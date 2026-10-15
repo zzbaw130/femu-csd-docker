@@ -1,0 +1,44 @@
+#ifndef __FEMU_ZFTL_H
+#define __FEMU_ZFTL_H
+
+#include "../nvme.h"
+
+#define INVALID_PPA     (~(0ULL))
+#define INVALID_LPN     (~(0ULL))
+#define UNMAPPED_PPA    (~(0ULL))
+
+
+
+/* configure the shared NAND media layer for this ZNS device */
+void zns_nand_media_init(struct zns_ssd *zns);
+uint64_t zns_zone_reset(struct zns_ssd *zns, uint32_t zone_idx,
+                        uint64_t zone_size_lbas, uint64_t lbasz, uint64_t stime);
+
+#ifdef FEMU_DEBUG_ZFTL
+#define ftl_debug(fmt, ...) \
+    do { printf("[Misao] ZFTL-Dbg: " fmt, ## __VA_ARGS__); } while (0)
+#else
+#define ftl_debug(fmt, ...) \
+    do { } while (0)
+#endif
+
+#define ftl_err(fmt, ...) \
+    do { fprintf(stderr, "[Misao] ZFTL-Err: " fmt, ## __VA_ARGS__); } while (0)
+
+#define ftl_log(fmt, ...) \
+    do { printf("[Misao] ZFTL-Log: " fmt, ## __VA_ARGS__); } while (0)
+
+
+/*
+ * FTL invariant checks. Off in the normal build to keep the I/O path
+ * short; FEMU_DEBUG_FTL arms them together with the debug chatter, and
+ * FEMU_FTL_ASSERT arms them alone, which is what the sanitizer build in
+ * CI uses so a bound violation aborts instead of corrupting state.
+ */
+#if defined(FEMU_DEBUG_FTL) || defined(FEMU_FTL_ASSERT)
+#define ftl_assert(expression) assert(expression)
+#else
+#define ftl_assert(expression)
+#endif
+
+#endif

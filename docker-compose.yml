@@ -10,7 +10,11 @@ services:
       memlock: -1                 # FEMU pins its device memory with mlock
     volumes:
       - ./images:/root/images     # guest image + SSH key, kept on the host
+      # ./code holds the container-side build inputs (the FEMU source); it is
+      # not shared with the guest. The other four are exported over virtio-9p
+      # and appear in the guest as /home/femu/<name>.
       - ./code:/root/workspace/code
+      - ./csd:/root/workspace/csd
       - ./scripts:/root/workspace/scripts
       - ./tests:/root/workspace/tests
       - ./results:/root/workspace/results

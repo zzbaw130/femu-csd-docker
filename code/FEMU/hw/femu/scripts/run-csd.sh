@@ -1,0 +1,110 @@
+#!/bin/bash
+# Run FEMU as a Computational Storage Drive (CSD)
+
+# Image directory
+IMGDIR=${IMGDIR:-$HOME/images}
+# Virtual machine disk image
+OSIMGF=${OSIMGF:-$IMGDIR/u20s.qcow2}
+# Host port forwarded to the guest's SSH port; run-guest-ssh.sh reads it too
+SSH_PORT=${SSH_PORT:-8080}
+
+# Configurable SSD Controller layout parameters (must be power of 2)
+secsz=512 # sector size in bytes
+secs_per_pg=8 # number of sectors in a flash page
+pgs_per_blk=256 # number of pages per flash block
+blks_per_pl=1024 # number of blocks per plane
+pls_per_lun=1 # planes per LUN
+luns_per_ch=8 # number of chips per channel
+nchs=8 # number of channels
+ssd_size=49152 # in megabytes, 48GB with 25%(16GB) op
+
+# Latency in nanoseconds
+pg_rd_lat=40000 # page read latency
+pg_wr_lat=200000 # page write latency
+blk_er_lat=2000000 # block erase latency
+ch_xfer_lat=0 # channel transfer time, ignored for now
+
+# GC Threshold (1-100)
+gc_thres_pcent=75
+gc_thres_pcent_high=95
+
+# FEMU CSD parameters. nr_thread, time_slice and context_switch_time are
+# accepted for CEMU config compatibility but configure a scheduler this port
+# does not carry, so they have no effect; values other than these defaults
+# print a warning.
+fdm_size=4096
+nr_cu=4
+nr_thread=4
+time_slice=200000
+context_switch_time=200
+csf_runtime_scale=3
+
+# Host directory that shared-library CSD programs are loaded from. Inside the
+# container this is the mounted host directory ./csd, where kernels are built
+# into .so files; the guest names a file in it alone, with no path, and FEMU
+# refuses a name that resolves outside it. The guest sees it at /home/femu/csd.
+csd_program_dir=/root/workspace/csd
+
+# Container directory holding the four directories shared with the guest over
+# virtio-9p. Each one is exported on its own mount tag and mounted by the guest
+# image at /home/femu/<tag> (see make-guest-image.sh); ./code stays
+# container-side.
+femu_share_root=/root/workspace
+
+#-----------------------------------------------------------------------
+
+# Compose the entire FEMU CSD command line options
+FEMU_OPTIONS="-device femu"
+FEMU_OPTIONS=${FEMU_OPTIONS}",devsz_mb=${ssd_size}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",namespaces=1"
+FEMU_OPTIONS=${FEMU_OPTIONS}",femu_mode=4"
+FEMU_OPTIONS=${FEMU_OPTIONS}",secsz=${secsz}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",secs_per_pg=${secs_per_pg}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",pgs_per_blk=${pgs_per_blk}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",blks_per_pl=${blks_per_pl}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",pls_per_lun=${pls_per_lun}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",luns_per_ch=${luns_per_ch}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",nchs=${nchs}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",pg_rd_lat=${pg_rd_lat}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",pg_wr_lat=${pg_wr_lat}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",blk_er_lat=${blk_er_lat}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",ch_xfer_lat=${ch_xfer_lat}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",gc_thres_pcent=${gc_thres_pcent}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",gc_thres_pcent_high=${gc_thres_pcent_high}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",fdm_size=${fdm_size}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",nr_cu=${nr_cu}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",nr_thread=${nr_thread}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",time_slice=${time_slice}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",context_switch_time=${context_switch_time}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",csf_runtime_scale=${csf_runtime_scale}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",csd_program_dir=${csd_program_dir}"
+
+echo ${FEMU_OPTIONS}
+
+if [[ ! -e "$OSIMGF" ]]; then
+	echo ""
+	echo "VM disk image couldn't be found ..."
+	echo "Build one with ./make-guest-image.sh, or place an image at $OSIMGF"
+	echo "(set OSIMGF or IMGDIR to use another path), then rerun this script"
+	echo ""
+	exit 1
+fi
+
+sudo ./qemu-system-x86_64 \
+    -name "FEMU-CSD-VM",debug-threads=on \
+    -enable-kvm \
+    -cpu host \
+    -smp 4 \
+    -m 8G \
+    -device virtio-scsi-pci,id=scsi0 \
+    -device scsi-hd,drive=hd0 \
+    -drive file=$OSIMGF,if=none,aio=native,cache=none,format=qcow2,id=hd0 \
+    ${FEMU_OPTIONS} \
+    -net user,hostfwd=tcp::${SSH_PORT}-:22 \
+    -net nic,model=virtio \
+    -virtfs local,path=${femu_share_root}/csd,mount_tag=csd,security_model=mapped-xattr,multidevs=remap \
+    -virtfs local,path=${femu_share_root}/results,mount_tag=results,security_model=mapped-xattr,multidevs=remap \
+    -virtfs local,path=${femu_share_root}/scripts,mount_tag=scripts,security_model=mapped-xattr,multidevs=remap \
+    -virtfs local,path=${femu_share_root}/tests,mount_tag=tests,security_model=mapped-xattr,multidevs=remap \
+    -nographic \
+    -qmp unix:./qmp-sock,server,nowait 2>&1 | tee log

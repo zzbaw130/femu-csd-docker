@@ -1,0 +1,361 @@
+#include "./nvme.h"
+
+static int nvme_add_kvm_msi_virq(FemuCtrl *n, NvmeCQueue *cq)
+{
+    int virq;
+    int vector_n;
+    KVMRouteChange c;
+
+    /* only an MSI-X vector can have a route; others are notified directly */
+    if (!msix_enabled(&(n->parent_obj))) {
+        return -1;
+    }
+
+    if (event_notifier_init(&cq->guest_notifier, 0)) {
+        femu_err("Initiated guest notifier failed");
+        return -1;
+    }
+    event_notifier_set_handler(&cq->guest_notifier, NULL);
+
+    vector_n = cq->vector;
+
+    c = kvm_irqchip_begin_route_changes(kvm_state);
+    virq = kvm_irqchip_add_msi_route(&c, vector_n, &n->parent_obj);
+    if (virq < 0) {
+        femu_debug("no KVM route for MSI-X vector %d\n", vector_n);
+        event_notifier_cleanup(&cq->guest_notifier);
+        return -1;
+    }
+    kvm_irqchip_commit_route_changes(&c);
+    cq->virq = virq;
+    femu_debug("%s,cq[%d]->virq=%d\n", __func__, cq->cqid, virq);
+
+    return 0;
+}
+
+void nvme_remove_kvm_msi_virq(NvmeCQueue *cq)
+{
+    kvm_irqchip_remove_irqfd_notifier_gsi(kvm_state, &cq->guest_notifier, cq->virq);
+    kvm_irqchip_release_virq(kvm_state, cq->virq);
+    event_notifier_set_handler(&cq->guest_notifier, NULL);
+    event_notifier_cleanup(&cq->guest_notifier);
+    cq->virq = -1;
+}
+
+static int nvme_set_guest_notifier(FemuCtrl *n, EventNotifier *notifier,
+                                   uint32_t qid)
+{
+    return 0;
+}
+
+static void nvme_clear_guest_notifier(FemuCtrl *n)
+{
+    NvmeCQueue *cq;
+    int qid;
+
+    /*
+     * Keep going past a queue the guest has deleted -- stopping there left the
+     * routes of every queue above it in place -- and release only a route that
+     * was really taken. A queue whose route could not be added keeps the id it
+     * was allocated with, and releasing that releases an interrupt this device
+     * does not own.
+     */
+    for (qid = 1; qid <= n->nr_io_queues; qid++) {
+        cq = n->cq[qid];
+        if (!cq) {
+            continue;
+        }
+
+        if (cq->irq_enabled && cq->virq > 0) {
+            nvme_remove_kvm_msi_virq(cq);
+        }
+    }
+
+    if (n->vector_poll_started) {
+        msix_unset_vector_notifiers(&n->parent_obj);
+        n->vector_poll_started = false;
+    }
+}
+
+static int nvme_vector_unmask(PCIDevice *dev, unsigned vector, MSIMessage msg)
+{
+    FemuCtrl *n = container_of(dev, FemuCtrl, parent_obj);
+    NvmeCQueue *cq;
+    EventNotifier *e;
+    int qid;
+    int ret;
+
+    for (qid = 1; qid <= n->nr_io_queues; qid++) {
+        cq = n->cq[qid];
+        /* a queue with no route of its own has no notifier to move either */
+        if (!cq || !cq->irq_enabled || cq->virq <= 0) {
+            continue;
+        }
+
+        e = &cq->guest_notifier;
+        if (cq->vector == vector) {
+            if (cq->msg.data != msg.data || cq->msg.address != msg.address) {
+                ret = kvm_irqchip_update_msi_route(kvm_state, cq->virq, msg, dev);
+                if (ret < 0) {
+                    femu_err("MSI irq update vector %u failed", vector);
+                    return ret;
+                }
+
+                kvm_irqchip_commit_routes(kvm_state);
+
+                cq->msg = msg;
+            }
+
+            ret = kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, e,
+                                                     NULL, cq->virq);
+            if (ret < 0) {
+                femu_err("MSI add irqfd gsi vector %u failed, ret %d", vector, ret);
+                return ret;
+            }
+        }
+    }
+
+    return 0;
+}
+
+static void nvme_vector_mask(PCIDevice *dev, unsigned vector)
+{
+    FemuCtrl *n = container_of(dev, FemuCtrl, parent_obj);
+    NvmeCQueue *cq;
+    EventNotifier *e;
+    int ret;
+
+    for (uint32_t qid = 1; qid <= n->nr_io_queues; qid++) {
+        cq = n->cq[qid];
+        if (!cq || !cq->irq_enabled || cq->virq <= 0) {
+            continue;
+        }
+
+        /* every queue on the vector, as unmask adds them all back */
+        if (cq->vector == vector) {
+            e = &cq->guest_notifier;
+            ret = kvm_irqchip_remove_irqfd_notifier_gsi(kvm_state, e, cq->virq);
+            if (ret != 0) {
+                femu_err("remove_irqfd_notifier_gsi failed");
+            }
+        }
+    }
+}
+
+static void nvme_vector_poll(PCIDevice *dev, unsigned int vector_start, unsigned
+                             int vector_end)
+{
+    FemuCtrl *n = container_of(dev, FemuCtrl, parent_obj);
+    NvmeCQueue *cq;
+    EventNotifier *e;
+    uint32_t vector;
+
+    for (uint32_t qid = 1; qid <= n->nr_io_queues; qid++) {
+        cq = n->cq[qid];
+        if (!cq || !cq->irq_enabled || cq->virq <= 0) {
+            continue;
+        }
+
+        vector = cq->vector;
+        if (vector < vector_end && vector >= vector_start) {
+            e = &cq->guest_notifier;
+            if (!msix_is_masked(dev, vector)) {
+                continue;
+            }
+
+            if (event_notifier_test_and_clear(e)) {
+                msix_set_pending(dev, vector);
+            }
+        }
+    }
+}
+
+static bool nvme_irq_by_pin(FemuCtrl *n)
+{
+    PCIDevice *pci = &n->parent_obj;
+
+    return !msix_enabled(pci) && !msi_enabled(pci);
+}
+
+/*
+ * The pin is level triggered: it stays asserted while an interrupt-enabled
+ * completion queue holds entries the host has not consumed and INTMS does not
+ * mask it, and drops once the host has caught up. Called with the BQL held.
+ */
+void nvme_irq_update(FemuCtrl *n)
+{
+    bool pending = false;
+    int qid;
+
+    if (!nvme_irq_by_pin(n)) {
+        return;
+    }
+
+    for (qid = 0; qid <= n->nr_io_queues && !pending; qid++) {
+        NvmeCQueue *cq = n->cq[qid];
+
+        if (!cq || !cq->irq_enabled) {
+            continue;
+        }
+        if (qid) {
+            nvme_update_cq_head(cq);
+        }
+        pending = cq->head != cq->tail;
+    }
+
+    n->irq_status = pending ? 1 : 0;
+    if (~n->bar.intms & n->irq_status) {
+        pci_irq_assert(&n->parent_obj);
+    } else {
+        pci_irq_deassert(&n->parent_obj);
+    }
+}
+
+/* INTMS or INTMC was written; unmasked holds the bits INTMC just cleared */
+void nvme_irq_mask_changed(FemuCtrl *n, uint32_t unmasked)
+{
+    PCIDevice *pci = &n->parent_obj;
+    uint32_t held;
+    int v;
+
+    if (msix_enabled(pci)) {
+        return;
+    }
+    if (!msi_enabled(pci)) {
+        nvme_irq_update(n);
+        return;
+    }
+
+    /* an MSI raised while its vector was masked is sent once it is not */
+    held = n->irq_status & unmasked;
+    n->irq_status &= ~held;
+    for (v = 0; v < 32; v++) {
+        if (held & (1U << v)) {
+            msi_notify(pci, v);
+        }
+    }
+}
+
+static void nvme_isr_notify_legacy(void *opaque)
+{
+    NvmeCQueue *cq = opaque;
+    FemuCtrl *n = cq->ctrl;
+    PCIDevice *pci = &n->parent_obj;
+
+    if (!cq->irq_enabled) {
+        return;
+    }
+
+    if (msix_enabled(pci)) {
+        msix_notify(pci, cq->vector);
+    } else if (msi_enabled(pci)) {
+        if (cq->vector >= msi_nr_vectors_allocated(pci)) {
+            return;
+        }
+        if (n->bar.intms & (1U << cq->vector)) {
+            n->irq_status |= 1U << cq->vector;
+        } else {
+            msi_notify(pci, cq->vector);
+        }
+    } else {
+        nvme_irq_update(n);
+    }
+}
+
+void nvme_isr_notify_admin(void *opaque)
+{
+    NvmeCQueue *cq = opaque;
+    FemuCtrl *n = cq->ctrl;
+
+    /* I/O queues that share the vector get this interrupt too */
+    if (cq->irq_enabled && n->features.ic_vec &&
+        cq->vector <= n->nr_io_queues) {
+        NvmeIcVector *v = &n->features.ic_vec[cq->vector];
+
+        qemu_spin_lock(&v->lock);
+        v->pending = 0;
+        v->urgent = false;
+        qemu_spin_unlock(&v->lock);
+    }
+    nvme_isr_notify_legacy(opaque);
+}
+
+/*
+ * Signal @cq's vector now, on a thread that holds the BQL: no bottom half
+ * that a queue delete could cancel before it runs.
+ */
+void nvme_isr_notify_now(NvmeCQueue *cq)
+{
+    nvme_isr_notify_legacy(cq);
+}
+
+void nvme_isr_notify_io(void *opaque)
+{
+    NvmeCQueue *cq = opaque;
+
+    if (!cq->irq_enabled) {
+        return;
+    }
+
+    /* the queue's own KVM route, when it could be set up */
+    if (cq->virq > 0) {
+        event_notifier_set(&cq->guest_notifier);
+        return;
+    }
+
+    /*
+     * Without one, the notification goes through the PCI core, which needs the
+     * BQL. A poller thread does not hold it, so leave the rest to a bottom
+     * half on the main loop.
+     */
+    qemu_bh_schedule(cq->irq_bh);
+}
+
+void nvme_cq_irq_init(NvmeCQueue *cq)
+{
+    cq->irq_bh = qemu_bh_new(nvme_isr_notify_legacy, cq);
+}
+
+void nvme_cq_irq_cleanup(NvmeCQueue *cq)
+{
+    if (cq->irq_bh) {
+        qemu_bh_delete(cq->irq_bh);
+        cq->irq_bh = NULL;
+    }
+}
+
+int nvme_setup_virq(FemuCtrl *n, NvmeCQueue *cq)
+{
+    int ret;
+
+    if (cq->cqid && cq->irq_enabled) {
+        ret = nvme_add_kvm_msi_virq(n, cq);
+        if (ret < 0) {
+            return -1;
+        }
+
+        ret = nvme_set_guest_notifier(n, &cq->guest_notifier, cq->cqid);
+        if (ret < 0) {
+            femu_err("nvme: set guest notifier failed\n");
+            return -1;
+        }
+    }
+
+    if (cq->irq_enabled && !n->vector_poll_started) {
+        n->vector_poll_started = true;
+        if (msix_set_vector_notifiers(&n->parent_obj, nvme_vector_unmask,
+                                      nvme_vector_mask, nvme_vector_poll)) {
+            femu_err("nvme: msix_set_vector_notifiers failed\n");
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+int nvme_clear_virq(FemuCtrl *n)
+{
+    nvme_clear_guest_notifier(n);
+
+    return 0;
+}

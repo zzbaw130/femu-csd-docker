@@ -1,0 +1,4247 @@
+#include "./nvme.h"
+#include "./bbssd/ftl.h"
+#include "./kvssd/kvssd.h"
+#include "./ocssd/oc-timing.h"
+#include "system/qtest.h"
+
+#define NVME_IDENTIFY_DATA_SIZE 4096
+
+/*
+ * Which features the controller answers, and what a host may do with each.
+ * Nothing is saveable: there is no persistent store behind Set Features, so
+ * Select = Saved reads the defaults, as it does in hw/nvme.
+ */
+static const bool nvme_feature_support[NVME_FID_MAX] = {
+    [NVME_ARBITRATION]              = true,
+    [NVME_POWER_MANAGEMENT]         = true,
+    [NVME_LBA_RANGE_TYPE]           = true,
+    [NVME_TEMPERATURE_THRESHOLD]    = true,
+    [NVME_ERROR_RECOVERY]           = true,
+    [NVME_VOLATILE_WRITE_CACHE]     = true,
+    [NVME_NUMBER_OF_QUEUES]         = true,
+    [NVME_INTERRUPT_COALESCING]     = true,
+    [NVME_INTERRUPT_VECTOR_CONF]    = true,
+    [NVME_WRITE_ATOMICITY]          = true,
+    [NVME_ASYNCHRONOUS_EVENT_CONF]  = true,
+    [NVME_FDP_MODE]                 = true,
+    [NVME_FDP_EVENTS]               = true,
+    [NVME_KV_FEAT_CONFIG]           = true,
+    [NVME_COMMAND_SET_PROFILE]      = true,
+    [NVME_SOFTWARE_PROGRESS_MARKER] = true,
+    [NVME_HOST_BEHAVIOR_SUPPORT]    = true,
+    [NVME_TIMESTAMP]                = true,
+};
+
+static const uint32_t nvme_feature_cap[NVME_FID_MAX] = {
+    [NVME_ARBITRATION]              = NVME_FEAT_CAP_CHANGE,
+    [NVME_POWER_MANAGEMENT]         = NVME_FEAT_CAP_CHANGE,
+    [NVME_LBA_RANGE_TYPE]           = NVME_FEAT_CAP_CHANGE | NVME_FEAT_CAP_NS,
+    [NVME_TEMPERATURE_THRESHOLD]    = NVME_FEAT_CAP_CHANGE,
+    [NVME_ERROR_RECOVERY]           = NVME_FEAT_CAP_CHANGE | NVME_FEAT_CAP_NS,
+    [NVME_VOLATILE_WRITE_CACHE]     = NVME_FEAT_CAP_CHANGE,
+    [NVME_COMMAND_SET_PROFILE]      = NVME_FEAT_CAP_CHANGE,
+    [NVME_NUMBER_OF_QUEUES]         = NVME_FEAT_CAP_CHANGE,
+    [NVME_INTERRUPT_COALESCING]     = NVME_FEAT_CAP_CHANGE,
+    [NVME_INTERRUPT_VECTOR_CONF]    = NVME_FEAT_CAP_CHANGE,
+    [NVME_WRITE_ATOMICITY]          = NVME_FEAT_CAP_CHANGE,
+    [NVME_HOST_BEHAVIOR_SUPPORT]    = NVME_FEAT_CAP_CHANGE,
+    [NVME_TIMESTAMP]                = NVME_FEAT_CAP_CHANGE,
+    [NVME_ASYNCHRONOUS_EVENT_CONF]  = NVME_FEAT_CAP_CHANGE,
+    /* configured at realize, which makes it the saved value as well */
+    [NVME_FDP_MODE]                 = NVME_FEAT_CAP_SAVE | NVME_FEAT_CAP_CHANGE,
+    [NVME_FDP_EVENTS]               = NVME_FEAT_CAP_SAVE |
+                                      NVME_FEAT_CAP_CHANGE | NVME_FEAT_CAP_NS,
+    [NVME_KV_FEAT_CONFIG]           = NVME_FEAT_CAP_CHANGE | NVME_FEAT_CAP_NS,
+    [NVME_SOFTWARE_PROGRESS_MARKER] = NVME_FEAT_CAP_CHANGE,
+};
+
+/*
+ * Whether the controller answers Get and Set Features for @fid: the table says
+ * which identifiers are implemented, and some only exist alongside what they
+ * configure. Both commands and the FID Supported and Effects log ask here, so
+ * the log cannot claim a feature the commands refuse.
+ */
+bool nvme_fid_supported(FemuCtrl *n, uint8_t fid)
+{
+    if (!nvme_feature_support[fid]) {
+        return false;
+    }
+
+    switch (fid) {
+    case NVME_VOLATILE_WRITE_CACHE:
+        return n->vwc;
+    case NVME_FDP_MODE:
+    case NVME_FDP_EVENTS:
+        /*
+         * FDP is fixed at realize, so a subsystem with FDP off has no FDP
+         * capability (CTRATT.FDPS clear) and no FDP features.
+         */
+        return n->subsys && n->subsys->endgrp.fdp.enabled;
+    case NVME_KV_FEAT_CONFIG:
+        for (int i = 0; n->namespaces && i < n->namespace_limit; i++) {
+            if (n->namespaces[i].allocated && NS_KVSSD(&n->namespaces[i])) {
+                return true;
+            }
+        }
+        return false;
+    default:
+        return true;
+    }
+}
+
+static uint16_t nvme_del_sq(FemuCtrl *n, NvmeCmd *cmd)
+{
+    NvmeDeleteQ *c = (NvmeDeleteQ *)cmd;
+    NvmeRequest *req, *next;
+    NvmeSQueue *sq;
+    NvmeCQueue *cq;
+    uint16_t qid = le16_to_cpu(c->qid);
+    bool resume;
+
+    if (!qid || nvme_check_sqid(n, qid)) {
+        return NVME_INVALID_QID | NVME_DNR;
+    }
+
+    sq = n->sq[qid];
+    if (!sq->is_active) {
+        return NVME_INVALID_QID | NVME_DNR;
+    }
+
+    /*
+     * Stop the dataplane before taking the queue apart. The request array
+     * about to be freed is reachable from the rings and from the poller's
+     * pending completions, and the FTL thread may be holding one of its
+     * requests right now.
+     */
+    resume = nvme_pause_pollers(n);
+    sq->is_active = false;
+    if (!nvme_check_cqid(n, sq->cqid)) {
+        cq = n->cq[sq->cqid];
+        QTAILQ_REMOVE(&cq->sq_list, sq, entry);
+
+        nvme_post_cqes_io(cq);
+        QTAILQ_FOREACH_SAFE(req, &cq->req_list, entry, next) {
+            if (req->sq == sq) {
+                QTAILQ_REMOVE(&cq->req_list, req, entry);
+                QTAILQ_INSERT_TAIL(&sq->req_list, req, entry);
+            }
+        }
+    }
+
+    nvme_drain_sq(n, sq);
+    nvme_free_sq(sq, n);
+    nvme_resume_pollers(n, resume);
+
+    return NVME_SUCCESS;
+}
+
+static uint16_t nvme_create_sq(FemuCtrl *n, NvmeCmd *cmd)
+{
+    NvmeSQueue *sq;
+    NvmeCreateSq *c = (NvmeCreateSq *)cmd;
+
+    uint16_t cqid = le16_to_cpu(c->cqid);
+    uint16_t sqid = le16_to_cpu(c->sqid);
+    uint16_t qsize = le16_to_cpu(c->qsize);
+    uint16_t qflags = le16_to_cpu(c->sq_flags);
+    uint64_t prp1 = le64_to_cpu(c->prp1);
+
+    if (!cqid || nvme_check_cqid(n, cqid)) {
+        return NVME_INVALID_CQID | NVME_DNR;
+    }
+    /*
+     * n->sq is sized nr_io_queues + 1. nvme_check_sqid() returns nonzero both
+     * for an out-of-range id and for an id with no live queue, so it cannot by
+     * itself reject an out-of-range id here; bound sqid explicitly before it is
+     * used to index n->sq in nvme_init_sq().
+     */
+    if (!sqid || sqid > n->nr_io_queues || !nvme_check_sqid(n, sqid)) {
+        return NVME_INVALID_QID | NVME_DNR;
+    }
+    /* also before the host has set the entry size (Base 2.3, Figure 510) */
+    if (!qsize || qsize > NVME_CAP_MQES(n->bar.cap) ||
+        !NVME_CC_IOSQES(n->bar.cc)) {
+        return NVME_MAX_QSIZE_EXCEEDED | NVME_DNR;
+    }
+    if (!prp1) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    /* the ring or its list starts on a page (Base 2.3, Figure 506) */
+    if (prp1 & (n->page_size - 1)) {
+        return NVME_INVALID_PRP_OFFSET | NVME_DNR;
+    }
+    if (!(NVME_SQ_FLAGS_PC(qflags)) && NVME_CAP_CQR(n->bar.cap)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    sq = g_malloc0(sizeof(*sq));
+    if (nvme_init_sq(sq, n, prp1, sqid, cqid, qsize + 1,
+                NVME_SQ_FLAGS_QPRIO(qflags),
+                NVME_SQ_FLAGS_PC(qflags))) {
+        g_free(sq);
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    assert(sq->is_active == false);
+    /*
+     * Publish is_active LAST, after a write barrier, so a concurrent poller
+     * that observes is_active==true is guaranteed to see a fully-initialized
+     * SQ (size / dma_addr_hva / io_req filled by nvme_init_sq, which also
+     * publishes n->sq[sqid] before returning). Without this, at high
+     * queue-creation rates (e.g. SPDK with many reactors) a poller could race
+     * a half-initialized SQ and segfault on a stale dma_addr_hva. The matching
+     * acquire barrier is the smp_rmb() in nvme_poller().
+     */
+    smp_wmb();
+    sq->is_active = true;
+
+    return NVME_SUCCESS;
+}
+
+static uint16_t nvme_create_cq(FemuCtrl *n, NvmeCmd *cmd)
+{
+    NvmeCQueue *cq;
+    NvmeCreateCq *c = (NvmeCreateCq *)cmd;
+    uint16_t cqid = le16_to_cpu(c->cqid);
+    uint16_t vector = le16_to_cpu(c->irq_vector);
+    uint16_t qsize = le16_to_cpu(c->qsize);
+    uint16_t qflags = le16_to_cpu(c->cq_flags);
+    uint64_t prp1 = le64_to_cpu(c->prp1);
+
+    /*
+     * Bound cqid before it indexes n->cq (sized nr_io_queues + 1); see the
+     * matching note in nvme_create_sq(). nvme_check_cqid() returns 0 when the
+     * queue already exists, so this also rejects a duplicate identifier, and
+     * the slot is guaranteed free below.
+     */
+    if (!cqid || cqid > n->nr_io_queues || !nvme_check_cqid(n, cqid)) {
+        return NVME_INVALID_QID | NVME_DNR;
+    }
+    if (!qsize || qsize > NVME_CAP_MQES(n->bar.cap) ||
+        !NVME_CC_IOCQES(n->bar.cc)) {
+        return NVME_MAX_QSIZE_EXCEEDED | NVME_DNR;
+    }
+    if (!prp1) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    if (prp1 & (n->page_size - 1)) {
+        return NVME_INVALID_PRP_OFFSET | NVME_DNR;
+    }
+    if (vector > n->nr_io_queues) {
+        return NVME_INVALID_IRQ_VECTOR | NVME_DNR;
+    }
+    /*
+     * MSI is limited to the number of vectors the guest has enabled (at most
+     * 32). If MSI is active, a completion-queue vector at or beyond that count
+     * has no MSI vector and would make msi_notify() assert when the queue
+     * fires; reject it as an invalid interrupt vector instead.
+     */
+    if (msi_enabled(&n->parent_obj) &&
+        vector >= msi_nr_vectors_allocated(&n->parent_obj)) {
+        return NVME_INVALID_IRQ_VECTOR | NVME_DNR;
+    }
+    if (!(NVME_CQ_FLAGS_PC(qflags)) && NVME_CAP_CQR(n->bar.cap)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    cq = g_malloc0(sizeof(*cq));
+    assert(cq != NULL);
+    if (nvme_init_cq(cq, n, prp1, cqid, vector, qsize + 1,
+                     NVME_CQ_FLAGS_IEN(qflags), NVME_CQ_FLAGS_PC(qflags))) {
+        g_free(cq);
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    /*
+     * A failure here means no interrupt route of its own: without KVM there is
+     * none to take, and the completion path then notifies through MSI-X
+     * directly. The queue is still usable, so the command is not refused.
+     */
+    nvme_setup_virq(n, cq);
+
+    assert(cq->is_active == false);
+    cq->is_active = true;
+
+    return NVME_SUCCESS;
+}
+
+static uint16_t nvme_del_cq(FemuCtrl *n, NvmeCmd *cmd)
+{
+    NvmeDeleteQ *c = (NvmeDeleteQ *)cmd;
+    NvmeCQueue *cq;
+    uint16_t qid = le16_to_cpu(c->qid);
+    bool resume;
+
+    if (!qid || nvme_check_cqid(n, qid)) {
+        return NVME_INVALID_QID | NVME_DNR;
+    }
+
+    cq = n->cq[qid];
+    assert(cq->is_active == true);
+    /* refused while a submission queue still uses it, and then left as it was */
+    if (!QTAILQ_EMPTY(&cq->sq_list)) {
+        return NVME_INVALID_QUEUE_DEL;
+    }
+    /*
+     * The pollers reach this queue through n->cq[], so take the dataplane down
+     * before it goes, exactly as deleting a submission queue does. Without it
+     * a poller can load the pointer and read through it after the free.
+     */
+    resume = nvme_pause_pollers(n);
+    cq->is_active = false;
+    nvme_free_cq(cq, n);
+    nvme_resume_pollers(n, resume);
+
+    return NVME_SUCCESS;
+}
+
+static int cmp_pri(pqueue_pri_t next, pqueue_pri_t curr)
+{
+    return (next > curr);
+}
+
+static pqueue_pri_t get_pri(void *a)
+{
+    return ((NvmeRequest *)a)->expire_time;
+}
+
+static void set_pri(void *a, pqueue_pri_t pri)
+{
+    ((NvmeRequest *)a)->expire_time = pri;
+}
+
+static size_t get_pos(void *a)
+{
+    return ((NvmeRequest *)a)->pos;
+}
+
+static void set_pos(void *a, size_t pos)
+{
+    ((NvmeRequest *)a)->pos = pos;
+}
+
+static void nvme_init_poller(FemuCtrl *n)
+{
+    int i;
+
+    /*
+     * M:N poller<->queue mapping. With multipoller enabled, spawn
+     * nr_pollers = ceil(nr_io_queues / poller_ratio) threads; each poller
+     * sweeps a round-robin shard of the queues (see nvme_poller). ratio == 1
+     * (the default) gives nr_pollers == nr_io_queues, i.e. one poller per
+     * queue -- bit-identical to the original 1:1 behavior. ratio > 1 trades
+     * fewer busy-spinning poller threads (less core oversubscription) for more
+     * queues per poller.
+     */
+    if (n->multipoller_enabled) {
+        uint32_t r = n->poller_ratio ? n->poller_ratio : 1;
+        n->nr_pollers = (n->nr_io_queues + r - 1) / r;
+    } else {
+        n->nr_pollers = 1;
+    }
+
+    /*
+     * One row of completion-queue flags per poller. A submission queue may
+     * report to a completion queue that another poller also serves, so a
+     * shared row would be written by two threads at once.
+     */
+    n->should_isr = g_malloc0(sizeof(bool) * (n->nr_pollers + 1) *
+                              (n->nr_io_queues + 1));
+    n->cpl_backlog = g_new0(union cq_req_list, n->nr_pollers + 1);
+    for (i = 1; i <= n->nr_pollers; i++) {
+        QTAILQ_INIT(&n->cpl_backlog[i]);
+    }
+
+    /* poller quiesce flags (1-based poller indices); see poller_in_sweep */
+    if (!n->poller_in_sweep) {
+        n->poller_in_sweep = g_malloc0(sizeof(bool) * (n->nr_pollers + 1));
+    }
+
+    /*
+     * per-poller I/O counters, cacheline-isolated (1-based); see FemuPollerCtr.
+     * qemu_memalign(64) so each slot's QEMU_ALIGNED(64) padding actually lands
+     * on its own cacheline (g_malloc0 would not guarantee 64-byte alignment).
+     */
+    if (!n->poller_ctr) {
+        size_t ctr_sz = sizeof(FemuPollerCtr) * (n->nr_pollers + 1);
+        n->poller_ctr = qemu_memalign(64, ctr_sz);
+        memset(n->poller_ctr, 0, ctr_sz);
+    }
+    if (n->io_stages && !n->stage_sets) {
+        n->stage_sets = g_new0(FemuStageSet, n->nr_pollers + 1);
+    }
+
+    /* Coperd: we put NvmeRequest into these rings */
+    n->to_ftl = g_malloc0(sizeof(struct rte_ring *) * (n->nr_pollers + 1));
+    for (i = 1; i <= n->nr_pollers; i++) {
+        n->to_ftl[i] = femu_ring_create(FEMU_RING_TYPE_MP_SC, FEMU_MAX_INF_REQS);
+        if (!n->to_ftl[i]) {
+            femu_err("Failed to create ring (n->to_ftl) ...\n");
+            abort();
+        }
+        assert(rte_ring_empty(n->to_ftl[i]));
+    }
+
+    n->to_poller = g_malloc0(sizeof(struct rte_ring *) * (n->nr_pollers + 1));
+    for (i = 1; i <= n->nr_pollers; i++) {
+        n->to_poller[i] = femu_ring_create(FEMU_RING_TYPE_MP_SC, FEMU_MAX_INF_REQS);
+        if (!n->to_poller[i]) {
+            femu_err("Failed to create ring (n->to_poller) ...\n");
+            abort();
+        }
+        assert(rte_ring_empty(n->to_poller[i]));
+    }
+
+    n->pq = g_malloc0(sizeof(pqueue_t *) * (n->nr_pollers + 1));
+    for (i = 1; i <= n->nr_pollers; i++) {
+        n->pq[i] = pqueue_init(FEMU_MAX_INF_REQS, cmp_pri, get_pri, set_pri,
+                               get_pos, set_pos);
+        if (!n->pq[i]) {
+            femu_err("Failed to create pqueue (n->pq) ...\n");
+            abort();
+        }
+    }
+
+    n->poller = g_malloc0(sizeof(QemuThread) * (n->nr_pollers + 1));
+    /*
+     * The threads read this for as long as they run, so it is released with
+     * them rather than here; it used to be released nowhere.
+     */
+    NvmePollerThreadArgument *args = g_malloc0(
+        sizeof(NvmePollerThreadArgument) * (n->nr_pollers + 1));
+
+    n->poller_args = args;
+    for (i = 1; i <= n->nr_pollers; i++) {
+        args[i].n = n;
+        args[i].index = i;
+        /*
+         * Thread name must fit the kernel's 15-char TASK_COMM_LEN limit
+         * (incl. NUL), or pthread_setname_np() silently fails and the poller
+         * inherits its creator's comm (e.g. "CPU N/KVM"). That misnames the
+         * pollers, breaking per-thread identification and CPU pinning. Keep
+         * "femu-poller" (11 chars) rather than the 16-char "femu-nvme-poller".
+         */
+        qemu_thread_create(&n->poller[i], "femu-poller", nvme_poller,
+                &args[i], QEMU_THREAD_JOINABLE);
+        femu_debug("femu-poller [%d] created ...\n", i - 1);
+    }
+}
+
+/*
+ * Start serving the I/O queues. Called when the host enables the controller:
+ * the shadow doorbell buffer is an optional host optimisation, and a host that
+ * never configures one drives the doorbell registers instead. The poller
+ * threads are created once and survive a reset, which only clears
+ * dataplane_started until the next enable.
+ */
+void nvme_start_dataplane(FemuCtrl *n)
+{
+    if (!n->poller_on) {
+        nvme_init_poller(n);
+        n->poller_on = true;
+    }
+    n->dataplane_started = true;
+}
+
+static uint16_t nvme_set_db_memory(FemuCtrl *n, const NvmeCmd *cmd)
+{
+    uint64_t dbs_addr = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t eis_addr = le64_to_cpu(cmd->dptr.prp2);
+    uint8_t stride = n->db_stride;
+    int dbbuf_entry_sz = 1 << (2 + stride);
+    AddressSpace *as = pci_get_address_space(&n->parent_obj);
+    void *dbs_hva, *eis_hva;
+    int i;
+
+
+    dma_addr_t dbs_tlen = n->page_size, eis_tlen = n->page_size;
+
+    /* Addresses should not be NULL and should be page aligned. */
+    if (dbs_addr == 0 || dbs_addr & (n->page_size - 1) || eis_addr == 0 ||
+            eis_addr & (n->page_size - 1)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    /* the buffers are set once per controller enable; a second one is refused */
+    if (n->dbs_addr) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    /*
+     * Each buffer is one memory page and holds two entries per queue plus the
+     * admin pair, so a controller with more queues than fit cannot use them.
+     * The loop below wrote past the mapping rather than saying so.
+     */
+    if ((2ULL * n->nr_io_queues + 1) * dbbuf_entry_sz > n->page_size) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    dbs_hva = dma_memory_map(as, dbs_addr, &dbs_tlen, DMA_DIRECTION_FROM_DEVICE,
+                             MEMTXATTRS_UNSPECIFIED);
+    eis_hva = dma_memory_map(as, eis_addr, &eis_tlen, DMA_DIRECTION_FROM_DEVICE,
+                             MEMTXATTRS_UNSPECIFIED);
+    /*
+     * The host may name an address that cannot be mapped, or one backed by
+     * something that does not hand out a whole page. Refuse the command in
+     * that case: the pollers dereference these pointers on every sweep, so
+     * accepting a short or absent mapping is a wild write from a guest
+     * command. Nothing is recorded until both succeed, so the host can retry.
+     */
+    if (!dbs_hva || !eis_hva || dbs_tlen < n->page_size ||
+        eis_tlen < n->page_size) {
+        if (dbs_hva) {
+            dma_memory_unmap(as, dbs_hva, dbs_tlen,
+                             DMA_DIRECTION_FROM_DEVICE, 0);
+        }
+        if (eis_hva) {
+            dma_memory_unmap(as, eis_hva, eis_tlen,
+                             DMA_DIRECTION_FROM_DEVICE, 0);
+        }
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    n->dbs_addr = dbs_addr;
+    n->eis_addr = eis_addr;
+    n->dbs_addr_hva = (uint64_t)dbs_hva;
+    n->eis_addr_hva = (uint64_t)eis_hva;
+    n->dbbuf_map_len = n->page_size;
+
+    /*
+     * The admin pair stays on its doorbell registers, but its EventIdx entries
+     * are kept current so a host that consults them still rings (Annex B.5).
+     */
+    n->sq[0]->eventidx_addr_hva = n->eis_addr_hva;
+    n->cq[0]->eventidx_addr_hva = n->eis_addr_hva + dbbuf_entry_sz;
+    stl_le_p((void *)n->sq[0]->eventidx_addr_hva, n->sq[0]->tail);
+    stl_le_p((void *)n->cq[0]->eventidx_addr_hva, n->cq[0]->head);
+
+    for (i = 1; i <= n->nr_io_queues; i++) {
+        NvmeSQueue *sq = n->sq[i];
+        NvmeCQueue *cq = n->cq[i];
+        uint64_t db_hva, eventidx_hva;
+
+        if (sq) {
+            /* Submission queue tail pointer location, 2 * QID * stride. */
+            db_hva = n->dbs_addr_hva + 2 * i * dbbuf_entry_sz;
+            eventidx_hva = n->eis_addr_hva + 2 * i * dbbuf_entry_sz;
+            /*
+             * The buffer the host just handed over is zeroed, but the queue
+             * may already have advanced through the doorbell registers, so
+             * seed it with where the queue actually stands. Seed before
+             * publishing: a poller reads the shadow from the moment
+             * db_addr_hva is set, and one that sweeps in between takes the
+             * zero as the tail, overwrites sq->tail with it and leaves the
+             * queue stalled until the host submits again.
+             */
+            *((uint32_t *)db_hva) = sq->tail;
+            smp_wmb();  /* seed the shadow before a poller can find it */
+            sq->eventidx_addr = eis_addr + 2 * i * dbbuf_entry_sz;
+            sq->eventidx_addr_hva = eventidx_hva;
+            sq->db_addr = dbs_addr + 2 * i * dbbuf_entry_sz;
+            sq->db_addr_hva = db_hva;
+            femu_debug("DBBUF,sq[%d]:db=%" PRIu64 ",ei=%" PRIu64 "\n", i,
+                    sq->db_addr, sq->eventidx_addr);
+        }
+        if (cq) {
+            /* Completion queue head pointer location, (2 * QID + 1) * stride. */
+            db_hva = n->dbs_addr_hva + (2 * i + 1) * dbbuf_entry_sz;
+            eventidx_hva = n->eis_addr_hva + (2 * i + 1) * dbbuf_entry_sz;
+            *((uint32_t *)db_hva) = cq->head;
+            smp_wmb();  /* seed the shadow before a poller can find it */
+            cq->eventidx_addr = eis_addr + (2 * i + 1) * dbbuf_entry_sz;
+            cq->eventidx_addr_hva = eventidx_hva;
+            cq->db_addr = dbs_addr + (2 * i + 1) * dbbuf_entry_sz;
+            cq->db_addr_hva = db_hva;
+            femu_debug("DBBUF,cq[%d]:db=%" PRIu64 ",ei=%" PRIu64 "\n", i,
+                    cq->db_addr, cq->eventidx_addr);
+        }
+    }
+
+    femu_debug("nvme_set_db_memory returns SUCCESS!\n");
+
+    return NVME_SUCCESS;
+}
+
+static uint16_t nvme_rpt_empty_id_struct(FemuCtrl *n, NvmeCmd *cmd)
+{
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+    uint8_t id[NVME_IDENTIFY_DATA_SIZE] = {};
+
+    return dma_read_prp(n, id, sizeof(id), prp1, prp2);
+}
+
+static inline bool nvme_csi_has_nvm_support(NvmeNamespace *ns)
+{
+    switch (ns->csi) {
+    case NVME_CSI_NVM:
+    case NVME_CSI_ZONED:
+        return true;
+    }
+
+    return false;
+}
+
+static bool nvme_is_ns_notice(const NvmeAsyncEvent *event)
+{
+    return event->result.event_type == NVME_AER_TYPE_NOTICE &&
+           event->result.event_info == 0 &&
+           event->result.log_page == NVME_LOG_CHANGED_NS_LIST;
+}
+
+static void nvme_ns_changed(FemuCtrl *n, uint32_t nsid, bool notify)
+{
+    uint32_t i;
+
+    if (!nvme_ns_mgmt_supported(n)) {
+        return;
+    }
+    if (n->changed_nsids[0] != NVME_NSID_BROADCAST) {
+        for (i = 0; i < n->changed_ns_count; i++) {
+            if (n->changed_nsids[i] >= nsid) {
+                break;
+            }
+        }
+        if (i == n->changed_ns_count || n->changed_nsids[i] != nsid) {
+            if (n->changed_ns_count == ARRAY_SIZE(n->changed_nsids)) {
+                memset(n->changed_nsids, 0, sizeof(n->changed_nsids));
+                n->changed_nsids[0] = NVME_NSID_BROADCAST;
+                n->changed_ns_count = 1;
+            } else {
+                memmove(&n->changed_nsids[i + 1], &n->changed_nsids[i],
+                        (n->changed_ns_count - i) * sizeof(uint32_t));
+                n->changed_nsids[i] = nsid;
+                n->changed_ns_count++;
+            }
+        }
+    }
+    if (notify && (n->features.async_config & NVME_AEC_NS_ATTR) &&
+        !n->ns_notice_pending) {
+        n->ns_notice_pending = true;
+        nvme_enqueue_event(n, NVME_AER_TYPE_NOTICE, 0,
+                            NVME_LOG_CHANGED_NS_LIST);
+    }
+}
+
+/* Acknowledging this log must leave unrelated Notice events alone. */
+static void nvme_ns_format_changed(FemuCtrl *n, NvmeNamespace *ns)
+{
+    if (!nvme_ns_shared(n)) {
+        nvme_ns_changed(n, ns->id, true);
+        return;
+    }
+    for (uint32_t i = 0; i < NVME_MAX_CONTROLLERS; i++) {
+        FemuCtrl *ctrl = nvme_subsys_ctrl(n->subsys, i);
+
+        if (ctrl && nvme_ns_attached(ctrl, ns)) {
+            nvme_ns_changed(ctrl, ns->id, true);
+        }
+    }
+}
+
+static void nvme_clear_ns_notice(FemuCtrl *n)
+{
+    NvmeAsyncEvent *event;
+    NvmeAsyncEvent *next;
+
+    n->ns_notice_pending = false;
+    n->ns_notice_masked = false;
+    qemu_mutex_lock(&n->aer_lock);
+    QSIMPLEQ_FOREACH_SAFE(event, &n->aer_queue, entry, next) {
+        if (nvme_is_ns_notice(event)) {
+            QSIMPLEQ_REMOVE(&n->aer_queue, event, NvmeAsyncEvent, entry);
+            n->aer_queued--;
+            g_free(event);
+        }
+    }
+    qemu_mutex_unlock(&n->aer_lock);
+}
+
+static uint16_t nvme_changed_ns_log(FemuCtrl *n, NvmeCmd *cmd, uint32_t len,
+                                    uint64_t off, bool rae)
+{
+    uint32_t list[1024] = { 0 };
+    uint16_t status;
+
+    if (!nvme_ns_mgmt_supported(n)) {
+        return NVME_INVALID_LOG_ID | NVME_DNR;
+    }
+    if (off >= sizeof(list)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    for (uint32_t i = 0; i < n->changed_ns_count; i++) {
+        list[i] = cpu_to_le32(n->changed_nsids[i]);
+    }
+    status = dma_read_prp(n, (uint8_t *)list + off,
+                          MIN(len, sizeof(list) - off),
+                          le64_to_cpu(cmd->dptr.prp1),
+                          le64_to_cpu(cmd->dptr.prp2));
+    if (!status) {
+        /* The list is since the last successful read; RAE retains the event. */
+        memset(n->changed_nsids, 0, sizeof(n->changed_nsids));
+        n->changed_ns_count = 0;
+        if (!rae) {
+            nvme_clear_ns_notice(n);
+        }
+    }
+    return status;
+}
+
+static uint16_t nvme_identify_ns(FemuCtrl *n, NvmeCmd *cmd,
+                                  bool present)
+{
+    NvmeNamespace *ns;
+    NvmeIdentify *c = (NvmeIdentify *)cmd;
+    uint32_t nsid = le32_to_cpu(c->nsid);
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+
+    if (!present && nsid == NVME_NSID_BROADCAST &&
+        nvme_ns_mgmt_supported(n)) {
+        NvmeIdNs id;
+
+        nvme_ns_common_identify(n, &id);
+        return dma_read_prp(n, (uint8_t *)&id, sizeof(id), prp1, prp2);
+    }
+    if (!nvme_nsid_valid(n, nsid) || nsid == NVME_NSID_BROADCAST) {
+        return NVME_INVALID_NSID | NVME_DNR;
+    }
+
+    ns = present ? nvme_ns_allocated(n, nsid) : nvme_ns(n, nsid);
+    if (unlikely(!ns)) {
+        return nvme_rpt_empty_id_struct(n, cmd);
+    }
+
+    /*
+     * CNS 00h belongs to the NVM Command Set and the sets built on it; Base
+     * 2.0 prohibits it for any other (Figure 273 note 11). A host reads such
+     * a namespace's size and format from CNS 08h instead.
+     */
+    if (ns->csi != NVME_CSI_NVM && ns->csi != NVME_CSI_ZONED) {
+        return NVME_INVALID_CMD_SET | NVME_DNR;
+    }
+    return dma_read_prp(n, (uint8_t *)&ns->id_ns, sizeof(NvmeIdNs), prp1, prp2);
+}
+
+static uint16_t nvme_identify_ns_csi(FemuCtrl *n, NvmeCmd *cmd,
+                                  bool present)
+{
+    NvmeNamespace *ns;
+    NvmeIdentify *c = (NvmeIdentify *)cmd;
+    uint32_t nsid = le32_to_cpu(c->nsid);
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+
+    if (!present && nsid == NVME_NSID_BROADCAST &&
+        nvme_ns_mgmt_supported(n)) {
+        if (c->csi != NVME_CSI_NVM) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        /* Supported NVM formats have no command-set-specific capabilities. */
+        return nvme_rpt_empty_id_struct(n, cmd);
+    }
+    if (!nvme_nsid_valid(n, nsid) || nsid == NVME_NSID_BROADCAST) {
+        return NVME_INVALID_NSID | NVME_DNR;
+    }
+
+    ns = present ? nvme_ns_allocated(n, nsid) : nvme_ns(n, nsid);
+    if (unlikely(!ns)) {
+        return nvme_rpt_empty_id_struct(n, cmd);
+    }
+
+    if (c->csi == NVME_CSI_NVM && nvme_csi_has_nvm_support(ns)) {
+        return nvme_rpt_empty_id_struct(n, cmd);
+    } else if (c->csi == NVME_CSI_ZONED && ns->csi == NVME_CSI_ZONED) {
+        /*
+         * An Identify data structure is 4096 bytes. This transferred the
+         * host's memory page size instead, which a guest sets through CC.MPS
+         * and can raise above that whenever the controller advertises it,
+         * reading past the end of the structure.
+         */
+        return dma_read_prp(n, (uint8_t *)ns->id_ns_zoned,
+                            NVME_IDENTIFY_DATA_SIZE, prp1, prp2);
+    } else if (c->csi == NVME_CSI_KV && ns->csi == NVME_CSI_KV) {
+        return kvssd_identify_ns_csi(n, ns, cmd);
+    }
+
+    return NVME_INVALID_FIELD | NVME_DNR;
+}
+
+/*
+ * A block erase sanitizes the whole subsystem, which here means every
+ * namespace, and only block namespaces can be erased the way Format erases
+ * them; the other modes keep geometry of their own. Offer it only then.
+ */
+bool nvme_can_sanitize(FemuCtrl *n)
+{
+    /* A sanitize would erase the medium behind its CXL cache. */
+    if (n->cxl_dev) {
+        return false;
+    }
+    for (int i = 0; i < n->namespace_limit; i++) {
+        if (!n->namespaces[i].allocated) {
+            continue;
+        }
+        if (!NS_BBSSD(&n->namespaces[i]) && !NS_NOSSD(&n->namespaces[i])) {
+            return false;
+        }
+    }
+    return n->namespace_limit > 0;
+}
+
+static uint16_t nvme_identify_ctrl(FemuCtrl *n, NvmeCmd *cmd)
+{
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+    NvmeIdCtrl id;
+
+    /* assigned when the controller joins its subsystem, after realize */
+    n->id_ctrl.cntlid = cpu_to_le16(n->cntlid);
+    for (int i = 0; i < n->namespace_limit; i++) {
+        if (n->namespaces[i].allocated && NS_ZNSSD(&n->namespaces[i])) {
+            n->id_ctrl.oaes |= cpu_to_le32(NVME_AEC_ZDCN);
+        }
+    }
+
+    /*
+     * The capabilities are derived again for the answer, which keeps it in
+     * step with logs 00h and 05h; the copy leaves the controller's own fields,
+     * which the FTL reads, untouched.
+     */
+    id = n->id_ctrl;
+    nvme_caps_id_ctrl(n, &id);
+
+    return dma_read_prp(n, (uint8_t *)&id, sizeof(id), prp1, prp2);
+}
+
+static uint16_t nvme_identify_ctrl_csi(FemuCtrl *n, NvmeCmd *cmd)
+{
+    NvmeIdentify *c = (NvmeIdentify *)cmd;
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+
+    typedef struct NvmeIdCtrlZoned {
+        uint8_t     zasl;
+        uint8_t     rsvd1[4095];
+    } NvmeIdCtrlZoned;
+
+    NvmeIdCtrlZoned id = {};
+
+    if (c->csi == NVME_CSI_NVM) {
+        return nvme_rpt_empty_id_struct(n, cmd);
+    } else if (c->csi == NVME_CSI_ZONED) {
+        if (n->zasl_bs) {
+            id.zasl = n->zasl;
+        }
+        return dma_read_prp(n, (uint8_t *)&id, sizeof(id), prp1, prp2);
+    } else if (c->csi == NVME_CSI_KV) {
+        return kvssd_identify_ctrl_csi(n, cmd);
+    }
+
+    return NVME_INVALID_FIELD | NVME_DNR;
+}
+
+static uint16_t nvme_identify_nslist(FemuCtrl *n, NvmeCmd *cmd,
+                                  bool present)
+{
+    NvmeNamespace *ns;
+    NvmeIdentify *c = (NvmeIdentify *)cmd;
+    uint32_t min_nsid = le32_to_cpu(c->nsid);
+    uint8_t list[NVME_IDENTIFY_DATA_SIZE] = {};
+    static const int data_len = sizeof(list);
+    uint32_t *list_ptr = (uint32_t *)list;
+    int i, j = 0;
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+
+    /*
+     * Both 0xffffffff (NVME_NSID_BROADCAST) and 0xfffffffe are invalid values
+     * since the Active Namespace ID List should return namespaces with ids
+     * *higher* than the NSID specified in the command. This is also specified
+     * in the spec (NVM Express v1.3d, Section 5.15.4).
+     */
+    if (min_nsid >= NVME_NSID_BROADCAST - 1) {
+        return NVME_INVALID_NSID | NVME_DNR;
+    }
+
+    for (i = 1; i <= n->namespace_limit; i++) {
+        ns = present ? nvme_ns_allocated(n, i) : nvme_ns(n, i);
+        if (!ns) {
+            continue;
+        }
+        if (ns->id <= min_nsid) {
+            continue;
+        }
+        list_ptr[j++] = cpu_to_le32(ns->id);
+        if (j == data_len / sizeof(uint32_t)) {
+            break;
+        }
+    }
+
+    return dma_read_prp(n, list, data_len, prp1, prp2);
+}
+
+static uint16_t nvme_identify_nslist_csi(FemuCtrl *n, NvmeCmd *cmd,
+                                  bool present)
+{
+    NvmeNamespace *ns;
+    NvmeIdentify *c = (NvmeIdentify *)cmd;
+    uint32_t min_nsid = le32_to_cpu(c->nsid);
+    uint8_t list[NVME_IDENTIFY_DATA_SIZE] = {};
+    static const int data_len = sizeof(list);
+    uint32_t *list_ptr = (uint32_t *)list;
+    int i, j = 0;
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+
+    if (min_nsid >= NVME_NSID_BROADCAST - 1) {
+        return NVME_INVALID_NSID | NVME_DNR;
+    }
+
+    /*
+     * A set that is not supported is refused, and for the active list
+     * (5.2.13.2.7, not 1Ah) also one that is not enabled. The one
+     * combination FEMU offers enables every set when CC.CSS selects by CSI,
+     * and only NVM under CC.CSS 000b.
+     */
+    if (c->csi != NVME_CSI_NVM && c->csi != NVME_CSI_ZONED &&
+        c->csi != NVME_CSI_KV) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    if (!present && NVME_CC_CSS(n->bar.cc) != NVME_CC_CSS_CSI &&
+        (c->csi != NVME_CSI_NVM ||
+         NVME_CC_CSS(n->bar.cc) == NVME_CC_CSS_ADMIN_ONLY)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    for (i = 1; i <= n->namespace_limit; i++) {
+        ns = present ? nvme_ns_allocated(n, i) : nvme_ns(n, i);
+        if (!ns) {
+            continue;
+        }
+        if (ns->id <= min_nsid || c->csi != ns->csi) {
+            continue;
+        }
+        list_ptr[j++] = cpu_to_le32(ns->id);
+        if (j == data_len / sizeof(uint32_t)) {
+            break;
+        }
+    }
+
+    return dma_read_prp(n, list, data_len, prp1, prp2);
+}
+
+/*
+ * A namespace with no EUI64 or NGUID needs a UUID of its own (Base 2.3,
+ * 4.7.1.4), and one that survives a restart. Derive it from the serial number
+ * and the namespace ID: RFC 9562 version 8, from a SHA-256 of the two.
+ */
+static void nvme_ns_uuid(FemuCtrl *n, NvmeNamespace *ns, uint8_t *uuid)
+{
+    g_autofree char *name = g_strdup_printf("%.20s:%u", n->id_ctrl.sn,
+                                            ns->id);
+    GChecksum *ck = g_checksum_new(G_CHECKSUM_SHA256);
+    guint8 digest[32];
+    gsize len = sizeof(digest);
+
+    /* Boot namespaces retain the original serial/NSID identity. */
+    if (ns->creation_generation) {
+        char *created = g_strdup_printf("%s:%" PRIu64, name,
+                                       ns->creation_generation);
+
+        g_free(name);
+        name = created;
+    }
+    g_checksum_update(ck, (const guchar *)name, strlen(name));
+    g_checksum_get_digest(ck, digest, &len);
+    g_checksum_free(ck);
+
+    memcpy(uuid, digest, NVME_NIDL_UUID);
+    uuid[6] = (uuid[6] & 0x0f) | 0x80;
+    uuid[8] = (uuid[8] & 0x3f) | 0x80;
+}
+
+/*
+ * The I/O Command Set Independent Identify Namespace structure (CNS 08h,
+ * Base 2.3, Figure 335), mandatory with the command sets FEMU offers. Linux
+ * asks for it first and takes readiness, sharing and the endurance group from
+ * it, so NRDY has to be set.
+ */
+static uint16_t nvme_identify_ns_cs_indep(FemuCtrl *n, NvmeCmd *cmd,
+                                          bool present)
+{
+    uint32_t nsid = le32_to_cpu(cmd->nsid);
+    uint8_t id[NVME_IDENTIFY_DATA_SIZE] = {};
+    NvmeNamespace *ns;
+
+    if (!nsid || (nsid != NVME_NSID_BROADCAST && !nvme_nsid_valid(n, nsid))) {
+        return NVME_INVALID_NSID | NVME_DNR;
+    }
+    /* CNS 1Fh, mandatory with Namespace Management from 2.1 (5.2.13.2.20) */
+    if (present && nsid == NVME_NSID_BROADCAST) {
+        return NVME_INVALID_NSID | NVME_DNR;
+    }
+
+    if (nsid == NVME_NSID_BROADCAST) {
+        ns = NULL;
+    } else {
+        ns = present ? nvme_ns_allocated(n, nsid) : nvme_ns(n, nsid);
+    }
+    if (ns) {
+        id[0] = n->vwc ? 0 : 1 << 5;        /* NSFEAT.VWCNP */
+        id[1] = ns->id_ns.nmic;
+        id[2] = ns->id_ns.rescap;
+        id[3] = ns->id_ns.fpi;
+        stw_le_p(&id[12], le16_to_cpu(ns->id_ns.endgid));
+        id[14] = 0x1;                       /* NSTAT.NRDY */
+    }
+
+    return dma_read_prp(n, id, sizeof(id), le64_to_cpu(cmd->dptr.prp1),
+                        le64_to_cpu(cmd->dptr.prp2));
+}
+
+static uint16_t nvme_identify_ns_descr_list(FemuCtrl *n, NvmeCmd *cmd)
+{
+    NvmeNamespace *ns;
+    NvmeIdentify *c = (NvmeIdentify *)cmd;
+    uint32_t nsid = le32_to_cpu(c->nsid);
+    uint8_t list[NVME_IDENTIFY_DATA_SIZE] = {};
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+
+    struct data {
+        struct {
+            NvmeIdNsDescr hdr;
+            uint8_t v[NVME_NIDL_UUID];
+        } uuid;
+        struct {
+            NvmeIdNsDescr hdr;
+            uint8_t v;
+        } csi;
+    };
+
+    struct data *ns_descrs = (struct data *)list;
+
+    if (!nvme_nsid_valid(n, nsid) || nsid == NVME_NSID_BROADCAST) {
+        return NVME_INVALID_NSID | NVME_DNR;
+    }
+
+    ns = nvme_ns(n, nsid);
+    if (unlikely(!ns)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    ns_descrs->uuid.hdr.nidt = NVME_NIDT_UUID;
+    ns_descrs->uuid.hdr.nidl = NVME_NIDL_UUID;
+    nvme_ns_uuid(nvme_ns_shared(n) ? ns->ctrl : n, ns,
+                 ns_descrs->uuid.v);
+
+    ns_descrs->csi.hdr.nidt = NVME_NIDT_CSI;
+    ns_descrs->csi.hdr.nidl = NVME_NIDL_CSI;
+    ns_descrs->csi.v = ns->csi;
+
+    return dma_read_prp(n, list, sizeof(list), prp1, prp2);
+}
+
+static uint16_t nvme_identify_cmd_set(FemuCtrl *n, NvmeCmd *cmd)
+{
+    uint8_t list[NVME_IDENTIFY_DATA_SIZE] = {};
+    static const int data_len = sizeof(list);
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+
+    NVME_SET_CSI(*list, NVME_CSI_NVM);
+    NVME_SET_CSI(*list, NVME_CSI_ZONED);
+    NVME_SET_CSI(*list, NVME_CSI_KV);
+
+    return dma_read_prp(n, list, data_len, prp1, prp2);
+}
+
+static uint16_t nvme_identify_ctrl_list(FemuCtrl *n, NvmeCmd *cmd,
+                                        bool attached)
+{
+    uint16_t list[2048] = { 0 };
+    uint16_t min = le32_to_cpu(cmd->cdw10) >> 16;
+    uint32_t nsid = le32_to_cpu(cmd->nsid);
+    NvmeNamespace *ns;
+    uint16_t count = 0;
+
+    if (!nvme_ns_mgmt_supported(n)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    if (attached) {
+        if (nsid == NVME_NSID_BROADCAST) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        ns = nvme_ns_allocated(n, nsid);
+        if (!ns) {
+            return (nvme_nsid_valid(n, nsid) ? NVME_INVALID_FIELD :
+                    NVME_INVALID_NSID) | NVME_DNR;
+        }
+        if (nvme_ns_shared(n)) {
+            for (uint32_t i = min; i < NVME_MAX_CONTROLLERS; i++) {
+                FemuCtrl *ctrl = nvme_subsys_ctrl(n->subsys, i);
+
+                if (ctrl && nvme_ns_attached(ctrl, ns)) {
+                    list[++count] = cpu_to_le16(i);
+                }
+            }
+        } else if (ns->attached && n->cntlid >= min) {
+            list[++count] = cpu_to_le16(n->cntlid);
+        }
+    } else if (n->subsys) {
+        for (uint32_t i = min; i < NVME_MAX_CONTROLLERS; i++) {
+            if (nvme_subsys_ctrl(n->subsys, i)) {
+                list[++count] = cpu_to_le16(i);
+            }
+        }
+    } else if (n->cntlid >= min) {
+        list[++count] = cpu_to_le16(n->cntlid);
+    }
+    list[0] = cpu_to_le16(count);
+    return dma_read_prp(n, (uint8_t *)list, sizeof(list),
+                        le64_to_cpu(cmd->dptr.prp1),
+                        le64_to_cpu(cmd->dptr.prp2));
+}
+
+/*
+ * Endurance Group List (CNS 19h): the groups this controller can reach whose
+ * identifier is at least the one in CDW11 bits 15:0. A controller in a
+ * subsystem has one group, 1; one without a subsystem reports no groups in
+ * CTRATT, so it does not take this CNS.
+ */
+static uint16_t nvme_identify_endgrp_list(FemuCtrl *n, NvmeCmd *cmd)
+{
+    uint16_t list[2048] = { 0 };
+    uint16_t min = le32_to_cpu(cmd->cdw11) & 0xffff;
+
+    if (!n->subsys) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    if (min <= 1) {
+        list[0] = cpu_to_le16(1);
+        list[1] = cpu_to_le16(1);
+    }
+    return dma_read_prp(n, (uint8_t *)list, sizeof(list),
+                        le64_to_cpu(cmd->dptr.prp1),
+                        le64_to_cpu(cmd->dptr.prp2));
+}
+
+static uint16_t nvme_identify(FemuCtrl *n, NvmeCmd *cmd)
+{
+    NvmeIdentify *c = (NvmeIdentify *)cmd;
+    /* CNS is bits 7:0; the controller identifier sits above it */
+    uint32_t cns  = le32_to_cpu(c->cns) & 0xff;
+
+    switch (cns) {
+    case NVME_ID_CNS_NS_CTRL_LIST:
+        return nvme_identify_ctrl_list(n, cmd, true);
+    case NVME_ID_CNS_CTRL_LIST:
+        return nvme_identify_ctrl_list(n, cmd, false);
+    case NVME_ID_CNS_NS_CS_INDEP:
+        return nvme_identify_ns_cs_indep(n, cmd, false);
+    case NVME_ID_CNS_NS_CS_INDEP_PRESENT:
+        return nvme_identify_ns_cs_indep(n, cmd, true);
+    case NVME_ID_CNS_NS:
+        return nvme_identify_ns(n, cmd, false);
+    case NVME_ID_CNS_NS_PRESENT:
+        return nvme_identify_ns(n, cmd, true);
+    case NVME_ID_CNS_CS_NS:
+        return nvme_identify_ns_csi(n, cmd, false);
+    case NVME_ID_CNS_CS_NS_PRESENT:
+        return nvme_identify_ns_csi(n, cmd, true);
+    case NVME_ID_CNS_CTRL:
+        return nvme_identify_ctrl(n, cmd);
+    case NVME_ID_CNS_CS_CTRL:
+        return nvme_identify_ctrl_csi(n, cmd);
+    case NVME_ID_CNS_CS_NS_FMT:
+        /*
+         * Key-value format-index identify: the command names a format index in
+         * CDW11 rather than a namespace, so it is answered from the first
+         * key-value namespace the controller has. Namespace zero is not one on
+         * a controller in another mode, and the key-value code would then be
+         * handed that mode's state object.
+         */
+        if (c->csi == NVME_CSI_KV) {
+            uint32_t kv_nsid = le32_to_cpu(c->nsid);
+            NvmeNamespace *kv_ns = nvme_ns(n, kv_nsid);
+
+            /*
+             * A host that names a namespace gets that namespace's structure --
+             * it carries the namespace's own size and use, so answering from
+             * another one over-commits its key space. A host that names none
+             * gets the first key-value namespace, which is how the format index
+             * this command selects is reported.
+             */
+            if (kv_ns) {
+                return NS_KVSSD(kv_ns) ?
+                       kvssd_identify_ns_csi_fmt(n, kv_ns, cmd) :
+                       NVME_INVALID_FIELD | NVME_DNR;
+            }
+            if (!kv_nsid) {
+                for (int i = 0; i < n->namespace_limit; i++) {
+                    if (n->namespaces[i].allocated &&
+                        NS_KVSSD(&n->namespaces[i])) {
+                        return kvssd_identify_ns_csi_fmt(n, &n->namespaces[i],
+                                                         cmd);
+                    }
+                }
+            }
+        }
+        return NVME_INVALID_FIELD | NVME_DNR;
+    case NVME_ID_CNS_NS_ACTIVE_LIST:
+        return nvme_identify_nslist(n, cmd, false);
+    case NVME_ID_CNS_NS_PRESENT_LIST:
+        return nvme_identify_nslist(n, cmd, true);
+    case NVME_ID_CNS_CS_NS_ACTIVE_LIST:
+        return nvme_identify_nslist_csi(n, cmd, false);
+    case NVME_ID_CNS_CS_NS_PRESENT_LIST:
+        return nvme_identify_nslist_csi(n, cmd, true);
+    case NVME_ID_CNS_NS_DESCR_LIST:
+        return nvme_identify_ns_descr_list(n, cmd);
+    case NVME_ID_CNS_IO_COMMAND_SET:
+        return nvme_identify_cmd_set(n, cmd);
+    case NVME_ID_CNS_ENDGRP_LIST:
+        return nvme_identify_endgrp_list(n, cmd);
+    default:
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+}
+
+/* true when some namespace answers the key-value command set */
+/*
+ * The value a feature has before the host changes it: what realize set, so
+ * Select = Default agrees with the first Get after a reset.
+ */
+/*
+ * Flexible Data Placement (1Dh) names an endurance group, and a subsystem has
+ * exactly one, identifier 1. Dword 0 holds FDPE and the configuration index,
+ * which is always 0 (Base 2.3, 5.2.26.1.20).
+ */
+static uint16_t nvme_get_feature_fdp(FemuCtrl *n, uint32_t dw11, bool dflt,
+                                     uint32_t *result)
+{
+    if (!n->subsys || (dw11 & 0xffff) != 1) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    *result = !dflt && n->subsys->endgrp.fdp.enabled ? 1 : 0;
+    return NVME_SUCCESS;
+}
+
+/*
+ * Flexible Data Placement Events (1Eh): the reclaim unit handle behind a
+ * namespace's placement handle (Base 2.3, 5.2.26.1.21).
+ */
+static uint16_t nvme_fdp_events_ruh(FemuCtrl *n, uint32_t nsid, uint32_t dw11,
+                                    NvmeRuHandle **ruh)
+{
+    NvmeNamespace *ns = nvme_ns(n, nsid);
+    uint16_t ph = dw11 & 0xffff;
+
+    if (!n->subsys || !n->subsys->endgrp.fdp.enabled) {
+        return NVME_FDP_DISABLED | NVME_DNR;
+    }
+    if (!ns || !ns->fdp.phs || ph >= ns->fdp.nphs) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    *ruh = &n->subsys->endgrp.fdp.ruhs[ns->fdp.phs[ph]];
+    return NVME_SUCCESS;
+}
+
+/*
+ * Every supported event type in ascending order, each with whether it is
+ * enabled on the handle; dword 0 holds how many there are.
+ */
+static uint16_t nvme_get_feature_fdp_events(FemuCtrl *n, NvmeCmd *cmd,
+                                            uint32_t dw11, NvmeCqe *cqe)
+{
+    NvmeFdpEventDescr edescr[ARRAY_SIZE(nvme_fdp_events_supported)];
+    NvmeRuHandle *ruh;
+    uint16_t status;
+    int i;
+
+    status = nvme_fdp_events_ruh(n, le32_to_cpu(cmd->nsid), dw11, &ruh);
+    if (status) {
+        return status;
+    }
+
+    for (i = 0; i < (int)ARRAY_SIZE(nvme_fdp_events_supported); i++) {
+        uint8_t ev = nvme_fdp_events_supported[i];
+
+        edescr[i].evt = ev;
+        edescr[i].evta = nvme_fdp_event_enabled(&n->subsys->endgrp, ruh, ev);
+    }
+
+    cqe->n.result = cpu_to_le32(ARRAY_SIZE(edescr));
+    return dma_read_prp(n, (uint8_t *)edescr, sizeof(edescr),
+                        le64_to_cpu(cmd->dptr.prp1),
+                        le64_to_cpu(cmd->dptr.prp2));
+}
+
+static uint16_t nvme_get_feature_default(FemuCtrl *n, NvmeCmd *cmd,
+                                         uint8_t fid, uint32_t dw11,
+                                         NvmeCqe *cqe)
+{
+    /* Host Behavior Support defaults to every behavior off */
+    if (fid == NVME_HOST_BEHAVIOR_SUPPORT) {
+        uint8_t hbs[512] = { 0 };
+
+        return dma_read_prp(n, hbs, sizeof(hbs), le64_to_cpu(cmd->dptr.prp1),
+                            le64_to_cpu(cmd->dptr.prp2));
+    }
+    /* the Timestamp a Controller Level Reset leaves: zero, origin 000b */
+    if (fid == NVME_TIMESTAMP) {
+        uint8_t ts[8] = { 0 };
+
+        return dma_read_prp(n, ts, sizeof(ts), le64_to_cpu(cmd->dptr.prp1),
+                            le64_to_cpu(cmd->dptr.prp2));
+    }
+
+    uint32_t result = 0;
+
+    switch (fid) {
+    case NVME_LBA_RANGE_TYPE: {
+        /*
+         * This feature answers with a descriptor list rather than a value, so
+         * it has to transfer one here too. Reporting success without writing
+         * the buffer would leave the host parsing whatever it had there, and
+         * the count in dword 0 is 0's based, so zero still claims one entry.
+         * The default state is a single unused range.
+         */
+        NvmeRangeType rt;
+
+        memset(&rt, 0, sizeof(rt));
+        cqe->n.result = 0;
+        return dma_read_prp(n, (uint8_t *)&rt, sizeof(rt),
+                            le64_to_cpu(cmd->dptr.prp1),
+                            le64_to_cpu(cmd->dptr.prp2));
+    }
+    case NVME_ARBITRATION:
+        result = 0x1f0f0706;
+        break;
+    case NVME_TEMPERATURE_THRESHOLD:
+        /*
+         * Only the composite sensor is implemented, so every other one reads
+         * zero, and the under-temperature threshold starts there too. The
+         * over threshold starts at the warning temperature Identify reports.
+         * THSEL 2 and 3 are reserved, and "all sensors" is for Set only.
+         */
+        if (NVME_TEMP_THSEL(dw11) > 1 || NVME_TEMP_TMPSEL(dw11) == 0xf) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        if (NVME_TEMP_TMPSEL(dw11) != 0 || NVME_TEMP_THSEL(dw11)) {
+            result = 0;
+            break;
+        }
+        result = NVME_TEMPERATURE_WARNING;
+        break;
+    case NVME_VOLATILE_WRITE_CACHE:
+        /* only a controller that reports a write cache has the feature */
+        if (!n->vwc) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        result = n->vwc;
+        break;
+    case NVME_NUMBER_OF_QUEUES:
+        result = (n->nr_io_queues - 1) | ((n->nr_io_queues - 1) << 16);
+        break;
+    case NVME_INTERRUPT_COALESCING:
+        result = n->intc_thresh | (n->intc_time << 8);
+        break;
+    case NVME_INTERRUPT_VECTOR_CONF:
+        if ((dw11 & 0xffff) > n->nr_io_queues) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        result = (dw11 & 0xffff) | (n->intc << 16);
+        break;
+    case NVME_FDP_MODE: {
+        uint16_t status = nvme_get_feature_fdp(n, dw11, true, &result);
+
+        if (status) {
+            return status;
+        }
+        break;
+    }
+    case NVME_COMMAND_SET_PROFILE:
+        /* one combination, index zero, holding every command set at once */
+        result = 0;
+        break;
+    default:
+        /* every other feature starts at zero, including an empty event list */
+        break;
+    }
+
+    cqe->n.result = cpu_to_le32(result);
+    return NVME_SUCCESS;
+}
+
+static uint16_t nvme_get_feature(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
+{
+    NvmeRangeType *rt;
+    uint32_t dw10 = le32_to_cpu(cmd->cdw10);
+    uint32_t dw11 = le32_to_cpu(cmd->cdw11);
+    uint32_t nsid = le32_to_cpu(cmd->nsid);
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+    uint8_t fid = NVME_GETSETFEAT_FID(dw10);
+    uint8_t sel = NVME_GETFEAT_SELECT(dw10);
+
+    if (!nvme_fid_supported(n, fid)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    if (nvme_feature_cap[fid] & NVME_FEAT_CAP_NS) {
+        /* the events feature says what an all-namespaces NSID returns */
+        if (fid == NVME_FDP_EVENTS && nsid == NVME_NSID_BROADCAST) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        if (!nvme_nsid_valid(n, nsid) || nsid == NVME_NSID_BROADCAST) {
+            return NVME_INVALID_NSID | NVME_DNR;
+        }
+        if (!nvme_ns(n, nsid)) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+    }
+
+    switch (sel) {
+    case NVME_GETFEAT_SELECT_CURRENT:
+        break;
+    case NVME_GETFEAT_SELECT_SAVED:
+        /* placement is configured at realize, which is what persists */
+        if (fid == NVME_FDP_MODE || fid == NVME_FDP_EVENTS) {
+            break;
+        }
+        /* nothing else is saved, so the saved value is the default */
+        /* fall through */
+    case NVME_GETFEAT_SELECT_DEFAULT:
+        return nvme_get_feature_default(n, cmd, fid, dw11, cqe);
+    case NVME_GETFEAT_SELECT_CAP:
+        cqe->n.result = cpu_to_le32(nvme_feature_cap[fid]);
+        return NVME_SUCCESS;
+    default:
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    switch (fid) {
+    case NVME_KV_FEAT_CONFIG: {
+        /* the mode that owns the namespace answers this one */
+        NvmeNamespace *kv_ns = nvme_ns(n, nsid);
+
+        if (!kv_ns || kv_ns->csi != NVME_CSI_KV) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        return kvssd_get_feature(n, kv_ns, cmd, cqe);
+    }
+    case NVME_ARBITRATION:
+        cqe->n.result = cpu_to_le32(n->features.arbitration);
+        break;
+    case NVME_POWER_MANAGEMENT:
+        cqe->n.result = cpu_to_le32(n->features.power_mgmt);
+        break;
+    case NVME_LBA_RANGE_TYPE: {
+        /*
+         * The number of ranges is a 0's based count, so a host asking for one
+         * range put zero in the field and this transferred nothing at all.
+         * The cap was one range's worth rather than the whole table, so a
+         * host asking for more than one got only the first either way.
+         */
+        NvmeNamespace *rt_ns = &n->namespaces[nsid - 1];
+        uint32_t nr = (dw11 & 0x3f) + 1;
+
+        rt = rt_ns->lba_range;
+        return dma_read_prp(n, (uint8_t *)rt,
+                MIN(sizeof(rt_ns->lba_range), nr * sizeof(*rt)),
+                prp1, prp2);
+    }
+    case NVME_NUMBER_OF_QUEUES:
+        cqe->n.result = cpu_to_le32((n->nr_io_queues - 1) |
+                ((n->nr_io_queues - 1) << 16));
+        break;
+    case NVME_TEMPERATURE_THRESHOLD:
+        /* one composite sensor; THSEL picks the over or under threshold */
+        if (NVME_TEMP_TMPSEL(dw11) != 0 || NVME_TEMP_THSEL(dw11) > 1) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        cqe->n.result = cpu_to_le32(NVME_TEMP_THSEL(dw11) ?
+                                    n->features.temp_thresh_under :
+                                    n->features.temp_thresh);
+        break;
+    case NVME_ERROR_RECOVERY:
+        cqe->n.result = cpu_to_le32(nvme_ns(n, nsid)->err_rec);
+        break;
+    case NVME_VOLATILE_WRITE_CACHE:
+        if (!n->vwc) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        cqe->n.result = cpu_to_le32(n->features.volatile_wc);
+        break;
+    case NVME_INTERRUPT_COALESCING:
+        cqe->n.result = cpu_to_le32(n->features.int_coalescing);
+        break;
+    case NVME_INTERRUPT_VECTOR_CONF:
+        if ((dw11 & 0xffff) > n->nr_io_queues) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        cqe->n.result = cpu_to_le32(n->features.int_vector_config[dw11 & 0xffff]);
+        break;
+    case NVME_WRITE_ATOMICITY:
+        cqe->n.result = cpu_to_le32(n->features.write_atomicity);
+        break;
+    case NVME_ASYNCHRONOUS_EVENT_CONF:
+        cqe->n.result = cpu_to_le32(n->features.async_config);
+        break;
+    case NVME_SOFTWARE_PROGRESS_MARKER:
+        cqe->n.result = cpu_to_le32(n->features.sw_prog_marker);
+        break;
+    case NVME_COMMAND_SET_PROFILE:
+        /* the only combination there is, and the only one selectable */
+        cqe->n.result = 0;
+        break;
+    case NVME_FDP_MODE: {
+        uint32_t result;
+        uint16_t status = nvme_get_feature_fdp(n, dw11, false, &result);
+
+        if (status) {
+            return status;
+        }
+        cqe->n.result = cpu_to_le32(result);
+        break;
+    }
+    case NVME_FDP_EVENTS:
+        return nvme_get_feature_fdp_events(n, cmd, dw11, cqe);
+    case NVME_HOST_BEHAVIOR_SUPPORT:
+        return dma_read_prp(n, n->features.host_behavior,
+                            sizeof(n->features.host_behavior), prp1, prp2);
+    case NVME_TIMESTAMP: {
+        uint8_t ts[8];
+
+        stq_le_p(ts, nvme_timestamp(n));
+        return dma_read_prp(n, ts, sizeof(ts), prp1, prp2);
+    }
+    default:
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    return NVME_SUCCESS;
+}
+
+/* the Critical Warning byte the SMART page would report now */
+static uint8_t nvme_critical_warning(FemuCtrl *n)
+{
+    NvmeSmartLog smart;
+
+    nvme_smart_fill(n, &smart);
+    return smart.critical_warning;
+}
+
+static uint16_t nvme_set_feature(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
+{
+    NvmeRangeType *rt;
+    uint32_t dw10 = le32_to_cpu(cmd->cdw10);
+    uint32_t dw11 = le32_to_cpu(cmd->cdw11);
+    uint32_t nsid = le32_to_cpu(cmd->nsid);
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+    uint8_t fid = NVME_GETSETFEAT_FID(dw10);
+    uint8_t save = NVME_SETFEAT_SAVE(dw10);
+
+    if (save && !(nvme_feature_cap[fid] & NVME_FEAT_CAP_SAVE)) {
+        return NVME_FID_NOT_SAVEABLE | NVME_DNR;
+    }
+
+    if (!nvme_fid_supported(n, fid)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    if (nvme_feature_cap[fid] & NVME_FEAT_CAP_NS) {
+        if (nsid != NVME_NSID_BROADCAST) {
+            if (!nvme_nsid_valid(n, nsid)) {
+                return NVME_INVALID_NSID | NVME_DNR;
+            }
+            if (!nvme_ns(n, nsid)) {
+                return NVME_INVALID_FIELD | NVME_DNR;
+            }
+        }
+    } else if (nsid && nsid != NVME_NSID_BROADCAST) {
+        if (!nvme_nsid_valid(n, nsid)) {
+            return NVME_INVALID_NSID | NVME_DNR;
+        }
+        return NVME_FID_NOT_NSID_SPEC | NVME_DNR;
+    }
+
+    if (!(nvme_feature_cap[fid] & NVME_FEAT_CAP_CHANGE)) {
+        return NVME_FEAT_NOT_CHANGEABLE | NVME_DNR;
+    }
+
+    switch (fid) {
+    case NVME_KV_FEAT_CONFIG: {
+        /* the mode that owns the namespace handles this one */
+        NvmeNamespace *kv_ns = nvme_ns(n, nsid);
+        uint16_t status;
+
+        if (!kv_ns || kv_ns->csi != NVME_CSI_KV) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        status = kvssd_set_feature(n, kv_ns, cmd, cqe);
+        if (status) {
+            return status;
+        }
+        break;
+    }
+    case NVME_ARBITRATION:
+        n->features.arbitration = dw11;
+        break;
+    case NVME_POWER_MANAGEMENT:
+        /* a power state the controller does not describe (Figure 405) */
+        if ((dw11 & 0x1f) > n->id_ctrl.npss) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        n->features.power_mgmt = dw11 & 0xff;
+        break;
+    case NVME_LBA_RANGE_TYPE:
+        if (nsid == NVME_NSID_BROADCAST) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        {
+            /* the same 0's based count, see the matching get above */
+            NvmeNamespace *rt_ns = &n->namespaces[nsid - 1];
+            uint32_t nr = (dw11 & 0x3f) + 1;
+
+            uint16_t len = MIN(sizeof(rt_ns->lba_range), nr * sizeof(*rt));
+            uint16_t status;
+
+            rt = rt_ns->lba_range;
+            status = dma_write_prp(n, (uint8_t *)rt, len, prp1, prp2);
+            if (!status) {
+                femu_pel_set_feature(n, cmd, rt, len);
+            }
+            return status;
+        }
+    case NVME_NUMBER_OF_QUEUES: {
+        int q;
+
+        /* 65535 would ask for 65536 queues, which no identifier can name */
+        if ((dw11 & 0xffff) == 0xffff || (dw11 >> 16) == 0xffff) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        /* only before any I/O queue exists (Base 2.3, 5.2.26.2.1) */
+        for (q = 1; q <= n->nr_io_queues; q++) {
+            if (n->sq[q] || n->cq[q]) {
+                return NVME_CMD_SEQ_ERROR | NVME_DNR;
+            }
+        }
+        /* nr_io_queues is 0-based in the result */
+        cqe->n.result = cpu_to_le32((n->nr_io_queues - 1) |
+                ((n->nr_io_queues - 1) << 16));
+        break;
+    }
+    case NVME_TEMPERATURE_THRESHOLD:
+        /*
+         * dw11 carries the threshold in its low half and, above it, which
+         * sensor (TMPSEL) and which side (THSEL, 2 and 3 reserved) it applies
+         * to. There is one composite sensor; "all sensors" sets it too.
+         */
+        if ((NVME_TEMP_TMPSEL(dw11) != 0 && NVME_TEMP_TMPSEL(dw11) != 0xf) ||
+            NVME_TEMP_THSEL(dw11) > 1) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        if (NVME_TEMP_THSEL(dw11)) {
+            n->features.temp_thresh_under = dw11 & 0xffff;
+        } else {
+            n->features.temp_thresh = dw11 & 0xffff;
+        }
+        if (n->thermal_timer) {
+            femu_temp_eval(n);
+            break;
+        }
+        femu_pel_warning(n, nvme_critical_warning(n));
+        /*
+         * Crossing a threshold raises a SMART event once, pointing the host
+         * at the health log, if the host enabled it. It is armed again when
+         * the thresholds move back past the temperature and the previous
+         * event has been read.
+         */
+        if (femu_temp_condition(n) && !n->temp_warn_issued) {
+            if (NVME_AEC_SMART(n->features.async_config) &
+                NVME_SMART_TEMPERATURE) {
+                n->temp_warn_issued = 1;
+                nvme_enqueue_event(n, NVME_AER_TYPE_SMART,
+                                   NVME_AER_INFO_SMART_TEMP_THRESH,
+                                   NVME_LOG_SMART_INFO);
+            }
+        } else if (!femu_temp_condition(n) &&
+                !(n->aer_mask & 1 << NVME_AER_TYPE_SMART)) {
+            n->temp_warn_issued = 0;
+        }
+        break;
+    case NVME_ERROR_RECOVERY: {
+        /*
+         * The read path tests this on the pollers to decide whether an
+         * unwritten block is an error, so change it with the dataplane
+         * stopped, as the write cache setting alongside does.
+         */
+        bool resume = nvme_pause_pollers(n);
+
+        if (nsid == NVME_NSID_BROADCAST) {
+            for (uint32_t i = 0; i < n->namespace_limit; i++) {
+                if (n->namespaces[i].allocated &&
+                    (!nvme_ns_shared(n) ||
+                     nvme_ns_attached(n, &n->namespaces[i]))) {
+                    n->namespaces[i].err_rec = dw11;
+                }
+            }
+        } else {
+            nvme_ns(n, nsid)->err_rec = dw11;
+        }
+        nvme_resume_pollers(n, resume);
+        break;
+    }
+    case NVME_VOLATILE_WRITE_CACHE: {
+        bool resume;
+
+        if (!n->vwc) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        /*
+         * ssd_buffer_enabled() reads this on the FTL thread to decide
+         * whether the write buffer may still accept pages, so change it with
+         * the dataplane stopped rather than under a request in flight.
+         */
+        resume = nvme_pause_pollers(n);
+        /*
+         * A disabled cache may not hold pages. Under FDP a write-back can
+         * find no room, so drain here and keep the cache on if it fails.
+         */
+        if ((n->power_loss || (n->subsys && n->subsys->endgrp.fdp.enabled &&
+                               n->bb_params.buffer_size > 0)) &&
+            !(dw11 & 1)) {
+            uint16_t status = bbssd_flush_all(n);
+
+            if (status) {
+                nvme_resume_pollers(n, resume);
+                return status;
+            }
+        }
+        n->features.volatile_wc = dw11 & 0x1;
+        nvme_resume_pollers(n, resume);
+        break;
+    }
+    case NVME_INTERRUPT_COALESCING: {
+        /* pollers read the setting per entry; send what the old one held */
+        bool resume = nvme_pause_pollers(n);
+
+        nvme_ic_flush(n);
+        n->features.int_coalescing = dw11;
+        nvme_resume_pollers(n, resume);
+        break;
+    }
+    case NVME_INTERRUPT_VECTOR_CONF: {
+        bool resume;
+
+        if ((dw11 & 0xffff) > n->nr_io_queues) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        resume = nvme_pause_pollers(n);
+        nvme_ic_flush(n);
+        n->features.int_vector_config[dw11 & 0xffff] = dw11 & 0x1ffff;
+        nvme_resume_pollers(n, resume);
+        break;
+    }
+    case NVME_WRITE_ATOMICITY:
+        n->features.write_atomicity = dw11;
+        break;
+    case NVME_ASYNCHRONOUS_EVENT_CONF:
+        n->features.async_config = dw11;
+        /* enabling temperature events during an excursion reports it */
+        if (n->thermal_timer) {
+            femu_temp_eval(n);
+        }
+        break;
+    case NVME_SOFTWARE_PROGRESS_MARKER:
+        n->features.sw_prog_marker = dw11;
+        break;
+    case NVME_FDP_MODE:
+        if (!n->subsys || (dw11 & 0xffff) != 1) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        /*
+         * The mode may only change while the endurance group holds no
+         * namespaces, and FEMU builds them at realize, so it never can.
+         */
+        return NVME_CMD_SEQ_ERROR | NVME_DNR;
+    case NVME_HOST_BEHAVIOR_SUPPORT: {
+        /*
+         * A 512-byte structure (Base 2.3, Figure 426). The first four bytes
+         * are each 0 or 1; Copy Descriptor Formats Enable ignores its bits
+         * 1:0, which name formats that need no enabling.
+         */
+        uint8_t hbs[512];
+        uint16_t status;
+        int i;
+
+        status = dma_write_prp(n, hbs, sizeof(hbs), prp1, prp2);
+        if (status) {
+            return status;
+        }
+        for (i = 0; i < 4; i++) {
+            if (hbs[i] > 1) {
+                return NVME_INVALID_FIELD | NVME_DNR;
+            }
+        }
+        memcpy(n->features.host_behavior, hbs, sizeof(hbs));
+        n->features.host_behavior[4] &= ~0x3;
+        /* Preserve the command buffer, including ignored input bits. */
+        femu_pel_set_feature(n, cmd, hbs, sizeof(hbs));
+        return NVME_SUCCESS;
+    }
+    case NVME_TIMESTAMP: {
+        /* Figure 414: 48 bits of milliseconds; bytes 7:6 are reserved */
+        uint8_t ts[8];
+        uint16_t status;
+
+        uint8_t ev[16];
+
+        status = dma_write_prp(n, ts, sizeof(ts), prp1, prp2);
+        if (status) {
+            return status;
+        }
+        /* Figure 236: the value it had, and the time since the last reset */
+        stq_le_p(ev, nvme_timestamp(n) & ((1ULL << 48) - 1));
+        stq_le_p(ev + 8, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - n->clr_ms);
+        nvme_timestamp_set(n, ldq_le_p(ts), 1);
+        femu_pel_log(n, NVME_PEL_TIMESTAMP_CHANGE, 1, ev, sizeof(ev));
+        break;
+    }
+    case NVME_FDP_EVENTS: {
+        /*
+         * NOET in dword 11 counts the one-byte event types in the buffer, and
+         * dword 12 bit 0 enables or disables them (Figures 437-439).
+         */
+        uint8_t noet = (dw11 >> 16) & 0xff;
+        bool enable = le32_to_cpu(cmd->cdw12) & 0x1;
+        uint8_t events[256];
+        uint64_t mask = 0;
+        NvmeRuHandle *ruh;
+        uint16_t status;
+        int i;
+
+        status = nvme_fdp_events_ruh(n, le32_to_cpu(cmd->nsid), dw11, &ruh);
+        if (status) {
+            return status;
+        }
+        if (noet) {
+            status = dma_write_prp(n, events, noet, prp1, prp2);
+            if (status) {
+                return status;
+            }
+        }
+        for (i = 0; i < noet; i++) {
+            if (!nvme_fdp_event_supported(events[i])) {
+                return NVME_INVALID_FIELD | NVME_DNR;
+            }
+            mask |= 1ULL << nvme_fdp_evf_shifts[events[i]];
+        }
+        nvme_fdp_event_filter_set(&n->subsys->endgrp, ruh, mask, enable);
+        femu_pel_set_feature(n, cmd, events, noet);
+        return NVME_SUCCESS;
+    }
+    case NVME_COMMAND_SET_PROFILE:
+        /*
+         * The controller offers a single combination, so the host may select
+         * index zero and nothing else. Refusing index zero as well left a host
+         * that asks for what it already has with an error.
+         */
+        if (dw11 & 0x1ff) {
+            return NVME_IOCS_COMBINATION_REJECTED | NVME_DNR;
+        }
+        break;
+    default:
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    femu_pel_set_feature(n, cmd, NULL, 0);
+    return NVME_SUCCESS;
+}
+
+static uint16_t nvme_fw_log_info(FemuCtrl *n, NvmeCmd *cmd, uint32_t buf_len,
+                                 uint64_t off)
+{
+    uint32_t trans_len;
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+    NvmeFwSlotInfoLog fw_log = {0};
+
+    if (off >= sizeof(fw_log)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    /* one firmware slot, active, carrying the revision Identify reports */
+    fw_log.afi = 0x1;
+    memcpy(fw_log.frs1, n->id_ctrl.fr, MIN(sizeof(fw_log.frs1),
+                                          sizeof(n->id_ctrl.fr)));
+    trans_len = MIN(sizeof(fw_log) - off, buf_len);
+
+    return dma_read_prp(n, (uint8_t *)&fw_log + off, trans_len, prp1, prp2);
+}
+
+static uint16_t nvme_error_log_info(FemuCtrl *n, NvmeCmd *cmd, uint32_t buf_len,
+                                    uint64_t off, bool rae)
+{
+    uint32_t trans_len;
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+    uint64_t log_len = sizeof(*n->elpes) * (n->elpe + 1);
+    g_autofree NvmeErrorLog *log = g_new0(NvmeErrorLog, n->elpe + 1);
+    uint16_t status;
+    int i;
+
+    /*
+     * The offset in Get Log Page is how a host reads a page in pieces, and this
+     * one ignored it: every chunk came back as the first. The other pages apply
+     * it; these two were missed.
+     */
+    if (off >= log_len) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    /* the most recent error first (Base 2.3, 5.2.12.1.2) */
+    qemu_spin_lock(&n->elp_lock);
+    for (i = 0; i <= n->elpe; i++) {
+        log[i] = n->elpes[(n->elp_index + n->elpe - i) % (n->elpe + 1)];
+    }
+    qemu_spin_unlock(&n->elp_lock);
+
+    trans_len = MIN(log_len - off, buf_len);
+    status = dma_read_prp(n, (uint8_t *)log + off, trans_len, prp1, prp2);
+    /* as for SMART, Retain Asynchronous Event keeps the event reported */
+    if (!status && !rae) {
+        nvme_clear_events(n, NVME_AER_TYPE_ERROR);
+    }
+
+    return status;
+}
+
+/* fields of a FID Supported and Effects entry (Base 2.3, Figure 267) */
+#define NVME_FID_FSUPP          (1u << 0)
+#define NVME_FID_SCOPE_NS       (1u << 20)
+#define NVME_FID_SCOPE_CTRL     (1u << 21)
+#define NVME_FID_SCOPE_ENDGRP   (1u << 23)
+
+/*
+ * Whether @fid belongs to command set @csi. Features an I/O command set defines
+ * are listed for that set only (Base 2.3, 5.2.12.1.18); the zoned set builds
+ * on the NVM one and has its features.
+ */
+static bool nvme_fid_in_iocs(uint8_t fid, uint8_t csi)
+{
+    switch (fid) {
+    case NVME_LBA_RANGE_TYPE:
+    case NVME_ERROR_RECOVERY:
+    case NVME_WRITE_ATOMICITY:
+        return csi == NVME_CSI_NVM || csi == NVME_CSI_ZONED;
+    case NVME_KV_FEAT_CONFIG:
+        return csi == NVME_CSI_KV;
+    default:
+        return true;
+    }
+}
+
+/*
+ * Feature Identifiers Supported and Effects (12h): one entry per FID, built
+ * from nvme_fid_supported() so it matches what Get and Set Features answer. No
+ * feature here changes user data, namespaces or controller capabilities, so
+ * an entry carries FSUPP and the scope Figure 403 gives the feature, where
+ * Figure 267 has a bit for it.
+ */
+static uint16_t nvme_fid_effects(FemuCtrl *n, NvmeCmd *cmd, uint8_t csi,
+                                 uint32_t buf_len, uint64_t off)
+{
+    uint32_t fis[256] = {};
+    uint32_t trans_len;
+    int fid;
+
+    QEMU_BUILD_BUG_ON(sizeof(fis) != 1024);
+
+    if (off >= sizeof(fis)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    /* the command set comes from CDW14 only when CC.CSS selects by CSI */
+    if (NVME_CC_CSS(n->bar.cc) != NVME_CC_CSS_CSI) {
+        csi = NVME_CSI_NVM;
+    }
+
+    for (fid = 0; fid < 256; fid++) {
+        uint32_t scope;
+
+        if (!nvme_fid_supported(n, fid) || !nvme_fid_in_iocs(fid, csi)) {
+            continue;
+        }
+        if (fid == NVME_FDP_MODE) {
+            scope = NVME_FID_SCOPE_ENDGRP;
+        } else if (fid == NVME_FDP_EVENTS) {
+            scope = 0;  /* a reclaim unit handle, which has no FSP bit */
+        } else if (nvme_feature_cap[fid] & NVME_FEAT_CAP_NS) {
+            scope = NVME_FID_SCOPE_NS;
+        } else {
+            scope = NVME_FID_SCOPE_CTRL;
+        }
+        fis[fid] = cpu_to_le32(NVME_FID_FSUPP | scope);
+    }
+
+    trans_len = MIN(sizeof(fis) - off, buf_len);
+
+    return dma_read_prp(n, (uint8_t *)fis + off, trans_len,
+                        le64_to_cpu(cmd->dptr.prp1),
+                        le64_to_cpu(cmd->dptr.prp2));
+}
+
+/*
+ * NVMe-MI Commands Supported and Effects (13h). There is no NVMe-MI Send or
+ * Receive, so no Management Interface command is supported and the whole
+ * 4 KiB page is zero.
+ */
+static uint16_t nvme_mi_effects(FemuCtrl *n, NvmeCmd *cmd, uint32_t buf_len,
+                                uint64_t off)
+{
+    uint8_t page[4096] = {};
+    uint32_t trans_len;
+
+    if (off >= sizeof(page)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    trans_len = MIN(sizeof(page) - off, buf_len);
+
+    return dma_read_prp(n, page + off, trans_len,
+                        le64_to_cpu(cmd->dptr.prp1),
+                        le64_to_cpu(cmd->dptr.prp2));
+}
+
+/*
+ * Supported Log Pages (00h): one 32 bit LID Supported and Effects structure
+ * per log page identifier, with bit 0 set for each identifier this controller
+ * answers. NVMe Base 2.3 lists the page as mandatory, and it is how a host
+ * finds the vendor page without being told about it out of band. Which pages
+ * are listed is nvme_log_support()'s to say.
+ */
+static uint16_t nvme_supported_log_pages(FemuCtrl *n, NvmeCmd *cmd,
+                                         uint32_t buf_len, uint64_t off)
+{
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+    uint32_t lids[256] = {};
+    uint32_t trans_len;
+    uint8_t csi = nvme_log_csi(n, le32_to_cpu(cmd->cdw14) >> 24);
+    int i;
+
+    QEMU_BUILD_BUG_ON(sizeof(lids) != 1024);
+
+    if (off >= sizeof(lids)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    for (i = 0; i < 256; i++) {
+        lids[i] = cpu_to_le32(nvme_log_support(n, csi, i));
+    }
+
+    trans_len = MIN(sizeof(lids) - off, buf_len);
+
+    return dma_read_prp(n, (uint8_t *)lids + off, trans_len, prp1, prp2);
+}
+
+/*
+ * Host and media totals, as the SMART log, the vendor counter page and the
+ * endurance group log all report them. Host figures come from the per-poller
+ * shards the I/O path keeps; media figures from the namespaces that have an
+ * FTL, since this is device-wide.
+ */
+typedef struct FemuMediaStats {
+    uint64_t rd_bytes, wr_bytes, rd_cmds, wr_cmds;
+    uint64_t host_pages, gc_pages, nand_pages;
+    uint64_t max_block_reads, read_reclaims, retention_refreshes;
+    uint64_t buf_reads, buf_read_hits, buf_writes, buf_write_hits;
+    uint64_t hybrid_switches;
+    uint64_t hybrid_full;
+    uint64_t hybrid_erases;
+    uint64_t overworn_blocks;
+    uint64_t grown_bad_blocks;
+    uint64_t retired_lines;
+    uint64_t wl_relocations;
+    uint64_t wl_pages;
+    uint64_t gc_copyback_pages;
+    uint64_t pd[3];             /* open reclaims, pad pages, pad closes */
+    uint64_t pace[3];           /* copies, lines, takeovers */
+    uint64_t partial_page_writes;
+    uint64_t plane_ops[3];      /* read, program, erase */
+    uint64_t stall_writes, stall_passes, stall_destages, cq_full;
+    uint64_t media_errors;      /* summed over every namespace */
+    uint64_t media_bytes;       /* host and relocated writes, in bytes */
+    uint8_t  available_spare;   /* worst namespace */
+    uint8_t  percentage_used;   /* most worn namespace */
+} FemuMediaStats;
+
+static void nvme_collect_media_stats(FemuCtrl *n, FemuMediaStats *st)
+{
+    uint32_t p;
+    int i;
+
+    memset(st, 0, sizeof(*st));
+    st->available_spare = 100;
+
+    for (p = 1; n->poller_ctr && p <= n->nr_pollers; p++) {
+        st->rd_cmds  += n->poller_ctr[p].nr_host_rd_cmds;
+        st->wr_cmds  += n->poller_ctr[p].nr_host_wr_cmds;
+        st->rd_bytes += n->poller_ctr[p].nr_host_rd_bytes;
+        st->wr_bytes += n->poller_ctr[p].nr_host_wr_bytes;
+        st->cq_full += n->poller_ctr[p].nr_cq_full;
+    }
+
+    for (i = 0; n->namespaces && i < n->namespace_limit; i++) {
+        NvmeNamespace *ns = &n->namespaces[i];
+        uint64_t reads;
+        uint8_t spare, used;
+
+        if (!ns->allocated) {
+            continue;
+        }
+        st->media_errors += zns_media_errors(ns);
+        used = zns_percentage_used(ns);
+        if (used > st->percentage_used) {
+            st->percentage_used = used;
+        }
+
+        if (!ns->ssd) {
+            continue;
+        }
+        st->media_errors += ssd_media_errors(ns->ssd);
+        spare = ssd_available_spare(ns->ssd);
+        if (spare < st->available_spare) {
+            st->available_spare = spare;
+        }
+        used = ssd_percentage_used(ns->ssd);
+        if (used > st->percentage_used) {
+            st->percentage_used = used;
+        }
+
+        if (!(NS_BBSSD(ns) || NS_CSD(ns) || NS_KVSSD(ns))) {
+            continue;
+        }
+        st->host_pages += ssd_host_write_pages(ns->ssd);
+        st->gc_pages   += ssd_gc_write_pages(ns->ssd);
+        st->nand_pages += ssd_nand_write_pages(ns->ssd);
+        ssd_hybrid_stats(ns->ssd, &st->hybrid_switches, &st->hybrid_full,
+                         &st->hybrid_erases);
+        {
+            uint64_t r, pads, cl;
+
+            ssd_pd_stats(ns->ssd, &r, &pads, &cl);
+            st->pd[0] += r;
+            st->pd[1] += pads;
+            st->pd[2] += cl;
+            /* pad pages are media writes too */
+            st->media_bytes += (ssd_nand_write_pages(ns->ssd) +
+                                ssd_gc_write_pages(ns->ssd) + pads) *
+                               (uint64_t)ssd_page_size(ns->ssd);
+        }
+        /*
+         * One walk of the media, not two: this is a scan of every block on
+         * the device, and every log page that carries the counters pays it.
+         */
+        reads = ssd_max_block_reads(ns->ssd);
+        if (reads > st->max_block_reads) {
+            st->max_block_reads = reads;
+        }
+        st->read_reclaims += ssd_read_reclaims(ns->ssd);
+        st->overworn_blocks += ssd_overworn_blocks(ns->ssd);
+        st->grown_bad_blocks += ssd_grown_bad_blocks(ns->ssd);
+        st->retired_lines += ssd_retired_lines(ns->ssd);
+        st->wl_relocations += ssd_wl_relocations(ns->ssd);
+        st->wl_pages += ssd_wl_pages(ns->ssd);
+        st->gc_copyback_pages += ssd_gc_copyback_pages(ns->ssd);
+        {
+            uint64_t c, l, t;
+
+            ssd_pace_stats(ns->ssd, &c, &l, &t);
+            st->pace[0] += c;
+            st->pace[1] += l;
+            st->pace[2] += t;
+        }
+        st->partial_page_writes += ssd_partial_page_writes(ns->ssd);
+        for (int op = 0; op < 3; op++) {
+            st->plane_ops[op] += ssd_plane_ops(ns->ssd, op);
+        }
+        {
+            uint64_t w, ps, dg;
+
+            ssd_stall_stats(ns->ssd, &w, &ps, &dg);
+            st->stall_writes += w;
+            st->stall_passes += ps;
+            st->stall_destages += dg;
+        }
+        st->retention_refreshes += ssd_retention_refreshes(ns->ssd);
+        st->buf_reads += ssd_buffer_reads(ns->ssd);
+        st->buf_read_hits += ssd_buffer_read_hits(ns->ssd);
+        st->buf_writes += ssd_buffer_writes(ns->ssd);
+        st->buf_write_hits += ssd_buffer_write_hits(ns->ssd);
+    }
+}
+
+/*
+ * Vendor-specific log page C0h: the emulator's media counters. Read it with
+ *   nvme get-log /dev/nvme0 --log-id=0xc0 --log-len=512 -b
+ * and the fields sit at the offsets FemuStatsLog declares.
+ * Bytes 88, 96 and 104 hold little-endian uint64_t hybrid switch merges,
+ * full merges and charged merge erases, summed over namespaces. Physical
+ * line GC is excluded. Other mappings leave these formerly reserved bytes
+ * zero; existing fields and the 512-byte size are unchanged.
+ */
+static void nvme_femu_stats_fill(FemuCtrl *n, FemuStatsLog *log)
+{
+    FemuStatsLog stats;
+    FemuMediaStats st;
+
+    memset(&stats, 0x0, sizeof(stats));
+    nvme_collect_media_stats(n, &st);
+
+    /*
+     * Amplification needs a host write to divide by; the rest are counts and
+     * are reported whether or not anything has been written, so a read-only
+     * workload can still read its block read counts back.
+     */
+    if (st.host_pages) {
+        stats.waf_x1000 = cpu_to_le32((uint32_t)
+            (((st.nand_pages + st.gc_pages + st.pd[1]) * 1000ull) /
+             st.host_pages));
+    }
+    stats.host_write_pages = cpu_to_le64(st.host_pages);
+    stats.gc_write_pages = cpu_to_le64(st.gc_pages);
+    stats.nand_write_pages = cpu_to_le64(st.nand_pages);
+    stats.max_block_reads = cpu_to_le64(st.max_block_reads);
+    stats.read_reclaims = cpu_to_le64(st.read_reclaims);
+    stats.retention_refreshes = cpu_to_le64(st.retention_refreshes);
+    stats.buffer_reads = cpu_to_le64(st.buf_reads);
+    stats.buffer_read_hits = cpu_to_le64(st.buf_read_hits);
+    stats.buffer_writes = cpu_to_le64(st.buf_writes);
+    stats.buffer_write_hits = cpu_to_le64(st.buf_write_hits);
+    stats.hybrid_switch_merges = cpu_to_le64(st.hybrid_switches);
+    stats.hybrid_full_merges = cpu_to_le64(st.hybrid_full);
+    stats.hybrid_merge_erases = cpu_to_le64(st.hybrid_erases);
+    stats.overworn_blocks = cpu_to_le64(st.overworn_blocks);
+    stats.grown_bad_blocks = cpu_to_le64(st.grown_bad_blocks);
+    stats.retired_lines = cpu_to_le64(st.retired_lines);
+    stats.wl_relocations = cpu_to_le64(st.wl_relocations);
+    stats.wl_pages = cpu_to_le64(st.wl_pages);
+    stats.partial_page_writes = cpu_to_le64(st.partial_page_writes);
+    stats.plane_reads = cpu_to_le64(st.plane_ops[NAND_MEDIA_READ]);
+    stats.plane_programs = cpu_to_le64(st.plane_ops[NAND_MEDIA_PROGRAM]);
+    stats.plane_erases = cpu_to_le64(st.plane_ops[NAND_MEDIA_ERASE]);
+    stats.energy_uj = cpu_to_le64(
+        (st.plane_ops[NAND_MEDIA_READ] * n->energy_read_nj +
+         st.plane_ops[NAND_MEDIA_PROGRAM] * n->energy_prog_nj +
+         st.plane_ops[NAND_MEDIA_ERASE] * n->energy_erase_nj) / 1000);
+    stats.gc_stalled_writes = cpu_to_le64(st.stall_writes);
+    stats.gc_stall_passes = cpu_to_le64(st.stall_passes);
+    stats.buffer_full_destages = cpu_to_le64(st.stall_destages);
+    stats.cq_full_completions = cpu_to_le64(st.cq_full);
+    stats.pace_copies = cpu_to_le64(st.pace[0]);
+    stats.pace_lines = cpu_to_le64(st.pace[1]);
+    stats.pace_takeovers = cpu_to_le64(st.pace[2]);
+    stats.gc_copyback_pages = cpu_to_le64(st.gc_copyback_pages);
+    stats.pd_open_reclaims = cpu_to_le64(st.pd[0]);
+    stats.pd_pad_pages = cpu_to_le64(st.pd[1]);
+    stats.pd_pad_closes = cpu_to_le64(st.pd[2]);
+    *log = stats;
+}
+
+static uint16_t nvme_femu_stats_info(FemuCtrl *n, NvmeCmd *cmd,
+                                     uint32_t buf_len, uint64_t off)
+{
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+    FemuStatsLog stats;
+    uint32_t trans_len;
+
+    if (off >= sizeof(stats)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    trans_len = MIN(sizeof(stats) - off, buf_len);
+    nvme_femu_stats_fill(n, &stats);
+
+    return dma_read_prp(n, (uint8_t *)&stats + off, trans_len, prp1, prp2);
+}
+
+/*
+ * Telemetry Host-Initiated (07h) and Controller-Initiated (08h) logs (Base
+ * 2.3, 5.2.12.1.8-9). A host-initiated capture takes the media counters of
+ * the vendor page as Data Area 1, one block, and keeps them until the next
+ * capture; Data Areas 2 and 3 end where it does. The controller never
+ * captures on its own, so its log is a header saying so. Both are read in
+ * whole blocks, and a block past the last one reads as zeroes.
+ */
+static uint16_t nvme_telemetry_log(FemuCtrl *n, NvmeCmd *cmd, uint8_t lid,
+                                   uint32_t buf_len, uint64_t off)
+{
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+    bool create = (le32_to_cpu(cmd->cdw10) >> 8) & 0x1;
+    uint8_t page[sizeof(NvmeTelemetryLog) + sizeof(FemuStatsLog)] = { 0 };
+    NvmeTelemetryLog *hdr = (NvmeTelemetryLog *)page;
+    uint64_t have = sizeof(*hdr);
+
+    if ((off | buf_len) & 511) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    hdr->lid = lid;
+    hdr->scope = 0x1;
+    if (lid == NVME_LOG_TELEMETRY_HOST) {
+        if (create) {
+            nvme_femu_stats_fill(n, &n->telemetry_data);
+            n->telemetry_captured = true;
+            n->telemetry_dgn++;
+        }
+        hdr->dgn = n->telemetry_dgn;
+        if (n->telemetry_captured) {
+            hdr->da1lb = cpu_to_le16(1);
+            hdr->da2lb = cpu_to_le16(1);
+            hdr->da3lb = cpu_to_le16(1);
+            memcpy(page + sizeof(*hdr), &n->telemetry_data,
+                   sizeof(n->telemetry_data));
+            have = sizeof(page);
+        }
+        /* a capture is an event, carrying the header it made (Figure 251) */
+        if (create) {
+            femu_pel_log(n, NVME_PEL_TELEMETRY_CREATED, 1, hdr, sizeof(*hdr));
+        }
+    }
+
+    /* every block asked for is sent; those past the page as zeroes */
+    return dma_read_prp_fill(n, page + MIN(off, have),
+                             MIN(have - MIN(off, have), buf_len), buf_len,
+                             prp1, prp2);
+}
+
+/*
+ * The SMART / Health Information page (Base 2.3, Figure 210) as it stands,
+ * without transferring it or touching the events behind it, so the
+ * Persistent Event log can take a snapshot.
+ */
+void nvme_smart_fill(FemuCtrl *n, NvmeSmartLog *smart_out)
+{
+    NvmeSmartLog smart;
+    FemuMediaStats st;
+
+    memset(&smart, 0x0, sizeof(smart));
+    nvme_collect_media_stats(n, &st);
+
+    /*
+     * The log reports data units in thousands of 512 byte units, rounded up,
+     * so a workload that moved anything at all reports at least one unit
+     * rather than the zero these fields used to carry.
+     */
+    smart.data_units_read[0] =
+        cpu_to_le64(DIV_ROUND_UP(st.rd_bytes / 512, 1000));
+    smart.data_units_written[0] =
+        cpu_to_le64(DIV_ROUND_UP(st.wr_bytes / 512, 1000));
+    smart.host_read_commands[0] = cpu_to_le64(st.rd_cmds);
+    smart.host_write_commands[0] = cpu_to_le64(st.wr_cmds);
+
+    smart.number_of_error_log_entries[0] = cpu_to_le64(n->num_errors);
+    smart.media_errors[0] = cpu_to_le64(st.media_errors);
+    smart.temperature[0] = n->temperature & 0xff;
+    smart.temperature[1] = (n->temperature >> 8) & 0xff;
+
+    /* both are controller-wide, so the worst namespace speaks for the device */
+    smart.available_spare = st.available_spare;
+    smart.percentage_used = st.percentage_used;
+
+    if (n->pel_file) {
+        smart.power_cycles[0] = cpu_to_le64(n->pel_power_cycles);
+    }
+    smart.power_on_hours[0] = cpu_to_le64(nvme_power_on_ms(n) / 3600000);
+    smart.unsafe_shutdowns[0] = cpu_to_le64(n->unsafe_shutdowns[0]);
+    smart.unsafe_shutdowns[1] = cpu_to_le64(n->unsafe_shutdowns[1]);
+
+    smart.available_spare_threshold = NVME_SPARE_THRESHOLD;
+    /* the warning is for a spare below the threshold, not one at it */
+    if (smart.available_spare < NVME_SPARE_THRESHOLD) {
+        smart.critical_warning |= NVME_SMART_SPARE;
+    }
+    /* a block in service past its erase limit makes the media less reliable */
+    if (st.overworn_blocks) {
+        smart.critical_warning |= NVME_SMART_RELIABILITY;
+    }
+    if (femu_temp_condition(n)) {
+        smart.critical_warning |= NVME_SMART_TEMPERATURE;
+    }
+
+    *smart_out = smart;
+}
+
+static uint16_t nvme_smart_info(FemuCtrl *n, NvmeCmd *cmd, uint32_t buf_len,
+                                uint64_t off, bool rae)
+{
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+
+    uint32_t nsid = le32_to_cpu(cmd->nsid);
+    uint32_t trans_len;
+    NvmeSmartLog smart;
+    uint16_t status;
+
+    /*
+     * Per-namespace SMART is advertised, and the page holds nothing namespace
+     * specific, so a namespace gets the controller's page; one that does not
+     * exist gets an error (Base 2.3, 5.2.12.1.3).
+     */
+    if (nsid && nsid != NVME_NSID_BROADCAST && !nvme_ns(n, nsid)) {
+        return NVME_INVALID_NSID | NVME_DNR;
+    }
+
+    /*
+     * A host may read a log page in pieces, from the offset in the command.
+     * Both of these used to hand back the start of the page whatever was
+     * asked for, so a second read returned the first bytes again.
+     */
+    if (off >= sizeof(smart)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    trans_len = MIN(sizeof(smart) - off, buf_len);
+    nvme_smart_fill(n, &smart);
+    femu_pel_warning(n, smart.critical_warning);
+
+    status = dma_read_prp(n, (uint8_t *)&smart + off, trans_len, prp1, prp2);
+
+    /*
+     * Reading this log without Retain Asynchronous Event is what clears a
+     * SMART event, once the host really has the state it pointed at. With
+     * RAE set the event stays reported and its type stays masked.
+     */
+    if (!status && !rae) {
+        nvme_clear_events(n, NVME_AER_TYPE_SMART);
+    }
+
+    return status;
+}
+
+/* ========== FDP Log Pages ========== */
+
+static size_t sizeof_fdp_conf_descr(size_t nruh, size_t vss)
+{
+    size_t entry_siz = sizeof(NvmeFdpDescrHdr) + nruh * sizeof(NvmeRuhDescr)
+                       + vss;
+    return ROUND_UP(entry_siz, 8);
+}
+
+static uint16_t nvme_endgrp_info(FemuCtrl *n, uint32_t buf_len,
+                                 uint64_t off, NvmeCmd *cmd)
+{
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+    uint32_t dw11 = le32_to_cpu(cmd->cdw11);
+    uint16_t endgrpid = (dw11 >> 16) & 0xffff;
+    NvmeEndGrpLog info = {};
+    FemuMediaStats st;
+
+    if (!n->subsys || endgrpid != 0x1) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    if (off >= sizeof(info)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    /*
+     * One endurance group covers the whole device here, so it reports the
+     * same totals the SMART log does. The page used to come back as zeroes.
+     * Media units written is what actually reached the flash, relocations
+     * included, which is the difference this log is for.
+     */
+    nvme_collect_media_stats(n, &st);
+    info.avail_spare = st.available_spare;
+    info.avail_spare_thres = NVME_SPARE_THRESHOLD;
+    info.percet_used = st.percentage_used;
+    if (st.available_spare < NVME_SPARE_THRESHOLD) {
+        info.critical_warning |= NVME_SMART_SPARE;
+    }
+    if (st.overworn_blocks) {
+        info.critical_warning |= NVME_SMART_RELIABILITY;
+    }
+    /*
+     * This log counts bytes in billions, rounded up -- not the thousands of
+     * 512 byte units the SMART log uses. Media units written covers what the
+     * device actually programmed, relocations included.
+     */
+    info.data_units_read[0] =
+        cpu_to_le64(DIV_ROUND_UP(st.rd_bytes, 1000000000));
+    info.data_units_written[0] =
+        cpu_to_le64(DIV_ROUND_UP(st.wr_bytes, 1000000000));
+    info.media_units_written[0] =
+        cpu_to_le64(DIV_ROUND_UP(st.media_bytes, 1000000000));
+    info.host_read_commands[0] = cpu_to_le64(st.rd_cmds);
+    info.host_write_commands[0] = cpu_to_le64(st.wr_cmds);
+    info.media_integrity_errors[0] = cpu_to_le64(st.media_errors);
+    info.no_err_info_log_entries[0] = cpu_to_le64(n->num_errors);
+
+    buf_len = MIN(sizeof(info) - off, buf_len);
+    return dma_read_prp(n, (uint8_t *)&info + off, buf_len, prp1, prp2);
+}
+
+static uint16_t nvme_fdp_confs(FemuCtrl *n, uint32_t endgrpid,
+                               uint32_t buf_len, uint64_t off, NvmeCmd *cmd)
+{
+    uint32_t log_size, trans_len;
+    g_autofree uint8_t *buf = NULL;
+    NvmeFdpDescrHdr *hdr;
+    NvmeRuhDescr *ruhd;
+    NvmeEnduranceGroup *endgrp;
+    NvmeFdpConfsHdr *log;
+    size_t nruh, fdp_descr_size;
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+    int i;
+
+    if (endgrpid != 1 || !n->subsys) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    endgrp = &n->subsys->endgrp;
+
+    if (endgrp->fdp.enabled) {
+        nruh = endgrp->fdp.nruh;
+    } else {
+        nruh = 1;
+    }
+
+    fdp_descr_size = sizeof_fdp_conf_descr(nruh, FDPVSS);
+    log_size = sizeof(NvmeFdpConfsHdr) + fdp_descr_size;
+
+    if (off >= log_size) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    trans_len = MIN(log_size - off, buf_len);
+
+    buf = g_malloc0(log_size);
+    log = (NvmeFdpConfsHdr *)buf;
+    hdr = (NvmeFdpDescrHdr *)(log + 1);
+    ruhd = (NvmeRuhDescr *)(buf + sizeof(*log) + sizeof(*hdr));
+
+    log->num_confs = cpu_to_le16(0);
+    log->size = cpu_to_le32(log_size);
+
+    hdr->descr_size = cpu_to_le16(fdp_descr_size);
+    if (endgrp->fdp.enabled) {
+        hdr->fdpa = FIELD_DP8(hdr->fdpa, FDPA, VALID, 1);
+        hdr->fdpa = FIELD_DP8(hdr->fdpa, FDPA, RGIF, endgrp->fdp.rgif);
+        hdr->nrg = cpu_to_le32(endgrp->fdp.nrg);
+        hdr->nruh = cpu_to_le16(endgrp->fdp.nruh);
+        hdr->maxpids = cpu_to_le16(NVME_FDP_MAXPIDS - 1);
+        hdr->nnss = cpu_to_le32(NVME_MAX_NAMESPACES);
+        hdr->runs = cpu_to_le64(endgrp->fdp.runs);
+
+        for (i = 0; i < (int)nruh; i++) {
+            ruhd->ruht = endgrp->fdp.ruhs[i].ruht;
+            ruhd++;
+        }
+    } else {
+        hdr->nrg = cpu_to_le32(1);
+        hdr->nruh = cpu_to_le16(1);
+        hdr->maxpids = cpu_to_le16(NVME_FDP_MAXPIDS - 1);
+        hdr->nnss = cpu_to_le32(1);
+        hdr->runs = cpu_to_le64(96 * MiB);
+        ruhd->ruht = NVME_RUHT_INITIALLY_ISOLATED;
+    }
+
+    return dma_read_prp(n, (uint8_t *)buf + off, trans_len, prp1, prp2);
+}
+
+static uint16_t nvme_fdp_ruh_usage(FemuCtrl *n, uint32_t endgrpid,
+                                   uint32_t buf_len, uint64_t off,
+                                   NvmeCmd *cmd)
+{
+    NvmeRuHandle *ruh;
+    NvmeRuhuLog *hdr;
+    NvmeRuhuDescr *ruhud;
+    NvmeEnduranceGroup *endgrp;
+    g_autofree uint8_t *buf = NULL;
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+    uint32_t log_size, trans_len;
+    uint16_t i;
+
+    if (endgrpid != 1 || !n->subsys) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    endgrp = &n->subsys->endgrp;
+
+    if (!endgrp->fdp.enabled) {
+        return NVME_FDP_DISABLED | NVME_DNR;
+    }
+
+    log_size = sizeof(NvmeRuhuLog) + endgrp->fdp.nruh * sizeof(NvmeRuhuDescr);
+
+    if (off >= log_size) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    trans_len = MIN(log_size - off, buf_len);
+
+    buf = g_malloc0(log_size);
+    hdr = (NvmeRuhuLog *)buf;
+    ruhud = (NvmeRuhuDescr *)(hdr + 1);
+
+    ruh = endgrp->fdp.ruhs;
+    hdr->nruh = cpu_to_le16(endgrp->fdp.nruh);
+
+    for (i = 0; i < endgrp->fdp.nruh; i++, ruhud++, ruh++) {
+        ruhud->ruha = ruh->ruha;
+    }
+
+    return dma_read_prp(n, (uint8_t *)buf + off, trans_len, prp1, prp2);
+}
+
+static uint16_t nvme_fdp_stats(FemuCtrl *n, uint32_t endgrpid,
+                               uint32_t buf_len, uint64_t off, NvmeCmd *cmd)
+{
+    NvmeEnduranceGroup *endgrp;
+    NvmeFdpStatsLog log = {};
+    uint32_t trans_len;
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+
+    if (off >= sizeof(NvmeFdpStatsLog)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    if (endgrpid != 1 || !n->subsys) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    if (!n->subsys->endgrp.fdp.enabled) {
+        return NVME_FDP_DISABLED | NVME_DNR;
+    }
+
+    endgrp = &n->subsys->endgrp;
+    trans_len = MIN(sizeof(log) - off, buf_len);
+
+    /* spec value is 128 bit, we only use low 64 bit */
+    log.hbmw[0] = cpu_to_le64(endgrp->fdp.hbmw);
+    log.mbmw[0] = cpu_to_le64(endgrp->fdp.mbmw);
+    log.mbe[0] = cpu_to_le64(endgrp->fdp.mbe);
+
+    return dma_read_prp(n, (uint8_t *)&log + off, trans_len, prp1, prp2);
+}
+
+static uint16_t nvme_fdp_events(FemuCtrl *n, uint32_t endgrpid,
+                                uint32_t buf_len, uint64_t off, NvmeCmd *cmd)
+{
+    NvmeEnduranceGroup *endgrp;
+    bool host_events = (le32_to_cpu(cmd->cdw10) >> 8) & 0x1;
+    uint32_t log_size, trans_len;
+    unsigned int nelems, start, next;
+    NvmeFdpEventBuffer *ebuf;
+    g_autofree NvmeFdpEventsLog *elog = NULL;
+    NvmeFdpEvent *event;
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+
+    if (endgrpid != 1 || !n->subsys) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    endgrp = &n->subsys->endgrp;
+
+    if (!endgrp->fdp.enabled) {
+        return NVME_FDP_DISABLED | NVME_DNR;
+    }
+
+    if (host_events) {
+        ebuf = &endgrp->fdp.host_events;
+    } else {
+        ebuf = &endgrp->fdp.ctrl_events;
+    }
+
+    /*
+     * A poller and the FTL thread append to the ring, so the indices and the
+     * events they describe are read under the lock the appenders hold.
+     */
+    qemu_mutex_lock(&endgrp->fdp.events_lock);
+    nelems = ebuf->nelems;
+    start = ebuf->start;
+    next = ebuf->next;
+    if (nelems > NVME_FDP_MAX_EVENTS) {
+        nelems = NVME_FDP_MAX_EVENTS;
+    }
+    if (start >= NVME_FDP_MAX_EVENTS || next > NVME_FDP_MAX_EVENTS) {
+        qemu_mutex_unlock(&endgrp->fdp.events_lock);
+        return NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+    }
+
+    log_size = sizeof(NvmeFdpEventsLog) + nelems * sizeof(NvmeFdpEvent);
+    if (off >= log_size) {
+        qemu_mutex_unlock(&endgrp->fdp.events_lock);
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    trans_len = MIN(log_size - off, buf_len);
+    elog = g_malloc0(log_size);
+    elog->num_events = cpu_to_le32(nelems);
+    event = (NvmeFdpEvent *)(elog + 1);
+
+    /* every copy below is bounded by the nelems the buffer was sized for */
+    if (nelems && start == next) {
+        unsigned int first = MIN(NVME_FDP_MAX_EVENTS - start, nelems);
+
+        memcpy(event, &ebuf->events[start], sizeof(NvmeFdpEvent) * first);
+        if (nelems > first) {
+            memcpy(event + first, ebuf->events,
+                   sizeof(NvmeFdpEvent) * (nelems - first));
+        }
+    } else if (start < next) {
+        unsigned int cnt = MIN(next - start, nelems);
+
+        memcpy(event, &ebuf->events[start], sizeof(NvmeFdpEvent) * cnt);
+    }
+    qemu_mutex_unlock(&endgrp->fdp.events_lock);
+
+    return dma_read_prp(n, (uint8_t *)elog + off, trans_len, prp1, prp2);
+}
+
+/* ========== End FDP Log Pages ========== */
+
+static uint16_t nvme_cmd_effects(FemuCtrl *n, NvmeCmd *cmd, uint8_t csi,
+                                 uint32_t buf_len, uint64_t off)
+{
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+    NvmeEffectsLog log = {};
+    uint32_t trans_len;
+    int i;
+
+    if (off >= sizeof(log)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    for (i = 0; i < 256; i++) {
+        log.acs[i] = cpu_to_le32(nvme_admin_effects(n, i));
+        log.iocs[i] = cpu_to_le32(nvme_io_effects(n, csi, i));
+    }
+
+    trans_len = MIN(sizeof(log) - off, buf_len);
+
+    return dma_read_prp(n, ((uint8_t *)&log) + off, trans_len, prp1, prp2);
+}
+
+/*
+ * Device Self-test (Base 2.3, 5.2.8). A short or extended test of the
+ * controller and the named namespaces finishes before the command completes,
+ * which the specification allows, so none is ever in progress and an abort has
+ * nothing to stop. Each test leaves a result at the head of the log.
+ */
+static uint16_t nvme_dev_self_test(FemuCtrl *n, NvmeCmd *cmd)
+{
+    uint32_t nsid = le32_to_cpu(cmd->nsid);
+    uint8_t stc = le32_to_cpu(cmd->cdw10) & 0xf;
+    NvmeDstResult *r = n->dst_results;
+
+    if (nsid && nsid != NVME_NSID_BROADCAST) {
+        if (!nvme_nsid_valid(n, nsid)) {
+            return NVME_INVALID_NSID | NVME_DNR;
+        }
+        if (!nvme_ns(n, nsid)) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+    }
+
+    switch (stc) {
+    case 0x1:   /* short */
+    case 0x2:   /* extended */
+        break;
+    case 0xf:   /* abort: nothing is ever running */
+        return NVME_SUCCESS;
+    default:    /* host-initiated refresh and vendor tests are not offered */
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    memmove(&r[1], &r[0], sizeof(*r) * (NVME_DST_RESULTS - 1));
+    memset(&r[0], 0, sizeof(*r));
+    r[0].status = stc << 4;                 /* completed without error */
+    r[0].poh = cpu_to_le64(nvme_power_on_ms(n) / 3600000);
+    r[0].nsid = cpu_to_le32(nsid);
+
+    return NVME_SUCCESS;
+}
+
+/* Device Self-test log (06h): the current operation, then 20 results */
+static uint16_t nvme_dst_log(FemuCtrl *n, NvmeCmd *cmd, uint32_t buf_len,
+                             uint64_t off)
+{
+    uint8_t log[4 + sizeof(n->dst_results)] = {};
+    uint32_t trans_len;
+
+    QEMU_BUILD_BUG_ON(sizeof(log) != 564);
+
+    if (off >= sizeof(log)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    memcpy(log + 4, n->dst_results, sizeof(n->dst_results));
+    trans_len = MIN(sizeof(log) - off, buf_len);
+
+    return dma_read_prp(n, log + off, trans_len, le64_to_cpu(cmd->dptr.prp1),
+                        le64_to_cpu(cmd->dptr.prp2));
+}
+
+/*
+ * Sanitize (Base 2.3, 5.2.24): a block erase of every namespace, done before
+ * the command completes so no sanitize is ever in progress and none can fail.
+ * Media verification, overwrite and cryptographic erase are not offered.
+ */
+/*
+ * Get LBA Status (NVM 1.2, 4.2.1). The blocks a read would fail on here are
+ * the ones a Write Uncorrectable marked, and a write clears them, so the
+ * tracked list and a scan are the same thing: action types 10h and 11h both
+ * report runs of the uncorrectable map (LBARS 011b), and 02h reports runs of
+ * allocated blocks (010b). Runs are as long as possible; CMPC says whether
+ * more remained than MNDW had room for.
+ */
+static uint16_t nvme_get_lba_status(FemuCtrl *n, NvmeCmd *cmd)
+{
+    uint32_t nsid = le32_to_cpu(cmd->nsid);
+    uint64_t slba = (uint64_t)le32_to_cpu(cmd->cdw11) << 32 |
+                    le32_to_cpu(cmd->cdw10);
+    uint64_t len = ((uint64_t)le32_to_cpu(cmd->cdw12) + 1) * 4;
+    uint32_t dw13 = le32_to_cpu(cmd->cdw13);
+    uint8_t atype = dw13 >> 24;
+    uint32_t rl = dw13 & 0xffff;
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+    g_autofree uint8_t *buf = NULL;
+    NvmeNamespace *ns;
+    unsigned long *map;
+    uint64_t nsze, end, lba, cap;
+    uint32_t room, nlsd = 0;
+    uint8_t lbars;
+
+    if (!nvme_nsid_valid(n, nsid) || nsid == NVME_NSID_BROADCAST) {
+        return NVME_INVALID_NSID | NVME_DNR;
+    }
+    ns = nvme_ns(n, nsid);
+    if (!ns) {
+        return NVME_INVALID_NSID | NVME_DNR;
+    }
+    switch (atype) {
+    case 0x10:
+    case 0x11:
+        map = ns->uncorrectable;
+        lbars = 0x3;
+        break;
+    case 0x02:
+        map = ns->util;
+        lbars = 0x2;
+        break;
+    default:
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    nsze = le64_to_cpu(ns->id_ns.nsze);
+    if (slba >= nsze) {
+        return NVME_LBA_RANGE | NVME_DNR;
+    }
+    if (!map) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    if (nvme_check_mdts(n, len) || len > UINT32_MAX) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    end = rl ? MIN(slba + rl, nsze) : nsze;
+    room = len < 8 ? 0 : (len - 8) / 16;
+
+    /*
+     * Without MDTS the host buffer can be gigabytes; grow ours with the
+     * descriptors found and send zeroes after them. The 8-byte header is
+     * built whole even when fewer bytes are asked for.
+     */
+    cap = MAX(8, MIN(len, 4096));
+    buf = g_malloc0(cap);
+    buf[4] = 0x2;                       /* COMPLETE unless a run is left out */
+    for (lba = slba; lba < end; ) {
+        uint64_t first = find_next_bit(map, end, lba);
+        uint64_t last;
+        uint8_t *d;
+
+        if (first >= end) {
+            break;
+        }
+        if (nlsd == room) {
+            buf[4] = 0x1;               /* INCOMPLETE */
+            break;
+        }
+        last = find_next_zero_bit(map, end, first);
+        /* the block count is 32 bits and 0's based */
+        last = MIN(last, first + ((uint64_t)UINT32_MAX + 1));
+        if (8 + 16 * ((uint64_t)nlsd + 1) > cap) {
+            uint64_t grown = MAX(cap, MIN(len, cap * 2));
+
+            buf = g_realloc(buf, grown);
+            memset(buf + cap, 0, grown - cap);
+            cap = grown;
+        }
+        d = buf + 8 + 16 * (uint64_t)nlsd;
+        stq_le_p(d, first);
+        stl_le_p(d + 8, last - first - 1);
+        d[13] = lbars;
+        nlsd++;
+        lba = last;
+    }
+    if (len >= 4) {
+        stl_le_p(buf, nlsd);
+    }
+
+    return dma_read_prp_fill(n, buf, MIN(len, 8 + 16 * (uint64_t)nlsd), len,
+                             prp1, prp2);
+}
+
+/*
+ * LBA Status Information (NVM 1.2, 4.1.4.5). No namespace elements are listed;
+ * the estimate says how many blocks a Get LBA Status over each namespace
+ * would find, which is what a host is told to do in that case.
+ */
+static uint16_t nvme_lba_status_log(FemuCtrl *n, NvmeCmd *cmd,
+                                    uint32_t buf_len, uint64_t off)
+{
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+    uint8_t log[16] = { 0 };
+    uint64_t estulb = 0;
+    int i;
+
+    if (off >= sizeof(log)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    for (i = 0; n->namespaces && i < n->namespace_limit; i++) {
+        NvmeNamespace *ns = &n->namespaces[i];
+
+        if (ns->allocated && ns->uncorrectable) {
+            estulb += bitmap_count_one(ns->uncorrectable,
+                                       le64_to_cpu(ns->id_ns.nsze));
+        }
+    }
+    stl_le_p(log, sizeof(log));
+    stl_le_p(log + 8, MIN(estulb, UINT32_MAX - 1));
+
+    return dma_read_prp(n, log + off, MIN(sizeof(log) - off, buf_len),
+                        prp1, prp2);
+}
+
+static uint16_t nvme_sanitize(FemuCtrl *n, NvmeCmd *cmd)
+{
+    NvmeSanitizeState *sanitize = nvme_sanitize_state(n);
+    uint32_t dw10 = le32_to_cpu(cmd->cdw10);
+    uint8_t sanact = dw10 & 0x7;
+    bool ndas = dw10 & (1 << 9);
+    bool emvs = dw10 & (1 << 10);
+    bool resume;
+    uint8_t ev[16] = { 0 };
+
+    if (!nvme_can_sanitize(n)) {
+        return NVME_INVALID_OPCODE | NVME_DNR;
+    }
+
+    switch (sanact) {
+    case 0x1:   /* exit failure mode: a sanitize here never fails */
+        return NVME_SUCCESS;
+    case 0x2:   /* block erase */
+        if (emvs) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        break;
+    default:
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    /* Sanitize Start (Figure 247): the whole subsystem is the target */
+    stl_le_p(ev, le32_to_cpu(n->id_ctrl.sanicap));
+    stl_le_p(ev + 4, dw10);
+    stl_le_p(ev + 8, le32_to_cpu(cmd->cdw11));
+    stl_le_p(ev + 12, NVME_NSID_BROADCAST);
+    femu_pel_log(n, NVME_PEL_SANITIZE_START, 2, ev, 16);
+
+    resume = nvme_pause_pollers(n);
+    if (n->power_loss) {
+        uint16_t status = bbssd_flush_all(n);
+
+        if (status) {
+            nvme_resume_pollers(n, resume);
+            return status;
+        }
+    }
+    if (n->ns_mgmt && n->mbe && n->mbe->logical_space) {
+        /* The pool includes deleted extents, but excludes spare capacity. */
+        memset(n->mbe->logical_space, 0, n->namespace_pool_size);
+    }
+    for (int i = 0; i < n->namespace_limit; i++) {
+        NvmeNamespace *ns = &n->namespaces[i];
+
+        if (!ns->allocated) {
+            continue;
+        }
+        if (!n->ns_mgmt && n->mbe && n->mbe->logical_space) {
+            memset(n->mbe->logical_space + ns->backend_offset, 0,
+                   ns->extent_size);
+        }
+        bitmap_zero(ns->util, ns->ns_blks);
+        bitmap_zero(ns->uncorrectable, ns->ns_blks);
+        if (ns->mdata) {
+            memset(ns->mdata, 0, ns->mdata_len);
+        }
+        if (NS_BBSSD(ns)) {
+            bbssd_deallocate_all(ns);
+        }
+    }
+    sanitize->cdw10 = dw10;
+    /*
+     * Completed, 001b, or 100b when the host asked for no deallocation. Set
+     * before the pollers resume: a write clears GDE, and one that ran first
+     * would leave the status claiming no data was written since.
+     */
+    qatomic_set(&sanitize->sstat, NVME_SSTAT_GDE | (ndas ? 0x4 : 0x1));
+
+    /* Sanitize Completion (Figure 248): progress FFFFh, done */
+    memset(ev, 0, sizeof(ev));
+    stw_le_p(ev, 0xffff);
+    stw_le_p(ev + 2, qatomic_read(&sanitize->sstat));
+    stl_le_p(ev + 8, NVME_NSID_BROADCAST);
+    femu_pel_log(n, NVME_PEL_SANITIZE_COMPLETION, 2, ev, 12);
+    nvme_resume_pollers(n, resume);
+
+    return NVME_SUCCESS;
+}
+
+/* Sanitize Status (81h): progress, status and the command that ran */
+static uint16_t nvme_sanitize_log(FemuCtrl *n, NvmeCmd *cmd, uint32_t buf_len,
+                                  uint64_t off)
+{
+    NvmeSanitizeState *sanitize = nvme_sanitize_state(n);
+    uint8_t log[512] = {};
+    uint32_t trans_len;
+
+    if (off >= sizeof(log)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    stw_le_p(log, 0xffff);                      /* SPROG: none in progress */
+    stw_le_p(log + 2, qatomic_read(&sanitize->sstat));
+    stl_le_p(log + 4, sanitize->cdw10);
+    /* the estimated times, not reported */
+    for (int i = 8; i < 32; i += 4) {
+        stl_le_p(log + i, 0xffffffff);
+    }
+    trans_len = MIN(sizeof(log) - off, buf_len);
+
+    return dma_read_prp(n, log + off, trans_len, le64_to_cpu(cmd->dptr.prp1),
+                        le64_to_cpu(cmd->dptr.prp2));
+}
+
+static uint16_t nvme_get_log(FemuCtrl *n, NvmeCmd *cmd)
+{
+    uint32_t dw10 = le32_to_cpu(cmd->cdw10);
+    uint32_t dw11 = le32_to_cpu(cmd->cdw11);
+    uint32_t dw12 = le32_to_cpu(cmd->cdw12);
+    uint32_t dw13 = le32_to_cpu(cmd->cdw13);
+    /*
+     * Command Dword 10 packs more than the identifier: bits 7:0 are the Log
+     * Page Identifier, 13:8 the Log Specific Field, and bit 15 Retain
+     * Asynchronous Event. Masking the whole low half made a host that set
+     * Retain Asynchronous Event -- the ordinary way to read a log without
+     * clearing the event behind it -- miss every identifier below and be told
+     * the log page was invalid.
+     */
+    uint8_t lid = dw10 & 0xff;
+    bool rae = (dw10 >> 15) & 0x1;   /* Retain Asynchronous Event */
+    uint8_t  csi = le32_to_cpu(cmd->cdw14) >> 24;
+    uint16_t lspi = (dw11 >> 16) & 0xffff;
+    uint64_t len;
+    uint64_t off, lpol, lpou;
+    uint32_t numdl, numdu;
+    int status;
+
+    numdl = (dw10 >> 16);
+    numdu = (dw11 & 0xffff);
+    lpol = dw12;
+    lpou = dw13;
+
+    len = ((((uint64_t)numdu << 16) | numdl) + 1) << 2;
+    off = (lpou << 32ULL) | lpol;
+
+    /*
+     * Releasing a Persistent Event context, or reading its header, ignores the
+     * length and offset (Figure 229), so they are not checked for it.
+     */
+    if (lid == NVME_LOG_PERSISTENT_EVENT && ((dw10 >> 8) & 0x3) >= 2) {
+        /* but not the offset type: the page has no index offsets either */
+        if ((le32_to_cpu(cmd->cdw14) >> 23) & 0x1) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        return femu_pel_get_log(n, cmd, 0, 0);
+    }
+
+    /* The log handlers and PRP transfer helpers take a 32-bit length. */
+    if (len > UINT32_MAX || (off & 0x3)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    /* an index offset (OT) needs IOS, which no page here reports */
+    if ((le32_to_cpu(cmd->cdw14) >> 23) & 0x1) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    status = nvme_check_mdts(n, len);
+    if (status) {
+        return status;
+    }
+
+    /*
+     * The pages that use CSI name a set this controller knows (Fig 268).
+     * The Changed Zone List is one of them (ZNS 1.4, Figure 46).
+     */
+    if ((lid == NVME_LOG_SUPPORTED || lid == NVME_LOG_CMD_EFFECTS ||
+         lid == NVME_LOG_FID_EFFECTS || lid == NVME_LOG_CHANGED_ZONE_LIST) &&
+        NVME_CC_CSS(n->bar.cc) == NVME_CC_CSS_CSI &&
+        csi != NVME_CSI_NVM && csi != NVME_CSI_KV && csi != NVME_CSI_ZONED) {
+        return NVME_IOCS_NOT_SUPPORTED | NVME_DNR;
+    }
+
+    /* a page log 00h does not list for the command set is not answered */
+    if (!nvme_log_support(n, nvme_log_csi(n, csi), lid)) {
+        return NVME_INVALID_LOG_ID | NVME_DNR;
+    }
+
+    switch (lid) {
+    case NVME_LOG_SUPPORTED:
+        return nvme_supported_log_pages(n, cmd, len, off);
+    case NVME_LOG_ERROR_INFO:
+        return nvme_error_log_info(n, cmd, len, off, rae);
+    case NVME_LOG_SMART_INFO:
+        return nvme_smart_info(n, cmd, len, off, rae);
+    case NVME_LOG_FEMU_STATS:
+        return nvme_femu_stats_info(n, cmd, len, off);
+    case NVME_LOG_FW_SLOT_INFO:
+        return nvme_fw_log_info(n, cmd, len, off);
+    case NVME_LOG_CHANGED_NS_LIST:
+        return nvme_changed_ns_log(n, cmd, len, off, rae);
+    case NVME_LOG_CMD_EFFECTS:
+        return nvme_cmd_effects(n, cmd, nvme_log_csi(n, csi), len, off);
+    case NVME_LOG_DEV_SELF_TEST:
+        return nvme_dst_log(n, cmd, len, off);
+    case NVME_LOG_TELEMETRY_HOST:
+    case NVME_LOG_TELEMETRY_CTRL:
+        return nvme_telemetry_log(n, cmd, lid, len, off);
+    case NVME_LOG_LBA_STATUS:
+        return nvme_lba_status_log(n, cmd, len, off);
+    case NVME_LOG_FID_EFFECTS:
+        return nvme_fid_effects(n, cmd, csi, len, off);
+    case NVME_LOG_MI_EFFECTS:
+        return nvme_mi_effects(n, cmd, len, off);
+    case NVME_LOG_PERSISTENT_EVENT:
+        return femu_pel_get_log(n, cmd, len, off);
+    case NVME_LOG_SANITIZE:
+        if (!nvme_can_sanitize(n)) {
+            return NVME_INVALID_LOG_ID | NVME_DNR;
+        }
+        return nvme_sanitize_log(n, cmd, len, off);
+    case NVME_LOG_ENDGRP:
+        return nvme_endgrp_info(n, len, off, cmd);
+    case NVME_LOG_FDP_CONFS:
+        return nvme_fdp_confs(n, lspi, len, off, cmd);
+    case NVME_LOG_FDP_RUH_USAGE:
+        return nvme_fdp_ruh_usage(n, lspi, len, off, cmd);
+    case NVME_LOG_FDP_STATS:
+        return nvme_fdp_stats(n, lspi, len, off, cmd);
+    case NVME_LOG_FDP_EVENTS:
+        return nvme_fdp_events(n, lspi, len, off, cmd);
+    default: {
+        /*
+         * A namespace-specific log page belongs to the mode that namespace
+         * runs, which is not necessarily the controller's once namespaces run
+         * different modes. Offer the command to the named namespace's handler
+         * first, then fall back to the controller's for controller-wide logs.
+         */
+        uint32_t nsid = le32_to_cpu(cmd->nsid);
+
+        if (nvme_ns(n, nsid)) {
+            NvmeNamespace *ns = &n->namespaces[nsid - 1];
+
+            if (ns->ext_ops.get_log) {
+                return ns->ext_ops.get_log(n, cmd);
+            }
+        }
+        if (n->ext_ops.get_log) {
+            return n->ext_ops.get_log(n, cmd);
+        }
+        return NVME_INVALID_LOG_ID | NVME_DNR;
+    }
+    }
+}
+
+/* where slot @slot of @sq lives in host memory */
+static hwaddr nvme_sq_slot_addr(FemuCtrl *n, NvmeSQueue *sq, uint32_t slot)
+{
+    if (sq->phys_contig) {
+        return sq->dma_addr + slot * n->sqe_size;
+    }
+    return nvme_discontig(sq->prp_list, slot, n->page_size, n->sqe_size);
+}
+
+/*
+ * Abort commands still in the admin queue. Admin commands run one at a time,
+ * so with the one running these are all the Aborts the host has submitted
+ * and not yet seen complete.
+ */
+static uint32_t nvme_aborts_queued(FemuCtrl *n)
+{
+    NvmeSQueue *sq = n->sq[0];
+    uint32_t nr = 0;
+    uint32_t index;
+
+    for (index = 0; index < sq->size; index++) {
+        uint32_t slot = (sq->head + index) % sq->size;
+        uint8_t opcode;
+
+        if (slot == sq->tail) {
+            break;
+        }
+        nvme_addr_read(n, nvme_sq_slot_addr(n, sq, slot), &opcode,
+                       sizeof(opcode));
+        nr += opcode == NVME_ADM_CMD_ABORT;
+    }
+    return nr;
+}
+
+/*
+ * Abort (Base 2.3, 5.2.1). A command still in its submission queue is marked
+ * in controller state; the fetch path then completes it with Command Abort
+ * Requested without running it, so it has no effects after this completes and
+ * the abort counts as immediate. The host's queue is never written. A command
+ * already fetched has run or is running and is left alone.
+ *
+ * More than ACL + 1 Aborts outstanding at once is refused: the one running is
+ * failed while more than ACL others wait behind it.
+ */
+static uint16_t nvme_abort_req(FemuCtrl *n, NvmeCmd *cmd, uint32_t *result)
+{
+    uint16_t sqid = le32_to_cpu(cmd->cdw10) & 0xffff;
+    uint16_t cid = (le32_to_cpu(cmd->cdw10) >> 16) & 0xffff;
+    NvmeSQueue *sq;
+    uint32_t index;
+    bool resume;
+
+    *result = 1;    /* Immediate Abort Not Performed */
+    if (nvme_aborts_queued(n) > n->acl) {
+        return NVME_ACL_EXCEEDED;
+    }
+    if (nvme_check_sqid(n, sqid)) {
+        return NVME_SUCCESS;
+    }
+
+    sq = n->sq[sqid];
+
+    /* a poller must not fetch from the queue while it is read and marked */
+    resume = nvme_pause_pollers(n);
+
+    /*
+     * Step at most once round the ring: the modulo index below only ever takes
+     * values inside it, so a tail outside it would never be reached and this
+     * runs on the thread holding the big lock.
+     */
+    for (index = 0; index < sq->size; index++) {
+        uint32_t slot = (sq->head + index) % sq->size;
+        NvmeCmd entry;
+
+        if (slot == sq->tail) {
+            break;
+        }
+        nvme_addr_read(n, nvme_sq_slot_addr(n, sq, slot), &entry,
+                       sizeof(entry));
+        if (le16_to_cpu(entry.cid) == cid) {
+            if (!sq->abort_cid[slot]) {
+                sq->abort_cid[slot] = NVME_ABORT_MARKED | entry.cid;
+                sq->nr_aborts++;
+            }
+            *result = 0;
+            break;
+        }
+    }
+
+    nvme_resume_pollers(n, resume);
+    return NVME_SUCCESS;
+}
+
+/*
+ * A format changes how many logical blocks the namespace has, so everything
+ * sized in blocks has to be rebuilt: the per-block bitmaps are indexed by LBA
+ * on every read and write, and a format from a large block size to a small one
+ * used to leave them sized for the smaller count, which the next write walked
+ * past.
+ */
+static uint16_t nvme_format_resize(NvmeNamespace *ns, uint64_t blks)
+{
+    unsigned long *util, *uncorrectable;
+
+    /* fallible, so Format and Create refuse rather than abort on no memory */
+    util = bitmap_try_new(blks);
+    uncorrectable = bitmap_try_new(blks);
+    if (!util || !uncorrectable) {
+        g_free(util);
+        g_free(uncorrectable);
+        return NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+    }
+
+    g_free(ns->util);
+    g_free(ns->uncorrectable);
+    ns->util = util;
+    ns->uncorrectable = uncorrectable;
+
+    return NVME_SUCCESS;
+}
+
+/*
+ * Whether this namespace can be formatted as asked, decided without changing
+ * anything. Every namespace a command names is put through this before any of
+ * them is touched, so a refusal cannot leave some already reformatted.
+ */
+static uint16_t nvme_format_check(FemuCtrl *n, const NvmeIdNs *id_ns,
+                                  uint8_t mode, uint8_t lba_idx,
+                                  uint8_t meta_loc, uint8_t pil, uint8_t pi)
+{
+    uint16_t ms;
+
+    /*
+     * A format redefines the namespace in terms of logical blocks, which only
+     * a plain block namespace is described by. Every other mode derives its
+     * capacity from a geometry of its own -- zones, key space, or the physical
+     * addresses an open-channel host manages itself -- and reformatting it
+     * would leave the two disagreeing, or hand the host a size its own address
+     * space does not have.
+     */
+    if (mode != FEMU_BBSSD_MODE && mode != FEMU_NOSSD_MODE) {
+        return NVME_INVALID_FORMAT | NVME_DNR;
+    }
+
+    if (lba_idx > id_ns->nlbaf) {
+        return NVME_INVALID_FORMAT | NVME_DNR;
+    }
+
+    ms = le16_to_cpu(id_ns->lbaf[lba_idx].ms);
+    if (n->power_loss && (ms || pi ||
+        ((uint64_t)n->bb_params.secsz * n->bb_params.secs_per_pg) %
+        (1ULL << id_ns->lbaf[lba_idx].lbads))) {
+        return NVME_INVALID_FORMAT | NVME_DNR;
+    }
+    if (pi) {
+        /* the protection information is eight bytes of the metadata */
+        if (!n->pi || pi > DPS_TYPE_3 || ms < 8) {
+            return NVME_INVALID_FORMAT | NVME_DNR;
+        }
+        /* PIL set puts it in the first eight bytes, clear in the last */
+        if (pil && !NVME_ID_NS_DPC_FIRST_EIGHT(id_ns->dpc)) {
+            return NVME_INVALID_FORMAT | NVME_DNR;
+        }
+        if (!pil && !NVME_ID_NS_DPC_LAST_EIGHT(id_ns->dpc)) {
+            return NVME_INVALID_FORMAT | NVME_DNR;
+        }
+        if (!((id_ns->dpc & 0x7) & (1 << (pi - 1)))) {
+            return NVME_INVALID_FORMAT | NVME_DNR;
+        }
+    }
+    if (meta_loc && ms && !NVME_ID_NS_MC_EXTENDED(id_ns->mc)) {
+        return NVME_INVALID_FORMAT | NVME_DNR;
+    }
+    if (!meta_loc && ms && !NVME_ID_NS_MC_SEPARATE(id_ns->mc)) {
+        return NVME_INVALID_FORMAT | NVME_DNR;
+    }
+
+    return NVME_SUCCESS;
+}
+
+static uint16_t nvme_format_namespace(NvmeNamespace *ns, uint8_t lba_idx,
+                                      uint8_t meta_loc, uint8_t pil, uint8_t pi,
+                                      uint8_t sec_erase)
+{
+    NvmeIdNs *id_ns = &ns->id_ns;
+    FemuCtrl *n = ns->ctrl;
+    uint64_t blks;
+    uint64_t mlen;
+    uint8_t *mdata = NULL;
+    uint16_t status;
+
+    blks = ns->size / (1 << id_ns->lbaf[lba_idx].lbads);
+    /*
+     * The metadata store is sized to the new format and taken before anything
+     * changes, so a format that cannot have it leaves the namespace as it was.
+     */
+    mlen = blks * le16_to_cpu(id_ns->lbaf[lba_idx].ms);
+    if (mlen) {
+        mdata = g_try_malloc0(mlen);
+        if (!mdata) {
+            return NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+        }
+    }
+    status = bbssd_drain_namespace(ns, qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
+                                    NULL);
+    if (status) {
+        g_free(mdata);
+        return status;
+    }
+    status = nvme_format_resize(ns, blks);
+    if (status != NVME_SUCCESS) {
+        g_free(mdata);
+        return status;
+    }
+    g_free(ns->mdata);
+    ns->mdata = mdata;
+    ns->mdata_len = mlen;
+
+    /*
+     * The block count and the state sized to it are changed together. Nothing
+     * observes them half-updated because the caller holds the pollers off for
+     * the whole of this; without that, a shrinking format would expose a window
+     * where the host still reads the old count against the new bitmaps.
+     */
+    id_ns->nuse = id_ns->ncap = id_ns->nsze = cpu_to_le64(blks);
+    ns->id_ns.flbas = lba_idx | meta_loc;
+    ns->id_ns.dps = !n->pi || pi ? pil | pi : 0;
+    /* the copy the FTL and Flexible Data Placement size units by */
+    ns->lbaf = id_ns->lbaf[lba_idx];
+    ns->ns_blks = ns_blks(ns, lba_idx);
+    nvme_ns_refresh_fdp(ns);
+
+    /*
+     * A format ends the life of the data whatever the erase settings say, so
+     * a read of any block must not return what was written before it. The
+     * bitmaps above are already clear, which makes every block deallocated;
+     * clear the backing store with them so a controller with the
+     * deallocated-block error disabled reads zeros rather than stale data.
+     */
+    if (n->mbe && n->mbe->logical_space) {
+        memset((uint8_t *)n->mbe->logical_space + ns->backend_offset, 0,
+               ns->size);
+    }
+    nvme_streams_release(ns, false);
+
+    /* and the FTL must stop treating the old pages as live */
+    if (NS_BBSSD(ns)) {
+        bbssd_deallocate_all(ns);
+    }
+
+    return NVME_SUCCESS;
+}
+
+static uint16_t nvme_format(FemuCtrl *n, NvmeCmd *cmd)
+{
+    NvmeNamespace *ns;
+    uint16_t status = NVME_SUCCESS;
+    bool resume;
+    bool modified = false;
+    uint8_t ev[12] = { 0 };
+    uint32_t dw10 = le32_to_cpu(cmd->cdw10);
+    uint32_t nsid = le32_to_cpu(cmd->nsid);
+
+    uint8_t lba_idx = dw10 & 0xf;
+    uint8_t meta_loc = dw10 & 0x10;
+    uint8_t pil = (dw10 >> 5) & 0x8;
+    uint8_t pi = (dw10 >> 5) & 0x7;
+    /* SES is bits 11:9; bit 8 is PIL, which used to be read as an erase */
+    uint8_t sec_erase = (dw10 >> 9) & 0x7;
+
+    if (nsid != NVME_NSID_BROADCAST) {
+        if (!nvme_nsid_valid(n, nsid)) {
+            return NVME_INVALID_NSID | NVME_DNR;
+        }
+        if (!nvme_ns_allocated(n, nsid)) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+    }
+    /* Only legacy LBA formats with 16-bit guards; no ELBAF or 64-bit PI. */
+    if (n->pi && (dw10 & (3 << 12))) {
+        return NVME_INVALID_FORMAT | NVME_DNR;
+    }
+    /*
+     * No erase or a user data erase. FNA reports no cryptographic erase, and
+     * 011b and above are reserved (Base 2.3, Figure 193).
+     */
+    if (sec_erase > 1) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    /*
+     * Decide on every namespace before touching any of them. This used to
+     * format each in turn and return on the first refusal, so a controller
+     * mixing command sets could lose the data of the namespaces already done
+     * and still report that the command failed.
+     */
+    if (nsid == 0xffffffff) {
+        for (uint32_t i = 0; i < n->namespace_limit; ++i) {
+            if (!nvme_ns(n, i + 1)) {
+                continue;
+            }
+            status = nvme_format_check(n, &n->namespaces[i].id_ns,
+                                       n->namespaces[i].femu_mode, lba_idx,
+                                       meta_loc, pil, pi);
+            if (status != NVME_SUCCESS) {
+                return status;
+            }
+        }
+    } else {
+        status = nvme_format_check(n, &n->namespaces[nsid - 1].id_ns,
+                                   n->namespaces[nsid - 1].femu_mode, lba_idx,
+                                   meta_loc, pil, pi);
+        if (status != NVME_SUCCESS) {
+            return status;
+        }
+    }
+
+    /* validated, and nothing changed yet: Format NVM Start (Figure 245) */
+    stl_le_p(ev, nsid);
+    ev[4] = n->id_ctrl.fna;
+    stl_le_p(ev + 8, dw10);
+    femu_pel_log(n, NVME_PEL_FORMAT_START, 1, ev, 12);
+
+    /*
+     * The bitmaps about to be replaced are indexed by every read and write, so
+     * no poller may be inside a sweep while they are swapped and the backing
+     * store is cleared.
+     */
+    resume = nvme_pause_pollers(n);
+
+    if (nsid == 0xffffffff) {
+        for (uint32_t i = 0; i < n->namespace_limit; ++i) {
+            ns = nvme_ns(n, i + 1);
+            if (!ns) {
+                continue;
+            }
+            status = nvme_format_namespace(ns, lba_idx, meta_loc, pil, pi,
+                                           sec_erase);
+            if (status != NVME_SUCCESS) {
+                break;
+            }
+            nvme_ns_format_changed(n, ns);
+            modified = true;
+        }
+    } else {
+        ns = &n->namespaces[nsid - 1];
+        status = nvme_format_namespace(ns, lba_idx, meta_loc, pil, pi,
+                                       sec_erase);
+        modified = status == NVME_SUCCESS;
+        if (modified) {
+            nvme_ns_format_changed(n, ns);
+        }
+    }
+
+    /*
+     * Format NVM Completion (Figure 246), only if something changed. A
+     * namespace that refuses changes nothing, so a failure after one did is
+     * an incomplete format. The status is the completion's, without phase.
+     */
+    if (modified) {
+        memset(ev, 0, sizeof(ev));
+        stl_le_p(ev, nsid);
+        ev[5] = status == NVME_SUCCESS ? 0 : 0x3;
+        stw_le_p(ev + 8, status << 1);
+        femu_pel_log(n, NVME_PEL_FORMAT_COMPLETION, 2, ev, 12);
+    }
+
+    nvme_resume_pollers(n, resume);
+
+    return status;
+}
+
+/*
+ * Only qtest can seed otherwise transient queue states. Use SQ-owned requests
+ * so completion, CQ pressure and recycling follow the normal dataplane paths.
+ */
+static void nvme_qtest_seed_ns_requests(FemuCtrl *n)
+{
+    NvmeRequest *held[9];
+    NvmeRequest *req;
+    NvmeSQueue *sq;
+    int i;
+    int p;
+
+    assert(!n->dataplane_started);
+    assert(n->sq[1] && n->sq[2] && n->cpl_backlog);
+    for (i = 0; i < ARRAY_SIZE(held); i++) {
+        sq = n->sq[1 + (i + 1) % 2];
+        req = QTAILQ_FIRST(&sq->req_list);
+        assert(req);
+        QTAILQ_REMOVE(&sq->req_list, req, entry);
+        memset(req, 0, sizeof(*req));
+        req->sq = sq;
+        req->ns = &n->namespaces[i < 5 ? 0 : 1];
+        req->cmd_opcode = NVME_CMD_FLUSH;
+        req->cqe.cid = cpu_to_le16(0x8000 + i);
+        req->expire_time = i < 5 ? INT64_MAX : 0;
+        req->status = i == 3 ? NVME_LBA_RANGE : NVME_SUCCESS;
+        req->cqe.n.result = cpu_to_le32(0x100 + i);
+        /* Completed survivor backlogs have already released their payloads. */
+        if (i < 8) {
+            req->dsm_ranges = g_new0(NvmeDsmRange, 1);
+            req->dsm_nr_ranges = 1;
+        }
+        p = 1 + (sq->sqid - 1) % n->nr_pollers;
+        switch (i < 5 ? i : i - 5) {
+        case 0:
+            femu_ring_enqueue(n->to_ftl[p], (void **)&req, 1);
+            break;
+        case 1:
+            femu_ring_enqueue(n->use_ftl_thread || i < 5 ?
+                              n->to_poller[p] : n->to_ftl[p],
+                              (void **)&req, 1);
+            break;
+        case 2:
+            pqueue_insert(n->pq[p], req);
+            break;
+        case 3:
+            QTAILQ_INSERT_TAIL(&n->cpl_backlog[p], req, entry);
+            break;
+        case 4:
+            QTAILQ_INSERT_TAIL(&n->cq[sq->cqid]->req_list, req, entry);
+            break;
+        }
+    }
+}
+
+static uint16_t nvme_ns_cmd_error(FemuCtrl *n, NvmeCmd *cmd, uint16_t status,
+                                  uint64_t info)
+{
+    status |= NVME_DNR;
+    nvme_set_error_info(n, 0, cmd->cid, status, 0xffff, 0,
+                        le32_to_cpu(cmd->nsid), info);
+    return status;
+}
+
+/* Figure 244: reserved fields stay zero, including delete-all attributes. */
+static void nvme_pel_ns_change(FemuCtrl *n, NvmeCmd *cmd, const NvmeIdNs *id,
+                                uint32_t nsid)
+{
+    uint8_t ev[48] = { 0 };
+
+    stl_le_p(ev, le32_to_cpu(cmd->cdw10));
+    if (id) {
+        memcpy(ev + 8, &id->nsze, 8);
+        memcpy(ev + 24, &id->ncap, 8);
+        ev[32] = id->flbas;
+        ev[33] = id->dps;
+        ev[34] = id->nmic;
+        memcpy(ev + 40, &id->nvmsetid, 2);
+        memcpy(ev + 42, &id->endgid, 2);
+    }
+    stl_le_p(ev + 44, nsid);
+    femu_pel_log(n, NVME_PEL_CHANGE_NS, 2, ev, sizeof(ev));
+}
+
+static uint16_t nvme_ns_mgmt(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
+{
+    FemuCtrl *storage = nvme_ns_shared(n) ? n->subsys->storage : n;
+    uint32_t sel = le32_to_cpu(cmd->cdw10) & 0xf;
+    uint32_t nsid = le32_to_cpu(cmd->nsid);
+    uint32_t allocated = 0;
+    NvmeIdNs id;
+    NvmeIdNs caps;
+    uint8_t idx;
+    uint64_t bytes;
+    uint64_t unit = 4096;
+    NvmeNamespace *ns;
+    Error *err = NULL;
+    uint64_t nsze;
+    uint16_t status;
+    bool resume;
+    int ret;
+
+    if (!nvme_ns_mgmt_supported(n)) {
+        return NVME_INVALID_OPCODE | NVME_DNR;
+    }
+    if (sel == 1) {
+        if (!nvme_nsid_valid(n, nsid)) {
+            return NVME_INVALID_NSID | NVME_DNR;
+        }
+        if (nsid != NVME_NSID_BROADCAST && !nvme_ns_allocated(n, nsid)) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        if (nsid != NVME_NSID_BROADCAST) {
+            id = nvme_ns_allocated(n, nsid)->id_ns;
+        }
+        resume = nvme_pause_pollers(n);
+        if (qtest_enabled()) {
+            for (uint32_t c = 0; c < NVME_MAX_CONTROLLERS; c++) {
+                FemuCtrl *ctrl = nvme_ns_shared(n) ?
+                                nvme_subsys_ctrl(n->subsys, c) :
+                                c == 0 ? n : NULL;
+
+                if (ctrl && ctrl->test_ns_seed) {
+                    ctrl->test_ns_seed = false;
+                    nvme_qtest_seed_ns_requests(ctrl);
+                }
+            }
+        }
+        for (uint32_t i = 1; i <= n->namespace_limit; i++) {
+            ns = nvme_ns_allocated(n, i);
+            if (ns && (nsid == NVME_NSID_BROADCAST || nsid == i)) {
+                if (nvme_ns_shared(n)) {
+                    for (uint32_t c = 0; c < NVME_MAX_CONTROLLERS; c++) {
+                        FemuCtrl *ctrl = nvme_subsys_ctrl(n->subsys, c);
+
+                        if (!ctrl) {
+                            continue;
+                        }
+                        nvme_retire_ns_requests(ctrl, ns);
+                        if (nvme_ns_attached(ctrl, ns)) {
+                            nvme_ns_changed(ctrl, ns->id, ctrl != n);
+                        }
+                        clear_bit(ns->id - 1, ctrl->attached_ns);
+                    }
+                } else {
+                    nvme_retire_ns_requests(n, ns);
+                    if (ns->attached) {
+                        /* Delete does not notify its issuing controller. */
+                        nvme_ns_changed(n, ns->id, false);
+                    }
+                }
+                nvme_ns_destroy(n, ns);
+            }
+        }
+        nvme_pel_ns_change(n, cmd, nsid == NVME_NSID_BROADCAST ? NULL : &id,
+                           nsid);
+        nvme_resume_pollers(n, resume);
+        return NVME_SUCCESS;
+    }
+    if (sel || nsid) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    if (le32_to_cpu(cmd->cdw11) >> 24 != NVME_CSI_NVM) {
+        return NVME_IOCS_NOT_SUPPORTED | NVME_DNR;
+    }
+    status = dma_write_prp(n, (uint8_t *)&id, sizeof(id),
+                           le64_to_cpu(cmd->dptr.prp1),
+                           le64_to_cpu(cmd->dptr.prp2));
+    if (status) {
+        return status;
+    }
+    nsze = le64_to_cpu(id.nsze);
+    if (!nsze || !id.ncap || le64_to_cpu(id.ncap) > nsze) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    if (le64_to_cpu(id.ncap) != nsze) {
+        return NVME_NS_THIN_PROVISION | NVME_DNR;
+    }
+    nvme_ns_common_identify(n, &caps);
+    idx = NVME_ID_NS_FLBAS_INDEX(id.flbas);
+    if ((id.flbas & 0xe0) || (id.dps & ~0xf) || (!n->pi && id.dps)) {
+        return NVME_INVALID_FORMAT | NVME_DNR;
+    }
+    status = nvme_format_check(n, &caps, n->femu_mode, idx, id.flbas & 0x10,
+                               id.dps & DPS_FIRST_EIGHT,
+                               id.dps & DPS_TYPE_MASK);
+    if (status) {
+        /* Base 2.3 Figure 386 uses Format's Invalid Format status (10Ah). */
+        return status;
+    }
+    if ((id.nmic & ~(nvme_ns_shared(n) ? 1 : 0)) ||
+        id.nvmsetid || id.endgid) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    if (ldl_le_p((uint8_t *)&id + 92)) {
+        return NVME_ANA_GROUP_INVALID | NVME_DNR;
+    }
+    if (nsze > (UINT64_MAX >> caps.lbaf[idx].lbads)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    bytes = nsze << caps.lbaf[idx].lbads;
+    if (BBSSD(n)) {
+        unit = (uint64_t)storage->bb_params.secs_per_pg *
+               storage->bb_params.secsz;
+    }
+    if (bytes > UINT64_MAX - (unit - 1)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    bytes = DIV_ROUND_UP(bytes, unit) * unit;
+    for (nsid = 1; nsid <= n->namespace_limit; nsid++) {
+        if (!nvme_ns_allocated(n, nsid)) {
+            break;
+        }
+    }
+    if (nsid > n->namespace_limit) {
+        return NVME_NS_ID_UNAVAILABLE | NVME_DNR;
+    }
+    if (BBSSD(n)) {
+        NvmeNamespace candidate = { .id = nsid, .size = bytes };
+
+        for (uint32_t i = 0; i < n->namespace_limit; i++) {
+            allocated += n->namespaces[i].allocated;
+        }
+        if (allocated >= storage->bbssd_ns_limit) {
+            return NVME_NS_ID_UNAVAILABLE | NVME_DNR;
+        }
+        /* A free backend extent may still exceed one FTL's usable capacity. */
+        if (bb_check_capacity(storage, &candidate, &err)) {
+            error_free(err);
+            return nvme_ns_cmd_error(n, cmd, NVME_NS_INSUFFICIENT_CAP, bytes);
+        }
+    }
+    resume = nvme_pause_pollers(n);
+    ret = nvme_ns_create(n, nsid, nsze, id.flbas, n->femu_mode, false,
+                         &err);
+    if (!ret && nvme_ns_shared(n)) {
+        nvme_ns_allocated(n, nsid)->id_ns.nmic = id.nmic;
+    }
+    if (!ret && n->pi) {
+        ns = nvme_ns_allocated(n, nsid);
+        status = nvme_format_namespace(ns, idx, id.flbas & 0x10,
+                                       id.dps & DPS_FIRST_EIGHT,
+                                       id.dps & DPS_TYPE_MASK, 0);
+        if (status) {
+            nvme_ns_destroy(n, ns);
+        }
+    }
+    nvme_resume_pollers(n, resume);
+    error_free(err);
+    if (ret == -ENOSPC) {
+        return nvme_ns_cmd_error(n, cmd, NVME_NS_INSUFFICIENT_CAP, bytes);
+    }
+    if (ret) {
+        return NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+    }
+    if (status) {
+        return status;
+    }
+    nvme_pel_ns_change(n, cmd, &id, nsid);
+    cqe->n.result = cpu_to_le32(nsid);
+    return NVME_SUCCESS;
+}
+
+static uint16_t nvme_ns_attachment(FemuCtrl *n, NvmeCmd *cmd)
+{
+    uint16_t list[2048];
+    uint32_t sel = le32_to_cpu(cmd->cdw10) & 0xf;
+    NvmeNamespace *ns;
+    uint16_t status;
+    uint16_t count;
+    uint32_t nsid = le32_to_cpu(cmd->nsid);
+    bool resume;
+
+    if (!nvme_ns_mgmt_supported(n)) {
+        return NVME_INVALID_OPCODE | NVME_DNR;
+    }
+    if (sel > 1) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    if (!nvme_nsid_valid(n, nsid) || nsid == NVME_NSID_BROADCAST) {
+        return NVME_INVALID_NSID | NVME_DNR;
+    }
+    ns = nvme_ns_allocated(n, nsid);
+    if (!ns) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    status = dma_write_prp(n, (uint8_t *)list, sizeof(list),
+                           le64_to_cpu(cmd->dptr.prp1),
+                           le64_to_cpu(cmd->dptr.prp2));
+    if (status) {
+        return status;
+    }
+    count = le16_to_cpu(list[0]);
+    if (!count || count >= ARRAY_SIZE(list)) {
+        return nvme_ns_cmd_error(n, cmd, NVME_CTRL_LIST_INVALID, 0);
+    }
+    /* Validate every target before mutating the attachment set. */
+    for (uint16_t i = 1; i <= count; i++) {
+        uint16_t id = le16_to_cpu(list[i]);
+        FemuCtrl *ctrl = nvme_ns_shared(n) ? nvme_subsys_ctrl(n->subsys, id) :
+                         id == n->cntlid ? n : NULL;
+
+        if (!ctrl || (i > 1 && id <= le16_to_cpu(list[i - 1]))) {
+            return nvme_ns_cmd_error(n, cmd, NVME_CTRL_LIST_INVALID, 2 * i);
+        }
+        if (nvme_ns_attached(ctrl, ns) == !sel) {
+            return nvme_ns_cmd_error(n, cmd,
+                                    sel ? NVME_NS_NOT_ATTACHED :
+                                    NVME_NS_ALREADY_ATTACHED, 2 * i);
+        }
+    }
+    if (!sel && nvme_ns_shared(n) && !(ns->id_ns.nmic & 1)) {
+        if (count > 1) {
+            return nvme_ns_cmd_error(n, cmd, NVME_NS_PRIVATE, 2);
+        }
+        for (uint32_t i = 0; i < NVME_MAX_CONTROLLERS; i++) {
+            FemuCtrl *ctrl = nvme_subsys_ctrl(n->subsys, i);
+
+            if (ctrl && nvme_ns_attached(ctrl, ns)) {
+                return nvme_ns_cmd_error(n, cmd, NVME_NS_PRIVATE, 2);
+            }
+        }
+    }
+    resume = nvme_pause_pollers(n);
+    for (uint16_t i = 1; i <= count; i++) {
+        FemuCtrl *ctrl = nvme_ns_shared(n) ?
+                        nvme_subsys_ctrl(n->subsys, le16_to_cpu(list[i])) : n;
+
+        if (sel) {
+            nvme_retire_ns_requests(ctrl, ns);
+        }
+        if (nvme_ns_shared(n)) {
+            if (sel) {
+                clear_bit(nsid - 1, ctrl->attached_ns);
+            } else {
+                set_bit(nsid - 1, ctrl->attached_ns);
+            }
+        } else {
+            ns->attached = !sel;
+        }
+        nvme_ns_changed(ctrl, ns->id, true);
+    }
+    nvme_resume_pollers(n, resume);
+    return NVME_SUCCESS;
+}
+
+static uint16_t nvme_admin_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
+{
+    /* admin data is always moved by PRP over PCIe */
+    if (cmd->psdt != NVME_PSDT_PRP) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    switch (cmd->opcode) {
+    case NVME_ADM_CMD_DIRECTIVE_SEND:
+    case NVME_ADM_CMD_DIRECTIVE_RECV:
+        if (n->streams || nvme_fdp_directive(n)) {
+            return nvme_directive(n, cmd, cqe);
+        }
+        return NVME_INVALID_OPCODE | NVME_DNR;
+    case NVME_ADM_CMD_NS_MGMT:
+        return nvme_ns_mgmt(n, cmd, cqe);
+    case NVME_ADM_CMD_NS_ATTACHMENT:
+        return nvme_ns_attachment(n, cmd);
+    case NVME_ADM_CMD_FEMU_DEBUG:
+        /* only the Open-Channel timing model has these times; log 05h agrees */
+        if (!OCSSD(n)) {
+            return NVME_INVALID_OPCODE | NVME_DNR;
+        }
+        oc_set_latency(n, le32_to_cpu(cmd->cdw10), le32_to_cpu(cmd->cdw11),
+                       le32_to_cpu(cmd->cdw12), le32_to_cpu(cmd->cdw13),
+                       le32_to_cpu(cmd->cdw14), le32_to_cpu(cmd->cdw15));
+        femu_log("tRu=%u, tRl=%u, tWu=%u, tWl=%u, tBERS=%u, tCHNL=%u\n",
+                 le32_to_cpu(cmd->cdw10), le32_to_cpu(cmd->cdw11),
+                 le32_to_cpu(cmd->cdw12), le32_to_cpu(cmd->cdw13),
+                 le32_to_cpu(cmd->cdw14), le32_to_cpu(cmd->cdw15));
+        return NVME_SUCCESS;
+    case NVME_ADM_CMD_DELETE_SQ:
+        femu_debug("admin cmd,del_sq\n");
+        return nvme_del_sq(n, cmd);
+    case NVME_ADM_CMD_CREATE_SQ:
+        femu_debug("admin cmd,create_sq\n");
+        return nvme_create_sq(n, cmd);
+    case NVME_ADM_CMD_DELETE_CQ:
+        femu_debug("admin cmd,del_cq\n");
+        return nvme_del_cq(n, cmd);
+    case NVME_ADM_CMD_CREATE_CQ:
+        femu_debug("admin cmd,create_cq\n");
+        return nvme_create_cq(n, cmd);
+    case NVME_ADM_CMD_IDENTIFY:
+        femu_debug("admin cmd,identify\n");
+        return nvme_identify(n, cmd);
+    case NVME_ADM_CMD_SET_FEATURES:
+        femu_debug("admin cmd,set_feature\n");
+        return nvme_set_feature(n, cmd, cqe);
+    case NVME_ADM_CMD_GET_FEATURES:
+        femu_debug("admin cmd,get_feature\n");
+        return nvme_get_feature(n, cmd, cqe);
+    case NVME_ADM_CMD_GET_LOG_PAGE:
+        femu_debug("admin cmd,get_log_page\n");
+        return nvme_get_log(n, cmd);
+    case NVME_ADM_CMD_ABORT:
+        femu_debug("admin cmd,abort\n");
+        return nvme_abort_req(n, cmd, &cqe->n.result);
+    case NVME_ADM_CMD_FORMAT_NVM:
+        femu_debug("admin cmd,format_nvm\n");
+        if (NVME_OACS_FORMAT & n->oacs) {
+            return nvme_format(n, cmd);
+        }
+        return NVME_INVALID_OPCODE | NVME_DNR;
+    case NVME_ADM_CMD_SET_DB_MEMORY:
+        femu_debug("admin cmd,set_db_memory\n");
+        return nvme_set_db_memory(n, cmd);
+    case NVME_ADM_CMD_SANITIZE:
+        return nvme_sanitize(n, cmd);
+    case NVME_ADM_CMD_GET_LBA_STATUS:
+        return nvme_get_lba_status(n, cmd);
+    case NVME_ADM_CMD_DEV_SELF_TEST:
+        return nvme_dev_self_test(n, cmd);
+    case NVME_ADM_CMD_ASYNC_EV_REQ:
+        /*
+         * Held outstanding until an event is queued for it; the fetch loop
+         * records it and nvme_process_aers() completes it.
+         */
+        femu_debug("admin cmd,async_event_request (held pending)\n");
+        if (n->outstanding_aers > n->aerl) {
+            return NVME_AER_LIMIT_EXCEEDED;
+        }
+        return NVME_NO_COMPLETE;
+    case NVME_ADM_CMD_ACTIVATE_FW:
+    case NVME_ADM_CMD_DOWNLOAD_FW:
+    case NVME_ADM_CMD_SECURITY_SEND:
+    case NVME_ADM_CMD_SECURITY_RECV:
+        return NVME_INVALID_OPCODE | NVME_DNR;
+    default:
+        if (n->ext_ops.admin_cmd_cqe) {
+            return n->ext_ops.admin_cmd_cqe(n, cmd, cqe);
+        }
+        if (n->ext_ops.admin_cmd) {
+            return n->ext_ops.admin_cmd(n, cmd);
+        }
+
+        return NVME_INVALID_OPCODE | NVME_DNR;
+    }
+}
+
+/* an event is dropped rather than growing this queue without bound */
+#define FEMU_AER_MAX_QUEUED 16
+
+/* Post one admin completion for an entry the controller had been holding. */
+static void nvme_post_held_cqe(FemuCtrl *n, const NvmeAerHold *hold,
+                               const NvmeAerResult *result, uint32_t nsid)
+{
+    NvmeCQueue *cq = n->cq[hold->cqid];
+    NvmeSQueue *sq = n->sq[hold->sqid];
+    NvmeCqe cqe;
+
+    /*
+     * is_active is not checked here: it marks a queue brought up by Create I/O
+     * Completion Queue, and the admin queue an Async Event Request arrives on
+     * is built at controller enable instead, so it never carries the flag.
+     */
+    if (!cq) {
+        return;
+    }
+
+    memset(&cqe, 0, sizeof(cqe));
+    memcpy(&cqe.n.result, result, sizeof(*result));
+    cqe.n.rsvd = cpu_to_le32(nsid);
+    cqe.cid = hold->cid;
+    cqe.status = cpu_to_le16(NVME_SUCCESS << 1 | cq->phase);
+    cqe.sq_id = cpu_to_le16(hold->sqid);
+    /* where the queue head is now, not where it was when the request came */
+    cqe.sq_head = cpu_to_le16(sq ? sq->head : hold->sq_head);
+
+    nvme_write_cqe(n, cq, &cqe);
+    nvme_inc_cq_tail(cq);
+    nvme_isr_notify_admin(cq);
+}
+
+/*
+ * Hand queued events to the Async Event Requests the host has outstanding.
+ *
+ * One event of a given type is reported at a time: posting sets that type in
+ * aer_mask, and the mask is only cleared when the host reads the log page the
+ * event pointed at. Until then further events of that type stay queued, so the
+ * host is not told the same thing twice before it has looked.
+ */
+/*
+ * Post queued events. Only ever called from the vCPU thread or from the
+ * aer_bh bottom half, both of which hold the BQL, so outstanding_aers,
+ * aer_mask and aer_held need no lock of their own. aer_lock covers just the
+ * queue and its count, which a poller thread also appends to.
+ */
+void nvme_process_aers(FemuCtrl *n)
+{
+    for (;;) {
+        NvmeAsyncEvent *event = NULL, *cand, *next;
+
+        /* a full completion queue takes the event once the host makes room */
+        if (n->outstanding_aers) {
+            NvmeCQueue *cq = n->cq[n->aer_held[n->outstanding_aers - 1].cqid];
+
+            if (cq && nvme_cq_full(cq)) {
+                return;
+            }
+        }
+
+        qemu_mutex_lock(&n->aer_lock);
+        QSIMPLEQ_FOREACH_SAFE(cand, &n->aer_queue, entry, next) {
+            if (!n->outstanding_aers) {
+                break;          /* nothing to complete it with */
+            }
+            if (nvme_is_ns_notice(cand) ? n->ns_notice_masked :
+                n->aer_mask & (1 << cand->result.event_type)) {
+                continue;       /* already reported, awaiting the log read */
+            }
+            QSIMPLEQ_REMOVE(&n->aer_queue, cand, NvmeAsyncEvent, entry);
+            n->aer_queued--;
+            event = cand;
+            break;
+        }
+        qemu_mutex_unlock(&n->aer_lock);
+
+        if (!event) {
+            return;
+        }
+
+        if (nvme_is_ns_notice(event)) {
+            n->ns_notice_masked = true;
+        } else {
+            n->aer_mask |= 1 << event->result.event_type;
+        }
+        n->outstanding_aers--;
+
+        nvme_post_held_cqe(n, &n->aer_held[n->outstanding_aers],
+                           &event->result, event->nsid);
+        g_free(event);
+    }
+}
+
+/*
+ * Raise an asynchronous event, reporting it as soon as an AER is available. An
+ * event about one namespace names it in dword 1 of the completion.
+ */
+void nvme_enqueue_ns_event(FemuCtrl *n, uint8_t event_type, uint8_t event_info,
+                           uint8_t log_page, uint32_t nsid)
+{
+    NvmeAsyncEvent *event;
+
+    event = g_new0(NvmeAsyncEvent, 1);
+    event->result.event_type = event_type;
+    event->result.event_info = event_info;
+    event->result.log_page = log_page;
+    event->nsid = nsid;
+
+    qemu_mutex_lock(&n->aer_lock);
+    if (n->aer_queued >= FEMU_AER_MAX_QUEUED) {
+        qemu_mutex_unlock(&n->aer_lock);
+        g_free(event);
+        return;
+    }
+    QSIMPLEQ_INSERT_TAIL(&n->aer_queue, event, entry);
+    n->aer_queued++;
+    qemu_mutex_unlock(&n->aer_lock);
+
+    /*
+     * Posting happens in the bottom half. A zoned namespace raises events from
+     * its I/O handler, which runs on a poller thread, and that thread must not
+     * touch the admin completion queue the vCPU thread is serving.
+     */
+    qemu_bh_schedule(n->aer_bh);
+}
+
+void nvme_enqueue_event(FemuCtrl *n, uint8_t event_type, uint8_t event_info,
+                        uint8_t log_page)
+{
+    nvme_enqueue_ns_event(n, event_type, event_info, log_page, 0);
+}
+
+/*
+ * The host has read the log page an event pointed at, so that type may be
+ * reported again. Drop any still-queued events of the type as well: the host
+ * has just seen the state they describe.
+ */
+/*
+ * The host has read the log behind one namespace's event: that type may be
+ * reported again, and events for the other namespaces still queued go out.
+ */
+void nvme_clear_ns_events(FemuCtrl *n, uint8_t event_type, uint32_t nsid)
+{
+    NvmeAsyncEvent *event, *next;
+
+    n->aer_mask &= ~(1 << event_type);
+
+    qemu_mutex_lock(&n->aer_lock);
+    QSIMPLEQ_FOREACH_SAFE(event, &n->aer_queue, entry, next) {
+        if (event->result.event_type == event_type && event->nsid == nsid) {
+            QSIMPLEQ_REMOVE(&n->aer_queue, event, NvmeAsyncEvent, entry);
+            n->aer_queued--;
+            g_free(event);
+        }
+    }
+    qemu_mutex_unlock(&n->aer_lock);
+
+    nvme_process_aers(n);
+}
+
+void nvme_clear_events(FemuCtrl *n, uint8_t event_type)
+{
+    NvmeAsyncEvent *event, *next;
+
+    n->aer_mask &= ~(1 << event_type);
+
+    /*
+     * Every other place that touches the queue holds this, because a poller
+     * can be appending to it: the zoned mode reports a zone taken read only
+     * from there. Walking it unlocked can free an entry the bottom half is
+     * about to post and leaves the count out of step with the list.
+     */
+    qemu_mutex_lock(&n->aer_lock);
+    QSIMPLEQ_FOREACH_SAFE(event, &n->aer_queue, entry, next) {
+        if (event->result.event_type == event_type) {
+            QSIMPLEQ_REMOVE(&n->aer_queue, event, NvmeAsyncEvent, entry);
+            n->aer_queued--;
+            g_free(event);
+        }
+    }
+    qemu_mutex_unlock(&n->aer_lock);
+}
+
+void nvme_process_sq_admin(void *opaque)
+{
+    NvmeSQueue *sq = opaque;
+    FemuCtrl *n = sq->ctrl;
+    NvmeCQueue *cq = n->cq[sq->cqid];
+
+    uint16_t status;
+    hwaddr addr;
+    NvmeCmd cmd;
+    NvmeCqe cqe;
+    bool aborted;
+
+    /*
+     * A command is only fetched while its completion has somewhere to go. The
+     * rest stay in the queue until the host frees a slot, which resumes this
+     * from the completion queue head doorbell.
+     */
+    while (!nvme_sq_empty(sq) && !nvme_cq_full(cq)) {
+        if (sq->phys_contig) {
+            addr = sq->dma_addr + sq->head * n->sqe_size;
+        } else {
+            addr = nvme_discontig(sq->prp_list, sq->head, n->page_size,
+                    n->sqe_size);
+        }
+        nvme_addr_read(n, addr, (void *)&cmd, sizeof(cmd));
+        aborted = sq->nr_aborts && nvme_take_abort(sq, cmd.cid);
+        nvme_inc_sq_head(sq);
+
+        memset(&cqe, 0, sizeof(cqe));
+
+        status = aborted ? NVME_CMD_ABORT_REQ : nvme_admin_cmd(n, &cmd, &cqe);
+        if (status == NVME_NO_COMPLETE) {
+            /*
+             * Held pending: no completion now. An Async Event Request is
+             * recorded here rather than in the handler because the entry it
+             * will eventually be completed with is identified by the queue it
+             * arrived on, which the handler does not see.
+             */
+            if (cmd.opcode == NVME_ADM_CMD_ASYNC_EV_REQ) {
+                NvmeAerHold *hold = &n->aer_held[n->outstanding_aers++];
+
+                hold->cid = cmd.cid;
+                hold->sqid = sq->sqid;
+                hold->cqid = sq->cqid;
+                hold->sq_head = sq->head;
+                if (!QSIMPLEQ_EMPTY(&n->aer_queue)) {
+                    nvme_process_aers(n);
+                }
+            }
+            continue;
+        }
+        cqe.cid = cmd.cid;
+        cqe.status = cpu_to_le16(status << 1 | cq->phase);
+        cqe.sq_id = cpu_to_le16(sq->sqid);
+        cqe.sq_head = cpu_to_le16(sq->head);
+
+        nvme_write_cqe(n, cq, &cqe);
+        nvme_inc_cq_tail(cq);
+        nvme_isr_notify_admin(cq);
+    }
+}

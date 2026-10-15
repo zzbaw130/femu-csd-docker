@@ -1,0 +1,1006 @@
+# -*- Mode: Python -*-
+# vim: filetype=python
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+##
+# ************
+# FEMU devices
+# ************
+##
+
+##
+# @FemuMode:
+#
+# Mode of a FEMU controller or namespace, as femu_mode and
+# namespace_modes name it.
+#
+# @ocssd: OpenChannel SSD
+#
+# @bbssd: blackbox SSD with a device-side FTL
+#
+# @nossd: no FTL, memory timing only
+#
+# @znssd: zoned namespace SSD
+#
+# @csd: computational storage drive
+#
+# @kvssd: key-value SSD
+#
+# Since: 10.1
+##
+{ 'enum': 'FemuMode',
+  'data': [ 'ocssd', 'bbssd', 'nossd', 'znssd', 'csd', 'kvssd' ] }
+
+##
+# @FemuQueryKind:
+#
+# What @query-femu reports for each namespace.
+#
+# @summary: identity, and the members of the namespace mode: for a
+#     blackbox namespace the geometry, write counters and line counts
+#     (reclaim unit counts and handles with flexible data placement),
+#     for a zoned namespace the zone geometry, limits and zone counts
+#
+# @lines: the summary and one record per line, for a window of lines.
+#     Blackbox namespaces without flexible data placement only.
+#
+# @zones: the summary and one record per zone, for a window of zones.
+#     Zoned namespaces only.
+#
+# @reclaim-units: the summary and one record per reclaim unit, for a
+#     window of units.  Blackbox namespaces with flexible data placement
+#     only.
+#
+# Since: 10.1
+##
+{ 'enum': 'FemuQueryKind',
+  'data': [ 'summary', 'lines', 'zones', 'reclaim-units' ] }
+
+##
+# @FemuLineState:
+#
+# Where the flash translation layer holds a line.
+#
+# @free: on the free list, erased and ready to program
+#
+# @open: a write pointer is programming it
+#
+# @full: closed with every page valid
+#
+# @victim: closed with invalid pages, a garbage collection candidate
+#
+# @reclaiming: garbage collection is moving its valid pages
+#
+# @unlisted: on no list the FTL keeps
+#
+# @retired: taken out of service after a block in it wore out
+#
+# @spare: held back so its blocks can replace worn-out ones
+#
+# Since: 10.1
+##
+{ 'enum': 'FemuLineState',
+  'data': [ 'free', 'open', 'full', 'victim', 'reclaiming', 'unlisted',
+            'retired', 'spare' ] }
+
+##
+# @FemuGeometry:
+#
+# NAND geometry of a namespace.  A line takes the same block index in
+# every plane of every LUN of every channel.
+#
+# @channels: channels
+#
+# @luns-per-channel: LUNs per channel
+#
+# @planes-per-lun: planes per LUN
+#
+# @blocks-per-plane: blocks per plane, which is also the number of
+#     lines
+#
+# @pages-per-block: pages per block
+#
+# @page-size: bytes per page
+#
+# @pages-per-line: pages per line
+#
+# Since: 10.1
+##
+{ 'struct': 'FemuGeometry',
+  'data': { 'channels': 'uint32', 'luns-per-channel': 'uint32',
+            'planes-per-lun': 'uint32', 'blocks-per-plane': 'uint32',
+            'pages-per-block': 'uint32', 'page-size': 'uint32',
+            'pages-per-line': 'uint32' } }
+
+##
+# @FemuWriteCounters:
+#
+# Write and erase counters of a namespace.  The page counters are the
+# ones vendor log page C0h reports, there summed over the namespaces
+# of the controller.
+#
+# @host-write-pages: pages the host asked to program
+#
+# @nand-write-pages: pages programmed on behalf of the host
+#
+# @gc-write-pages: pages relocated by garbage collection
+#
+# @block-erases: block erases, summed over every block
+#
+# @pad-write-pages: pages programmed with pad data to close lines or
+#     reclaim units left open past pd_open_close_sec.  Absent when no
+#     page was padded.
+#
+# @waf: write amplification factor, (@nand-write-pages +
+#     @gc-write-pages + @pad-write-pages) / @host-write-pages.  Absent
+#     until the host has written a page.
+#
+# Since: 10.1
+##
+{ 'struct': 'FemuWriteCounters',
+  'data': { 'host-write-pages': 'uint64', 'nand-write-pages': 'uint64',
+            'gc-write-pages': 'uint64', 'block-erases': 'uint64',
+            '*pad-write-pages': 'uint64', '*waf': 'number' } }
+
+##
+# @FemuLineCounts:
+#
+# How many lines are in each state.
+#
+# @free: lines on the free list
+#
+# @victim: lines waiting for garbage collection
+#
+# @full: closed lines with every page valid
+#
+# @retired: lines taken out of service after a block wore out
+#
+# @spare: lines held back as replacement blocks
+#
+# @total: every line of the namespace
+#
+# Since: 10.1
+##
+{ 'struct': 'FemuLineCounts',
+  'data': { 'free': 'uint32', 'victim': 'uint32', 'full': 'uint32',
+            'retired': 'uint32', 'spare': 'uint32', 'total': 'uint32' } }
+
+##
+# @FemuLineInfo:
+#
+# One line of a namespace.
+#
+# @id: line index, from 0
+#
+# @state: where the FTL holds the line
+#
+# @vpc: valid pages in the line
+#
+# @ipc: invalid pages in the line
+#
+# @erase-min: fewest erases of a block in the line
+#
+# @erase-max: most erases of a block in the line
+#
+# Since: 10.1
+##
+{ 'struct': 'FemuLineInfo',
+  'data': { 'id': 'uint32', 'state': 'FemuLineState', 'vpc': 'uint32',
+            'ipc': 'uint32', 'erase-min': 'uint32', 'erase-max': 'uint32' } }
+
+##
+# @FemuZoneState:
+#
+# State of a zone, as Report Zones gives it.
+#
+# @empty: no data written since the last reset
+#
+# @implicitly-open: opened by a write
+#
+# @explicitly-open: opened by an Open Zone command
+#
+# @closed: holds data, not open
+#
+# @read-only: can be read, not written
+#
+# @full: written to its capacity, or finished
+#
+# @offline: can be neither read nor written
+#
+# Since: 10.1
+##
+{ 'enum': 'FemuZoneState',
+  'data': [ 'empty', 'implicitly-open', 'explicitly-open', 'closed',
+            'read-only', 'full', 'offline' ] }
+
+##
+# @FemuZoneType:
+#
+# Write rule of a zone.
+#
+# @sequential: writes must start at the write pointer
+#
+# @conventional: writes may go to any block of the zone
+#
+# Since: 10.1
+##
+{ 'enum': 'FemuZoneType',
+  'data': [ 'sequential', 'conventional' ] }
+
+##
+# @FemuZoneCounts:
+#
+# How many zones are in each state.
+#
+# @empty: empty zones
+#
+# @implicitly-open: zones opened by a write
+#
+# @explicitly-open: zones opened by an Open Zone command
+#
+# @closed: closed zones
+#
+# @read-only: read-only zones
+#
+# @full: full zones
+#
+# @offline: offline zones
+#
+# @total: every zone of the namespace
+#
+# Since: 10.1
+##
+{ 'struct': 'FemuZoneCounts',
+  'data': { 'empty': 'uint32', 'implicitly-open': 'uint32',
+            'explicitly-open': 'uint32', 'closed': 'uint32',
+            'read-only': 'uint32', 'full': 'uint32', 'offline': 'uint32',
+            'total': 'uint32' } }
+
+##
+# @FemuZoneInfo:
+#
+# One zone of a namespace.  Addresses and sizes are in logical blocks.
+#
+# @index: zone index, from 0
+#
+# @type: write rule of the zone
+#
+# @state: zone state
+#
+# @start-lba: first logical block of the zone
+#
+# @capacity: writable logical blocks of the zone
+#
+# @write-pointer: the next logical block a write must use, as Report
+#     Zones gives it.  Absent when Report Zones has no valid write
+#     pointer: a conventional zone, or a full, read-only or offline
+#     zone.
+#
+# @zrwa: the zone holds a zone random write area
+#
+# Since: 10.1
+##
+{ 'struct': 'FemuZoneInfo',
+  'data': { 'index': 'uint32', 'type': 'FemuZoneType',
+            'state': 'FemuZoneState', 'start-lba': 'uint64',
+            'capacity': 'uint64', '*write-pointer': 'uint64',
+            'zrwa': 'bool' } }
+
+##
+# @FemuReclaimUnitState:
+#
+# Where the flash translation layer holds a reclaim unit.
+#
+# @free: on the free list, erased and ready to program
+#
+# @open: a handle writes host data or collected data to it
+#
+# @full: closed with every page valid
+#
+# @victim: closed with invalid or unwritten pages, a garbage collection
+#     candidate.  A Reclaim Unit Handle Update closes a unit before it
+#     fills.
+#
+# @unlisted: on no list the FTL keeps
+#
+# Since: 10.1
+##
+{ 'enum': 'FemuReclaimUnitState',
+  'data': [ 'free', 'open', 'full', 'victim', 'unlisted' ] }
+
+##
+# @FemuRuHandleType:
+#
+# Isolation of a reclaim unit handle.
+#
+# @initially-isolated: garbage collection may mix its data with the
+#     data of other initially isolated handles
+#
+# @persistently-isolated: garbage collection keeps its data apart
+#
+# Since: 10.1
+##
+{ 'enum': 'FemuRuHandleType',
+  'data': [ 'initially-isolated', 'persistently-isolated' ] }
+
+##
+# @FemuRuHandleInfo:
+#
+# One reclaim unit handle.  The byte counters count whole NAND pages,
+# as the FDP Statistics log does, keep their values when a controller
+# replaces another on the same subsystem, and saturate.
+#
+# @id: handle index, from 0
+#
+# @type: isolation of the handle
+#
+# @host-bytes: bytes of the NAND pages the host wrote through the handle
+#
+# @media-bytes: bytes programmed for the handle: host writes, data that
+#     garbage collection moved out of its units, and pad pages that
+#     closed its units
+#
+# Since: 10.1
+##
+{ 'struct': 'FemuRuHandleInfo',
+  'data': { 'id': 'uint32', 'type': 'FemuRuHandleType',
+            'host-bytes': 'uint64', 'media-bytes': 'uint64' } }
+
+##
+# @FemuReclaimUnitCounts:
+#
+# How many reclaim units are in each state.
+#
+# @free: units on the free list
+#
+# @open: units a handle writes to
+#
+# @full: closed units with every page valid
+#
+# @victim: units waiting for garbage collection
+#
+# @total: every reclaim unit, over every reclaim group
+#
+# Since: 10.1
+##
+{ 'struct': 'FemuReclaimUnitCounts',
+  'data': { 'free': 'uint32', 'open': 'uint32', 'full': 'uint32',
+            'victim': 'uint32', 'total': 'uint32' } }
+
+##
+# @FemuReclaimUnitInfo:
+#
+# One reclaim unit.  Page counts are in NAND pages.
+#
+# @group: reclaim group index, from 0
+#
+# @unit: unit index in its group, from 0
+#
+# @handle: the handle that wrote the unit.  Absent for a free unit.
+#
+# @state: where the FTL holds the unit
+#
+# @vpc: valid pages in the unit
+#
+# @ipc: invalid pages in the unit
+#
+# @erase-min: fewest erases of a block in the unit
+#
+# @erase-max: most erases of a block in the unit
+#
+# Since: 10.1
+##
+{ 'struct': 'FemuReclaimUnitInfo',
+  'data': { 'group': 'uint32', 'unit': 'uint32', '*handle': 'uint32',
+            'state': 'FemuReclaimUnitState', 'vpc': 'uint32',
+            'ipc': 'uint32', 'erase-min': 'uint32', 'erase-max': 'uint32' } }
+
+##
+# @FemuFdpInfo:
+#
+# Flexible data placement state of a blackbox namespace.
+#
+# @reclaim-groups: reclaim groups
+#
+# @units-per-group: reclaim units in each group
+#
+# @pages-per-unit: NAND pages in each reclaim unit
+#
+# @handles: every reclaim unit handle, in index order
+#
+# @unit-counts: reclaim units in each state
+#
+# @reclaim-units: with kind @reclaim-units, the units from the offset,
+#     at most limit of them, by group and then by unit
+#
+# Since: 10.1
+##
+{ 'struct': 'FemuFdpInfo',
+  'data': { 'reclaim-groups': 'uint32', 'units-per-group': 'uint32',
+            'pages-per-unit': 'uint32', 'handles': [ 'FemuRuHandleInfo' ],
+            'unit-counts': 'FemuReclaimUnitCounts',
+            '*reclaim-units': [ 'FemuReclaimUnitInfo' ] } }
+
+##
+# @FemuMediaTiming:
+#
+# The NAND bus timing a namespace charges.  The values are the ones
+# the media layer uses, after its fallbacks: a command phase that the
+# ONFI profile does not set takes cmd_addr_lat.  With @staged-bus false
+# the bus costs nothing, so every bus phase is 0.  Times are in
+# nanoseconds.
+#
+# @staged-bus: the channel bus phases are charged
+#
+# @onfi-profile: the ONFI 6.0 profile (onfi_mode 0 to 26) sets the bus
+#     phases
+#
+# @onfi-mode: the ONFI 6.0 timing mode.  Present only with
+#     @onfi-profile.  With a parameter page and onfi_mode -1, it is the
+#     highest mode that the page lists.
+#
+# @column-cycles: the column address cycles of a command, or 0 without
+#     @onfi-profile
+#
+# @row-cycles: the row address cycles of a command, or 0 without
+#     @onfi-profile
+#
+# @page-transfer-ns: one page on the bus
+#
+# @read-command-ns: command and address of a read
+#
+# @program-command-ns: command and address of a program
+#
+# @erase-command-ns: command and address of an erase
+#
+# @copyback-read-command-ns: command and address of the read of a
+#     copyback
+#
+# @copyback-program-command-ns: command and address of the program of
+#     a copyback
+#
+# @status-ns: one status read
+#
+# @data-out-lead-ns: the command and preamble before the page of a
+#     read.  With @sca, the column select on the CA bus plus the tCCS
+#     wait, which holds no bus.
+#
+# @data-out-tail-ns: the postamble and turnaround after the page of a
+#     read
+#
+# @plane-select-ns: the column select before each page of a
+#     multi-plane read
+#
+# @data-in-edges-ns: the preamble and postamble of the page of a
+#     program
+#
+# @program-confirm-ns: the confirm cycle after the page of a program
+#
+# @plane-read-busy-ns: tPLRBSY, the gap between the planes of a
+#     multi-plane read.  It applies with the bus on or off.
+#
+# @plane-program-busy-ns: tPLPBSY, the same gap for a program
+#
+# @plane-erase-busy-ns: tPLEBSY, the same gap for an erase
+#
+# @data-in-gap-ns: with @sca, the wait from the end of a program
+#     command to its data burst: tCDL less the SCE packet, tSCD and
+#     tWPRE2, because tCDL ends with the write preamble; else 0
+#
+# @data-out-edges-ns: with @sca, the data bus time of a read burst
+#     without the page: the SCE and SCT packets, the preambles and the
+#     holds; else 0
+#
+# @sca: the SCA protocol is on.  Then the command, status and
+#     confirm members are times on the separate command and address
+#     bus, and the data bus carries only bursts.  The lead and
+#     plane-select members are the column select on that bus plus the
+#     tCCS wait, which holds no bus.
+#
+# @cache-read: the pages of one read command that land on one LUN form
+#     a read cache sequence (onfi_cache_read)
+#
+# @read-cache-busy-ns: tRCBSY, the busy time of each copy in a read
+#     cache sequence; 0 without @cache-read
+#
+# @cache-step-ns: the 31h or 3Fh command of a read cache sequence; 0
+#     without @cache-read
+#
+# @cache-select-ns: the status that selects the LUN before each 31h or
+#     3Fh when several LUNs share a channel; 0 with one LUN, or without
+#     @cache-read
+#
+# @onfi-order: a read reads its status before its data out, and a
+#     program or erase ends at its status
+#
+# @page-register-hold: an op sends its command only when its LUN is
+#     ready, and holds the LUN until its last bus phase ends
+#
+# @status-per-plane: a multi-plane program or erase reads one status
+#     for each plane
+#
+# Since: 10.1
+##
+{ 'struct': 'FemuMediaTiming',
+  'data': { 'staged-bus': 'bool', 'onfi-profile': 'bool',
+            '*onfi-mode': 'uint8', 'column-cycles': 'uint8',
+            'row-cycles': 'uint8', 'page-transfer-ns': 'uint64',
+            'read-command-ns': 'uint64', 'program-command-ns': 'uint64',
+            'erase-command-ns': 'uint64',
+            'copyback-read-command-ns': 'uint64',
+            'copyback-program-command-ns': 'uint64',
+            'status-ns': 'uint64', 'data-out-lead-ns': 'uint64',
+            'data-out-tail-ns': 'uint64', 'plane-select-ns': 'uint64',
+            'data-in-edges-ns': 'uint64', 'program-confirm-ns': 'uint64',
+            'plane-read-busy-ns': 'uint64',
+            'plane-program-busy-ns': 'uint64',
+            'plane-erase-busy-ns': 'uint64', 'data-in-gap-ns': 'uint64',
+            'data-out-edges-ns': 'uint64', 'sca': 'bool',
+            'cache-read': 'bool', 'read-cache-busy-ns': 'uint64',
+            'cache-step-ns': 'uint64', 'cache-select-ns': 'uint64',
+            'onfi-order': 'bool',
+            'page-register-hold': 'bool', 'status-per-plane': 'bool' } }
+
+##
+# @FemuMediaInfo:
+#
+# A namespace that @query-femu reports only the NAND bus timing of:
+# a computational storage (csd), key-value (kvssd) or OpenChannel
+# (ocssd) namespace.
+#
+# @media: NAND bus timing
+#
+# Since: 10.1
+##
+{ 'struct': 'FemuMediaInfo',
+  'data': { 'media': 'FemuMediaTiming' } }
+
+##
+# @FemuBbssdInfo:
+#
+# State of a blackbox namespace, copied by the FTL thread between two
+# requests, so its fields agree with each other.
+#
+# @geometry: NAND geometry
+#
+# @counters: write and erase counters
+#
+# @media: NAND bus timing
+#
+# @line-counts: lines in each state.  Absent with flexible data
+#     placement, where reclaim units hold the lines.
+#
+# @fdp: flexible data placement state.  Present only when it is on.
+#
+# @lines: with kind @lines, the lines from @offset, at most limit of
+#     them
+#
+# @offset: with kind @lines or @reclaim-units, the index of the first
+#     record in the listing
+#
+# @next-offset: with kind @lines or @reclaim-units, the offset that
+#     continues the listing.  Absent after the last record.
+#
+# Since: 10.1
+##
+{ 'struct': 'FemuBbssdInfo',
+  'data': { 'geometry': 'FemuGeometry',
+            'counters': 'FemuWriteCounters',
+            'media': 'FemuMediaTiming',
+            '*line-counts': 'FemuLineCounts', '*fdp': 'FemuFdpInfo',
+            '*lines': [ 'FemuLineInfo' ], '*offset': 'uint32',
+            '*next-offset': 'uint32' } }
+
+##
+# @FemuZonedInfo:
+#
+# State of a zoned namespace, copied under its zone lock, so its
+# fields agree with each other.  Addresses and sizes are in logical
+# blocks.
+#
+# @lba-size: bytes per logical block
+#
+# @zone-size: logical blocks per zone
+#
+# @zone-capacity: writable logical blocks per zone
+#
+# @max-open: the most zones that may be open at once, or 0 for no
+#     limit
+#
+# @max-active: the most zones that may be open or closed at once, or
+#     0 for no limit
+#
+# @zone-counts: zones in each state
+#
+# @media: NAND bus timing
+#
+# @zones: with kind @zones, the zones from @offset, at most limit of
+#     them
+#
+# @offset: with kind @zones, the index of the first zone in @zones
+#
+# @next-offset: with kind @zones, the offset that continues the
+#     listing.  Absent after the last zone.
+#
+# Since: 10.1
+##
+{ 'struct': 'FemuZonedInfo',
+  'data': { 'lba-size': 'uint32', 'zone-size': 'uint64',
+            'zone-capacity': 'uint64', 'max-open': 'uint32',
+            'max-active': 'uint32', 'zone-counts': 'FemuZoneCounts',
+            'media': 'FemuMediaTiming',
+            '*zones': [ 'FemuZoneInfo' ], '*offset': 'uint32',
+            '*next-offset': 'uint32' } }
+
+##
+# @FemuNamespaceInfo:
+#
+# State of one namespace.  @mode selects the other members.
+#
+# @nsid: namespace identifier
+#
+# @mode: namespace mode
+#
+# Since: 10.1
+##
+{ 'union': 'FemuNamespaceInfo',
+  'base': { 'nsid': 'uint32', 'mode': 'FemuMode' },
+  'discriminator': 'mode',
+  'data': { 'bbssd': 'FemuBbssdInfo', 'znssd': 'FemuZonedInfo',
+            'csd': 'FemuMediaInfo', 'kvssd': 'FemuMediaInfo',
+            'ocssd': 'FemuMediaInfo' } }
+
+##
+# @FemuInfo:
+#
+# State of a FEMU NVMe controller.
+#
+# @path: canonical QOM path of the device
+#
+# @mode: controller mode
+#
+# @namespaces: the selected namespaces, in nsid order
+#
+# Since: 10.1
+##
+{ 'struct': 'FemuInfo',
+  'data': { 'path': 'str', 'mode': 'FemuMode',
+            'namespaces': [ 'FemuNamespaceInfo' ] } }
+
+##
+# @query-femu:
+#
+# Report the flash translation layer state of a FEMU NVMe controller.
+# Blackbox (bbssd) namespaces, also with flexible data placement, and
+# zoned (znssd) namespaces are supported.  For a computational storage
+# (csd), key-value (kvssd) or OpenChannel (ocssd) namespace, the reply
+# has the NAND bus timing only.  A selected no-SSD (nossd) namespace,
+# or one backed by a CXL SSD medium, makes the command fail.  The
+# controller must be enabled when a blackbox namespace is selected.
+# Each namespace is one copy, but two namespaces, and two calls, can
+# show different points in time.
+#
+# @path: QOM path of the femu device.  Optional when exactly one
+#     exists.
+#
+# @nsid: namespace to report.  Default every attached namespace.
+#     With a kind other than summary, required when the controller has
+#     more than one attached namespace.
+#
+# @kind: what to report (default summary).  Kind lines needs a
+#     blackbox namespace without flexible data placement, kind
+#     reclaim-units one with it, and kind zones a zoned namespace.  A
+#     csd, kvssd or ocssd namespace takes kind summary only.
+#
+# @offset: the first line, zone or reclaim unit to report (default
+#     0).  An error with kind summary.
+#
+# @limit: the most lines, zones or reclaim units to report, 1 to 4096
+#     (default 256).  An error with kind summary.
+#
+# Returns: the state of the controller and its selected namespaces
+#
+# Since: 10.1
+#
+# .. qmp-example::
+#
+#     -> { "execute": "query-femu",
+#          "arguments": { "path": "/machine/peripheral/femu0" } }
+#     <- { "return": {
+#            "path": "/machine/peripheral/femu0", "mode": "bbssd",
+#            "namespaces": [ {
+#              "nsid": 1, "mode": "bbssd",
+#              "geometry": { "channels": 8, "luns-per-channel": 8,
+#                            "planes-per-lun": 1,
+#                            "blocks-per-plane": 256,
+#                            "pages-per-block": 256, "page-size": 4096,
+#                            "pages-per-line": 16384 },
+#              "counters": { "host-write-pages": 1024,
+#                            "nand-write-pages": 1024,
+#                            "gc-write-pages": 0, "block-erases": 0,
+#                            "waf": 1.0 },
+#              "media": { "staged-bus": false, "onfi-profile": false,
+#                         "column-cycles": 0, "row-cycles": 0,
+#                         "page-transfer-ns": 0, "read-command-ns": 0,
+#                         "program-command-ns": 0,
+#                         "erase-command-ns": 0,
+#                         "copyback-read-command-ns": 0,
+#                         "copyback-program-command-ns": 0,
+#                         "status-ns": 0, "data-out-lead-ns": 0,
+#                         "data-out-tail-ns": 0, "plane-select-ns": 0,
+#                         "data-in-edges-ns": 0,
+#                         "program-confirm-ns": 0,
+#                         "plane-read-busy-ns": 0,
+#                         "plane-program-busy-ns": 0,
+#                         "plane-erase-busy-ns": 0, "data-in-gap-ns": 0,
+#                         "data-out-edges-ns": 0, "sca": false,
+#                         "cache-read": false, "read-cache-busy-ns": 0,
+#                         "cache-step-ns": 0, "cache-select-ns": 0,
+#                         "onfi-order": false,
+#                         "page-register-hold": false,
+#                         "status-per-plane": false },
+#              "line-counts": { "free": 255, "victim": 0, "full": 0,
+#                               "retired": 0, "spare": 0,
+#                               "total": 256 } } ] } }
+#
+# .. qmp-example::
+#
+#     -> { "execute": "query-femu",
+#          "arguments": { "kind": "zones", "limit": 2 } }
+#     <- { "return": {
+#            "path": "/machine/peripheral/femu0", "mode": "znssd",
+#            "namespaces": [ {
+#              "nsid": 1, "mode": "znssd", "lba-size": 512,
+#              "zone-size": 131072, "zone-capacity": 131072,
+#              "max-open": 0, "max-active": 0,
+#              "zone-counts": { "empty": 14, "implicitly-open": 1,
+#                               "explicitly-open": 0, "closed": 0,
+#                               "read-only": 0, "full": 1,
+#                               "offline": 0, "total": 16 },
+#              "media": { "staged-bus": false, "onfi-profile": false,
+#                         "column-cycles": 0, "row-cycles": 0,
+#                         "page-transfer-ns": 0, "read-command-ns": 0,
+#                         "program-command-ns": 0,
+#                         "erase-command-ns": 0,
+#                         "copyback-read-command-ns": 0,
+#                         "copyback-program-command-ns": 0,
+#                         "status-ns": 0, "data-out-lead-ns": 0,
+#                         "data-out-tail-ns": 0, "plane-select-ns": 0,
+#                         "data-in-edges-ns": 0,
+#                         "program-confirm-ns": 0,
+#                         "plane-read-busy-ns": 0,
+#                         "plane-program-busy-ns": 0,
+#                         "plane-erase-busy-ns": 0, "data-in-gap-ns": 0,
+#                         "data-out-edges-ns": 0, "sca": false,
+#                         "cache-read": false, "read-cache-busy-ns": 0,
+#                         "cache-step-ns": 0, "cache-select-ns": 0,
+#                         "onfi-order": false,
+#                         "page-register-hold": false,
+#                         "status-per-plane": false },
+#              "zones": [ { "index": 0, "type": "sequential",
+#                           "state": "full", "start-lba": 0,
+#                           "capacity": 131072, "zrwa": false },
+#                         { "index": 1, "type": "sequential",
+#                           "state": "implicitly-open",
+#                           "start-lba": 131072, "capacity": 131072,
+#                           "write-pointer": 131080, "zrwa": false } ],
+#              "offset": 0, "next-offset": 2 } ] } }
+#
+# .. qmp-example::
+#
+#     -> { "execute": "query-femu",
+#          "arguments": { "kind": "reclaim-units", "limit": 1 } }
+#     <- { "return": {
+#            "path": "/machine/peripheral/femu0", "mode": "bbssd",
+#            "namespaces": [ {
+#              "nsid": 1, "mode": "bbssd",
+#              "geometry": { "channels": 2, "luns-per-channel": 2,
+#                            "planes-per-lun": 1,
+#                            "blocks-per-plane": 25,
+#                            "pages-per-block": 4, "page-size": 4096,
+#                            "pages-per-line": 16 },
+#              "counters": { "host-write-pages": 0,
+#                            "nand-write-pages": 0,
+#                            "gc-write-pages": 0, "block-erases": 0 },
+#              "media": { "staged-bus": false, "onfi-profile": false,
+#                         "column-cycles": 0, "row-cycles": 0,
+#                         "page-transfer-ns": 0, "read-command-ns": 0,
+#                         "program-command-ns": 0,
+#                         "erase-command-ns": 0,
+#                         "copyback-read-command-ns": 0,
+#                         "copyback-program-command-ns": 0,
+#                         "status-ns": 0, "data-out-lead-ns": 0,
+#                         "data-out-tail-ns": 0, "plane-select-ns": 0,
+#                         "data-in-edges-ns": 0,
+#                         "program-confirm-ns": 0,
+#                         "plane-read-busy-ns": 0,
+#                         "plane-program-busy-ns": 0,
+#                         "plane-erase-busy-ns": 0, "data-in-gap-ns": 0,
+#                         "data-out-edges-ns": 0, "sca": false,
+#                         "cache-read": false, "read-cache-busy-ns": 0,
+#                         "cache-step-ns": 0, "cache-select-ns": 0,
+#                         "onfi-order": false,
+#                         "page-register-hold": false,
+#                         "status-per-plane": false },
+#              "fdp": { "reclaim-groups": 1, "units-per-group": 25,
+#                       "pages-per-unit": 16,
+#                       "handles": [ { "id": 0,
+#                                      "type": "persistently-isolated",
+#                                      "host-bytes": 0,
+#                                      "media-bytes": 0 },
+#                                    { "id": 1,
+#                                      "type": "persistently-isolated",
+#                                      "host-bytes": 0,
+#                                      "media-bytes": 0 },
+#                                    { "id": 2,
+#                                      "type": "persistently-isolated",
+#                                      "host-bytes": 0,
+#                                      "media-bytes": 0 },
+#                                    { "id": 3,
+#                                      "type": "persistently-isolated",
+#                                      "host-bytes": 0,
+#                                      "media-bytes": 0 } ],
+#                       "unit-counts": { "free": 21, "open": 4,
+#                                        "full": 0, "victim": 0,
+#                                        "total": 25 },
+#                       "reclaim-units": [ { "group": 0, "unit": 0,
+#                                            "handle": 0,
+#                                            "state": "open",
+#                                            "vpc": 0, "ipc": 0,
+#                                            "erase-min": 0,
+#                                            "erase-max": 0 } ] },
+#              "offset": 0, "next-offset": 1 } ] } }
+#
+# .. qmp-example::
+#
+#     -> { "execute": "query-femu" }
+#     <- { "return": {
+#            "path": "/machine/peripheral/femu0", "mode": "bbssd",
+#            "namespaces": [ {
+#              "nsid": 1, "mode": "bbssd",
+#              "geometry": { "channels": 8, "luns-per-channel": 8,
+#                            "planes-per-lun": 1,
+#                            "blocks-per-plane": 256,
+#                            "pages-per-block": 256, "page-size": 4096,
+#                            "pages-per-line": 16384 },
+#              "counters": { "host-write-pages": 0,
+#                            "nand-write-pages": 0,
+#                            "gc-write-pages": 0, "block-erases": 0 },
+#              "media": { "staged-bus": true, "onfi-profile": true,
+#                         "onfi-mode": 26, "column-cycles": 2,
+#                         "row-cycles": 3, "page-transfer-ns": 855,
+#                         "read-command-ns": 275,
+#                         "program-command-ns": 562,
+#                         "erase-command-ns": 225,
+#                         "copyback-read-command-ns": 275,
+#                         "copyback-program-command-ns": 275,
+#                         "status-ns": 321, "data-out-lead-ns": 200,
+#                         "data-out-tail-ns": 115,
+#                         "plane-select-ns": 200,
+#                         "data-in-edges-ns": 57,
+#                         "program-confirm-ns": 125,
+#                         "plane-read-busy-ns": 500,
+#                         "plane-program-busy-ns": 500,
+#                         "plane-erase-busy-ns": 500, "data-in-gap-ns": 0,
+#                         "data-out-edges-ns": 0, "sca": false,
+#                         "cache-read": false, "read-cache-busy-ns": 0,
+#                         "cache-step-ns": 0, "cache-select-ns": 0,
+#                         "onfi-order": true,
+#                         "page-register-hold": true,
+#                         "status-per-plane": true },
+#              "line-counts": { "free": 255, "victim": 0, "full": 0,
+#                               "retired": 0, "spare": 0,
+#                               "total": 256 } } ] } }
+##
+{ 'command': 'query-femu',
+  'data': { '*path': 'str', '*nsid': 'uint32', '*kind': 'FemuQueryKind',
+            '*offset': 'uint32', '*limit': 'uint32' },
+  'returns': 'FemuInfo',
+  'coroutine': true }
+
+##
+# @FemuIoStage:
+#
+# A stage of an I/O command, as the pollers time it with io_stages.
+#
+# @submit: from the fetch of the command to its handoff to the FTL
+#
+# @ftl: from the handoff to the return from the FTL, in host time
+#
+# @hold: from the return to ready, the later of the return and the
+#     time the model completes the command
+#
+# @post-delay: from ready to the posted completion entry
+#
+# @total: from the fetch of the command to the posted completion entry.
+#     For a command that goes through the FTL ring, submit, ftl, hold
+#     and post-delay add up to total.
+#
+# @past-due: from the time the model completes the command to the
+#     posted completion entry.  It shows how far the real completion
+#     lands after the modelled one.  It is not part of total.
+#
+# Since: 10.1
+##
+{ 'enum': 'FemuIoStage',
+  'data': [ 'submit', 'ftl', 'hold', 'post-delay', 'total', 'past-due' ] }
+
+##
+# @FemuIoStageInfo:
+#
+# Times of one stage over the commands counted.
+#
+# @stage: the stage
+#
+# @count: commands counted
+#
+# @sum-ns: sum of their times, in nanoseconds
+#
+# @max-ns: the longest time, in nanoseconds
+#
+# @buckets: commands per time bucket, 40 of them.  Bucket i holds
+#     times of 2^i to 2^(i+1) - 1 ns.  Bucket 0 also holds 0 ns, and
+#     bucket 39 also holds every longer time.
+#
+# Since: 10.1
+##
+{ 'struct': 'FemuIoStageInfo',
+  'data': { 'stage': 'FemuIoStage', 'count': 'uint64', 'sum-ns': 'uint64',
+            'max-ns': 'uint64', 'buckets': [ 'uint64' ] } }
+
+##
+# @FemuIoStages:
+#
+# Stage times of the I/O commands a FEMU controller completed.
+#
+# @path: canonical QOM path of the device
+#
+# @stages: one entry per stage
+#
+# @returned-after-due: commands that came back from the FTL after the
+#     time the model completes them
+#
+# Since: 10.1
+##
+{ 'struct': 'FemuIoStages',
+  'data': { 'path': 'str', 'stages': [ 'FemuIoStageInfo' ],
+            'returned-after-due': 'uint64' } }
+
+##
+# @query-femu-stages:
+#
+# Report how long the I/O commands of a FEMU controller spent in each
+# stage, from the fetch of a command to its posted completion entry.
+# The device needs the property io_stages=on.  Commands that complete
+# without the FTL ring count only in post-delay, past-due and total.
+# Commands a namespace retired are not counted.  Without reset the sums
+# are taken while I/O may run, so they can differ by commands in
+# flight; with reset the pollers stop while the counts are read and
+# cleared.
+#
+# @path: QOM path of the femu device.  Optional when exactly one
+#     exists.
+#
+# @reset: clear the counts after they are read (default false)
+#
+# Returns: the stage times of the controller
+#
+# Since: 10.1
+#
+# .. qmp-example::
+#
+#     -> { "execute": "query-femu-stages" }
+#     <- { "return": {
+#            "path": "/machine/peripheral/femu0",
+#            "stages": [ { "stage": "hold", "count": 2,
+#                          "sum-ns": 3999000, "max-ns": 2000000,
+#                          "buckets": [ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#                                       0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#                                       2, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#                                       0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ] } ],
+#            "returned-after-due": 0 } }
+##
+{ 'command': 'query-femu-stages',
+  'data': { '*path': 'str', '*reset': 'bool' },
+  'returns': 'FemuIoStages' }

@@ -4,10 +4,11 @@
 # guest 通过 9p 共享出去的实验输出目录
 /results/
 
-# 编译产物：例如 code/csd_program_dir 里编译出来的算子 .so
+# 编译产物：例如 csd 目录里编译出来的算子 .so、guest 里编出的 csd-passthru
 *.o
 *.so
 *.a
+/csd/csd-passthru
 
 # QEMU/FEMU 运行残留
 /qmp-sock

@@ -1,0 +1,854 @@
+/*
+ * Unit tests for the uniform NAND media timing layer.
+ *
+ * These cover the arithmetic only -- contention rules, ECC tiers and multi-plane
+ * batching -- which is the part that is otherwise measurable solely by booting
+ * a guest and timing it. Two bugs in 2026 were mis-diagnosed because a slow
+ * end-to-end measurement was the only evidence available: an ECC adder that
+ * could never run, and a multi-plane rule that read state its caller leaves
+ * unset. Both are asserted below.
+ *
+ * Output is TAP, so the same binary runs under meson (make check-unit) and
+ * from hw/femu/tests/Makefile, which builds it in milliseconds against a stub
+ * osdep.h before the QEMU build exists.
+ */
+#include "qemu/osdep.h"
+#include "hw/femu/nand/nand-media.h"
+
+/* sizes for this test's fake timelines; the media layer has no opinion */
+#define NAND_TEST_CHS  8
+#define NAND_TEST_LUNS 64
+
+static uint64_t ch_avail[NAND_TEST_CHS];
+static uint64_t lun_avail[NAND_TEST_LUNS];
+static uint64_t pl_avail[NAND_TEST_LUNS];
+
+static uint64_t *t_ch(void *o, uint32_t ch) { (void)o; return &ch_avail[ch % NAND_TEST_CHS]; }
+static uint64_t *t_lun(void *o, const NandLoc *l) { (void)o; return &lun_avail[(l->ch * 8 + l->lun) % NAND_TEST_LUNS]; }
+static uint64_t *t_pl(void *o, const NandLoc *l) { (void)o; return &pl_avail[(l->ch * 8 + l->lun) % NAND_TEST_LUNS]; }
+static const NandTimelineOps timeline = {
+    .ch_avail = t_ch, .lun_avail = t_lun, .plane_avail = t_pl,
+};
+
+/* what bbssd actually registers: no plane_avail, because its rule is LUN-only */
+static const NandTimelineOps lun_only_timeline = {
+    .ch_avail = t_ch, .lun_avail = t_lun,
+};
+
+static int failures;
+static int ntests;
+
+static void reset_timelines(void)
+{
+    memset(ch_avail, 0, sizeof(ch_avail));
+    memset(lun_avail, 0, sizeof(lun_avail));
+    memset(pl_avail, 0, sizeof(pl_avail));
+}
+
+static void check(const char *what, uint64_t got, uint64_t want)
+{
+    ntests++;
+    if (got == want) {
+        printf("ok %d - %s (%llu)\n", ntests, what, (unsigned long long)got);
+    } else {
+        printf("not ok %d - %s: got %llu want %llu\n", ntests, what,
+               (unsigned long long)got, (unsigned long long)want);
+        failures++;
+    }
+}
+
+static void check_lt(const char *what, uint64_t got, uint64_t bound)
+{
+    ntests++;
+    if (got < bound) {
+        printf("ok %d - %s (%llu < %llu)\n", ntests, what,
+               (unsigned long long)got, (unsigned long long)bound);
+    } else {
+        printf("not ok %d - %s: %llu not < %llu\n", ntests, what,
+               (unsigned long long)got, (unsigned long long)bound);
+        failures++;
+    }
+}
+
+/* the configuration bb_nand_media_init() builds, so the tests match bbssd */
+static void bb_config(NandMediaConfig *cfg)
+{
+    memset(cfg, 0, sizeof(*cfg));
+    reset_timelines();
+    cfg->nchs = 8;
+    cfg->luns_per_ch = 8;
+    cfg->planes_per_lun = 1;
+    cfg->timing.rd_ns = 10000;
+    cfg->timing.wr_ns = 40000;
+    cfg->timing.er_ns = 2000000;
+    cfg->timing.ecc_pe_per_tier = 750;
+    cfg->timing.ecc_max_tiers = 4;
+    cfg->policy.use_flat_timing = true;
+    cfg->policy.ecc_on_read = true;
+    cfg->policy.array_contend = NAND_CONTEND_LUN_ONLY;
+    cfg->policy.channel_mode = NAND_CH_OFF;
+    cfg->timeline = &timeline;
+    cfg->timeline_opaque = NULL;
+}
+
+/*
+ * Each call starts from an idle array. Without this the LUN rule carries the
+ * previous op's completion forward and every latency after the first is the
+ * sum of those before it.
+ */
+static uint64_t read_lat_x(const NandMediaConfig *cfg, uint32_t pe,
+                           uint32_t age, uint8_t extra)
+{
+    NandMedia m;
+    NandLoc loc;
+
+    reset_timelines();
+    nand_media_init(&m, cfg);
+    memset(&loc, 0, sizeof(loc));
+    loc.pe_cycles = pe;
+    loc.age_sec = age;
+    loc.extra_tiers = extra;
+    {
+        uint64_t lat = nand_media_op(&m, &loc, NAND_MEDIA_READ,
+                                     1000000000ULL).latency_ns;
+        nand_media_destroy(&m);
+        return lat;
+    }
+}
+
+static uint64_t read_lat(const NandMediaConfig *cfg, uint32_t pe, uint32_t age)
+{
+    return read_lat_x(cfg, pe, age, 0);
+}
+
+static void test_ecc(void)
+{
+    NandMediaConfig cfg;
+
+    printf("# ECC read adder\n");
+    bb_config(&cfg);
+    check("fresh, unworn read is just the array latency", read_lat(&cfg, 0, 0), 10000);
+
+    /* ecc_step_ns unset: the adder must contribute nothing */
+    bb_config(&cfg);
+    cfg.timing.ecc_retention_per_tier_sec = 10;
+    check("ecc_step_ns=0 disables the adder", read_lat(&cfg, 3000, 100), 10000);
+
+    /*
+     * policy.ecc_on_read false must also disable it. This is the bug that made
+     * ecc_step_ns inert: nothing ever set the flag.
+     */
+    bb_config(&cfg);
+    cfg.policy.ecc_on_read = false;
+    cfg.timing.ecc_step_ns = 200000;
+    cfg.timing.ecc_retention_per_tier_sec = 10;
+    check("ecc_on_read=false disables the adder", read_lat(&cfg, 3000, 100), 10000);
+
+    bb_config(&cfg);
+    cfg.timing.ecc_step_ns = 200000;
+    check("wear: 1500 P/E = 2 tiers", read_lat(&cfg, 1500, 0), 10000 + 2 * 200000);
+    check("wear is capped at ecc_max_tiers", read_lat(&cfg, 100000, 0), 10000 + 4 * 200000);
+
+    bb_config(&cfg);
+    cfg.timing.ecc_step_ns = 200000;
+    cfg.timing.ecc_retention_per_tier_sec = 10;
+    check("age below one tier adds nothing", read_lat(&cfg, 0, 9), 10000);
+    check("age: 30s at 10s per tier = 3 tiers", read_lat(&cfg, 0, 30), 10000 + 3 * 200000);
+    check("age is capped at ecc_max_tiers", read_lat(&cfg, 0, 6000), 10000 + 4 * 200000);
+    check("wear and age tiers add", read_lat(&cfg, 750, 20), 10000 + 3 * 200000);
+    check("their sum shares one cap", read_lat(&cfg, 2250, 30), 10000 + 4 * 200000);
+
+    /* the caller's extra tiers (program disturb) add under the same cap */
+    check("extra tiers add", read_lat_x(&cfg, 0, 0, 2), 10000 + 2 * 200000);
+    check("extra, wear and age tiers add", read_lat_x(&cfg, 750, 10, 1),
+          10000 + 3 * 200000);
+    check("extra tiers share the cap", read_lat_x(&cfg, 1500, 20, 2),
+          10000 + 4 * 200000);
+    bb_config(&cfg);
+    check("extra tiers cost nothing without ecc_step_ns",
+          read_lat_x(&cfg, 0, 0, 3), 10000);
+}
+
+/* one op on an idle array and bus, latency only */
+static uint64_t staged_lat(const NandMediaConfig *cfg, NandMediaOp op)
+{
+    NandMedia m;
+    NandLoc loc;
+
+    reset_timelines();
+    nand_media_init(&m, cfg);
+    memset(&loc, 0, sizeof(loc));
+    {
+        uint64_t lat = nand_media_op(&m, &loc, op, 1000000000ULL).latency_ns;
+        nand_media_destroy(&m);
+        return lat;
+    }
+}
+
+static void test_staged_channel(void)
+{
+    NandMediaConfig cfg;
+    NandMedia m;
+    NandLoc a, b;
+    uint64_t first, second;
+
+    printf("# staged channel bus\n");
+    bb_config(&cfg);
+    cfg.policy.channel_mode = NAND_CH_STAGED;
+    cfg.timing.cmd_addr_ns = 300;
+    cfg.timing.page_xfer_ns = 20000;
+    cfg.timing.status_ns = 100;
+    check("read = command + array + transfer + status",
+          staged_lat(&cfg, NAND_MEDIA_READ), 300 + 10000 + 20000 + 100);
+    check("program = command + transfer + array",
+          staged_lat(&cfg, NAND_MEDIA_PROGRAM), 300 + 20000 + 40000);
+    check("erase = command + array + status",
+          staged_lat(&cfg, NAND_MEDIA_ERASE), 300 + 2000000 + 100);
+
+    /* two reads on one channel but different LUNs share the bus, not the array */
+    reset_timelines();
+    nand_media_init(&m, &cfg);
+    memset(&a, 0, sizeof(a));
+    memset(&b, 0, sizeof(b));
+    b.lun = 1;
+    first = nand_media_op(&m, &a, NAND_MEDIA_READ, 1000000000ULL).latency_ns;
+    second = nand_media_op(&m, &b, NAND_MEDIA_READ, 1000000000ULL).latency_ns;
+    /*
+     * The second read's command goes out while the first is still in its
+     * array time (the bus is idle then); only its data-out queues behind the
+     * first's transfer and status, which end at 30400: 300 cmd, 10000 array,
+     * wait until 30400, 20000 transfer, 100 status.
+     */
+    check("the second read queues only its transfer behind the first",
+          second, 300 + 10000 + (30400 - 10300) + 20000 + 100);
+
+    /* with the phases unset the plain rule is used and the bus never queues */
+    bb_config(&cfg);
+    reset_timelines();
+    nand_media_destroy(&m);
+    nand_media_init(&m, &cfg);
+    first = nand_media_op(&m, &a, NAND_MEDIA_READ, 1000000000ULL).latency_ns;
+    second = nand_media_op(&m, &b, NAND_MEDIA_READ, 1000000000ULL).latency_ns;
+    check("channel off: another LUN's read costs the same", second, first);
+    nand_media_destroy(&m);
+}
+
+/* the configuration zns_nand_media_init() builds once a bus phase is set */
+static void zns_config(NandMediaConfig *cfg)
+{
+    memset(cfg, 0, sizeof(*cfg));
+    reset_timelines();
+    cfg->nchs = 8;
+    cfg->luns_per_ch = 4;
+    cfg->planes_per_lun = 2;
+    cfg->timing.rd_table_ns[0][0] = 65000;
+    cfg->timing.wr_table_ns[0][0] = 450000;
+    cfg->timing.er_table_ns[0] = 2000000;
+    cfg->policy.use_flat_timing = false;
+    cfg->policy.array_contend = NAND_CONTEND_PLANE_ONLY;
+    cfg->policy.channel_mode = NAND_CH_STAGED;
+    cfg->timing.page_xfer_ns = 25000;
+    cfg->timeline = &timeline;
+    cfg->timeline_opaque = NULL;
+}
+
+static void test_plane_contend_with_channel(void)
+{
+    NandMediaConfig cfg;
+    NandMedia m;
+    NandLoc a, b;
+    uint64_t first, second;
+
+    printf("# plane rule with the channel bus (ZNS)\n");
+    zns_config(&cfg);
+    check("read = array + transfer",
+          staged_lat(&cfg, NAND_MEDIA_READ), 65000 + 25000);
+    check("program = transfer + array",
+          staged_lat(&cfg, NAND_MEDIA_PROGRAM), 25000 + 450000);
+    check("erase is array only when no command phase is set",
+          staged_lat(&cfg, NAND_MEDIA_ERASE), 2000000);
+
+    /* two reads on different planes of one channel share the bus, not the array */
+    reset_timelines();
+    nand_media_init(&m, &cfg);
+    memset(&a, 0, sizeof(a));
+    memset(&b, 0, sizeof(b));
+    b.lun = 1;
+    first = nand_media_op(&m, &a, NAND_MEDIA_READ, 1000000000ULL).latency_ns;
+    second = nand_media_op(&m, &b, NAND_MEDIA_READ, 1000000000ULL).latency_ns;
+    check_lt("the first read pays no bus wait", first, 65000 + 25000 + 1);
+    check("the second read waits only for the first transfer",
+          second, first + 25000);
+
+    /* a program on the same channel uses the bus while the read's array is busy */
+    reset_timelines();
+    nand_media_destroy(&m);
+    nand_media_init(&m, &cfg);
+    b.lun = 1;
+    first = nand_media_op(&m, &a, NAND_MEDIA_READ, 1000000000ULL).latency_ns;
+    second = nand_media_op(&m, &b, NAND_MEDIA_PROGRAM, 1000000000ULL).latency_ns;
+    check("a program backfills the bus during the read's tR",
+          second, 25000 + 450000);
+
+    /* eight reads on one plane pipeline their transfers behind the array */
+    reset_timelines();
+    nand_media_destroy(&m);
+    nand_media_init(&m, &cfg);
+    {
+        uint64_t last = 0;
+        int i;
+        for (i = 0; i < 8; i++) {
+            last = nand_media_op(&m, &a, NAND_MEDIA_READ, 1000000000ULL).latency_ns;
+        }
+        check("eight same-plane reads = 8 x tR + one transfer",
+              last, 8 * 65000 + 25000);
+        /* more reads than the window list holds: past windows are pruned */
+        for (; i < 3 * NAND_BUS_RES_MAX; i++) {
+            last = nand_media_op(&m, &a, NAND_MEDIA_READ,
+                                 1000000000ULL + i * 65000ULL).latency_ns;
+        }
+        check("a long stream of reads keeps pipelining", last,
+              (uint64_t)65000 + 25000);
+    }
+
+    /* the same two reads on different channels do not interact */
+    reset_timelines();
+    nand_media_destroy(&m);
+    nand_media_init(&m, &cfg);
+    b.lun = 0;
+    b.ch = 1;
+    first = nand_media_op(&m, &a, NAND_MEDIA_READ, 1000000000ULL).latency_ns;
+    second = nand_media_op(&m, &b, NAND_MEDIA_READ, 1000000000ULL).latency_ns;
+    check("another channel's read costs the same", second, first);
+
+    /* all phases zero: CH_OFF, and the plane rule alone decides */
+    zns_config(&cfg);
+    cfg.timing.page_xfer_ns = 0;
+    cfg.policy.channel_mode = NAND_CH_OFF;
+    reset_timelines();
+    nand_media_destroy(&m);
+    nand_media_init(&m, &cfg);
+    b.ch = 0;
+    b.lun = 1;
+    first = nand_media_op(&m, &a, NAND_MEDIA_READ, 1000000000ULL).latency_ns;
+    second = nand_media_op(&m, &b, NAND_MEDIA_READ, 1000000000ULL).latency_ns;
+    check("channel off: reads on one channel cost the same", second, first);
+    check("channel off: a read is the array time alone", first, 65000);
+    nand_media_destroy(&m);
+}
+
+static void test_multiplane_erase(void)
+{
+    NandMediaConfig cfg;
+    NandMedia m;
+    NandLoc locs[4];
+    uint64_t one, batched, serial;
+    int i;
+
+    printf("# multi-plane erase\n");
+
+    /*
+     * One plane must be identical to the single-op path. A commit claimed this
+     * and only a guest run could check it until now.
+     */
+    bb_config(&cfg);
+    nand_media_init(&m, &cfg);
+    memset(locs, 0, sizeof(locs));
+    one = nand_media_op(&m, &locs[0], NAND_MEDIA_ERASE, 0).latency_ns;
+    bb_config(&cfg);
+    nand_media_destroy(&m);
+    nand_media_init(&m, &cfg);
+    memset(locs, 0, sizeof(locs));
+    batched = nand_media_multiplane(&m, locs, 1, NAND_MEDIA_ERASE, 0).latency_ns;
+    check("one plane matches the single-op path", batched, one);
+
+    /*
+     * Two planes of a LUN erase as one array operation, so the batch must beat
+     * two serial erases. It must also not read plane state: the bbssd rule is
+     * LUN-only and leaves plane_avail unset, which used to be dereferenced.
+     */
+    bb_config(&cfg);
+    cfg.planes_per_lun = 2;
+    nand_media_destroy(&m);
+    nand_media_init(&m, &cfg);
+    memset(locs, 0, sizeof(locs));
+    locs[1].pl = 1;
+    batched = nand_media_multiplane(&m, locs, 2, NAND_MEDIA_ERASE, 0).latency_ns;
+
+    bb_config(&cfg);
+    cfg.planes_per_lun = 2;
+    nand_media_destroy(&m);
+    nand_media_init(&m, &cfg);
+    memset(locs, 0, sizeof(locs));
+    locs[1].pl = 1;
+    serial = 0;
+    for (i = 0; i < 2; i++) {
+        serial = nand_media_op(&m, &locs[i], NAND_MEDIA_ERASE, 0).done_ns;
+    }
+    check_lt("two planes batch cheaper than two serial erases", batched, serial);
+    check("the batch is one erase, not two", batched, cfg.timing.er_ns);
+    nand_media_destroy(&m);
+}
+
+/*
+ * Program and read of the same page on two planes, as bbssd issues them with
+ * mp_program and mp_read: the per-plane bus phases and the inter-plane busy
+ * time are serial, the array time is paid once.
+ */
+static uint64_t mp_lat(NandMediaConfig *cfg, NandMediaOp op)
+{
+    NandMedia m;
+    NandLoc locs[2];
+    uint64_t lat;
+
+    reset_timelines();
+    nand_media_init(&m, cfg);
+    memset(locs, 0, sizeof(locs));
+    locs[1].pl = 1;
+    lat = nand_media_multiplane(&m, locs, 2, op, 0).latency_ns;
+    nand_media_destroy(&m);
+    return lat;
+}
+
+static void test_multiplane_program_read(void)
+{
+    NandMediaConfig cfg;
+
+    printf("# multi-plane program and read\n");
+
+    /* no bus phases: the busy time between planes, then one array op */
+    bb_config(&cfg);
+    cfg.planes_per_lun = 2;
+    cfg.timeline = &lun_only_timeline;
+    cfg.timing.tplpbsy_ns = 500;
+    cfg.timing.tplrbsy_ns = 300;
+    check("program: one array time plus tPLPBSY",
+          mp_lat(&cfg, NAND_MEDIA_PROGRAM), 500 + 40000);
+    check("the LUN is busy for one program", lun_avail[0], 500 + 40000);
+    check("read: one array time plus tPLRBSY",
+          mp_lat(&cfg, NAND_MEDIA_READ), 300 + 10000);
+
+    /*
+     * Staged bus. Program: command, address and data in per plane, with the
+     * busy time between them, then the array, then status. Read: command and
+     * address per plane, the array, status, then each plane's data out.
+     */
+    cfg.timing.cmd_addr_ns = 100;
+    cfg.timing.page_xfer_ns = 1000;
+    cfg.timing.status_ns = 50;
+    cfg.policy.channel_mode = NAND_CH_STAGED;
+    check("staged program",
+          mp_lat(&cfg, NAND_MEDIA_PROGRAM), 1100 + 500 + 1100 + 40000 + 50);
+    check("staged read",
+          mp_lat(&cfg, NAND_MEDIA_READ),
+          100 + 300 + 100 + 10000 + 50 + 2 * (100 + 1000));
+}
+
+static void test_copyback(void)
+{
+    NandMediaConfig cfg;
+    NandMedia m;
+    NandLoc src, dst;
+    NandOpCompletion c;
+
+    printf("# on-chip copyback\n");
+
+    /*
+     * A LUN-only caller (bbssd) leaves plane_avail unset. Reading it would be a
+     * NULL call, which is what kept the multi-plane path unusable; copyback had
+     * the same defect. Reaching the check below at all is the regression guard.
+     */
+    bb_config(&cfg);
+    cfg.timeline = &lun_only_timeline;
+    nand_media_init(&m, &cfg);
+    memset(&src, 0, sizeof(src));
+    memset(&dst, 0, sizeof(dst));
+    dst.lun = 1;
+    c = nand_media_copyback(&m, &src, &dst, 1000000000ULL);
+    check("LUN-only rule does not touch plane state",
+          c.done_ns, 1000000000ULL + 10000 + 40000);
+
+    /*
+     * An op cannot start before it was requested. With idle resources whose
+     * timestamps sit in the past, the old code started at the resource time and
+     * returned a completion earlier than stime.
+     */
+    bb_config(&cfg);
+    nand_media_destroy(&m);
+    nand_media_init(&m, &cfg);
+    memset(&src, 0, sizeof(src));
+    memset(&dst, 0, sizeof(dst));
+    dst.lun = 1;
+    c = nand_media_copyback(&m, &src, &dst, 5000000000ULL);
+    check("idle array still starts at stime, not in the past",
+          c.done_ns, 5000000000ULL + 10000 + 40000);
+
+    /* a busy destination LUN pushes the program out */
+    bb_config(&cfg);
+    nand_media_destroy(&m);
+    nand_media_init(&m, &cfg);
+    memset(&src, 0, sizeof(src));
+    memset(&dst, 0, sizeof(dst));
+    dst.lun = 1;
+    lun_avail[1] = 5000000000ULL + 500000;
+    c = nand_media_copyback(&m, &src, &dst, 5000000000ULL);
+    check("a busy destination LUN delays the program",
+          c.done_ns, 5000000000ULL + 500000 + 40000);
+    nand_media_destroy(&m);
+
+    /*
+     * Staged channel: the read books command/address and status, the program
+     * command/address, and neither books data. cmd 100, status 50, transfer
+     * 1000 (never booked): 100 + 10000 + 50 + 100 + 40000. Two transfers
+     * would add 2000.
+     */
+    bb_config(&cfg);
+    cfg.policy.channel_mode = NAND_CH_STAGED;
+    cfg.timing.cmd_addr_ns = 100;
+    cfg.timing.status_ns = 50;
+    cfg.timing.page_xfer_ns = 1000;
+    nand_media_init(&m, &cfg);
+    memset(&src, 0, sizeof(src));
+    memset(&dst, 0, sizeof(dst));
+    dst.blk = 1;
+    c = nand_media_copyback(&m, &src, &dst, 1000000000ULL);
+    check("staged copyback: command and status phases only",
+          c.done_ns, 1000000000ULL + 100 + 10000 + 50 + 100 + 40000);
+
+    /* the read skips the ECC adder: the controller never decodes it */
+    bb_config(&cfg);
+    nand_media_destroy(&m);
+    cfg.timing.ecc_step_ns = 7000;
+    nand_media_init(&m, &cfg);
+    memset(&src, 0, sizeof(src));
+    memset(&dst, 0, sizeof(dst));
+    src.pe_cycles = 3000;
+    dst.blk = 1;
+    check("copyback read has no ECC adder",
+          nand_media_copyback(&m, &src, &dst, 1000000000ULL).done_ns,
+          1000000000ULL + 10000 + 40000);
+    check("the same read off-chip has one",
+          nand_media_read_ecc_ns(&m, &src), 4 * 7000);
+    nand_media_destroy(&m);
+
+    /*
+     * A whole collection burst on one channel: two LUNs, 64 moves. The later
+     * phases share a bounded booking queue, and when it fills the channel is
+     * held to the end of a phase. Copyback books one window per move where an
+     * off-chip move books two and holds the channel for its data-in, so a
+     * read on a third LUN after the burst never waits longer than after the
+     * same burst moved off-chip.
+     */
+    {
+        NandLoc other = { .lun = 2 };
+        uint64_t after_cb = 0;
+        uint64_t after_off = 0;
+
+        for (int pass = 0; pass < 2; pass++) {
+            bb_config(&cfg);
+            cfg.policy.channel_mode = NAND_CH_STAGED;
+            cfg.timing.cmd_addr_ns = 100;
+            cfg.timing.status_ns = 50;
+            cfg.timing.page_xfer_ns = 1000;
+            nand_media_init(&m, &cfg);
+            for (int i = 0; i < 64; i++) {
+                memset(&src, 0, sizeof(src));
+                memset(&dst, 0, sizeof(dst));
+                src.lun = dst.lun = i % 2;
+                dst.blk = 1;
+                if (pass == 0) {
+                    nand_media_copyback(&m, &src, &dst, 1000000000ULL);
+                } else {
+                    nand_media_op(&m, &src, NAND_MEDIA_READ, 1000000000ULL);
+                    nand_media_op(&m, &dst, NAND_MEDIA_PROGRAM,
+                                  1000000000ULL);
+                }
+            }
+            c = nand_media_op(&m, &other, NAND_MEDIA_READ, 1000000000ULL);
+            if (pass == 0) {
+                after_cb = c.done_ns;
+            } else {
+                after_off = c.done_ns;
+            }
+            nand_media_destroy(&m);
+        }
+        printf("# read after the burst: copyback %llu ns, off-chip %llu ns\n",
+               (unsigned long long)(after_cb - 1000000000ULL),
+               (unsigned long long)(after_off - 1000000000ULL));
+        check_lt("a read beside a copyback burst waits no longer than "
+                 "beside an off-chip one", after_cb, after_off + 1);
+    }
+}
+
+/*
+ * Program/erase suspend. Off (the default) a read queues behind whatever the
+ * LUN or plane is doing; on, it starts after tsusp and the suspended
+ * operation resumes after it, so the LUN frees that much later. The same
+ * rule has to hold on the lock-free LUN rule (bbssd), the plane rule (ZNS)
+ * and the staged channel path, which is why each is checked.
+ */
+static void test_pe_suspend(void)
+{
+    NandMediaConfig cfg;
+    NandMedia m;
+    NandLoc a;
+    const uint64_t t0 = 1000000000ULL;
+    uint64_t lat;
+
+    printf("# program/erase suspend\n");
+    memset(&a, 0, sizeof(a));
+
+    /* lun-only rule, suspend off: the read waits out the program */
+    bb_config(&cfg);
+    nand_media_init(&m, &cfg);
+    nand_media_op(&m, &a, NAND_MEDIA_PROGRAM, t0);
+    lat = nand_media_op(&m, &a, NAND_MEDIA_READ, t0 + 1000).latency_ns;
+    check("suspend off: read queues behind the program", lat, (40000 - 1000) + 10000);
+    nand_media_destroy(&m);
+
+    /* lun-only rule, suspend on: read after tsusp, program resumes after it */
+    bb_config(&cfg);
+    cfg.policy.pe_suspend = true;
+    cfg.timing.tsusp_ns = 5000;
+    nand_media_init(&m, &cfg);
+    nand_media_op(&m, &a, NAND_MEDIA_PROGRAM, t0);
+    lat = nand_media_op(&m, &a, NAND_MEDIA_READ, t0 + 1000).latency_ns;
+    check("suspend on: read = tsusp + array", lat, 5000 + 10000);
+    /* the program now ends at t0 + 40000 + 10000 + 5000; a second program
+     * issued right after the read queues behind that */
+    lat = nand_media_op(&m, &a, NAND_MEDIA_PROGRAM, t0 + 1000).latency_ns;
+    check("suspended program resumes after the read",
+          lat, (40000 + 10000 + 5000 - 1000) + 40000);
+    nand_media_destroy(&m);
+
+    /* an idle LUN pays no suspend overhead */
+    bb_config(&cfg);
+    cfg.policy.pe_suspend = true;
+    cfg.timing.tsusp_ns = 5000;
+    nand_media_init(&m, &cfg);
+    lat = nand_media_op(&m, &a, NAND_MEDIA_READ, t0).latency_ns;
+    check("suspend on, idle LUN: plain read", lat, 10000);
+    nand_media_destroy(&m);
+
+    /* only reads preempt: a program behind an erase still waits */
+    bb_config(&cfg);
+    cfg.policy.pe_suspend = true;
+    cfg.timing.tsusp_ns = 5000;
+    nand_media_init(&m, &cfg);
+    nand_media_op(&m, &a, NAND_MEDIA_ERASE, t0);
+    lat = nand_media_op(&m, &a, NAND_MEDIA_PROGRAM, t0 + 1000).latency_ns;
+    check("suspend on: a program does not preempt", lat, (2000000 - 1000) + 40000);
+    nand_media_destroy(&m);
+
+    /* plane rule without a channel (ZNS default): a read preempts an erase */
+    zns_config(&cfg);
+    cfg.policy.channel_mode = NAND_CH_OFF;
+    cfg.policy.pe_suspend = true;
+    cfg.timing.tsusp_ns = 5000;
+    nand_media_init(&m, &cfg);
+    nand_media_op(&m, &a, NAND_MEDIA_ERASE, t0);
+    lat = nand_media_op(&m, &a, NAND_MEDIA_READ, t0 + 1000).latency_ns;
+    check("plane rule: read preempts the erase", lat, 5000 + 65000);
+    lat = nand_media_op(&m, &a, NAND_MEDIA_PROGRAM, t0 + 1000).latency_ns;
+    check("plane rule: erase resumes after the read",
+          lat, (2000000 + 65000 + 5000 - 1000) + 450000);
+    nand_media_destroy(&m);
+
+    /*
+     * Only a program or erase is suspended. A read that finds the LUN busy with
+     * another read queues behind it: two reads cannot hold one array at once.
+     */
+    bb_config(&cfg);
+    cfg.policy.pe_suspend = true;
+    cfg.timing.tsusp_ns = 5000;
+    nand_media_init(&m, &cfg);
+    nand_media_op(&m, &a, NAND_MEDIA_READ, t0);
+    lat = nand_media_op(&m, &a, NAND_MEDIA_READ, t0 + 1000).latency_ns;
+    check("suspend on: a read queues behind a read",
+          lat, (10000 - 1000) + 10000);
+    nand_media_destroy(&m);
+
+    /*
+     * Two reads inside one suspension: the second waits for the first and pays
+     * no second overhead, and the program slides by both reads.
+     */
+    bb_config(&cfg);
+    cfg.policy.pe_suspend = true;
+    cfg.timing.tsusp_ns = 5000;
+    nand_media_init(&m, &cfg);
+    nand_media_op(&m, &a, NAND_MEDIA_PROGRAM, t0);
+    lat = nand_media_op(&m, &a, NAND_MEDIA_READ, t0 + 1000).latency_ns;
+    check("first read in a suspension: tsusp + array", lat, 5000 + 10000);
+    lat = nand_media_op(&m, &a, NAND_MEDIA_READ, t0 + 2000).latency_ns;
+    check("second read in the same suspension: behind the first",
+          lat, (1000 + 5000 + 10000 - 2000) + 10000);
+    lat = nand_media_op(&m, &a, NAND_MEDIA_PROGRAM, t0 + 2000).latency_ns;
+    check("the program slides by the overhead and both reads",
+          lat, (40000 + 5000 + 10000 + 10000 - 2000) + 40000);
+    nand_media_destroy(&m);
+
+    /*
+     * A read that arrives after an earlier read but before a program queued
+     * behind it goes after the read and ahead of the program.
+     */
+    bb_config(&cfg);
+    cfg.policy.pe_suspend = true;
+    cfg.timing.tsusp_ns = 5000;
+    nand_media_init(&m, &cfg);
+    nand_media_op(&m, &a, NAND_MEDIA_READ, t0);
+    nand_media_op(&m, &a, NAND_MEDIA_PROGRAM, t0 + 500);
+    lat = nand_media_op(&m, &a, NAND_MEDIA_READ, t0 + 1000).latency_ns;
+    check("read between a read and a queued program: after the read",
+          lat, (10000 - 1000) + 10000);
+    nand_media_destroy(&m);
+
+    /* a multi-plane erase is suspended the same way (the collector's erase) */
+    bb_config(&cfg);
+    cfg.planes_per_lun = 2;
+    cfg.policy.pe_suspend = true;
+    cfg.timing.tsusp_ns = 5000;
+    nand_media_init(&m, &cfg);
+    {
+        NandLoc pls[2];
+
+        memset(pls, 0, sizeof(pls));
+        pls[1].pl = 1;
+        nand_media_multiplane(&m, pls, 2, NAND_MEDIA_ERASE, t0);
+        lat = nand_media_op(&m, &pls[1], NAND_MEDIA_READ, t0 + 1000).latency_ns;
+        check("read preempts a multi-plane erase", lat, 5000 + 10000);
+    }
+    nand_media_destroy(&m);
+
+    /* staged channel: the existing suspend branch, now reachable */
+    bb_config(&cfg);
+    cfg.policy.channel_mode = NAND_CH_STAGED;
+    cfg.timing.cmd_addr_ns = 300;
+    cfg.timing.page_xfer_ns = 20000;
+    cfg.timing.status_ns = 100;
+    cfg.policy.pe_suspend = true;
+    cfg.timing.tsusp_ns = 5000;
+    nand_media_init(&m, &cfg);
+    nand_media_op(&m, &a, NAND_MEDIA_ERASE, t0);
+    lat = nand_media_op(&m, &a, NAND_MEDIA_READ, t0 + 1000).latency_ns;
+    /* command 300, then suspend 5000 + array 10000, then data-out 20000
+     * (the bus is idle: the erase moved no data) and status 100 */
+    check("staged: read = cmd + tsusp + array + xfer + status",
+          lat, 300 + 5000 + 10000 + 20000 + 100);
+    nand_media_destroy(&m);
+}
+
+/* one op on an idle array, moving @xfer_secs sectors of the page */
+static uint64_t partial_lat(const NandMediaConfig *cfg, NandMediaOp op,
+                            uint32_t xfer_secs)
+{
+    NandMedia m;
+    NandLoc loc;
+    uint64_t lat;
+
+    reset_timelines();
+    nand_media_init(&m, cfg);
+    memset(&loc, 0, sizeof(loc));
+    loc.xfer_secs = xfer_secs;
+    lat = nand_media_op(&m, &loc, op, 1000000000ULL).latency_ns;
+    nand_media_destroy(&m);
+    return lat;
+}
+
+/*
+ * A partial page pays its share of the page transfer, rounded up: OC 1.2
+ * charged one 512-byte sector of a four-sector page 52433 / 4 -> 13109 ns.
+ */
+static void test_partial_xfer(void)
+{
+    NandMediaConfig cfg;
+
+    printf("# data phase for part of a page\n");
+    bb_config(&cfg);
+    cfg.policy.channel_mode = NAND_CH_STAGED;
+    cfg.timing.page_xfer_ns = 52433;
+    cfg.secs_per_page = 4;
+    check("read of one sector rounds the transfer up",
+          partial_lat(&cfg, NAND_MEDIA_READ, 1), 10000 + 13109);
+    check("program of one sector rounds the transfer up",
+          partial_lat(&cfg, NAND_MEDIA_PROGRAM, 1), 13109 + 40000);
+    check("two pages of sectors pay two transfers",
+          partial_lat(&cfg, NAND_MEDIA_READ, 8), 10000 + 2 * 52433);
+    check("no sector count is a whole page",
+          partial_lat(&cfg, NAND_MEDIA_READ, 0), 10000 + 52433);
+    cfg.secs_per_page = 0;
+    check("no sectors per page is a whole page",
+          partial_lat(&cfg, NAND_MEDIA_READ, 1), 10000 + 52433);
+}
+
+/*
+ * 40 reads queued on one LUN book 40 data-out windows in the future. The
+ * capped list holds 32 and books the rest from busy-until, which then holds
+ * another LUN's read off the bus; the unbounded list keeps every window.
+ */
+static uint64_t forty_windows(bool unbounded, int *booked)
+{
+    NandMediaConfig cfg;
+    NandMedia m;
+    NandLoc a;
+    NandLoc b;
+    uint64_t last = 0;
+    uint64_t other;
+    int i;
+
+    bb_config(&cfg);
+    cfg.policy.channel_mode = NAND_CH_STAGED;
+    cfg.policy.ecc_on_read = false;
+    cfg.timing.page_xfer_ns = 1000;
+    cfg.policy.bus_res_unbounded = unbounded;
+    reset_timelines();
+    nand_media_init(&m, &cfg);
+    memset(&a, 0, sizeof(a));
+    memset(&b, 0, sizeof(b));
+    b.lun = 1;
+    for (i = 0; i < 40; i++) {
+        last = nand_media_op(&m, &a, NAND_MEDIA_READ, 1000000000ULL).latency_ns;
+    }
+    check(unbounded ? "unbounded: the 40th read is 40 x tR + transfer" :
+                      "capped: the 40th read is 40 x tR + transfer",
+          last, 40 * 10000 + 1000);
+    *booked = m.bus_res[0].n;
+    other = nand_media_op(&m, &b, NAND_MEDIA_READ, 1000000000ULL).latency_ns;
+    nand_media_destroy(&m);
+    return other;
+}
+
+static void test_unbounded_windows(void)
+{
+    int booked;
+
+    printf("# more future read windows than the capped list holds\n");
+    check("capped: another LUN's read waits for the unbooked windows",
+          forty_windows(false, &booked), 40 * 10000 + 1000 + 1000);
+    check("capped: 32 windows booked", booked, NAND_BUS_RES_MAX);
+    check("unbounded: another LUN's read fits after the first window",
+          forty_windows(true, &booked), 10000 + 1000 + 1000);
+    check("unbounded: 40 windows booked", booked, 40);
+}
+
+int main(void)
+{
+    /*
+     * Under meson the output goes through a pipe, so stdout is fully buffered
+     * and an abort -- an armed assertion, a sanitizer report -- would discard
+     * every TAP line written so far, leaving an empty log for the failure that
+     * matters most. Line buffering costs nothing here and keeps the record.
+     */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
+    test_ecc();
+    test_staged_channel();
+    test_plane_contend_with_channel();
+    test_multiplane_erase();
+    test_multiplane_program_read();
+    test_copyback();
+    test_pe_suspend();
+    test_partial_xfer();
+    test_unbounded_windows();
+    printf("1..%d\n", ntests);
+    return failures ? 1 : 0;
+}
