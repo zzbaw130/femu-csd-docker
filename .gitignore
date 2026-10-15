@@ -1,0 +1,26 @@
+# 运行时生成：guest 镜像（u20s.qcow2）、SSH 私钥、cloud image 下载缓存
+/images/
+
+# guest 通过 9p 共享出去的实验输出目录
+/results/
+
+# 编译产物：例如 code/csd_program_dir 里编译出来的算子 .so
+*.o
+*.so
+*.a
+
+# QEMU/FEMU 运行残留
+/qmp-sock
+/log
+*.qcow2
+provision.log
+.make-guest-image/
+
+# 与 FEMU 部署无关的独立上游 checkout（自带 git 历史）
+/code/postgres/
+
+# 编辑器/系统噪声
+*.swp
+*.orig
+*.rej
+.DS_Store

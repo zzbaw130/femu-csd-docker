@@ -1,0 +1,3 @@
+[submodule "code/FEMU"]
+	path = code/FEMU
+	url = git@github.com:MoatLab/FEMU.git

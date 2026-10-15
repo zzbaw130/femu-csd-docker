@@ -1,0 +1,18 @@
+services:
+  femu:
+    build: .
+    image: femu-csd
+    devices:
+      - /dev/kvm                  # FEMU boots its guest with KVM
+    ports:
+      - "8080:8080"               # guest SSH, forwarded by run-csd.sh
+    ulimits:
+      memlock: -1                 # FEMU pins its device memory with mlock
+    volumes:
+      - ./images:/root/images     # guest image + SSH key, kept on the host
+      - ./code:/root/workspace/code
+      - ./scripts:/root/workspace/scripts
+      - ./tests:/root/workspace/tests
+      - ./results:/root/workspace/results
+    stdin_open: true              # -nographic serial console
+    tty: true
