@@ -5,16 +5,13 @@ SO_CFLAGS ?= -Wall -Wextra -O2 -g -fPIC
 CXX_SO_CFLAGS ?= -Wall -Wextra -O2 -g -fPIC
 
 BPF_TARGETS := csd-vadd.bpf.o
-TARGETS := csd-passthru csd-vadd.so csd-original-kernels.so
+TARGETS := csd-vadd.so csd-original-kernels.so
 
 .PHONY: all bpf clean
 
 all: $(TARGETS)
 
 bpf: $(BPF_TARGETS)
-
-csd-passthru: csd-passthru.c
-	$(CC) $(CFLAGS) -o $@ $<
 
 csd-vadd.so: csd-vadd.c femu-csd-kernel.h
 	$(CC) $(SO_CFLAGS) -shared -o $@ $<

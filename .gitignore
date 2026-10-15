@@ -8,7 +8,7 @@
 *.o
 *.so
 *.a
-/csd/csd-passthru
+/code/apps/csd-passthru/csd-passthru
 
 # QEMU/FEMU 运行残留
 /qmp-sock

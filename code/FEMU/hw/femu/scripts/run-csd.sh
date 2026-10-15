@@ -33,22 +33,19 @@ gc_thres_pcent_high=95
 # does not carry, so they have no effect; values other than these defaults
 # print a warning.
 fdm_size=4096
-nr_cu=4
+nr_cu=8
 nr_thread=4
 time_slice=200000
 context_switch_time=200
-csf_runtime_scale=3
+csf_runtime_scale=1
 
-# Host directory that shared-library CSD programs are loaded from. Inside the
-# container this is the mounted host directory ./csd, where kernels are built
-# into .so files; the guest names a file in it alone, with no path, and FEMU
-# refuses a name that resolves outside it. The guest sees it at /home/femu/csd.
-csd_program_dir=/root/workspace/csd
+# container-side only; not shared with the guest
+csd_program_dir=/root/workspace/code/csd-programs
 
 # Container directory holding the four directories shared with the guest over
 # virtio-9p. Each one is exported on its own mount tag and mounted by the guest
-# image at /home/femu/<tag> (see make-guest-image.sh); ./code stays
-# container-side.
+# image at /home/femu/<tag> (see make-guest-image.sh); ./code itself is not exported; 
+# only ./code/apps is
 femu_share_root=/root/workspace
 
 #-----------------------------------------------------------------------
@@ -102,7 +99,7 @@ sudo ./qemu-system-x86_64 \
     ${FEMU_OPTIONS} \
     -net user,hostfwd=tcp::${SSH_PORT}-:22 \
     -net nic,model=virtio \
-    -virtfs local,path=${femu_share_root}/csd,mount_tag=csd,security_model=mapped-xattr,multidevs=remap \
+    -virtfs local,path=${femu_share_root}/code/apps,mount_tag=apps,security_model=mapped-xattr,multidevs=remap \
     -virtfs local,path=${femu_share_root}/results,mount_tag=results,security_model=mapped-xattr,multidevs=remap \
     -virtfs local,path=${femu_share_root}/scripts,mount_tag=scripts,security_model=mapped-xattr,multidevs=remap \
     -virtfs local,path=${femu_share_root}/tests,mount_tag=tests,security_model=mapped-xattr,multidevs=remap \

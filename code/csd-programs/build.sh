@@ -1,0 +1,1 @@
+docker compose exec femu-csd make -C /root/workspace/code/csd-programs
