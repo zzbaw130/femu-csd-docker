@@ -4,6 +4,10 @@
 # guest 通过 9p 共享出去的实验输出目录
 /results/
 
+# data
+/data/**
+!/data/tpch_s0.01.tar
+
 # 编译产物：例如 csd 目录里编译出来的算子 .so、guest 里编出的 csd-passthru
 *.o
 *.so
@@ -16,9 +20,6 @@
 *.qcow2
 provision.log
 .make-guest-image/
-
-# 与 FEMU 部署无关的独立上游 checkout（自带 git 历史）
-/code/postgres/
 
 # 编辑器/系统噪声
 *.swp

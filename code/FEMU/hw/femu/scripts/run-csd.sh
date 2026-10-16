@@ -16,7 +16,7 @@ blks_per_pl=1024 # number of blocks per plane
 pls_per_lun=1 # planes per LUN
 luns_per_ch=8 # number of chips per channel
 nchs=8 # number of channels
-ssd_size=49152 # in megabytes, 48GB with 25%(16GB) op
+ssd_size=${CSD_NVM_SIZE} # in megabytes, 48GB with 25%(16GB) op
 
 # Latency in nanoseconds
 pg_rd_lat=40000 # page read latency
@@ -32,21 +32,15 @@ gc_thres_pcent_high=95
 # accepted for CEMU config compatibility but configure a scheduler this port
 # does not carry, so they have no effect; values other than these defaults
 # print a warning.
-fdm_size=4096
-nr_cu=8
+fdm_size=${CSD_FDM_SIZE}
+nr_cu=${CSD_NR_CU}
 nr_thread=4
 time_slice=200000
 context_switch_time=200
-csf_runtime_scale=1
+csf_runtime_scale=${CSD_CSF_RUNTIME_SCALE}
 
 # container-side only; not shared with the guest
-csd_program_dir=/root/workspace/code/csd-programs
-
-# Container directory holding the four directories shared with the guest over
-# virtio-9p. Each one is exported on its own mount tag and mounted by the guest
-# image at /home/femu/<tag> (see make-guest-image.sh); ./code itself is not exported; 
-# only ./code/apps is
-femu_share_root=/root/workspace
+csd_program_dir=${CSD_PROGRAM_DIR}
 
 #-----------------------------------------------------------------------
 
@@ -91,17 +85,18 @@ sudo ./qemu-system-x86_64 \
     -name "FEMU-CSD-VM",debug-threads=on \
     -enable-kvm \
     -cpu host \
-    -smp 4 \
-    -m 8G \
+    -smp ${FEMU_SMP} \
+    -m ${FEMU_MEM} \
     -device virtio-scsi-pci,id=scsi0 \
     -device scsi-hd,drive=hd0 \
     -drive file=$OSIMGF,if=none,aio=native,cache=none,format=qcow2,id=hd0 \
     ${FEMU_OPTIONS} \
     -net user,hostfwd=tcp::${SSH_PORT}-:22 \
     -net nic,model=virtio \
-    -virtfs local,path=${femu_share_root}/code/apps,mount_tag=apps,security_model=mapped-xattr,multidevs=remap \
-    -virtfs local,path=${femu_share_root}/results,mount_tag=results,security_model=mapped-xattr,multidevs=remap \
-    -virtfs local,path=${femu_share_root}/scripts,mount_tag=scripts,security_model=mapped-xattr,multidevs=remap \
-    -virtfs local,path=${femu_share_root}/tests,mount_tag=tests,security_model=mapped-xattr,multidevs=remap \
+    -virtfs local,path=/workspace/code/apps,mount_tag=apps,security_model=passthrough,multidevs=remap \
+    -virtfs local,path=/workspace/data,mount_tag=data,security_model=passthrough,multidevs=remap \
+    -virtfs local,path=/workspace/results,mount_tag=results,security_model=passthrough,multidevs=remap \
+    -virtfs local,path=/workspace/scripts/guest,mount_tag=scripts,security_model=passthrough,multidevs=remap \
+    -virtfs local,path=/workspace/tests/guest,mount_tag=tests,security_model=passthrough,multidevs=remap \
     -nographic \
     -qmp unix:./qmp-sock,server,nowait 2>&1 | tee log
