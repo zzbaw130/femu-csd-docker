@@ -32,6 +32,6 @@ RUN cp ../femu-scripts/femu-copy-scripts.sh . \
 # Its cloud-init already carries the 9p mount above, so every boot after that
 # shows /home/femu/workspace. Delete the image to have it built again.
 
-CMD test -f "/workspace/images/u20s.qcow2" || ./make-guest-image.sh --packages \
+CMD test -f "/root/images/u20s.qcow2" || ./make-guest-image.sh --packages \
     build-essential,zlib1g-dev,libreadline-dev,bison,flex; \
     exec ./run-csd.sh

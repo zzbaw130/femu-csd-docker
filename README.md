@@ -5,22 +5,28 @@
 数据盘是 FEMU 模拟的 NVMe SSD —— NAND 时序、FTL、GC 全部是模拟的，用来做 CSD / 存储相关实验
 （TPC-H 等）。算子（`.so`）在容器里编译，由宿主机的 FEMU 进程加载执行。
 
-## 1. 一键构建并启动
+## 1. 构建并启动
 
 ```bash
-./scripts/build.sh
+./scripts/build.sh              # 重建容器镜像 + 启动 VM（保留已有 guest 镜像，不碰 postgres）
+./scripts/build.sh -i           # 额外删掉 guest 镜像 u20s.qcow2，重新做一遍 provisioning
+./scripts/build.sh -p           # 额外：挂载模拟盘 → 编译安装 PostgreSQL → 载数据启库
+./scripts/build.sh -ip          # 从零一条龙（首次构建用这个）
 ```
 
-依次完成：
+| 步骤 | 默认 | `-i` | `-p` |
+| --- | :-: | :-: | :-: |
+| `docker compose down --rmi local` | ✓ | | |
+| 删 `images/u20s.qcow2`（强制重做 guest 镜像） | | ✓ | |
+| `docker compose build` 编译 FEMU | ✓ | | |
+| `docker compose up -d --wait` 启动 CSD VM（等 healthcheck：guest SSH 可用） | ✓ | | |
+| guest `mount-nvme.sh`：模拟盘 `/dev/nvme0n1` mkfs.ext4 并挂到 `/data` | | | ✓ |
+| guest `install-postgre.sh`：从 `~/apps/postgres` 编译安装 PostgreSQL 到 `~/opt/postgres/release` | | | ✓ |
+| guest `start-postgre.sh 0.01`：解压 `data/tpch_s0.01.tar` 到 `/data` 并启动 `tpch_s0.01` | | | ✓ |
 
-1. `docker compose down --rmi local` + 删掉 guest 镜像 `images/u20s.qcow2`
-2. `docker compose build` 编译 FEMU
-3. `docker compose up -d --wait`：首次会自动制作 guest 镜像（Ubuntu 24.04 cloud image + cloud-init，
-   顺带装 `build-essential,zlib1g-dev,libreadline-dev,bison,flex`），随后启动 CSD VM；
-   `--wait` 会等 healthcheck（guest SSH 可用）通过
-4. guest 内 `mount-nvme.sh`：模拟盘 `/dev/nvme0n1` mkfs.ext4 并挂到 `/data`
-5. guest 内 `install-postgre.sh`：从 `~/apps/postgres` 编译安装 PostgreSQL 到 `~/opt/postgres/release`
-6. guest 内 `start-postgre.sh 0.01`：解压 `data/tpch_s0.01.tar` 到 `/data` 并启动数据库 `tpch_s0.01`
+`images/u20s.qcow2` 不存在时（首次或用了 `-i`）会自动制作 guest 镜像：下载 Ubuntu 24.04 cloud image +
+cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,flex`（guest 里编译 PG 需要），
+耗时几分钟。
 
 前置条件：x86_64 + **可用的 `/dev/kvm`**、docker compose v2、首次构建/首次启动需要联网；
 内存按第 5 节预留（默认约 32 GiB 模拟盘 + 8 GiB guest + FDM ≈ 45 GiB）。
@@ -28,11 +34,17 @@
 ## 2. 快速验证
 
 ```bash
-./tests/test-guest.sh tpch-test.sh    # guest 内跑 TPC-H 22 条，结果写到 results/<db>/
-./tests/passthru-test.sh              # CSD passthru smoke test（phantom / vadd / original kernels）
-./tests/passthru-test.sh build        # 只重编：容器里算子 .so + guest 里 csd-passthru
-./scripts/ssh-guest.sh                # 进 guest 交互 shell
-./scripts/scp-guest.sh <宿主路径> <guest路径>
+# CSD passthru smoke test
+# 编译passthru程序以及相关so算子
+./tests/passthru-test.sh build
+# 开启测试
+./tests/passthru-test.sh build <nvme dev> <options>
+
+# 基于postgrs的tpch测试，需要build.sh的时候指定了-p
+./tests/test-guest.sh tpch-test.sh
+
+# ssh到guest内部
+./scripts/ssh-guest.sh
 ```
 
 想换数据规模：`./scripts/sh-guest.sh guest/start-postgre.sh -f 1`（`-f` 强制重新解压，SF 见 `data/`）。
@@ -45,7 +57,7 @@
 .
 ├── Dockerfile / docker-compose.yml / .dockerignore
 ├── scripts/
-│   ├── build.sh                     # 一键：构建 + 起 VM + mount-nvme + 装 PG + 载数据启库
+│   ├── build.sh                     # 构建/启动（-i 重做 guest 镜像，-p 顺带装并启动 PostgreSQL）
 │   ├── sh-guest.sh                  # 在 guest 里执行 scripts/guest/<name>
 │   ├── ssh-guest.sh / scp-guest.sh  # 进 guest / 往 guest 传文件
 │   ├── gen-pgdata.sh                # 宿主机侧生成 data/tpch_s<SF>.tar（需要本机 duckdb + pg）
@@ -75,8 +87,8 @@
 
 ```
 /workspace/FEMU/                    # FEMU 源码 + build-femu/（qemu-system-x86_64、脚本副本）
-/workspace/code/                    # ← ./code（只有 code/apps 会导出给 guest）
-/workspace/data/ results/ scripts/ tests/ images/   # ← 同名宿主机目录
+/workspace/{code,data,results,scripts,tests}/   # ← 同名宿主机目录（只有 code/apps 导出给 guest）
+/root/images/                       # ← ./images（guest 镜像 u20s.qcow2 + SSH key，落在宿主机）
 ```
 
 ### guest 内（`/home/femu`）
@@ -111,24 +123,18 @@ tests/    ← 9p: 宿主机 tests/guest    （tpch-test.sh + queries/）
 | --- | --- | --- |
 | `FEMU_SMP` | 8 | guest vCPU 数 |
 | `FEMU_MEM` | 8G | guest 内存 |
-| `CSD_NVM_SIZE` | 32768 | **暴露给 guest 的容量**（MiB）。NAND 原始容量固定 64 GiB：设 49152 → 余 16 GiB（25% OP），设 32768 → 余 32 GiB（50% OP） |
+| `CSD_NVM_SIZE` | 32768 | **暴露给 guest 的SSD容量**（MB）。NAND 原始容量固定 64 GB；由于需要有25% OP，因此size最大为49152MB |
 | `CSD_FDM_SIZE` | 4096 | CSD 设备内存 FDM（MiB） |
 | `CSD_NR_CU` | 8 | CSD 计算单元数（≤64） |
 | `CSD_CSF_RUNTIME_SCALE` | 1 | 程序运行时间缩放 |
 | `CSD_PROGRAM_DIR` | `/workspace/code/csd-programs` | 容器内算子目录（`csd_program_dir`） |
 
-内存需求 ≈ `CSD_NVM_SIZE`（MiB）+ `FEMU_MEM` + （FDM 用时最多 `CSD_FDM_SIZE`）+ 约 1 GiB。
+最大内存需求 ≈ `CSD_NVM_SIZE`（MB）+ `FEMU_MEM`（GB） + `CSD_FDM_SIZE`（MB）+ 约 1 GiB。
 
 ## 6. 容易踩的坑
 
-1. **删 `images/` 前先 `docker compose down`**：`./images` 是 bind mount，运行中删除会让
+1. **删除 `images/` 前需要先 `docker compose down`**：`./images` 是 bind mount，运行中删除会让
    provisioning 半途失败（`qemu-img: Could not open ...`），容器随后退出、8080 无人监听。
-2. **改了 `make-guest-image.sh` 必须重建 guest 镜像**：`docker compose build` 之后删掉
-   `images/u20s.qcow2` 再 `up -d`（`scripts/build.sh` 已经包含这两步）；只改 `run-csd.sh`
-   的环境变量/QEMU 参数则不用重建 guest。
-3. **宿主机直连 guest 的私钥权限**：`images/femu-guest-key` 由容器 root 生成（0600），
-   宿主机上读不了时报 `Load key ... Permission denied`，用 `scripts/ssh-guest.sh`（走容器）
-   或 `sudo chown $USER images/femu-guest-key` 一次即可。
-4. **TPC-H 的 schema 索引不全时 Q21/Q22 会退化**：`scripts/create-indexes.sql` 里的复合主键
-   只覆盖 `l_orderkey` / `ps_partkey` 前导列，缺 `lineitem(l_partkey,l_suppkey)`、
-   `partsupp(ps_suppkey)` 这类非前导列索引，Q21 会走几十小时的 nested loop。
+2. **改了 `make-guest-image.sh` 必须重建 guest 镜像**：`./scripts/build.sh -i`（= `docker compose build`
+   后删掉 `images/u20s.qcow2` 再 `up -d`）；只改 `run-csd.sh` 的环境变量/QEMU 参数用默认的
+   `./scripts/build.sh` 即可，guest 镜像会复用。
