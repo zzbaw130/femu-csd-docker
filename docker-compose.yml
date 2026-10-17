@@ -29,8 +29,8 @@ services:
     environment:
       FEMU_SMP: 8
       FEMU_MEM: 8G
-      CSD_FDM_SIZE: 4096          # in megabytes, MAX=48GB=49152, with 25%(16GB) op
-      CSD_NVM_SIZE: 32768         # in megabytes           
-      CSD_NR_CU: 8                # max 64
+      CSD_FDM_SIZE: 64          # in megabytes, MAX=48GB=49152, with 25%(16GB) op
+      CSD_NVM_SIZE: 16384         # in megabytes           
+      CSD_NR_CU: 4                # max 64
       CSD_CSF_RUNTIME_SCALE: 1
       CSD_PROGRAM_DIR: /workspace/code/csd-programs

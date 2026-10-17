@@ -16,5 +16,13 @@ ${src_dir}/configure --prefix=${install_dir}
 make -j$(nproc)
 make install
 
+# install contrib extension
+extensions=(pg_visibility)
+for extension in ${extensions[@]}; do
+    cd ${build_dir}/contrib/${extension}
+    make -j$(nproc)
+    make install
+done
+
 echo PATH="${install_dir}/bin:\$PATH" >> /home/femu/.profile
 

@@ -11,7 +11,7 @@ RESULTS=${ROOT}/../results/${DB}
 mkdir -p ${RESULTS}
 
 stats() {
-    psql ${DB} -f - <<SQL
+    psql ${DB} <<SQL
 SELECT * FROM pg_stat_bgwriter;
 SELECT * FROM pg_stat_database WHERE datname = '${DB}';
 SQL

@@ -8,6 +8,15 @@
 /data/**
 !/data/tpch_s0.01.tar
 
+# code
+/code/pg_duckdb/
+
+# agent
+/.codex
+/reports
+/AGENTS.md
+/CLAUDE.md
+
 # 编译产物：例如 csd 目录里编译出来的算子 .so、guest 里编出的 csd-passthru
 *.o
 *.so
