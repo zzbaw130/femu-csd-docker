@@ -1,3 +1,7 @@
+> `sina_csd_dev` 分支基于 `femu-csd-with-original-postgre` tag，新增独立的
+> [Computational Storage API 库](code/apps/sina-cs-api/README.md)。Guest 应用包含
+> `cs.h` / `cs.sh` 并链接库即可使用规范 API；能力范围及软件 batch 说明见该目录文档。
+
 # FEMU CSD + PostgreSQL 实验环境
 
 在 Docker 里构建并运行 [FEMU](https://github.com/MoatLab/FEMU)（QEMU 10.1 基座）的 **CSD 模式**

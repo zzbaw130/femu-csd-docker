@@ -35,3 +35,7 @@ provision.log
 *.orig
 *.rej
 .DS_Store
+
+# Python 生成缓存
+__pycache__/
+*.pyc

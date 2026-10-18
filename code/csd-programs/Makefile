@@ -24,3 +24,8 @@ csd-vadd.bpf.o: csd-vadd.bpf.c femu-csd-kernel.h
 
 clean:
 	rm -f $(TARGETS) $(BPF_TARGETS)
+
+# SNIA API examples: run on FEMU CU threads, not in the Guest.
+all: sina-cs-scale.so
+sina-cs-scale.so: sina-cs-api/scale.c ../apps/sina-cs-api/include/cs_kernel.h
+	$(CC) $(SO_CFLAGS) -std=gnu11 -I../apps/sina-cs-api/include -shared -o $@ $<
