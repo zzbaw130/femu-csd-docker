@@ -1,7 +1,7 @@
 CC ?= cc
 CXX ?= c++
-BUILD_DIR ?= ../build
-OUT := $(abspath $(BUILD_DIR))
+include ../mk/csf.mk
+CPPFLAGS += $(CSF_CPPFLAGS)
 SO_CFLAGS ?= -Wall -Wextra -Werror -O2 -g -fPIC
 CXX_SO_CFLAGS ?= -Wall -Wextra -Werror -O2 -g -fPIC
 TARGETS := $(OUT)/csd-vadd.so $(OUT)/csd-original-kernels.so
@@ -9,10 +9,12 @@ TARGETS := $(OUT)/csd-vadd.so $(OUT)/csd-original-kernels.so
 all: $(TARGETS)
 $(OUT):
 	mkdir -p $@
-$(OUT)/csd-vadd.so: csd-vadd.c femu-csd-kernel.h | $(OUT)
-	$(CC) $(SO_CFLAGS) -shared -o $@ $<
-$(OUT)/csd-original-kernels.so: csd-original-kernels.cc femu-csd-kernel.h | $(OUT)
-	$(CXX) $(CXX_SO_CFLAGS) -shared -o $@ $< -pthread -llz4
+$(OUT)/csd-vadd.so: csd-vadd.c femu-csd-kernel.h $(CSF_BUILD_DEPS) | $(OUT)
+	$(CC) $(CPPFLAGS) $(SO_CFLAGS) -shared -o $@.tmp $< $(CSF_LDLIBS)
+	mv -f $@.tmp $@
+$(OUT)/csd-original-kernels.so: csd-original-kernels.cc femu-csd-kernel.h $(CSF_BUILD_DEPS) | $(OUT)
+	$(CXX) $(CPPFLAGS) $(CXX_SO_CFLAGS) -shared -o $@.tmp $< -pthread -llz4 $(CSF_LDLIBS)
+	mv -f $@.tmp $@
 $(OUT)/csd-vadd.bpf.o: csd-vadd.bpf.c femu-csd-kernel.h | $(OUT)
 	clang -target bpf -O2 -g -c -o $@ $<
 csd-vadd.so: $(OUT)/csd-vadd.so

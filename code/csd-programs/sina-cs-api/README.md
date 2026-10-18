@@ -7,3 +7,5 @@ make -C code/csd-programs/sina-cs-api
 ```
 
 采用 Guest API 库提供的可选 `cs_kernel_decode`，从最后一个 AFDM 输入 MR 解码类型化参数；FEMU 原生 ABI 不变。Guest 应用与测试位于 `code/apps/sina-cs-api`。
+
+构建统一链接 `libcs-workmem.so` 并设置 `$ORIGIN`，即使当前算子只使用 AFDM 和固定栈变量。新增动态工作区必须使用 cs_work_* 接口。

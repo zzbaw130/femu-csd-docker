@@ -25,7 +25,8 @@ cs_work_end(ctx);
 
 ```bash
 cc -shared -fPIC operator.c -Icsd-workmem/include -Lbuild \
-   -lcs-workmem -Wl,-rpath,'$ORIGIN' -o build/operator.so
+   -Wl,--push-state,--no-as-needed -lcs-workmem -Wl,--pop-state \
+   -Wl,-rpath,'$ORIGIN' -o build/operator.so
 ```
 
 头文件只声明接口。库实现和静态内存池状态只编译进公共动态库；不要把 workmem.c/静态库复制链接到各个算子，也不要用独立 dlmopen namespace 分别加载。公共库和算子位于同一 build 目录，SONAME 为 libcs-workmem.so，算子 RUNPATH 为 `$ORIGIN`，不需要全局 LD_LIBRARY_PATH。
@@ -49,3 +50,5 @@ make -C code/csd-programs/csd-workmem check
 真实 FEMU 验证客户端在 [apps/csd-workmem-test](../../apps/csd-workmem-test/README.md)。四个不同程序 ID 在四个 CU 上运行、覆盖两个 .so；每个申请池容量的 3/8，通过 AFDM 屏障保证同时持有，预期仅两个成功。执行两轮检查预算回收。
 
 具体构建和真实 Guest 结果见 [开发记录](doc/development.md)。
+
+所有 native 算子（包括无动态工作区的算子）统一使用 [公共构建规则](../README.md#新增算子的构建方式)。`exports.map` 只控制公共符号和 ABI 版本，不参与内存计量。

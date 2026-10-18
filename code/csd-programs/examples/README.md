@@ -39,3 +39,5 @@ make -C code/csd-programs bpf
 输出 `build/csd-vadd.bpf.o`，需要 clang BPF 后端和启用 uBPF 的 FEMU。默认 all 不构建 BPF。
 
 更多 Guest 命令参数可运行 `csd-passthru` 查看帮助；批量复制、执行、读取的示例用于功能回归，不作为精确带宽基准。
+
+所有 native .so 均经 `../mk/csf.mk` 动态链接共享工作内存库，即使某个例子没有申请动态工作区。原生入口和算法保持兼容；链接本身不接管运行库内部申请。新算子的工作内存遵循 [统一规范](../README.md#所有-native-算子的统一内存规范)。
