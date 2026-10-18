@@ -47,3 +47,5 @@ make -C code/csd-programs/csd-workmem check
 两个独立的 `csd-workmem-probe-a.so/b.so` 都链接同一个公共库。RTLD_LOCAL 测试验证共享 16 MiB 总预算，两个 6 MiB 分配后第三个失败，跨库释放后重新申请成功。
 
 真实 FEMU 验证客户端在 [apps/csd-workmem-test](../../apps/csd-workmem-test/README.md)。四个不同程序 ID 在四个 CU 上运行、覆盖两个 .so；每个申请池容量的 3/8，通过 AFDM 屏障保证同时持有，预期仅两个成功。执行两轮检查预算回收。
+
+具体构建和真实 Guest 结果见 [开发记录](doc/development.md)。

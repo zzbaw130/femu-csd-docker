@@ -80,8 +80,14 @@ cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,f
 │   ├── FEMU/                        # FEMU 源码（改这里，容器里编译）
 │   ├── apps/
 │   │   ├── postgres/                # PostgreSQL 12 源码（guest 里编译）
-│   │   └── csd-passthru/            # guest 侧 CSD 测试程序
-│   └── csd-programs/                # CSD 算子源码，容器里编成 .so 由 FEMU 加载
+│   │   ├── csd-passthru/            # guest 侧原生命令测试
+│   │   ├── sina-cs-api/             # guest SNIA API 库
+│   │   └── csd-workmem-test/         # guest 共享工作内存验证
+│   └── csd-programs/                # 容器编译、FEMU CU 执行
+│       ├── examples/                # 原生算子与 ABI 样例
+│       ├── sina-cs-api/             # SNIA 示例 CSF
+│       ├── csd-workmem/             # 共享工作内存库
+│       └── build/                   # 统一 .so 输出目录（不入库）
 ├── data/                            # TPC-H pgdata tar（tpch_s<SF>.tar，仓库只带 SF=0.01）
 ├── results/                         # 实验结果（共享给 guest，按数据库名分子目录）
 └── images/                          # guest 镜像、SSH key、下载缓存（不入库）
@@ -114,7 +120,7 @@ tests/    ← 9p: 宿主机 tests/guest    （tpch-test.sh + queries/）
   改脚本只重跑最后两层，**不再重编 FEMU**。
 - **`run-csd.sh`**：设备参数全部改成读环境变量（见第 5 节）；新增 5 条 `-virtfs`
   导出（`apps/data/results/scripts/tests`，`security_model=passthrough`）；
-  `csd_program_dir` 指向容器内的 `code/csd-programs`（guest 看不到算子目录）。
+  `csd_program_dir` 指向容器内的 `code/csd-programs/build`（guest 看不到算子目录）。
 - **`make-guest-image.sh`**：cloud-init 里预加载 `9pnet_virtio`（否则开机挂载会和
   virtio-9p 设备 probe 竞争，报 `no channels available`），`/etc/fstab` 追加 5 条 9p 挂载
   （`nofail,_netdev`），并建好/授权对应挂载点。
@@ -127,13 +133,14 @@ tests/    ← 9p: 宿主机 tests/guest    （tpch-test.sh + queries/）
 | --- | --- | --- |
 | `FEMU_SMP` | 8 | guest vCPU 数 |
 | `FEMU_MEM` | 8G | guest 内存 |
-| `CSD_NVM_SIZE` | 32768 | **暴露给 guest 的SSD容量**（MB）。NAND 原始容量固定 64 GB；由于需要有25% OP，因此size最大为49152MB |
-| `CSD_FDM_SIZE` | 4096 | CSD 设备内存 FDM（MiB） |
-| `CSD_NR_CU` | 8 | CSD 计算单元数（≤64） |
+| `CSD_NVM_SIZE` | 16384 | **暴露给 guest 的SSD容量**（MB）。NAND 原始容量固定 64 GB；由于需要有25% OP，因此size最大为49152MB |
+| `CSD_FDM_SIZE` | 64 | CSF 输入输出缓冲 FDM（MiB） |
+| `CSD_NR_CU` | 4 | CSD 计算单元数（≤64） |
 | `CSD_CSF_RUNTIME_SCALE` | 1 | 程序运行时间缩放 |
-| `CSD_PROGRAM_DIR` | `/workspace/code/csd-programs` | 容器内算子目录（`csd_program_dir`） |
+| `CSD_WORKMEM_SIZE_MB` | `64` | 所有协作式 CSF 共享的工作内存池，与 FDM 独立 |
+| `CSD_PROGRAM_DIR` | `/workspace/code/csd-programs/build` | 容器内算子目录（`csd_program_dir`） |
 
-最大内存需求 ≈ `CSD_NVM_SIZE`（MB）+ `FEMU_MEM`（GB） + `CSD_FDM_SIZE`（MB）+ 约 1 GiB。
+最大内存需求 ≈ `CSD_NVM_SIZE`（MB）+ `FEMU_MEM`（GB） + `CSD_FDM_SIZE`（MB）+ `CSD_WORKMEM_SIZE_MB`（MiB）+ 约 1 GiB。
 
 ## 6. 容易踩的坑
 

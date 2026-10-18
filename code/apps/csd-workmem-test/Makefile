@@ -8,7 +8,7 @@ CFLAGS += -std=gnu11 -Wall -Wextra -Werror -pthread
 all: $(BUILD_DIR)/csd-workmem-test
 sdk:
 	$(MAKE) -C $(SDK_DIR) BUILD_DIR=$(SDK_BUILD_DIR) all
-$(BUILD_DIR)/csd-workmem-test: src/main.c include/workmem-probe.h | sdk
+$(BUILD_DIR)/csd-workmem-test: src/main.c include/workmem-probe.h sdk
 	mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) -Iinclude -I$(SDK_DIR)/include $< $(SDK_BUILD_DIR)/libsina-cs-api.a -o $@
 clean:

@@ -81,7 +81,7 @@ if [[ ! -e "$OSIMGF" ]]; then
 	exit 1
 fi
 
-sudo ./qemu-system-x86_64 \
+sudo env CSD_WORKMEM_SIZE_MB="${CSD_WORKMEM_SIZE_MB:-64}" ./qemu-system-x86_64 \
     -name "FEMU-CSD-VM",debug-threads=on \
     -enable-kvm \
     -cpu host \

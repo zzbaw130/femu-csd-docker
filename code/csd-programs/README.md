@@ -1,185 +1,41 @@
-# FEMU CSD Passthrough Tests
+# CSD 设备程序
 
-This directory contains lightweight guest-side tools for validating FEMU CSD
-vendor commands without `linux-cemu`, FDMFS, or a fixed VM image.
+这里的 native `.so` 在容器内编译，由 FEMU CU 线程执行，逻辑上运行在 CSD CPU。Guest 应用源码位于 `code/apps`，两者通过 NVMe 交互。
 
-Build inside a normal Linux guest:
+```text
+csd-programs/
+├── Makefile          # 自动汇总各程序目录的构建规则
+├── examples/         # 原生 vadd、original-kernels、BPF、原生 ABI 头及独立样例规则
+├── sina-cs-api/      # SNIA API 的示例 CSF
+├── csd-workmem/      # 共享工作内存库、探针、测试和文档
+└── build/           # 所有 .so、可选 BPF 及本地测试程序，不提交 git
+```
+
+每个独立程序/组件一个目录，保存自己的源码、Makefile 和说明；根 Makefile 自动发现一级子目录中的 Makefile。各目录接受 `BUILD_DIR`，默认统一输出到 `build`。
+
+## 构建
 
 ```bash
-make
+# 宿主或容器内均可；original-kernels 需要 liblz4 开发包。
+make -C code/csd-programs -j4
+make -C code/csd-programs check
+
+# 从宿主在容器编译；无需重编译 FEMU。
+docker compose exec -T femu-csd make -C /workspace/code/csd-programs -j4
 ```
 
-Run a basic AFDM smoke test against a namespace device:
+也支持 `make -C code/csd-programs examples`、`csd-workmem`、`sina-cs-api`，以及原有 `csd-vadd.so` / `sina-cs-scale.so` 目标别名。无论入口在哪，产物都进入 build。`make bpf` 为可选目标，依赖带 BPF 后端的 clang。
 
-```bash
-sudo ./csd-passthru /dev/nvme0n1 smoke
-```
+Compose 将 `CSD_PROGRAM_DIR` 设置为 `/workspace/code/csd-programs/build`。加载时仍只传文件名，例如 `csd-vadd.so`，不传宿主/容器完整路径。公共库与依赖它的算子放在同一 build 目录，算子以 `$ORIGIN` 查找共享库。
 
-The smoke test sends AFDM commands through `NVME_IOCTL_IO_CMD` and uses the
-original CEMU-style admin lifecycle commands through `NVME_IOCTL_ADMIN_CMD`:
+Compose 使用挂载的 `scripts/container/start-csd.sh` 和当前源码的 run-csd.sh；后者通过 `sudo env` 显式传入工作池参数，避免 sudo 丢弃环境变量。无需因本次设备程序改动重建 FEMU 镜像。
 
-- allocate AFDM
-- write AFDM
-- read AFDM
-- load and activate a phantom CSF
-- execute the phantom CSF
-- deactivate and unload the phantom CSF
-- deallocate AFDM
+`CSD_WORKMEM_SIZE_MB=64` 控制所有协作式 CSF 共享的工作池，与 `CSD_FDM_SIZE=64` 独立。详细接口和限制见 [分配器说明](csd-workmem/README.md)。普通 malloc/new、栈和未接入的第三方分配不在工作池限制内。
 
-Build also produces `csd-vadd.so`, a minimal shared-library CSF used by the
-shared-library smoke path. The program load payload follows the original CEMU
-descriptor format: a PRP data buffer containing `path\0symbol\0`.
+## 测试
 
-The QEMU process on the host loads the program, so the file must be on the
-host, in the directory named by the `csd_program_dir` property. The `path` in
-the descriptor is a file name in that directory: FEMU refuses a name that
-contains `/` or resolves outside the directory, and refuses every shared-library
-and uBPF load when `csd_program_dir` is unset. `run-csd.sh` does not set it.
+- 原生命令、vadd 和 kernels：[examples](examples/README.md)。
+- Guest SNIA batch：`tests/sina-cs-api-test.sh [unit|build|smoke]`。
+- 工作内存：`tests/csd-workmem-test.sh [unit|build|live]`，live 需要 4 CU；以两个独立 .so 验证共享总预算、超额拒绝与恢复。
 
-Build the programs on the host and copy them into one directory
-(`csd-original-kernels.so` needs the lz4 development package):
-
-```bash
-cd hw/femu/tests/csd                 # in the FEMU source tree on the host
-make csd-vadd.so csd-original-kernels.so
-mkdir -p ~/csd-programs
-cp csd-vadd.so csd-original-kernels.so ~/csd-programs/
-```
-
-Start FEMU with `csd_program_dir` pointing at that directory. With
-`run-csd.sh`, add this line after the other `FEMU_OPTIONS` lines:
-
-```bash
-FEMU_OPTIONS=${FEMU_OPTIONS}",csd_program_dir=$HOME/csd-programs"
-```
-
-Then pass the file name alone in the guest:
-
-```bash
-sudo ./csd-passthru /dev/nvme0n1 smoke-so csd-vadd.so
-```
-
-`make` also builds `csd-original-kernels.so`, which contains small
-shared-library ports of the original CEMU `knn`, `sql`, `grep`, and `lz4`
-kernels. These tests exercise the same CSD program lifecycle and inline memory
-range interface as the vadd test:
-
-```bash
-sudo ./csd-passthru /dev/nvme0n1 smoke-so-all csd-original-kernels.so
-```
-
-FDMFS-free MRS is available through the original CEMU memory range set
-management command layout (`0x21`). The passthrough helper creates an MRS from
-AFDM-backed memory range descriptors and executes a CSF by `rsid`:
-
-```bash
-sudo ./csd-passthru /dev/nvme0n1 smoke-mrs csd-vadd.so
-sudo ./csd-passthru /dev/nvme0n1 vadd-example csd-vadd.so
-```
-
-The migrated sync-breakdown check measures NVM-to-AFDM copy, CSF execution, and
-AFDM read as separate stages:
-
-```bash
-sudo ./csd-passthru /dev/nvme0n1 sync-breakdown csd-vadd.so 4096 16
-```
-
-The indirect vadd smoke keeps the original indirect CSF ABI shape and uses an
-AFDM-backed MRS instead of FDMFS files:
-
-```bash
-sudo ./csd-passthru /dev/nvme0n1 indirect-vadd csd-vadd.so
-```
-
-A compact benchmark entry covers vadd plus the original kernel smoke set:
-
-```bash
-sudo ./csd-passthru /dev/nvme0n1 benchmark-kernels csd-vadd.so csd-original-kernels.so 1
-```
-
-The shared-library CSF ABI is:
-
-```c
-int64_t kernel(struct femu_csd_args *args);
-```
-
-The execute command uses a CEMU-style program execute command body:
-`pind`, `numr`, `dlen`, `cparam1`, `cparam2`, `group`, and `runtime` are sent
-in the command. Because this lightweight test path intentionally avoids MRS and
-FDMFS, it sends inline memory ranges in the PRP data buffer. In those test
-ranges, `nsid=0` means AFDM, `sb` is the AFDM id, and `len=0` means the full
-AFDM allocation. The CSF ABI then sees `args->mr_addr[0]` as the output AFDM
-and `args->mr_addr[1]` as the input AFDM.
-
-Other useful command-level checks:
-
-```bash
-sudo ./csd-passthru /dev/nvme0n1 alloc 4096
-sudo ./csd-passthru /dev/nvme0n1 create-group 5 0 0
-sudo ./csd-passthru /dev/nvme0n1 set-qos <group-id> 6 0 0
-sudo ./csd-passthru /dev/nvme0n1 exec <pind> <in-afdm-id> <out-afdm-id> 0 <group-id> <cparam1> <cparam2>
-sudo ./csd-passthru /dev/nvme0n1 delete-group <group-id>
-sudo ./csd-passthru /dev/nvme0n1 nvm-to-afdm <afdm-id> 0 0 0
-sudo ./csd-passthru /dev/nvme0n1 bench 4096 32
-sudo ./csd-passthru /dev/nvme0n1 bench 65536 16
-```
-
-The `bench` command reports wall-clock average latency for AFDM write, AFDM
-read, and NVM-to-AFDM copy. It is intended as a regression check for the CSD
-command path, not a final paper-level benchmark harness.
-
-FEMU CSD also accepts the original CEMU program lifecycle admin command
-layouts for load/unload (`0x22`) and activate/deactivate (`0x23`). The
-lightweight passthrough helper sends those commands to the controller device
-without the CEMU kernel driver:
-
-```bash
-sudo ./csd-passthru /dev/nvme0 admin-load-phantom 1 1000
-sudo ./csd-passthru /dev/nvme0 admin-load-so 1 csd-vadd.so csd_vadd
-sudo ./csd-passthru /dev/nvme0 admin-load-ubpf 1 csd-vadd.bpf.o csd_vadd_bpf 0
-sudo ./csd-passthru /dev/nvme0 admin-activate 1
-sudo ./csd-passthru /dev/nvme0 admin-deactivate 1
-sudo ./csd-passthru /dev/nvme0 admin-unload 1
-sudo ./csd-passthru /dev/nvme0 admin-create-mrs <out-afdm-id> <in-afdm-id>
-sudo ./csd-passthru /dev/nvme0 admin-delete-mrs <rsid>
-```
-
-The tool assumes FEMU was started with CSD mode enabled, for example:
-
-```bash
--device femu,femu_mode=4,fdm_size=64,csd_program_dir=/path/to/csd-programs
-```
-
-It intentionally does not depend on CEMU's modified kernel driver or FDMFS. CSD
-mode still uses FEMU's device-side BBSSD FTL path for normal NVM read/write
-requests; the passthrough commands validate the additional computational
-storage interface.
-
-Shared-library CSF support is enabled in the default FEMU build. uBPF support
-is optional because it depends on an external `ubpf` library. If `ubpf` is
-installed through pkg-config, build FEMU with:
-
-```bash
-./femu-compile.sh --enable-csd-ubpf
-```
-
-If you use the `ubpf-cemu` source tree directly, pass its path explicitly:
-
-```bash
-./femu-compile.sh --enable-csd-ubpf=/home/<user>/CEMU-FEMU/ubpf-cemu
-```
-
-The guest helper does not build BPF objects by default. Build the BPF test
-program on the host with Clang BPF support and copy it into `csd_program_dir`:
-
-```bash
-make bpf                             # on the host
-cp csd-vadd.bpf.o ~/csd-programs/
-```
-
-Then, in the guest:
-
-```bash
-sudo ./csd-passthru /dev/nvme0n1 smoke-ubpf csd-vadd.bpf.o 0
-sudo ./csd-passthru /dev/nvme0n1 smoke-ubpf csd-vadd.bpf.o 1
-```
+迁移时保留的旧分支编译产物位于本机 `build/legacy`，不参与构建或默认加载。`make clean` 只清理当前项目产物，不删除该归档。
