@@ -1,4 +1,4 @@
-/* Run only on a disposable FEMU namespace; this test performs no NVM writes. */
+/* Uses only the labelled femu-spill partition for temporary NVM writes. */
 #include "cs.h"
 #include <assert.h>
 #include <stdio.h>
@@ -6,6 +6,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include "spill-scenario.h"
 #define OK(x)                                                                                      \
     do {                                                                                           \
         CS_STATUS s = (x);                                                                         \
@@ -59,7 +60,11 @@ int main(int argc, char **argv)
     CS_DEV_HANDLE d;
     OK(csOpenCSx(argc > 1 ? argv[1] : "/dev/nvme0n1", NULL, &d));
     int length = 0;
-    assert(csQueryDeviceProperties(d, CS_CSE_TYPE, &length, NULL) == CS_UNSUPPORTED);
+    assert(csQueryDeviceProperties(d, CS_CSE_TYPE, &length, NULL) == CS_INVALID_LENGTH);
+    CsProperties *properties = calloc(1, length);
+    OK(csQueryDeviceProperties(d, CS_CSE_TYPE, &length, properties));
+    assert(properties->CSEDetails[0].CSE[0].NumCRs == 4);
+    free(properties);
     CsStatsInfo stats;
     assert(csQueryDeviceStatistics(d, CS_STAT_CSx_MEM_USAGE, NULL, &stats) == CS_UNSUPPORTED);
     CsMemFlags flags = {.FDMId = 1, .Flags = CS_FDM_FILL, .FillValue = 0xaabbccdd};
@@ -146,6 +151,17 @@ int main(int argc, char **argv)
     assert(max_busy >= 2); /* Run this integration profile with four native FEMU CUs. */
     OK(csFreeBatchRequest(batch));
     OK(csDeleteEvent(event));
+    CS_CSF_ID round = load(d, "cs_spill_roundtrip", 410),
+              store = load(d, "cs_spill_store", 411),
+              source = load(d, "cs_spill_load", 412),
+              fail = load(d, "cs_spill_fail", 413),
+              result64 = load(d, "cs_result64", 414);
+    spill_scenario(d, round, store, source, fail, result64);
+    CS_CSF_ID round2 = load(d, "cs_spill_roundtrip", 415),
+              validate = load(d, "cs_spill_validate", 416);
+    spill_graph(d, round, round2, validate);
+    for (unsigned i = 410; i <= 416; i++)
+        unload(d, i);
     for (unsigned i = 401; i <= 407; i++)
         unload(d, i);
     flags.Flags = 0;
@@ -153,7 +169,7 @@ int main(int argc, char **argv)
     OK(csCloseCSx(d));
     free(r);
     printf("LIVE PASS: 64 typed args, scalar-only, 128-bit, native error, FDM, storage LOAD, %u "
-           "overlapping native CSFs, cleanup\n",
+           "overlapping native CSFs, result64, internal STORE/LOAD, cross-batch spill, cleanup\n",
            max_busy);
     return 0;
 }

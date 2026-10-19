@@ -86,6 +86,7 @@ CS_STATUS cs_output(int *length, void *buffer, size_t needed)
 }
 static void device_destroy(struct cs_object *o)
 {
+    cs_spill_detach((void *)o);
     cs_transport_close((void *)o);
 }
 CS_STATUS csOpenCSx(const char *name, void *ctx, CS_DEV_HANDLE *handle)
@@ -98,7 +99,7 @@ CS_STATUS csOpenCSx(const char *name, void *ctx, CS_DEV_HANDLE *handle)
         return CS_OUT_OF_RESOURCES;
     d->fd = d->admin = -1;
     CS_STATUS s;
-    if (cs_profile_load(d, name) < 0 || cs_transport_open(d, name) < 0)
+    if (cs_transport_open(d, name) < 0 || cs_profile_load(d, name) < 0)
         s = CS_DEVICE_NOT_AVAILABLE;
     else
         s = CS_SUCCESS;

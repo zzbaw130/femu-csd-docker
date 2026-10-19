@@ -230,11 +230,6 @@ CS_STATUS csQueryDeviceProperties(CS_DEV_HANDLE h, CS_RESOURCE_TYPE type, int *l
     if (!d)
         return CS_INVALID_HANDLE;
     CS_STATUS s = CS_SUCCESS;
-    /* The original device has no CU availability query. Do not invent a value. */
-    if (type == CS_CSE_TYPE) {
-        cs_put(&d->base);
-        return CS_UNSUPPORTED;
-    }
     struct cs_program_info *list = NULL;
     size_t count = 0, extra = 0;
     if (type == CS_CSF_TYPE || type == CS_CSEE_TYPE) {
@@ -242,7 +237,9 @@ CS_STATUS csQueryDeviceProperties(CS_DEV_HANDLE h, CS_RESOURCE_TYPE type, int *l
         if (s != CS_SUCCESS)
             goto done;
     }
-    if (type == CS_CSEE_TYPE)
+    if (type == CS_CSE_TYPE)
+        extra = d->caps.workers * sizeof(ComputeResource);
+    else if (type == CS_CSEE_TYPE)
         extra = sizeof(CSEEInstance);
     else if (type == CS_FDM_TYPE)
         extra = sizeof(CSEAccess);
@@ -263,6 +260,21 @@ CS_STATUS csQueryDeviceProperties(CS_DEV_HANDLE h, CS_RESOURCE_TYPE type, int *l
             .HwVersion = 0, .SwVersion = 0, .VendorId = 0x1d1d, .DeviceId = 0x1f1f};
         strcpy(out->CSxDetails.FriendlyName,
                "FEMU SNIA CS API"); /* Software batch: hardware flag stays zero. */
+    } else if (type == CS_CSE_TYPE) {
+        out->CSEDetails[0].NumCSEs = 1;
+        CSEInfo *c = &out->CSEDetails[0].CSE[0];
+        c->CSETypeToken = c->CSEId = 1;
+        c->MaxRequestsPerBatch = CS_MAX_BATCH;
+        c->MaxCSFParametersAllowed = CS_API_MAX_ARGS;
+        c->MaxCSEEs = c->NumActivatedCSEEs = 1;
+        c->NumCRs = d->caps.workers;
+        /* The fixed native CSEE owns every CR. Unallocated != currently idle. */
+        c->NumAvailableCRs = 0;
+        c->CRs = tail;
+        for (unsigned i = 0; i < d->caps.workers; i++) {
+            c->CRs[i].ERId = i + 1;
+            snprintf(c->CRs[i].Name, sizeof(c->CRs[i].Name), "femu-cu-%u", i);
+        }
     } else if (type == CS_CSEE_TYPE) {
         CSEEProperties *p = &out->CSEEDetails[0];
         p->NumCSEEs = 1;

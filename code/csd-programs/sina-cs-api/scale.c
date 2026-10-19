@@ -1,5 +1,7 @@
 /* Device program: AFDM contains only declared inputs and outputs. */
 #include "cs_kernel.h"
+#include "cs_csf.h"
+#include <string.h>
 #include <stdint.h>
 #include <time.h>
 int64_t cs_scale(struct femu_csd_args *args)
@@ -58,4 +60,118 @@ int64_t cs_check_128(struct femu_csd_args *args)
     if (cs_kernel_decode(args, decoded) != 1 || decoded[0].type != 6)
         return -1;
     return decoded[0].value_lo == 7 && decoded[0].value_hi == 3 ? 1 : -2;
+}
+
+/* A reproducible spill example: one AFDM is the declared temporary I/O buffer.
+ * 8191 valid bytes deliberately exercises sector rounding without a host copy. */
+static int spill_args(struct femu_csd_args *native, struct cs_kernel_arg *a)
+{
+    int n = cs_kernel_decode(native, a);
+    if (n < 2 || a[n - 2].type != 1 || a[n - 2].bytes < 8192 || a[n - 1].type != 6 ||
+        !csCsfIsControl(a[n - 1].value_lo, a[n - 1].value_hi))
+        return -1;
+    return n;
+}
+int64_t cs_result64(struct femu_csd_args *native)
+{
+    struct cs_kernel_arg a[CS_API_MAX_ARGS];
+    if (cs_kernel_decode(native, a) != 1 || a[0].type != 5)
+        return -1;
+    return (int64_t)a[0].value_lo;
+}
+int64_t cs_spill_roundtrip(struct femu_csd_args *native)
+{
+    struct cs_kernel_arg a[CS_API_MAX_ARGS];
+    int n = spill_args(native, a);
+    if (n < 0)
+        return -1;
+    uint64_t lo = a[n - 1].value_lo;
+    unsigned event = csCsfEvent(lo);
+    uint64_t token = csCsfToken(lo);
+    uint8_t *io = a[n - 2].address;
+    if (event == CS_CSF_ABORT)
+        return csCsfCompletion(CS_CSF_DONE, 0);
+    if (event == CS_CSF_START) {
+        for (unsigned i = 0; i < 8191; i++)
+            io[i] = (uint8_t)(i * 13 + 7);
+        io[8191] = 0; /* Padding belongs to the declared I/O buffer. */
+        return csCsfCompletion(CS_CSF_NEED_STORE, 8191);
+    }
+    if (event == CS_CSF_STORE_DONE) {
+        memset(io, 0, 8192);
+        return csCsfCompletion(CS_CSF_NEED_LOAD, token);
+    }
+    if (event == CS_CSF_LOAD_DONE) {
+        if (csCsfBytes(a[n - 1].value_hi) != 8191)
+            return -2;
+        for (unsigned i = 0; i < 8191; i++)
+            if (io[i] != (uint8_t)(i * 13 + 7))
+                return -3;
+        return csCsfCompletion(CS_CSF_NEED_FREE, token);
+    }
+    if (event == CS_CSF_FREE_DONE)
+        return csCsfCompletion(CS_CSF_DONE, 8191);
+    return -4;
+}
+/* These two CSFs also demonstrate tokens surviving a successful batch boundary. */
+int64_t cs_spill_store(struct femu_csd_args *native)
+{
+    struct cs_kernel_arg a[CS_API_MAX_ARGS];
+    int n = spill_args(native, a);
+    if (n < 0)
+        return -1;
+    unsigned event = csCsfEvent(a[n - 1].value_lo);
+    if (event == CS_CSF_ABORT)
+        return csCsfCompletion(CS_CSF_DONE, 0);
+    if (event == CS_CSF_START) {
+        memset(a[n - 2].address, 0x5a, 8192);
+        return csCsfCompletion(CS_CSF_NEED_STORE, 8191);
+    }
+    return event == CS_CSF_STORE_DONE
+        ? (int64_t)csCsfCompletion(CS_CSF_DONE, csCsfToken(a[n - 1].value_lo)) : -2;
+}
+int64_t cs_spill_load(struct femu_csd_args *native)
+{
+    struct cs_kernel_arg a[CS_API_MAX_ARGS];
+    int n = spill_args(native, a);
+    if (n != 3 || a[0].type != 5)
+        return -1;
+    unsigned event = csCsfEvent(a[2].value_lo);
+    if (event == CS_CSF_ABORT)
+        return csCsfCompletion(CS_CSF_DONE, 0);
+    if (event == CS_CSF_START)
+        return csCsfCompletion(CS_CSF_NEED_LOAD, a[0].value_lo);
+    if (event == CS_CSF_LOAD_DONE) {
+        const uint8_t *io = a[1].address;
+        for (unsigned i = 0; i < 8191; i++)
+            if (io[i] != 0x5a)
+                return -2;
+        return csCsfCompletion(CS_CSF_NEED_FREE, csCsfToken(a[2].value_lo));
+    }
+    return event == CS_CSF_FREE_DONE ? (int64_t)csCsfCompletion(CS_CSF_DONE, 8191) : -3;
+}
+int64_t cs_spill_fail(struct femu_csd_args *native)
+{
+    struct cs_kernel_arg a[CS_API_MAX_ARGS];
+    int n = spill_args(native, a);
+    if (n < 0)
+        return -1;
+    if (csCsfEvent(a[n - 1].value_lo) == CS_CSF_START)
+        return csCsfCompletion(CS_CSF_NEED_STORE, 8191);
+    return -9; /* A failed batch must reclaim the extent it just allocated. */
+}
+int64_t cs_spill_validate(struct femu_csd_args *native)
+{
+    struct cs_kernel_arg a[CS_API_MAX_ARGS];
+    if (cs_kernel_decode(native, a) != 2)
+        return -1;
+    for (unsigned j = 0; j < 2; j++) {
+        if (a[j].type != 1 || a[j].bytes < 8191)
+            return -2;
+        const uint8_t *io = a[j].address;
+        for (unsigned i = 0; i < 8191; i++)
+            if (io[i] != (uint8_t)(i * 13 + 7))
+                return -3;
+    }
+    return 16382;
 }

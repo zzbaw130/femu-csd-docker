@@ -9,8 +9,7 @@
 ```bash
 make -C /home/femu/apps/csd-workmem-test BUILD_DIR=/tmp/csd-workmem-test \
     SDK_BUILD_DIR=/tmp/sina-cs-api-guest
-sudo env SINA_CS_FEMU_DEVICES=/dev/nvme0n1:67108864:4 \
-    /tmp/csd-workmem-test/csd-workmem-test /dev/nvme0n1
+sudo /tmp/csd-workmem-test/csd-workmem-test /dev/nvme0n1
 ```
 
 测试预留程序索引 63000..63005。四个独立程序实例覆盖两个不同 .so，各申请工作池的 3/8。AFDM 屏障确保所有请求完成分配后才开始释放，预期两个成功、两个 ENOMEM，峰值不超过总容量，结束时占用恢复为零；重复两轮。探针有 5 秒等待超时，配置不足 4 CU 会报告执行错误。

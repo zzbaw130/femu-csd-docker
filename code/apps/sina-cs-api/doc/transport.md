@@ -1,42 +1,39 @@
-# 原生 FEMU NVMe 传输适配
+# FEMU 传输绑定
 
-SNIA 定义应用 API，并不要求增加设备命令。本库仅使用初始 FEMU 已有的命令，不修改 `code/FEMU/hw/femu/csd/`、设备 ABI 或现有 `.so` 加载机制。
+SNIA 定义应用 API；具体 NVMe 绑定属于本 backend。设备端只有通用资源查询、64 位完成值和内部写入扩展，没有 SNIA 专用 wire 头、SQL runtime 或图命令。`femu_csd_args` 结构不变。
 
-## 命令映射
-
-| API 行为 | 原生命令及适配 |
+| API 行为 | NVMe 传输 |
 | --- | --- |
-| AFDM 分配/释放 | B0 / C0，4096 字节分配粒度 |
+| 设备身份、LBA/容量 | Identify Controller / Namespace |
+| 能力 | vendor admin C0 GET_INFO，CDW10=0 版本、1 FDM 字节、2 已分配 FDM、3 CU 数、4 功能位；64 位 CQE |
+| AFDM 分配/释放 | I/O B0 / C0，4096 字节分配粒度 |
 | Host↔AFDM | F5 / F2，最多 1 MiB 一次 |
-| AFDM 初始化 | Guest 生成模式，再用 F5 分块写入 |
-| AFDM→AFDM | Guest 临时缓冲，F2→F5；支持重叠范围，存在外部传输 |
-| block LOAD | D0，按真实 namespace LBA 大小计算 |
-| native CSF 加载/卸载 | 原有 admin 25 / 22 |
-| CSF 激活/去激活 | 原有 admin 23 |
-| CSF 计算 | 原有 E1，MR 列表与两个 cparam |
-| batch/callback/event | Guest 软件实现，无新增设备命令 |
-| 属性与程序发现 | 显式实验配置、进程内程序目录；不能获取的信息返回不支持 |
+| 清零/填充、AFDM→AFDM | Guest F5 或 F2→F5 软件适配 |
+| block LOAD / STORE | D0 / D1，SLBA=CDW10/11，NLB-1=CDW12低16位，AFDM ID=CDW13，byte offset=CDW14/15；无 Guest 数据载荷 |
+| native CSF 加载/卸载、激活 | admin 25 / 22、23 |
+| CSF 计算 | 原生 E1 MR 列表，使用 NVME_IOCTL_IO64_CMD 保留完整完成值 |
+| 临时区段释放 | DSM 09，AD=1，控制描述为绝对 namespace LBA/块数 |
+| batch、callback、event、恢复协议 | Guest 库实现，没有整图 NVMe 提交 |
 
-不使用新增的 C1/B1/E3，不需要 `cs-api-wire.h` 或 `cs-api.inc`。SDK 只依赖自身头文件。
+GET_INFO 功能位 bit0=内部 STORE，bit1=64 位 CSF 返回。使用 NVME_IOCTL_ADMIN64_CMD 获取查询值。非负 CSF 返回原样作为 CompValue，负 int64_t 返回转换为 CS_ERROR_IN_EXECUTION。
 
-## CSF 参数适配
+## 类型化参数
 
-原生 `femu_csd_args` 保持原样：`numr / mr_addr / mr_len / cparam1 / cparam2 / data_buffer / buffer_len`。Linux NVMe passthrough 的 metadata 字段不能用来随意指定命令 DW4/5，因此不借用它传入扩展载荷。
+1. AFDM 参数按出现顺序编码为原生 MR。
+2. 将 header 和最多 64 个类型化参数写入额外的 4 KiB AFDM 输入缓冲，再追加为最后一个 MR，长度精确描述 payload。
+3. 前两个标量低 64 位同步填入 cparam1/2；完整 128 位值保存在参数描述中。
+4. 设备 `.so` 用 `cs_kernel.h` 在本地栈解码。FEMU 只解析 MR 并调用 `.so`，不解析描述内容。
+5. E1 完成后释放参数缓冲，失败路径也释放。
 
-每次计算：
+整数 little endian，无进程指针，不借用 Linux ioctl metadata 字段去传任意 DW4/5。该约定不是 SNIA 规定的设备 ABI，旧 CSF 若直接依赖 MR 次序，应按自己的接口适配。
 
-1. 库将应用 AFDM 参数按出现顺序编码为原生 MR。
-2. 分配一个 4096 字节 AFDM，将 header 和最多 64 个类型化参数写入。该缓冲是 CSF 输入，不是 runtime 工作内存。
-3. 将参数缓冲追加为最后一个 MR，MR length 精确给出描述长度，提交 E1。前两个标量的低 64 位也填入 cparam1/2。
-4. `.so` 用可选的 `cs_kernel.h` 解码器解析最后一个 MR；AFDM 参数保存 MR 索引和 offset，整数保存最多 128 位值。FEMU 仍只解析 MR 并调用 `.so`。
-5. E1 完成后释放参数缓冲，主机调度后继或报告完成。
+## 可恢复 CSF v1
 
-描述整数使用 little endian，不包含进程指针。解码后的指针和参数数组只在 CSF 私有内存中产生。不使用原生 E1 的附加载荷字段，也不改变它的 dlen/runtime 解释。
+`cs_csf.h` 是 Guest 库和设备程序共同包含的约定，不被 FEMU include。
 
-`cs_kernel.h` 是库与采用该约定的 CSF 之间的可选适配头，**不是 SNIA 规定的 CSF ABI，也不是 FEMU runtime 扩展**。现有 CSF 保持原来的接口；要通过本库使用完整类型化参数，需在 CSF 入口采用此解码约定。不能假定任意旧 `.so` 都能直接解释它。
+- 可恢复请求最后两参：IO AFDM、128 位控制值，初值 `csCsfControl(START,0,0)`。
+- CompValue `[63:48]=0x4353, [47:44]=版本1, [43:40]=action, [39:0]=payload`。
+- 控制低64位 `[63:56]=0, [55:48]=版本1, [47:40]=event, [39:0]=token`；高64位 `[63:32]=0x43534631, [31:0]=有效字节数`。
+- STORE payload=有效字节数，LOAD/FREE payload=token，DONE payload=结果。输入控制事件为 START、STORE_DONE、LOAD_DONE、FREE_DONE、ABORT。
 
-## 返回与限制
-
-原生 FEMU 不解释 CSF 返回值的正负。本库的 native profile 约定：0..INT32_MAX 为 completion，负的 32 位值为执行错误；由 Guest 根据 E1 completion 转换状态。大量结果写入 AFDM。
-
-原生 block LOAD 及其时序保持不变。设备不执行整图；本库的并发配置不能替代设备 CU 能力或提供运行中的 CSF 抢占。
+batch 调度器在执行副本上改写控制参数，重新走普通 E1。算子收到 STORE_DONE 后自行更新私有 run 列表；库不读写算法状态。STORE/LOAD 的 payload 始终留在 AFDM/NVM 内部，只有控制描述经过 Guest。单独 csQueueComputeRequest 返回原始完成值，不自动处理恢复动作。

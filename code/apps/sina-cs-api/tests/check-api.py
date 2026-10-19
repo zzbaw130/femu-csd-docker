@@ -9,7 +9,7 @@ assert len(prototypes) == len(set(prototypes)) == 33, '规范 API 入口数不�
 sources = '\n'.join(p.read_text() for p in (root / 'src').glob('*.c'))
 for name in prototypes:
     assert re.search(r'\b(?:CS_STATUS|void)\s+' + name + r'\s*\(', sources), name
-print('PASS: 33 API declarations/implementations, original FEMU transport')
+print('PASS: 33 API declarations/implementations, native FEMU argument ABI')
 
 assert not (root / 'include/cs-api-wire.h').exists()
 for name in ('csd.c', 'csd.h'):

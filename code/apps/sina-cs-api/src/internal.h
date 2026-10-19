@@ -2,6 +2,7 @@
 #define CS_INTERNAL_H
 #include "cs.h"
 #include "cs_kernel.h"
+#include "cs_csf.h"
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdatomic.h>
@@ -21,10 +22,12 @@ struct cs_device {
     struct cs_object base;
     int fd, admin, nsid;
     uint32_t lba;
+    uint64_t blocks;
+    struct cs_spill_pool *spill;
     char path[4096];
     struct cs_profile {
         uint32_t workers;
-        uint64_t fdm_bytes;
+        uint64_t fdm_bytes, features;
     } caps;
     void *context;
 };
@@ -88,6 +91,11 @@ CS_STATUS cs_output(int *length, void *buffer, size_t needed);
 int cs_transport_open(struct cs_device *d, const char *name);
 void cs_transport_close(struct cs_device *d);
 CS_STATUS cs_io(struct cs_device *d, bool admin, struct nvme_passthru_cmd *cmd);
+CS_STATUS cs_io64(struct cs_device *, bool, struct nvme_passthru_cmd64 *);
+int cs_spill_region(struct cs_device *, uint64_t *, uint64_t *);
+void cs_spill_detach(struct cs_device *);
+void cs_spill_scope_end(struct cs_device *, void *, bool);
+CS_STATUS cs_task_resume(struct cs_task *, atomic_bool *, void *, u64 *);
 int cs_profile_load(struct cs_device *, const char *);
 /* Host catalog: only programs loaded through this library in this process. */
 struct cs_program_info {

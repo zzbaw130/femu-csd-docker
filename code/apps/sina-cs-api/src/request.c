@@ -120,8 +120,8 @@ CS_STATUS cs_task_clone(const CsBatchRequest *r, struct cs_task **out)
     } else {
         const CsStorageRequest *sr = &r->u.StorageIo;
         const CsBlockIo *b = &sr->u.BlockIo;
-        if (b->Type != CS_STORAGE_LOAD_TYPE)
-            s = CS_UNSUPPORTED;
+        if (b->Type != CS_STORAGE_LOAD_TYPE && b->Type != CS_STORAGE_STORE_TYPE)
+            s = CS_INVALID_OPTION;
         else if (b->StorageIndex)
             s = CS_UNSUPPORTED_INDEX;
         else
@@ -211,14 +211,14 @@ static CS_STATUS compute(struct cs_task *t, u64 *value)
         uint64_t id = htole64(parameter_id);
         memcpy(payload + ranges * 32 + 4, &length, sizeof(length));
         memcpy(payload + ranges * 32 + 8, &id, sizeof(id));
-        struct nvme_passthru_cmd cmd = {.opcode = 0xe1,
+        struct nvme_passthru_cmd64 cmd = {.opcode = 0xe1,
             .nsid = t->dev->nsid, .addr = (uintptr_t)payload, .data_len = bytes,
             .cdw2 = f->index, .cdw3 = ranges + 1,
             .cdw10 = params[0], .cdw11 = params[0] >> 32,
             .cdw12 = params[1], .cdw13 = params[1] >> 32};
-        s = cs_io(t->dev, false, &cmd);
+        s = cs_io64(t->dev, false, &cmd);
         /* The original firmware transports the return value without interpreting it. */
-        if (s == CS_SUCCESS && (int32_t)cmd.result < 0)
+        if (s == CS_SUCCESS && (int64_t)cmd.result < 0)
             s = CS_ERROR_IN_EXECUTION;
         if (value)
             *value = cmd.result;
@@ -303,7 +303,7 @@ static CS_STATUS storage(struct cs_task *t, u64 *value)
         uint32_t remaining = r->Range[i].NumBlocks;
         while (remaining) {
             uint32_t n = remaining > 65536 ? 65536 : remaining;
-            struct nvme_passthru_cmd cmd = {.opcode = 0xd0,
+            struct nvme_passthru_cmd cmd = {.opcode = r->Type == CS_STORAGE_STORE_TYPE ? 0xd1 : 0xd0,
                                             .nsid = t->dev->nsid,
                                             .cdw10 = lba,
                                             .cdw11 = lba >> 32,

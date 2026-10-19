@@ -19,7 +19,7 @@ $(BUILD_DIR)/libsina-cs-api.so: $(OBJECTS) src/exports.map
 	$(CC) -shared -pthread -Wl,-soname,libsina-cs-api.so -Wl,--version-script=src/exports.map -o $@ $(OBJECTS)
 install: all
 	install -d $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib
-	install -m 644 include/cs.h include/cs.sh include/cs_types.h include/cs_kernel.h $(DESTDIR)$(PREFIX)/include/
+	install -m 644 include/cs.h include/cs.sh include/cs_types.h include/cs_kernel.h include/cs_csf.h $(DESTDIR)$(PREFIX)/include/
 	install -m 644 $(BUILD_DIR)/libsina-cs-api.a $(DESTDIR)$(PREFIX)/lib/
 	install -m 755 $(BUILD_DIR)/libsina-cs-api.so $(DESTDIR)$(PREFIX)/lib/
 clean:
@@ -28,15 +28,19 @@ clean:
 $(BUILD_DIR)/api-smoke: examples/api-smoke.c $(BUILD_DIR)/libsina-cs-api.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(BUILD_DIR)/libsina-cs-api.a -o $@
 examples: $(BUILD_DIR)/api-smoke
-$(BUILD_DIR)/test-api: tests/test-api.c tests/mock-nvme.c $(filter-out src/nvme.c,$(SOURCES)) $(wildcard include/*) src/internal.h | $(BUILD_DIR)
+$(BUILD_DIR)/test-api: tests/test-api.c tests/mock-nvme.c tests/spill-scenario.h $(filter-out src/nvme.c,$(SOURCES)) $(wildcard include/*) src/internal.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) $(filter %.c,$^) -ldl -o $@
 
-$(BUILD_DIR)/live-api: tests/live-api.c $(BUILD_DIR)/libsina-cs-api.a
+$(BUILD_DIR)/live-api: tests/live-api.c tests/spill-scenario.h $(BUILD_DIR)/libsina-cs-api.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(BUILD_DIR)/libsina-cs-api.a -o $@
 $(BUILD_DIR)/headers-cxx: tests/headers.cpp $(BUILD_DIR)/libsina-cs-api.a
 	$(CXX) $(CPPFLAGS) -std=gnu++17 -Wall -Wextra -Werror $< $(BUILD_DIR)/libsina-cs-api.a -pthread -o $@
-check: $(BUILD_DIR)/test-api $(BUILD_DIR)/headers-cxx
+$(BUILD_DIR)/test-identify: tests/test-identify.c $(BUILD_DIR)/libsina-cs-api.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(BUILD_DIR)/libsina-cs-api.a \
+	    -Wl,--wrap=open,--wrap=close,--wrap=ioctl,--wrap=glob,--wrap=globfree -o $@
+check: $(BUILD_DIR)/test-api $(BUILD_DIR)/headers-cxx $(BUILD_DIR)/test-identify
 	python3 tests/check-api.py
-	SINA_CS_FEMU_DEVICES=/dev/nvme0n1:67108864:4 $(BUILD_DIR)/test-api
+	$(BUILD_DIR)/test-api
 	$(BUILD_DIR)/headers-cxx
+	$(BUILD_DIR)/test-identify
 live: $(BUILD_DIR)/live-api

@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "spill-scenario.h"
 static atomic_uint checks;
 #define CHECK(x)                                                                                   \
     do {                                                                                           \
@@ -83,14 +84,7 @@ int main(void)
     CS_MEM_HANDLE a, b;
     CHECK(csCloseCSx((void *)1) == CS_INVALID_HANDLE);
     CHECK(csCreateEvent(NULL) == CS_INVALID_ARG);
-    const char *configured = getenv("SINA_CS_FEMU_DEVICES");
-    char *saved = strdup(configured ? configured : "");
     unsetenv("SINA_CS_FEMU_DEVICES");
-    CHECK(csOpenCSx("/dev/nvme0n1", NULL, &d) == CS_DEVICE_NOT_AVAILABLE);
-    setenv("SINA_CS_FEMU_DEVICES", "/dev/nvme0n1:67108864:0", 1);
-    CHECK(csOpenCSx("/dev/nvme0n1", NULL, &d) == CS_DEVICE_NOT_AVAILABLE);
-    setenv("SINA_CS_FEMU_DEVICES", saved, 1);
-    free(saved);
     OK(csOpenCSx("/dev/nvme0n1", NULL, &d));
     CHECK(csAllocMem(d, 0, &f, &a, NULL) == CS_INVALID_ARG);
     CS_MEM_PTR va = (void *)1;
@@ -122,7 +116,13 @@ int main(void)
     CHECK(!props->FDMDetails[0].FDM[0].Flags.HostVisible);
     free(props);
     n = 0;
-    CHECK(csQueryDeviceProperties(d, CS_CSE_TYPE, &n, NULL) == CS_UNSUPPORTED);
+    CHECK(csQueryDeviceProperties(d, CS_CSE_TYPE, &n, NULL) == CS_INVALID_LENGTH);
+    props = calloc(1, n);
+    OK(csQueryDeviceProperties(d, CS_CSE_TYPE, &n, props));
+    CHECK(props->CSEDetails[0].CSE[0].NumCRs == 4);
+    CHECK(props->CSEDetails[0].CSE[0].NumAvailableCRs == 0);
+    free(props);
+    n = 0;
     CHECK(csQueryDeviceProperties(d, CS_CSx_TYPE, &n, NULL) == CS_INVALID_LENGTH);
     props = calloc(1, n);
     OK(csQueryDeviceProperties(d, CS_CSx_TYPE, &n, props));
@@ -258,8 +258,18 @@ int main(void)
     CHECK(value == 512);
     OK(copy(a, buf, 16, CS_COPY_FROM_DEVICE, 0));
     CHECK(buf[0] == 0xa5);
+    memset(buf, 0x37, sizeof(buf));
+    OK(copy(a, buf, sizeof(buf), CS_COPY_TO_DEVICE, 0));
     storage.u.BlockIo.Type = CS_STORAGE_STORE_TYPE;
-    CHECK(csQueueStorageRequest(&storage, NULL, NULL, NULL, NULL, NULL) == CS_UNSUPPORTED);
+    storage.u.BlockIo.Range[0].StartLba = 8;
+    OK(csQueueStorageRequest(&storage, NULL, NULL, NULL, NULL, &value));
+    CHECK(value == 512);
+    memset(buf, 0, sizeof(buf));
+    OK(copy(a, buf, sizeof(buf), CS_COPY_TO_DEVICE, 0));
+    storage.u.BlockIo.Type = CS_STORAGE_LOAD_TYPE;
+    OK(csQueueStorageRequest(&storage, NULL, NULL, NULL, NULL, &value));
+    OK(copy(a, buf, sizeof(buf), CS_COPY_FROM_DEVICE, 0));
+    CHECK(buf[0] == 0x37 && buf[31] == 0x37);
     f.Flags = (CS_FDM_FLAG_TYPE)8;
     CHECK(csFreeMem(a, &f) == CS_INVALID_OPTION);
     OK(copy(a, buf, 16, CS_COPY_FROM_DEVICE, 0));
@@ -293,6 +303,15 @@ int main(void)
     free(observed);
     CsStatsInfo stats;
     CHECK(csQueryDeviceStatistics(d, CS_STAT_CSx_MEM_USAGE, NULL, &stats) == CS_UNSUPPORTED);
+    CS_CSF_ID round = load(d, "cs_spill_roundtrip", "spill-round", 210),
+              store = load(d, "cs_spill_store", "spill-store", 211),
+              source = load(d, "cs_spill_load", "spill-load", 212),
+              fail = load(d, "cs_spill_fail", "spill-fail", 213),
+              wide = load(d, "cs_result64", "result64", 214);
+    spill_scenario(d, round, store, source, fail, wide);
+    CS_CSF_ID round2 = load(d, "cs_spill_roundtrip", "spill-round2", 215),
+              validate = load(d, "cs_spill_validate", "spill-validate", 216);
+    spill_graph(d, round, round2, validate);
     CHECK(mock_used_bytes() == 0);
     OK(csCloseCSx(d));
     CHECK(csCloseCSx(d) == CS_INVALID_HANDLE);

@@ -228,7 +228,7 @@ static void *batch_worker(void *arg)
         x->running++;
         pthread_mutex_unlock(&x->lock);
         u64 value = 0;
-        CS_STATUS s = cs_task_run(x->b->entries[index].task, &value);
+        CS_STATUS s = cs_task_resume(x->b->entries[index].task, x->cancelled, x, &value);
         pthread_mutex_lock(&x->lock);
         x->running--;
         x->done |= UINT64_C(1) << index;
@@ -247,10 +247,12 @@ CS_STATUS cs_batch_run(struct cs_batch *b, atomic_bool *cancelled, u64 *value)
                           .cond = PTHREAD_COND_INITIALIZER,
                           .error = CS_SUCCESS};
     unsigned workers = 1;
+    struct cs_device *device = NULL;
     for (unsigned i = 0; i < b->capacity; i++)
         if (b->entries[i].task) {
             x.all |= UINT64_C(1) << i;
-            workers = b->entries[i].task->dev->caps.workers;
+            device = b->entries[i].task->dev;
+            workers = device->caps.workers;
         }
     if (!x.all) {
         pthread_mutex_destroy(&x.lock);
@@ -273,6 +275,7 @@ CS_STATUS cs_batch_run(struct cs_batch *b, atomic_bool *cancelled, u64 *value)
     batch_worker(&x);
     for (unsigned i = 0; i < launched; i++)
         pthread_join(threads[i], NULL);
+    cs_spill_scope_end(device, &x, x.error == CS_SUCCESS && !atomic_load(cancelled));
     if (value)
         *value = x.value;
     pthread_mutex_destroy(&x.lock);

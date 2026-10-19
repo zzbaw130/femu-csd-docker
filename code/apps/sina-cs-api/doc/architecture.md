@@ -1,54 +1,33 @@
-# 架构、执行位置和内存
-
-## 调用路径
+# 架构、执行位置和资源
 
 ```text
-Guest 应用（cs.h / cs.sh）
-  → Guest API 库：参数检查、句柄、资源引用、软件 batch、callback/event
-  → Linux 原有 NVMe passthrough 驱动
-  → 原生 FEMU CSD：B0/C0/D0/E1/F2/F5，原有加载/激活命令
-  → FEMU CU 线程：调用原有 femu_csd_args ABI 的 native .so
-  → NVMe 完成 → Guest 库推进依赖图，返回或发布完成通知
+Guest 应用 → Guest SNIA 库（图、线程、event、临时 token）
+          → Linux NVMe passthrough → 容器内 FEMU
+          → CU 线程调用 native .so → CQE → Guest 库推进逻辑节点
 ```
 
-API 库位于 Guest 应用进程及其工作线程，消耗 Guest vCPU；没有常驻代理。FEMU 在容器内运行，`.so` 加载进 FEMU 进程，由其 CU 线程执行，逻辑上模拟 CSD CPU。
+无常驻代理。库使用 Guest vCPU，设备 `.so` 在容器内 FEMU CU 线程执行，逻辑上属于 CSD CPU。设备只理解通用命令和 `femu_csd_args`，不解析 SQL 或恢复协议。
 
-`code/FEMU/hw/femu/csd/` 保持初始 tag 的实现；没有 SNIA 专用查询命令、设备 DAG、类型化执行命令或追加的 `femu_csd_args` 字段。SNIA 应用接口通过 Guest 库映射到已有命令。
+## 能力与内存
 
-## 软件 batch 与完成通知
+Identify Controller 验证 CSD Model Number；Identify Namespace 获取实际 LBA/容量；vendor admin GET_INFO 获取 FDM、CU、功能位，不使用环境变量绑定。FDM 属性对应设备容量；CU 映射为一个 CSE 中的多个 CR，固定 native CSEE 已分配所有 CR，`NumAvailableCRs=0` 不代表瞬时繁忙。
 
-图及依赖状态保存在 Guest 私有内存。每个节点仍通过独立 NVMe 命令执行；前驱完成后，Guest 工作线程提交后继。SERIAL 单线程，PARALLEL 执行独立节点，HYBRID 等待每个节点的全部前驱。
+AFDM 保存输入、输出和共享中间数据；每个 E1 额外使用 4 KiB AFDM 输入描述。解码数组在 CU 栈上，私有堆统一使用设备共享 `libcs-workmem.so`，与 FDM 配额独立；这是一种合作式配额，并非 native 指令沙箱。
 
-- 最多 64 节点；ADD/DELETE/RECONFIG/JOIN/SPLIT，拒绝环并回滚配置。
-- Before 表示后继，After 表示前驱；JOIN 加 After→Before，SPLIT 的两个索引切断 Before→After。
-- 配置复制请求描述并保留资源引用，不复制 HostVAddress 指向的数据。
-- 并发提交上限取实验配置中的 CU 数，并限制为最多 64 个工作线程。实际并行受原生 FEMU 限制：同一程序 ID 串行，不同实例可占用不同 CU。
-- 失败后停止启动新节点，等待已运行节点退出后报告整批失败。
-- 输入输出通过 AFDM 参数明确绑定，依赖图不自动推导 CSF 的数据格式或读写冲突。
-- 连续 CSF 使用同一块 AFDM 时，中间结果留在设备中；Guest 只推进控制依赖。
+CSF 名称/GlobalId/激活状态由 Guest 进程内目录记录，同进程同路径共享。无法枚举别的进程加载的程序，仍需预留索引。设备重启后重新初始化应用。
 
-硬件 batch 标志为 0。callback 由 Guest 工作线程在完成后调用；event 记录也在 Guest 内存，由应用轮询。FEMU 只返回原有命令的完成状态，不接收 callback 地址。
+## batch
 
-## 实验配置与主机目录
+最多 64 节点，配置深拷贝描述并持有资源引用。SERIAL 单线程；PARALLEL 独立节点；HYBRID 在全部前驱完成后启动。Before 为后继，After 为前驱；JOIN 加 After→Before，SPLIT 双索引切断 Before→After。环检测拒绝并回滚非法配置。并发工作线程数来自设备 CU 查询，最多 64；FEMU 实际执行仍限制 CU 数和同一程序 ID 的并发。
 
-原生 FEMU 没有本库所需的设备能力/程序枚举查询，库不补造设备命令。`SINA_CS_FEMU_DEVICES` 显式指定允许使用的 namespace、FDM 容量和 CU 数。容量属性来自配置；内存是否分配成功仍由设备决定。CSE 实时可用 CU 属性、设备全局统计返回 `CS_UNSUPPORTED`。
+每个可恢复节点在独立请求副本上循环：E1 → NEED_STORE/LOAD/FREE → 标准 storage 请求或 DSM → 带确认控制值的 E1 → DONE。存入节点的原始描述保持不变，因此图可重复提交。整个循环完成后才将该节点置为 done，依赖、callback 和 event 都基于逻辑完成。错误后不启动新节点，等待所有在途节点，然后回收本批新增 spill 区段。
 
-程序名称、GlobalId 和激活状态由 Guest 进程内目录记录，同进程打开同一路径的多个 handle 共享目录；只包含该进程通过库加载的程序。不能查询其他进程/旧 passthrough 已加载的程序，也不持久化到 FEMU。应用需预留程序索引，避免与其他客户端重复使用；当前实验使用单一管理进程。设备重启后应结束原应用进程并重新初始化。
+临时池在首次使用时按 GPT PARTLABEL 找到 `femu-spill` 分区，用 sysfs 的 512 字节单位换算为实际 namespace LBA。数据始终通过 namespace 上的 D0/D1 命令传送，区段在 Guest 进程内按 LBA 排序进行首次适配分配。LOAD/STORE/FREE 在池锁内执行，避免复用正在读取的区段；运行 CSF 时不持池锁。独占 flock 持有在分区节点上，阻止另一个合作进程分配重叠范围。
 
-## AFDM 与 CSF 私有运行内存
+成功 batch 的 token 可供后续 batch 使用；算子在私有状态中保存 token 和自己的算法状态。失败批次仅释放本批新增区段；旧 token 需显式 FREE。最后一个参与池的设备关闭时释放剩余区段。资源不是持久化数据库，不提供崩溃恢复。
 
-AFDM 保存 CSF 输入、输出和共享中间数据。为适配完整类型化参数，Guest 库为每次计算分配一个 4 KiB AFDM 输入缓冲，写入参数描述，并作为原生 E1 的最后一个 MR。`.so` 可使用 `cs_kernel_decode` 在自己的栈上解析，FEMU 不理解该内容。完成后库释放输入缓冲，包括执行失败的路径。因此纯标量 CSF 也可执行，且每个在途计算需要额外 4 KiB FDM。
+## 生命周期与适配成本
 
-该输入缓冲不保存队列、线程、主机指针或 CSF 私有工作区。CSF 的解码数组和临时变量位于 CU 栈/私有内存；64 MiB FDM 不等同于设备总 RAM。目前没有 CSF 私有 heap 配额或 native 指令级沙箱。
+句柄为登记表的 opaque token。图及请求持有 AFDM/CSF/device 引用，使用中的资源不能释放。异步完成先释放请求引用再通知，callback 不持登记表锁。HostVAddress 指向的数据不复制，调用者保留至完成。已开始的 native CSF 不支持强制抢占。
 
-## 内存操作的软件适配
-
-- 清零/填充：Guest 生成最多 1 MiB 的模式缓冲，通过原生 F5 分块写入。
-- AFDM→AFDM：Guest 使用最多 1 MiB 临时缓冲，通过 F2/F5 分块复制；重叠范围按 memmove 方向处理。该路径有数据往返，不能视作设备内部带宽。
-- block LOAD：原生 D0 直接从 namespace 进入 AFDM，不经过 Guest 数据缓冲。
-
-## 资源生命周期
-
-句柄为登记表中的 opaque token。配置图和执行请求持有 AFDM/CSF/device 引用，仍被引用的资源不能释放。完成时先释放请求引用，再通知应用；callback 不在登记表锁内执行。已开始的 native CSF 不能抢占，abort 返回不支持。
-
-关闭设备只会失效空闲 CSF handle；有内存、配置图或请求时拒绝关闭。主机目录和设备状态之间不具备跨进程事务性；真实命令失败仍会报告给应用。
+清零/填充通过 Guest F5；AFDM→AFDM fallback 使用 Guest 的 F2/F5 临时缓冲，支持重叠，具有外部传输。共享 AFDM 的相邻 CSF 无需复制。LOAD/STORE 的数据不经过 Guest。每次重入需要一次额外参数 AFDM 分配/写入/释放和 E1，这部分是调度开销，不能算成纯 CSF 计算性能。

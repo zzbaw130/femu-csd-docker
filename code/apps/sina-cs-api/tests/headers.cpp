@@ -1,5 +1,6 @@
 #include "cs.sh"
 #include "cs_kernel.h"
+#include "cs_csf.h"
 static_assert(sizeof(femu_csd_args) == 52, "original FEMU ABI");
 int main()
 {
