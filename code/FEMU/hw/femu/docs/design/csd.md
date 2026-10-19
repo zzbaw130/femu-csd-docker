@@ -51,19 +51,17 @@ collection.
         |        |  compute unit busy-until times,       |
         |        |  queue of Execute jobs                |
         |        +----+------------------+---------------+
-        |             | Execute job      | copy namespace data
-        |             v                  v into an AFDM
-        |   +-------------------+    memory backend
+        |             | Execute job      | namespace/AFDM copy
+        |             v                  | queued to FTL thread
+        |   +-------------------+        |
         |   | femu-csd-cu x     |
         |   | nr_cu: run the    |--> completion ring of the poller
         |   | program, charge a |    that fetched the command
         |   | compute unit      |
         |   +-------------------+
    +----v------------------------+
-   | FTL thread: black-box FTL   |   timing for Read and Write; CSD
-   +-----------------------------+   commands other than Execute pass
-                                     through it and are charged nothing
-                                     there, though the FTL may run GC
+   | FTL thread: black-box FTL   |<---+ data copy + timing for D0/D1
+   +-----------------------------+     and timing for ordinary Read/Write
 ```
 
 `csd_init()` runs the black-box geometry and capacity checks, builds a full
@@ -137,7 +135,8 @@ I/O commands, on the CSD namespace (`csd_io_cmd()`):
 | 0x01, 0x02 | Write, Read | `nvme_rw()` then the black-box FTL | black-box FTL timing |
 | 0xb0 | Allocate FDM | new AFDM of `size` bytes; Dword 0 = id | none |
 | 0xc0 | Deallocate AFDM | frees it, returns its bytes to the quota | none |
-| 0xd0 | NVM to AFDM | copy `nlb + 1` blocks (`nlb` is 0-based) from `slba` into an AFDM at `offset` | one `pg_rd_lat` if any page of the range is mapped in the FTL, else none |
+| 0xd0 | NVM to AFDM | copy `nlb + 1` blocks (`nlb` is 0-based) from `slba` into an AFDM at `offset` | black-box FTL read timing |
+| 0xd1 | AFDM to NVM | reverse of 0xd0, same fields, no Guest data payload | black-box FTL write timing, FUA |
 | 0xe1 | Execute | run a program on memory ranges; Dword 0 = its return value | compute unit time, below |
 | 0xf2 | Read AFDM | AFDM bytes to the host | none |
 | 0xf5 | Write AFDM | host bytes into an AFDM | none |
@@ -151,14 +150,15 @@ Admin commands (`csd_admin_cmd()`):
 | 0x22, 0x25 | Load program, or load more of its bytes; `sel` 1 unloads |
 | 0x23 | Activate (`sel` 1) or deactivate (`sel` 0) a program |
 
-`hw/femu/tests/csd/csd-passthru.c` builds every one of these commands and is
-the reference for their layouts; `hw/femu/csd/csd.h` declares them.
+`hw/femu/tests/csd/csd-passthru.c` builds the original CEMU commands;
+`hw/femu/csd/csd.h` declares the command layouts, including 0xd1.
 
-NVM to AFDM reads the namespace's slice of the memory backend directly and
-checks the black-box mapping table only to decide whether to charge the
-read. It does not go through the FTL's LUN queues. Pages still held in the
-write buffer and deallocated pages are not mapped, so a range of only those
-costs nothing.
+`csd_ftl_storage()` handles both copy directions on the controller FTL
+thread. It validates the namespace and AFDM ranges, calls the normal FTL
+read/write path, and copies backend bytes without Guest DMA. Writes use
+FUA and update namespace allocation state; internal writes do not increase
+the host-write-page counter. Metadata formats and power-loss mode are not
+supported by these data-only commands.
 
 When `oncs` turns them on, the generic NVM commands (Dataset Management,
 Compare, Write Zeroes and the others) are handled by the common layer in
@@ -347,7 +347,7 @@ properties apply to the namespace as in the black-box mode.
 | `nr_cu` | compute units, 1 to 64 |
 | `csf_runtime_scale` | host-to-device time factor for programs that give no runtime; not 0 |
 | `csd_program_dir` | where shared-library and eBPF programs load from |
-| `pg_rd_lat` | the cost of an NVM to AFDM copy |
+| `pg_rd_lat`, `pg_wr_lat` | NAND timing used by namespace/AFDM copies |
 | `nr_thread`, `time_slice`, `context_switch_time` | accepted for CEMU configurations; no effect, and a non-default value warns at realize (`nr_thread` must still not be 0) |
 
 The smallest device line that loads programs:
@@ -362,8 +362,8 @@ The smallest device line that loads programs:
 - The vendor log page C0h counts the namespace's NAND traffic as for the
   black-box mode
   ([log pages and counters](../reference/log-pages-and-counters.md#vendor-log-page-c0h)).
-  NVM to AFDM copies do not appear there, because they do not go through
-  the FTL.
+  Internal copies contribute NAND traffic, while internal writes are
+  excluded from the host-write-page counter.
 - The SMART log counts plain Read and Write. CSD commands are not counted.
 - FEMU keeps no counter of programs run or compute unit use. Time the
   Execute commands from the guest; `csd-passthru benchmark-kernels` times
@@ -407,8 +407,7 @@ The smallest device line that loads programs:
   returns.
 - The guest's program runs in the QEMU process. Treat `csd_program_dir` as
   code you are choosing to run on the host.
-- NVM to AFDM charges one page read whatever its size, and does not queue on
-  LUNs or channels.
+- Namespace/AFDM copies currently reject metadata formats and power-loss mode.
 - Groups and their QoS settings are stored but do not affect scheduling.
 - Device memory transfers (Read and Write AFDM) take no device time.
 - One CSD namespace per controller. No `meta` and no namespace management.
@@ -424,10 +423,8 @@ Refusal messages are listed in the
   compute unit by group priority or deadline would happen in
   `csd_finish_locked()`, where it picks the unit with the smallest
   `cu_next_avail`, and the order jobs leave the queue in `csd_worker()`.
-- **Copy cost from the FTL.** `csd_nvm_to_afdm()` has the mapped page count
-  from `csd_check_nvm_ftl_range()`; charging each mapped page through the
-  media model (`ssd_advance_status()`) instead of one `pg_rd_lat` would add
-  LUN and channel contention.
+- **Internal copies.** `csd_ftl_storage()` shares normal FTL timing and GC.
+  Add future copy variants there without introducing Guest data transfers.
 - **Preemption.** A compute unit thread runs a program to the end. A time
   slice, which CEMU's `time_slice` and `context_switch_time` describe, would
   need programs that yield.

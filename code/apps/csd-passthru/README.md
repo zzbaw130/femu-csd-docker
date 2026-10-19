@@ -124,6 +124,23 @@ sudo ./csd-passthru /dev/nvme0n1 bench 4096 32
 sudo ./csd-passthru /dev/nvme0n1 bench 65536 16
 ```
 
+新增设备内部 AFDM→NVM 命令 `0xd1`，与 NVM→AFDM 的 `0xd0` 使用同一参数布局：
+
+```bash
+sudo ./csd-passthru /dev/nvme0n1 afdm-to-nvm <afdm-id> <afdm字节偏移> <namespace起始LBA> <零基块数>
+sudo ./csd-passthru /dev/nvme0n1 nvm-to-afdm <afdm-id> <afdm字节偏移> <namespace起始LBA> <零基块数>
+```
+
+`nlb=0` 表示一个逻辑块；512B namespace 中 `nlb=7` 表示 4KiB。
+CDW10/11 是起始 LBA，CDW12 低 16 位是零基块数，CDW13 是 AFDM ID，
+CDW14/15 是 AFDM 字节偏移。请求不携带 Guest 数据缓冲区，成功完成值为复制字节数。
+写入会覆盖指定 LBA，spill 使用时应填入 `femu-spill` 分区内的 namespace 绝对地址。
+
+两个方向均在控制器 FTL 线程调用公共读写路径，计入 NAND、通道排队和 GC 时延。
+`0xd1` 使用 FUA，完成前计入介质写入开销，内部写不计为主机传输的写入页数。
+当前不支持携带 namespace metadata 的格式或 power-loss 模式。
+本次只增加设备命令及 passthru 调用；SINA STORE 映射和临时空间分配另行接入。
+
 The `bench` command reports wall-clock average latency for AFDM write, AFDM
 read, and NVM-to-AFDM copy. It is intended as a regression check for the CSD
 command path, not a final paper-level benchmark harness.

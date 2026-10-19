@@ -17491,6 +17491,7 @@ static const FemuOc12TraceWant femu_oc12_trace_want[] = {
 #define FEMU_CSD_ALLOC_FDM   0xb0
 #define FEMU_CSD_DEALLOC     0xc0
 #define FEMU_CSD_NVM_TO_AFDM 0xd0
+#define FEMU_CSD_AFDM_TO_NVM 0xd1
 #define FEMU_CSD_EXEC        0xe1
 #define FEMU_CSD_READ_AFDM   0xf2
 #define FEMU_CSD_WRITE_AFDM  0xf5
@@ -17503,6 +17504,123 @@ typedef struct FemuCsdFuzzMem {
     uint32_t id;
     uint32_t size;
 } FemuCsdFuzzMem;
+
+static uint16_t femu_csd_copy(FemuCtrlState *c, uint8_t opcode, uint32_t id,
+                              uint64_t offset, uint64_t slba, uint16_t nlb)
+{
+    NvmeCmd cmd = { 0 };
+    uint16_t cid, status;
+    uint32_t result;
+
+    cmd.opcode = opcode;
+    cmd.nsid = cpu_to_le32(1);
+    /* Neither direction may dereference Guest data pointers. */
+    cmd.dptr.prp1 = cpu_to_le64(UINT64_MAX);
+    cmd.cdw10 = cpu_to_le32(slba);
+    cmd.cdw11 = cpu_to_le32(slba >> 32);
+    cmd.cdw12 = cpu_to_le32(nlb);
+    cmd.cdw13 = cpu_to_le32(id);
+    cmd.cdw14 = cpu_to_le32(offset);
+    cmd.cdw15 = cpu_to_le32(offset >> 32);
+    femu_submit(c, &c->io, &cmd);
+    status = FEMU_SC(femu_complete(c, &c->io, &cid, &result));
+    if (status == NVME_SUCCESS) {
+        g_assert_cmpuint(result, ==, ((uint32_t)nlb + 1) * c->lba_size);
+    }
+    return status;
+}
+
+/* AFDM -> namespace -> ordinary READ and namespace -> AFDM round trips. */
+static void femu_test_csd_nvm_copy(void *obj, void *data, QGuestAllocator *alloc)
+{
+    QFemu *femu = obj;
+    QTestState *qts = femu->dev.bus->qts;
+    FemuCtrlState c = { 0 };
+    uint64_t buf = guest_alloc(alloc, 4096);
+    uint8_t expected[4096], actual[4096], stats[512];
+    uint32_t id;
+    uint16_t cid;
+    NvmeCmd cmd = { 0 };
+    NvmeRwCmd rw = { 0 };
+
+    femu_enable(&c, &femu->dev, alloc);
+    c.lba_size = GPOINTER_TO_UINT(data);
+    femu_create_io_queues(&c);
+    for (int i = 0; i < sizeof(expected); i++) {
+        expected[i] = (uint8_t)(i * 13 + 7);
+    }
+    qtest_memwrite(qts, buf, expected, sizeof(expected));
+    cmd.opcode = FEMU_CSD_ALLOC_FDM;
+    cmd.nsid = cpu_to_le32(1);
+    cmd.cdw10 = cpu_to_le32(16384);
+    femu_submit(&c, &c.io, &cmd);
+    g_assert_cmpint(FEMU_SC(femu_complete(&c, &c.io, &cid, &id)), ==, NVME_SUCCESS);
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.opcode = FEMU_CSD_WRITE_AFDM;
+    cmd.nsid = cpu_to_le32(1);
+    cmd.dptr.prp1 = cpu_to_le64(buf);
+    cmd.cdw10 = cpu_to_le32(4096);
+    cmd.cdw12 = cpu_to_le32(4096);
+    cmd.cdw14 = cpu_to_le32(id);
+    g_assert_cmpint(femu_io(&c, &cmd), ==, NVME_SUCCESS);
+
+    g_assert_cmpint(femu_csd_copy(&c, FEMU_CSD_AFDM_TO_NVM, id, 4096,
+                                 128, 4096 / c.lba_size - 1), ==, NVME_SUCCESS);
+    /* The write must program flash, not merely change backend bytes. */
+    g_assert_cmpint(femu_get_log(&c, FEMU_LOG_FEMU_STATS, buf, sizeof(stats), 0), ==, NVME_SUCCESS);
+    qtest_memread(qts, buf, stats, sizeof(stats));
+    g_assert_cmpuint(ldq_le_p(stats + 24), >, 0);
+    g_assert_cmpuint(ldq_le_p(stats + 8), ==, 0); /* internal write is not host traffic */
+
+    rw.opcode = NVME_CMD_READ;
+    rw.nsid = cpu_to_le32(1);
+    rw.slba = cpu_to_le64(128);
+    rw.nlb = cpu_to_le16(4096 / c.lba_size - 1);
+    rw.dptr.prp1 = cpu_to_le64(buf);
+    g_assert_cmpint(femu_io(&c, (NvmeCmd *)&rw), ==, NVME_SUCCESS);
+    qtest_memread(qts, buf, actual, sizeof(actual));
+    g_assert_cmpint(memcmp(expected, actual, sizeof(actual)), ==, 0);
+
+    g_assert_cmpint(femu_csd_copy(&c, FEMU_CSD_NVM_TO_AFDM, id, 8192,
+                                 128, 4096 / c.lba_size - 1), ==, NVME_SUCCESS);
+    cmd.opcode = FEMU_CSD_READ_AFDM;
+    cmd.cdw10 = cpu_to_le32(8192);
+    g_assert_cmpint(femu_io(&c, &cmd), ==, NVME_SUCCESS);
+    qtest_memread(qts, buf, actual, sizeof(actual));
+    g_assert_cmpint(memcmp(expected, actual, sizeof(actual)), ==, 0);
+
+    /* A multi-page transfer must copy and charge every page. */
+    g_assert_cmpint(femu_csd_copy(&c, FEMU_CSD_AFDM_TO_NVM, id, 0,
+                                 256, 8192 / c.lba_size - 1), ==, NVME_SUCCESS);
+    g_assert_cmpint(femu_csd_copy(&c, FEMU_CSD_NVM_TO_AFDM, id, 8192,
+                                 256, 8192 / c.lba_size - 1), ==, NVME_SUCCESS);
+    cmd.cdw10 = cpu_to_le32(12288);
+    g_assert_cmpint(femu_io(&c, &cmd), ==, NVME_SUCCESS);
+    qtest_memread(qts, buf, actual, sizeof(actual));
+    g_assert_cmpint(memcmp(expected, actual, sizeof(actual)), ==, 0);
+    g_assert_cmpint(femu_get_log(&c, FEMU_LOG_FEMU_STATS, buf, sizeof(stats), 0), ==, NVME_SUCCESS);
+    qtest_memread(qts, buf, stats, sizeof(stats));
+    g_assert_cmpuint(ldq_le_p(stats + 24), >=, 3);
+
+    for (int write = 0; write <= 1; write++) {
+        uint8_t opcode = write ? FEMU_CSD_AFDM_TO_NVM : FEMU_CSD_NVM_TO_AFDM;
+
+        g_assert_cmpint(femu_csd_copy(&c, opcode, UINT32_MAX, 0, 128, 0), ==, NVME_INVALID_FIELD);
+        g_assert_cmpint(femu_csd_copy(&c, opcode, id, 16384, 128, 0), ==, NVME_INVALID_FIELD);
+        g_assert_cmpint(femu_csd_copy(&c, opcode, id, UINT64_MAX, 128, 0), ==, NVME_INVALID_FIELD);
+        g_assert_cmpint(femu_csd_copy(&c, opcode, id, 0, UINT64_MAX, 0), ==, NVME_LBA_RANGE);
+    }
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.opcode = FEMU_CSD_DEALLOC;
+    cmd.nsid = cpu_to_le32(1);
+    cmd.cdw10 = cpu_to_le32(id);
+    g_assert_cmpint(femu_io(&c, &cmd), ==, NVME_SUCCESS);
+    g_assert_cmpint(femu_csd_copy(&c, FEMU_CSD_AFDM_TO_NVM, id, 0, 128, 0), ==, NVME_INVALID_FIELD);
+    femu_queue_free(&c, &c.io);
+    femu_disable(&c);
+    guest_free(alloc, buf);
+}
 
 /*
  * Computational storage commands from a fixed seed. The run keeps a small
@@ -17519,7 +17637,7 @@ static void femu_test_csd_fuzz(void *obj, void *data, QGuestAllocator *alloc)
     QTestState *qts = femu->dev.bus->qts;
     FemuCtrlState c = { 0 };
     const uint8_t ops[] = {
-        FEMU_CSD_ALLOC_FDM, FEMU_CSD_DEALLOC, FEMU_CSD_NVM_TO_AFDM,
+        FEMU_CSD_ALLOC_FDM, FEMU_CSD_DEALLOC, FEMU_CSD_NVM_TO_AFDM, FEMU_CSD_AFDM_TO_NVM,
         FEMU_CSD_EXEC, FEMU_CSD_READ_AFDM, FEMU_CSD_WRITE_AFDM,
         FEMU_CSD_NEW_GROUP, FEMU_CSD_SET_QOS, FEMU_CSD_DEL_GROUP,
         NVME_CMD_WRITE, NVME_CMD_READ,
@@ -17579,6 +17697,7 @@ static void femu_test_csd_fuzz(void *obj, void *data, QGuestAllocator *alloc)
             }
             break;
         case FEMU_CSD_NVM_TO_AFDM:
+        case FEMU_CSD_AFDM_TO_NVM:
             len = g_rand_int_range(rng, 1, 9);
             rw.slba = cpu_to_le64(g_rand_int_range(rng, 0, 1024));
             cmd->cdw12 = cpu_to_le32(len - 1);
@@ -36051,6 +36170,16 @@ static void femu_register_nodes(void)
     qos_add_test("csd-fuzz", "femu", femu_test_csd_fuzz,
                  &(QOSGraphTestOptions) {
         .edge.extra_device_opts = "femu_mode=4,fdm_size=16,sgl=on"
+    });
+    qos_add_test("csd-nvm-copy", "femu", femu_test_csd_nvm_copy,
+                 &(QOSGraphTestOptions) {
+        .arg = GUINT_TO_POINTER(512),
+        .edge.extra_device_opts = "femu_mode=4,fdm_size=16,vwc=1"
+    });
+    qos_add_test("csd-nvm-copy-4k", "femu", femu_test_csd_nvm_copy,
+                 &(QOSGraphTestOptions) {
+        .arg = GUINT_TO_POINTER(4096),
+        .edge.extra_device_opts = "femu_mode=4,fdm_size=16,vwc=1,lba_index=3"
     });
     qos_add_test("io-fuzz-metadata", "femu", femu_test_io_fuzz,
                  &(QOSGraphTestOptions) {

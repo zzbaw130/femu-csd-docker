@@ -204,8 +204,9 @@ workload-mix model instead
 CSD runs a program on the compute unit that frees up first. A program holds
 its unit for its declared run time, or for its measured host run time
 multiplied by the program's own scale, or by `csf_runtime_scale` when it
-gives none. `nr_cu` sets how many units run at once. A copy from the
-namespace into device memory costs `pg_rd_lat`.
+gives none. `nr_cu` sets how many units run at once. Namespace/AFDM copies
+use the normal BlackBox FTL read/write paths, including per-page media
+timing and LUN/channel contention. AFDM-to-NVM uses FUA writes.
 
 Properties: [CSD](../reference/properties.md#csd-computational-storage).
 

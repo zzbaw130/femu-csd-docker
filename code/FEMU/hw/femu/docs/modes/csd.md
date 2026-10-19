@@ -114,9 +114,9 @@ namespace; see the [BlackBox guide](blackbox.md#configuration).
   configurations still start. They have no effect, and a value other than
   the default prints a warning at realize.
 
-A copy from the namespace into device memory costs one `pg_rd_lat`,
-whatever its size, when any page of the range has been written, and nothing
-otherwise. See the
+Namespace/AFDM copies in both directions use the BlackBox FTL's NAND,
+cache, LUN/channel scheduling and GC timing. AFDM-to-NVM writes use FUA.
+See the
 [timing model](../concepts/timing-model.md#kv-and-csd).
 
 ### Program types
@@ -156,6 +156,7 @@ I/O commands on the namespace:
 | 0xb0 | Allocate device memory |
 | 0xc0 | Free device memory |
 | 0xd0 | Copy namespace data into device memory |
+| 0xd1 | Copy device memory into the namespace (FUA, no Guest data payload) |
 | 0xe1 | Execute a program |
 | 0xf2 | Read device memory |
 | 0xf5 | Write device memory |

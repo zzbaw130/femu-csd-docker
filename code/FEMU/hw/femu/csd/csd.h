@@ -7,6 +7,7 @@ enum FemuCsdIoCommands {
     NVME_CMD_CSD_ALLOC_FDM      = 0xb0,
     NVME_CMD_CSD_DEALLOC_AFDM   = 0xc0,
     NVME_CMD_CSD_NVM_TO_AFDM    = 0xd0,
+    NVME_CMD_CSD_AFDM_TO_NVM    = 0xd1,
     NVME_CMD_CSD_EXEC           = 0xe1,
     NVME_CMD_CSD_READ_AFDM      = 0xf2,
     NVME_CMD_CSD_WRITE_AFDM     = 0xf5,
@@ -100,6 +101,7 @@ typedef struct QEMU_PACKED NvmeCsdDeallocAfdmCmd {
     uint32_t    rsvd11[5];
 } NvmeCsdDeallocAfdmCmd;
 
+/* D0/D1 share this layout and carry no Guest data payload. NLB is zero-based. */
 typedef struct QEMU_PACKED NvmeCsdNvmToAfdmCmd {
     uint8_t     opcode;
     uint8_t     flags;
@@ -114,6 +116,12 @@ typedef struct QEMU_PACKED NvmeCsdNvmToAfdmCmd {
     uint32_t    id;
     uint64_t    offset;
 } NvmeCsdNvmToAfdmCmd;
+
+typedef NvmeCsdNvmToAfdmCmd NvmeCsdAfdmToNvmCmd;
+
+/* Called by the controller FTL thread for internal namespace/AFDM copies. */
+bool csd_ftl_storage(FemuCtrl *n, NvmeNamespace *ns, NvmeRequest *req,
+                     uint64_t *lat);
 
 typedef struct QEMU_PACKED NvmeCsdExecCmd {
     uint8_t     opcode;

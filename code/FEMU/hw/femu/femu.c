@@ -10,6 +10,7 @@
 
 #include "./nvme.h"
 #include "./bbssd/ftl.h"
+#include "./csd/csd.h"
 #include "./nand/onfi.h"
 #include "./femu-props.h"
 #include "./femu-query.h"
@@ -1972,6 +1973,10 @@ static uint64_t femu_ftl_process_req(FemuCtrl *n, NvmeRequest *req)
     /* The medium's own worker uses the same FTL; it serializes both. */
     if (n->cxl_media && ns->ssd_borrowed) {
         return femu_cxl_nvme_ops->ftl(n, ns, req);
+    }
+
+    if (NS_CSD(ns) && csd_ftl_storage(n, ns, req, &lat)) {
+        return lat;
     }
 
     if (n->power_loss) {

@@ -469,48 +469,6 @@ static uint16_t csd_parse_program(FemuCsdProgram *program, const char **path,
 }
 
 /*
- * Look up the mapping state in the FTL of the namespace the command names.
- * n->ssd is whichever namespace initialized its mode first, so on a device that
- * mixes CSD with another FTL mode it is not this namespace's FTL.
- */
-static uint16_t csd_check_nvm_ftl_range(NvmeNamespace *ns, uint64_t slba,
-                                        uint64_t nlb, uint64_t *mapped_pages)
-{
-    struct ssd *ssd = ns->ssd;
-    struct ssdparams *spp;
-    uint64_t start_lpn;
-    uint64_t end_lpn;
-
-    if (!ssd || !ssd->maptbl) {
-        return NVME_INTERNAL_DEV_ERROR | NVME_DNR;
-    }
-
-    spp = &ssd->sp;
-    if (spp->secs_per_pg <= 0 || spp->tt_pgs == 0 || nlb == 0) {
-        return NVME_INTERNAL_DEV_ERROR | NVME_DNR;
-    }
-
-    start_lpn = slba / spp->secs_per_pg;
-    if (slba > UINT64_MAX - nlb + 1) {
-        return NVME_LBA_RANGE | NVME_DNR;
-    }
-
-    end_lpn = (slba + nlb - 1) / spp->secs_per_pg;
-    if (end_lpn >= spp->tt_pgs) {
-        return NVME_LBA_RANGE | NVME_DNR;
-    }
-
-    *mapped_pages = 0;
-    for (uint64_t lpn = start_lpn; lpn <= end_lpn; lpn++) {
-        if (ssd->maptbl[lpn].ppa != UNMAPPED_PPA) {
-            (*mapped_pages)++;
-        }
-    }
-
-    return NVME_SUCCESS;
-}
-
-/*
  * The name in a program comes from the guest, and loading one means the host
  * process opens that file and calls a symbol out of it. A guest must not be
  * able to name any file on the host, so the operator says where programs live
@@ -1502,11 +1460,12 @@ static uint16_t csd_write_afdm(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req)
     return NVME_SUCCESS;
 }
 
-static uint16_t csd_nvm_to_afdm(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
-                                NvmeRequest *req)
+static uint16_t csd_nvm_copy(FemuCtrl *n, NvmeNamespace *ns, NvmeRequest *req,
+                             uint64_t *lat)
 {
     FemuCsdState *csd = csd_state(n);
-    NvmeCsdNvmToAfdmCmd *copy = (NvmeCsdNvmToAfdmCmd *)cmd;
+    NvmeCsdNvmToAfdmCmd *copy = (NvmeCsdNvmToAfdmCmd *)&req->cmd;
+    bool write = copy->opcode == NVME_CMD_CSD_AFDM_TO_NVM;
     const uint8_t lba_index = NVME_ID_NS_FLBAS_INDEX(ns->id_ns.flbas);
     const uint8_t data_shift = ns->id_ns.lbaf[lba_index].lbads;
     uint32_t id = le32_to_cpu(copy->id);
@@ -1520,9 +1479,18 @@ static uint16_t csd_nvm_to_afdm(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
      * would copy from the earlier namespace's data instead of its own.
      */
     uint64_t nvm_offset = ns->backend_offset + (slba << data_shift);
-    uint64_t mapped_pages;
+    NvmeRequest internal = *req;
+    NvmeRwCmd *rw = (NvmeRwCmd *)&internal.cmd;
     FemuCsdAfdm *afdm;
     uint16_t status;
+
+    /* The command describes data only, not metadata or power-loss staging. */
+    if (n->power_loss || nvme_ns_ms(ns)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    if (!ns->ssd) {
+        return NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+    }
 
     /*
      * Bound the copy by this namespace's slice rather than the whole backend:
@@ -1535,19 +1503,54 @@ static uint16_t csd_nvm_to_afdm(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         return NVME_LBA_RANGE | NVME_DNR;
     }
 
-    status = csd_check_nvm_ftl_range(ns, slba, nlb, &mapped_pages);
-    if (status) {
-        return status;
+    if (!write) {
+        if (find_next_bit(ns->uncorrectable, slba + nlb, slba) < slba + nlb) {
+            return NVME_UNRECOVERED_READ | NVME_DNR;
+        }
+        status = nvme_check_dulbe(n, ns, slba, slba + nlb);
+        if (status) {
+            return status;
+        }
     }
 
     qemu_mutex_lock(&csd->lock);
     afdm = csd_get_afdm_locked(csd, id);
     status = csd_check_afdm_range(afdm, offset, size);
     if (!status) {
-        backend_lock_range(n->mbe, nvm_offset, size);
-        memcpy(afdm->data + offset,
-               (uint8_t *)n->mbe->logical_space + nvm_offset, size);
-        backend_unlock_range(n->mbe, nvm_offset, size);
+        uint64_t host_pages = ns->ssd->host_write_pages;
+
+        /* Reuse normal mapping, NAND timing and GC, without a Guest DMA. */
+        memset(&internal.cmd, 0, sizeof(internal.cmd));
+        internal.cmd.opcode = write ? NVME_CMD_WRITE : NVME_CMD_READ;
+        internal.cmd.nsid = cpu_to_le32(ns->id);
+        internal.slba = slba;
+        internal.nlb = nlb;
+        internal.is_write = write;
+        internal.status = NVME_SUCCESS;
+        rw->slba = cpu_to_le64(slba);
+        rw->nlb = cpu_to_le16(nlb - 1);
+        /* Spill writes reach NAND before completion, even with VWC enabled. */
+        rw->control = cpu_to_le16(write ? NVME_RW_FUA : 0);
+        *lat = bb_ftl_process_req(n, ns, &internal);
+        if (write) {
+            ns->ssd->host_write_pages = host_pages;
+        }
+        status = internal.status;
+        if (!status) {
+            void *nvm = (uint8_t *)n->mbe->logical_space + nvm_offset;
+
+            backend_lock_range(n->mbe, nvm_offset, size);
+            if (write) {
+                memcpy(nvm, afdm->data + offset, size);
+            } else {
+                memcpy(afdm->data + offset, nvm, size);
+            }
+            backend_unlock_range(n->mbe, nvm_offset, size);
+            if (write) {
+                nvme_mark_written(ns, slba, nlb);
+                nvme_note_user_write(n);
+            }
+        }
     }
     qemu_mutex_unlock(&csd->lock);
 
@@ -1556,11 +1559,21 @@ static uint16_t csd_nvm_to_afdm(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     }
 
     req->cqe.n.result = size;
-    if (mapped_pages && ns->ssd) {
-        req->reqlat += ns->ssd->sp.pg_rd_lat;
-        req->expire_time += ns->ssd->sp.pg_rd_lat;
-    }
     return NVME_SUCCESS;
+}
+
+bool csd_ftl_storage(FemuCtrl *n, NvmeNamespace *ns, NvmeRequest *req,
+                     uint64_t *lat)
+{
+    if (req->cmd.opcode != NVME_CMD_CSD_NVM_TO_AFDM &&
+        req->cmd.opcode != NVME_CMD_CSD_AFDM_TO_NVM) {
+        return false;
+    }
+    *lat = 0;
+    if (req->status == NVME_SUCCESS) {
+        req->status = csd_nvm_copy(n, ns, req, lat);
+    }
+    return true;
 }
 
 static uint16_t csd_io_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
@@ -1575,7 +1588,9 @@ static uint16_t csd_io_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     case NVME_CMD_CSD_DEALLOC_AFDM:
         return csd_dealloc_afdm(n, cmd);
     case NVME_CMD_CSD_NVM_TO_AFDM:
-        return csd_nvm_to_afdm(n, ns, cmd, req);
+    case NVME_CMD_CSD_AFDM_TO_NVM:
+        /* The controller FTL thread validates and executes internal copies. */
+        return NVME_SUCCESS;
     case NVME_CMD_CSD_EXEC:
         return csd_exec(n, cmd, req);
     case NVME_CMD_CSD_READ_AFDM:
