@@ -115,6 +115,7 @@ static uint32_t nvme_mode_admin_effects(FemuCtrl *n, uint8_t opc)
         return opc == NVME_ADM_CMD_FEMU_FLIP ? NVME_CMD_EFF_CSUPP : 0;
     case FEMU_CSD_MODE:
         switch (opc) {
+        case NVME_ADM_CMD_CSD_GET_INFO:
         case NVME_ADM_CMD_CSD_MRS_MGMT:
         case NVME_ADM_CMD_CSD_COMPUTE_LOAD:
         case NVME_ADM_CMD_CSD_COMPUTE_ACTIVATE:

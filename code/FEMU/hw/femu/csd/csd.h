@@ -17,11 +17,23 @@ enum FemuCsdIoCommands {
 };
 
 enum FemuCsdAdminCommands {
+    NVME_ADM_CMD_CSD_GET_INFO         = 0xc0,
     NVME_ADM_CMD_CSD_MRS_MGMT         = 0x21,
     NVME_ADM_CMD_CSD_COMPUTE_LOAD     = 0x22,
     NVME_ADM_CMD_CSD_COMPUTE_ACTIVATE = 0x23,
     NVME_ADM_CMD_CSD_COMPUTE_LOAD_DATA = 0x25,
 };
+
+/* GET_INFO: CDW10 selects a scalar, returned in CQE DW0/DW1 (no DMA). */
+enum FemuCsdInfo {
+    NVME_CSD_INFO_VERSION = 0,
+    NVME_CSD_INFO_FDM_BYTES = 1,
+    NVME_CSD_INFO_FDM_USED = 2,
+    NVME_CSD_INFO_NR_CU = 3,
+    NVME_CSD_INFO_FEATURES = 4,
+};
+#define NVME_CSD_FEATURE_STORE (1ULL << 0)
+#define NVME_CSD_FEATURE_RESULT64 (1ULL << 1)
 
 #define NVME_CSD_MR_AFDM_NSID 0
 

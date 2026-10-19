@@ -18197,7 +18197,8 @@ static const char femu_csd_slow_src[] =
     "    struct timespec t = { a->p1 / 1000, (a->p1 % 1000) * 1000000L };\n"
     "    nanosleep(&t, 0);\n"
     "    return 7;\n"
-    "}\n";
+    "}\n"
+    "long long result64(struct args *a) { return a->p1; }\n";
 
 /* build the program with the host compiler; false when there is none */
 static bool femu_csd_build_slow(void)
@@ -18208,15 +18209,22 @@ static bool femu_csd_build_slow(void)
                                            NULL);
     const char *argv[] = { "cc", "-shared", "-fPIC", "-o", so, src, NULL };
     int wait_status = -1;
+    g_autoptr(GError) error = NULL;
+    g_autofree char *errors = NULL;
 
     g_assert_cmpint(g_mkdir_with_parents(femu_csd_slow_dir, 0700), ==, 0);
     g_assert_true(g_file_set_contents(src, femu_csd_slow_src, -1, NULL));
     if (!g_spawn_sync(NULL, (char **)argv, NULL, G_SPAWN_SEARCH_PATH |
-                      G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
-                      NULL, NULL, NULL, NULL, &wait_status, NULL)) {
+                      G_SPAWN_LEAVE_DESCRIPTORS_OPEN | G_SPAWN_STDOUT_TO_DEV_NULL,
+                      NULL, NULL, NULL, &errors, &wait_status, &error)) {
+        g_test_message("CSF compiler: %s", error->message);
         return false;
     }
-    return WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 0;
+    if (!WIFEXITED(wait_status) || WEXITSTATUS(wait_status)) {
+        g_test_message("CSF compiler: %s", errors);
+        return false;
+    }
+    return true;
 }
 
 static void femu_csd_remove_slow(void)
@@ -18405,6 +18413,70 @@ static void femu_test_csd_runtime_floor(void *obj, void *data,
     femu_disable(&c);
     femu_csd_remove_slow();
     unlink(femu_csd_warn_log);
+}
+
+/* Both resource queries and CSF completions preserve all 64 result bits. */
+static void femu_test_csd_info_result64(void *obj, void *data,
+                                       QGuestAllocator *alloc)
+{
+    QFemu *femu = obj;
+    QTestState *qts = femu->dev.bus->qts;
+    FemuCtrlState c = { 0 };
+    NvmeCmd cmd = { 0 };
+    uint64_t buf = guest_alloc(alloc, 4096);
+    uint64_t ranges = guest_alloc(alloc, 4096);
+    uint32_t id, mr[8] = { 0 }, dw[16] = { 0 };
+    const uint64_t expected[] = { 1, 16ULL * 1024 * 1024, 0, 2, 3 };
+    const uint64_t result = 0x4353123456789abcULL;
+
+    if (!femu_csd_build_slow()) {
+        femu_csd_remove_slow();
+        g_test_skip("no host C compiler");
+        return;
+    }
+    femu_enable(&c, &femu->dev, alloc);
+    femu_create_io_queues(&c);
+    for (unsigned i = 0; i < ARRAY_SIZE(expected); i++) {
+        uint64_t slot = c.admin.cq_addr + c.admin.cq_head * sizeof(NvmeCqe);
+        cmd.opcode = 0xc0;
+        cmd.cdw10 = cpu_to_le32(i);
+        g_assert_cmpint(femu_admin(&c, &cmd), ==, NVME_SUCCESS);
+        g_assert_cmpuint(qtest_readq(qts, slot), ==, expected[i]);
+    }
+    cmd.cdw10 = cpu_to_le32(99);
+    g_assert_cmpint(FEMU_SC(femu_admin(&c, &cmd)), ==, NVME_INVALID_FIELD);
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.opcode = FEMU_CSD_ALLOC_FDM;
+    cmd.nsid = cpu_to_le32(1);
+    cmd.cdw10 = cpu_to_le32(4096);
+    femu_submit(&c, &c.io, &cmd);
+    g_assert_cmpint(FEMU_SC(femu_complete(&c, &c.io, NULL, &id)), ==, NVME_SUCCESS);
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.opcode = 0xc0;
+    cmd.cdw10 = cpu_to_le32(2);
+    uint32_t used;
+    g_assert_cmpint(femu_admin_result(&c, &cmd, &used), ==, NVME_SUCCESS);
+    g_assert_cmpuint(used, ==, 4096);
+    g_assert_cmpint(femu_csd_load(&c, buf, "slow.so", "result64"), ==, NVME_SUCCESS);
+    g_assert_cmpint(femu_csd_activate(&c, 1), ==, NVME_SUCCESS);
+    mr[2] = cpu_to_le32(id);
+    qtest_memwrite(qts, ranges, mr, sizeof(mr));
+    dw[0] = FEMU_CSD_EXEC;
+    dw[1] = cpu_to_le32(1);
+    dw[2] = cpu_to_le32(1);
+    dw[3] = cpu_to_le32(1);
+    dw[4] = cpu_to_le32(sizeof(mr));
+    dw[6] = cpu_to_le32(ranges);
+    dw[7] = cpu_to_le32(ranges >> 32);
+    dw[10] = cpu_to_le32((uint32_t)result);
+    dw[11] = cpu_to_le32(result >> 32);
+    uint64_t slot = c.io.cq_addr + c.io.cq_head * sizeof(NvmeCqe);
+    femu_submit(&c, &c.io, (NvmeCmd *)dw);
+    g_assert_cmpint(FEMU_SC(femu_complete(&c, &c.io, NULL, NULL)), ==, NVME_SUCCESS);
+    g_assert_cmpuint(qtest_readq(qts, slot), ==, result);
+    femu_queue_free(&c, &c.io);
+    femu_disable(&c);
+    femu_csd_remove_slow();
 }
 
 static void femu_test_csd_exec_concurrency(void *obj, void *data,
@@ -36585,6 +36657,12 @@ static void femu_register_nodes(void)
             "femu_mode=4,fdm_size=16,nr_cu=1,csd_program_dir=%s",
             femu_csd_slow_dir),
         .before = femu_csd_warn_before,
+    });
+    qos_add_test("csd-info-result64", "femu", femu_test_csd_info_result64,
+                 &(QOSGraphTestOptions) {
+        .edge.extra_device_opts = g_strdup_printf(
+            "femu_mode=4,fdm_size=16,nr_cu=2,csd_program_dir=%s",
+            femu_csd_slow_dir),
     });
     qos_add_test("csd-exec-concurrency", "femu",
                  femu_test_csd_exec_concurrency,

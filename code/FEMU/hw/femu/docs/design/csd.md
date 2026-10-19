@@ -444,3 +444,26 @@ Refusal messages are listed in the
 - [CSD guide](../modes/csd.md): launching, guest tool, citation
 - [Timing model: KV and CSD](../concepts/timing-model.md#kv-and-csd)
 - [BlackBox SSD guide](../modes/blackbox.md): the FTL under the namespace
+
+## Generic resource queries and 64-bit results
+
+Vendor admin opcode `0xc0` is GET_INFO (separate from I/O opcode `0xc0`,
+which frees AFDM). CDW10 selects: 0 ABI version (1); 1 total FDM bytes;
+2 allocated FDM bytes; 3 CU count; 4 feature bits (bit 0 internal AFDM→NVM,
+bit 1 full 64-bit CSF completion). It has no data buffer and returns the
+scalar in CQE DW0/DW1. Unknown selectors return Invalid Field. The FDM
+counter is read under the same lock as allocation. CU count is capacity,
+not a claim about instantaneous CU availability or SNIA resource ownership.
+
+Execute also returns the complete native `int64_t` bit pattern in CQE
+DW0/DW1, including negative CSF results. Linux clients must use
+`NVME_IOCTL_IO64_CMD` (and `NVME_IOCTL_ADMIN64_CMD` for GET_INFO) to receive
+both words. A legacy 32-bit ioctl only exposes the low word. These changes
+are independent of SQL, batch scheduling, and `femu_csd_args` layout.
+
+Validation: QTest `csd-info-result64` checks all selectors, invalid selectors,
+FDM accounting after allocation and a shared-library return value
+`0x4353123456789abc`. The test compiler leaves existing descriptors open
+while spawning so it also works under Docker seccomp profiles that reject
+GLib's close-range operation. Native concurrency and 4 KiB LBA internal-copy
+regressions are run as separate QTest processes.

@@ -302,3 +302,12 @@ please also cite:
   and program ABI
 - [BlackBox SSD](blackbox.md): the FTL under the namespace
 - [Timing model: KV and CSD](../concepts/timing-model.md#kv-and-csd)
+
+## Resource discovery
+
+Generic vendor GET_INFO (admin `0xc0`) reports the FDM capacity/current
+allocation, CU capacity, ABI version and supported feature bits. Execute
+returns all 64 bits of the native program result. See the
+[wire details](../design/csd.md#generic-resource-queries-and-64-bit-results).
+These commands do not implement an application graph or require a SNIA
+specific firmware runtime.

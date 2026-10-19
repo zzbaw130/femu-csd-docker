@@ -979,7 +979,7 @@ static void csd_finish_locked(FemuCsdState *csd, FemuCsdJob *job,
 
     req->status = status;
     if (!status) {
-        req->cqe.n.result = result > UINT32_MAX ? UINT32_MAX : result;
+        req->cqe.res64 = cpu_to_le64((uint64_t)result);
     }
 
     if (job->reserved_end) {
@@ -1608,9 +1608,42 @@ static uint16_t csd_io_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     }
 }
 
+static uint16_t csd_get_info(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
+{
+    FemuCsdState *csd = csd_state(n);
+    uint64_t value;
+
+    qemu_mutex_lock(&csd->lock);
+    switch (le32_to_cpu(cmd->cdw10)) {
+    case NVME_CSD_INFO_VERSION:
+        value = 1;
+        break;
+    case NVME_CSD_INFO_FDM_BYTES:
+        value = csd->fdm_capacity;
+        break;
+    case NVME_CSD_INFO_FDM_USED:
+        value = csd->fdm_used;
+        break;
+    case NVME_CSD_INFO_NR_CU:
+        value = csd->params.nr_cu;
+        break;
+    case NVME_CSD_INFO_FEATURES:
+        value = NVME_CSD_FEATURE_STORE | NVME_CSD_FEATURE_RESULT64;
+        break;
+    default:
+        qemu_mutex_unlock(&csd->lock);
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    qemu_mutex_unlock(&csd->lock);
+    cqe->res64 = cpu_to_le64(value);
+    return NVME_SUCCESS;
+}
+
 static uint16_t csd_admin_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
 {
     switch (cmd->opcode) {
+    case NVME_ADM_CMD_CSD_GET_INFO:
+        return csd_get_info(n, cmd, cqe);
     case NVME_ADM_CMD_CSD_MRS_MGMT:
         return csd_mrs_mgmt(n, cmd, cqe);
     case NVME_ADM_CMD_CSD_COMPUTE_LOAD:
