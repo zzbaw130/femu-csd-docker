@@ -139,7 +139,7 @@ CDW14/15 是 AFDM 字节偏移。请求不携带 Guest 数据缓冲区，成功�
 两个方向均在控制器 FTL 线程调用公共读写路径，计入 NAND、通道排队和 GC 时延。
 `0xd1` 使用 FUA，完成前计入介质写入开销，内部写不计为主机传输的写入页数。
 当前不支持携带 namespace metadata 的格式或 power-loss 模式。
-本次只增加设备命令及 passthru 调用；SINA STORE 映射和临时空间分配另行接入。
+本工具直接调用设备命令；SNIA STORE 映射和临时空间管理见 [SNIA API 库](../snia-cs-api/README.md)。
 
 The `bench` command reports wall-clock average latency for AFDM write, AFDM
 read, and NVM-to-AFDM copy. It is intended as a regression check for the CSD

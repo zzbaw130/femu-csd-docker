@@ -22,7 +22,7 @@ extern uint64_t mock_used_bytes(void);
 extern uint64_t mock_allocation_count(void);
 static CS_CSF_ID load(CS_DEV_HANDLE d, const char *symbol, const char *name, unsigned index)
 {
-    char descriptor[128] = "sina-cs-scale.so";
+    char descriptor[128] = "snia-cs-scale.so";
     strcpy(descriptor + strlen(descriptor) + 1, symbol);
     CsCSFDownloadInfo info = {.Type = CS_CSF_VENDOR_SPECIFIC,
                               .SubType = CS_SUBTYPE_VENDOR_SPECIFIC,
@@ -30,7 +30,7 @@ static CS_CSF_ID load(CS_DEV_HANDLE d, const char *symbol, const char *name, uns
                               .Index = index};
     strcpy(info.common.UniqueName, name);
     info.common.DataBuffer = descriptor;
-    info.common.Length = strlen("sina-cs-scale.so") + strlen(symbol) + 2;
+    info.common.Length = strlen("snia-cs-scale.so") + strlen(symbol) + 2;
     u32 id;
     OK(csCSFDownload(d, &info, &id));
     CHECK(id == index);
@@ -85,7 +85,6 @@ int main(void)
     CS_MEM_HANDLE a, b;
     CHECK(csCloseCSx((void *)1) == CS_INVALID_HANDLE);
     CHECK(csCreateEvent(NULL) == CS_INVALID_ARG);
-    unsetenv("SINA_CS_FEMU_DEVICES");
     OK(csOpenCSx("/dev/nvme0n1", NULL, &d));
     CHECK(csAllocMem(d, 0, &f, &a, NULL) == CS_INVALID_ARG);
     CS_MEM_PTR va = (void *)1;
@@ -150,9 +149,8 @@ int main(void)
     csHelperSetComputeArg(&r->Args[2], CS_32BIT_VALUE_TYPE, (u32)99);
     CHECK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, &value) == CS_UNSUPPORTED);
     r->NumArgs = 1;
-    csHelperSetComputeArg(&r->Args[0], CS_128BIT_VALUE_TYPE, ((u128)3 << 64) | 7);
-    OK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, &value));
-    CHECK(value == 10); /* One 128-bit value occupies native cparam1/2. */
+    r->Args[0].Type = CS_128BIT_VALUE_TYPE;
+    CHECK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, &value) == CS_UNSUPPORTED_TYPE);
     r->NumArgs = 2;
     csHelperSetComputeArg(&r->Args[0], CS_32BIT_VALUE_TYPE, (u32)1);
     csHelperSetComputeArg(&r->Args[1], CS_64BIT_VALUE_TYPE, (u64)20);
@@ -315,6 +313,15 @@ int main(void)
     free(observed);
     CsStatsInfo stats;
     CHECK(csQueryDeviceStatistics(d, CS_STAT_CSx_MEM_USAGE, NULL, &stats) == CS_UNSUPPORTED);
+    r->CSFId = load(d, "cs_check_params", "params", 207);
+    r->NumArgs = 2;
+    csHelperSetComputeArg(&r->Args[0], CS_64BIT_VALUE_TYPE, (u64)7);
+    csHelperSetComputeArg(&r->Args[1], CS_64BIT_VALUE_TYPE, (u64)3);
+    OK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, &value));
+    CHECK(value == 1); /* cparam1=7, cparam2=3 independently. */
+    r->Args[0].u.Value64 = 3;
+    r->Args[1].u.Value64 = 7;
+    CHECK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, &value) == CS_ERROR_IN_EXECUTION);
     CS_CSF_ID round = load(d, "cs_spill_roundtrip", "spill-round", 210),
               store = load(d, "cs_spill_store", "spill-store", 211),
               source = load(d, "cs_spill_load", "spill-load", 212),

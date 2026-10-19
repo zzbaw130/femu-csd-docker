@@ -1,4 +1,4 @@
-SINA_CS_API_1.1 {
+SNIA_CS_API_1.1 {
     global: cs[A-Z]*;
     local: *;
 };

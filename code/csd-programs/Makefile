@@ -3,13 +3,13 @@ BUILD_DIR ?= $(CURDIR)/build
 OUT := $(abspath $(BUILD_DIR))
 PROGRAMS := $(patsubst %/Makefile,%,$(wildcard */Makefile))
 .PHONY: all clean check check-links bpf $(PROGRAMS) csd-vadd.so csd-original-kernels.so \
-    sina-cs-scale.so libcs-workmem.so csd-workmem-probe-a.so csd-workmem-probe-b.so
+    snia-cs-scale.so libcs-workmem.so csd-workmem-probe-a.so csd-workmem-probe-b.so
 all: check-links
 $(filter-out csd-workmem,$(PROGRAMS)): csd-workmem
 $(PROGRAMS):
 	$(MAKE) -C $@ BUILD_DIR=$(OUT) all
 csd-vadd.so csd-original-kernels.so: examples
-sina-cs-scale.so: sina-cs-api
+snia-cs-scale.so: snia-cs-api
 libcs-workmem.so csd-workmem-probe-a.so csd-workmem-probe-b.so: csd-workmem
 bpf:
 	$(MAKE) -C examples BUILD_DIR=$(OUT) bpf

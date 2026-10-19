@@ -1,6 +1,6 @@
 /* SNIA Computational Storage API v1.1, Linux/FEMU implementation. */
-#ifndef SINA_CS_H
-#define SINA_CS_H
+#ifndef SNIA_CS_H
+#define SNIA_CS_H
 #include "cs_types.h"
 #ifdef __cplusplus
 extern "C" {

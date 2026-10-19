@@ -1,14 +1,13 @@
 /* SNIA Computational Storage API v1.1 declarations, adapted from the
  * SNIA standard (2025), BSD-3-Clause. See LICENSE and doc/compatibility.md. */
-#ifndef SINA_CS_TYPES_H
-#define SINA_CS_TYPES_H
+#ifndef SNIA_CS_TYPES_H
+#define SNIA_CS_TYPES_H
 #include <stdint.h>
 #include <stddef.h>
 typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
-typedef unsigned __int128 u128;
 typedef void *CS_DEV_HANDLE;
 typedef void *CS_MEM_HANDLE;
 typedef void *CS_MEM_PTR;
@@ -338,7 +337,6 @@ typedef struct {
         u32 Value32;
         u16 Value16;
         u8 Value8;
-        u128 Value128;
     } u;
 } CsComputeArg;
 typedef struct {

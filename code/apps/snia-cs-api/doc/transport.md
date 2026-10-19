@@ -14,7 +14,7 @@
 | 临时区释放 | DSM 09，AD=1 |
 | batch、event/callback | Guest 库实现 |
 
-计算的 AFDM offset 目前只支持 0；多个 AFDM 保留相互顺序，标量保留相互顺序，最多两个 64 位标量位置。128 位值占两个位置。零 MR 请求直接执行纯标量 CSF，不分配占位 AFDM。native MR length=0 表示整个 AFDM。
+计算的 AFDM offset 目前只支持 0；多个 AFDM 保留相互顺序，标量保留相互顺序，最多两个 64 位标量位置。两个 cparam 独立传递，128 位参数不支持。零 MR 请求直接执行纯标量 CSF，不分配占位 AFDM。native MR length=0 表示整个 AFDM。
 
 ## 原生附加输入：当前未映射
 

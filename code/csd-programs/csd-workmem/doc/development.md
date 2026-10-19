@@ -2,7 +2,7 @@
 
 ## 2026-10-19
 
-分支 `sina_csd_dev`。第一阶段提交 `b46d5923a`：共享 arena 分配器、context、统计、两个独立探针和 Guest 集成客户端。
+分支 `snia_csd_dev`。第一阶段提交 `b46d5923a`：共享 arena 分配器、context、统计、两个独立探针和 Guest 集成客户端。
 
 第二阶段整理目录：原生 vadd、original-kernels、BPF 和原生 ABI 头移入 examples，内容与原始 tag 相同；每个组件有自己的 Makefile，根目录汇总，所有当前 .so 输出到 build。旧分支遗留二进制归档至本机 build/legacy，不加载也不清理掉。
 

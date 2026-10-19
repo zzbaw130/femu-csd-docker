@@ -7,7 +7,7 @@ csd-programs/
 ├── Makefile          # 汇总构建并检查统一动态库依赖
 ├── mk/               # native CSF 公共构建规则及 ELF 检查
 ├── examples/         # 原生 vadd、original-kernels、BPF、原生 ABI 头及独立样例规则
-├── sina-cs-api/      # SNIA API 的示例 CSF
+├── snia-cs-api/      # SNIA API 的示例 CSF
 ├── csd-workmem/      # 共享工作内存库、探针、测试和文档
 └── build/           # 所有 .so、可选 BPF 及本地测试程序，不提交 git
 ```
@@ -61,7 +61,7 @@ all: $(OUT)/my-operator.so
 $(OUT):
 	mkdir -p $@
 $(OUT)/my-operator.so: src/operator.c $(CSF_BUILD_DEPS) | $(OUT)
-	$(CC) $(CSF_CPPFLAGS) -I../../apps/sina-cs-api/include -O2 -fPIC \
+	$(CC) $(CSF_CPPFLAGS) -I../../apps/snia-cs-api/include -O2 -fPIC \
 	    -shared $< $(CSF_LDLIBS) -o $@.tmp
 	mv -f $@.tmp $@
 clean:
@@ -87,7 +87,7 @@ make -C code/csd-programs check
 docker compose exec -T femu-csd make -C /workspace/code/csd-programs -j4
 ```
 
-也支持 `make -C code/csd-programs examples`、`csd-workmem`、`sina-cs-api`，以及原有 `csd-vadd.so` / `sina-cs-scale.so` 目标别名。无论入口在哪，产物都进入 build。`make bpf` 为可选目标，依赖带 BPF 后端的 clang。
+也支持 `make -C code/csd-programs examples`、`csd-workmem`、`snia-cs-api`，以及原有 `csd-vadd.so` / `snia-cs-scale.so` 目标别名。无论入口在哪，产物都进入 build。`make bpf` 为可选目标，依赖带 BPF 后端的 clang。
 
 Compose 将 `CSD_PROGRAM_DIR` 设置为 `/workspace/code/csd-programs/build`。加载时仍只传文件名，例如 `csd-vadd.so`，不传宿主/容器完整路径。公共库与依赖它的算子放在同一 build 目录，算子以 `$ORIGIN` 查找共享库。
 
@@ -98,7 +98,7 @@ Compose 使用挂载的 `scripts/container/start-csd.sh` 和当前源码的 run-
 ## 测试
 
 - 原生命令、vadd 和 kernels：[examples](examples/README.md)。
-- Guest SNIA batch：`tests/sina-cs-api-test.sh [unit|build|smoke]`。
+- Guest SNIA batch：`tests/snia-cs-api-test.sh [unit|build|smoke]`。
 - 工作内存：`tests/csd-workmem-test.sh [unit|build|live]`，live 需要 4 CU；以两个独立 .so 验证共享总预算、超额拒绝与恢复。
 
 ## legacy 与 exports.map

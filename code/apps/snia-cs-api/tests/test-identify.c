@@ -100,7 +100,6 @@ static void rejected(const char *path)
 
 int main(void)
 {
-    unsetenv("SINA_CS_FEMU_DEVICES");
     CS_DEV_HANDLE dev;
     assert(csOpenCSx("/dev/nvme0n1", NULL, &dev) == CS_SUCCESS);
     assert(controller_reads == 1 && namespace_reads == 1);

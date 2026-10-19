@@ -1,6 +1,6 @@
 # 开发与验证记录
 
-分支 `sina_csd_dev`，基线 tag `femu-csd-with-original-postgre`。当前功能不包含 PostgreSQL SQL runtime。
+分支 `snia_csd_dev`，基线 tag `femu-csd-with-original-postgre`。当前功能不包含 PostgreSQL SQL runtime。
 
 ## 已完成阶段
 
@@ -15,7 +15,7 @@
 ### 修改
 
 - 删除额外参数解码头、描述结构、写入描述的 AFDM 及所有调用点，包括 workmem 探针。
-- 库将 AFDM 按顺序直接映射为原生 MR，标量直接映射到 cparam1/2；128 位普通输入占两个位置。超出两个标量位置、计算 AFDM 非零 offset 明确返回不支持。
+- 库将 AFDM 按顺序直接映射为原生 MR，标量直接映射到 cparam1/2；当时曾实现128位映射，现已删除。超出两个标量位置、计算 AFDM 非零 offset 明确返回不支持。
 - 原生 E1 支持零 MR，使已有纯标量函数和 workmem 用量查询无需占位 AFDM；拒绝零 MR 携带无效附加数据。
 - 删除控制参数、版本、magic、事件与128位控制封装。重入算子保留 cparam2：首次为0，内部I/O完成后由库填为 spill_id。
 - 设备侧提供 csIsReentry/csReentryValue，算子在入口判断并更新自己的状态；csNeedStore/Load/Free 用CompValue提出请求。普通结果直接完成，不再包装 DONE。
@@ -42,7 +42,24 @@
 
 ## 2026-10-19：澄清参数来源与文档对象
 
-- 对照 SNIA v1.1 第62/74页，说明普通128位参数来自标准枚举，与重入控制无关；Value128是为规范union示例遗漏成员所作的补充。
+- 对照 SNIA v1.1 第62/74页，说明普通128位参数来自标准枚举，与重入控制无关；当时添加的128位成员现已删除。
 - 核对原生E1附加输入：MR之后的字节通过data_buffer/buffer_len交给CSF，本次执行结束释放，修改不自动回写。明确本库当前未映射该路径，以及Linux ioctl data_len与命令CDW4不是同一字段。
 - 说明“最后一个AFDM”限定在当前CSF请求中，上例具体指io；先介绍batch中的请求与依赖，再区分batch和设备私有SortState的sort_handle。
 - 用完整加入/提交/释放batch的示意代码替换跳跃叙述，解释复制请求描述和保留句柄的实际含义。仅文档及头文件注释变化，git diff --check通过。
+
+
+## 2026-10-19：统一 SNIA 命名，保留两个独立 cparam
+
+- 应用与设备组件目录统一为 snia-cs-api，库名为 libsnia-cs-api.so/.a，示例为 snia-cs-scale.so，测试入口为 tests/snia-cs-api-test.sh。
+- 同步构建依赖、导出符号版本名、头文件保护宏、示例加载描述、测试路径与所有项目文档中的相关拼写；本地分支改为 snia_csd_dev，保留提交历史。
+- 删除128位值成员、helper取值和拼接/拆分路径。两个原生long long字段独立传递，128位类型保留标准枚举但明确返回不支持。
+- 设备示例与真实测试用7、3两个独立64位值检查cparam1/2，更新mock中的不支持类型检查；删除测试脚本中已废弃的手工资源配置。
+
+### 本阶段验证
+
+- 更名后的测试脚本build/smoke通过；231项接口检查、33个标准入口和C++头文件检查通过。
+- 7、3独立传入cparam1/2并正确匹配，交换顺序按算子约定失败；128位请求明确返回CS_UNSUPPORTED_TYPE。
+- ASan/UBSan/LeakSanitizer检查通过；设备程序统一workmem动态依赖检查通过。
+- Guest真实NVMe测试覆盖4CU并行、内部STORE/LOAD、跨批spill与失败回收；workmem两轮跨SO配额验证通过。
+- 使用新安装头文件和-lsnia-cs-api动态链接应用，ldd确认加载libsnia-cs-api.so，示例输出4 12 28 44。
+- 项目自有源码、构建脚本和文档无旧拼写引用，旧生成库名已清理；shell语法和git diff --check通过。

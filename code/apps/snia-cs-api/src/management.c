@@ -146,9 +146,6 @@ void csHelperSetComputeArg(CsComputeArg *a, CS_COMPUTE_ARG_TYPE type, ...)
     case CS_64BIT_VALUE_TYPE:
         a->u.Value64 = va_arg(ap, u64);
         break;
-    case CS_128BIT_VALUE_TYPE:
-        a->u.Value128 = va_arg(ap, u128);
-        break;
     default:
         break;
     }

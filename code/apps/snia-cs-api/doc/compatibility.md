@@ -13,7 +13,7 @@
 | `csAllocMem`、`csFreeMem`、`csInitMem` | FDMId=1、4096 字节粒度；清零/32 位填充由 Guest F5 写入；不提供主机映射 |
 | `csQueueCopyMemRequest` | Host↔AFDM；AFDM→AFDM 为经过 Guest 的软件 fallback，最多 1 MiB 缓冲，支持重叠 |
 | `csQueueStorageRequest` | block LOAD/STORE、多 LBA range、内部 D0/D1，无 Guest 数据中转 |
-| `csQueueComputeRequest`、`csHelperSetComputeArg` | AFDM 直接映射 MR；最多两个 64 位标量位置；128 位值占两位置；计算 AFDM offset 仅支持 0；无额外参数 AFDM |
+| `csQueueComputeRequest`、`csHelperSetComputeArg` | AFDM 直接映射 MR；最多两个 64 位标量位置；两个 cparam 独立；计算 AFDM offset 仅支持 0；无额外参数 AFDM |
 | `csAllocBatchRequest`、`csFreeBatchRequest` | 最多 64 节点的主机软件 batch |
 | `csConfigureBatchEntry`、`csHelperResizeBatchRequest` | ADD/DELETE/RECONFIG/JOIN/SPLIT；环检测、配置回滚、描述深拷贝、引用保护 |
 | `csQueueBatchRequest` | SERIAL/PARALLEL/HYBRID；单 batch 一个 CSx；设备 CU 决定工作线程数；可选恢复协议自动 STORE/LOAD/FREE |
@@ -23,13 +23,13 @@
 | `csQueryDeviceProperties` | CSx、单 CSE 的 CU/CR 列表、固定 native CSEE、本进程已知 CSF、设备 FDM 容量；硬件 batch flag=0 |
 | `csQueryLibrarySupport` | 文件系统支持列表为空，当前仅 block I/O |
 
-设备通过通用 GET_INFO 提供 FDM/CU/功能位；没有全局程序目录或设备统计查询。CU 映射为一个 CSE 的 CR，固定 CSEE 已分配全部 CR，NumAvailableCRs=0 不代表瞬时空闲线程数。不再需要 SINA_CS_FEMU_DEVICES。应用仍需预留程序索引，设备重启后重新初始化。
+设备通过通用 GET_INFO 提供 FDM/CU/功能位；没有全局程序目录或设备统计查询。CU 映射为一个 CSE 的 CR，固定 CSEE 已分配全部 CR，NumAvailableCRs=0 不代表瞬时空闲线程数。无需手工配置 FDM/CU。应用仍需预留程序索引，设备重启后重新初始化。
 
 ## 有入口但返回不支持
 
 - `csQueryDeviceStatistics`：不把本进程的局部记录伪装成设备全局统计。
 - `csRegisterNotify`、`csDeregisterNotify`、`csCSEEDownload`、`csReset`、`csRegisterPlugin`、`csDeregisterPlugin`。
-- uBPF/FPGA/container profile、文件 I/O、跨设备复制/batch、descriptor 参数、FDM 主机映射、CR affinity、设备整图提交和运行中抢占。
+- uBPF/FPGA/container profile、文件 I/O、跨设备复制/batch、128 位整数参数、descriptor 参数、FDM 主机映射、CR affinity、设备整图提交和运行中抢占。
 
 设备增加通用内部 STORE、资源查询与 64 位完成值；原生算子参数结构不变。部分功能有主机软件实现，不等于硬件具有对应能力；AFDM 内复制 fallback 尤其不能用于测量内部带宽。
 
@@ -46,8 +46,8 @@
 
 - 状态枚举缺少正文使用的 `CS_LENGTH_RETURNED`，提供 `CS_INVALID_LENGTH` 别名。
 - `CSFIdinfo`/`CSFIdInfo` 和 `CS_COPY_AFDM`/`CS_COPY_DEV_MEM` 提供兼容别名。
-- 参数枚举包含 128 位值但 union 缺少对应字段，本实现补充 `u128 Value128`；descriptor 尚不支持。
-- 可变参数 helper 的 AFDM offset 应传 `unsigned long`，32/64/128 位值应传对应的 `u32/u64/u128`；8/16 位值遵循 C 整数提升。
+- 保留标准的 128 位参数类型枚举，当前设备适配不实现该类型，也不添加对应 union 成员。
+- 可变参数 helper 的 AFDM offset 应传 `unsigned long`，32/64 位值应传对应的 `u32/u64`；8/16 位值遵循 C 整数提升。
 
 ## 可选扩展
 

@@ -44,9 +44,9 @@ int64_t cs_delay(struct femu_csd_args *a)
     }
     return 0;
 }
-int64_t cs_check_128(struct femu_csd_args *a)
+int64_t cs_check_params(struct femu_csd_args *a)
 {
-    /* A 128-bit input occupies the two existing 64-bit native scalar fields. */
+    /* Two independent 64-bit scalar inputs, in the caller-defined order. */
     return a->cparam1 == 7 && a->cparam2 == 3 ? 1 : -1;
 }
 int64_t cs_result64(struct femu_csd_args *a) { return a->cparam1; }

@@ -17,7 +17,7 @@
     } while (0)
 static CS_CSF_ID load(CS_DEV_HANDLE dev, const char *symbol, unsigned index)
 {
-    char descriptor[128] = "sina-cs-scale.so";
+    char descriptor[128] = "snia-cs-scale.so";
     strcpy(descriptor + strlen(descriptor) + 1, symbol);
     CsCSFDownloadInfo info = {.Type = CS_CSF_VENDOR_SPECIFIC,
                               .SubType = CS_SUBTYPE_VENDOR_SPECIFIC,
@@ -25,7 +25,7 @@ static CS_CSF_ID load(CS_DEV_HANDLE dev, const char *symbol, unsigned index)
                               .Index = index};
     snprintf(info.common.UniqueName, 32, "live-%u", index);
     info.common.DataBuffer = descriptor;
-    info.common.Length = strlen("sina-cs-scale.so") + strlen(symbol) + 2;
+    info.common.Length = strlen("snia-cs-scale.so") + strlen(symbol) + 2;
     u32 id;
     OK(csCSFDownload(dev, &info, &id));
     CsConfigInfo config = {
@@ -75,7 +75,7 @@ int main(int argc, char **argv)
         .Type = CS_COPY_FROM_DEVICE, .u.HostVAddress = bytes, .DevMem = {memory, 0}, .Bytes = 32};
     OK(csQueueCopyMemRequest(&read, NULL, NULL, NULL, NULL, NULL));
     assert(bytes[0] == 0xdd && bytes[3] == 0xaa);
-    CS_CSF_ID sum = load(d, "cs_scalar_sum", 401), wide = load(d, "cs_check_128", 402),
+    CS_CSF_ID sum = load(d, "cs_scalar_sum", 401), pair = load(d, "cs_check_params", 402),
               scale = load(d, "cs_scale", 403);
     CsComputeRequest *r = calloc(1, sizeof(*r) + 64 * sizeof(CsComputeArg));
     r->CSFId = sum;
@@ -88,9 +88,10 @@ int main(int argc, char **argv)
     r->NumArgs = 0;
     OK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, &result));
     assert(result == 0);
-    r->CSFId = wide;
-    r->NumArgs = 1;
-    csHelperSetComputeArg(&r->Args[0], CS_128BIT_VALUE_TYPE, ((u128)3 << 64) | 7);
+    r->CSFId = pair;
+    r->NumArgs = 2;
+    csHelperSetComputeArg(&r->Args[0], CS_64BIT_VALUE_TYPE, (u64)7);
+    csHelperSetComputeArg(&r->Args[1], CS_64BIT_VALUE_TYPE, (u64)3);
     OK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, &result));
     assert(result == 1);
     r->CSFId = scale;
@@ -169,7 +170,7 @@ int main(int argc, char **argv)
     OK(csFreeMem(memory, &flags));
     OK(csCloseCSx(d));
     free(r);
-    printf("LIVE PASS: native MR/cparam arguments, scalar-only, 128-bit scalar pair, native error, FDM, storage LOAD, %u "
+    printf("LIVE PASS: native MR/cparam arguments, scalar-only, independent 64-bit cparams, native error, FDM, storage LOAD, %u "
            "overlapping native CSFs, result64, internal STORE/LOAD, cross-batch spill, cleanup\n",
            max_busy);
     return 0;

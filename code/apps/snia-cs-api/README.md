@@ -1,6 +1,6 @@
 # FEMU 的 SNIA Computational Storage API
 
-本目录提供运行在 Linux Guest 的 SNIA API 库。应用包含 `cs.h` 或 `cs.sh` 并链接 `libsina-cs-api.so`，由库提交 NVMe 命令。`cs.sh` 是 C 头文件。
+本目录提供运行在 Linux Guest 的 SNIA API 库。应用包含 `cs.h` 或 `cs.sh` 并链接 `libsnia-cs-api.so`，由库提交 NVMe 命令。`cs.sh` 是 C 头文件。
 
 ## 一、项目：编译与执行位置
 
@@ -10,28 +10,28 @@
 | `src/` | Guest 应用进程中的 NVMe 传输、资源管理、batch、event/callback 和 spill 分配 |
 | `examples/`、`tests/` | Guest 示例、mock 与真实 NVMe 测试 |
 | `doc/` | 架构、传输、兼容性和开发记录 |
-| `../../csd-programs/sina-cs-api/` | 设备算子；容器内编译，由 FEMU CU 线程执行，逻辑上属于 CSD CPU |
+| `../../csd-programs/snia-cs-api/` | 设备算子；容器内编译，由 FEMU CU 线程执行，逻辑上属于 CSD CPU |
 | `../../csd-programs/csd-workmem/` | 设备算子的共享私有工作内存分配器 |
 
 Guest 中编译和安装：
 
 ```sh
-cd /home/femu/apps/sina-cs-api
+cd /home/femu/apps/snia-cs-api
 make all examples live
 sudo make install PREFIX=/usr/local
 sudo ldconfig
 ```
 
-生成 `build/libsina-cs-api.so` 和 `.a`。可以指定 `BUILD_DIR=/tmp/sina-cs-api-guest`。宿主项目根目录编译设备算子、运行 mock 测试：
+生成 `build/libsnia-cs-api.so` 和 `.a`。可以指定 `BUILD_DIR=/tmp/snia-cs-api-guest`。宿主项目根目录编译设备算子、运行 mock 测试：
 
 ```sh
-docker compose exec -T femu-csd make -C /workspace/code/csd-programs sina-cs-scale.so
-docker compose exec -T femu-csd make -C /workspace/code/apps/sina-cs-api BUILD_DIR=/tmp/sina-native-check check
+docker compose exec -T femu-csd make -C /workspace/code/csd-programs snia-cs-scale.so
+docker compose exec -T femu-csd make -C /workspace/code/apps/snia-cs-api BUILD_DIR=/tmp/snia-native-check check
 ```
 
 设备 `.so` 输出到 `code/csd-programs/build/`。Guest 库在 Guest 编译，设备算子在容器编译。mock 测试加载真实设备 `.so`，应在相同容器环境运行。
 
-库用 Identify 校验 FEMU CSD 身份、获取 namespace LBA 大小和容量，用通用 GET_INFO 查询 FDM/CU。无需 `SINA_CS_FEMU_DEVICES`。FDM 容量用于属性报告；CU 数限制 batch 工作线程数，实际资源由设备限制。
+库用 Identify 校验 FEMU CSD 身份、获取 namespace LBA 大小和容量，用通用 GET_INFO 查询 FDM/CU。无需手工配置 FDM 容量和 CU 数。FDM 容量用于属性报告；CU 数限制 batch 工作线程数，实际资源由设备限制。
 
 batch 图在 Guest 库中调度；SERIAL 单线程，PARALLEL 并行独立节点，HYBRID 在全部前驱完成后启动节点。设备不接收整张图，硬件 batch 标志为 0。完整能力范围见 [兼容性说明](doc/compatibility.md)。
 
@@ -44,19 +44,19 @@ batch 图在 Guest 库中调度；SERIAL 单线程，PARALLEL 并行独立节点
 安装后编译：
 
 ```sh
-cc application.c -lsina-cs-api -pthread -o application
+cc application.c -lsnia-cs-api -pthread -o application
 ```
 
 未安装时，在项目目录使用动态库：
 
 ```sh
-cc application.c -Iinclude -Lbuild -lsina-cs-api -pthread \
+cc application.c -Iinclude -Lbuild -lsnia-cs-api -pthread \
     -Wl,-rpath,"$PWD/build" -o application
 ```
 
 `examples/api-smoke.c` 包含加载、激活、AFDM、batch 和回收的完整示例。Guest 中执行 `sudo build/api-smoke /dev/nvme0n1`，期望输出 `SNIA API batch PASS: 4 12 28 44`。
 
-CSF 下载描述为 `文件名\0入口符号\0`，例如 `sina-cs-scale.so\0cs_scale\0`。文件在容器的 `csd_program_dir` 中，Guest 不需要持有设备 `.so`。
+CSF 下载描述为 `文件名\0入口符号\0`，例如 `snia-cs-scale.so\0cs_scale\0`。文件在容器的 `csd_program_dir` 中，Guest 不需要持有设备 `.so`。
 
 **应用和算子自行约定参数含义。库只映射原生字段，不附加参数描述或输入 AFDM。**
 
@@ -64,9 +64,8 @@ CSF 下载描述为 `文件名\0入口符号\0`，例如 `sina-cs-scale.so\0cs_s
 | --- | --- |
 | 第一个、第二个……AFDM | `mr_addr[0]`、`mr_addr[1]`……以及相应 `mr_len` |
 | 第一个、第二个普通整数 | `cparam1`、`cparam2`；8/16/32 位值按无符号扩展 |
-| 一个 128 位整数 | 低 64 位为 `cparam1`，高 64 位为 `cparam2`，占满两个标量字段 |
 
-128 位整数是 SNIA v1.1 在 `CS_COMPUTE_ARG_TYPE` 中列出的普通参数类型 `CS_128BIT_VALUE_TYPE`，不是重入机制要求的参数。只有算子本身需要时应用才传；本库为它补充了 `Value128` 字段，因为规范列出了该类型，但 `CsComputeArg` 的 union 示例遗漏了对应成员。下文的 sort 示例不使用它。规范见 [第 62、74 页](https://www.snia.org/sites/default/files/technical-work/computational/release/Computational%20Storage%20API%20v1.1.pdf)。
+两个 `long long` 参数始终独立：第一个整数进入 `cparam1`，第二个进入 `cparam2`，应用按算子约定分别填写。当前实现只支持 8/16/32/64 位整数；标准枚举中的 128 位类型保留名称，但请求返回 `CS_UNSUPPORTED_TYPE`。
 
 原生 `femu_csd_args` 还有 `data_buffer/buffer_len`，用于接收**执行命令中紧跟 MR 列表的附加输入字节**。例如原生命令的输入为 `[MR0][MR1][SortParams]`，那么 `data_buffer` 指向 `SortParams` 的设备端副本，`buffer_len` 是其长度。FEMU 在这次执行结束后释放副本；算子修改它不会自动写回 Guest。
 
@@ -106,7 +105,7 @@ csFreeBatchRequest(batch);
 
 ## 三、设备算子：在入口判断是否重入
 
-普通算子包含 `femu-csd-kernel.h`，直接读取 `femu_csd_args`。支持重入时再包含 `cs_csf.h`。这两个头不要求算子链接 Guest 的 `libsina-cs-api.so`。
+普通算子包含 `femu-csd-kernel.h`，直接读取 `femu_csd_args`。支持重入时再包含 `cs_csf.h`。这两个头不要求算子链接 Guest 的 `libsnia-cs-api.so`。
 
 所有设备算子统一链接 `libcs-workmem.so`。排序缓冲、run 列表等私有数据用 `cs_work_begin/cs_work_alloc/cs_work_end` 管理；context 可跨多次入口保留。AFDM 保存输入、输出和交接数据，私有算法状态留在工作内存中。
 
@@ -142,13 +141,13 @@ int64_t sort_sink(struct femu_csd_args *args)
 
 1. 首次入口 `cparam2=0`，`csIsReentry(args)` 为假。
 2. 算子在声明的 I/O AFDM 中放入待写数据，返回 `csNeedStore(bytes)`。
-3. SINA 分配 spill LBA，通过 D1 在设备内部写入，保留 `spill_id → LBA/长度` 的映射。
-4. SINA 再次调用相同 CSF，保留输入参数，把 `spill_id` 放入 `cparam2`。
+3. SNIA 分配 spill LBA，通过 D1 在设备内部写入，保留 `spill_id → LBA/长度` 的映射。
+4. SNIA 再次调用相同 CSF，保留输入参数，把 `spill_id` 放入 `cparam2`。
 5. 此时 `csIsReentry(args)` 为真，`csReentryValue(args)` 返回该标识。算子把它和已知长度加入自己的 run 列表，再继续或完成。
 
 sort.source 也在入口做相同判断：首次根据自己的 run 游标返回 `csNeedLoad(run.spill_id)`；重入时 I/O AFDM 已有数据，消费数据并推进游标。需要释放 run 时返回 `csNeedFree(spill_id)`，重入后更新自己的记录。算子自己的 pending 状态区分刚完成的是哪项操作，不需要库另传事件配置。
 
-| 算子返回 | SINA 执行 | 再次调用 CSF 时 |
+| 算子返回 | SNIA 执行 | 再次调用 CSF 时 |
 | --- | --- | --- |
 | `csNeedStore(bytes)` | 分配区段，I/O AFDM → NVM | `cparam2=新 spill_id` |
 | `csNeedLoad(spill_id)` | NVM → I/O AFDM | `cparam2=同一 spill_id` |
@@ -159,7 +158,7 @@ sort.source 也在入口做相同判断：首次根据自己的 run 游标返回
 
 batch 自动处理整个循环，直到得到普通结果才启动后继或发布 callback/event。单独 `csQueueComputeRequest` 执行一轮并返回原始 `CompValue`。
 
-设备编译可参考 `code/csd-programs/sina-cs-api/Makefile`；`../mk/csf.mk` 只是复用输出目录和链接选项的 Makefile 片段。完整可执行重入示例见 [scale.c](../../csd-programs/sina-cs-api/scale.c)。
+设备编译可参考 `code/csd-programs/snia-cs-api/Makefile`；`../mk/csf.mk` 只是复用输出目录和链接选项的 Makefile 片段。完整可执行重入示例见 [scale.c](../../csd-programs/snia-cs-api/scale.c)。
 
 ## spill 区与资源生命周期
 

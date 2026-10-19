@@ -8,7 +8,7 @@
 
 ```bash
 make -C /home/femu/apps/csd-workmem-test BUILD_DIR=/tmp/csd-workmem-test \
-    SDK_BUILD_DIR=/tmp/sina-cs-api-guest
+    SDK_BUILD_DIR=/tmp/snia-cs-api-guest
 sudo /tmp/csd-workmem-test/csd-workmem-test /dev/nvme0n1
 ```
 

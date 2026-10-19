@@ -1,6 +1,6 @@
 /* Device-side helpers for reentrant CSFs. CompValue requests, not CS_STATUS. */
-#ifndef SINA_CS_CSF_H
-#define SINA_CS_CSF_H
+#ifndef SNIA_CS_CSF_H
+#define SNIA_CS_CSF_H
 #include <stdint.h>
 #include "femu-csd-kernel.h"
 /* A reentrant CSF reserves cparam2. The scheduler supplies the completed I/O's

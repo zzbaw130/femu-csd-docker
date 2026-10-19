@@ -22,12 +22,12 @@ int main(int argc, char **argv)
     int rc = 1;
     u32 index = 400;
     int loaded = 0, active = 0;
-    const char descriptor[] = "sina-cs-scale.so\0cs_scale";
+    const char descriptor[] = "snia-cs-scale.so\0cs_scale";
     CsCSFDownloadInfo dl = {.Type = CS_CSF_VENDOR_SPECIFIC,
                             .SubType = CS_SUBTYPE_VENDOR_SPECIFIC,
                             .CSEEId = 1,
                             .Index = index,
-                            .common = {.UniqueName = "sina-scale",
+                            .common = {.UniqueName = "snia-scale",
                                        .Length = sizeof(descriptor),
                                        .DataBuffer = (void *)descriptor}};
     CsConfigInfo config = {
@@ -41,13 +41,13 @@ int main(int argc, char **argv)
     REQUIRE(csConfig(dev, &size, &config, &activated));
     active = 1;
     int length = 0, count = 0;
-    CS_STATUS status = csGetCSFId(dev, "sina-scale", 0, &length, &count, NULL);
+    CS_STATUS status = csGetCSFId(dev, "snia-scale", 0, &length, &count, NULL);
     if (status != CS_LENGTH_RETURNED)
         goto cleanup;
     CSFIdInfo *functions = calloc(1, length);
     if (!functions)
         goto cleanup;
-    status = csGetCSFId(dev, "sina-scale", 0, &length, &count, functions);
+    status = csGetCSFId(dev, "snia-scale", 0, &length, &count, functions);
     CS_CSF_ID function = status == CS_SUCCESS ? functions[0].CSFId : NULL;
     free(functions);
     if (!function)

@@ -1,5 +1,5 @@
-> `sina_csd_dev` 分支基于 `femu-csd-with-original-postgre` tag，新增独立的
-> [Computational Storage API 库](code/apps/sina-cs-api/README.md)。Guest 应用包含
+> `snia_csd_dev` 分支基于 `femu-csd-with-original-postgre` tag，新增独立的
+> [Computational Storage API 库](code/apps/snia-cs-api/README.md)。Guest 应用包含
 > `cs.h` / `cs.sh` 并链接库即可使用规范 API；能力范围及软件 batch 说明见该目录文档。
 
 # FEMU CSD + PostgreSQL 实验环境
@@ -81,11 +81,11 @@ cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,f
 │   ├── apps/
 │   │   ├── postgres/                # PostgreSQL 12 源码（guest 里编译）
 │   │   ├── csd-passthru/            # guest 侧原生命令测试
-│   │   ├── sina-cs-api/             # guest SNIA API 库
+│   │   ├── snia-cs-api/             # guest SNIA API 库
 │   │   └── csd-workmem-test/         # guest 共享工作内存验证
 │   └── csd-programs/                # 容器编译、FEMU CU 执行
 │       ├── examples/                # 原生算子与 ABI 样例
-│       ├── sina-cs-api/             # SNIA 示例 CSF
+│       ├── snia-cs-api/             # SNIA 示例 CSF
 │       ├── csd-workmem/             # 共享工作内存库
 │       └── build/                   # 统一 .so 输出目录（不入库）
 ├── data/                            # TPC-H pgdata tar（tpch_s<SF>.tar，仓库只带 SF=0.01）
@@ -115,7 +115,7 @@ tests/    ← 9p: 宿主机 tests/guest    （tpch-test.sh + queries/）
 模拟盘的 `femu-data` 分区约占 80%，`femu-spill` 分区约占 20%，后者不格式化、不挂载。
 Guest 需安装 `parted`。首次运行或标签不匹配时会重新分区并格式化数据区，清除原有数据；
 标签匹配时复用已有布局。执行 `./scripts/sh-guest.sh scripts/guest/mount-nvme.sh` 即可。
-后续 SINA 按 GPT `PARTLABEL=femu-spill` 查找 spill 分区，读取其起始位置和容量；
+后续 SNIA 按 GPT `PARTLABEL=femu-spill` 查找 spill 分区，读取其起始位置和容量；
 分区序号不承担角色含义。当前尚未实现 spill 调度和 STORE。
 
 ## 4. 设计要点（相对上游 FEMU 的改动）

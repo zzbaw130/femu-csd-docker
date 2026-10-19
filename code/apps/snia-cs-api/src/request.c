@@ -90,10 +90,10 @@ CS_STATUS cs_task_clone(const CsBatchRequest *r, struct cs_task **out)
                     else if (a->u.DevMem.ByteOffset)
                         s = CS_UNSUPPORTED;
                 }
-            } else if (a->Type < CS_8BIT_VALUE_TYPE || a->Type > CS_128BIT_VALUE_TYPE)
+            } else if (a->Type < CS_8BIT_VALUE_TYPE || a->Type > CS_64BIT_VALUE_TYPE)
                 s = CS_UNSUPPORTED_TYPE;
             else {
-                t->scalar_slots += a->Type == CS_128BIT_VALUE_TYPE ? 2 : 1;
+                t->scalar_slots++;
                 if (t->scalar_slots > 2)
                     s = CS_UNSUPPORTED;
             }
@@ -174,10 +174,7 @@ static CS_STATUS compute(struct cs_task *t, u64 *value)
             params[scalar++] = a->Type == CS_8BIT_VALUE_TYPE ? a->u.Value8
                              : a->Type == CS_16BIT_VALUE_TYPE ? a->u.Value16
                              : a->Type == CS_32BIT_VALUE_TYPE ? a->u.Value32
-                             : a->Type == CS_128BIT_VALUE_TYPE ? (uint64_t)a->u.Value128
-                                                              : a->u.Value64;
-            if (a->Type == CS_128BIT_VALUE_TYPE)
-                params[scalar++] = a->u.Value128 >> 64;
+                             : a->u.Value64;
         }
     }
     if (t->reentry)

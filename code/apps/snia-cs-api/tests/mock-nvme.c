@@ -91,7 +91,7 @@ CS_STATUS cs_io64(struct cs_device *d, bool admin, struct nvme_passthru_cmd64 *c
         if (programs[id].library)
             dlclose(programs[id].library);
         programs[id].active = false;
-        programs[id].library = dlopen("../../csd-programs/build/sina-cs-scale.so", RTLD_NOW | RTLD_LOCAL);
+        programs[id].library = dlopen("../../csd-programs/build/snia-cs-scale.so", RTLD_NOW | RTLD_LOCAL);
         programs[id].entry = programs[id].library ? dlsym(programs[id].library, symbol) : NULL;
         if (!programs[id].entry)
             s = CS_LOAD_ERROR;
