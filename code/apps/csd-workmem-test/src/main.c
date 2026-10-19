@@ -66,17 +66,18 @@ int main(int argc, char **argv)
         assert(req);
         req->ReqType = CS_QUEUE_COMPUTE;
         req->u.Compute.CSFId = functions[i];
-        req->u.Compute.NumArgs = 4;
+        req->u.Compute.NumArgs = 2;
         csHelperSetComputeArg(&req->u.Compute.Args[0], CS_AFDM_TYPE, memory, 0UL);
         csHelperSetComputeArg(&req->u.Compute.Args[1], CS_32BIT_VALUE_TYPE, (u32)i);
-        csHelperSetComputeArg(&req->u.Compute.Args[2], CS_64BIT_VALUE_TYPE, bytes);
-        csHelperSetComputeArg(&req->u.Compute.Args[3], CS_32BIT_VALUE_TYPE, (u32)4);
         CS_BATCH_INDEX index;
         CHECK(csConfigureBatchEntry(batch, CS_BATCH_ADD, req, 0, 0, &index));
         free(req);
     }
     for (unsigned round = 0; round < 2; round++) {
-        CHECK(csInitMem(memory, 0, sizeof(struct workmem_probe_control), &flags));
+        struct workmem_probe_control input = {.bytes = bytes, .participants = 4};
+        CsCopyMemRequest write = {.Type = CS_COPY_TO_DEVICE,
+            .DevMem = {memory, 0}, .u.HostVAddress = &input, .Bytes = sizeof(input)};
+        CHECK(csQueueCopyMemRequest(&write, NULL, NULL, NULL, NULL, NULL));
         CHECK(csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, NULL));
         struct workmem_probe_control report;
         CsCopyMemRequest read = {.Type = CS_COPY_FROM_DEVICE,

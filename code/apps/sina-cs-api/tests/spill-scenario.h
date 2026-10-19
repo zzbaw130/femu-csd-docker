@@ -7,12 +7,10 @@ static u64 spill_batch(CS_CSF_ID csf, CS_MEM_HANDLE mem, u64 token, int with_tok
     assert(r);
     r->ReqType = CS_QUEUE_COMPUTE;
     r->u.Compute.CSFId = csf;
-    r->u.Compute.NumArgs = 2 + with_token;
+    r->u.Compute.NumArgs = 1 + with_token;
     if (with_token)
         csHelperSetComputeArg(&r->u.Compute.Args[0], CS_64BIT_VALUE_TYPE, token);
     csHelperSetComputeArg(&r->u.Compute.Args[with_token], CS_AFDM_TYPE, mem, (unsigned long)0);
-    csHelperSetComputeArg(&r->u.Compute.Args[with_token + 1], CS_128BIT_VALUE_TYPE,
-                           csCsfControl(CS_CSF_START, 0, 0));
     CS_BATCH_HANDLE b;
     assert(csAllocBatchRequest(CS_BATCH_SERIAL, 1, &b) == CS_SUCCESS);
     CS_BATCH_INDEX index;
@@ -38,21 +36,20 @@ static void spill_scenario(CS_DEV_HANDLE d, CS_CSF_ID round, CS_CSF_ID store,
     assert(csQueueComputeRequest(&r, NULL, NULL, NULL, NULL, &result) == CS_SUCCESS);
     assert(result == UINT64_C(0x12345678fedcba98));
     value = spill_batch(round, io, 0, 0, CS_SUCCESS);
-    assert(csCsfIsCompletion(value) && csCsfAction(value) == CS_CSF_DONE &&
-           csCsfPayload(value) == 8191);
+    assert(value == 8191);
     value = spill_batch(store, io, 0, 0, CS_SUCCESS);
-    u64 token = csCsfPayload(value);
+    u64 token = value;
     assert(token);
     /* A failed later batch must preserve this earlier batch's retained run. */
     spill_batch(fail, io, 0, 0, CS_ERROR_IN_EXECUTION);
     value = spill_batch(load, io, token, 1, CS_SUCCESS);
-    assert(csCsfPayload(value) == 8191);
+    assert(value == 8191);
     spill_batch(load, io, token, 1, CS_INVALID_ID); /* Freed tokens cannot be reused. */
     /* The mock arena is only 1 MiB. Repeated failures expose leaked extents. */
     for (unsigned i = 0; i < 140; i++)
         spill_batch(fail, io, 0, 0, CS_ERROR_IN_EXECUTION);
     value = spill_batch(round, io, 0, 0, CS_SUCCESS);
-    assert(csCsfPayload(value) == 8191);
+    assert(value == 8191);
     assert(csFreeMem(io, &flags) == CS_SUCCESS);
 }
 
@@ -67,16 +64,15 @@ static void spill_graph(CS_DEV_HANDLE d, CS_CSF_ID round1, CS_CSF_ID round2,
     CsBatchRequest *r = calloc(1, sizeof(*r) + 2 * sizeof(CsComputeArg));
     assert(r);
     r->ReqType = CS_QUEUE_COMPUTE;
-    r->u.Compute.NumArgs = 2;
+    r->u.Compute.NumArgs = 1;
     for (unsigned i = 0; i < 2; i++) {
         assert(csAllocMem(d, 8192, &flags, &io[i], NULL) == CS_SUCCESS);
         r->u.Compute.CSFId = i ? round2 : round1;
         csHelperSetComputeArg(&r->u.Compute.Args[0], CS_AFDM_TYPE, io[i], (unsigned long)0);
-        csHelperSetComputeArg(&r->u.Compute.Args[1], CS_128BIT_VALUE_TYPE,
-                               csCsfControl(CS_CSF_START, 0, 0));
         assert(csConfigureBatchEntry(batch, CS_BATCH_ADD, r, 0, 0, &nodes[i]) == CS_SUCCESS);
     }
     r->u.Compute.CSFId = validate;
+    r->u.Compute.NumArgs = 2;
     for (unsigned i = 0; i < 2; i++)
         csHelperSetComputeArg(&r->u.Compute.Args[i], CS_AFDM_TYPE, io[i], (unsigned long)0);
     assert(csConfigureBatchEntry(batch, CS_BATCH_ADD, r, 0, nodes[0], &nodes[2]) == CS_SUCCESS);

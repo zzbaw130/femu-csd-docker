@@ -79,12 +79,12 @@ int main(int argc, char **argv)
               scale = load(d, "cs_scale", 403);
     CsComputeRequest *r = calloc(1, sizeof(*r) + 64 * sizeof(CsComputeArg));
     r->CSFId = sum;
-    r->NumArgs = 64;
-    for (int i = 0; i < 64; i++)
+    r->NumArgs = 2;
+    for (int i = 0; i < 2; i++)
         csHelperSetComputeArg(&r->Args[i], CS_64BIT_VALUE_TYPE, (u64)1);
     u64 result;
     OK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, &result));
-    assert(result == 64);
+    assert(result == 2);
     r->NumArgs = 0;
     OK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, &result));
     assert(result == 0);
@@ -117,11 +117,12 @@ int main(int argc, char **argv)
     CS_CSF_ID delays[4];
     for (unsigned i = 0; i < 4; i++) {
         delays[i] = load(d, "cs_delay", 404 + i);
-        CsBatchRequest *req = calloc(1, sizeof(*req));
+        CsBatchRequest *req = calloc(1, sizeof(*req) + sizeof(CsComputeArg));
         req->ReqType = CS_QUEUE_COMPUTE;
         req->u.Compute.CSFId = delays[i];
-        req->u.Compute.NumArgs = 1;
-        csHelperSetComputeArg(&req->u.Compute.Args[0], CS_AFDM_TYPE, memory, (unsigned long)i * 16);
+        req->u.Compute.NumArgs = 2;
+        csHelperSetComputeArg(&req->u.Compute.Args[0], CS_AFDM_TYPE, memory, (unsigned long)0);
+        csHelperSetComputeArg(&req->u.Compute.Args[1], CS_64BIT_VALUE_TYPE, (u64)i * 16);
         CS_BATCH_INDEX index;
         OK(csConfigureBatchEntry(batch, CS_BATCH_ADD, req, 0, 0, &index));
         free(req);
@@ -168,7 +169,7 @@ int main(int argc, char **argv)
     OK(csFreeMem(memory, &flags));
     OK(csCloseCSx(d));
     free(r);
-    printf("LIVE PASS: 64 typed args, scalar-only, 128-bit, native error, FDM, storage LOAD, %u "
+    printf("LIVE PASS: native MR/cparam arguments, scalar-only, 128-bit scalar pair, native error, FDM, storage LOAD, %u "
            "overlapping native CSFs, result64, internal STORE/LOAD, cross-batch spill, cleanup\n",
            max_busy);
     return 0;

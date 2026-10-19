@@ -9,6 +9,7 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static void *memory[4096];
 static uint64_t sizes[4096], used;
 static unsigned next_id = 1;
+static uint64_t allocations;
 static uint8_t nvm[4U << 20];
 static bool nvm_initialized;
 static struct {
@@ -54,6 +55,7 @@ CS_STATUS cs_io64(struct cs_device *d, bool admin, struct nvme_passthru_cmd64 *c
         else
             memset(nvm + first * 512, 0, (uint64_t)desc[1] * 512);
     } else if (c->opcode == 0xb0) {
+        allocations++;
         uint64_t bytes = c->cdw10 | ((uint64_t)c->cdw11 << 32);
         if (bytes > (64U << 20) - used || next_id >= 4096)
             s = CS_NOT_ENOUGH_MEMORY;
@@ -127,7 +129,7 @@ CS_STATUS cs_io64(struct cs_device *d, bool admin, struct nvme_passthru_cmd64 *c
         void *addresses[CS_API_MAX_ARGS + 1];
         long long lengths[CS_API_MAX_ARGS + 1];
         /* Linux ioctl cannot carry arbitrary CDW4/5 via metadata address. */
-        if (!nr || nr > CS_API_MAX_ARGS + 1 || c->data_len != nr * 32 || c->metadata ||
+        if (nr > CS_API_MAX_ARGS || c->data_len != nr * 32 || c->metadata ||
             c->metadata_len || c->cdw15 || !programs[id].entry || !programs[id].active) {
             s = CS_INVALID_ARG;
             goto done;
@@ -188,4 +190,12 @@ int cs_spill_region(struct cs_device *d, uint64_t *start, uint64_t *blocks)
     *start = (3U << 20) / 512;
     *blocks = (1U << 20) / 512;
     return open("/dev/null", O_RDWR | O_CLOEXEC);
+}
+
+uint64_t mock_allocation_count(void)
+{
+    pthread_mutex_lock(&lock);
+    uint64_t count = allocations;
+    pthread_mutex_unlock(&lock);
+    return count;
 }

@@ -1,7 +1,6 @@
 #ifndef CS_INTERNAL_H
 #define CS_INTERNAL_H
 #include "cs.h"
-#include "cs_kernel.h"
 #include "cs_csf.h"
 #include <pthread.h>
 #include <stdbool.h>
@@ -10,6 +9,7 @@
 #include <string.h>
 #include <linux/nvme_ioctl.h>
 #define CS_MAX_BATCH 64
+#define CS_API_MAX_ARGS 64
 #define CS_TRANSFER (1U << 20)
 enum cs_kind { DEV = 1, MEM, FUNCTION, EVENT, BATCH, REQUEST };
 struct cs_object {
@@ -56,7 +56,8 @@ struct cs_event {
 struct cs_task {
     CsBatchRequest *req;
     struct cs_object *pins[CS_API_MAX_ARGS + 4];
-    unsigned npins;
+    unsigned npins, scalar_slots;
+    uint64_t reentry;
     struct cs_device *dev;
 };
 struct cs_entry {

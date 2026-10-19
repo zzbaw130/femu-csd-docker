@@ -61,15 +61,17 @@ int main(int argc, char **argv)
                                             .u.HostVAddress = input,
                                             .DevMem = {in, 4},
                                             .Bytes = sizeof(input)}};
-    CsBatchRequest *compute = calloc(1, sizeof(*compute) + 2 * sizeof(CsComputeArg));
+    CsBatchRequest *compute = calloc(1, sizeof(*compute) + 3 * sizeof(CsComputeArg));
     if (!compute)
         goto cleanup;
     compute->ReqType = CS_QUEUE_COMPUTE;
     compute->u.Compute.CSFId = function;
-    compute->u.Compute.NumArgs = 3;
-    csHelperSetComputeArg(&compute->u.Compute.Args[0], CS_AFDM_TYPE, in, 4UL);
-    csHelperSetComputeArg(&compute->u.Compute.Args[1], CS_AFDM_TYPE, out, 8UL);
+    compute->u.Compute.NumArgs = 4;
+    csHelperSetComputeArg(&compute->u.Compute.Args[0], CS_AFDM_TYPE, in, 0UL);
+    csHelperSetComputeArg(&compute->u.Compute.Args[1], CS_AFDM_TYPE, out, 0UL);
     csHelperSetComputeArg(&compute->u.Compute.Args[2], CS_32BIT_VALUE_TYPE, (u32)4);
+    /* cs_scale explicitly defines cparam2 as its two byte offsets. */
+    csHelperSetComputeArg(&compute->u.Compute.Args[3], CS_64BIT_VALUE_TYPE, ((u64)8 << 32) | 4);
     CsBatchRequest copy_out = {.ReqType = CS_COPY_AFDM,
                                .u.CopyMem = {.Type = CS_COPY_FROM_DEVICE,
                                              .u.HostVAddress = result,
@@ -79,7 +81,8 @@ int main(int argc, char **argv)
     status = csConfigureBatchEntry(batch, CS_BATCH_ADD, &copy_in, 0, 0, &a);
     if (status == CS_SUCCESS)
         status = csConfigureBatchEntry(batch, CS_BATCH_ADD, compute, 0, a, &b);
-    compute->u.Compute.Args[0].u.DevMem = (CsDevAFDM){out, 8};
+    compute->u.Compute.Args[0].u.DevMem = (CsDevAFDM){out, 0};
+    compute->u.Compute.Args[3].u.Value64 = ((u64)8 << 32) | 8;
     if (status == CS_SUCCESS)
         status = csConfigureBatchEntry(batch, CS_BATCH_ADD, compute, 0, b, &c);
     free(compute);

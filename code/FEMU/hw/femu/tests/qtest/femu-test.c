@@ -18474,6 +18474,14 @@ static void femu_test_csd_info_result64(void *obj, void *data,
     femu_submit(&c, &c.io, (NvmeCmd *)dw);
     g_assert_cmpint(FEMU_SC(femu_complete(&c, &c.io, NULL, NULL)), ==, NVME_SUCCESS);
     g_assert_cmpuint(qtest_readq(qts, slot), ==, result);
+    dw[3] = 0;
+    dw[4] = 0;
+    dw[6] = 0;
+    dw[7] = 0;
+    slot = c.io.cq_addr + c.io.cq_head * sizeof(NvmeCqe);
+    femu_submit(&c, &c.io, (NvmeCmd *)dw);
+    g_assert_cmpint(FEMU_SC(femu_complete(&c, &c.io, NULL, NULL)), ==, NVME_SUCCESS);
+    g_assert_cmpuint(qtest_readq(qts, slot), ==, result);
     femu_queue_free(&c, &c.io);
     femu_disable(&c);
     femu_csd_remove_slow();

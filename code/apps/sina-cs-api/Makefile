@@ -19,7 +19,7 @@ $(BUILD_DIR)/libsina-cs-api.so: $(OBJECTS) src/exports.map
 	$(CC) -shared -pthread -Wl,-soname,libsina-cs-api.so -Wl,--version-script=src/exports.map -o $@ $(OBJECTS)
 install: all
 	install -d $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib
-	install -m 644 include/cs.h include/cs.sh include/cs_types.h include/cs_kernel.h include/cs_csf.h $(DESTDIR)$(PREFIX)/include/
+	install -m 644 include/cs.h include/cs.sh include/cs_types.h include/femu-csd-kernel.h include/cs_csf.h $(DESTDIR)$(PREFIX)/include/
 	install -m 644 $(BUILD_DIR)/libsina-cs-api.a $(DESTDIR)$(PREFIX)/lib/
 	install -m 755 $(BUILD_DIR)/libsina-cs-api.so $(DESTDIR)$(PREFIX)/lib/
 clean:

@@ -13,7 +13,7 @@
 | `csAllocMem`、`csFreeMem`、`csInitMem` | FDMId=1、4096 字节粒度；清零/32 位填充由 Guest F5 写入；不提供主机映射 |
 | `csQueueCopyMemRequest` | Host↔AFDM；AFDM→AFDM 为经过 Guest 的软件 fallback，最多 1 MiB 缓冲，支持重叠 |
 | `csQueueStorageRequest` | block LOAD/STORE、多 LBA range、内部 D0/D1，无 Guest 数据中转 |
-| `csQueueComputeRequest`、`csHelperSetComputeArg` | 最多 64 参数：AFDM+offset、8/16/32/64/128 位整数；CSF 入口采用可选解码器；每次计算额外使用 4 KiB AFDM 输入 |
+| `csQueueComputeRequest`、`csHelperSetComputeArg` | AFDM 直接映射 MR；最多两个 64 位标量位置；128 位值占两位置；计算 AFDM offset 仅支持 0；无额外参数 AFDM |
 | `csAllocBatchRequest`、`csFreeBatchRequest` | 最多 64 节点的主机软件 batch |
 | `csConfigureBatchEntry`、`csHelperResizeBatchRequest` | ADD/DELETE/RECONFIG/JOIN/SPLIT；环检测、配置回滚、描述深拷贝、引用保护 |
 | `csQueueBatchRequest` | SERIAL/PARALLEL/HYBRID；单 batch 一个 CSx；设备 CU 决定工作线程数；可选恢复协议自动 STORE/LOAD/FREE |
@@ -40,7 +40,7 @@
 - Callback 与 EventHandle 不能同时指定。异步 ReqHandle 在完成后失效，无额外 free API。
 - 共享 AFDM 的依赖由应用明确建边，库不推断 CSF 的读写语义。
 - CSF 私有栈/heap 与 AFDM 分开；通过设备 libcs-workmem.so 合作式管理私有工作内存；没有 native 沙箱。
-- 本 profile 保留非负 64 位 completion，负 int64_t 值解释为 CSF 错误；大结果写 AFDM。
+- 本 profile 保留 64 位 completion，负 int64_t 值解释为 CSF 错误；batch 的高四位1/2/3范围保留给STORE/LOAD/FREE请求，其余非负值正常完成。
 
 ## 规范正文中的不一致
 
@@ -51,4 +51,4 @@
 
 ## 可选扩展
 
-`cs_csf.h` 定义 CompValue 与控制输入的可恢复协议，不扩展标准 CS_STATUS。只对携带标记的 batch 计算节点自动恢复，独立计算请求仍是一轮执行。临时区按 GPT PARTLABEL=femu-spill 识别；按 namespace LBA 分配，不使用隐藏 OP 或普通文件系统空闲块。成功批次的 token 可跨 batch 保留，失败批次回收本批新增区段。协议不是 SNIA v1.1 规定的算子 ABI，需双方采用，详见 README。
+`cs_csf.h` 提供重入判断和 STORE/LOAD/FREE 请求函数，不扩展标准 CS_STATUS。重入算子保留 cparam2，首次为0，I/O完成后由库填入 spill_id；最后一个AFDM是I/O缓冲。batch 自动推进，独立计算请求仍是一轮执行。临时区按 GPT PARTLABEL=femu-spill 识别；按 namespace LBA 分配，不使用隐藏 OP 或普通文件系统空闲块。成功批次的 token 可跨 batch 保留，失败批次回收本批新增区段。协议不是 SNIA v1.1 规定的算子 ABI，需双方采用，详见 README。

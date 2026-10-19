@@ -4,7 +4,6 @@
 #include <unistd.h>
 struct spill_extent {
     uint64_t token, start, blocks;
-    uint32_t bytes;
     void *scope;
     struct spill_extent *next;
 };
@@ -71,8 +70,8 @@ static CS_STATUS transfer(struct cs_device *d, const CsDevAFDM *io,
             .Range = {{d->nsid, e->start, (uint32_t)e->blocks}}}};
     return csQueueStorageRequest(&r, NULL, NULL, NULL, NULL, NULL);
 }
-static CS_STATUS exchange(struct cs_task *t, const CsDevAFDM *io, unsigned action,
-                           uint64_t payload, void *scope, unsigned __int128 *control)
+static CS_STATUS exchange(struct cs_task *t, const CsDevAFDM *io, uint64_t action,
+                           uint64_t payload, void *scope, uint64_t *reentry)
 {
     struct cs_device *d = t->dev;
     struct cs_memory *m = (void *)cs_task_object(t, io->MemHandle, MEM);
@@ -82,8 +81,8 @@ static CS_STATUS exchange(struct cs_task *t, const CsDevAFDM *io, unsigned actio
         goto out;
     struct cs_spill_pool *p = d->spill;
     struct spill_extent **slot = &p->extents, *e;
-    if (action == CS_CSF_NEED_STORE) {
-        if (!payload || payload > UINT32_MAX || next_token > CS_CSF_PAYLOAD_MASK) {
+    if (action == CS_NEED_STORE) {
+        if (!payload || payload > UINT32_MAX || next_token > CS_IO_VALUE_MASK) {
             s = CS_INVALID_LENGTH;
             goto out;
         }
@@ -109,11 +108,11 @@ static CS_STATUS exchange(struct cs_task *t, const CsDevAFDM *io, unsigned actio
             goto out;
         }
         *e = (struct spill_extent){.token = next_token++, .start = first, .blocks = blocks,
-            .bytes = payload, .scope = scope, .next = *slot};
+            .scope = scope, .next = *slot};
         *slot = e; /* Reserve before I/O; even a partial failure owns its extent. */
         s = transfer(d, io, e, true);
         if (s == CS_SUCCESS)
-            *control = csCsfControl(CS_CSF_STORE_DONE, e->token, e->bytes);
+            *reentry = e->token;
     } else {
         while (*slot && (*slot)->token != payload)
             slot = &(*slot)->next;
@@ -122,18 +121,18 @@ static CS_STATUS exchange(struct cs_task *t, const CsDevAFDM *io, unsigned actio
             s = CS_INVALID_ID;
             goto out;
         }
-        if (action == CS_CSF_NEED_LOAD) {
+        if (action == CS_NEED_LOAD) {
             if (e->blocks * d->lba > m->bytes - io->ByteOffset) {
                 s = CS_INVALID_LENGTH;
                 goto out;
             }
             s = transfer(d, io, e, false);
             if (s == CS_SUCCESS)
-                *control = csCsfControl(CS_CSF_LOAD_DONE, e->token, e->bytes);
-        } else if (action == CS_CSF_NEED_FREE) {
+                *reentry = e->token;
+        } else if (action == CS_NEED_FREE) {
             s = trim(d, e);
             if (s == CS_SUCCESS) {
-                *control = csCsfControl(CS_CSF_FREE_DONE, e->token, e->bytes);
+                *reentry = e->token;
                 *slot = e->next;
                 free(e);
             }
@@ -189,53 +188,42 @@ void cs_spill_detach(struct cs_device *d)
 }
 CS_STATUS cs_task_resume(struct cs_task *original, atomic_bool *cancelled, void *scope, u64 *value)
 {
-    if (original->req->ReqType != CS_QUEUE_COMPUTE)
-        return cs_task_run(original, value);
-    const CsComputeRequest *r = &original->req->u.Compute;
-    if (r->NumArgs < 2 || r->Args[r->NumArgs - 1].Type != CS_128BIT_VALUE_TYPE)
-        return cs_task_run(original, value);
-    unsigned __int128 control = r->Args[r->NumArgs - 1].u.Value128;
-    if (!csCsfIsControl(control, control >> 64))
-        return cs_task_run(original, value);
-    if (control != csCsfControl(CS_CSF_START, 0, 0) ||
-        r->Args[r->NumArgs - 2].Type != CS_AFDM_TYPE)
-        return CS_INVALID_ARG;
-    struct cs_task *t;
-    CS_STATUS s = cs_task_clone(original->req, &t);
-    if (s != CS_SUCCESS)
+    CS_STATUS s = cs_task_run(original, value);
+    if (s != CS_SUCCESS || original->req->ReqType != CS_QUEUE_COMPUTE)
         return s;
-    CsComputeRequest *private = &t->req->u.Compute;
-    const CsDevAFDM *io = &private->Args[private->NumArgs - 2].u.DevMem;
-    bool invoked = false;
+    struct cs_task *t = NULL;
     for (;;) {
+        uint64_t action = *value & ~CS_IO_VALUE_MASK;
+        if (action != CS_NEED_STORE && action != CS_NEED_LOAD && action != CS_NEED_FREE)
+            break; /* Ordinary completion; successors may now run. */
         if (atomic_load(cancelled)) {
             s = CS_ERROR_IN_EXECUTION;
             break;
         }
-        private->Args[private->NumArgs - 1].u.Value128 = control;
-        invoked = true;
+        if (original->scalar_slots > 1) {
+            s = CS_INVALID_ARG; /* cparam2 must be reserved for reentry. */
+            break;
+        }
+        if (!t) {
+            s = cs_task_clone(original->req, &t);
+            if (s != CS_SUCCESS)
+                break;
+        }
+        const CsComputeRequest *r = &t->req->u.Compute;
+        const CsDevAFDM *io = NULL;
+        for (int i = 0; i < r->NumArgs; i++)
+            if (r->Args[i].Type == CS_AFDM_TYPE)
+                io = &r->Args[i].u.DevMem; /* Last AFDM is the operator's I/O output. */
+        if (!io) {
+            s = CS_INVALID_ARG;
+            break;
+        }
+        s = exchange(t, io, action, *value & CS_IO_VALUE_MASK, scope, &t->reentry);
+        if (s != CS_SUCCESS)
+            break;
         s = cs_task_run(t, value);
         if (s != CS_SUCCESS)
             break;
-        if (!csCsfIsCompletion(*value)) {
-            s = CS_INVALID_OPTION;
-            break;
-        }
-        unsigned action = csCsfAction(*value);
-        if (action == CS_CSF_DONE)
-            break;
-        if (atomic_load(cancelled)) {
-            s = CS_ERROR_IN_EXECUTION;
-            break;
-        }
-        s = exchange(t, io, action, csCsfPayload(*value), scope, &control);
-        if (s != CS_SUCCESS)
-            break;
-    }
-    if (s != CS_SUCCESS && invoked) {
-        private->Args[private->NumArgs - 1].u.Value128 = csCsfControl(CS_CSF_ABORT, 0, 0);
-        u64 ignored;
-        cs_task_run(t, &ignored); /* CSF releases private state; never schedule its new I/O. */
     }
     cs_task_free(t);
     return s;

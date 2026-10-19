@@ -19,6 +19,7 @@ static atomic_uint checks;
 #define OK(x) CHECK((x) == CS_SUCCESS)
 extern atomic_uint mock_active, mock_peak;
 extern uint64_t mock_used_bytes(void);
+extern uint64_t mock_allocation_count(void);
 static CS_CSF_ID load(CS_DEV_HANDLE d, const char *symbol, const char *name, unsigned index)
 {
     char descriptor[128] = "sina-cs-scale.so";
@@ -136,17 +137,25 @@ int main(void)
     free(props);
     CsComputeRequest *r = calloc(1, sizeof(*r) + 64 * sizeof(CsComputeArg));
     r->CSFId = sum;
-    r->NumArgs = 6;
+    r->NumArgs = 2;
     csHelperSetComputeArg(&r->Args[0], CS_8BIT_VALUE_TYPE, 1);
-    csHelperSetComputeArg(&r->Args[1], CS_16BIT_VALUE_TYPE, 2);
-    csHelperSetComputeArg(&r->Args[2], CS_32BIT_VALUE_TYPE, (u32)3);
-    csHelperSetComputeArg(&r->Args[3], CS_64BIT_VALUE_TYPE, (u64)4);
-    csHelperSetComputeArg(&r->Args[4], CS_128BIT_VALUE_TYPE, (u128)5);
-    csHelperSetComputeArg(&r->Args[5], CS_64BIT_VALUE_TYPE, (u64)6);
+    csHelperSetComputeArg(&r->Args[1], CS_16BIT_VALUE_TYPE, 20);
     u64 value = 0;
+    uint64_t allocations = mock_allocation_count();
     OK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, &value));
     CHECK(value == 21);
-    CHECK(mock_used_bytes() == 8192); /* Temporary argument AFDM was returned. */
+    CHECK(mock_used_bytes() == 8192);
+    CHECK(mock_allocation_count() == allocations); /* No hidden argument AFDM. */
+    r->NumArgs = 3;
+    csHelperSetComputeArg(&r->Args[2], CS_32BIT_VALUE_TYPE, (u32)99);
+    CHECK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, &value) == CS_UNSUPPORTED);
+    r->NumArgs = 1;
+    csHelperSetComputeArg(&r->Args[0], CS_128BIT_VALUE_TYPE, ((u128)3 << 64) | 7);
+    OK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, &value));
+    CHECK(value == 10); /* One 128-bit value occupies native cparam1/2. */
+    r->NumArgs = 2;
+    csHelperSetComputeArg(&r->Args[0], CS_32BIT_VALUE_TYPE, (u32)1);
+    csHelperSetComputeArg(&r->Args[1], CS_64BIT_VALUE_TYPE, (u64)20);
     CS_DEV_HANDLE second_handle;
     OK(csOpenCSx("/dev/nvme0n1", NULL, &second_handle));
     n = 0;
@@ -162,11 +171,11 @@ int main(void)
     r->CSFId = scale;
     r->NumArgs = 0;
     CHECK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, NULL) == CS_ERROR_IN_EXECUTION);
-    CHECK(mock_used_bytes() == 8192); /* Error path also returns argument AFDM. */
+    CHECK(mock_used_bytes() == 8192); /* Errors also allocate no hidden AFDM. */
     r->CSFId = sum;
     r->NumArgs = 65;
     CHECK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, NULL) == CS_INVALID_ARG);
-    r->NumArgs = 6;
+    r->NumArgs = 2;
     CHECK(csQueueComputeRequest(r, NULL, callback, (void *)1, NULL, NULL) == CS_INVALID_ARG);
     CHECK(csQueueComputeRequest(r, (void *)123, callback, NULL, NULL, NULL) == CS_QUEUED);
     for (int i = 0; i < 3000 && !atomic_load(&callback_done); i++)
@@ -176,10 +185,13 @@ int main(void)
     OK(csCreateEvent(&event));
     CHECK(csPollEvent(event, NULL, NULL) == CS_NOT_DONE);
     r->CSFId = scale;
-    r->NumArgs = 3;
+    r->NumArgs = 4;
     csHelperSetComputeArg(&r->Args[0], CS_AFDM_TYPE, a, 4UL);
-    csHelperSetComputeArg(&r->Args[1], CS_AFDM_TYPE, b, 8UL);
+    csHelperSetComputeArg(&r->Args[1], CS_AFDM_TYPE, b, 0UL);
     csHelperSetComputeArg(&r->Args[2], CS_32BIT_VALUE_TYPE, (u32)4);
+    csHelperSetComputeArg(&r->Args[3], CS_64BIT_VALUE_TYPE, ((u64)8 << 32) | 4);
+    CHECK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, NULL) == CS_UNSUPPORTED);
+    csHelperSetComputeArg(&r->Args[0], CS_AFDM_TYPE, a, 0UL);
     uint32_t input[] = {2, 4, 6, 8}, output[4];
     OK(copy(a, input, sizeof(input), CS_COPY_TO_DEVICE, 4));
     OK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, &value));

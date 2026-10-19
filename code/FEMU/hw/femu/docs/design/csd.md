@@ -467,3 +467,8 @@ FDM accounting after allocation and a shared-library return value
 while spawning so it also works under Docker seccomp profiles that reject
 GLib's close-range operation. Native concurrency and 4 KiB LBA internal-copy
 regressions are run as separate QTest processes.
+
+Execute accepts zero MRs for scalar-only native CSFs. Their arguments contain
+numr=0 and no memory ranges; no placeholder AFDM is required. With zero MRs
+and no saved range set, nonzero dlen is invalid. The csd-info-result64 QTest
+also checks the scalar-only case.

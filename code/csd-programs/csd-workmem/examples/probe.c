@@ -1,5 +1,5 @@
 /* Device-side test CSF. A and B are distinct .so files sharing libcs-workmem.so. */
-#include "cs_kernel.h"
+#include "femu-csd-kernel.h"
 #include "cs_workmem.h"
 #include "workmem-probe.h"
 #include <errno.h>
@@ -25,28 +25,27 @@ static int wait_count(uint32_t *counter, uint32_t expected, uint64_t deadline)
 }
 int64_t cs_workmem_probe(struct femu_csd_args *native)
 {
-    struct cs_kernel_arg args[CS_API_MAX_ARGS];
-    if (cs_kernel_decode(native, args) != 4 || args[0].type != 1 ||
-        args[0].bytes < sizeof(struct workmem_probe_control) || args[1].type != 4 ||
-        args[2].type != 5 || args[3].type != 4 || args[1].value_lo >= WORKMEM_PROBE_SLOTS ||
-        !args[3].value_lo || args[3].value_lo > WORKMEM_PROBE_SLOTS)
+    if (native->numr != 1 || native->mr_len[0] < (long long)sizeof(struct workmem_probe_control) ||
+        native->cparam1 < 0 || native->cparam1 >= WORKMEM_PROBE_SLOTS)
         return -1;
-    struct workmem_probe_control *control = args[0].address;
-    struct workmem_probe_result *result = &control->slots[args[1].value_lo];
+    struct workmem_probe_control *control = native->mr_addr[0];
+    if (!control->participants || control->participants > WORKMEM_PROBE_SLOTS || !control->bytes)
+        return -1;
+    struct workmem_probe_result *result = &control->slots[native->cparam1];
     cs_work_context *ctx = cs_work_begin();
     if (!ctx)
         return -2;
-    void *data = cs_work_alloc(ctx, args[2].value_lo);
+    void *data = cs_work_alloc(ctx, control->bytes);
     result->allocated = data != NULL;
     result->error = data ? 0 : errno;
     result->variant = PROBE_VARIANT;
     if (data) {
         ((unsigned char *)data)[0] = PROBE_VARIANT;
-        ((unsigned char *)data)[args[2].value_lo - 1] = PROBE_VARIANT;
+        ((unsigned char *)data)[control->bytes - 1] = PROBE_VARIANT;
     }
     uint64_t deadline = now_ns() + UINT64_C(5000000000);
     __atomic_add_fetch(&control->ready, 1, __ATOMIC_RELEASE);
-    if (wait_count(&control->ready, args[3].value_lo, deadline)) {
+    if (wait_count(&control->ready, control->participants, deadline)) {
         cs_work_end(ctx);
         return -3;
     }
@@ -57,7 +56,7 @@ int64_t cs_workmem_probe(struct femu_csd_args *native)
     result->requested = stats.requested_bytes;
     result->peak = stats.peak_used_bytes;
     __atomic_add_fetch(&control->observed, 1, __ATOMIC_RELEASE);
-    int status = wait_count(&control->observed, args[3].value_lo, deadline);
+    int status = wait_count(&control->observed, control->participants, deadline);
     cs_work_end(ctx);
     return status ? -4 : 0;
 }

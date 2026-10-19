@@ -1172,7 +1172,7 @@ static uint16_t csd_exec(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req)
         dlen = numr * sizeof(NvmeCsdMemoryRange);
     }
 
-    if (pind == 0 || (rsid == 0 && numr == 0) ||
+    if (pind == 0 || (!rsid && !numr && dlen) ||
         numr > CSD_EXEC_DATA_MAX / sizeof(NvmeCsdMemoryRange)) {
         return NVME_INVALID_FIELD | NVME_DNR;
     }

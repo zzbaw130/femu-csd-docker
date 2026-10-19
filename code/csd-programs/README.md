@@ -18,7 +18,7 @@ csd-programs/
 
 **所有 native CSF `.so` 均必须动态链接同一个 `libcs-workmem.so`，即使当前没有动态工作区。** 分配器库本身不依赖自己；可选 BPF `.o` 不属于 native 动态库。
 
-动态工作内存必须包含 `cs_workmem.h`，通过 `cs_work_alloc/calloc/realloc/free` 申请和释放。每次执行创建 context，所有成功、失败和提前退出路径都必须调用 `cs_work_end`；处理内存不足时可缩小 chunk、分区、spill 或返回错误。
+动态工作内存必须包含 `cs_workmem.h`，通过 `cs_work_alloc/calloc/realloc/free` 申请和释放。为一次完整算子任务创建 context，可跨重入保留，任务完成、失败或销毁时调用 `cs_work_end`；处理内存不足时可缩小 chunk、分区、spill 或返回错误。
 
 **链接库不会自动拦截 malloc/new。** Hash 表、排序缓冲、解码数组等显式动态工作区不得绕过分配器使用 malloc/calloc/realloc/new/mmap。C++ STL 的大工作数组需要接入自定义 allocator，不能直接使用默认 std::allocator。输入规模决定的大工作区也不应转移到栈/VLA/alloca。
 
@@ -27,7 +27,7 @@ csd-programs/
 FDM 只用于约定的输入、输出和交接数据；CSF 私有工作区由本库管理，不以 FDM 代替。多个 CU/不同 .so 在同一个 FEMU 进程中共享一份预算；不要把 workmem.c 或静态库复制链接进各个算子，也不要通过不同 dlmopen namespace 加载多份分配器。
 
 ```c
-#include "cs_kernel.h"   /* 原生 femu_csd_args 定义及可选参数解码器 */
+#include "femu-csd-kernel.h"   /* 仅定义原生 femu_csd_args */
 #include "cs_workmem.h"
 
 int64_t operator_main(struct femu_csd_args *args)

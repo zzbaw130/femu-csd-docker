@@ -87,9 +87,16 @@ CS_STATUS cs_task_clone(const CsBatchRequest *r, struct cs_task **out)
                     struct cs_memory *m = (void *)t->pins[t->npins - 1];
                     if (a->u.DevMem.ByteOffset > m->bytes)
                         s = CS_INVALID_LENGTH;
+                    else if (a->u.DevMem.ByteOffset)
+                        s = CS_UNSUPPORTED;
                 }
             } else if (a->Type < CS_8BIT_VALUE_TYPE || a->Type > CS_128BIT_VALUE_TYPE)
                 s = CS_UNSUPPORTED_TYPE;
+            else {
+                t->scalar_slots += a->Type == CS_128BIT_VALUE_TYPE ? 2 : 1;
+                if (t->scalar_slots > 2)
+                    s = CS_UNSUPPORTED;
+            }
         }
         pthread_mutex_unlock(&cs_catalog_lock);
     } else if (r->ReqType == CS_COPY_AFDM) {
@@ -154,84 +161,36 @@ static CS_STATUS compute(struct cs_task *t, u64 *value)
 {
     const CsComputeRequest *r = &t->req->u.Compute;
     struct cs_function *f = (void *)cs_task_object(t, r->CSFId, FUNCTION);
-    unsigned ranges = 0;
-    for (int i = 0; i < r->NumArgs; i++)
-        ranges += r->Args[i].Type == CS_AFDM_TYPE;
-    size_t descriptor_bytes = sizeof(struct cs_kernel_header) +
-                              r->NumArgs * sizeof(struct cs_kernel_wire_arg);
-    size_t bytes = (ranges + 1) * 32;
-    uint8_t *payload = calloc(1, bytes);
-    struct cs_kernel_header *h = calloc(1, descriptor_bytes);
-    if (!payload || !h) {
-        free(payload);
-        free(h);
-        return CS_OUT_OF_RESOURCES;
-    }
-    struct cs_kernel_wire_arg *args = (void *)(h + 1);
-    h->magic = htole32(CS_KERNEL_MAGIC);
-    h->version = htole32(1);
-    h->nargs = htole32(r->NumArgs);
-    unsigned index = 0, scalar = 0;
+    /* Native MR descriptors only. No argument AFDM or type description. */
+    struct { uint32_t nsid, len; uint64_t id, reserved[2]; } ranges[CS_API_MAX_ARGS] = {0};
     uint64_t params[2] = {0};
+    unsigned nr = 0, scalar = 0;
     for (int i = 0; i < r->NumArgs; i++) {
         const CsComputeArg *a = &r->Args[i];
-        args[i].type = htole32(a->Type);
         if (a->Type == CS_AFDM_TYPE) {
             struct cs_memory *m = (void *)cs_task_object(t, a->u.DevMem.MemHandle, MEM);
-            uint64_t sb = htole64(m->id);
-            memcpy(payload + index * 32 + 8, &sb, 8);
-            args[i].range = htole32(index++);
-            args[i].offset = htole64(a->u.DevMem.ByteOffset);
+            ranges[nr++].id = htole64(m->id);
         } else {
-            uint64_t lo = a->Type == CS_8BIT_VALUE_TYPE     ? a->u.Value8
-                          : a->Type == CS_16BIT_VALUE_TYPE  ? a->u.Value16
-                          : a->Type == CS_32BIT_VALUE_TYPE  ? a->u.Value32
-                          : a->Type == CS_128BIT_VALUE_TYPE ? (uint64_t)a->u.Value128
-                                                            : a->u.Value64;
-            args[i].value_lo = htole64(lo);
+            params[scalar++] = a->Type == CS_8BIT_VALUE_TYPE ? a->u.Value8
+                             : a->Type == CS_16BIT_VALUE_TYPE ? a->u.Value16
+                             : a->Type == CS_32BIT_VALUE_TYPE ? a->u.Value32
+                             : a->Type == CS_128BIT_VALUE_TYPE ? (uint64_t)a->u.Value128
+                                                              : a->u.Value64;
             if (a->Type == CS_128BIT_VALUE_TYPE)
-                args[i].value_hi = htole64(a->u.Value128 >> 64);
-            if (scalar < 2)
-                params[scalar++] = lo;
+                params[scalar++] = a->u.Value128 >> 64;
         }
     }
-    /* Typed parameters are a CSF input buffer, using only original B0/F5/E1/C0.
-     * No firmware extension, metadata-pointer trick or host pointer is required. */
-    struct nvme_passthru_cmd alloc = {.opcode = 0xb0, .nsid = t->dev->nsid, .cdw10 = 4096};
-    CS_STATUS s = cs_io(t->dev, false, &alloc);
-    uint32_t parameter_id = alloc.result;
-    if (s != CS_SUCCESS)
-        goto done;
-    struct nvme_passthru_cmd write = {.opcode = 0xf5, .nsid = t->dev->nsid,
-        .addr = (uintptr_t)h, .data_len = descriptor_bytes, .cdw12 = descriptor_bytes,
-        .cdw14 = parameter_id};
-    s = cs_io(t->dev, false, &write);
-    if (s == CS_SUCCESS) {
-        uint32_t length = htole32(descriptor_bytes);
-        uint64_t id = htole64(parameter_id);
-        memcpy(payload + ranges * 32 + 4, &length, sizeof(length));
-        memcpy(payload + ranges * 32 + 8, &id, sizeof(id));
-        struct nvme_passthru_cmd64 cmd = {.opcode = 0xe1,
-            .nsid = t->dev->nsid, .addr = (uintptr_t)payload, .data_len = bytes,
-            .cdw2 = f->index, .cdw3 = ranges + 1,
-            .cdw10 = params[0], .cdw11 = params[0] >> 32,
-            .cdw12 = params[1], .cdw13 = params[1] >> 32};
-        s = cs_io64(t->dev, false, &cmd);
-        /* The original firmware transports the return value without interpreting it. */
-        if (s == CS_SUCCESS && (int64_t)cmd.result < 0)
-            s = CS_ERROR_IN_EXECUTION;
-        if (value)
-            *value = cmd.result;
-    }
-    struct nvme_passthru_cmd drop = {.opcode = 0xc0, .nsid = t->dev->nsid,
-                                    .cdw10 = parameter_id};
-    CS_STATUS released = cs_io(t->dev, false, &drop);
-    if (s == CS_SUCCESS)
-        s = released;
-done:
-    free(payload);
-    free(h);
-    return s;
+    if (t->reentry)
+        params[1] = t->reentry;
+    struct nvme_passthru_cmd64 cmd = {.opcode = 0xe1,
+        .nsid = t->dev->nsid, .addr = nr ? (uintptr_t)ranges : 0,
+        .data_len = nr * sizeof(ranges[0]), .cdw2 = f->index, .cdw3 = nr,
+        .cdw10 = params[0], .cdw11 = params[0] >> 32,
+        .cdw12 = params[1], .cdw13 = params[1] >> 32};
+    CS_STATUS s = cs_io64(t->dev, false, &cmd);
+    if (value)
+        *value = cmd.result;
+    return s == CS_SUCCESS && (int64_t)cmd.result < 0 ? CS_ERROR_IN_EXECUTION : s;
 }
 
 static CS_STATUS copy(struct cs_task *t, u64 *value)

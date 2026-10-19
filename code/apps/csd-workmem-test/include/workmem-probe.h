@@ -9,6 +9,8 @@ struct workmem_probe_result {
 };
 struct workmem_probe_control {
     uint32_t ready, observed;
+    uint64_t bytes;
+    uint32_t participants, reserved;
     struct workmem_probe_result slots[WORKMEM_PROBE_SLOTS];
 };
 #endif

@@ -18,11 +18,11 @@ $(LIB): src/workmem.c include/cs_workmem.h src/exports.map Makefile | $(OUT)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -shared -Wl,-soname,libcs-workmem.so \
 	    -Wl,--version-script=src/exports.map $< -o $@.tmp
 	mv -f $@.tmp $@
-$(OUT)/csd-workmem-probe-a.so: examples/probe.c include/cs_workmem.h $(SDK_INCLUDE)/cs_kernel.h $(PROBE_INCLUDE)/workmem-probe.h $(CSF_BUILD_DEPS)
+$(OUT)/csd-workmem-probe-a.so: examples/probe.c include/cs_workmem.h $(SDK_INCLUDE)/femu-csd-kernel.h $(PROBE_INCLUDE)/workmem-probe.h $(CSF_BUILD_DEPS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(SDK_INCLUDE) -I$(PROBE_INCLUDE) -DPROBE_VARIANT=1 \
 	    -shared $< $(CSF_LDLIBS) -o $@.tmp
 	mv -f $@.tmp $@
-$(OUT)/csd-workmem-probe-b.so: examples/probe.c include/cs_workmem.h $(SDK_INCLUDE)/cs_kernel.h $(PROBE_INCLUDE)/workmem-probe.h $(CSF_BUILD_DEPS)
+$(OUT)/csd-workmem-probe-b.so: examples/probe.c include/cs_workmem.h $(SDK_INCLUDE)/femu-csd-kernel.h $(PROBE_INCLUDE)/workmem-probe.h $(CSF_BUILD_DEPS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(SDK_INCLUDE) -I$(PROBE_INCLUDE) -DPROBE_VARIANT=2 \
 	    -shared $< $(CSF_LDLIBS) -o $@.tmp
 	mv -f $@.tmp $@
