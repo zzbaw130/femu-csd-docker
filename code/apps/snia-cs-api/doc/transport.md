@@ -1,6 +1,6 @@
 # FEMU 传输绑定
 
-本文件描述 Guest 中的 `plugins/femu/`，不属于公共层。公共库先将公开句柄绑定到插件私有对象，再调用 FEMU 的 validate/execute；插件不访问公共句柄表。
+本文件描述 Guest 中的 `plugins/femu/`，不属于公共层。公共库先将公开句柄绑定到插件私有对象，再调用 FEMU 的 validateRequest 及对应的 queueComputeRequest/queueCopyMemRequest/queueStorageRequest；插件不访问公共句柄表。
 
 应用参数直接映射原生 `femu_csd_args`，结构不变。AFDM 依次生成 MR，整数依次填入 cparam1/2，不生成额外的参数缓冲。
 

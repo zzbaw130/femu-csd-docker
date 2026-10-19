@@ -6,7 +6,7 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
-CS_STATUS femu_resolve(const char *path, unsigned int *length, char *out)
+CS_STATUS femu_getCSxFromPath(const char *path, unsigned int *length, char *out)
 {
     if (!path || !length)
         return CS_INVALID_ARG;
@@ -36,10 +36,10 @@ CS_STATUS femu_resolve(const char *path, unsigned int *length, char *out)
     }
     struct cs_device *d;
     unsigned workers;
-    CS_STATUS s = femu_open(device, NULL, (void **)&d, &workers);
+    CS_STATUS s = femu_openCSx(device, NULL, (void **)&d, &workers);
     if (s != CS_SUCCESS)
         return CS_NO_MATCHING_DEVICE;
-    femu_close(d);
+    femu_closeCSx(d);
     unsigned need = strlen(device) + 1, have = *length;
     *length = need;
     if (!out || have < need)
@@ -47,7 +47,7 @@ CS_STATUS femu_resolve(const char *path, unsigned int *length, char *out)
     memcpy(out, device, need);
     return CS_SUCCESS;
 }
-CS_STATUS femu_enumerate(int *length, char *buffer)
+CS_STATUS femu_queryCSxList(int *length, char *buffer)
 {
     if (!length)
         return CS_INVALID_ARG;
@@ -64,9 +64,9 @@ CS_STATUS femu_enumerate(int *length, char *buffer)
     for (size_t i = 0; i < g.gl_pathc; i++) {
         struct cs_device *d;
     unsigned workers;
-        if (femu_open(g.gl_pathv[i], NULL, (void **)&d, &workers) != CS_SUCCESS)
+        if (femu_openCSx(g.gl_pathv[i], NULL, (void **)&d, &workers) != CS_SUCCESS)
             continue;
-        femu_close(d);
+        femu_closeCSx(d);
         size_t n = strlen(g.gl_pathv[i]), extra = n + (bytes > 1);
         char *next = realloc(list, bytes + extra);
         if (!next) {
@@ -120,18 +120,18 @@ CS_STATUS cs_collect(struct cs_device *d, struct cs_program_info **out, size_t *
     }
     return CS_SUCCESS;
 }
-CS_STATUS femu_csf_list(const char *path, int *length, int *count, CSFUniqueId *out)
+CS_STATUS femu_queryCSFList(const char *path, int *length, int *count, CSFUniqueId *out)
 {
     if (!path || !length || !count)
         return CS_INVALID_ARG;
     char device[4096];
     unsigned n = sizeof(device);
-    CS_STATUS s = femu_resolve(path, &n, device);
+    CS_STATUS s = femu_getCSxFromPath(path, &n, device);
     if (s != CS_SUCCESS)
         return s;
     struct cs_device *d;
     unsigned workers;
-    s = femu_open(device, NULL, (void **)&d, &workers);
+    s = femu_openCSx(device, NULL, (void **)&d, &workers);
     if (s != CS_SUCCESS)
         return s;
     struct cs_program_info *programs;
@@ -153,10 +153,10 @@ CS_STATUS femu_csf_list(const char *path, int *length, int *count, CSFUniqueId *
         }
         free(programs);
     }
-    femu_close(d);
+    femu_closeCSx(d);
     return s;
 }
-CS_STATUS femu_get_csf(void *device, const char *name, u64 global, int *length, int *count,
+CS_STATUS femu_getCSFId(void *device, const char *name, u64 global, int *length, int *count,
                      CSFIdinfo *out)
 {
     if (!length || !count || (!name && !global) || (name && global))
@@ -204,7 +204,7 @@ done:
     free(list);
     return s;
 }
-CS_STATUS femu_properties(void *device, CS_RESOURCE_TYPE type, int *length,
+CS_STATUS femu_queryDeviceProperties(void *device, CS_RESOURCE_TYPE type, int *length,
                                   CsProperties *out)
 {
     if (!length)

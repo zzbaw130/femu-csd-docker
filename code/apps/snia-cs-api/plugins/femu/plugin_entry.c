@@ -1,5 +1,5 @@
 #include "femu.h"
-CS_STATUS femu_open(const char *name, void *context, void **out, unsigned *workers)
+CS_STATUS femu_openCSx(const char *name, void *context, void **out, unsigned *workers)
 {
     (void)context;
     *out = NULL;
@@ -12,34 +12,33 @@ CS_STATUS femu_open(const char *name, void *context, void **out, unsigned *worke
     *out = d; *workers = d->caps.workers;
     return CS_SUCCESS;
 }
-void femu_close(void *device)
+void femu_closeCSx(void *device)
 {
     struct cs_device *d = device;
     cs_spill_detach(d); cs_transport_close(d); free(d);
 }
-static u32 function_id(void *device, CS_CSF_ID function)
+static u32 getCSFResourceId(void *device, CS_CSF_ID function)
 {
     (void)device;
     return (u32)(uintptr_t)function;
 }
-static CS_STATUS execute(void *device, const CsBatchRequest *req, u64 *value)
-{
-    struct cs_task task = {.dev = device, .req = req};
-    return cs_task_run(&task, value);
-}
-static void scope_end(void *device, void *scope, bool success)
+static void finishBatchExecution(void *device, void *scope, bool success)
 {
     cs_spill_scope_end(device, scope, success);
 }
 static const struct cs_backend_ops ops = {
     .abi = CS_BACKEND_ABI, .name = "femu", .type = CS_PLUGIN_NVME,
-    .enumerate = femu_enumerate, .resolve = femu_resolve,
-    .open = femu_open, .close = femu_close,
-    .csf_list = femu_csf_list, .get_csf = femu_get_csf, .function_id = function_id,
-    .alloc = femu_alloc, .free_mem = femu_free, .init_mem = femu_init,
-    .validate = femu_validate, .execute = execute, .execute_batch = femu_resume,
-    .scope_end = scope_end, .properties = femu_properties,
-    .download_csf = femu_download, .config = femu_config
+    .queryCSxList = femu_queryCSxList, .getCSxFromPath = femu_getCSxFromPath,
+    .openCSx = femu_openCSx, .closeCSx = femu_closeCSx,
+    .queryCSFList = femu_queryCSFList, .getCSFId = femu_getCSFId, .getCSFResourceId = getCSFResourceId,
+    .allocMem = femu_allocMem, .freeMem = femu_freeMem, .initMem = femu_initMem,
+    .validateRequest = femu_validateRequest,
+    .queueComputeRequest = femu_queueComputeRequest,
+    .queueCopyMemRequest = femu_queueCopyMemRequest,
+    .queueStorageRequest = femu_queueStorageRequest,
+    .executeBatchEntry = femu_executeBatchEntry,
+    .finishBatchExecution = finishBatchExecution, .queryDeviceProperties = femu_queryDeviceProperties,
+    .CSFDownload = femu_CSFDownload, .config = femu_config
 };
 __attribute__((visibility("default")))
 const struct cs_backend_ops *cs_backend_create(void) { return &ops; }

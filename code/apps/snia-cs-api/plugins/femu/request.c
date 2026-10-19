@@ -1,8 +1,8 @@
 #include "femu.h"
 #include <endian.h>
-static CS_STATUS compute(struct cs_task *t, u64 *value)
+static CS_STATUS compute(struct cs_device *device, const CsComputeRequest *r,
+                         u64 reentry, u64 *value)
 {
-    const CsComputeRequest *r = &t->req->u.Compute;
     uint32_t function_id = (uint32_t)(uintptr_t)r->CSFId;
     /* Native MR descriptors only. No argument AFDM or type description. */
     struct { uint32_t nsid, len; uint64_t id, reserved[2]; } ranges[CS_API_MAX_ARGS] = {0};
@@ -20,22 +20,22 @@ static CS_STATUS compute(struct cs_task *t, u64 *value)
                              : a->u.Value64;
         }
     }
-    if (t->reentry)
-        params[1] = t->reentry;
+    if (reentry)
+        params[1] = reentry;
     struct nvme_passthru_cmd64 cmd = {.opcode = 0xe1,
-        .nsid = t->dev->nsid, .addr = nr ? (uintptr_t)ranges : 0,
+        .nsid = device->nsid, .addr = nr ? (uintptr_t)ranges : 0,
         .data_len = nr * sizeof(ranges[0]), .cdw2 = function_id, .cdw3 = nr,
         .cdw10 = params[0], .cdw11 = params[0] >> 32,
         .cdw12 = params[1], .cdw13 = params[1] >> 32};
-    CS_STATUS s = cs_io64(t->dev, false, &cmd);
+    CS_STATUS s = cs_io64(device, false, &cmd);
     if (value)
         *value = cmd.result;
     return s == CS_SUCCESS && (int64_t)cmd.result < 0 ? CS_ERROR_IN_EXECUTION : s;
 }
 
-static CS_STATUS copy(struct cs_task *t, u64 *value)
+CS_STATUS femu_queueCopyMemRequest(void *backend, const CsCopyMemRequest *r, u64 *value)
 {
-    const CsCopyMemRequest *r = &t->req->u.CopyMem;
+    struct cs_device *device = backend;
     struct cs_memory *m = (void *)r->DevMem.MemHandle;
     if (r->Type == CS_COPY_WITHIN_DEVICE) {
         struct cs_memory *src = (void *)r->u.SrcDevMem.MemHandle;
@@ -52,17 +52,17 @@ static CS_STATUS copy(struct cs_task *t, u64 *value)
             uint32_t n = (uint64_t)r->Bytes - done > chunk ? chunk : r->Bytes - done;
             uint64_t position = reverse ? (uint64_t)r->Bytes - done - n : done;
             uint64_t offset = source + position;
-            struct nvme_passthru_cmd read = {.opcode = 0xf2, .nsid = t->dev->nsid,
+            struct nvme_passthru_cmd read = {.opcode = 0xf2, .nsid = device->nsid,
                 .addr = (uintptr_t)buffer, .data_len = n, .cdw10 = offset,
                 .cdw11 = offset >> 32, .cdw12 = n, .cdw14 = src->id};
-            s = cs_io(t->dev, false, &read);
+            s = cs_io(device, false, &read);
             if (s != CS_SUCCESS)
                 break;
             offset = destination + position;
-            struct nvme_passthru_cmd write = {.opcode = 0xf5, .nsid = t->dev->nsid,
+            struct nvme_passthru_cmd write = {.opcode = 0xf5, .nsid = device->nsid,
                 .addr = (uintptr_t)buffer, .data_len = n, .cdw10 = offset,
                 .cdw11 = offset >> 32, .cdw12 = n, .cdw14 = m->id};
-            s = cs_io(t->dev, false, &write);
+            s = cs_io(device, false, &write);
             if (s != CS_SUCCESS)
                 break;
             done += n;
@@ -76,14 +76,14 @@ static CS_STATUS copy(struct cs_task *t, u64 *value)
         uint32_t bytes = (uint64_t)r->Bytes - done > CS_TRANSFER ? CS_TRANSFER : r->Bytes - done;
         uint64_t off = r->DevMem.ByteOffset + done;
         struct nvme_passthru_cmd cmd = {.opcode = r->Type == CS_COPY_TO_DEVICE ? 0xf5 : 0xf2,
-                                        .nsid = t->dev->nsid,
+                                        .nsid = device->nsid,
                                         .addr = (uintptr_t)r->u.HostVAddress + done,
                                         .data_len = bytes,
                                         .cdw10 = off,
                                         .cdw11 = off >> 32,
                                         .cdw12 = bytes,
                                         .cdw14 = m->id};
-        CS_STATUS s = cs_io(t->dev, false, &cmd);
+        CS_STATUS s = cs_io(device, false, &cmd);
         if (s != CS_SUCCESS)
             return s;
         done += bytes;
@@ -92,9 +92,10 @@ static CS_STATUS copy(struct cs_task *t, u64 *value)
         *value = r->Bytes;
     return CS_SUCCESS;
 }
-static CS_STATUS storage(struct cs_task *t, u64 *value)
+CS_STATUS femu_queueStorageRequest(void *backend, const CsStorageRequest *request, u64 *value)
 {
-    const CsBlockIo *r = &t->req->u.StorageIo.u.BlockIo;
+    struct cs_device *device = backend;
+    const CsBlockIo *r = &request->u.BlockIo;
     struct cs_memory *m = (void *)r->DevMem.MemHandle;
     uint64_t off = r->DevMem.ByteOffset;
     for (int i = 0; i < r->NumRanges; i++) {
@@ -103,17 +104,17 @@ static CS_STATUS storage(struct cs_task *t, u64 *value)
         while (remaining) {
             uint32_t n = remaining > 65536 ? 65536 : remaining;
             struct nvme_passthru_cmd cmd = {.opcode = r->Type == CS_STORAGE_STORE_TYPE ? 0xd1 : 0xd0,
-                                            .nsid = t->dev->nsid,
+                                            .nsid = device->nsid,
                                             .cdw10 = lba,
                                             .cdw11 = lba >> 32,
                                             .cdw12 = n - 1,
                                             .cdw13 = m->id,
                                             .cdw14 = off,
                                             .cdw15 = off >> 32};
-            CS_STATUS s = cs_io(t->dev, false, &cmd);
+            CS_STATUS s = cs_io(device, false, &cmd);
             if (s != CS_SUCCESS)
                 return s;
-            off += (uint64_t)n * t->dev->lba;
+            off += (uint64_t)n * device->lba;
             lba += n;
             remaining -= n;
         }
@@ -122,11 +123,22 @@ static CS_STATUS storage(struct cs_task *t, u64 *value)
         *value = off - r->DevMem.ByteOffset;
     return CS_SUCCESS;
 }
+CS_STATUS femu_queueComputeRequest(void *device, const CsComputeRequest *request, u64 *value)
+{
+    return compute(device, request, 0, value);
+}
+/* FEMU 内部使用：仅重入路径额外传递 cparam2，不改变标准计算请求。 */
 CS_STATUS cs_task_run(struct cs_task *t, u64 *value)
 {
-    if (value)
-        *value = 0;
-    return t->req->ReqType == CS_QUEUE_COMPUTE ? compute(t, value)
-           : t->req->ReqType == CS_COPY_AFDM   ? copy(t, value)
-                                               : storage(t, value);
+    if (value) *value = 0;
+    switch (t->req->ReqType) {
+    case CS_QUEUE_COMPUTE:
+        return compute(t->dev, &t->req->u.Compute, t->reentry, value);
+    case CS_COPY_AFDM:
+        return femu_queueCopyMemRequest(t->dev, &t->req->u.CopyMem, value);
+    case CS_STORAGE_IO:
+        return femu_queueStorageRequest(t->dev, &t->req->u.StorageIo, value);
+    default:
+        return CS_INVALID_OPTION;
+    }
 }

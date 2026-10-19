@@ -1,9 +1,10 @@
-#include "internal.h"
+/* SNIA batch：配置依赖、检查环、调度就绪节点并等待全部完成。 */
+#include "cs_internal.h"
 static void batch_destroy(struct cs_object *o)
 {
     struct cs_batch *b = (void *)o;
     for (unsigned i = 0; i < b->capacity; i++)
-        cs_task_free(b->entries[i].task);
+        cs_request_release(b->entries[i].task);
 }
 static bool acyclic(const struct cs_entry *entries, unsigned max)
 {
@@ -62,7 +63,7 @@ static void *batch_worker(void *arg)
         x->running++;
         pthread_mutex_unlock(&x->lock);
         u64 value = 0;
-        CS_STATUS s = cs_task_run_batch(x->b->entries[index].task, x->cancelled, x, &value);
+        CS_STATUS s = cs_request_execute_batch_entry(x->b->entries[index].task, x->cancelled, x, &value);
         pthread_mutex_lock(&x->lock);
         x->running--;
         x->done |= UINT64_C(1) << index;
@@ -109,8 +110,8 @@ CS_STATUS cs_batch_run(struct cs_batch *b, atomic_bool *cancelled, u64 *value)
     batch_worker(&x);
     for (unsigned i = 0; i < launched; i++)
         pthread_join(threads[i], NULL);
-    if (device->plugin->ops->scope_end)
-        device->plugin->ops->scope_end(device->private_data, &x,
+    if (device->plugin->ops->finishBatchExecution)
+        device->plugin->ops->finishBatchExecution(device->private_data, &x,
                                       x.error == CS_SUCCESS && !atomic_load(cancelled));
     if (value)
         *value = x.value;
@@ -119,14 +120,14 @@ CS_STATUS cs_batch_run(struct cs_batch *b, atomic_bool *cancelled, u64 *value)
     return atomic_load(cancelled) ? CS_ERROR_IN_EXECUTION : x.error;
 }
 
-CS_STATUS cs_batch_alloc(CS_BATCH_MODE mode, int max, CS_BATCH_HANDLE *out)
+CS_STATUS csAllocBatchRequest(CS_BATCH_MODE mode, int max, CS_BATCH_HANDLE *out)
 {
     if (!out || max <= 0 || max > CS_MAX_BATCH)
         return CS_INVALID_ARG;
     *out = NULL;
     if (mode < CS_BATCH_SERIAL || mode > CS_BATCH_HYBRID)
         return CS_INVALID_OPTION;
-    struct cs_batch *b = (void *)cs_new(sizeof(*b), BATCH, batch_destroy);
+    struct cs_batch *b = (void *)cs_handle_create(sizeof(*b), BATCH, batch_destroy);
     if (!b)
         return CS_OUT_OF_RESOURCES;
     b->mode = mode;
@@ -134,34 +135,34 @@ CS_STATUS cs_batch_alloc(CS_BATCH_MODE mode, int max, CS_BATCH_HANDLE *out)
     *out = (void *)b->base.id;
     return CS_SUCCESS;
 }
-CS_STATUS cs_batch_free(CS_BATCH_HANDLE h)
+CS_STATUS csFreeBatchRequest(CS_BATCH_HANDLE h)
 {
-    struct cs_batch *b = (void *)cs_get(h, BATCH);
+    struct cs_batch *b = (void *)cs_handle_acquire(h, BATCH);
     if (!b)
         return CS_INVALID_HANDLE;
-    CS_STATUS s = cs_retire(&b->base);
-    cs_put(&b->base);
+    CS_STATUS s = cs_handle_retire(&b->base);
+    cs_handle_release(&b->base);
     return s;
 }
-CS_STATUS cs_batch_configure(CS_BATCH_HANDLE h, CS_BATCH_CONFIG_TYPE action,
+CS_STATUS csConfigureBatchEntry(CS_BATCH_HANDLE h, CS_BATCH_CONFIG_TYPE action,
                                 const CsBatchRequest *req, CS_BATCH_INDEX before,
                                 CS_BATCH_INDEX after, CS_BATCH_INDEX *curr)
 {
-    struct cs_batch *b = (void *)cs_get(h, BATCH);
+    struct cs_batch *b = (void *)cs_handle_acquire(h, BATCH);
     if (!b)
         return CS_INVALID_HANDLE;
-    struct cs_task *newtask = NULL, *oldtask = NULL;
+    struct cs_prepared_request *newtask = NULL, *oldtask = NULL;
     CS_STATUS s = CS_SUCCESS;
     if (action == CS_BATCH_ADD || action == CS_BATCH_RECONFIG) {
         if (!req) {
             s = CS_INVALID_ARG;
             goto out;
         }
-        s = cs_task_clone(req, &newtask);
+        s = cs_request_prepare(req, &newtask);
         if (s != CS_SUCCESS)
             goto out;
     }
-    pthread_mutex_lock(&cs_lock);
+    pthread_mutex_lock(&cs_handle_lock);
     if (b->base.refs != 2) {
         s = CS_HANDLE_IN_USE;
         goto unlock;
@@ -256,22 +257,22 @@ CS_STATUS cs_batch_configure(CS_BATCH_HANDLE h, CS_BATCH_CONFIG_TYPE action,
     if (action == CS_BATCH_ADD || action == CS_BATCH_RECONFIG)
         newtask = NULL;
 unlock:
-    pthread_mutex_unlock(&cs_lock);
+    pthread_mutex_unlock(&cs_handle_lock);
 out:
-    cs_task_free(newtask);
+    cs_request_release(newtask);
     if (s == CS_SUCCESS)
-        cs_task_free(oldtask);
-    cs_put(&b->base);
+        cs_request_release(oldtask);
+    cs_handle_release(&b->base);
     return s;
 }
-CS_STATUS cs_batch_resize(CS_BATCH_HANDLE h, int max)
+CS_STATUS csHelperResizeBatchRequest(CS_BATCH_HANDLE h, int max)
 {
     if (max <= 0 || max > CS_MAX_BATCH)
         return CS_INVALID_ARG;
-    struct cs_batch *b = (void *)cs_get(h, BATCH);
+    struct cs_batch *b = (void *)cs_handle_acquire(h, BATCH);
     if (!b)
         return CS_INVALID_HANDLE;
-    pthread_mutex_lock(&cs_lock);
+    pthread_mutex_lock(&cs_handle_lock);
     CS_STATUS s = b->base.refs != 2 ? CS_HANDLE_IN_USE : CS_SUCCESS;
     if (s == CS_SUCCESS) {
         for (unsigned i = max; i < b->capacity; i++)
@@ -280,15 +281,15 @@ CS_STATUS cs_batch_resize(CS_BATCH_HANDLE h, int max)
     }
     if (s == CS_SUCCESS)
         b->capacity = max;
-    pthread_mutex_unlock(&cs_lock);
-    cs_put(&b->base);
+    pthread_mutex_unlock(&cs_handle_lock);
+    cs_handle_release(&b->base);
     return s;
 }
-CS_STATUS cs_batch_queue(CS_BATCH_HANDLE h, void *ctx, csQueueCallbackFn cb, CS_EVT_HANDLE ev,
+CS_STATUS csQueueBatchRequest(CS_BATCH_HANDLE h, void *ctx, csQueueCallbackFn cb, CS_EVT_HANDLE ev,
                               CS_REQ_HANDLE *req, u64 *value)
 {
-    struct cs_batch *b = (void *)cs_get(h, BATCH);
+    struct cs_batch *b = (void *)cs_handle_acquire(h, BATCH);
     if (!b)
         return CS_INVALID_HANDLE;
-    return cs_submit(NULL, b, ctx, cb, ev, req, value);
+    return cs_request_submit(NULL, b, ctx, cb, ev, req, value);
 }

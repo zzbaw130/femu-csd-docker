@@ -7,9 +7,11 @@
 | 目录 | 内容与执行位置 |
 | --- | --- |
 | `include/cs.h` | 应用唯一入口，C/C++ 均可包含 |
-| `src/facade/` | 按 SNIA 分类组织的九个 API 实现文件；在 Guest 应用进程执行 |
-| `src/core/` | 通用句柄、插件加载、请求引用、异步完成和 batch 依赖调度 |
-| `src/interface/cs_backend.h` | 设备插件的内部 C 函数表契约，应用无需包含 |
+| `src/cs_*.c`（九个 SNIA 分类文件） | API 与所属实现放在同一文件，包括 batch 调度和动态插件管理 |
+| `src/cs_handle_registry.c` | 跨 API 的句柄查找、引用计数和资源退役 |
+| `src/cs_request_execution.c` | 计算/复制/存储/batch 共用的请求快照、句柄绑定和同步/异步执行 |
+| `src/cs_internal.h` | 上述文件共享的私有对象与函数声明，应用和插件都不包含 |
+| `src/cs_backend.h` | C 函数表实现的设备多态接口，标准方法与 SNIA API 同名去掉 cs 前缀 |
 | `plugins/femu/` | Guest 中运行的 FEMU 适配器：NVMe、资源查询、程序管理和 spill 重入 |
 | `plugins/femu/include/` | FEMU 设备算子使用的原生参数及重入辅助头 |
 | `tests/facade_tests/`、`tests/plugin_tests/` | 公共层转发测试、FEMU mock/传输/真实设备测试 |
@@ -44,7 +46,7 @@ bash tests/snia-cs-api-test.sh smoke
 
 也可在项目目录手动运行 `cmake -S . -B build && cmake --build build -j2 && ctest --test-dir build --output-on-failure`；FEMU mock 测试加载的设备算子须事先编译。设备 `.so` 仍输出到 `code/csd-programs/build/`，与 Guest 插件是不同产物。
 
-加入其他 CSx 设备时，在 `plugins/` 新增一个适配器并编译为独立动态库，在其 CMakeLists.txt 中定义构建和安装规则，由项目根 CMakeLists.txt 加入该目录，实现 `src/interface/cs_backend.h` 的设备操作，导出 `cs_backend_create` 和 `cs_backend_destroy` 两个 C 工厂符号。插件可以内部使用 C++，跨动态库边界仍使用 C 接口。每个适配器自行识别设备，公共层不判断设备类型。完整职责与调用路径见 [架构说明](doc/architecture.md)。
+加入其他 CSx 设备时，在 `plugins/` 新增一个适配器并编译为独立动态库，在其 CMakeLists.txt 中定义构建和安装规则，由项目根 CMakeLists.txt 加入该目录，实现 `src/cs_backend.h` 的设备操作，导出 `cs_backend_create` 和 `cs_backend_destroy` 两个 C 工厂符号。插件可以内部使用 C++，跨动态库边界仍使用 C 接口。每个适配器自行识别设备，公共层不判断设备类型。目前使用 C 函数指针表实现运行时多态，没有引入 C++ 虚函数类。完整职责与调用路径见 [架构说明](doc/architecture.md)。
 
 新插件可安装到默认插件目录，也可用 `csRegisterPlugin` 显式加载绝对路径；`csDeregisterPlugin` 在仍有设备或请求引用插件时返回 `CS_HANDLE_IN_USE`。这个 C 工厂契约是本项目的适配器接口，不是 SNIA 规定的通用插件二进制格式。
 

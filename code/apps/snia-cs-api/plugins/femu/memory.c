@@ -29,7 +29,7 @@ CS_STATUS cs_fill(struct cs_memory *m, uint64_t offset, uint64_t bytes, const Cs
     free(buffer);
     return s;
 }
-CS_STATUS femu_alloc(void *device, int bytes, const CsMemFlags *f, void **out,
+CS_STATUS femu_allocMem(void *device, int bytes, const CsMemFlags *f, void **out,
                      u64 *allocated, CS_MEM_PTR *va)
 {
     if (!out || !f || bytes <= 0)
@@ -64,19 +64,19 @@ CS_STATUS femu_alloc(void *device, int bytes, const CsMemFlags *f, void **out,
     if (s != CS_SUCCESS) {
         void *temp = m;
         CsMemFlags none = {0};
-        femu_free(d, temp, &none);
+        femu_freeMem(d, temp, &none);
         return s;
     }
     *out = m;
     *allocated = size;
     return CS_SUCCESS;
 }
-CS_STATUS femu_init(void *device, void *memory, unsigned long off, int bytes, const CsMemFlags *f)
+CS_STATUS femu_initMem(void *device, void *memory, unsigned long off, int bytes, const CsMemFlags *f)
 {
     (void)device;
     return cs_fill(memory, off, bytes, f);
 }
-CS_STATUS femu_free(void *device, void *memory, const CsMemFlags *f)
+CS_STATUS femu_freeMem(void *device, void *memory, const CsMemFlags *f)
 {
     (void)device;
     struct cs_memory *m = memory;

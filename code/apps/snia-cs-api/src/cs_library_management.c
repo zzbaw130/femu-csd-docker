@@ -1,5 +1,6 @@
+/* SNIA 库管理及其直接实现：动态插件发现、加载、引用和卸载。 */
 #define _GNU_SOURCE
-#include "internal.h"
+#include "cs_internal.h"
 #include <dlfcn.h>
 #include <glob.h>
 #include <stdio.h>
@@ -31,9 +32,10 @@ static CS_STATUS load_locked(const char *path, unsigned type)
     cs_backend_destroy_fn destroy = (cs_backend_destroy_fn)dlsym(library, "cs_backend_destroy");
     const struct cs_backend_ops *ops = create && destroy ? create() : NULL;
     CS_STATUS status = CS_LOAD_ERROR;
-    if (!ops || ops->abi != CS_BACKEND_ABI || !ops->name || !ops->enumerate || !ops->resolve ||
-        !ops->open || !ops->close || !ops->alloc || !ops->free_mem || !ops->init_mem ||
-        !ops->validate || !ops->execute) goto fail;
+    if (!ops || ops->abi != CS_BACKEND_ABI || !ops->name || !ops->queryCSxList || !ops->getCSxFromPath ||
+        !ops->openCSx || !ops->closeCSx || !ops->allocMem || !ops->freeMem || !ops->initMem ||
+        (!ops->queueComputeRequest && !ops->queueCopyMemRequest && !ops->queueStorageRequest))
+        goto fail;
     if (type && !(type & ops->type)) { status = CS_UNSUPPORTED_TYPE; goto fail; }
     struct cs_plugin *p = calloc(1, sizeof(*p));
     if (!p) { status = CS_OUT_OF_RESOURCES; goto fail; }
@@ -98,7 +100,7 @@ static bool valid(const CsPluginRequest *r)
     return r && r->Type && !(r->Type & ~15U) && r->PluginPath[0] &&
            memchr(r->PluginPath, 0, sizeof(r->PluginPath));
 }
-CS_STATUS cs_plugin_register(const CsPluginRequest *r)
+CS_STATUS csRegisterPlugin(const CsPluginRequest *r)
 {
     if (!valid(r)) return CS_INVALID_ARG;
     pthread_once(&plugin_once, discover);
@@ -121,12 +123,22 @@ static CS_STATUS deregister_locked(const CsPluginRequest *r)
     if (s == CS_SUCCESS) dispose(p);
     return s;
 }
-CS_STATUS cs_plugin_deregister(const CsPluginRequest *r)
+CS_STATUS csDeregisterPlugin(const CsPluginRequest *r)
 {
     if (!valid(r)) return CS_INVALID_ARG;
     pthread_once(&plugin_once, discover);
     pthread_mutex_lock(&module_lock);
     CS_STATUS s = deregister_locked(r);
     pthread_mutex_unlock(&module_lock);
+    return s;
+}
+
+CS_STATUS csQueryLibrarySupport(CS_LIBRARY_SUPPORT type, int *length, char *out)
+{
+    if (type != CS_FILE_SYSTEMS_SUPPORTED)
+        return CS_UNSUPPORTED;
+    CS_STATUS s = cs_output(length, out, 1);
+    if (s == CS_SUCCESS)
+        *out = 0;
     return s;
 }

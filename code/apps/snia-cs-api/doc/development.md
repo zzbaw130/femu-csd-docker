@@ -91,3 +91,24 @@
 - Guest workmem 两轮通过：4CU/2SO共享64MiB，2次成功/2次ENOMEM，峰值50331744字节，结束占用0；5个设备SO的共享workmem依赖检查通过。
 - Guest已安装到/usr/local并执行ldconfig；独立应用仅包含cs.h，以 cc application.c -lsnia-cs-api 编译并实际运行成功，插件从安装目录自动加载。
 - 当前重建后的模拟盘无分区或文件系统签名，沿用既有mount-nvme.sh准备80%数据区和20%spill区用于真实测试；未重启容器或Guest。
+
+## 2026-10-20：标准后端命名与扁平化实现
+
+### 修改
+
+- 明确当前通过 C 函数指针表实现运行时多态，不是 C++ 虚函数类。
+- 后端标准操作统一使用原 API 去掉 cs 前缀的名称，例如 queryDeviceProperties、getCSFId、queueComputeRequest；FEMU 实现同步改为 femu_ 对应名称。
+- 将原先混用的 execute 分成 queueComputeRequest、queueCopyMemRequest、queueStorageRequest 三个强类型方法；通知也分为 registerNotify/deregisterNotify。
+- 标准操作与 getCSFResourceId、validateRequest、executeBatchEntry、finishBatchExecution 四个内部钩子分组，逐项中文说明用途、调用时机及其不属于标准 API。
+- 删除 src/facade、src/core、src/interface 目录层级。九个标准分类文件直接位于 src/；batch 配置/调度合入 cs_batch_scheduling.c，动态插件加载/注册合入 cs_library_management.c，设备关闭直接在 cs_access.c 实现，删除同义薄包装。
+- 仅保留 cs_handle_registry.c 与 cs_request_execution.c 两份跨 API 共享实现；共享函数按句柄 acquire/retain/release、请求 prepare/execute/submit 等具体用途命名，文件顶部说明职责。删除未被读取的第二份请求副本。
+- src/cs_backend.h 为插件契约，src/cs_internal.h 为公共实现私有对象；同步 CMake、边界检查、mock 插件与中文 README/架构文档。公开 cs.h 与33个API签名不变。
+- 操作表布局变化，内部插件 ABI 更新为2，旧插件需重编；已同步重编并安装 Guest 动态库与插件，不改变设备算子 ABI。
+
+### 验证
+
+- 五组 CTest 通过：231项API检查、单头文件C++、Identify、两种插件路由，以及后端命名/目录边界。
+- ASan/UBSan/LeakSanitizer 全部通过；确认公共库导出的仍是原33个SNIA函数。
+- 用原先ABI 1 mock插件验证新加载器明确返回CS_LOAD_ERROR，避免错误解释旧操作表。
+- Guest真实回归通过：四CU重叠执行、完整64位参数/完成值、内部STORE/LOAD、跨batch spill、重复执行和失败回收。
+- Guest重新安装到/usr/local并执行ldconfig，独立应用仍以 cc application.c -lsnia-cs-api 编译运行成功，无需额外头文件或显式链接设备插件。

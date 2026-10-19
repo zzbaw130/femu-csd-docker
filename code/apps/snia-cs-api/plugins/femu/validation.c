@@ -1,5 +1,5 @@
 #include "femu.h"
-CS_STATUS femu_validate(void *device, const CsBatchRequest *r)
+CS_STATUS femu_validateRequest(void *device, const CsBatchRequest *r)
 {
     struct cs_device *d = device;
     if (r->ReqType == CS_QUEUE_COMPUTE) {

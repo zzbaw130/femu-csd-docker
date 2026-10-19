@@ -1,4 +1,5 @@
-#include "internal.h"
+/* SNIA 存储 I/O：构造存储请求，由共享请求执行器完成调用。 */
+#include "cs_internal.h"
 #include <stddef.h>
 CS_STATUS csQueueStorageRequest(const CsStorageRequest *r, void *ctx, csQueueCallbackFn cb,
                                 CS_EVT_HANDLE ev, CS_REQ_HANDLE *req, u64 *value)
@@ -6,7 +7,7 @@ CS_STATUS csQueueStorageRequest(const CsStorageRequest *r, void *ctx, csQueueCal
     if (!r) return CS_INVALID_ARG;
     if (r->Mode == CS_STORAGE_FILE_IO) {
         CsBatchRequest b = {.ReqType = CS_STORAGE_IO}; b.u.StorageIo = *r;
-        return cs_queue_one(&b, ctx, cb, ev, req, value);
+        return cs_request_queue(&b, ctx, cb, ev, req, value);
     }
     if (r->Mode != CS_STORAGE_BLOCK_IO) return CS_INVALID_OPTION;
     if (r->u.BlockIo.NumRanges <= 0 || r->u.BlockIo.NumRanges > 4096)
@@ -22,7 +23,7 @@ CS_STATUS csQueueStorageRequest(const CsStorageRequest *r, void *ctx, csQueueCal
     memcpy(&b->u.StorageIo, r,
            offsetof(CsStorageRequest, u.BlockIo.Range) +
                (size_t)r->u.BlockIo.NumRanges * sizeof(CSBlockRange));
-    CS_STATUS s = cs_queue_one(b, ctx, cb, ev, req, value);
+    CS_STATUS s = cs_request_queue(b, ctx, cb, ev, req, value);
     free(b);
     return s;
 }

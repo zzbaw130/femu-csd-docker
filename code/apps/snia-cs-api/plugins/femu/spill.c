@@ -189,7 +189,7 @@ void cs_spill_detach(struct cs_device *d)
     d->spill = NULL;
     pthread_mutex_unlock(&spill_lock);
 }
-CS_STATUS femu_resume(void *device, const CsBatchRequest *req, bool (*cancelled)(void *),
+CS_STATUS femu_executeBatchEntry(void *device, const CsBatchRequest *req, bool (*cancelled)(void *),
                       void *cancel_context, void *scope, u64 *value)
 {
     struct cs_task task = {.dev = device, .req = req};

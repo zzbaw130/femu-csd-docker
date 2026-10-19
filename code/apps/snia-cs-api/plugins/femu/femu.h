@@ -39,20 +39,23 @@ int cs_spill_region(struct cs_device *, uint64_t *, uint64_t *);
 void cs_spill_detach(struct cs_device *);
 void cs_spill_scope_end(struct cs_device *, void *, bool);
 CS_STATUS cs_task_run(struct cs_task *, u64 *);
-CS_STATUS femu_resume(void *, const CsBatchRequest *, bool (*)(void *), void *, void *, u64 *);
-CS_STATUS femu_validate(void *, const CsBatchRequest *);
-CS_STATUS femu_open(const char *, void *, void **, unsigned *);
-void femu_close(void *);
-CS_STATUS femu_enumerate(int *, char *);
-CS_STATUS femu_resolve(const char *, unsigned *, char *);
-CS_STATUS femu_csf_list(const char *, int *, int *, CSFUniqueId *);
-CS_STATUS femu_get_csf(void *, const char *, u64, int *, int *, CSFIdinfo *);
-CS_STATUS femu_properties(void *, CS_RESOURCE_TYPE, int *, CsProperties *);
-CS_STATUS femu_download(void *, const CsCSFDownloadInfo *, u32 *);
+CS_STATUS femu_queueComputeRequest(void *, const CsComputeRequest *, u64 *);
+CS_STATUS femu_queueCopyMemRequest(void *, const CsCopyMemRequest *, u64 *);
+CS_STATUS femu_queueStorageRequest(void *, const CsStorageRequest *, u64 *);
+CS_STATUS femu_executeBatchEntry(void *, const CsBatchRequest *, bool (*)(void *), void *, void *, u64 *);
+CS_STATUS femu_validateRequest(void *, const CsBatchRequest *);
+CS_STATUS femu_openCSx(const char *, void *, void **, unsigned *);
+void femu_closeCSx(void *);
+CS_STATUS femu_queryCSxList(int *, char *);
+CS_STATUS femu_getCSxFromPath(const char *, unsigned *, char *);
+CS_STATUS femu_queryCSFList(const char *, int *, int *, CSFUniqueId *);
+CS_STATUS femu_getCSFId(void *, const char *, u64, int *, int *, CSFIdinfo *);
+CS_STATUS femu_queryDeviceProperties(void *, CS_RESOURCE_TYPE, int *, CsProperties *);
+CS_STATUS femu_CSFDownload(void *, const CsCSFDownloadInfo *, u32 *);
 CS_STATUS femu_config(void *, int *, const CsConfigInfo *, CsConfigData *);
-CS_STATUS femu_alloc(void *, int, const CsMemFlags *, void **, u64 *, CS_MEM_PTR *);
-CS_STATUS femu_free(void *, void *, const CsMemFlags *);
-CS_STATUS femu_init(void *, void *, unsigned long, int, const CsMemFlags *);
+CS_STATUS femu_allocMem(void *, int, const CsMemFlags *, void **, u64 *, CS_MEM_PTR *);
+CS_STATUS femu_freeMem(void *, void *, const CsMemFlags *);
+CS_STATUS femu_initMem(void *, void *, unsigned long, int, const CsMemFlags *);
 /* Local output-size helper; no dependency on the public library internals. */
 static inline CS_STATUS cs_output(int *length, void *buffer, size_t needed)
 {

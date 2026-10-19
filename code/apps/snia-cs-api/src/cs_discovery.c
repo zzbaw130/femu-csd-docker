@@ -1,4 +1,5 @@
-#include "internal.h"
+/* SNIA 设备发现：汇总插件枚举结果、解析路径、列出 CSF。 */
+#include "cs_internal.h"
 CS_STATUS csQueryCSxList(int *length, char *buffer)
 {
     if (!length) return CS_INVALID_ARG;
@@ -9,12 +10,12 @@ CS_STATUS csQueryCSxList(int *length, char *buffer)
     if (!list) status = CS_OUT_OF_RESOURCES;
     for (size_t i = 0; i < count && status == CS_SUCCESS; i++) {
         int n = 0;
-        CS_STATUS s = plugins[i]->ops->enumerate(&n, NULL);
+        CS_STATUS s = plugins[i]->ops->queryCSxList(&n, NULL);
         if (s != CS_INVALID_LENGTH && s != CS_SUCCESS) { status = s; break; }
         if (n <= 1) continue;
         char *part = malloc(n);
         if (!part) { status = CS_OUT_OF_RESOURCES; break; }
-        s = plugins[i]->ops->enumerate(&n, part);
+        s = plugins[i]->ops->queryCSxList(&n, part);
         if (s == CS_SUCCESS) {
             size_t extra = strlen(part);
             if (extra) {
@@ -44,7 +45,7 @@ CS_STATUS csGetCSxFromPath(const char *path, unsigned *length, char *out)
     s = CS_NO_MATCHING_DEVICE;
     for (size_t i = 0; i < count; i++) {
         unsigned n = *length;
-        CS_STATUS result = plugins[i]->ops->resolve(path, &n, out);
+        CS_STATUS result = plugins[i]->ops->getCSxFromPath(path, &n, out);
         if (result == CS_SUCCESS || result == CS_INVALID_LENGTH) { *length = n; s = result; break; }
         if (result == CS_INVALID_PATH) s = result;
     }
@@ -60,7 +61,7 @@ CS_STATUS csQueryCSFList(const char *path, int *length, int *count, CSFUniqueId 
     CS_DEV_HANDLE handle;
     s = csOpenCSx(name, NULL, &handle);
     if (s != CS_SUCCESS) return s;
-    struct cs_device *d = (void *)cs_get(handle, DEV);
-    s = d->plugin->ops->csf_list ? d->plugin->ops->csf_list(path, length, count, out) : CS_UNSUPPORTED;
-    cs_put(&d->base); csCloseCSx(handle); return s;
+    struct cs_device *d = (void *)cs_handle_acquire(handle, DEV);
+    s = d->plugin->ops->queryCSFList ? d->plugin->ops->queryCSFList(path, length, count, out) : CS_UNSUPPORTED;
+    cs_handle_release(&d->base); csCloseCSx(handle); return s;
 }

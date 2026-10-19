@@ -1,5 +1,5 @@
 #include "femu.h"
-CS_STATUS femu_download(void *device, const CsCSFDownloadInfo *info, u32 *out)
+CS_STATUS femu_CSFDownload(void *device, const CsCSFDownloadInfo *info, u32 *out)
 {
     if (!info || !out)
         return CS_INVALID_ARG;

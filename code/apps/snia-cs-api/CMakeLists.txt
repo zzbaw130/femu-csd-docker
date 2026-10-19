@@ -11,12 +11,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_compile_options(-Wall -Wextra -Werror)
 set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
 add_library(snia-cs-api SHARED
-    src/facade/cs_discovery.c src/facade/cs_access.c src/facade/cs_afdm_management.c
-    src/facade/cs_storage_ios.c src/facade/cs_csf_scheduling.c src/facade/cs_batch_scheduling.c
-    src/facade/cs_event_management.c src/facade/cs_management.c src/facade/cs_library_management.c
-    src/core/handle_registry.c src/core/plugin_loader.c src/core/request.c src/core/async.c src/core/batch.c)
+    src/cs_discovery.c src/cs_access.c src/cs_afdm_management.c
+    src/cs_storage_ios.c src/cs_csf_scheduling.c src/cs_batch_scheduling.c
+    src/cs_event_management.c src/cs_management.c src/cs_library_management.c
+    src/cs_handle_registry.c src/cs_request_execution.c)
 target_include_directories(snia-cs-api PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}> PRIVATE src/core src/interface)
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}> PRIVATE src)
 target_link_libraries(snia-cs-api PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 target_link_options(snia-cs-api PRIVATE "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/exports.map")
 set_property(TARGET snia-cs-api APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/exports.map")
