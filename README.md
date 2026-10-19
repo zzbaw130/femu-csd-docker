@@ -24,7 +24,7 @@
 | 删 `images/u20s.qcow2`（强制重做 guest 镜像） | | ✓ | |
 | `docker compose build` 编译 FEMU | ✓ | | |
 | `docker compose up -d --wait` 启动 CSD VM（等 healthcheck：guest SSH 可用） | ✓ | | |
-| guest `mount-nvme.sh`：模拟盘 `/dev/nvme0n1` mkfs.ext4 并挂到 `/data` | | | ✓ |
+| guest `mount-nvme.sh`：模拟盘 GPT 分区，80% ext4 挂到 `/data`、20% 预留 spill | | | ✓ |
 | guest `install-postgre.sh`：从 `~/apps/postgres` 编译安装 PostgreSQL 到 `~/opt/postgres/release` | | | ✓ |
 | guest `start-postgre.sh 0.01`：解压 `data/tpch_s0.01.tar` 到 `/data` 并启动 `tpch_s0.01` | | | ✓ |
 
@@ -67,7 +67,8 @@ cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,f
 │   ├── gen-pgdata.sh                # 宿主机侧生成 data/tpch_s<SF>.tar（需要本机 duckdb + pg）
 │   ├── create-tables.sql / create-indexes.sql
 │   └── guest/                       # 只在 guest 内跑的脚本
-│       ├── mount-nvme.sh            # 格式化并挂载模拟盘到 /data
+│       ├── mount-nvme.sh            # 80% ext4 挂 /data，20% 留作 spill
+│       ├── nvme-layout.py          # 分区校验与 SINA spill 配置生成
 │       ├── install-postgre.sh       # 编译安装 PostgreSQL
 │       └── start-postgre.sh         # 解压数据 + 启库
 ├── tests/
@@ -109,8 +110,14 @@ data/     ← 9p: 宿主机 data           （tpch_s<SF>.tar）
 results/  ← 9p: 宿主机 results        （实验结果直接落回宿主机）
 scripts/  ← 9p: 宿主机 scripts/guest  （guest 内脚本）
 tests/    ← 9p: 宿主机 tests/guest    （tpch-test.sh + queries/）
-/data                               # 模拟 SSD（/dev/nvme0n1, ext4），PGDATA 在这里
+/data                               # 模拟 SSD 数据分区（/dev/nvme0n1p1, ext4），PGDATA 在这里
+/etc/sina-cs-api/spill.json          # 系统盘上的 spill 分区身份和 namespace 绝对 LBA 范围
 ```
+
+模拟盘的 `femu-data` 分区约占 80%，`femu-spill` 分区约占 20%，后者不格式化、不挂载。
+已有布局会复用；旧版整盘 ext4 不会自动覆盖，备份并卸载后才能用 `--repartition` 重建。
+SINA 按标签、PARTUUID 和配置范围识别角色，不依赖 p1/p2 序号；当前仅生成配置，尚未启用自动 spill。
+使用方法和配置契约见 [Guest SSD 分区说明](scripts/guest/README.md)。
 
 ## 4. 设计要点（相对上游 FEMU 的改动）
 

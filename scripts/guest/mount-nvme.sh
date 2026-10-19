@@ -1,18 +1,11 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-sudo mkdir -p /data
+# 只在 Guest 内运行；具体分区、身份校验和配置生成由同目录工具完成。
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-if ! sudo blkid /dev/nvme0n1 > /dev/null 2>&1; then
-    sudo mkfs.ext4 /dev/nvme0n1
-else
-    echo "already mkfs"
+if [[ $EUID -ne 0 ]]; then
+    exec sudo -- python3 "$SCRIPT_DIR/nvme-layout.py" "$@"
 fi
 
-if ! mountpoint -q /data; then
-    sudo mount -o noatime /dev/nvme0n1 /data
-else
-    echo "already mount"
-fi
-
-sudo chown femu:femu /data
+exec python3 "$SCRIPT_DIR/nvme-layout.py" "$@"
