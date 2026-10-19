@@ -5,7 +5,7 @@ include ../mk/csf.mk
 CFLAGS ?= -O2 -g
 CFLAGS += -std=gnu11 -Wall -Wextra -Werror -fPIC -pthread
 CPPFLAGS += -Iinclude
-SDK_INCLUDE := ../../apps/snia-cs-api/include
+SDK_INCLUDE := ../../apps/snia-cs-api/plugins/femu/include
 PROBE_INCLUDE := ../../apps/csd-workmem-test/include
 LIB := $(OUT)/libcs-workmem.so
 PROBES := $(OUT)/csd-workmem-probe-a.so $(OUT)/csd-workmem-probe-b.so

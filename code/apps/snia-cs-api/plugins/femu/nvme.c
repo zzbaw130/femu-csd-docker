@@ -1,5 +1,5 @@
 #define _GNU_SOURCE
-#include "internal.h"
+#include "femu.h"
 #include <endian.h>
 #include <errno.h>
 #include <glob.h>

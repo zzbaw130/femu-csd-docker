@@ -84,36 +84,43 @@ CS_STATUS cs_output(int *length, void *buffer, size_t needed)
     *length = (int)needed;
     return !buffer || have < 0 || (size_t)have < needed ? CS_INVALID_LENGTH : CS_SUCCESS;
 }
-static void device_destroy(struct cs_object *o)
+void cs_unlink(struct cs_object *o)
 {
-    cs_spill_detach((void *)o);
-    cs_transport_close((void *)o);
-}
-CS_STATUS csOpenCSx(const char *name, void *ctx, CS_DEV_HANDLE *handle)
-{
-    if (!name || !handle)
-        return CS_INVALID_ARG;
-    *handle = NULL;
-    struct cs_device *d = (void *)cs_new(sizeof(*d), DEV, device_destroy);
-    if (!d)
-        return CS_OUT_OF_RESOURCES;
-    d->fd = d->admin = -1;
-    CS_STATUS s;
-    if (cs_transport_open(d, name) < 0 || cs_profile_load(d, name) < 0)
-        s = CS_DEVICE_NOT_AVAILABLE;
-    else
-        s = CS_SUCCESS;
-    if (s != CS_SUCCESS) {
-        cs_hold(&d->base);
-        cs_retire(&d->base);
-        cs_put(&d->base);
-        return s;
+    pthread_mutex_lock(&cs_lock);
+    struct cs_object **p = &objects;
+    while (*p && *p != o)
+        p = &(*p)->next;
+    if (*p) {
+        *p = o->next;
+        o->refs--;
     }
-    d->context = ctx;
-    *handle = (void *)d->base.id;
-    return CS_SUCCESS;
+    pthread_mutex_unlock(&cs_lock);
 }
-CS_STATUS csCloseCSx(CS_DEV_HANDLE h)
+
+void cs_restore(struct cs_object *o)
+{
+    pthread_mutex_lock(&cs_lock);
+    o->refs++;
+    o->next = objects;
+    objects = o;
+    pthread_mutex_unlock(&cs_lock);
+}
+
+bool cs_function_busy(struct cs_device *d, unsigned index)
+{
+    bool busy = false;
+    pthread_mutex_lock(&cs_lock);
+    for (struct cs_object *o = objects; o; o = o->next)
+        if (o->kind == FUNCTION && ((struct cs_function *)o)->dev->plugin == d->plugin &&
+            !strcmp(((struct cs_function *)o)->dev->path, d->path) &&
+            ((struct cs_function *)o)->id == index && o->refs > 1) {
+            busy = true;
+            break;
+        }
+    pthread_mutex_unlock(&cs_lock);
+    return busy;
+}
+CS_STATUS cs_device_close(CS_DEV_HANDLE h)
 {
     struct cs_device *d = (void *)cs_get(h, DEV);
     if (!d)
@@ -157,39 +164,4 @@ CS_STATUS csCloseCSx(CS_DEV_HANDLE h)
     }
     cs_put(&d->base);
     return status;
-}
-void cs_unlink(struct cs_object *o)
-{
-    pthread_mutex_lock(&cs_lock);
-    struct cs_object **p = &objects;
-    while (*p && *p != o)
-        p = &(*p)->next;
-    if (*p) {
-        *p = o->next;
-        o->refs--;
-    }
-    pthread_mutex_unlock(&cs_lock);
-}
-
-void cs_restore(struct cs_object *o)
-{
-    pthread_mutex_lock(&cs_lock);
-    o->refs++;
-    o->next = objects;
-    objects = o;
-    pthread_mutex_unlock(&cs_lock);
-}
-
-bool cs_function_busy(struct cs_device *d, unsigned index)
-{
-    bool busy = false;
-    pthread_mutex_lock(&cs_lock);
-    for (struct cs_object *o = objects; o; o = o->next)
-        if (o->kind == FUNCTION && !strcmp(((struct cs_function *)o)->dev->path, d->path) &&
-            ((struct cs_function *)o)->index == index && o->refs > 1) {
-            busy = true;
-            break;
-        }
-    pthread_mutex_unlock(&cs_lock);
-    return busy;
 }

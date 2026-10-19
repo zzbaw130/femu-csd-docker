@@ -1,62 +1,79 @@
-# FEMU 的 SNIA Computational Storage API
+# SNIA Computational Storage API
 
-本目录提供运行在 Linux Guest 的 SNIA API 库。应用包含 `cs.h` 或 `cs.sh` 并链接 `libsnia-cs-api.so`，由库提交 NVMe 命令。`cs.sh` 是 C 头文件。
+应用只需 `#include "cs.h"` 并链接 `libsnia-cs-api.so`。`cs.h` 包含全部类型、状态和 33 个 API 声明，不依赖其他项目头文件。当前提供 FEMU 设备插件，公共库不包含 NVMe/FEMU 适配代码。
 
-## 一、项目：编译与执行位置
+## 一、项目：编译、安装与执行位置
 
 | 目录 | 内容与执行位置 |
 | --- | --- |
-| `include/` | 应用 API、原生 `femu-csd-kernel.h`、设备侧重入辅助函数 `cs_csf.h` |
-| `src/` | Guest 应用进程中的 NVMe 传输、资源管理、batch、event/callback 和 spill 分配 |
-| `examples/`、`tests/` | Guest 示例、mock 与真实 NVMe 测试 |
+| `include/cs.h` | 应用唯一入口，C/C++ 均可包含 |
+| `src/facade/` | 按 SNIA 分类组织的九个 API 实现文件；在 Guest 应用进程执行 |
+| `src/core/` | 通用句柄、插件加载、请求引用、异步完成和 batch 依赖调度 |
+| `src/interface/cs_backend.h` | 设备插件的内部 C 函数表契约，应用无需包含 |
+| `plugins/femu/` | Guest 中运行的 FEMU 适配器：NVMe、资源查询、程序管理和 spill 重入 |
+| `plugins/femu/include/` | FEMU 设备算子使用的原生参数及重入辅助头 |
+| `tests/facade_tests/`、`tests/plugin_tests/` | 公共层转发测试、FEMU mock/传输/真实设备测试 |
 | `doc/` | 架构、传输、兼容性和开发记录 |
-| `../../csd-programs/snia-cs-api/` | 设备算子；容器内编译，由 FEMU CU 线程执行，逻辑上属于 CSD CPU |
+| `../../csd-programs/snia-cs-api/` | 设备算子；容器内编译，在 FEMU CU 线程执行，逻辑上属于 CSD CPU |
 | `../../csd-programs/csd-workmem/` | 设备算子的共享私有工作内存分配器 |
+
+依赖为 C/C++ 编译器、CMake 3.16 及以上；测试额外使用 Python 3。Ubuntu 包管理器的 CMake 足够。容器与 Guest 是两套系统，容器安装软件不会同时安装到 Guest；首次镜像创建的包列表在 docker-compose.yml 的 command 中配置。
 
 Guest 中编译和安装：
 
 ```sh
 cd /home/femu/apps/snia-cs-api
-make all examples live
-sudo make install PREFIX=/usr/local
+cmake -S . -B /tmp/snia-cs-api-guest -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build /tmp/snia-cs-api-guest -j2
+sudo cmake --install /tmp/snia-cs-api-guest --prefix /usr/local
 sudo ldconfig
 ```
 
-生成 `build/libsnia-cs-api.so` 和 `.a`。可以指定 `BUILD_DIR=/tmp/snia-cs-api-guest`。宿主项目根目录编译设备算子、运行 mock 测试：
+构建产物为公共动态库 `libsnia-cs-api.so` 和 `snia-cs-api/libcs-femu.so`。安装后对应 `lib/libsnia-cs-api.so`、`lib/snia-cs-api/libcs-femu.so`（部分平台 lib 为 lib64）。公共库根据自身实际路径扫描旁边的 `snia-cs-api/*.so`，通过 `dlopen` 加载插件，无需应用选择 FEMU 或链接插件。移动构建产物时保留这个相对位置。
+
+在宿主项目根目录运行已有测试入口：
 
 ```sh
-docker compose exec -T femu-csd make -C /workspace/code/csd-programs snia-cs-scale.so
-docker compose exec -T femu-csd make -C /workspace/code/apps/snia-cs-api BUILD_DIR=/tmp/snia-native-check check
+# 宿主编译算子及 mock 测试
+bash tests/snia-cs-api-test.sh unit
+# 容器编译算子，Guest 编译公共库与 FEMU 插件
+bash tests/snia-cs-api-test.sh build
+# Guest 真实设备测试，需已准备 femu-spill 分区
+bash tests/snia-cs-api-test.sh smoke
 ```
 
-设备 `.so` 输出到 `code/csd-programs/build/`。Guest 库在 Guest 编译，设备算子在容器编译。mock 测试加载真实设备 `.so`，应在相同容器环境运行。
+也可在项目目录手动运行 `cmake -S . -B build && cmake --build build -j2 && ctest --test-dir build --output-on-failure`；FEMU mock 测试加载的设备算子须事先编译。设备 `.so` 仍输出到 `code/csd-programs/build/`，与 Guest 插件是不同产物。
 
-库用 Identify 校验 FEMU CSD 身份、获取 namespace LBA 大小和容量，用通用 GET_INFO 查询 FDM/CU。无需手工配置 FDM 容量和 CU 数。FDM 容量用于属性报告；CU 数限制 batch 工作线程数，实际资源由设备限制。
+加入其他 CSx 设备时，在 `plugins/` 新增一个适配器并编译为独立动态库，在其 CMakeLists.txt 中定义构建和安装规则，由项目根 CMakeLists.txt 加入该目录，实现 `src/interface/cs_backend.h` 的设备操作，导出 `cs_backend_create` 和 `cs_backend_destroy` 两个 C 工厂符号。插件可以内部使用 C++，跨动态库边界仍使用 C 接口。每个适配器自行识别设备，公共层不判断设备类型。完整职责与调用路径见 [架构说明](doc/architecture.md)。
 
-batch 图在 Guest 库中调度；SERIAL 单线程，PARALLEL 并行独立节点，HYBRID 在全部前驱完成后启动节点。设备不接收整张图，硬件 batch 标志为 0。完整能力范围见 [兼容性说明](doc/compatibility.md)。
+新插件可安装到默认插件目录，也可用 `csRegisterPlugin` 显式加载绝对路径；`csDeregisterPlugin` 在仍有设备或请求引用插件时返回 `CS_HANDLE_IN_USE`。这个 C 工厂契约是本项目的适配器接口，不是 SNIA 规定的通用插件二进制格式。
+
+FEMU 插件用 Identify 校验 CSD 身份及 namespace 格式，用 GET_INFO 查询 FDM/CU，无需手工配置。公共 batch 使用插件报告的并发数调度：SERIAL 单线程、PARALLEL 独立节点并行、HYBRID 等全部前驱完成。FEMU 不接收整张图，硬件 batch 标志仍为 0。
 
 ## 二、上层应用：参数按算子约定填写
 
 ```c
-#include "cs.sh"
+#include "cs.h"
 ```
 
 安装后编译：
 
 ```sh
-cc application.c -lsnia-cs-api -pthread -o application
+cc application.c -lsnia-cs-api -o application
 ```
 
 未安装时，在项目目录使用动态库：
 
 ```sh
-cc application.c -Iinclude -Lbuild -lsnia-cs-api -pthread \
+cc application.c -Iinclude -Lbuild -lsnia-cs-api \
     -Wl,-rpath,"$PWD/build" -o application
 ```
 
 `examples/api-smoke.c` 包含加载、激活、AFDM、batch 和回收的完整示例。Guest 中执行 `sudo build/api-smoke /dev/nvme0n1`，期望输出 `SNIA API batch PASS: 4 12 28 44`。
 
-CSF 下载描述为 `文件名\0入口符号\0`，例如 `snia-cs-scale.so\0cs_scale\0`。文件在容器的 `csd_program_dir` 中，Guest 不需要持有设备 `.so`。
+以下参数映射、程序下载和 spill 约定均属于 FEMU 插件；其他插件按其设备能力实现。
+
+FEMU 的 CSF 下载描述为 `文件名\0入口符号\0`，例如 `snia-cs-scale.so\0cs_scale\0`。文件在容器的 `csd_program_dir` 中，Guest 不需要持有设备 `.so`。
 
 **应用和算子自行约定参数含义。库只映射原生字段，不附加参数描述或输入 AFDM。**
 
@@ -105,7 +122,7 @@ csFreeBatchRequest(batch);
 
 ## 三、设备算子：在入口判断是否重入
 
-普通算子包含 `femu-csd-kernel.h`，直接读取 `femu_csd_args`。支持重入时再包含 `cs_csf.h`。这两个头不要求算子链接 Guest 的 `libsnia-cs-api.so`。
+这些设备侧头文件位于 `plugins/femu/include/`，安装到 `include/snia-cs-api/femu/`，不属于应用的 `cs.h`。普通算子包含 `femu-csd-kernel.h`，直接读取 `femu_csd_args`。支持重入时再包含 `cs_csf.h`。这两个头不要求算子链接 Guest 的 `libsnia-cs-api.so`。
 
 所有设备算子统一链接 `libcs-workmem.so`。排序缓冲、run 列表等私有数据用 `cs_work_begin/cs_work_alloc/cs_work_end` 管理；context 可跨多次入口保留。AFDM 保存输入、输出和交接数据，私有算法状态留在工作内存中。
 
@@ -141,13 +158,13 @@ int64_t sort_sink(struct femu_csd_args *args)
 
 1. 首次入口 `cparam2=0`，`csIsReentry(args)` 为假。
 2. 算子在声明的 I/O AFDM 中放入待写数据，返回 `csNeedStore(bytes)`。
-3. SNIA 分配 spill LBA，通过 D1 在设备内部写入，保留 `spill_id → LBA/长度` 的映射。
-4. SNIA 再次调用相同 CSF，保留输入参数，把 `spill_id` 放入 `cparam2`。
+3. Guest 中的 FEMU 插件分配 spill LBA，通过 D1 在设备内部写入，保留 `spill_id → LBA/长度` 的映射。
+4. FEMU 插件再次调用相同 CSF，保留输入参数，把 `spill_id` 放入 `cparam2`。
 5. 此时 `csIsReentry(args)` 为真，`csReentryValue(args)` 返回该标识。算子把它和已知长度加入自己的 run 列表，再继续或完成。
 
 sort.source 也在入口做相同判断：首次根据自己的 run 游标返回 `csNeedLoad(run.spill_id)`；重入时 I/O AFDM 已有数据，消费数据并推进游标。需要释放 run 时返回 `csNeedFree(spill_id)`，重入后更新自己的记录。算子自己的 pending 状态区分刚完成的是哪项操作，不需要库另传事件配置。
 
-| 算子返回 | SNIA 执行 | 再次调用 CSF 时 |
+| 算子返回 | FEMU 插件执行 | 再次调用 CSF 时 |
 | --- | --- | --- |
 | `csNeedStore(bytes)` | 分配区段，I/O AFDM → NVM | `cparam2=新 spill_id` |
 | `csNeedLoad(spill_id)` | NVM → I/O AFDM | `cparam2=同一 spill_id` |
@@ -156,13 +173,13 @@ sort.source 也在入口做相同判断：首次根据自己的 run 游标返回
 
 这些请求通过标准 `CompValue` 返回，不新增 `CS_STATUS`。仅用一个 64 位值的高 4 位表示 STORE/LOAD/FREE、低 60 位表示长度或标识；这三个结果范围供 batch I/O 请求使用，没有版本字段、magic 或 128 位控制封装。负的原生返回值仍表示执行错误。
 
-batch 自动处理整个循环，直到得到普通结果才启动后继或发布 callback/event。单独 `csQueueComputeRequest` 执行一轮并返回原始 `CompValue`。
+FEMU 插件在 batch 节点内自动处理整个循环，直到得到普通结果才启动后继或发布 callback/event。单独 `csQueueComputeRequest` 执行一轮并返回原始 `CompValue`。
 
 设备编译可参考 `code/csd-programs/snia-cs-api/Makefile`；`../mk/csf.mk` 只是复用输出目录和链接选项的 Makefile 片段。完整可执行重入示例见 [scale.c](../../csd-programs/snia-cs-api/scale.c)。
 
 ## spill 区与资源生命周期
 
-Guest 先执行 `/home/femu/scripts/mount-nvme.sh`：模拟盘的 80% 格式化挂载到 `/data`，20% 作为不格式化、不挂载的 spill 区。首次分区会清除模拟盘。库按 GPT PARTLABEL=`femu-spill` 识别专区，不依赖 p1/p2 编号。
+Guest 先执行 `/home/femu/scripts/mount-nvme.sh`：模拟盘的 80% 格式化挂载到 `/data`，20% 作为不格式化、不挂载的 spill 区。首次分区会清除模拟盘。FEMU 插件按 GPT PARTLABEL=`femu-spill` 识别专区，不依赖 p1/p2 编号。
 
 STORE/LOAD 数据走 D1/D0，不经过 Guest。I/O AFDM 必须容纳按 LBA 向上取整后的长度，算子应初始化最后的填充字节。长度本来就由算子掌握，不在重入时重复传递。
 

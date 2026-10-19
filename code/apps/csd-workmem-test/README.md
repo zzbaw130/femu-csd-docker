@@ -4,6 +4,8 @@
 
 设备侧源码位于 `code/csd-programs/csd-workmem`，公共库和两个探针 .so 编译至 `csd-programs/build`，由容器内 FEMU CU 加载。需要 4 CU，原有命令即可执行，不写 namespace 数据。
 
+该应用的 Makefile 调用 CMake 构建 SNIA 库，并动态链接 libsnia-cs-api.so；运行时由库自动加载 FEMU 插件。Guest 需安装 cmake。
+
 在 Guest 中：
 
 ```bash

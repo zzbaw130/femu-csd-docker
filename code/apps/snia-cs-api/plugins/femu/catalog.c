@@ -1,4 +1,4 @@
-#include "internal.h"
+#include "femu.h"
 pthread_mutex_t cs_catalog_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct cs_catalog_entry *catalog;
 struct cs_catalog_entry *cs_catalog_find_locked(struct cs_device *d, unsigned id)
@@ -32,4 +32,12 @@ CS_STATUS cs_program(struct cs_device *d, unsigned start, struct cs_program_info
             *out = e->info;
     pthread_mutex_unlock(&cs_catalog_lock);
     return CS_SUCCESS;
+}
+void cs_catalog_clear(void)
+{
+    while (catalog) {
+        struct cs_catalog_entry *e = catalog;
+        catalog = e->next;
+        free(e);
+    }
 }

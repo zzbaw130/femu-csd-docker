@@ -1,7 +1,9 @@
 /* Emulates the FEMU commands used by this backend, including internal STORE. */
 #define _GNU_SOURCE
-#include "internal.h"
+#include "femu.h"
 #include <dlfcn.h>
+#include <stdatomic.h>
+#include <glob.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -17,7 +19,7 @@ static struct {
     void *library;
     int64_t (*entry)(struct femu_csd_args *);
 } programs[1024];
-atomic_uint mock_active, mock_peak;
+__attribute__((visibility("default"))) atomic_uint mock_active, mock_peak;
 int cs_transport_open(struct cs_device *d, const char *name)
 {
     if (strcmp(name, "/dev/nvme0n1"))
@@ -91,7 +93,7 @@ CS_STATUS cs_io64(struct cs_device *d, bool admin, struct nvme_passthru_cmd64 *c
         if (programs[id].library)
             dlclose(programs[id].library);
         programs[id].active = false;
-        programs[id].library = dlopen("../../csd-programs/build/snia-cs-scale.so", RTLD_NOW | RTLD_LOCAL);
+        programs[id].library = dlopen(CS_TEST_PROGRAM, RTLD_NOW | RTLD_LOCAL);
         programs[id].entry = programs[id].library ? dlsym(programs[id].library, symbol) : NULL;
         if (!programs[id].entry)
             s = CS_LOAD_ERROR;
@@ -168,7 +170,7 @@ done:
     pthread_mutex_unlock(&lock);
     return s;
 }
-uint64_t mock_used_bytes(void)
+__attribute__((visibility("default"))) uint64_t mock_used_bytes(void)
 {
     pthread_mutex_lock(&lock);
     uint64_t value = used;
@@ -192,10 +194,18 @@ int cs_spill_region(struct cs_device *d, uint64_t *start, uint64_t *blocks)
     return open("/dev/null", O_RDWR | O_CLOEXEC);
 }
 
-uint64_t mock_allocation_count(void)
+__attribute__((visibility("default"))) uint64_t mock_allocation_count(void)
 {
     pthread_mutex_lock(&lock);
     uint64_t count = allocations;
     pthread_mutex_unlock(&lock);
     return count;
 }
+int __wrap_glob(const char *pattern, int flags, int (*error)(const char *, int), glob_t *out)
+{
+    (void)flags; (void)error;
+    static char *paths[] = {"/dev/nvme0n1", NULL};
+    if (strcmp(pattern, "/dev/nvme*n*")) return GLOB_NOMATCH;
+    out->gl_pathc = 1; out->gl_pathv = paths; return 0;
+}
+void __wrap_globfree(glob_t *out) { (void)out; }

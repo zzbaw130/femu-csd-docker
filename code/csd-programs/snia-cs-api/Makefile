@@ -2,7 +2,7 @@ CC ?= cc
 include ../mk/csf.mk
 CPPFLAGS += $(CSF_CPPFLAGS)
 SO_CFLAGS ?= -O2 -g -Wall -Wextra -Werror -fPIC -pthread
-SDK_INCLUDE := ../../apps/snia-cs-api/include
+SDK_INCLUDE := ../../apps/snia-cs-api/plugins/femu/include
 .PHONY: all clean
 all: $(OUT)/snia-cs-scale.so
 $(OUT):

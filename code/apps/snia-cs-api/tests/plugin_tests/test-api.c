@@ -1,5 +1,6 @@
-#include "cs.sh"
+#include "cs.h"
 #include <assert.h>
+#include <dlfcn.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -17,9 +18,11 @@ static atomic_uint checks;
         }                                                                                          \
     } while (0)
 #define OK(x) CHECK((x) == CS_SUCCESS)
-extern atomic_uint mock_active, mock_peak;
-extern uint64_t mock_used_bytes(void);
-extern uint64_t mock_allocation_count(void);
+static atomic_uint *mock_active_ptr, *mock_peak_ptr;
+#define mock_active (*mock_active_ptr)
+#define mock_peak (*mock_peak_ptr)
+static uint64_t (*mock_used_bytes)(void);
+static uint64_t (*mock_allocation_count)(void);
 static CS_CSF_ID load(CS_DEV_HANDLE d, const char *symbol, const char *name, unsigned index)
 {
     char descriptor[128] = "snia-cs-scale.so";
@@ -80,6 +83,14 @@ static void callback(void *ctx, CS_STATUS status, u64 value)
 }
 int main(void)
 {
+    void *mock = dlopen(CS_MOCK_PLUGIN, RTLD_NOW | RTLD_LOCAL);
+    assert(mock);
+    mock_active_ptr = dlsym(mock, "mock_active"); mock_peak_ptr = dlsym(mock, "mock_peak");
+    mock_used_bytes = dlsym(mock, "mock_used_bytes");
+    mock_allocation_count = dlsym(mock, "mock_allocation_count");
+    assert(mock_active_ptr && mock_peak_ptr && mock_used_bytes && mock_allocation_count);
+    /* Keep this test-only observation handle until process exit. */
+
     CS_DEV_HANDLE d;
     CsMemFlags f = {.FDMId = 1, .Flags = CS_FDM_CLEAR};
     CS_MEM_HANDLE a, b;

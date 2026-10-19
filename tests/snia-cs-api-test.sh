@@ -4,14 +4,16 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 case ${1:-unit} in
     unit)
         make -C "$ROOT/code/csd-programs" snia-cs-scale.so
-        make -C "$ROOT/code/apps/snia-cs-api" check
+        cmake -S "$ROOT/code/apps/snia-cs-api" -B /tmp/snia-cs-api-check -DCMAKE_BUILD_TYPE=Debug
+        cmake --build /tmp/snia-cs-api-check -j2
+        ctest --test-dir /tmp/snia-cs-api-check --output-on-failure
         ;;
     build)
         docker compose -f "$ROOT/docker-compose.yml" exec -T femu-csd \
             make -C /workspace/code/csd-programs snia-cs-scale.so
         docker compose -f "$ROOT/docker-compose.yml" exec -T femu-csd \
             env SSH_PORT="${SSH_PORT:-8080}" ./run-guest-ssh.sh \
-            'make -C /home/femu/apps/snia-cs-api BUILD_DIR=/tmp/snia-cs-api-guest all examples live -j2'
+            'cmake -S /home/femu/apps/snia-cs-api -B /tmp/snia-cs-api-guest -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build /tmp/snia-cs-api-guest -j2'
         ;;
     smoke)
         docker compose -f "$ROOT/docker-compose.yml" exec -T femu-csd \

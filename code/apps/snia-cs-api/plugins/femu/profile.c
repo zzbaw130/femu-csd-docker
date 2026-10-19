@@ -1,5 +1,5 @@
 /* FEMU vendor transport discovery; the public API remains SNIA v1.1. */
-#include "internal.h"
+#include "femu.h"
 int cs_profile_load(struct cs_device *d, const char *name)
 {
     (void)name;

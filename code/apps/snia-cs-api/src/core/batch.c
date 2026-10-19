@@ -1,34 +1,9 @@
 #include "internal.h"
-#include <endian.h>
 static void batch_destroy(struct cs_object *o)
 {
     struct cs_batch *b = (void *)o;
     for (unsigned i = 0; i < b->capacity; i++)
         cs_task_free(b->entries[i].task);
-}
-CS_STATUS csAllocBatchRequest(CS_BATCH_MODE mode, int max, CS_BATCH_HANDLE *out)
-{
-    if (!out || max <= 0 || max > CS_MAX_BATCH)
-        return CS_INVALID_ARG;
-    *out = NULL;
-    if (mode < CS_BATCH_SERIAL || mode > CS_BATCH_HYBRID)
-        return CS_INVALID_OPTION;
-    struct cs_batch *b = (void *)cs_new(sizeof(*b), BATCH, batch_destroy);
-    if (!b)
-        return CS_OUT_OF_RESOURCES;
-    b->mode = mode;
-    b->capacity = max;
-    *out = (void *)b->base.id;
-    return CS_SUCCESS;
-}
-CS_STATUS csFreeBatchRequest(CS_BATCH_HANDLE h)
-{
-    struct cs_batch *b = (void *)cs_get(h, BATCH);
-    if (!b)
-        return CS_INVALID_HANDLE;
-    CS_STATUS s = cs_retire(&b->base);
-    cs_put(&b->base);
-    return s;
 }
 static bool acyclic(const struct cs_entry *entries, unsigned max)
 {
@@ -48,7 +23,127 @@ static bool acyclic(const struct cs_entry *entries, unsigned max)
     }
     return false;
 }
-CS_STATUS csConfigureBatchEntry(CS_BATCH_HANDLE h, CS_BATCH_CONFIG_TYPE action,
+struct execution {
+    struct cs_batch *b;
+    atomic_bool *cancelled;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    uint64_t all, started, done;
+    unsigned running;
+    CS_STATUS error;
+    u64 value;
+};
+static void *batch_worker(void *arg)
+{
+    struct execution *x = arg;
+    for (;;) {
+        pthread_mutex_lock(&x->lock);
+        unsigned index;
+        for (;;) {
+            if (x->error != CS_SUCCESS || atomic_load(x->cancelled) || x->done == x->all) {
+                pthread_mutex_unlock(&x->lock);
+                return NULL;
+            }
+            for (index = 0; index < x->b->capacity; index++)
+                if ((x->all & (UINT64_C(1) << index)) && !(x->started & (UINT64_C(1) << index)) &&
+                    !(x->b->entries[index].dependencies & ~x->done))
+                    break;
+            if (index < x->b->capacity)
+                break;
+            if (!x->running) {
+                x->error = CS_INVALID_ARG;
+                pthread_cond_broadcast(&x->cond);
+                pthread_mutex_unlock(&x->lock);
+                return NULL;
+            }
+            pthread_cond_wait(&x->cond, &x->lock);
+        }
+        x->started |= UINT64_C(1) << index;
+        x->running++;
+        pthread_mutex_unlock(&x->lock);
+        u64 value = 0;
+        CS_STATUS s = cs_task_run_batch(x->b->entries[index].task, x->cancelled, x, &value);
+        pthread_mutex_lock(&x->lock);
+        x->running--;
+        x->done |= UINT64_C(1) << index;
+        x->value = value;
+        if (s != CS_SUCCESS && x->error == CS_SUCCESS)
+            x->error = s;
+        pthread_cond_broadcast(&x->cond);
+        pthread_mutex_unlock(&x->lock);
+    }
+}
+CS_STATUS cs_batch_run(struct cs_batch *b, atomic_bool *cancelled, u64 *value)
+{
+    struct execution x = {.b = b,
+                          .cancelled = cancelled,
+                          .lock = PTHREAD_MUTEX_INITIALIZER,
+                          .cond = PTHREAD_COND_INITIALIZER,
+                          .error = CS_SUCCESS};
+    unsigned workers = 1;
+    struct cs_device *device = NULL;
+    for (unsigned i = 0; i < b->capacity; i++)
+        if (b->entries[i].task) {
+            x.all |= UINT64_C(1) << i;
+            device = b->entries[i].task->dev;
+            workers = device->workers;
+        }
+    if (!x.all) {
+        pthread_mutex_destroy(&x.lock);
+        pthread_cond_destroy(&x.cond);
+        return CS_INVALID_ARG;
+    }
+    if (b->mode == CS_BATCH_SERIAL)
+        workers = 1;
+    if (!workers)
+        workers = 1;
+    if (workers > CS_MAX_BATCH)
+        workers = CS_MAX_BATCH;
+    pthread_t threads[CS_MAX_BATCH];
+    unsigned launched = 0;
+    for (unsigned i = 1; i < workers; i++) {
+        if (pthread_create(&threads[launched], NULL, batch_worker, &x))
+            break;
+        launched++;
+    }
+    batch_worker(&x);
+    for (unsigned i = 0; i < launched; i++)
+        pthread_join(threads[i], NULL);
+    if (device->plugin->ops->scope_end)
+        device->plugin->ops->scope_end(device->private_data, &x,
+                                      x.error == CS_SUCCESS && !atomic_load(cancelled));
+    if (value)
+        *value = x.value;
+    pthread_mutex_destroy(&x.lock);
+    pthread_cond_destroy(&x.cond);
+    return atomic_load(cancelled) ? CS_ERROR_IN_EXECUTION : x.error;
+}
+
+CS_STATUS cs_batch_alloc(CS_BATCH_MODE mode, int max, CS_BATCH_HANDLE *out)
+{
+    if (!out || max <= 0 || max > CS_MAX_BATCH)
+        return CS_INVALID_ARG;
+    *out = NULL;
+    if (mode < CS_BATCH_SERIAL || mode > CS_BATCH_HYBRID)
+        return CS_INVALID_OPTION;
+    struct cs_batch *b = (void *)cs_new(sizeof(*b), BATCH, batch_destroy);
+    if (!b)
+        return CS_OUT_OF_RESOURCES;
+    b->mode = mode;
+    b->capacity = max;
+    *out = (void *)b->base.id;
+    return CS_SUCCESS;
+}
+CS_STATUS cs_batch_free(CS_BATCH_HANDLE h)
+{
+    struct cs_batch *b = (void *)cs_get(h, BATCH);
+    if (!b)
+        return CS_INVALID_HANDLE;
+    CS_STATUS s = cs_retire(&b->base);
+    cs_put(&b->base);
+    return s;
+}
+CS_STATUS cs_batch_configure(CS_BATCH_HANDLE h, CS_BATCH_CONFIG_TYPE action,
                                 const CsBatchRequest *req, CS_BATCH_INDEX before,
                                 CS_BATCH_INDEX after, CS_BATCH_INDEX *curr)
 {
@@ -169,7 +264,7 @@ out:
     cs_put(&b->base);
     return s;
 }
-CS_STATUS csHelperResizeBatchRequest(CS_BATCH_HANDLE h, int max)
+CS_STATUS cs_batch_resize(CS_BATCH_HANDLE h, int max)
 {
     if (max <= 0 || max > CS_MAX_BATCH)
         return CS_INVALID_ARG;
@@ -189,100 +284,7 @@ CS_STATUS csHelperResizeBatchRequest(CS_BATCH_HANDLE h, int max)
     cs_put(&b->base);
     return s;
 }
-struct execution {
-    struct cs_batch *b;
-    atomic_bool *cancelled;
-    pthread_mutex_t lock;
-    pthread_cond_t cond;
-    uint64_t all, started, done;
-    unsigned running;
-    CS_STATUS error;
-    u64 value;
-};
-static void *batch_worker(void *arg)
-{
-    struct execution *x = arg;
-    for (;;) {
-        pthread_mutex_lock(&x->lock);
-        unsigned index;
-        for (;;) {
-            if (x->error != CS_SUCCESS || atomic_load(x->cancelled) || x->done == x->all) {
-                pthread_mutex_unlock(&x->lock);
-                return NULL;
-            }
-            for (index = 0; index < x->b->capacity; index++)
-                if ((x->all & (UINT64_C(1) << index)) && !(x->started & (UINT64_C(1) << index)) &&
-                    !(x->b->entries[index].dependencies & ~x->done))
-                    break;
-            if (index < x->b->capacity)
-                break;
-            if (!x->running) {
-                x->error = CS_INVALID_ARG;
-                pthread_cond_broadcast(&x->cond);
-                pthread_mutex_unlock(&x->lock);
-                return NULL;
-            }
-            pthread_cond_wait(&x->cond, &x->lock);
-        }
-        x->started |= UINT64_C(1) << index;
-        x->running++;
-        pthread_mutex_unlock(&x->lock);
-        u64 value = 0;
-        CS_STATUS s = cs_task_resume(x->b->entries[index].task, x->cancelled, x, &value);
-        pthread_mutex_lock(&x->lock);
-        x->running--;
-        x->done |= UINT64_C(1) << index;
-        x->value = value;
-        if (s != CS_SUCCESS && x->error == CS_SUCCESS)
-            x->error = s;
-        pthread_cond_broadcast(&x->cond);
-        pthread_mutex_unlock(&x->lock);
-    }
-}
-CS_STATUS cs_batch_run(struct cs_batch *b, atomic_bool *cancelled, u64 *value)
-{
-    struct execution x = {.b = b,
-                          .cancelled = cancelled,
-                          .lock = PTHREAD_MUTEX_INITIALIZER,
-                          .cond = PTHREAD_COND_INITIALIZER,
-                          .error = CS_SUCCESS};
-    unsigned workers = 1;
-    struct cs_device *device = NULL;
-    for (unsigned i = 0; i < b->capacity; i++)
-        if (b->entries[i].task) {
-            x.all |= UINT64_C(1) << i;
-            device = b->entries[i].task->dev;
-            workers = device->caps.workers;
-        }
-    if (!x.all) {
-        pthread_mutex_destroy(&x.lock);
-        pthread_cond_destroy(&x.cond);
-        return CS_INVALID_ARG;
-    }
-    if (b->mode == CS_BATCH_SERIAL)
-        workers = 1;
-    if (!workers)
-        workers = 1;
-    if (workers > CS_MAX_BATCH)
-        workers = CS_MAX_BATCH;
-    pthread_t threads[CS_MAX_BATCH];
-    unsigned launched = 0;
-    for (unsigned i = 1; i < workers; i++) {
-        if (pthread_create(&threads[launched], NULL, batch_worker, &x))
-            break;
-        launched++;
-    }
-    batch_worker(&x);
-    for (unsigned i = 0; i < launched; i++)
-        pthread_join(threads[i], NULL);
-    cs_spill_scope_end(device, &x, x.error == CS_SUCCESS && !atomic_load(cancelled));
-    if (value)
-        *value = x.value;
-    pthread_mutex_destroy(&x.lock);
-    pthread_cond_destroy(&x.cond);
-    return atomic_load(cancelled) ? CS_ERROR_IN_EXECUTION : x.error;
-}
-CS_STATUS csQueueBatchRequest(CS_BATCH_HANDLE h, void *ctx, csQueueCallbackFn cb, CS_EVT_HANDLE ev,
+CS_STATUS cs_batch_queue(CS_BATCH_HANDLE h, void *ctx, csQueueCallbackFn cb, CS_EVT_HANDLE ev,
                               CS_REQ_HANDLE *req, u64 *value)
 {
     struct cs_batch *b = (void *)cs_get(h, BATCH);

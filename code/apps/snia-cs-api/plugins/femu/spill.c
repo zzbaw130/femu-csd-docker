@@ -1,5 +1,5 @@
 /* Guest-side temporary extent ownership and resumable batch execution. */
-#include "internal.h"
+#include "femu.h"
 #include <endian.h>
 #include <unistd.h>
 struct spill_extent {
@@ -64,17 +64,20 @@ static CS_STATUS trim(struct cs_device *d, struct spill_extent *e)
 static CS_STATUS transfer(struct cs_device *d, const CsDevAFDM *io,
                            struct spill_extent *e, bool store)
 {
-    CsStorageRequest r = {.Mode = CS_STORAGE_BLOCK_IO, .DevHandle = (void *)d->base.id,
+    CsStorageRequest r = {.Mode = CS_STORAGE_BLOCK_IO, .DevHandle = d,
         .u.BlockIo = {.Type = store ? CS_STORAGE_STORE_TYPE : CS_STORAGE_LOAD_TYPE,
             .DevMem = *io, .NumRanges = 1,
             .Range = {{d->nsid, e->start, (uint32_t)e->blocks}}}};
-    return csQueueStorageRequest(&r, NULL, NULL, NULL, NULL, NULL);
+    CsBatchRequest req = {.ReqType = CS_STORAGE_IO};
+    req.u.StorageIo = r;
+    struct cs_task t = {.req = &req, .dev = d};
+    return cs_task_run(&t, NULL);
 }
 static CS_STATUS exchange(struct cs_task *t, const CsDevAFDM *io, uint64_t action,
                            uint64_t payload, void *scope, uint64_t *reentry)
 {
     struct cs_device *d = t->dev;
-    struct cs_memory *m = (void *)cs_task_object(t, io->MemHandle, MEM);
+    struct cs_memory *m = (void *)io->MemHandle;
     pthread_mutex_lock(&spill_lock);
     CS_STATUS s = attach(d);
     if (s != CS_SUCCESS)
@@ -186,45 +189,29 @@ void cs_spill_detach(struct cs_device *d)
     d->spill = NULL;
     pthread_mutex_unlock(&spill_lock);
 }
-CS_STATUS cs_task_resume(struct cs_task *original, atomic_bool *cancelled, void *scope, u64 *value)
+CS_STATUS femu_resume(void *device, const CsBatchRequest *req, bool (*cancelled)(void *),
+                      void *cancel_context, void *scope, u64 *value)
 {
-    CS_STATUS s = cs_task_run(original, value);
-    if (s != CS_SUCCESS || original->req->ReqType != CS_QUEUE_COMPUTE)
-        return s;
-    struct cs_task *t = NULL;
+    struct cs_task task = {.dev = device, .req = req};
+    if (req->ReqType == CS_QUEUE_COMPUTE)
+        for (int i = 0; i < req->u.Compute.NumArgs; i++)
+            task.scalar_slots += req->u.Compute.Args[i].Type != CS_AFDM_TYPE;
+    CS_STATUS s = cs_task_run(&task, value);
+    if (s != CS_SUCCESS || req->ReqType != CS_QUEUE_COMPUTE) return s;
     for (;;) {
         uint64_t action = *value & ~CS_IO_VALUE_MASK;
-        if (action != CS_NEED_STORE && action != CS_NEED_LOAD && action != CS_NEED_FREE)
-            break; /* Ordinary completion; successors may now run. */
-        if (atomic_load(cancelled)) {
-            s = CS_ERROR_IN_EXECUTION;
-            break;
-        }
-        if (original->scalar_slots > 1) {
-            s = CS_INVALID_ARG; /* cparam2 must be reserved for reentry. */
-            break;
-        }
-        if (!t) {
-            s = cs_task_clone(original->req, &t);
-            if (s != CS_SUCCESS)
-                break;
-        }
-        const CsComputeRequest *r = &t->req->u.Compute;
+        if (action != CS_NEED_STORE && action != CS_NEED_LOAD && action != CS_NEED_FREE) break;
+        if (cancelled(cancel_context)) return CS_ERROR_IN_EXECUTION;
+        if (task.scalar_slots > 1) return CS_INVALID_ARG;
+        const CsComputeRequest *r = &req->u.Compute;
         const CsDevAFDM *io = NULL;
         for (int i = 0; i < r->NumArgs; i++)
-            if (r->Args[i].Type == CS_AFDM_TYPE)
-                io = &r->Args[i].u.DevMem; /* Last AFDM is the operator's I/O output. */
-        if (!io) {
-            s = CS_INVALID_ARG;
-            break;
-        }
-        s = exchange(t, io, action, *value & CS_IO_VALUE_MASK, scope, &t->reentry);
-        if (s != CS_SUCCESS)
-            break;
-        s = cs_task_run(t, value);
-        if (s != CS_SUCCESS)
-            break;
+            if (r->Args[i].Type == CS_AFDM_TYPE) io = &r->Args[i].u.DevMem;
+        if (!io) return CS_INVALID_ARG;
+        s = exchange(&task, io, action, *value & CS_IO_VALUE_MASK, scope, &task.reentry);
+        if (s != CS_SUCCESS) return s;
+        s = cs_task_run(&task, value);
+        if (s != CS_SUCCESS) return s;
     }
-    cs_task_free(t);
     return s;
 }

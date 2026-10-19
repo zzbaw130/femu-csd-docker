@@ -61,7 +61,7 @@ all: $(OUT)/my-operator.so
 $(OUT):
 	mkdir -p $@
 $(OUT)/my-operator.so: src/operator.c $(CSF_BUILD_DEPS) | $(OUT)
-	$(CC) $(CSF_CPPFLAGS) -I../../apps/snia-cs-api/include -O2 -fPIC \
+	$(CC) $(CSF_CPPFLAGS) -I../../apps/snia-cs-api/plugins/femu/include -O2 -fPIC \
 	    -shared $< $(CSF_LDLIBS) -o $@.tmp
 	mv -f $@.tmp $@
 clean:

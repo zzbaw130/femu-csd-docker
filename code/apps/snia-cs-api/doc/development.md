@@ -68,3 +68,26 @@
 
 - docker-compose.yml 的 command 覆盖 Dockerfile CMD，创建 Guest 的包列表遗漏 cmake；已与 Dockerfile 中的依赖同步。
 - 当前 Guest 直接通过 apt 安装 cmake，容器与 Guest 均验证为 3.28.3；不重新创建镜像或清空模拟盘。后续项目使用 CMake 3.16 兼容语法。
+
+## 2026-10-20：CMake、单头文件和运行时设备插件
+
+### 修改
+
+- 原 Makefile 替换为 CMake，公共库、FEMU 插件及测试分别构建；仅发布动态库。FEMU 构建和测试规则分别位于各自目录的 CMakeLists.txt。
+- cs_types.h 合入 cs.h，删除 cs.sh；include/ 只保留 cs.h，公开类型、状态和33个函数签名保持不变。FEMU 原生参数和重入辅助头移至 plugins/femu/include/。
+- src/facade/ 按 SNIA 分类分为九个文件；AFDM 移动归 cs_afdm_management.c，通知归 cs_access.c，设备查询归 cs_management.c，CSEE 下载归 cs_csf_scheduling.c。
+- src/core/ 保留公共句柄及引用、异步请求、event和batch依赖；公开句柄绑定到插件不透明对象，不再包含 NVMe fd、namespace 或原生程序字段。
+- src/interface/cs_backend.h 定义 C 操作表及 create/destroy 工厂契约。插件按公共库相邻目录自动发现，也支持 csRegisterPlugin/csDeregisterPlugin；在设备、资源或发现操作引用存在时拒绝卸载。
+- plugins/femu/ 独立编译 libcs-femu.so，包含 Identify、GET_INFO、NVMe 传输、内存、程序、参数映射及 spill。NEED_STORE/LOAD/FREE 由该插件解释，通用 batch 不占用这些完成值。内部 I/O 直接调用插件存储实现，不回调公共 API 或公共句柄表。
+- 同步更新设备算子的头文件路径、workmem 应用的 CMake SDK 构建和动态链接、既有测试脚本及中文文档。FEMU 设备源码及原生参数 ABI 未修改。
+
+### 验证
+
+- Debug 和 RelWithDebInfo 构建均通过；5组 CTest 通过，包含231项既有 API 检查、Identify、C++单头文件及静态边界检查。测试程序明确保留断言，避免发布配置跳过带调用的检查。
+- 第二个非 NVMe mock 插件实际通过 dlopen 加载：验证两插件发现汇总、不透明函数/内存标识绑定、三标量与非零偏移、异步event、HYBRID和跨设备拒绝；FEMU保留范围的完成值在其他插件正常返回，不触发spill。
+- 插件重复注册、类型不匹配、缺失库、引用期间拒绝卸载、释放后注销/重新加载验证通过。公共库实际只导出33个API，FEMU插件只导出两个工厂入口。
+- ASan/UBSan/LeakSanitizer 检查通过；LSan 在沙箱外执行，避免 ptrace 限制。
+- Guest真实NVMe回归通过：4CU执行重叠、独立64位cparam、64位完成值、内部STORE/LOAD、跨batch spill、失败回收及重复执行。
+- Guest workmem 两轮通过：4CU/2SO共享64MiB，2次成功/2次ENOMEM，峰值50331744字节，结束占用0；5个设备SO的共享workmem依赖检查通过。
+- Guest已安装到/usr/local并执行ldconfig；独立应用仅包含cs.h，以 cc application.c -lsnia-cs-api 编译并实际运行成功，插件从安装目录自动加载。
+- 当前重建后的模拟盘无分区或文件系统签名，沿用既有mount-nvme.sh准备80%数据区和20%spill区用于真实测试；未重启容器或Guest。

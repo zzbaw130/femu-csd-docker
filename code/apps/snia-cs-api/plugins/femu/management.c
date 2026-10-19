@@ -1,18 +1,15 @@
-#include "internal.h"
-#include <stdarg.h>
-CS_STATUS csCSFDownload(CS_DEV_HANDLE h, const CsCSFDownloadInfo *info, u32 *out)
+#include "femu.h"
+CS_STATUS femu_download(void *device, const CsCSFDownloadInfo *info, u32 *out)
 {
     if (!info || !out)
         return CS_INVALID_ARG;
     if (info->CSEEId != 1 || !info->Index || info->Index > 65535)
         return CS_UNSUPPORTED_INDEX;
-    struct cs_device *d = (void *)cs_get(h, DEV);
-    if (!d)
-        return CS_INVALID_HANDLE;
+    struct cs_device *d = device;
     CS_STATUS s;
     pthread_mutex_lock(&cs_catalog_lock);
     struct cs_catalog_entry *e = cs_catalog_find_locked(d, info->Index);
-    if ((e && e->info.active) || cs_function_busy(d, info->Index)) {
+    if ((e && e->info.active)) {
         s = CS_HANDLE_IN_USE;
         goto done;
     }
@@ -70,16 +67,14 @@ CS_STATUS csCSFDownload(CS_DEV_HANDLE h, const CsCSFDownloadInfo *info, u32 *out
         *out = info->Index;
 done:
     pthread_mutex_unlock(&cs_catalog_lock);
-    cs_put(&d->base);
     return s;
 }
-CS_STATUS csConfig(CS_DEV_HANDLE h, int *length, const CsConfigInfo *info, CsConfigData *out)
+
+CS_STATUS femu_config(void *device, int *length, const CsConfigInfo *info, CsConfigData *out)
 {
     if (!info || !length)
         return CS_INVALID_ARG;
-    struct cs_device *d = (void *)cs_get(h, DEV);
-    if (!d)
-        return CS_INVALID_HANDLE;
+    struct cs_device *d = device;
     CS_STATUS s;
     pthread_mutex_lock(&cs_catalog_lock);
     if (info->Type != CS_CSF_ACTIVATE) {
@@ -101,10 +96,6 @@ CS_STATUS csConfig(CS_DEV_HANDLE h, int *length, const CsConfigInfo *info, CsCon
         s = CS_INVALID_CSF_ID;
         goto done;
     }
-    if (c->State == CS_INACTIVE_STATE && cs_function_busy(d, c->CSFId)) {
-        s = CS_HANDLE_IN_USE;
-        goto done;
-    }
     s = cs_output(length, out, sizeof(*out));
     if (s != CS_SUCCESS)
         goto done;
@@ -118,89 +109,5 @@ CS_STATUS csConfig(CS_DEV_HANDLE h, int *length, const CsConfigInfo *info, CsCon
     }
 done:
     pthread_mutex_unlock(&cs_catalog_lock);
-    cs_put(&d->base);
     return s;
-}
-void csHelperSetComputeArg(CsComputeArg *a, CS_COMPUTE_ARG_TYPE type, ...)
-{
-    if (!a)
-        return;
-    memset(a, 0, sizeof(*a));
-    a->Type = type;
-    va_list ap;
-    va_start(ap, type);
-    switch (type) {
-    case CS_AFDM_TYPE:
-        a->u.DevMem.MemHandle = va_arg(ap, CS_MEM_HANDLE);
-        a->u.DevMem.ByteOffset = va_arg(ap, unsigned long);
-        break;
-    case CS_8BIT_VALUE_TYPE:
-        a->u.Value8 = (u8)va_arg(ap, int);
-        break;
-    case CS_16BIT_VALUE_TYPE:
-        a->u.Value16 = (u16)va_arg(ap, int);
-        break;
-    case CS_32BIT_VALUE_TYPE:
-        a->u.Value32 = va_arg(ap, u32);
-        break;
-    case CS_64BIT_VALUE_TYPE:
-        a->u.Value64 = va_arg(ap, u64);
-        break;
-    default:
-        break;
-    }
-    va_end(ap);
-}
-CS_STATUS csQueryLibrarySupport(CS_LIBRARY_SUPPORT type, int *length, char *out)
-{
-    if (type != CS_FILE_SYSTEMS_SUPPORTED)
-        return CS_UNSUPPORTED;
-    CS_STATUS s = cs_output(length, out, 1);
-    if (s == CS_SUCCESS)
-        *out = 0;
-    return s;
-}
-CS_STATUS csCSEEDownload(CS_DEV_HANDLE h, const CsCSEEDownloadInfo *i, u32 *id)
-{
-    if (!i || !id)
-        return CS_INVALID_ARG;
-    struct cs_object *d = cs_get(h, DEV);
-    if (!d)
-        return CS_INVALID_HANDLE;
-    cs_put(d);
-    return CS_UNSUPPORTED;
-}
-CS_STATUS csReset(CS_DEV_HANDLE h, CS_RESOURCE_TYPE type, u32 id)
-{
-    (void)type;
-    (void)id;
-    struct cs_object *d = cs_get(h, DEV);
-    if (!d)
-        return CS_INVALID_HANDLE;
-    cs_put(d);
-    return CS_UNSUPPORTED;
-}
-CS_STATUS csRegisterNotify(const char *name, u32 options, csDevNotificationFn cb)
-{
-    if (!name || !options || !cb)
-        return CS_INVALID_ARG;
-    return CS_UNSUPPORTED;
-}
-CS_STATUS csDeregisterNotify(const char *name, u32 options, csDevNotificationFn cb)
-{
-    if (!name || !options || !cb)
-        return CS_INVALID_ARG;
-    return CS_UNSUPPORTED;
-}
-CS_STATUS csRegisterPlugin(const CsPluginRequest *r)
-{
-    if (!r || !r->Type || !memchr(r->PluginPath, 0, sizeof(r->PluginPath)))
-        return CS_INVALID_ARG;
-    return CS_UNSUPPORTED;
-}
-CS_STATUS csDeregisterPlugin(const CsPluginRequest *r)
-{
-    if (!r || !r->Type || !memchr(r->PluginPath, 0, sizeof(r->PluginPath)))
-        return CS_INVALID_ARG;
-    return CS_UNSUPPORTED;
 }

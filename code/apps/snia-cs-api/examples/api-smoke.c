@@ -1,5 +1,5 @@
 /* Guest application: no NVMe structs or ioctl calls. */
-#include "cs.sh"
+#include "cs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

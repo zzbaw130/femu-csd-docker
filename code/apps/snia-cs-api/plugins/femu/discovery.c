@@ -1,12 +1,12 @@
 #define _GNU_SOURCE
-#include "internal.h"
+#include "femu.h"
 #include <endian.h>
 #include <glob.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
-CS_STATUS csGetCSxFromPath(const char *path, unsigned int *length, char *out)
+CS_STATUS femu_resolve(const char *path, unsigned int *length, char *out)
 {
     if (!path || !length)
         return CS_INVALID_ARG;
@@ -34,11 +34,12 @@ CS_STATUS csGetCSxFromPath(const char *path, unsigned int *length, char *out)
             return CS_NO_MATCHING_DEVICE;
         snprintf(device, sizeof(device), "/dev/nvme%un%u", c, n);
     }
-    CS_DEV_HANDLE h;
-    CS_STATUS s = csOpenCSx(device, NULL, &h);
+    struct cs_device *d;
+    unsigned workers;
+    CS_STATUS s = femu_open(device, NULL, (void **)&d, &workers);
     if (s != CS_SUCCESS)
         return CS_NO_MATCHING_DEVICE;
-    csCloseCSx(h);
+    femu_close(d);
     unsigned need = strlen(device) + 1, have = *length;
     *length = need;
     if (!out || have < need)
@@ -46,7 +47,7 @@ CS_STATUS csGetCSxFromPath(const char *path, unsigned int *length, char *out)
     memcpy(out, device, need);
     return CS_SUCCESS;
 }
-CS_STATUS csQueryCSxList(int *length, char *buffer)
+CS_STATUS femu_enumerate(int *length, char *buffer)
 {
     if (!length)
         return CS_INVALID_ARG;
@@ -61,10 +62,11 @@ CS_STATUS csQueryCSxList(int *length, char *buffer)
         return CS_DEVICE_ERROR;
     }
     for (size_t i = 0; i < g.gl_pathc; i++) {
-        CS_DEV_HANDLE h;
-        if (csOpenCSx(g.gl_pathv[i], NULL, &h) != CS_SUCCESS)
+        struct cs_device *d;
+    unsigned workers;
+        if (femu_open(g.gl_pathv[i], NULL, (void **)&d, &workers) != CS_SUCCESS)
             continue;
-        csCloseCSx(h);
+        femu_close(d);
         size_t n = strlen(g.gl_pathv[i]), extra = n + (bytes > 1);
         char *next = realloc(list, bytes + extra);
         if (!next) {
@@ -118,24 +120,23 @@ CS_STATUS cs_collect(struct cs_device *d, struct cs_program_info **out, size_t *
     }
     return CS_SUCCESS;
 }
-CS_STATUS csQueryCSFList(const char *path, int *length, int *count, CSFUniqueId *out)
+CS_STATUS femu_csf_list(const char *path, int *length, int *count, CSFUniqueId *out)
 {
     if (!path || !length || !count)
         return CS_INVALID_ARG;
     char device[4096];
     unsigned n = sizeof(device);
-    CS_STATUS s = csGetCSxFromPath(path, &n, device);
+    CS_STATUS s = femu_resolve(path, &n, device);
     if (s != CS_SUCCESS)
         return s;
-    CS_DEV_HANDLE h;
-    s = csOpenCSx(device, NULL, &h);
+    struct cs_device *d;
+    unsigned workers;
+    s = femu_open(device, NULL, (void **)&d, &workers);
     if (s != CS_SUCCESS)
         return s;
-    struct cs_device *d = (void *)cs_get(h, DEV);
     struct cs_program_info *programs;
     size_t total;
     s = cs_collect(d, &programs, &total);
-    cs_put(&d->base);
     if (s == CS_SUCCESS) {
         size_t active = 0;
         for (size_t i = 0; i < total; i++)
@@ -152,29 +153,21 @@ CS_STATUS csQueryCSFList(const char *path, int *length, int *count, CSFUniqueId 
         }
         free(programs);
     }
-    csCloseCSx(h);
+    femu_close(d);
     return s;
 }
-static void function_destroy(struct cs_object *o)
-{
-    struct cs_function *f = (void *)o;
-    cs_put(&f->dev->base);
-}
-CS_STATUS csGetCSFId(CS_DEV_HANDLE h, const char *name, u64 global, int *length, int *count,
+CS_STATUS femu_get_csf(void *device, const char *name, u64 global, int *length, int *count,
                      CSFIdinfo *out)
 {
     if (!length || !count || (!name && !global) || (name && global))
         return CS_INVALID_ARG;
     if (name && (!*name || strnlen(name, 32) == 32))
         return CS_INVALID_CSF_NAME;
-    struct cs_device *d = (void *)cs_get(h, DEV);
-    if (!d)
-        return CS_INVALID_HANDLE;
+    struct cs_device *d = device;
     struct cs_program_info *list;
     size_t total;
     CS_STATUS s = cs_collect(d, &list, &total);
     if (s != CS_SUCCESS) {
-        cs_put(&d->base);
         return s;
     }
     size_t matches = 0;
@@ -197,16 +190,7 @@ CS_STATUS csGetCSFId(CS_DEV_HANDLE h, const char *name, u64 global, int *length,
     for (size_t i = 0; i < total; i++)
         if (list[i].active &&
             (name ? !strncmp(name, list[i].name, 32) : global == list[i].global_id)) {
-            struct cs_function *f = (void *)cs_new(sizeof(*f), FUNCTION, function_destroy);
-            if (!f) {
-                s = CS_OUT_OF_RESOURCES;
-                break;
-            }
-            cs_hold(&d->base);
-            f->dev = d;
-            f->index = list[i].id;
-            f->type = list[i].type;
-            out[n].CSFId = (void *)f->base.id;
+            out[n].CSFId = (void *)(uintptr_t)list[i].id;
             out[n].Count = 1;
             out[n].NumFDMs = 1;
             out[n].FDMList = &access[n];
@@ -218,17 +202,14 @@ CS_STATUS csGetCSFId(CS_DEV_HANDLE h, const char *name, u64 global, int *length,
         }
 done:
     free(list);
-    cs_put(&d->base);
     return s;
 }
-CS_STATUS csQueryDeviceProperties(CS_DEV_HANDLE h, CS_RESOURCE_TYPE type, int *length,
+CS_STATUS femu_properties(void *device, CS_RESOURCE_TYPE type, int *length,
                                   CsProperties *out)
 {
     if (!length)
         return CS_INVALID_ARG;
-    struct cs_device *d = (void *)cs_get(h, DEV);
-    if (!d)
-        return CS_INVALID_HANDLE;
+    struct cs_device *d = device;
     CS_STATUS s = CS_SUCCESS;
     struct cs_program_info *list = NULL;
     size_t count = 0, extra = 0;
@@ -326,18 +307,5 @@ CS_STATUS csQueryDeviceProperties(CS_DEV_HANDLE h, CS_RESOURCE_TYPE type, int *l
     }
 done:
     free(list);
-    cs_put(&d->base);
     return s;
-}
-CS_STATUS csQueryDeviceStatistics(CS_DEV_HANDLE h, CS_STAT_TYPE type, void *id, CsStatsInfo *out)
-{
-    if (!out)
-        return CS_INVALID_ARG;
-    struct cs_device *d = (void *)cs_get(h, DEV);
-    if (!d)
-        return CS_INVALID_HANDLE;
-    (void)type;
-    (void)id;
-    cs_put(&d->base);
-    return CS_UNSUPPORTED;
 }

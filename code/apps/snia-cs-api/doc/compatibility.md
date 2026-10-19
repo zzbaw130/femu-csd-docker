@@ -2,7 +2,11 @@
 
 参照 SNIA《Computational Storage API v1.1》（2025-05-31）第 6 章实现 Guest API。全部 33 个函数有声明和可链接入口，不表示所有选项已实现，也不是规范一致性认证声明。
 
-## 当前支持
+## 公共层与插件
+
+应用只包含 cs.h 并链接动态库。公共层负责句柄、异步、event、batch；设备操作由 handle 所属插件实现，设备枚举汇总已加载插件。csRegisterPlugin/csDeregisterPlugin 支持本项目 C 工厂契约，模块引用存在时不卸载。默认安装的真实适配器目前只有 FEMU。
+
+## 当前 FEMU 插件支持
 
 | 接口 | 范围 |
 | --- | --- |
@@ -25,10 +29,10 @@
 
 设备通过通用 GET_INFO 提供 FDM/CU/功能位；没有全局程序目录或设备统计查询。CU 映射为一个 CSE 的 CR，固定 CSEE 已分配全部 CR，NumAvailableCRs=0 不代表瞬时空闲线程数。无需手工配置 FDM/CU。应用仍需预留程序索引，设备重启后重新初始化。
 
-## 有入口但返回不支持
+## FEMU 有入口但返回不支持
 
 - `csQueryDeviceStatistics`：不把本进程的局部记录伪装成设备全局统计。
-- `csRegisterNotify`、`csDeregisterNotify`、`csCSEEDownload`、`csReset`、`csRegisterPlugin`、`csDeregisterPlugin`。
+- `csRegisterNotify`、`csDeregisterNotify`、`csCSEEDownload`、`csReset`。
 - uBPF/FPGA/container profile、文件 I/O、跨设备复制/batch、128 位整数参数、descriptor 参数、FDM 主机映射、CR affinity、设备整图提交和运行中抢占。
 
 设备增加通用内部 STORE、资源查询与 64 位完成值；原生算子参数结构不变。部分功能有主机软件实现，不等于硬件具有对应能力；AFDM 内复制 fallback 尤其不能用于测量内部带宽。
@@ -51,4 +55,4 @@
 
 ## 可选扩展
 
-`cs_csf.h` 提供重入判断和 STORE/LOAD/FREE 请求函数，不扩展标准 CS_STATUS。重入算子保留 cparam2，首次为0，I/O完成后由库填入 spill_id；最后一个AFDM是I/O缓冲。batch 自动推进，独立计算请求仍是一轮执行。临时区按 GPT PARTLABEL=femu-spill 识别；按 namespace LBA 分配，不使用隐藏 OP 或普通文件系统空闲块。成功批次的 token 可跨 batch 保留，失败批次回收本批新增区段。协议不是 SNIA v1.1 规定的算子 ABI，需双方采用，详见 README。
+FEMU 专用 `plugins/femu/include/cs_csf.h` 提供重入判断和 STORE/LOAD/FREE 请求函数，不扩展标准 CS_STATUS。重入算子保留 cparam2，首次为0，I/O完成后由库填入 spill_id；最后一个AFDM是I/O缓冲。batch 自动推进，独立计算请求仍是一轮执行。临时区按 GPT PARTLABEL=femu-spill 识别；按 namespace LBA 分配，不使用隐藏 OP 或普通文件系统空闲块。成功批次的 token 可跨 batch 保留，失败批次回收本批新增区段。协议不是 SNIA v1.1 规定的算子 ABI，需双方采用，详见 README。

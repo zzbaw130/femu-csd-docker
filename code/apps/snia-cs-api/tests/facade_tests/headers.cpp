@@ -1,7 +1,4 @@
-#include "cs.sh"
-#include "femu-csd-kernel.h"
-#include "cs_csf.h"
-static_assert(sizeof(femu_csd_args) == 52, "original FEMU ABI");
+#include "cs.h"
 int main()
 {
     int length=0;

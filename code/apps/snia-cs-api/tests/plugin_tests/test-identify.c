@@ -1,6 +1,6 @@
 /* Exercise the production NVMe backend, without opening real devices. */
 #define _GNU_SOURCE
-#include "cs.h"
+#include "femu.h"
 #include <assert.h>
 #include <fcntl.h>
 #include <glob.h>
@@ -93,17 +93,17 @@ void __wrap_globfree(glob_t *out)
 
 static void rejected(const char *path)
 {
-    CS_DEV_HANDLE dev = (void *)1;
-    assert(csOpenCSx(path, NULL, &dev) == CS_DEVICE_NOT_AVAILABLE);
+    void *dev = (void *)1;
+    assert(femu_open(path, NULL, &dev, &(unsigned){0}) == CS_DEVICE_NOT_AVAILABLE);
     assert(dev == NULL && opens == closes);
 }
 
 int main(void)
 {
-    CS_DEV_HANDLE dev;
-    assert(csOpenCSx("/dev/nvme0n1", NULL, &dev) == CS_SUCCESS);
+    void *dev;
+    assert(femu_open("/dev/nvme0n1", NULL, &dev, &(unsigned){0}) == CS_SUCCESS);
     assert(controller_reads == 1 && namespace_reads == 1);
-    assert(csCloseCSx(dev) == CS_SUCCESS && opens == closes);
+    femu_close(dev); assert(opens == closes);
 
     rejected("/dev/nvme1n1"); /* A configured ordinary SSD is still rejected. */
     assert(namespace_reads == 1);
@@ -121,7 +121,7 @@ int main(void)
 
     char list[128];
     int bytes = sizeof(list);
-    assert(csQueryCSxList(&bytes, list) == CS_SUCCESS);
+    assert(femu_enumerate(&bytes, list) == CS_SUCCESS);
     assert(!strcmp(list, "/dev/nvme0n1") && bytes == (int)strlen(list) + 1);
     assert(opens == closes);
     puts("PASS: Identify Controller identity, ordinary SSD exclusion, errors and discovery");
