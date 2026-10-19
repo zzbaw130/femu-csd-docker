@@ -68,7 +68,6 @@ cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,f
 │   ├── create-tables.sql / create-indexes.sql
 │   └── guest/                       # 只在 guest 内跑的脚本
 │       ├── mount-nvme.sh            # 80% ext4 挂 /data，20% 留作 spill
-│       ├── nvme-layout.py          # 分区校验与 SINA spill 配置生成
 │       ├── install-postgre.sh       # 编译安装 PostgreSQL
 │       └── start-postgre.sh         # 解压数据 + 启库
 ├── tests/
@@ -111,13 +110,13 @@ results/  ← 9p: 宿主机 results        （实验结果直接落回宿主机�
 scripts/  ← 9p: 宿主机 scripts/guest  （guest 内脚本）
 tests/    ← 9p: 宿主机 tests/guest    （tpch-test.sh + queries/）
 /data                               # 模拟 SSD 数据分区（/dev/nvme0n1p1, ext4），PGDATA 在这里
-/etc/sina-cs-api/spill.json          # 系统盘上的 spill 分区身份和 namespace 绝对 LBA 范围
 ```
 
 模拟盘的 `femu-data` 分区约占 80%，`femu-spill` 分区约占 20%，后者不格式化、不挂载。
-已有布局会复用；旧版整盘 ext4 不会自动覆盖，备份并卸载后才能用 `--repartition` 重建。
-SINA 按标签、PARTUUID 和配置范围识别角色，不依赖 p1/p2 序号；当前仅生成配置，尚未启用自动 spill。
-使用方法和配置契约见 [Guest SSD 分区说明](scripts/guest/README.md)。
+Guest 需安装 `parted`。首次运行或标签不匹配时会重新分区并格式化数据区，清除原有数据；
+标签匹配时复用已有布局。执行 `./scripts/sh-guest.sh scripts/guest/mount-nvme.sh` 即可。
+后续 SINA 按 GPT `PARTLABEL=femu-spill` 查找 spill 分区，读取其起始位置和容量；
+分区序号不承担角色含义。当前尚未实现 spill 调度和 STORE。
 
 ## 4. 设计要点（相对上游 FEMU 的改动）
 
