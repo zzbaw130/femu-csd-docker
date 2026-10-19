@@ -6,7 +6,7 @@ services:
       - -ec
       - |
         if [ ! -f /root/images/u20s.qcow2 ]; then
-          ./make-guest-image.sh --packages build-essential,zlib1g-dev,libreadline-dev,bison,flex
+          ./make-guest-image.sh --packages build-essential,zlib1g-dev,libreadline-dev,bison,flex,cmake
         fi
         exec /workspace/code/FEMU/hw/femu/scripts/run-csd.sh
     build: 

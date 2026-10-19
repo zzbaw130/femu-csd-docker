@@ -7,7 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # femu-scripts/pkgdep.sh dependencies, plus what configure and the guest image
 # builder (make-guest-image.sh) need.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential pkg-config git ninja-build python3-venv flex bison \
+        build-essential pkg-config cmake git ninja-build python3-venv flex bison \
         libglib2.0-dev libfdt-dev libpixman-1-dev zlib1g-dev libdw-dev \
         libaio-dev libslirp-dev libnuma-dev liblz4-dev libreadline-dev \
         sudo ca-certificates curl cloud-image-utils qemu-utils openssh-client \
@@ -33,5 +33,5 @@ RUN cp ../femu-scripts/femu-copy-scripts.sh . \
 # shows /home/femu/workspace. Delete the image to have it built again.
 
 CMD test -f "/root/images/u20s.qcow2" || ./make-guest-image.sh --packages \
-    build-essential,zlib1g-dev,libreadline-dev,bison,flex; \
+    build-essential,zlib1g-dev,libreadline-dev,bison,flex,cmake; \
     exec ./run-csd.sh

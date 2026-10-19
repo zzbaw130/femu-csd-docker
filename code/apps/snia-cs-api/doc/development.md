@@ -63,3 +63,8 @@
 - Guest真实NVMe测试覆盖4CU并行、内部STORE/LOAD、跨批spill与失败回收；workmem两轮跨SO配额验证通过。
 - 使用新安装头文件和-lsnia-cs-api动态链接应用，ldd确认加载libsnia-cs-api.so，示例输出4 12 28 44。
 - 项目自有源码、构建脚本和文档无旧拼写引用，旧生成库名已清理；shell语法和git diff --check通过。
+
+## 2026-10-20：补齐 Guest CMake
+
+- docker-compose.yml 的 command 覆盖 Dockerfile CMD，创建 Guest 的包列表遗漏 cmake；已与 Dockerfile 中的依赖同步。
+- 当前 Guest 直接通过 apt 安装 cmake，容器与 Guest 均验证为 3.28.3；不重新创建镜像或清空模拟盘。后续项目使用 CMake 3.16 兼容语法。
