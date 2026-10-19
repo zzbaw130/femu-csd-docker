@@ -39,3 +39,7 @@ provision.log
 # Python 生成缓存
 __pycache__/
 *.pyc
+
+# CMake 构建目录
+/code/csd-programs/build/
+/code/apps/snia-cs-api/build/

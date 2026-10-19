@@ -132,3 +132,27 @@
 - Guest 真实设备回归通过：四 CU 执行重叠、独立64位参数/完成值、内部 STORE/LOAD、跨 batch spill、失败回收及重复执行。
 - Guest 重新安装至 /usr/local；独立 C 应用只包含 cs.h，以 cc application.c -lsnia-cs-api 编译运行，输出4 12 28 44。
 - 设备五个 SO 的共享 workmem 依赖检查通过；Guest 两轮4CU/2SO共享64MiB配额测试通过，均为2次成功、2次ENOMEM，结束占用0。
+
+## 2026-10-20：目录、CMake 与完整文件排序示例
+
+### 修改
+
+- src/core 保存九个标准分类 CPP；共享句柄/请求实现与更名后的 cs_common.hpp 移入 src/common；插件契约更名为 src/interface/cs_backend_interface.h；设备适配器移入 src/plugins。
+- FEMU 文件统一使用 femu_功能分类命名，将设备访问、AFDM复制、计算、存储和属性查询放入对应分类；共享传输、目录、资源查询、验证和重入分派的职责写入插件 README。公开 cs.h 与插件 ABI 2 不变。
+- 测试改按 SNIA 功能命名，删除只检查源码名称/目录的 Python 脚本；保留实际 API、插件路由、资源失败、Identify 和真实 batch 检查，并提供测试目录说明。
+- csd-programs 全部改用根 CMakeLists.txt 管理；add_csd_program 统一 workmem 动态依赖、输出路径和 ORIGIN。删除 Makefile、mk/、独立 snia-cs-api 算子目录和 examples/build.sh。
+- workmem 接口/实现平铺，合并使用规范到 README，删除 doc/；Guest 客户端和探针迁入其 tests/，移除 apps/csd-workmem-test 和本分支空的 apps/pg_csd 目录。真实客户端通过 SSH 传至 Guest 临时目录构建。
+- 原 SNIA scale/并行/spill 回归函数统一放在 csd-programs/examples/snia_compute_functions.c，产物改为 cs-example-functions.so。
+- 新增 Guest cs_batch_sort_limit.c、共享数据布局、设备 sort.cpp 和 limit.c。生成256MiB随机 int32 文件，FIEMAP 分区物理地址加分区起始位置，按逻辑4MiB收集一个或多个 extent 提交内部 LOAD。
+- 第一阶段 batch 为 LOAD → sort_sink，生成64个降序 run，每个 run 通过16次 NEED_STORE 保存；第二阶段 batch 为 sort_source → limit_five，通过 NEED_LOAD 多路归并后取全局前5；最后 NEED_FREE 释放全部1024个块。私有算法内存通过 workmem 分配，约20MiB；错误路径释放状态并关闭设备回收 spill。
+- 新增完整示例说明，逐项列出 input/io/sorted/result AFDM 和重入参数；同步根 README、SDK README 和测试脚本。
+
+### 验证
+
+- 按要求清空原 csd-programs/build，包括 legacy；容器 GCC13 用 CMake 重新编译8个 SO，全部 native 算子均保留 libcs-workmem.so 依赖和 ORIGIN 搜索路径。
+- 宿主与容器的4组设备测试通过；完整归并测试比较全部3个 run 的输出，覆盖跨块/跨输出chunk、重复值、负数、EOF、LIMIT、FREE 和异常销毁。排序/workmem 通过 ASan/UBSan/LeakSanitizer。
+- 宿主5组 SNIA 功能测试通过，保留231项既有 API 检查；公共库仍只导出33个C函数。
+- Guest 真实 batch 回归通过，覆盖四CU重叠执行、独立64位参数、完成值、内部STORE/LOAD、跨batch spill及失败回收。
+- 迁移后的 workmem Guest 客户端两轮通过：4CU/2SO共享64MiB，均2次成功/2次ENOMEM，结束占用0。
+- Guest256MiB完整示例通过；分别遇到4个和3个文件extent，均读完64个输入块，结果为2147483640、2147483488、2147483485、2147483458、2147483243，与生成时独立维护的参考值一致。
+- SDK重装至Guest /usr/local后，独立C应用仅链接-lsnia-cs-api，完整文件排序再次通过。保留/data/cs-batch-input.bin供查看；未重启Guest或重新分区。

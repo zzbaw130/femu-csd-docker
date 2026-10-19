@@ -11,7 +11,7 @@ FORCE_BUILD=0
 if [ ${FORCE_BUILD} -eq 1 ]; then
     # compile csd-programs in docker
     docker compose exec femu-csd \
-        make -C ${DOCKER_PROGRAMS_DIR} 
+        sh -c "cmake -S ${DOCKER_PROGRAMS_DIR} -B ${DOCKER_PROGRAMS_DIR}/build -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build ${DOCKER_PROGRAMS_DIR}/build -j2"
 
     # compile csd-passthru in guest
     docker compose exec femu-csd ./run-guest-ssh.sh \

@@ -55,4 +55,4 @@
 
 ## 可选扩展
 
-FEMU 专用 `plugins/femu/include/cs_csf.h` 提供重入判断和 STORE/LOAD/FREE 请求函数，不扩展标准 CS_STATUS。重入算子保留 cparam2，首次为0，I/O完成后由库填入 spill_id；最后一个AFDM是I/O缓冲。batch 自动推进，独立计算请求仍是一轮执行。临时区按 GPT PARTLABEL=femu-spill 识别；按 namespace LBA 分配，不使用隐藏 OP 或普通文件系统空闲块。成功批次的 token 可跨 batch 保留，失败批次回收本批新增区段。协议不是 SNIA v1.1 规定的算子 ABI，需双方采用，详见 README。
+FEMU 专用 `src/plugins/femu/include/cs_csf.h` 提供重入判断和 STORE/LOAD/FREE 请求函数，不扩展标准 CS_STATUS。重入算子保留 cparam2，首次为0，I/O完成后由库填入 spill_id；最后一个AFDM是I/O缓冲。batch 自动推进，独立计算请求仍是一轮执行。临时区按 GPT PARTLABEL=femu-spill 识别；按 namespace LBA 分配，不使用隐藏 OP 或普通文件系统空闲块。成功批次的 token 可跨 batch 保留，失败批次回收本批新增区段。协议不是 SNIA v1.1 规定的算子 ABI，需双方采用，详见 README。
