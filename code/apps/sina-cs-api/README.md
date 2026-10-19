@@ -66,11 +66,21 @@ CSF 下载描述为 `文件名\0入口符号\0`，例如 `sina-cs-scale.so\0cs_s
 | 第一个、第二个普通整数 | `cparam1`、`cparam2`；8/16/32 位值按无符号扩展 |
 | 一个 128 位整数 | 低 64 位为 `cparam1`，高 64 位为 `cparam2`，占满两个标量字段 |
 
+128 位整数是 SNIA v1.1 在 `CS_COMPUTE_ARG_TYPE` 中列出的普通参数类型 `CS_128BIT_VALUE_TYPE`，不是重入机制要求的参数。只有算子本身需要时应用才传；本库为它补充了 `Value128` 字段，因为规范列出了该类型，但 `CsComputeArg` 的 union 示例遗漏了对应成员。下文的 sort 示例不使用它。规范见 [第 62、74 页](https://www.snia.org/sites/default/files/technical-work/computational/release/Computational%20Storage%20API%20v1.1.pdf)。
+
+原生 `femu_csd_args` 还有 `data_buffer/buffer_len`，用于接收**执行命令中紧跟 MR 列表的附加输入字节**。例如原生命令的输入为 `[MR0][MR1][SortParams]`，那么 `data_buffer` 指向 `SortParams` 的设备端副本，`buffer_len` 是其长度。FEMU 在这次执行结束后释放副本；算子修改它不会自动写回 Guest。
+
+**当前库尚未接通这条附加载荷路径，因此经本库调用时这两个字段为 NULL/0。** 这属于当前适配器的限制。SNIA 的 `CsComputeArg` 明确定义了标量和 AFDM 参数，没有直接对应这两个原生字段的主机字节数组成员；`CS_DESCRIPTOR_TYPE` 虽然列在枚举中，正文没有给出完整的 descriptor 数据结构，本库也未实现它。应用现在可以把自己定义的参数结构放入输入 AFDM，由算子直接按约定读取；不能把“当前未映射到原生附加载荷”说成 SNIA 禁止传递这类数据。
+
 当前原生 MR 只表示整块 AFDM，计算请求的非零 `ByteOffset` 返回 `CS_UNSUPPORTED`。需要偏移时，应用按算子自己的接口把偏移放入标量或输入数据中，算子自行计算地址。超过两个 64 位标量位置也返回不支持；复杂配置直接作为应用定义的输入数据传入。
 
 例如 `cs_scale` 约定两个 AFDM 为输入和输出，`cparam1` 为元素数，`cparam2` 为输入/输出偏移。普通从起始地址计算时，应用传两个 AFDM 和一个 count 即可，未传的 `cparam2` 为 0。
 
-重入算子仍使用普通 `CsComputeRequest`：**保留 `cparam2`，只传至多一个标量输入**。不需要控制参数或 START 标记。例如 sort 约定 MR[0] 是输入、MR[1] 是 spill I/O 输出，cparam1 是私有排序状态 handle：
+应用用 `csAllocBatchRequest` 创建一个 batch，再用 `csConfigureBatchEntry` 向其中加入 LOAD、计算等请求，并指定请求之间的先后依赖，最后调用 `csQueueBatchRequest` 提交。这里的 batch 是 Guest 库管理的一组请求及其依赖关系。
+
+下面以向 batch 加入一个 sort.sink 请求为例。假定应用已分配 `input`、`io` 两块 AFDM，获得了算子函数句柄 `sort_sink`；设备端排序初始化函数已创建 `SortState` 并返回其标识 `sort_handle`。`sort_handle` 只标识这个排序状态对象，里面保存 run 列表、待写长度等内容，与 batch 是两个不同的对象。
+
+重入算子仍使用普通 `CsComputeRequest`，约定保留 `cparam2`，应用只传至多一个标量输入。这个 sort.sink 的参数约定为：MR[0] 是待排序输入 `input`，MR[1] 是放置待写 run 的 `io`，cparam1 是 `sort_handle`。
 
 ```c
 CsBatchRequest *r = calloc(1, sizeof(*r) + 2 * sizeof(CsComputeArg));
@@ -80,10 +90,19 @@ r->u.Compute.NumArgs = 3;
 csHelperSetComputeArg(&r->u.Compute.Args[0], CS_AFDM_TYPE, input, 0UL);
 csHelperSetComputeArg(&r->u.Compute.Args[1], CS_AFDM_TYPE, io, 0UL);
 csHelperSetComputeArg(&r->u.Compute.Args[2], CS_64BIT_VALUE_TYPE, sort_handle);
-/* 将 r 加入 batch，正常 csQueueBatchRequest 提交；之后释放 r。 */
+CS_BATCH_HANDLE batch;
+CS_BATCH_INDEX sort_entry;
+csAllocBatchRequest(CS_BATCH_SERIAL, 1, &batch);
+csConfigureBatchEntry(batch, CS_BATCH_ADD, r, 0, 0, &sort_entry);
+free(r);
+u64 result;
+CS_STATUS status = csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, &result);
+csFreeBatchRequest(batch);
 ```
 
-sort_handle 指向的私有状态由设备程序创建、查找和销毁，库不解析它。批次最后一个 AFDM 参数约定为重入 I/O 缓冲。配置图保留请求快照和资源引用，调用者检查各 API 返回状态。
+当前重入实现从**当前这一个计算请求的参数**中取最后一个 AFDM，作为 STORE 的数据来源或 LOAD 的数据目的地。上例中它就是 `Args[1]` 的 `io`，设备端看到的是 `mr_addr[1]`；后面的 `Args[2]` 是整数，不参与这个选择。这是本项目的算子参数约定，不是整批任务的最后一块 AFDM，也不是 SNIA 规定的位置。
+
+`csConfigureBatchEntry` 会复制 `r` 中的请求描述，记录它用到的算子和 AFDM 句柄，所以之后可以 `free(r)`；它不复制 AFDM 中的数据。只要 batch 还引用这些句柄，它们就不能释放，应先释放 batch 再释放 AFDM。示例为突出流程省略逐次错误处理，实际应用应检查各 API 返回的状态。
 
 ## 三、设备算子：在入口判断是否重入
 
