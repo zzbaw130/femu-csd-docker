@@ -11,10 +11,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_compile_options(-Wall -Wextra -Werror)
 set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
 add_library(snia-cs-api SHARED
-    src/cs_discovery.c src/cs_access.c src/cs_afdm_management.c
-    src/cs_storage_ios.c src/cs_csf_scheduling.c src/cs_batch_scheduling.c
-    src/cs_event_management.c src/cs_management.c src/cs_library_management.c
-    src/cs_handle_registry.c src/cs_request_execution.c)
+    src/cs_discovery.cpp src/cs_access.cpp src/cs_afdm_management.cpp
+    src/cs_storage_ios.cpp src/cs_csf_scheduling.cpp src/cs_batch_scheduling.cpp
+    src/cs_event_management.cpp src/cs_management.cpp src/cs_library_management.cpp
+    src/cs_handle_registry.cpp src/cs_request_execution.cpp)
 target_include_directories(snia-cs-api PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}> PRIVATE src)
 target_link_libraries(snia-cs-api PRIVATE Threads::Threads ${CMAKE_DL_LIBS})

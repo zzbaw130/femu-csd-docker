@@ -8,28 +8,40 @@
 
 | 文件 | API |
 | --- | --- |
-| cs_discovery.c | csQueryCSxList、csQueryCSFList、csGetCSxFromPath |
-| cs_access.c | csOpenCSx、csCloseCSx、csRegisterNotify、csDeregisterNotify |
-| cs_afdm_management.c | csAllocMem、csFreeMem、csInitMem、csQueueCopyMemRequest |
-| cs_storage_ios.c | csQueueStorageRequest |
-| cs_csf_scheduling.c | csGetCSFId、csAbortRequest、csQueueComputeRequest、csCSEEDownload、csHelperSetComputeArg |
-| cs_batch_scheduling.c | csAllocBatchRequest、csFreeBatchRequest、csConfigureBatchEntry、csHelperResizeBatchRequest、csQueueBatchRequest |
-| cs_event_management.c | csCreateEvent、csDeleteEvent、csPollEvent |
-| cs_management.c | csQueryDeviceProperties、csQueryDeviceStatistics、csCSFDownload、csConfig、csReset |
-| cs_library_management.c | csQueryLibrarySupport、csRegisterPlugin、csDeregisterPlugin |
+| cs_discovery.cpp | csQueryCSxList、csQueryCSFList、csGetCSxFromPath |
+| cs_access.cpp | csOpenCSx、csCloseCSx、csRegisterNotify、csDeregisterNotify |
+| cs_afdm_management.cpp | csAllocMem、csFreeMem、csInitMem、csQueueCopyMemRequest |
+| cs_storage_ios.cpp | csQueueStorageRequest |
+| cs_csf_scheduling.cpp | csGetCSFId、csAbortRequest、csQueueComputeRequest、csCSEEDownload、csHelperSetComputeArg |
+| cs_batch_scheduling.cpp | csAllocBatchRequest、csFreeBatchRequest、csConfigureBatchEntry、csHelperResizeBatchRequest、csQueueBatchRequest |
+| cs_event_management.cpp | csCreateEvent、csDeleteEvent、csPollEvent |
+| cs_management.cpp | csQueryDeviceProperties、csQueryDeviceStatistics、csCSFDownload、csConfig、csReset |
+| cs_library_management.cpp | csQueryLibrarySupport、csRegisterPlugin、csDeregisterPlugin |
 
 除这九个分类文件，只单独保留两份跨 API 共享实现：
 
-- `src/cs_handle_registry.c`：句柄创建、查找、类型检查、引用计数和退役，供设备、AFDM、CSF、event、batch 和异步请求共同使用。
-- `src/cs_request_execution.c`：计算/复制/存储请求的描述快照、句柄绑定、资源引用，以及同步/异步执行和完成通知。batch 也使用这套请求执行机制。
+- `src/cs_handle_registry.cpp`：句柄创建、查找、类型检查、引用计数和退役，供设备、AFDM、CSF、event、batch 和异步请求共同使用。
+- `src/cs_request_execution.cpp`：计算/复制/存储请求的描述快照、句柄绑定、资源引用，以及同步/异步执行和完成通知。batch 也使用这套请求执行机制。
 
-batch 的依赖检查、调度和全部五个 API 直接在 `cs_batch_scheduling.c` 中实现；插件扫描、加载和全部三个库管理 API 直接在 `cs_library_management.c` 中实现。没有单独的 facade/core 目录，也没有为这两类 API 再留一组仅负责转发的同义函数。
+batch 的依赖检查、调度和全部五个 API 直接在 `cs_batch_scheduling.cpp` 中实现；插件扫描、加载和全部三个库管理 API 直接在 `cs_library_management.cpp` 中实现。没有单独的 facade/core 目录，也没有为这两类 API 再留一组仅负责转发的同义函数。
 
-`src/cs_internal.h` 只声明这些文件之间共享的对象和函数。公共设备对象保存插件引用、不透明私有对象、设备名称及并发数，不含 fd、namespace、NVMe 命令或 FEMU MR。插件不包含这个头。
+`src/cs_internal.hpp` 只声明这些文件之间共享的对象和函数。公共设备对象保存插件引用、不透明私有对象、设备名称及并发数，不含 fd、namespace、NVMe 命令或 FEMU MR。插件不包含这个头。
+
+## 内部 C++ 与边界 C
+
+公共实现使用 C++17，但应用仍包含原来的 cs.h，并通过原33个C符号调用。设备插件仍通过 cs_backend.h 的 C 函数表对接，ABI 保持2；现有 C 插件无需迁移到 C++。
+
+库内只对实际资源建立类型：Handle 提供虚析构，Resource 提供设备/私有标识访问；Device、Memory、Function 为 final 具体类，Event、Batch、Request 也由同一套句柄表管理。acquireHandle<T> 做类型检查并返回智能指针，资源引用随作用域自动释放。没有另建一套33方法的虚服务接口。
+
+设备持有插件，AFDM/CSF持有设备，请求快照持有其资源，batch持有请求快照。这样最后一次引用释放时自然按顺序析构，仍被请求使用的公开句柄不能关闭。CloseHandle 在显式释放期间阻止新引用，后端释放失败会自动恢复句柄。
+
+请求描述由 unique_ptr 保存，完成队列用 list 管理，配置草稿用 array 保存。异步完成节点在提交前分配，完成时通过 splice 移入 event，避免计算完成后再因申请内存失败而丢失通知。lock_guard/unique_lock 负责释放锁，批次配置的失败分支直接返回，不再手工回滚引用或逐条解锁。
+
+apiCall 是 C API 和工作线程的异常边界：内部错误状态及内存/线程分配异常转换为 CS_STATUS。公开接口不抛出 C++ 异常，插件只收发标准C结构、C函数指针及不透明标识。
 
 ## 后端方法如何对应标准 API
 
-`src/cs_backend.h` 中的 `cs_backend_ops` 是 C 函数指针表，用于运行时多态；目前没有 C++ 虚函数类。每个设备插件提供自己的操作表，同一个 API 根据设备句柄调用对应插件。
+`src/cs_backend.h` 中的 `cs_backend_ops` 是 C 函数指针表，用于跨动态库的设备分发；库内对象使用 C++ 虚析构和资源类。每个设备插件提供自己的操作表，同一个 API 根据设备句柄调用对应插件。
 
 标准设备操作使用原 API 去掉 cs 前缀的名称，首单词小写、CSF/CSEE 缩写保留。例如：
 
@@ -66,9 +78,9 @@ batch 的依赖检查、调度和全部五个 API 直接在 `cs_batch_scheduling
 5. 可选的 validateRequest 检查设备限制，再调用所属插件的 queueComputeRequest 执行请求。同步调用直接返回；异步调用由共享工作线程执行并发布 callback/event。
 6. FEMU 插件将私有 AFDM ID 转为 MR，标量依次填 cparam1/2，再提交 E1。其他插件可使用不同设备协议，不修改外观层。
 
-插件使用自己的私有类型，不包含 cs_internal.h；公共层不包含 FEMU 头文件。此次后端操作表调整为 ABI 2，旧插件需重新编译。插件工厂导出的操作表有一个内部 ABI 版本，防止加载接口不兼容的动态库；它与算子参数、完成值无关。可选操作为空时公共 API 返回不支持。
+插件使用自己的私有类型，不包含 cs_internal.hpp；公共层不包含 FEMU 头文件。插件契约保持 ABI 2，本次内部 C++ 重构不改变操作表，已有 ABI 2 的 C 插件可继续使用。插件工厂导出的操作表有一个内部 ABI 版本，防止加载接口不兼容的动态库；它与算子参数、完成值无关。可选操作为空时公共 API 返回不支持。
 
-公开设备、AFDM、CSF 和在途请求通过引用计数维持生命周期。发现时也临时引用插件。注销插件时有引用则返回 CS_HANDLE_IN_USE，不能卸载正在执行或仍被句柄使用的代码。重复注册同一路径不会重新初始化插件。插件 CSF 私有标识须有效到设备关闭；若内部需创建包装对象，由插件随设备管理。
+公开设备、AFDM、CSF 和在途请求通过 shared_ptr 维持生命周期。发现时也临时引用插件。注销插件时有引用则返回 CS_HANDLE_IN_USE，不能卸载正在执行或仍被句柄使用的代码。重复注册同一路径不会重新初始化插件。插件 CSF 私有标识须有效到设备关闭；若内部需创建包装对象，由插件随设备管理。
 
 ## 通用 batch 与 FEMU 重入
 

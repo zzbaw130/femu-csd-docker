@@ -112,3 +112,23 @@
 - 用原先ABI 1 mock插件验证新加载器明确返回CS_LOAD_ERROR，避免错误解释旧操作表。
 - Guest真实回归通过：四CU重叠执行、完整64位参数/完成值、内部STORE/LOAD、跨batch spill、重复执行和失败回收。
 - Guest重新安装到/usr/local并执行ldconfig，独立应用仍以 cc application.c -lsnia-cs-api 编译运行成功，无需额外头文件或显式链接设备插件。
+
+## 2026-10-20：用 C++ 简化内部资源管理
+
+### 修改
+
+- 公共实现使用 C++17，九个 SNIA 分类文件以及句柄、请求共享实现改为 .cpp，私有头改为 cs_internal.hpp；保持现有扁平目录和 API 分类。
+- Handle 提供虚析构，Resource 提供所属设备和私有标识访问，Device、Memory、Function 等具体资源类使用 final。句柄查找返回带类型的智能指针，设备、插件、AFDM、请求之间通过引用管理生命周期。
+- 请求缓冲用 unique_ptr 管理，batch 配置使用 array 草稿，event 完成队列使用 list，锁由 lock_guard/unique_lock 管理。删除手工引用增减、解锁和 goto 回滚；显式释放失败时 CloseHandle 自动恢复句柄。
+- 异步请求在提交前分配完成通知节点，完成时直接移入 event 队列。C API 和工作线程统一捕获内部异常，转换为 CS_STATUS；分配失败时自动释放资源。
+- 公开 cs.h、33个C函数签名和插件 cs_backend.h 均保持原样，插件 ABI 仍为2。现有 FEMU 和第二个测试插件继续使用 C 实现。
+- 公共实现及私有头共由1379行减为1045行；补充中文 README 与架构说明，解释具体资源的所有权和调用边界。
+
+### 验证
+
+- 宿主 GCC9、容器 GCC13 均通过六组 CTest，覆盖231项既有 API 检查、两插件路由、Identify、单头文件 C++、33个入口及新增分配失败检查。
+- 分配失败测试覆盖创建 AFDM 后发布句柄失败、创建 event 失败，以及128次异步提交中的分配失败和重试；检查完整 FDM 容量可重新申请、无丢失通知、句柄和资源最终可释放。
+- 六组测试均通过 ASan/UBSan/LeakSanitizer；确认动态库仍只导出原33个 C API。
+- Guest 真实设备回归通过：四 CU 执行重叠、独立64位参数/完成值、内部 STORE/LOAD、跨 batch spill、失败回收及重复执行。
+- Guest 重新安装至 /usr/local；独立 C 应用只包含 cs.h，以 cc application.c -lsnia-cs-api 编译运行，输出4 12 28 44。
+- 设备五个 SO 的共享 workmem 依赖检查通过；Guest 两轮4CU/2SO共享64MiB配额测试通过，均为2次成功、2次ENOMEM，结束占用0。
