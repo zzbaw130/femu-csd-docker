@@ -98,7 +98,9 @@ free(r);
 
 ## 三、设备算子：参数、私有内存与 spill
 
-设备算子包含 `cs_kernel.h`，入口仍为 `int64_t fn(struct femu_csd_args *)`，原生结构保持 52 字节。`cs_kernel_decode` 将参数解码到 CU 栈上的数组：AFDM 参数得到本地指针和长度，整数得到 `value_lo/value_hi`。库每次计算额外分配 4 KiB 参数 AFDM，作为最后一个原生 MR；它只保存输入描述，不是算子工作区。
+原生算子入口仍为 `int64_t fn(struct femu_csd_args *)`，结构保持 52 字节。FEMU 已经把命令中的 MR 转换为 `mr_addr/mr_len`，算子可以直接访问这些字段和 `cparam1/2`。
+
+本库为了传递 SNIA 请求中的任意参数序列（最多 64 项，含 128 位整数和 AFDM offset），另外在最后一个 MR 中放入类型化参数描述。`cs_kernel_decode` 只负责读取这份额外描述，方便示例算子按原参数次序取值；它不是 SNIA 要求，也不是所有 FEMU 算子必须调用的接口。当前库每次计算都额外分配 4 KiB 参数 AFDM，因此不能把本库当前的参数布局与原生 MR 布局直接混用。
 
 需要恢复协议时再包含 `cs_csf.h`。**算子不链接 Guest 的 libsina-cs-api.so**；解码和协议辅助函数都在头文件中。所有算子统一链接设备侧 `libcs-workmem.so`，私有工作区使用 `cs_work_begin/cs_work_alloc/cs_work_free/cs_work_end`；可跨多次入口保留同一 context，结束或 ABORT 时释放。多个 `.so` 引用同一共享库、同一个总配额。AFDM 仅用于输入、输出及在算子间传递的数据。
 
@@ -111,9 +113,11 @@ cc -shared -fPIC operator.c \
     -o ../build/operator.so
 ```
 
-项目组件应使用已有 `../mk/csf.mk` 统一规则，参考 `code/csd-programs/sina-cs-api/Makefile`。
+`../mk/csf.mk` 只是公共 Makefile 片段，复用 `build/` 输出位置、`libcs-workmem.so` 链接选项和 `$ORIGIN` 搜索路径。现有组件通过 `include` 使用它；手写相同编译命令也可以，它不参与算子运行或 spill 调度。
 
-扩展协议使用标准 `CompValue` 携带操作，不新增 `CS_STATUS`：
+spill 的实际流程只有：算子返回 NEED_STORE 和待写长度 → 库分配 LBA 并将 I/O AFDM 写入 → 库再次调用同一 CSF，参数中带回写入完成及 spill 信息 → CSF 更新自己的 run 记录并继续。LOAD 同理。CSF 不需要自己发存储命令，但需区分首次调用与 I/O 完成后的重入，避免重复提出同一个请求。
+
+当前实现把这些返回信息打包在一个 128 位参数中，称为“控制值”；它就是 spill 完成信息，不是额外的系统配置。下面的辅助函数只是这个打包格式的访问方式，均属本项目约定。操作请求放在标准 `CompValue` 中，不新增 `CS_STATUS`：
 
 | 算子返回 `csCsfCompletion(action, payload)` | 库的动作 | 下一次入口的控制事件 |
 | --- | --- | --- |
