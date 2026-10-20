@@ -1,3 +1,5 @@
+.vscode
+
 # 运行时生成：guest 镜像（u20s.qcow2）、SSH 私钥、cloud image 下载缓存
 /images/
 
@@ -12,12 +14,13 @@
 /code/pg_duckdb/
 
 # agent
-/.codex
+.codex
 /reports
-/AGENTS.md
-/CLAUDE.md
+AGENTS.md
+CLAUDE.md
 
 # 编译产物：例如 csd 目录里编译出来的算子 .so、guest 里编出的 csd-passthru
+build/
 *.o
 *.so
 *.a
@@ -39,7 +42,3 @@ provision.log
 # Python 生成缓存
 __pycache__/
 *.pyc
-
-# CMake 构建目录
-/code/csd-programs/build/
-/code/apps/snia/build/
