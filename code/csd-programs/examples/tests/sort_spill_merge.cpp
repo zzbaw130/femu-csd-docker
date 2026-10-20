@@ -238,7 +238,7 @@ int main(int argc, char **argv)
         sort_heap_pop(&heap);
     }
     assert(!heap.count);
-    // Validate the shared C run sorter independently of both merge paths.
+    // Validate the shared C run sorter independently of the merge.
     for (unsigned count : {0U, 1U, 16U, 17U, 1024U}) {
         for (unsigned mode = 0; mode < 4; ++mode) {
             std::vector<int32_t> values(count);

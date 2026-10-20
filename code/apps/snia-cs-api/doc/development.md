@@ -2,7 +2,17 @@
 
 分支 `snia_csd_dev`，基线 tag `femu-csd-with-original-postgre`。当前功能不包含 PostgreSQL SQL runtime。
 
+## 2026-10-21：精简示例，只保留 merge sort
+
+- 删除设备 merge-path-sort.cpp、CPU 对照 read_merge_path_sort_avg.c、共享分区头和对应测试，移除 CMake 构建目标及 Guest 的 --merge-path 选项。原生 vadd/kernels 示例保留。
+- Guest 只保留四条 LOAD→sort_sink 的 HYBRID 分支，以及单条 sort_source→AVG 的 SERIAL 循环；输出和累计结果各保留一个 AFDM，删除分区任务、双路结果合并和分支退出逻辑。
+- bench 只交替运行 merge sort 的 CPU/CSD 各三轮，保留完整结果、spill 工作量、64MiB 内存预算核对和细分计时。当前 README 删除两路版本的用法和重复历史测量；并行归并的历史数据仍保留在下节。
+- 宿主设备程序 5 项、SNIA SDK 5 项 CTest 全部通过，容器与 Guest 重新编译成功。清除容器构建目录、宿主测试目录和 Guest 中已移除版本的 SO/可执行文件，以及容器构建目录中对应的目标中间文件。
+- Guest 复用已有 256MiB 文件验证 CPU/CSD 两条路径：count=67108864、sum=15688155813636、average=233771.73861318827；均为64个run、60个spill run，写入/回读各251658240字节。算法内存上界CPU66104320、CSD66135168字节，均低于64MiB。单次验证耗时CPU7.319867秒、CSD8.922484秒，仅用于确认清理后的完整执行，不作为新的多轮性能结论。
+
 ## 2026-10-21：保留 merge-sort，新增两路 K-Way Merge Path
+
+> 历史实验：当前已移除两路 Merge Path 的实现、构建目标及命令行入口，以下数据仅保留为实验记录。
 
 - 原sort.cpp原样更名merge-sort.cpp，SO更名merge-sort.so；CPU基线更名read_merge_sort_avg.c / read-merge-sort-avg。同步CMake、下载描述、测试、脚本和当前文档；清除canonical build中的旧cs-example-sort.so和read-sort-avg，不保留重复产物。
 - 新增独立设备文件merge-path-sort.cpp / merge-path-sort.so、独立CPU文件tests/read_merge_path_sort_avg.c / read-merge-path-sort-avg。两个版本各保留sink/source两个CSF入口，第一阶段都是四路sink，新增版本第二阶段为两路source→AVG。Guest通过--merge-path选择，默认仍为merge-sort；不修改FEMU和SNIA库。

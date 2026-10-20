@@ -1,6 +1,6 @@
 /* Guest example: file extents -> internal LOAD -> external sort -> average. */
 #include "cs.h"
-#include "merge_path_sort.h"
+#include "batch_sort.h"
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/fiemap.h>
@@ -75,13 +75,12 @@ static void unload_program(CS_DEV_HANDLE device, const struct program *p)
 }
 /* CsComputeRequest describes computation; its caller supplies the batch wrapper. */
 static void build_compute_request(CsComputeRequest *request, CS_CSF_ID function,
-                                  CS_MEM_HANDLE input, CS_MEM_HANDLE output, u64 state, CS_MEM_HANDLE control, CS_MEM_HANDLE source_task)
+                                  CS_MEM_HANDLE input, CS_MEM_HANDLE output, u64 state, CS_MEM_HANDLE control)
 {
     request->CSFId = function;
     request->NumArgs = 0;
     if (input) csHelperSetComputeArg(&request->Args[request->NumArgs++], CS_AFDM_TYPE, input, 0UL);
     if (control) csHelperSetComputeArg(&request->Args[request->NumArgs++], CS_AFDM_TYPE, control, 0UL);
-    if (source_task) csHelperSetComputeArg(&request->Args[request->NumArgs++], CS_AFDM_TYPE, source_task, 0UL);
     if (output) csHelperSetComputeArg(&request->Args[request->NumArgs++], CS_AFDM_TYPE, output, 0UL);
     if (state) csHelperSetComputeArg(&request->Args[request->NumArgs++], CS_64BIT_VALUE_TYPE, state);
 }
@@ -171,24 +170,20 @@ static int build_load_request(CsStorageRequest *request, const struct fiemap *ma
 }
 int main(int argc, char **argv)
 {
-    int existing = 0, merge_path = 0;
-    for (int i = 3; i < argc; ++i) {
-        if (!strcmp(argv[i], "--existing")) existing = 1;
-        else if (!strcmp(argv[i], "--merge-path")) merge_path = 1;
-        else { fprintf(stderr, "usage: %s [device] [file] [--existing] [--merge-path]\n", argv[0]); return 2; }
+    if (argc > 4 || (argc == 4 && strcmp(argv[3], "--existing"))) {
+        fprintf(stderr, "usage: %s [device] [file] [--existing]\n", argv[0]);
+        return 2;
     }
-    unsigned merge_workers = merge_path ? MERGE_PATH_WORKERS : 1;
+    int existing = argc == 4;
     const char *device_path = argc > 1 ? argv[1] : "/dev/nvme0n1";
     const char *file_path = argc > 2 ? argv[2] : "/data/cs-batch-input.bin";
     struct program programs[] = {
         [SORT_SINK] = {.file = "merge-sort.so", .symbol = "sort_sink", .index = 420},
         [SORT_SOURCE] = {.file = "merge-sort.so", .symbol = "sort_source", .index = 421},
         [AVERAGE] = {.file = "cs-example-avg.so", .symbol = "avg_int32", .index = 422}};
-    programs[SORT_SINK].file = programs[SORT_SOURCE].file = merge_path ? "merge-path-sort.so" : "merge-sort.so";
     CS_DEV_HANDLE device = NULL;
     CS_MEM_HANDLE input[SORT_WORKERS] = {0}, io[SORT_WORKERS] = {0}, task[SORT_WORKERS] = {0};
-    CS_MEM_HANDLE sorted[MERGE_PATH_WORKERS] = {0}, result[MERGE_PATH_WORKERS] = {0};
-    CS_MEM_HANDLE source_task[MERGE_PATH_WORKERS] = {0}, group_mem = NULL;
+    CS_MEM_HANDLE sorted = NULL, result = NULL, group_mem = NULL;
     struct sort_run_group group = {.count = SORT_WORKERS};
     int group_ready = 0;
     CS_BATCH_HANDLE batch = NULL;
@@ -235,30 +230,19 @@ int main(int argc, char **argv)
         flags.Flags = 0;
     }
     TRY(csAllocMem(device, sizeof(group), &flags, &group_mem, NULL));
-    for (unsigned part = 0; part < merge_workers; ++part) {
-        flags.Flags = 0;
-        TRY(csAllocMem(device, sizeof(struct sorted_chunk), &flags, &sorted[part], NULL));
-        flags.Flags = CS_FDM_CLEAR;
-        TRY(csAllocMem(device, sizeof(struct average_result), &flags, &result[part], NULL));
-        if (merge_path) {
-            TRY(csAllocMem(device, sizeof(struct merge_path_task), &flags, &source_task[part], NULL));
-            struct merge_path_task control = {.part = part};
-            CsCopyMemRequest write = {.Type = CS_COPY_TO_DEVICE, .DevMem = {source_task[part], 0},
-                .u.HostVAddress = &control, .Bytes = sizeof(control)};
-            TRY(csQueueCopyMemRequest(&write, NULL, NULL, NULL, NULL, NULL));
-        }
-    }
+    TRY(csAllocMem(device, sizeof(struct sorted_chunk), &flags, &sorted, NULL));
+    flags.Flags = CS_FDM_CLEAR; // AVG accumulates across chunks; only its small output needs zeroing.
+    TRY(csAllocMem(device, sizeof(struct average_result), &flags, &result, NULL));
     // Allocate two batch wrappers once; the API copies each configured request.
     load_entry = calloc(1, sizeof(*load_entry) + (map->fm_mapped_extents - 1) * sizeof(CSBlockRange));
-    compute_entry = calloc(1, sizeof(*compute_entry) + 5 * sizeof(CsComputeArg));
+    compute_entry = calloc(1, sizeof(*compute_entry) + 4 * sizeof(CsComputeArg));
     if (!load_entry || !compute_entry) goto cleanup;
     load_entry->ReqType = CS_STORAGE_IO;
     compute_entry->ReqType = CS_QUEUE_COMPUTE;
 
     struct timespec start, sink_done, end;
-    printf("CONFIG CSD sink_workers=%u merge_workers=%u work_bytes=%zu buffer_bytes=%zu\n",
-           SORT_WORKERS, merge_workers, merge_path ? merge_path_work_bytes() : sort_work_bytes(SORT_WORKERS),
-           merge_path ? merge_path_buffer_bytes() : sort_buffer_bytes(SORT_WORKERS));
+    printf("CONFIG CSD sink_workers=%u merge_workers=1 work_bytes=%zu buffer_bytes=%zu\n",
+           SORT_WORKERS, sort_work_bytes(SORT_WORKERS), sort_buffer_bytes(SORT_WORKERS));
     clock_gettime(CLOCK_MONOTONIC, &start);
     // Four independent LOAD -> sink branches. Each sink uses the same CSF ID.
     TRY(csAllocBatchRequest(CS_BATCH_HYBRID, 2 * SORT_WORKERS, &batch));
@@ -271,7 +255,7 @@ int main(int argc, char **argv)
             }
             if (!round) {
                 TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, load_entry, 0, 0, &load_nodes[i]));
-                build_compute_request(&compute_entry->u.Compute, programs[SORT_SINK].function, input[i], io[i], 0, task[i], NULL);
+                build_compute_request(&compute_entry->u.Compute, programs[SORT_SINK].function, input[i], io[i], 0, task[i]);
                 TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, compute_entry, 0, load_nodes[i], &sink_node));
             } else {
                 TRY(csConfigureBatchEntry(batch, CS_BATCH_RECONFIG, load_entry, load_nodes[i], 0, NULL));
@@ -294,51 +278,21 @@ int main(int argc, char **argv)
     batch = NULL;
     clock_gettime(CLOCK_MONOTONIC, &sink_done);
 
-    struct average_result averages[MERGE_PATH_WORKERS] = {0}, average;
-    CS_BATCH_INDEX source_nodes[MERGE_PATH_WORKERS], average_nodes[MERGE_PATH_WORKERS];
-    if (merge_path) {
-        // Prime part 0: allocate both caches, compute the exact midpoint, emit one chunk.
-        TRY(csAllocBatchRequest(CS_BATCH_SERIAL, 2, &batch));
-        build_compute_request(&compute_entry->u.Compute, programs[SORT_SOURCE].function,
-            sorted[0], io[0], group.states[0], group_mem, source_task[0]);
-        TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, compute_entry, 0, 0, &source_nodes[0]));
-        build_compute_request(&compute_entry->u.Compute, programs[AVERAGE].function, sorted[0], result[0], 0, NULL, NULL);
-        TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, compute_entry, 0, source_nodes[0], &average_nodes[0]));
+    // Phase 2: source -> avg. The same wrapper can configure both nodes.
+    TRY(csAllocBatchRequest(CS_BATCH_SERIAL, 2, &batch));
+    CS_BATCH_INDEX source_node, average_node;
+    build_compute_request(&compute_entry->u.Compute, programs[SORT_SOURCE].function, sorted, io[0], group.states[0], group_mem);
+    TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, compute_entry, 0, 0, &source_node));
+    build_compute_request(&compute_entry->u.Compute, programs[AVERAGE].function, sorted, result, 0, NULL);
+    TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, compute_entry, 0, source_node, &average_node));
+
+    struct average_result average;
+    CsCopyMemRequest read_result = {.Type = CS_COPY_FROM_DEVICE, .DevMem = {result, 0},
+        .u.HostVAddress = &average, .Bytes = sizeof(average)};
+    do {
         TRY(csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, NULL));
-        TRY(csFreeBatchRequest(batch)); batch = NULL;
-    }
-    TRY(csAllocBatchRequest(merge_path ? CS_BATCH_HYBRID : CS_BATCH_SERIAL, 2 * merge_workers, &batch));
-    for (unsigned part = 0; part < merge_workers; ++part) {
-        build_compute_request(&compute_entry->u.Compute, programs[SORT_SOURCE].function,
-            sorted[part], io[part], group.states[0], group_mem, source_task[part]);
-        TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, compute_entry, 0, 0, &source_nodes[part]));
-        build_compute_request(&compute_entry->u.Compute, programs[AVERAGE].function, sorted[part], result[part], 0, NULL, NULL);
-        TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, compute_entry, 0, source_nodes[part], &average_nodes[part]));
-    }
-    unsigned remaining = merge_workers;
-    while (remaining) {
-        TRY(csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, NULL));
-        for (unsigned part = 0; part < merge_workers; ++part) if (source_nodes[part]) {
-            CsCopyMemRequest read = {.Type = CS_COPY_FROM_DEVICE, .DevMem = {result[part], 0},
-                .u.HostVAddress = &averages[part], .Bytes = sizeof(averages[part])};
-            TRY(csQueueCopyMemRequest(&read, NULL, NULL, NULL, NULL, NULL));
-            if (averages[part].finished) {
-                TRY(csConfigureBatchEntry(batch, CS_BATCH_DELETE, NULL, average_nodes[part], 0, NULL));
-                TRY(csConfigureBatchEntry(batch, CS_BATCH_DELETE, NULL, source_nodes[part], 0, NULL));
-                source_nodes[part] = 0; --remaining;
-            }
-        }
-    }
-    average = averages[0];
-    if (merge_path) {
-        average.sum += averages[1].sum; average.count += averages[1].count;
-        average.average = (double)average.sum / average.count;
-        average.aggregate.wall_ns += averages[1].aggregate.wall_ns;
-        average.aggregate.cpu_ns += averages[1].aggregate.cpu_ns;
-        average.metrics.source.wall_ns += averages[1].metrics.source.wall_ns;
-        average.metrics.source.cpu_ns += averages[1].metrics.source.cpu_ns;
-        average.metrics.spill_read_bytes += averages[1].metrics.spill_read_bytes;
-    }
+        TRY(csQueueCopyMemRequest(&read_result, NULL, NULL, NULL, NULL, NULL));
+    } while (!average.finished);
     clock_gettime(CLOCK_MONOTONIC, &end);
     if (average.count != SORT_FILE_BYTES / sizeof(int32_t) ||
         average.average != (double)average.sum / (double)average.count ||
@@ -360,16 +314,7 @@ int main(int argc, char **argv)
            average.metrics.source.wall_ns / 1e9, average.metrics.source.cpu_ns / 1e9);
     printf("PROFILE CSD average_work wall_s=%.9f cpu_s=%.9f\n",
            average.aggregate.wall_ns / 1e9, average.aggregate.cpu_ns / 1e9);
-    if (merge_path) {
-        struct merge_path_task control;
-        CsCopyMemRequest read = {.Type = CS_COPY_FROM_DEVICE, .DevMem = {source_task[0], 0},
-            .u.HostVAddress = &control, .Bytes = sizeof(control)};
-        TRY(csQueueCopyMemRequest(&read, NULL, NULL, NULL, NULL, NULL));
-        printf("PROFILE CSD prepare wall_s=%.9f\n", control.prepare_ns / 1e9);
-        printf("PROFILE CSD partition wall_s=%.9f read_bytes=%llu\n", control.partition_ns / 1e9,
-               (unsigned long long)control.partition_read_bytes);
-    }
-    printf("PASS: 4 sinks / %u source(s), full sorted stream, AVG and state cleanup\n", merge_workers);
+    puts("PASS: 4 parallel sinks / 1 source; 256 MiB, memory-first runs, spill on allocation failure, full merge, AVG; source released all state");
     rc = 0;
 cleanup:
     if (batch) csFreeBatchRequest(batch);
@@ -387,18 +332,15 @@ cleanup:
         }
     }
     for (unsigned i = 0; i < SORT_WORKERS; ++i) if (group.states[i] && compute_entry) {
-        build_compute_request(&compute_entry->u.Compute, programs[SORT_SOURCE].function, io[0], NULL, group.states[i], NULL, NULL);
+        build_compute_request(&compute_entry->u.Compute, programs[SORT_SOURCE].function, io[0], NULL, group.states[i], NULL);
         csQueueComputeRequest(&compute_entry->u.Compute, NULL, NULL, NULL, NULL, NULL);
     }
     free(load_entry);
     free(compute_entry);
     free(map);
     flags.Flags = 0;
-    for (unsigned part = 0; part < merge_workers; ++part) {
-        if (result[part]) csFreeMem(result[part], &flags);
-        if (sorted[part]) csFreeMem(sorted[part], &flags);
-        if (source_task[part]) csFreeMem(source_task[part], &flags);
-    }
+    if (result) csFreeMem(result, &flags);
+    if (sorted) csFreeMem(sorted, &flags);
     if (group_mem) csFreeMem(group_mem, &flags);
     for (unsigned i = 0; i < SORT_WORKERS; ++i) {
         if (task[i]) csFreeMem(task[i], &flags);
