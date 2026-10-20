@@ -22,3 +22,12 @@
 3. 加入Sort/TopN和高基数聚合的sink/source边界，以workmem保存私有状态，通过NEED_STORE/LOAD/FREE恢复协议完成spill。
 4. 加入Hash Join的build/probe和分区spill，覆盖Q14，再逐步增加所需连接、字符串与子查询语义。
 5. 逐条TPC-H正确性回归与性能分解；不能用少数Query或整数示例代表完整SQL支持，也不能把宿主CPU模拟结果解释为真实SSD性能。
+
+## 执行路径与统一冷启动（开发中）
+
+- 新增pg_sina_csd.exe_path：host为默认值，全部采用PG原生计划；csd优先采用已经实现且语义匹配的设备计划，不支持的节点或表达式保留PG路径。后续auto选项由规划器按成本选择；成本模型尚未实现前不开放auto，避免把固定选择误称为自动规划。
+- Q1/Q6作为第一批端到端卸载对象：设备端完成扫描、过滤、表达式、聚合，Q1还包括排序与LIMIT。先从PG表达式树编排，不能按SQL文本或Query编号硬编码。
+- 所有TPC-H测量统一冷启动：每条被测语句之前停止PG（清空shared buffers）、同步写入并清除Guest OS page cache，再启动PG。测试期间关闭autovacuum，避免后台扫描干扰。不能只drop_caches就把PG缓存仍热的执行称为冷启动。
+- host与csd采用同样的冷启动流程；设备每次查询新建AFDM和工作上下文并完整回收，不复用上次查询的输入。FEMU模拟NVM的数据字节本身是存储介质，不是需要清除的文件缓存。
+- 普通PG服务重启且表文件保持不变时复用准备结果；Guest/FEMU重启、数据重新恢复或文件/schema变化才重新prepare。不会为每次冷启动重复FIEMAP。
+- 后续按聚合→Sort/TopN/高基数聚合spill→Hash Join/分区spill→更多连接/字符串/子查询推进，直至22条TPC-H正确性全部通过；每阶段记录具体算子、回退范围与冷启动性能，不能把部分Query通过记为完整支持。

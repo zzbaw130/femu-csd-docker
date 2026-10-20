@@ -6,6 +6,25 @@
 
 当前完成阶段0：扩展安装、静态映射和设备 heap 行数校验。尚未接入 planner/CustomScan，普通 SQL 仍由原生 PG 执行。
 
+## 执行路径与冷启动
+
+```sql
+LOAD 'pg_sina_csd';
+SET pg_sina_csd.exe_path=host; -- 默认：PG原生路径
+SET pg_sina_csd.exe_path=csd;  -- 优先卸载支持的子计划，不支持时保留PG执行
+```
+
+auto将在成本模型实现后开放，目前只接受host/csd。切换后应重新规划语句；不要复用切换前已经生成的prepared plan。
+
+TPC-H测量每条语句之前使用Guest的cold-query.sh：停止PG清空shared buffers，sync并drop_caches，再启动PG（测试期间autovacuum=off）。host和csd同样处理；不是只清除OS缓存。脚本在Guest执行：
+
+```sh
+/home/femu/scripts/cold-query.sh host /path/to/query.sql
+/home/femu/scripts/cold-query.sh csd /path/to/query.sql
+```
+
+每个文件只放一条被测查询；EXPLAIN ANALYZE也会实际执行，应单独冷启动。普通PG服务重启不改变冻结表文件，可复用映射；Guest/FEMU重启或恢复/改动文件后重新prepare。
+
 ## 执行位置与目录
 
 | 路径 | 用途及执行位置 |
