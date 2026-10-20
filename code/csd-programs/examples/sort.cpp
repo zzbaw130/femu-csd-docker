@@ -4,7 +4,6 @@
 #include "cs_workmem.h"
 #include "batch_sort.h"
 #include <algorithm>
-#include <functional>
 #include <cstring>
 
 namespace {
@@ -24,6 +23,7 @@ struct SortState {
     uint64_t emitted;
     IO pending;
     bool finishing;
+    sort_metrics metrics;
 };
 SortState *state(femu_csd_args *args) { return reinterpret_cast<SortState *>(args->cparam1); }
 int resident(const SortState &s)
@@ -53,13 +53,16 @@ int64_t resume(SortState &s, femu_csd_args &args)
     auto &run = s.runs[s.ioRun];
     switch (s.pending) {
     case IO::Store:
+        s.metrics.spill_write_bytes += SORT_BLOCK_BYTES;
         run.blocks[s.ioBlock++] = csReentryValue(&args);
         if (s.ioBlock < SORT_BLOCKS_PER_RUN) return store_block(s, args);
         cs_work_free(s.context, run.data);
         run.data = nullptr;
         run.spilled = true;
+        ++s.metrics.spilled_runs;
         break;
     case IO::Load:
+        s.metrics.spill_read_bytes += SORT_BLOCK_BYTES;
         std::memcpy(run.data, args.mr_addr[1], SORT_BLOCK_BYTES);
         run.loadedBlock = s.ioBlock;
         break;
@@ -91,7 +94,10 @@ extern "C" int64_t sort_sink(femu_csd_args *args)
     auto *s = state(args);
     bool first = !s;
     if (first) {
-        auto *context = cs_work_begin();
+        cs_work_stats stats;
+        if (cs_work_get_stats(&stats)) return -1;
+        // The example's AFDM buffers also count against its total 64 MiB budget.
+        auto *context = cs_work_begin_limit(std::min(stats.capacity_bytes, SORT_WORK_BYTES));
         s = context ? static_cast<SortState *>(cs_work_calloc(context, 1, sizeof(SortState))) : nullptr;
         if (!s) { if (context) cs_work_end(context); return -1; }
         s->context = context;
@@ -107,7 +113,7 @@ extern "C" int64_t sort_sink(femu_csd_args *args)
         return -2; // At least one run must fit to perform an in-place sort.
     }
     std::memcpy(data, args->mr_addr[0], SORT_CHUNK_BYTES);
-    std::sort(data, data + RunValues, std::greater<int32_t>());
+    sort_int32_desc(data, RunValues);
     s->runs[s->count++].data = data;
     return reinterpret_cast<int64_t>(s);
 }
@@ -157,6 +163,11 @@ extern "C" int64_t sort_source(femu_csd_args *args)
         if (++s->emitted == static_cast<uint64_t>(s->count) * RunValues) s->finishing = true;
     }
     if (s->finishing) {
+        cs_work_context_stats stats;
+        if (cs_work_get_context_stats(s->context, &stats)) return -1;
+        s->metrics.peak_bytes = stats.peak_used_bytes + SORT_BUFFER_BYTES;
+        s->metrics.runs = s->count;
+        out->metrics = s->metrics;
         result = finish(*s);
         if (result) return result;
         out->finished = 1; // The last chunk remains in AFDM after workmem is destroyed.

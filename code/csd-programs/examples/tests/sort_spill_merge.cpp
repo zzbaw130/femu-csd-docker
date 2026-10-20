@@ -94,6 +94,10 @@ static void scenario(Function sink, Function source, Function limit, unsigned ch
         offset += output->count;
     } while (!output->finished);
     assert(offset == expected.size() && top.finished);
+    assert(top.metrics.runs == chunks && top.metrics.peak_bytes <= SORT_MEMORY_BYTES);
+    assert(top.metrics.spill_write_bytes == static_cast<uint64_t>(spill.stores) * SORT_BLOCK_BYTES);
+    assert(top.metrics.spill_read_bytes == static_cast<uint64_t>(spill.loads) * SORT_BLOCK_BYTES);
+    assert(top.metrics.spilled_runs * SORT_BLOCKS_PER_RUN == spill.stores);
     assert(spill.frees == spill.stores && spill.loads == spill.stores);
     if (chunks > 2) {
         assert(spill.stores > sinkStores);
@@ -103,6 +107,19 @@ static void scenario(Function sink, Function source, Function limit, unsigned ch
 }
 int main(int argc, char **argv)
 {
+    // Validate the shared C run sorter independently of both merge paths.
+    for (unsigned count : {0U, 1U, 16U, 17U, 1024U}) {
+        for (unsigned mode = 0; mode < 4; ++mode) {
+            std::vector<int32_t> values(count);
+            for (unsigned i = 0; i < count; ++i)
+                values[i] = mode == 0 ? 7 : mode == 1 ? static_cast<int32_t>(i)
+                    : mode == 2 ? -static_cast<int32_t>(i) : static_cast<int32_t>(i * 2654435761U);
+            auto expected = values;
+            std::sort(expected.begin(), expected.end(), std::greater<int32_t>());
+            sort_int32_desc(values.data(), values.size());
+            assert(values == expected);
+        }
+    }
     assert(argc == 3);
     void *sort = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL), *limit = dlopen(argv[2], RTLD_NOW | RTLD_LOCAL);
     assert(sort && limit);

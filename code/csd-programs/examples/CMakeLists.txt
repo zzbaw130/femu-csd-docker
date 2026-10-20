@@ -12,6 +12,10 @@ add_csd_program(cs-example-sort sort.cpp)
 add_csd_program(cs-example-limit limit.c)
 target_include_directories(cs-example-sort PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/snia-cs-api/examples")
 target_include_directories(cs-example-limit PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/snia-cs-api/examples")
+# Independent Guest CPU benchmark, sharing only the allocator and run-sort code.
+add_executable(read-sort-limit tests/read_sort_limit.c)
+target_include_directories(read-sort-limit PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/snia-cs-api/examples")
+target_link_libraries(read-sort-limit PRIVATE cs-workmem)
 if(BUILD_TESTING)
     add_executable(sort-spill-merge tests/sort_spill_merge.cpp)
     target_include_directories(sort-spill-merge PRIVATE "${CSD_FEMU_INCLUDE}"

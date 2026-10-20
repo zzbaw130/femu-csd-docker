@@ -17,6 +17,10 @@ case ${1:-unit} in
         docker compose -f "$ROOT/docker-compose.yml" exec -T femu-csd \
             env SSH_PORT="${SSH_PORT:-8080}" ./run-guest-ssh.sh \
             'cmake -S /home/femu/apps/snia-cs-api -B /tmp/snia-cs-api-guest -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build /tmp/snia-cs-api-guest -j2'
+        # Built with the container's Guest-compatible toolchain. Preserve the
+        # executable's relative RPATH to the same workmem library used by CSFs.
+        docker compose -f "$ROOT/docker-compose.yml" exec -T femu-csd env SSH_PORT="${SSH_PORT:-8080}" sh -c \
+            'tar -C /workspace/code/csd-programs/build -cf - examples/read-sort-limit libcs-workmem.so | ./run-guest-ssh.sh "mkdir -p /tmp/csd-sort-bench; tar -xf - -C /tmp/csd-sort-bench"'
         ;;
     smoke|example)
         docker compose -f "$ROOT/docker-compose.yml" exec -T femu-csd \
@@ -28,12 +32,13 @@ case ${1:-unit} in
         RESULT_DIR=$(mktemp -d /tmp/snia-sort-limit.XXXXXX)
         printf 'mode\tround\tstage1_s\tstage2_s\ttotal_s\n' > "$RESULT_DIR/timings.tsv"
         reference=''
+        reference_workload=''
         for round in 1 2 3; do
             if (( round % 2 )); then methods=(CPU CSD); else methods=(CSD CPU); fi
             for method in "${methods[@]}"; do
                 echo "Round $round: $method"
                 if [[ $method == CPU ]]; then
-                    guest_command='sudo /tmp/snia-cs-api-guest/read-sort-limit /data/cs-batch-input.bin'
+                    guest_command='sudo /tmp/csd-sort-bench/examples/read-sort-limit /data/cs-batch-input.bin'
                 else
                     guest_command='sudo stdbuf -oL /tmp/snia-cs-api-guest/cs-batch-sort-limit /dev/nvme0n1 /data/cs-batch-input.bin --existing'
                 fi
@@ -43,6 +48,11 @@ case ${1:-unit} in
                 top=$(sed -n 's/^Top 5: //p' "$logfile")
                 if [[ -z $reference ]]; then reference=$top; fi
                 if [[ -z $top || $top != "$reference" ]]; then echo 'FAIL: Top 5 mismatch' >&2; exit 1; fi
+                workload=$(awk '/^WORKLOAD/ { print $3, $4, $5, $6 }' "$logfile")
+                if [[ -z ${reference_workload:-} ]]; then reference_workload=$workload; fi
+                if [[ -z $workload || $workload != "$reference_workload" ]]; then echo 'FAIL: spill workload mismatch' >&2; exit 1; fi
+                awk '/^WORKLOAD/ { split($7, peak, "="); split($8, cap, "=");
+                    if (peak[2] > cap[2] || cap[2] != 67108864) exit 1 }' "$logfile"
                 awk -v round="$round" '$1 == "TIMING" { printf "%s\t%d\t%s\t%s\t%s\n", $2, round, $3, $4, $5; found++ }
                     END { if (found != 1) exit 1 }' "$logfile" >> "$RESULT_DIR/timings.tsv"
             done

@@ -11,6 +11,7 @@
 | sort.cpp | cs-example-sort.so，只有 sort_sink、sort_source 两个入口 |
 | limit.c | cs-example-limit.so，从全局降序流保留前5 |
 | tests/sort_spill_merge.cpp | 内存驻留、按需 spill、完整归并与自动释放测试 |
+| tests/read_sort_limit.c | 独立 Guest CPU 性能基线，相同排序/归并逻辑、64MiB总算法预算，普通文件直接I/O和临时文件 |
 
 使用 csd-programs 根 CMakeLists.txt 构建，所有 SO 进入 build。每个 native SO 统一动态链接 libcs-workmem.so；[内存使用规范](../README.md#统一内存规范)同样适用于示例。每个算子的实现放在自己的 .c/.cpp 中，不再单独维护无关的标量/scale/delay 演示函数。
 
@@ -18,7 +19,7 @@
 
 Guest 应用是 [cs_batch_sort_limit.c](../../apps/snia-cs-api/examples/cs_batch_sort_limit.c)，参数布局在旁边的 batch_sort.h；完整 batch 及 AFDM 组织见[示例说明](../../apps/snia-cs-api/examples/README.md)。
 
-sort_sink 首次接收 cparam1=0，创建 workmem context 和排序状态，申请4MiB，复制输入并原地降序排序。只要申请成功，整个 run 就保留在 workmem。入口返回状态的64位标识，Guest 从第一次 batch 的 CompValue 取得它，随后原样传入 cparam1。
+sort_sink 首次接收 cparam1=0，创建 workmem context 和排序状态。为公平比较，示例从64MiB总算法预算扣除四个 AFDM 缓冲，剩余约55.75MiB限制该 context；设备共享 workmem 全局容量不变。随后申请4MiB，复制输入并使用与 C 基线相同的原地 quicksort 降序排序。只要申请成功，整个 run 就保留在 workmem。入口返回状态的64位标识，Guest 从第一次 batch 的 CompValue 取得它，随后原样传入 cparam1。
 
 后续 run 申请4MiB失败时，选择一个驻留 run，将它完整 spill；STORE 完成并重入后记录 token，腾出的 workmem 再用于新 run。一个4MiB run 以16个256KiB块保存，合计仍是4MiB。小块用于归并时按需读取 run 的下一段，避免每个 spill run 都要占4MiB读缓冲。
 
@@ -38,3 +39,7 @@ sudo /home/femu/apps/csd-passthru/csd-passthru /dev/nvme0n1 smoke-so-all csd-ori
 ```
 
 可选 BPF 用根构建目录的 csd-vadd-bpf 目标。原生 kernels 依赖 liblz4 开发包。
+
+## 普通文件排序对比
+
+read_sort_limit.c 独立编译为 build/examples/read-sort-limit，只链接同一个 workmem 分配器，不调用设备接口。输入、输出和 I/O 缓冲加 workmem 的峰值不超过64MiB；输入 O_DIRECT 读取，临时文件在输入所在目录创建并 unlink，也用 O_DIRECT 读写。两边同样生成64个4MiB run，优先驻留、申请失败才 spill，归并每个 spill run 缓存256KiB，全部输出到 EOF 后取前5。由宿主 tests/snia-cs-api-test.sh bench 传到 Guest 运行并检查 spill 工作量一致。

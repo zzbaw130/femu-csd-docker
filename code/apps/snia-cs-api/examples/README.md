@@ -28,22 +28,35 @@ sudo ./cs-batch-sort-limit /dev/nvme0n1 /data/cs-batch-input.bin
 bash tests/snia-cs-api-test.sh bench
 ```
 
-脚本编译两个 Guest 程序，交替运行3轮，并检查每次前5完全一致。CPU 基线是 tests/read_sort_limit.cpp：普通 read 读完整256MiB，用单线程 std::sort 全量降序排序，再取前5；每轮先用 POSIX_FADV_DONTNEED 请求丢弃该文件的 Guest 页缓存。CSD 用 --existing 复用同一个文件，不重新生成数据，继续执行现有64MiB workmem下的按需spill和完整归并。
+普通路径是独立 C 程序 [read_sort_limit.c](../../../csd-programs/examples/tests/read_sort_limit.c)，不调用 SNIA 或 NVMe API。它和设备 sort.cpp 共用 batch_sort.h 中的原地降序 quicksort，以及 libcs-workmem.so 分配器实现（Guest 与 FEMU 进程各有独立的池）。两边都单线程执行以下流程：
 
-计时排除文件生成和打开：CPU 从数组申请之后、第一次 read 之前开始；CSD 从 extent 查询、算子下载/激活及 AFDM/请求缓冲分配完成后开始，包含 batch 配置、内部 I/O、运行中的 workmem 申请、计算、重入、结果读取和 source 的 EOF 回收。日志中的 TIMING 行依次输出模式、第一阶段秒数、第二阶段秒数、总秒数：CPU 两阶段是 read 和 sort+limit，CSD 两阶段是 LOAD+sink（含排序与spill）和 source+limit（含归并与回收），阶段含义不同。
+1. 顺序读取同一256MiB文件，每4MiB原地排序，产生64个 run。
+2. 申请 run 内存成功就驻留，失败才淘汰编号最小的驻留 run。每次完整写出4MiB，分16次256KiB I/O。
+3. 为 spill run 按需申请256KiB头部读缓冲；申请失败仍淘汰驻留 run。每个输出值都比较未耗尽 run 的头部，完成全量归并。
+4. 每4MiB输出交给 LIMIT，保留首5个数，但继续归并到 EOF，计时包含释放工作内存和临时数据。
 
-脚本输出3轮平均总耗时及 CPU/CSD 比值，大于1表示这次测量中CSD更快。原始日志和 timings.tsv 写入打印出的 /tmp/snia-sort-limit.* 目录。此测试比较当前两条实现路径：CPU 使用约256MiB排序数组，CSD workmem为64MiB并产生额外临时I/O；FEMU的设备算子实际运行在宿主线程，结果不能直接代表真实SSD的CPU性能。
+两条路径的**算法内存总预算都是64MiB**：run 数据、状态、读缓冲、分配块头，以及 input、io、sorted、result 四个缓冲都计入。先从64MiB扣除这四个缓冲，剩余约55.75MiB给 workmem（容量向下按页对齐）。CPU 缓冲是进程内存；设备缓冲是 AFDM，设备通过 context 配额扣除同样的空间，FDM 容量和共享 workmem 的全局配置仍各64MiB。这是算法与 I/O 缓冲预算，不是操作系统对整个 Guest/FEMU 进程 RSS 的限制；代码、线程栈和库的固定管理开销不在此预算中。
 
-2026-10-20 实测：Guest为8 vCPU、8GiB，CPU排序单线程，CSD batch使用SERIAL，FDM/workmem各64MiB；同一文件有3个extent，所有结果一致。
+普通路径的输入和临时文件均使用同步 O_DIRECT，绕过 Guest 页缓存，避免临时数据借用不受上述预算限制的缓存。临时文件创建在输入旁边（/data，正常数据分区），创建后立即 unlink，关闭时释放；CSD 走内部 LOAD/STORE，在 femu-spill 分区保存临时块。两者访问同一 FEMU namespace，仍分别包含文件系统路径和内部设备路径的实际成本。O_DIRECT 表示绕过页缓存，不额外承诺掉电持久性。
 
-| 轮次 | CPU总耗时（秒） | CSD总耗时（秒） |
+脚本在容器用与 Guest 兼容的工具链编译普通 C 程序，并把二进制及同一 workmem 库传到 Guest /tmp/csd-sort-bench；CSD 应用仍在 Guest 编译。bench 交替运行两种路径各3轮，检查前5一致、run 数与逻辑 spill 读写量一致、算法内存峰值不超过64MiB。CSD 使用 --existing，不重新生成文件。
+
+计时排除文件打开、临时文件创建、文件生成、extent 查询、程序下载/激活、初始 I/O 缓冲和内存池初始化。两边均计入运行中的状态/run/归并缓冲申请、I/O、排序、完整归并和临时数据回收；CSD 另含 batch 配置、重入和小结果复制。TIMING 行的两阶段统一为“读入+生成run+必要spill”和“归并+LIMIT+回收”。WORKLOAD 行打印 run 数、spill run 数、读写字节、总内存峰值和预算。
+
+日志及 timings.tsv 写入脚本打印的 /tmp/snia-sort-limit.*。CPU/CSD 为平均总延迟之比，大于1表示 CSD 更快。设备算子实际在宿主 CU 线程运行，普通路径在 Guest CPU 运行；测量用于比较当前仿真实现，不能直接代表真实 SSD 计算核性能。此前 CPU 全量内存排序10.19秒与 CSD 61.34秒的比较使用不同内存预算和算法，不能据此得出同等条件下的加速比。
+
+2026-10-20在同一 Guest（8 vCPU、8GiB）和文件（3个extent）上实测，CPU单线程、CSD使用SERIAL batch：
+
+| 轮次 | 普通文件路径（秒） | CSD路径（秒） |
 | --- | ---: | ---: |
-| 1 | 10.447 | 61.348 |
-| 2 | 10.120 | 61.576 |
-| 3 | 10.005 | 61.105 |
-| 平均 | 10.191 | 61.343 |
+| 1 | 85.431 | 61.988 |
+| 2 | 85.177 | 61.805 |
+| 3 | 85.096 | 61.521 |
+| 平均 | 85.234 | 61.771 |
 
-本次CSD耗时约为CPU的6.02倍。CPU平均read为0.580秒、sort+limit为9.611秒；CSD平均LOAD+sink为8.124秒、source+limit为53.219秒。后者含spill读取、完整归并及回收，占CSD总时间约87%。当前source每输出一个整数会遍历全部run，这与CPU一次性内存排序的算法和I/O开销不同；这些阶段计时尚不能单独量化比较、重入和内部I/O各自的占比。
+两条路径每轮均为64个run，累计spill 54个run，写入与回读各216MiB。CPU内存峰值63.753MiB、CSD为63.762MiB，差别主要来自CPU文件偏移与设备token描述的大小不同。全部前5一致。普通路径两个阶段平均8.632/76.603秒，CSD为8.459/53.312秒，总延迟比CPU/CSD为1.380，CSD延迟降低约27.5%。原始数据：/tmp/snia-sort-limit.tvUcHU/timings.tsv。
+
+这次两边均执行同一逐值遍历64个run的归并逻辑，归并阶段仍占主要时间。两阶段包含计算与I/O，没有单独测量各项开销，不能把23.29秒的归并阶段差距全部归因于内部带宽；Guest与宿主的执行成本、编译器生成的循环、文件系统/内部I/O和重入均可能影响结果。
 
 ## extent 与内部 LOAD
 
@@ -57,7 +70,7 @@ fsync 后用 FIEMAP 查询物理 extent。FIEMAP 地址相对于数据分区；L
 | --- | --- | --- |
 | input | 4MiB | LOAD 写入，sink 的 MR[0] 读取 |
 | io | 256KiB | sink/source 的 MR[1]，最后一个 AFDM；保存一个待 STORE 或刚 LOAD 的 spill 块 |
-| sorted | 4MiB+8字节 | source 的 MR[0] 写 count、finished 和全局降序整数；limit 的 MR[0] 读 |
+| sorted | sizeof(sorted_chunk)，约4MiB | source 的 MR[0] 写 count、finished、运行统计和全局降序整数；limit 的 MR[0] 读 |
 | result | sizeof(top_five) | limit 的 MR[1] 保留前5并传递 finished；Guest 只读这个小结果 |
 
 首次 sink 只传 input、io，cparam1 默认为0。sink 创建状态、保存第一个 run，并把64位状态标识作为普通 CompValue 返回。Guest 把它加入之后 sink/source 请求的第一个标量位置。cparam2 始终留给库在重入时传入刚完成 I/O 的 spill_id。Guest 不解引用状态标识。
@@ -92,7 +105,9 @@ main 只申请一份 LOAD 节点缓冲和一份计算节点缓冲。csConfigureB
 
 4MiB 是一次排序的输入和一个 run 的大小。256KiB 是 I/O 及归并缓存的大小；只有需要淘汰 run 时，才连续 STORE 16次，保存完整4MiB。归并只需为每个 spill run 缓存下一段，而不是同时把所有完整 run 载入内存。
 
-所有 run 数据、读缓冲和描述都由同一 workmem context 分配。内存充足时没有 spill；256MiB输入在64MiB工作池下会触发申请失败、淘汰和重入。没有额外的固定 spill 阈值或预留算法内存池。
+所有 run 数据、读缓冲和描述都由同一 workmem context 分配。示例从64MiB总预算扣除 AFDM 缓冲后限制 context；256MiB输入会触发申请失败、淘汰和重入。没有按输入字节计数的固定 spill 阈值。
+
+始终只有64个4MiB run，并没有把它们重新排序成1024个小 run。若同时为64个 run 各准备4MiB读缓冲，需要256MiB；各用256KiB只需16MiB，因此可以在这个预算内一次归并全部 run。256KiB是本示例选取的块大小，不是规范要求；它减少归并缓存占用，也增加 STORE/LOAD 次数。
 
 source 每次最多输出4MiB，最后一批同时带 finished=1；即使最后一批恰好装满，也已经销毁状态，不能再调用一次探测 EOF。本示例把整个有序流读完，以展示正常结束自动回收；limit 始终保留首5，后续 chunk 不覆盖它们。
 

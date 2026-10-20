@@ -285,6 +285,10 @@ int main(int argc, char **argv)
     double sink_seconds = sink_done.tv_sec - start.tv_sec + (sink_done.tv_nsec - start.tv_nsec) / 1e9;
     double source_seconds = end.tv_sec - sink_done.tv_sec + (end.tv_nsec - sink_done.tv_nsec) / 1e9;
     printf("TIMING CSD %.6f %.6f %.6f\n", sink_seconds, source_seconds, sink_seconds + source_seconds);
+    printf("WORKLOAD CSD runs=%u spilled=%u write=%llu read=%llu peak=%llu limit=%u\n",
+           top.metrics.runs, top.metrics.spilled_runs,
+           (unsigned long long)top.metrics.spill_write_bytes, (unsigned long long)top.metrics.spill_read_bytes,
+           (unsigned long long)top.metrics.peak_bytes, SORT_MEMORY_BYTES);
     puts("PASS: 256 MiB, memory-first runs, spill on allocation failure, full merge, LIMIT 5; source released all state");
     rc = 0;
 cleanup:

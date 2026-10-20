@@ -14,5 +14,6 @@ int64_t limit_five(struct femu_csd_args *args)
     memcpy(output->values + output->count, input->values, count * sizeof(int32_t));
     output->count += count;
     output->finished = input->finished;
+    if (input->finished) output->metrics = input->metrics;
     return output->count;
 }
