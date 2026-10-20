@@ -1,10 +1,39 @@
 # pg_sina_csd 设备算子
 
-这里的 .so 在容器内编译，由 FEMU 的 CU 线程执行，逻辑上属于 CSD CPU。Guest 扩展和 SNIA 调度代码位于 code/apps/pg_sina_csd；FEMU 不解释 SQL。
+这里的 SO 在容器内编译，由 FEMU 的 CU 线程执行，逻辑上属于 CSD CPU。Guest 中的 PG 扩展和 SNIA 调度代码位于 `code/apps/pg_sina_csd`；FEMU 不解释 SQL，也未增加 SQL 专用 runtime。
 
-当前 heap_count.c 编译为 build/pg-sina-heap-count.so，导出 pg_sina_heap_count。MR[0]为PG12原始heap页，MR[1]为pg_sina_count输出；cparam1为物理列数，cparam2为有效输入长度。只处理x86-64小端、8KiB页、完全visible/frozen的heap；格式或可见性不符合时返回负值，SNIA报告执行错误。
+## 执行流程
 
-本入口只计数，无跨调用私有状态。后续有私有算法工作区的算子必须使用libcs-workmem；构建已通过根目录add_csd_program统一链接。AFDM只存输入/输出，不作为算法运行空间。
+PG 从表达式树生成列投影、过滤、聚合、排序和 LIMIT 描述，Guest 的短生命周期 worker 用 SNIA batch 提交：
+
+```text
+LOAD → Scan → Filter（可选）→ Aggregate.sink     # 每个 CU 一个分支，HYBRID batch
+                   ...重复读取后续 chunk...
+Aggregate.source → Sort（可选）→ Limit（可选）  # 合并局部状态，SERIAL batch
+```
+
+每个分支通常处理4MiB原始页。各分支拥有独立输入缓冲、列批次和聚合状态；SNIA 按依赖并行提交，底层不猜测并行策略。整个查询的数据块循环由 Guest worker 驱动，单个 batch 的依赖执行由 SNIA 调度。当前不包含设备自主预取或读算重叠。
+
+| 源文件 / 构建产物 | 工作及 MR 参数顺序 |
+| --- | --- |
+| scan.c / pg-sina-scan.so | MR[0]原始页、MR[1]计划、MR[2]投影列批次、MR[3]分支状态与有效输入字节数 |
+| filter.c / pg-sina-filter.so | MR[0]列批次、MR[1]计划；生成 selection vector，不复制被选中的行 |
+| aggregate.c / pg-sina-aggregate.so | sink：MR[0]列批次、MR[1]计划、MR[2]分支状态；source：MR[0]所有局部状态句柄、MR[1]最终结果 |
+| sort.c / pg-sina-sort.so | MR[0]最终结果、MR[1]计划；按多列方向及 NULL 顺序堆排序 |
+| limit.c / pg-sina-limit.so | MR[0]最终结果、MR[1]计划；设置结果范围，支持 OFFSET |
+| heap_count.c / pg-sina-heap-count.so | 阶段0诊断：MR[0]原始页、MR[1]计数；cparam1物理列数、cparam2有效输入字节数 |
+
+`query.h`（位于 apps/pg_sina_csd/include）定义本扩展的应用级输入输出布局，`query_eval.h` 共享精确表达式计算。参数均按上述顺序构造，不新增设备参数解码机制。source 还接受仅有 MR[0] 的清理调用，用于错误或取消时释放尚未完成的局部状态。
+
+## 列批次与内存
+
+Scan 只解码查询需要的列；跳过其他列的内容，仍须遍历 heap 的变长属性边界。输出为列式 int64 值、NULL 位图、小数显示精度和 selection vector。输入 numeric 使用百分之一为单位，表达式及 SUM/AVG 使用带溢出检查的整数运算；内部 `__int128` 仅用于精确计算，不是 NVMe 标量参数封装。AVG 在设备上完成除法及符合 PG numeric 的精度选择与舍入，Guest 只转换最终结果为 PG Datum。
+
+AFDM 保存输入、输出、计划和不透明状态句柄；真正的哈希表和排序工作区通过 `libcs-workmem` 分配。sink 首次运行创建私有上下文，source 合并后销毁；取消路径也调用 source 清理。所有 SO 通过根目录 `add_csd_program` 统一链接同一份 workmem 库。64MiB AFDM 与64MiB workmem 是两项独立限制。
+
+当前针对 Q1/Q6：PG12、x86-64小端、8KiB页、完全 visible/frozen heap；numeric 输入必须有限、至多两位小数且可精确表示为 int64 百分数。支持整数、date、bool、ASCII bpchar(1)；分组最多256组，最多4个 CU。这里的 Sort 只排序聚合后的少量结果，尚非可 spill 的通用行排序。超出已知规划能力回退 PG；数据值超出上述设备表示范围时会报错，不能将这种情况视为已实现透明回退。
+
+## 编译与测试
 
 ```sh
 cmake -S code/csd-programs -B code/csd-programs/build -DCMAKE_BUILD_TYPE=RelWithDebInfo
@@ -12,4 +41,4 @@ cmake --build code/csd-programs/build -j2
 ctest --test-dir code/csd-programs/build -R pgSina --output-on-failure
 ```
 
-生产请求由Guest构建LOAD→count的SNIA batch。设备算子不调用NVMe，不持有Guest文件描述符，不自行访问SQL元数据。
+真实 PG heap、冷启动结果对照和 EXPLAIN 检查由 `tests/pg-sina-csd-test.sh query` 执行。设备算子不调用 NVMe，不持有 Guest 文件描述符，不查询 SQL 元数据。

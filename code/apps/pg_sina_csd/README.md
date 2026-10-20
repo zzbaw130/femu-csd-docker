@@ -4,17 +4,19 @@
 
 目标是把 PG 执行计划转换为 SNIA batch，由 Guest 调度 CSD 算子。只读实验使用与原生 PG 相同的全表 visible/frozen heap；实验前准备一次 schema、extent 和 LBA 映射，后续持续使用。文件、schema 或设备变化以及重启后重新准备，不设置守护连接。
 
-当前完成阶段0：扩展安装、静态映射和设备 heap 行数校验。尚未接入 planner/CustomScan，普通 SQL 仍由原生 PG 执行。
+当前完成阶段1：Q1/Q6 由 PG 表达式树生成动态 pipeline，通过 CustomScan 卸载 Scan、Filter、表达式、SUM/AVG/COUNT、低基数分组、结果排序与 LIMIT/OFFSET。Q1/Q6 的 SQL 数据算子都在 CSD 执行；PG 负责规划、权限检查及结果 Datum 转换。其余能力按[开发计划](doc/development.md)逐步补齐，尚未支持全部22条 TPC-H。
 
 ## 执行路径与冷启动
 
 ```sql
 LOAD 'pg_sina_csd';
 SET pg_sina_csd.exe_path=host; -- 默认：PG原生路径
-SET pg_sina_csd.exe_path=csd;  -- 优先卸载支持的子计划，不支持时保留PG执行
+SET pg_sina_csd.exe_path=csd;  -- 卸载支持的查询计划，不支持时保留PG执行
 ```
 
-auto将在成本模型实现后开放，目前只接受host/csd。切换后应重新规划语句；不要复用切换前已经生成的prepared plan。
+`auto` 将在成本模型实现后开放，目前只接受 `host` / `csd`。切换选项会使 prepared plan 缓存失效，下一次执行按新路径重新规划。需要在规划前 LOAD 扩展；也可通过 session_preload_libraries 加载。
+
+当前只为单表聚合生成完整 CustomScan；不支持的连接、HAVING、表达式等保留原生计划。后续再扩展到混合子计划，不会将不支持的算子伪装成设备执行。没有准备映射的表也保留原生路径；已有映射失效时执行报错并要求重新 prepare。可用 EXPLAIN 查看 `SniaCsdAggregate` 及实际 SNIA Pipelines。
 
 TPC-H测量每条语句之前使用Guest的cold-query.sh：停止PG清空shared buffers，sync并drop_caches，再启动PG（测试期间autovacuum=off）。host和csd同样处理；不是只清除OS缓存。脚本在Guest执行：
 
@@ -29,12 +31,16 @@ TPC-H测量每条语句之前使用Guest的cold-query.sh：停止PG清空shared 
 
 | 路径 | 用途及执行位置 |
 | --- | --- |
-| src/extension.c | Guest PG 扩展入口与版本函数 |
+| src/extension.c | Guest PG 扩展入口、exe_path 与 planner hook |
+| src/planner/ | Guest PG 表达式树转设备计划，选择可卸载路径 |
+| src/executor/ | Guest CustomScan 生命周期、取消回收及最终 Datum 转换 |
+| src/transport/ | Guest PG 读取已准备映射并启动 SNIA worker |
+| src/worker.c | Guest 每查询一个进程，仅负责 SNIA batch 编排与资源回收 |
 | src/prepare.c | Guest PG 内检查 visible/frozen，checkpoint，保存 schema/extent/LBA |
 | src/check.c | Guest 诊断工具，链接 libpq 和 libsnia；提交 LOAD→heap_count，与原生 COUNT 比较 |
-| include/heap_count.h | Guest 与设备共同使用的计数结果布局 |
+| include/ | Guest 与设备共用的查询计划、列批次、结果及诊断计数布局 |
 | sql/ | 扩展安装 SQL；sina_csd schema 保存准备结果 |
-| tests/ | PG12 实际页布局与准备功能测试 |
+| tests/ | PG12 页布局、准备测试、SQL 边界用例及 Q1/Q6 |
 | doc/ | 分阶段开发记录 |
 | ../../csd-programs/pg_sina_csd/ | 容器编译、FEMU CU 执行的设备算子 |
 
@@ -55,6 +61,10 @@ bash tests/pg-sina-csd-test.sh prepare
 bash tests/pg-sina-csd-test.sh check
 # 临时测试表：拒绝未冻结输入、schema/extent 保存、空表
 bash tests/pg-sina-csd-test.sh sql
+# 每条查询分别冷启动：Q1/Q6、NULL/空输入/排序/回退、prepared plan 切换及取消回收
+bash tests/pg-sina-csd-test.sh query
+# Q1/Q6各3轮，交替host/csd，每次重新冷启动并核对结果
+bash tests/pg-sina-csd-test.sh bench
 ```
 
 Guest 中也可手动：
@@ -99,6 +109,23 @@ sudo /home/femu/opt/pg_sina_csd/build/pg-sina-csd-check \
 
 设备输入为 MR[0] 原始页、MR[1] 计数结果；cparam1 为物理列数、cparam2 为实际有效输入字节数，保证尾块不扫描未使用的AFDM空间。算子校验页边界、tuple 边界和 frozen 标志，跳过 UNUSED/REDIRECT/DEAD line pointer。它是无状态诊断算子，不使用 spill 重入，故本入口的第二个标量可以表示长度。
 
-工具启动时检查 Guest boot ID 和 relfilenode；设备或文件变化后仍须主动重新准备。当前固定程序索引500，单次独占使用；不是跨PG backend程序目录管理方案。诊断工具通过sudo访问NVMe，不提升PG服务权限。后续SQL卸载阶段还需落实PG请求到NVMe的权限路径。
+工具启动时检查 Guest boot ID 和 relfilenode；设备或文件变化后仍须主动重新准备。当前固定程序索引500，单次独占使用；不是跨PG backend程序目录管理方案。诊断工具通过sudo访问NVMe，不提升PG服务权限。SQL 卸载同样使用现有 sudo 权限，具体路径见下文。
 
 PG 会另行执行 COUNT 校验结果，因此本工具用于正确性验收，不是 SQL 性能基准。后续阶段与验收记录见[开发记录](doc/development.md)。
+
+## SQL 卸载的执行位置
+
+```text
+Guest PG：解析/规划 → CustomScan → 读取数据库中的静态 extent 映射
+Guest worker：SNIA HYBRID batch → 多分支 LOAD → Scan → Filter → Aggregate.sink
+Guest worker：SNIA SERIAL batch → Aggregate.source → Sort → Limit
+Guest PG：接收少量最终结果 → 转换 Datum → 返回客户端
+```
+
+箭头中的 Scan/Filter/Aggregate/Sort/Limit 是设备 SO，运行在 FEMU CU；worker 本身不扫描 heap、不计算聚合、不排序。原始 heap 通过 NVM→AFDM 内部路径读取，不经过 Guest 应用缓冲。列批次保留在 AFDM，哈希表等私有状态放在受限 workmem。借鉴 DuckDB 的所需列投影、selection vector、局部聚合后合并及公共子表达式复用；当前表达式循环没有显式 SIMD，不能把批处理直接等同于 SIMD。
+
+PG 普通进程没有 vendor NVMe 命令权限，因此每次设备查询用 `sudo -n` 启动安装在 PG lib 目录的 `pg-sina-csd-worker`。它通过本地 socket 接收二进制计划和映射，不连接数据库、不解析 SQL、不是常驻代理。查询结束或取消后释放 batch、AFDM、workmem 状态和程序；取消在 batch 边界生效。该权限路径用于当前已有免密 sudo 的实验 Guest，并非生产权限隔离方案。
+
+worker 查询设备 FDM/CU 容量，通常按4MiB块和最多4个 CU 分配独立分支；容量不足会减少分支或块大小。当前程序索引501–506由整个查询持有 namespace 文件锁，设备查询串行进入；这是单查询性能实验的实现，尚未支持多 PG 会话共享程序目录。
+
+EXPLAIN ANALYZE 会显示投影列数、设备 CU 数、扫描/匹配行数、内部读取量、AFDM 用量及 workmem 峰值。计时包含 worker 启动、程序加载与回收，不只统计设备计算。具体类型和规模限制见[设备算子说明](../../csd-programs/pg_sina_csd/README.md)。

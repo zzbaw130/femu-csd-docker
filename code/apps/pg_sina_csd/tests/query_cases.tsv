@@ -1,0 +1,11 @@
+null_groups	SELECT k,sum(a),avg(a),sum(a*(1-b)),count(a),count(*) FROM snia_query_fixture GROUP BY k ORDER BY k DESC NULLS FIRST;
+boolean_filter	SELECT k,sum(a),avg(a),count(a),count(*) FROM snia_query_fixture WHERE d>=date '1994-01-01' AND (a>=0 OR a IS NULL) GROUP BY k ORDER BY k DESC NULLS FIRST LIMIT 3 OFFSET 1;
+empty_aggregate	SELECT sum(a),avg(a),count(a),count(*) FROM snia_query_empty;
+empty_groups	SELECT k,sum(a),count(*) FROM snia_query_empty GROUP BY k ORDER BY k;
+no_match	SELECT sum(a),avg(a),count(*) FROM snia_query_fixture WHERE a>1000;
+zero_average	SELECT avg(a),sum(a),count(a) FROM snia_query_fixture WHERE a=0;
+nullable_expression	SELECT sum(a*(1-b)),avg(a*(1-b)),count(a*(1-b)) FROM snia_query_fixture WHERE d>=date '1994-01-01';
+constant_aggregate	SELECT sum(1),avg(1.0),count(*) FROM snia_query_fixture;
+zero_limit	SELECT k,sum(a) FROM snia_query_fixture GROUP BY k ORDER BY k LIMIT 0;
+unsupported_aggregate	SELECT min(a),max(a) FROM snia_query_fixture;
+unsupported_having	SELECT k,sum(a) FROM snia_query_fixture GROUP BY k HAVING count(*)>0 ORDER BY k;
