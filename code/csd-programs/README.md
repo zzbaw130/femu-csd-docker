@@ -5,6 +5,7 @@
 ```text
 csd-programs/
 ├── CMakeLists.txt       # 公共编译、workmem 链接和输出规则
+├── pg_sina_csd/         # PG12 heap 设备算子，通过 SNIA batch 调用
 ├── examples/            # 原生 vadd/kernels、merge-sort、avg
 │   ├── CMakeLists.txt
 │   └── tests/           # 排序、重入和归并测试

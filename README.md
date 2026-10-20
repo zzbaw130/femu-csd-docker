@@ -1,3 +1,7 @@
+> 当前 `pg_sina_csd_dev` 从 `sina-femu-csd` 标签开始开发
+> [pg_sina_csd 扩展](code/apps/pg_sina_csd/README.md)，通过 SNIA 调用设备算子。
+> 当前已实现冻结 heap 映射与设备行数校验，尚未接入 SQL 计划卸载。
+
 > `snia_csd_dev` 分支基于 `femu-csd-with-original-postgre` tag，新增独立的
 > [Computational Storage API 库](code/apps/snia/README.md)。Guest 应用包含
 > `cs.h` 并用 `-lsnia` 链接库即可使用规范 API；能力范围及软件 batch 说明见该目录文档。
@@ -81,11 +85,13 @@ cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,f
 │   ├── apps/
 │   │   ├── postgres/                # PostgreSQL 12 源码（guest 里编译）
 │   │   ├── csd-passthru/            # guest 侧原生命令测试
-│   │   └── snia/                    # guest SNIA API 库与完整 batch 示例
+│   │   ├── snia/                    # guest SNIA API 库与完整 batch 示例
+│   │   └── pg_sina_csd/             # guest PG 扩展及 SNIA heap 校验
 │   └── csd-programs/                # 容器编译、FEMU CU 执行
 │       ├── CMakeLists.txt           # 统一构建、链接与输出
 │       ├── examples/                # 原生/SNIA 算子及 sort/avg 样例
 │       ├── csd-workmem/             # 共享工作内存库
+│       ├── pg_sina_csd/             # PG 设备算子
 │       └── build/                   # 统一 .so 输出目录（不入库）
 ├── data/                            # TPC-H pgdata tar（tpch_s<SF>.tar，仓库只带 SF=0.01）
 ├── results/                         # 实验结果（共享给 guest，按数据库名分子目录）
