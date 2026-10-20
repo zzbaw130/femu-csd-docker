@@ -230,3 +230,21 @@
 - 新版CSD平均sink/source阶段8.492733/4.973892秒，算子累计执行8.024623/4.570028秒，source线程CPU4.567398秒，run排序7.795755秒。E1累计12.809140秒；内部D0/D1/TRIM/F2为0.217255/0.295964/0.126260/0.002170秒。E1减两类排序CSF执行约0.214489秒，仍包含LIMIT及其他命令成本。主要瓶颈已转为run排序，其次为堆归并。
 - 两边均64个run、54个spill run，写入与回读各226492416字节，内存峰值CPU66850904、CSD66860056字节；6次前5一致，命令次数E1=2784、D0=928、D1=864、TRIM=864、F2=64。原始数据、profile TSV及原算法基线日志位于/tmp/snia-sort-limit.f3wFHU。
 - 宿主5组SNIA及4组设备CTest通过。排序测试比较完整多run输出，覆盖跨块重入、输出chunk边界、内存压力淘汰、EOF与提前停止；补充64槽堆替换/删除、重复值、INT32极值检查及计时字段检查。生产传输测试覆盖诊断开关、命令分类、忽略Identify、失败请求计数和errno保持。排序ASan/UBSan/LeakSanitizer通过。
+
+## 2026-10-20：完整排序后分批AVG，移除LIMIT示例
+
+### 修改
+
+- 删除设备limit.c及cs-example-limit.so，新增单文件avg.c，入口avg_int32，编译为cs-example-avg.so。Guest示例更名cs_batch_sort_avg.c/目标cs-batch-sort-avg；普通C基线更名read_sort_avg.c/目标read-sort-avg。同步CMake、脚本、项目及设备说明，移除当前文档中的LIMIT提前结束流程；历史记录保留。
+- 输出AFDM中的average_result以int64 sum、uint64 count跨批次累计，再计算double average，finished仅跟随source EOF。初始结果清零，不把各批均值直接相加或取平均。256MiB int32的最坏总和绝对值不超过2^57；空输入以count=0区分，average暂置0，无SQL NULL语义。AVG返回累计count，不触发提前结束。
+- CPU与CSD共用同一分批累加函数，第二阶段均为sort.source→AVG并消费完整输出。新增average_work墙钟和线程CPU计时；CPU source_work扣除AVG时间，保持与设备source入口相同口径。最终必须消费67,108,864个整数。
+- 文件生成时独立累计参考总和并在真实示例末尾核对；bench交替测量三轮，严格核对每次总和、条数、均值、spill量和内存预算。仍使用大根堆、4MiB run、256KiB spill块、共享workmem及SERIAL，无自动多CU或预取。
+- 设备测试继续逐项比较全部排序输出，AVG增加不等长批次[10,20]与[90]得到40的检查，覆盖空批次、空EOF、负数/INT32极值以及拒绝重复消费EOF；SNIA mock batch改用真实AVG并核对全部数据的sum/count/average和EOF回收。
+
+### 验证与实测
+
+- 宿主4组设备与5组SNIA CTest通过，容器4组设备CTest通过。容器及Guest同步重编，旧LIMIT设备SO和旧Guest/CPU临时二进制已删除；数据分区在运行结束后回到257MiB占用。排序与AVG的ASan/UBSan/LeakSanitizer检查通过。
+- Guest真实示例重新生成相同伪随机数据，在2个extent上完整执行并通过生成时的独立总和参考。6次延迟测试结果均为count=67108864、sum=15688155813636、average=233771.73861318827。
+- 三轮CPU总延迟13.827569/13.538000/13.739177，平均13.701582秒；CSD为13.388101/13.345029/13.465496，平均13.399542秒。CPU/CSD约1.023，两条路径仍为相近量级。
+- 两阶段CPU平均8.779530/4.922052秒，CSD为8.383206/5.016335秒。AVG自身平均CPU0.054643、CSD0.059315秒；CSD sink/source执行7.984451/4.550438秒，run排序7.774153秒，E1累计12.797748秒，D0/D1/TRIM/F2为0.238663/0.228625/0.115047/0.002520秒。E1包含AVG执行，不可与三个CSF执行时间重复相加。
+- 两边均64个run、54个spill run，写入及回读各226492416字节；CPU算法内存峰值66850920、CSD66860072字节，均小于64MiB。原始日志、timings.tsv及profiles.tsv位于/tmp/snia-sort-avg.GQq8lV。

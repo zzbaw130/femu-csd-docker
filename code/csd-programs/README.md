@@ -5,7 +5,7 @@
 ```text
 csd-programs/
 ├── CMakeLists.txt       # 公共编译、workmem 链接和输出规则
-├── examples/            # 原生 vadd/kernels、sort、limit
+├── examples/            # 原生 vadd/kernels、sort、avg
 │   ├── CMakeLists.txt
 │   └── tests/           # 排序、重入和归并测试
 ├── csd-workmem/
@@ -77,5 +77,5 @@ AFDM 保存输入、输出和交接数据；私有算法状态使用工作内存
 - [分配器使用规范](csd-workmem/README.md)。
 - `bash tests/snia-cs-api-test.sh unit`：本地设备程序与 SNIA 测试。
 - `bash tests/snia-cs-api-test.sh build`：容器设备程序与 Guest SDK。
-- `bash tests/snia-cs-api-test.sh example`：Guest 256MiB 文件排序取前5。
+- `bash tests/snia-cs-api-test.sh example`：Guest 256MiB 文件完整排序后分批计算平均值。
 - `bash tests/csd-workmem-test.sh unit|build|live`：工作内存模拟或真实设备测试。

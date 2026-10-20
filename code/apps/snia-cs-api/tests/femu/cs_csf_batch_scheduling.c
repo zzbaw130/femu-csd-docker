@@ -115,7 +115,7 @@ int main(void)
     CHECK(buf[0] == 0x44 && buf[6] == 0x22);
     CS_CSF_ID sink = load(d, "cs-example-sort.so", "sort_sink", "sink", 201),
               source = load(d, "cs-example-sort.so", "sort_source", "source", 202),
-              limit = load(d, "cs-example-limit.so", "limit_five", "limit", 203);
+              average = load(d, "cs-example-avg.so", "avg_int32", "avg", 203);
     int n = 0;
     CHECK(csQueryDeviceProperties(d, CS_FDM_TYPE, &n, NULL) == CS_INVALID_LENGTH);
     CsProperties *props = calloc(1, n);
@@ -244,7 +244,7 @@ int main(void)
     OK(csAllocMem(d, SORT_CHUNK_BYTES, &clear, &input, NULL));
     OK(csAllocMem(d, SORT_BLOCK_BYTES, &clear, &io, NULL));
     OK(csAllocMem(d, sizeof(struct sorted_chunk), &clear, &sorted, NULL));
-    OK(csAllocMem(d, sizeof(struct top_five), &clear, &output, NULL));
+    OK(csAllocMem(d, sizeof(struct average_result), &clear, &output, NULL));
     int32_t *data = malloc(SORT_CHUNK_BYTES);
     CHECK(data);
     CsBatchRequest *request = calloc(1, sizeof(*request) + 2 * sizeof(CsComputeArg));
@@ -255,9 +255,13 @@ int main(void)
     csHelperSetComputeArg(&request->u.Compute.Args[1], CS_AFDM_TYPE, io, 0UL);
     OK(csAllocBatchRequest(CS_BATCH_SERIAL, 1, &batch));
     OK(csConfigureBatchEntry(batch, CS_BATCH_ADD, request, 0, 0, &first));
+    int64_t expected_sum = 0;
     u64 state = 0;
     for (unsigned chunk = 0; chunk < 4; ++chunk) {
-        for (unsigned i = 0; i < SORT_CHUNK_BYTES / 4; ++i) data[i] = (int32_t)(i % 100) - 50 + (int32_t)chunk;
+        for (unsigned i = 0; i < SORT_CHUNK_BYTES / 4; ++i) {
+            data[i] = (int32_t)(i % 100) - 50 + (int32_t)chunk;
+            expected_sum += data[i];
+        }
         OK(copy(input, data, SORT_CHUNK_BYTES, CS_COPY_TO_DEVICE, 0));
         OK(csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, &value));
         if (!state) {
@@ -273,19 +277,19 @@ int main(void)
     csHelperSetComputeArg(&request->u.Compute.Args[0], CS_AFDM_TYPE, sorted, 0UL);
     OK(csAllocBatchRequest(CS_BATCH_HYBRID, 2, &batch));
     OK(csConfigureBatchEntry(batch, CS_BATCH_ADD, request, 0, 0, &first));
-    request->u.Compute.CSFId = limit;
+    request->u.Compute.CSFId = average;
     request->u.Compute.NumArgs = 2;
     csHelperSetComputeArg(&request->u.Compute.Args[1], CS_AFDM_TYPE, output, 0UL);
     OK(csConfigureBatchEntry(batch, CS_BATCH_ADD, request, 0, first, &second));
     OK(csCreateEvent(&event));
-    struct top_five top;
+    struct average_result result;
     do {
         CHECK(csQueueBatchRequest(batch, NULL, NULL, event, NULL, NULL) == CS_QUEUED);
         wait_event(event);
-        OK(copy(output, &top, sizeof(top), CS_COPY_FROM_DEVICE, 0));
-    } while (!top.finished);
-    CHECK(top.count == 5);
-    for (unsigned i = 0; i < 5; ++i) CHECK(top.values[i] == 52);
+        OK(copy(output, &result, sizeof(result), CS_COPY_FROM_DEVICE, 0));
+    } while (!result.finished);
+    CHECK(result.count == 4ULL * SORT_OUTPUT_VALUES && result.sum == expected_sum);
+    CHECK(result.average == (double)expected_sum / (double)result.count);
     OK(csDeleteEvent(event));
     OK(csFreeBatchRequest(batch));
     OK(csFreeMem(output, &f)); OK(csFreeMem(sorted, &f));

@@ -1,4 +1,4 @@
-/* Guest CPU baseline: file read -> 4 MiB runs -> full merge -> LIMIT 5.
+/* Guest CPU baseline: file read -> 4 MiB runs -> full merge -> average.
  * Uses the same bounded workmem allocator and run sort as the device program.
  * No SNIA/NVMe calls. O_DIRECT keeps spill outside the Guest page cache. */
 #define _GNU_SOURCE
@@ -104,7 +104,7 @@ int main(int argc, char **argv)
     int32_t *input = NULL;
     void *io = NULL;
     struct sorted_chunk *output = NULL;
-    struct top_five *top = NULL;
+    struct average_result *result = NULL;
     cs_work_context *context = NULL;
     struct stat info;
     file = open(path, O_RDONLY | O_DIRECT);
@@ -125,8 +125,8 @@ int main(int argc, char **argv)
     if (posix_memalign((void **)&input, 4096, SORT_CHUNK_BYTES) ||
         posix_memalign(&io, 4096, SORT_BLOCK_BYTES)) goto cleanup;
     output = malloc(sizeof(*output));
-    top = calloc(1, sizeof(*top));
-    if (!output || !top || cs_work_init(SORT_WORK_BYTES)) goto cleanup;
+    result = calloc(1, sizeof(*result));
+    if (!output || !result || cs_work_init(SORT_WORK_BYTES)) goto cleanup;
     struct sort_timing start = sort_clock(), sink_done, end;
     context = cs_work_begin();
     struct sort_state *s = context ? cs_work_calloc(context, 1, sizeof(*s)) : NULL;
@@ -178,16 +178,15 @@ int main(int argc, char **argv)
             s->root_pending = true;
             ++emitted;
         }
-        unsigned count = 5 - top->count;
-        if (count > output->count) count = output->count;
-        memcpy(top->values + top->count, output->values, count * sizeof(int32_t));
-        top->count += count;
+        output->finished = emitted == SORT_FILE_BYTES / sizeof(int32_t);
+        if (output->finished) output->metrics = s->metrics;
+        average_chunk(result, output);
     } while (emitted < SORT_FILE_BYTES / sizeof(int32_t));
     cs_work_context_stats stats;
     if (cs_work_get_context_stats(context, &stats)) goto cleanup;
-    top->metrics = s->metrics;
-    top->metrics.runs = s->count;
-    top->metrics.peak_bytes = stats.peak_used_bytes + SORT_BUFFER_BYTES;
+    result->metrics = s->metrics;
+    result->metrics.runs = s->count;
+    result->metrics.peak_bytes = stats.peak_used_bytes + SORT_BUFFER_BYTES;
     cs_work_end(context);
     context = NULL;
     /* Closing the unlinked file releases all spill extents inside the timer. */
@@ -198,20 +197,24 @@ int main(int argc, char **argv)
     temporary = -1;
     if (close_status) goto io_error;
     end = sort_clock();
-    top->metrics.source.wall_ns = end.wall_ns - sink_done.wall_ns - spill_read.time.wall_ns
-        - (spill_write.time.wall_ns - sink_io.wall_ns) - release_file.time.wall_ns;
-    top->metrics.source.cpu_ns = end.cpu_ns - sink_done.cpu_ns - spill_read.time.cpu_ns
-        - (spill_write.time.cpu_ns - sink_io.cpu_ns) - release_file.time.cpu_ns;
-    printf("Top 5: %d %d %d %d %d\n", top->values[0], top->values[1], top->values[2], top->values[3], top->values[4]);
+    result->metrics.source.wall_ns = end.wall_ns - sink_done.wall_ns - spill_read.time.wall_ns
+        - (spill_write.time.wall_ns - sink_io.wall_ns) - release_file.time.wall_ns - result->aggregate.wall_ns;
+    result->metrics.source.cpu_ns = end.cpu_ns - sink_done.cpu_ns - spill_read.time.cpu_ns
+        - (spill_write.time.cpu_ns - sink_io.cpu_ns) - release_file.time.cpu_ns - result->aggregate.cpu_ns;
+    if (!result->finished || result->count != SORT_FILE_BYTES / sizeof(int32_t)) goto cleanup;
+    printf("AVERAGE count=%llu sum=%lld value=%.17g\n", (unsigned long long)result->count,
+           (long long)result->sum, result->average);
     printf("WORKLOAD CPU runs=%u spilled=%u write=%llu read=%llu peak=%llu limit=%u\n",
-           top->metrics.runs, top->metrics.spilled_runs,
-           (unsigned long long)top->metrics.spill_write_bytes, (unsigned long long)top->metrics.spill_read_bytes,
-           (unsigned long long)top->metrics.peak_bytes, SORT_MEMORY_BYTES);
+           result->metrics.runs, result->metrics.spilled_runs,
+           (unsigned long long)result->metrics.spill_write_bytes, (unsigned long long)result->metrics.spill_read_bytes,
+           (unsigned long long)result->metrics.peak_bytes, SORT_MEMORY_BYTES);
     printf("TIMING CPU %.6f %.6f %.6f\n", seconds(start, sink_done), seconds(sink_done, end), seconds(start, end));
     printf("PROFILE CPU sink_work wall_s=%.9f cpu_s=%.9f run_sort_s=%.9f\n",
-           top->metrics.sink.wall_ns / 1e9, top->metrics.sink.cpu_ns / 1e9, top->metrics.run_sort_ns / 1e9);
+           result->metrics.sink.wall_ns / 1e9, result->metrics.sink.cpu_ns / 1e9, result->metrics.run_sort_ns / 1e9);
     printf("PROFILE CPU source_work wall_s=%.9f cpu_s=%.9f\n",
-           top->metrics.source.wall_ns / 1e9, top->metrics.source.cpu_ns / 1e9);
+           result->metrics.source.wall_ns / 1e9, result->metrics.source.cpu_ns / 1e9);
+    printf("PROFILE CPU average_work wall_s=%.9f cpu_s=%.9f\n",
+           result->aggregate.wall_ns / 1e9, result->aggregate.cpu_ns / 1e9);
     const char *names[] = {"input_read", "spill_write", "spill_read", "release"};
     const struct file_timing *timings[] = {&input_read, &spill_write, &spill_read, &release_file};
     for (unsigned i = 0; i < 4; ++i)
@@ -223,7 +226,7 @@ io_error:
     perror("file I/O");
 cleanup:
     if (context) cs_work_end(context);
-    free(top); free(output); free(io); free(input);
+    free(result); free(output); free(io); free(input);
     if (temporary >= 0) close(temporary);
     if (file >= 0) close(file);
     return rc;

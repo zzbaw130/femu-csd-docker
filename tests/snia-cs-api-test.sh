@@ -20,16 +20,16 @@ case ${1:-unit} in
         # Built with the container's Guest-compatible toolchain. Preserve the
         # executable's relative RPATH to the same workmem library used by CSFs.
         docker compose -f "$ROOT/docker-compose.yml" exec -T femu-csd env SSH_PORT="${SSH_PORT:-8080}" sh -c \
-            'tar -C /workspace/code/csd-programs/build -cf - examples/read-sort-limit libcs-workmem.so | ./run-guest-ssh.sh "mkdir -p /tmp/csd-sort-bench; tar -xf - -C /tmp/csd-sort-bench"'
+            'tar -C /workspace/code/csd-programs/build -cf - examples/read-sort-avg libcs-workmem.so | ./run-guest-ssh.sh "mkdir -p /tmp/csd-sort-bench; tar -xf - -C /tmp/csd-sort-bench"'
         ;;
     smoke|example)
         docker compose -f "$ROOT/docker-compose.yml" exec -T femu-csd \
             env SSH_PORT="${SSH_PORT:-8080}" ./run-guest-ssh.sh \
-            'sudo /tmp/snia-cs-api-guest/cs-batch-sort-limit /dev/nvme0n1 /data/cs-batch-input.bin'
+            'sudo /tmp/snia-cs-api-guest/cs-batch-sort-avg /dev/nvme0n1 /data/cs-batch-input.bin'
         ;;
     bench)
         bash "$0" build
-        RESULT_DIR=$(mktemp -d /tmp/snia-sort-limit.XXXXXX)
+        RESULT_DIR=$(mktemp -d /tmp/snia-sort-avg.XXXXXX)
         printf 'mode\tround\tstage1_s\tstage2_s\ttotal_s\n' > "$RESULT_DIR/timings.tsv"
         printf 'mode\tround\toperation\tcalls\twall_s\tcpu_s\trun_sort_s\n' > "$RESULT_DIR/profiles.tsv"
         reference=''
@@ -39,16 +39,17 @@ case ${1:-unit} in
             for method in "${methods[@]}"; do
                 echo "Round $round: $method"
                 if [[ $method == CPU ]]; then
-                    guest_command='sudo /tmp/csd-sort-bench/examples/read-sort-limit /data/cs-batch-input.bin'
+                    guest_command='sudo /tmp/csd-sort-bench/examples/read-sort-avg /data/cs-batch-input.bin'
                 else
-                    guest_command='sudo env SNIA_FEMU_PROFILE=1 stdbuf -oL /tmp/snia-cs-api-guest/cs-batch-sort-limit /dev/nvme0n1 /data/cs-batch-input.bin --existing'
+                    guest_command='sudo env SNIA_FEMU_PROFILE=1 stdbuf -oL /tmp/snia-cs-api-guest/cs-batch-sort-avg /dev/nvme0n1 /data/cs-batch-input.bin --existing'
                 fi
                 logfile="$RESULT_DIR/$method-$round.log"
                 docker compose -f "$ROOT/docker-compose.yml" exec -T femu-csd \
                     env SSH_PORT="${SSH_PORT:-8080}" ./run-guest-ssh.sh "$guest_command" 2>&1 | tee "$logfile"
-                top=$(sed -n 's/^Top 5: //p' "$logfile")
-                if [[ -z $reference ]]; then reference=$top; fi
-                if [[ -z $top || $top != "$reference" ]]; then echo 'FAIL: Top 5 mismatch' >&2; exit 1; fi
+                result=$(sed -n 's/^AVERAGE //p' "$logfile")
+                if [[ -z $reference ]]; then reference=$result; fi
+                if [[ -z $result || $result != "$reference" ]]; then echo 'FAIL: average/count/sum mismatch' >&2; exit 1; fi
+                [[ $result == count=67108864\ * ]] || { echo 'FAIL: incomplete sorted stream' >&2; exit 1; }
                 workload=$(awk '/^WORKLOAD/ { print $3, $4, $5, $6 }' "$logfile")
                 if [[ -z ${reference_workload:-} ]]; then reference_workload=$workload; fi
                 if [[ -z $workload || $workload != "$reference_workload" ]]; then echo 'FAIL: spill workload mismatch' >&2; exit 1; fi

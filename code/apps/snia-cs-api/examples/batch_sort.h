@@ -37,15 +37,33 @@ struct sorted_chunk {
     struct sort_metrics metrics;
     int32_t values[SORT_OUTPUT_VALUES];
 };
-struct top_five {
-    uint32_t count, finished;
+struct average_result {
+    int64_t sum;
+    uint64_t count;
+    double average;
+    uint32_t finished;
+    struct sort_timing aggregate;
     struct sort_metrics metrics;
-    int32_t values[5];
 };
 #define SORT_MEMORY_BYTES (64U << 20)
 /* Count the four I/O buffers in the same 64 MiB budget on both paths. */
-#define SORT_BUFFER_BYTES (SORT_CHUNK_BYTES + SORT_BLOCK_BYTES + sizeof(struct sorted_chunk) + sizeof(struct top_five))
+#define SORT_BUFFER_BYTES (SORT_CHUNK_BYTES + SORT_BLOCK_BYTES + sizeof(struct sorted_chunk) + sizeof(struct average_result))
 #define SORT_WORK_BYTES ((SORT_MEMORY_BYTES - SORT_BUFFER_BYTES) & ~(size_t)4095)
+
+/* Retain exact integer sum/count across chunks; never average batch averages.
+ * 256 MiB of int32 values has a sum bounded by 2^57, so int64 is sufficient. */
+static inline void average_chunk(struct average_result *result, const struct sorted_chunk *input)
+{
+    struct sort_timing start = sort_clock();
+    int64_t sum = 0;
+    for (uint32_t i = 0; i < input->count; ++i) sum += input->values[i];
+    result->sum += sum;
+    result->count += input->count;
+    result->average = result->count ? (double)result->sum / (double)result->count : 0;
+    result->finished = input->finished;
+    if (input->finished) result->metrics = input->metrics;
+    sort_record(&result->aggregate, start);
+}
 
 /* Cached heads keep heap comparisons independent of spill-buffer residency. */
 struct sort_heap_entry { int32_t value; unsigned run; };

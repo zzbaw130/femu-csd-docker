@@ -1,4 +1,4 @@
-/* Guest example: file extents -> internal LOAD -> external sort -> LIMIT 5. */
+/* Guest example: file extents -> internal LOAD -> external sort -> average. */
 #include "cs.h"
 #include "batch_sort.h"
 #include <fcntl.h>
@@ -17,7 +17,7 @@
 
 #define TRY(call) do { CS_STATUS status = (call); if (status != CS_SUCCESS) { \
     fprintf(stderr, "%s: status=%d\n", #call, status); goto cleanup; } } while (0)
-enum { SORT_SINK, SORT_SOURCE, LIMIT_FIVE, PROGRAM_COUNT };
+enum { SORT_SINK, SORT_SOURCE, AVERAGE, PROGRAM_COUNT };
 struct program {
     const char *file, *symbol;
     unsigned index;
@@ -84,21 +84,17 @@ static void build_compute_request(CsComputeRequest *request, CS_CSF_ID function,
     if (state) csHelperSetComputeArg(&request->Args[request->NumArgs++], CS_64BIT_VALUE_TYPE, state);
 }
 
-static int generate_file(int fd, int32_t expected[5])
+static int generate_file(int fd, int64_t *expected_sum)
 {
     int32_t *buffer = malloc(SORT_CHUNK_BYTES);
     if (!buffer) return -1;
     uint32_t random = 0x12345678;
-    for (unsigned i = 0; i < 5; ++i) expected[i] = INT32_MIN;
+    *expected_sum = 0;
     for (unsigned chunk = 0; chunk < SORT_MAX_RUNS; ++chunk) {
         for (unsigned i = 0; i < SORT_CHUNK_BYTES / sizeof(*buffer); ++i) {
             random ^= random << 13; random ^= random >> 17; random ^= random << 5;
             buffer[i] = (int32_t)random;
-            for (unsigned j = 0; j < 5; ++j) if (buffer[i] > expected[j]) {
-                memmove(expected + j + 1, expected + j, (4 - j) * sizeof(*expected));
-                expected[j] = buffer[i];
-                break;
-            }
+            *expected_sum += buffer[i];
         }
         size_t written = 0;
         while (written < SORT_CHUNK_BYTES) {
@@ -183,7 +179,7 @@ int main(int argc, char **argv)
     struct program programs[] = {
         [SORT_SINK] = {.file = "cs-example-sort.so", .symbol = "sort_sink", .index = 420},
         [SORT_SOURCE] = {.file = "cs-example-sort.so", .symbol = "sort_source", .index = 421},
-        [LIMIT_FIVE] = {.file = "cs-example-limit.so", .symbol = "limit_five", .index = 422}};
+        [AVERAGE] = {.file = "cs-example-avg.so", .symbol = "avg_int32", .index = 422}};
     CS_DEV_HANDLE device = NULL;
     CS_MEM_HANDLE input = NULL, io = NULL, sorted = NULL, result = NULL;
     CS_BATCH_HANDLE batch = NULL;
@@ -198,13 +194,13 @@ int main(int argc, char **argv)
     if (file < 0 || flock(file, LOCK_EX | LOCK_NB) || read_namespace_geometry(file, device_path, &lba, &nsid, &partition_start)) {
         fprintf(stderr, "数据文件必须位于指定 namespace 的普通数据分区\n"); goto cleanup;
     }
-    int32_t expected[5];
+    int64_t expected_sum = 0;
     if (existing) {
         struct stat info;
         if (fstat(file, &info) || info.st_size != SORT_FILE_BYTES) {
             fprintf(stderr, "existing file must contain exactly 256 MiB\n"); goto cleanup;
         }
-    } else if (ftruncate(file, 0) || generate_file(file, expected)) {
+    } else if (ftruncate(file, 0) || generate_file(file, &expected_sum)) {
         perror("generate_file"); goto cleanup;
     }
     map->fm_length = SORT_FILE_BYTES;
@@ -221,8 +217,8 @@ int main(int argc, char **argv)
     TRY(csAllocMem(device, SORT_CHUNK_BYTES, &flags, &input, NULL));
     TRY(csAllocMem(device, SORT_BLOCK_BYTES, &flags, &io, NULL));
     TRY(csAllocMem(device, sizeof(struct sorted_chunk), &flags, &sorted, NULL));
-    flags.Flags = CS_FDM_CLEAR; // LIMIT accumulates across chunks; only its small output needs zeroing.
-    TRY(csAllocMem(device, sizeof(struct top_five), &flags, &result, NULL));
+    flags.Flags = CS_FDM_CLEAR; // AVG accumulates across chunks; only its small output needs zeroing.
+    TRY(csAllocMem(device, sizeof(struct average_result), &flags, &result, NULL));
     // Allocate two batch wrappers once; the API copies each configured request.
     load_entry = calloc(1, sizeof(*load_entry) + (map->fm_mapped_extents - 1) * sizeof(CSBlockRange));
     compute_entry = calloc(1, sizeof(*compute_entry) + 2 * sizeof(CsComputeArg));
@@ -261,39 +257,44 @@ int main(int argc, char **argv)
     batch = NULL;
     clock_gettime(CLOCK_MONOTONIC, &sink_done);
 
-    // Phase 2: source -> limit. The same wrapper can configure both nodes.
+    // Phase 2: source -> avg. The same wrapper can configure both nodes.
     TRY(csAllocBatchRequest(CS_BATCH_SERIAL, 2, &batch));
-    CS_BATCH_INDEX source_node, limit_node;
+    CS_BATCH_INDEX source_node, average_node;
     build_compute_request(&compute_entry->u.Compute, programs[SORT_SOURCE].function, sorted, io, sort_state);
     TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, compute_entry, 0, 0, &source_node));
-    build_compute_request(&compute_entry->u.Compute, programs[LIMIT_FIVE].function, sorted, result, 0);
-    TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, compute_entry, 0, source_node, &limit_node));
+    build_compute_request(&compute_entry->u.Compute, programs[AVERAGE].function, sorted, result, 0);
+    TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, compute_entry, 0, source_node, &average_node));
 
-    struct top_five top;
+    struct average_result average;
     CsCopyMemRequest read_result = {.Type = CS_COPY_FROM_DEVICE, .DevMem = {result, 0},
-        .u.HostVAddress = &top, .Bytes = sizeof(top)};
+        .u.HostVAddress = &average, .Bytes = sizeof(average)};
     do {
         TRY(csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, NULL));
         TRY(csQueueCopyMemRequest(&read_result, NULL, NULL, NULL, NULL, NULL));
-        if (top.finished) sort_state = 0; // source has released workmem and every spill token.
-    } while (!top.finished);
+        if (average.finished) sort_state = 0; // source has released workmem and every spill token.
+    } while (!average.finished);
     clock_gettime(CLOCK_MONOTONIC, &end);
-    if (top.count != 5 || (!existing && memcmp(top.values, expected, sizeof(expected)))) {
+    if (average.count != SORT_FILE_BYTES / sizeof(int32_t) ||
+        average.average != (double)average.sum / (double)average.count ||
+        (!existing && average.sum != expected_sum)) {
         fprintf(stderr, "FAIL: CSD result differs from host reference\n"); goto cleanup;
     }
-    printf("Top 5: %d %d %d %d %d\n", top.values[0], top.values[1], top.values[2], top.values[3], top.values[4]);
+    printf("AVERAGE count=%llu sum=%lld value=%.17g\n", (unsigned long long)average.count,
+           (long long)average.sum, average.average);
     double sink_seconds = sink_done.tv_sec - start.tv_sec + (sink_done.tv_nsec - start.tv_nsec) / 1e9;
     double source_seconds = end.tv_sec - sink_done.tv_sec + (end.tv_nsec - sink_done.tv_nsec) / 1e9;
     printf("TIMING CSD %.6f %.6f %.6f\n", sink_seconds, source_seconds, sink_seconds + source_seconds);
     printf("WORKLOAD CSD runs=%u spilled=%u write=%llu read=%llu peak=%llu limit=%u\n",
-           top.metrics.runs, top.metrics.spilled_runs,
-           (unsigned long long)top.metrics.spill_write_bytes, (unsigned long long)top.metrics.spill_read_bytes,
-           (unsigned long long)top.metrics.peak_bytes, SORT_MEMORY_BYTES);
+           average.metrics.runs, average.metrics.spilled_runs,
+           (unsigned long long)average.metrics.spill_write_bytes, (unsigned long long)average.metrics.spill_read_bytes,
+           (unsigned long long)average.metrics.peak_bytes, SORT_MEMORY_BYTES);
     printf("PROFILE CSD sink_work wall_s=%.9f cpu_s=%.9f run_sort_s=%.9f\n",
-           top.metrics.sink.wall_ns / 1e9, top.metrics.sink.cpu_ns / 1e9, top.metrics.run_sort_ns / 1e9);
+           average.metrics.sink.wall_ns / 1e9, average.metrics.sink.cpu_ns / 1e9, average.metrics.run_sort_ns / 1e9);
     printf("PROFILE CSD source_work wall_s=%.9f cpu_s=%.9f\n",
-           top.metrics.source.wall_ns / 1e9, top.metrics.source.cpu_ns / 1e9);
-    puts("PASS: 256 MiB, memory-first runs, spill on allocation failure, full merge, LIMIT 5; source released all state");
+           average.metrics.source.wall_ns / 1e9, average.metrics.source.cpu_ns / 1e9);
+    printf("PROFILE CSD average_work wall_s=%.9f cpu_s=%.9f\n",
+           average.aggregate.wall_ns / 1e9, average.aggregate.cpu_ns / 1e9);
+    puts("PASS: 256 MiB, memory-first runs, spill on allocation failure, full merge, AVG; source released all state");
     rc = 0;
 cleanup:
     if (batch) csFreeBatchRequest(batch);

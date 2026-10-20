@@ -84,7 +84,7 @@ cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,f
 │   │   └── snia-cs-api/             # guest SNIA API 库与完整 batch 示例
 │   └── csd-programs/                # 容器编译、FEMU CU 执行
 │       ├── CMakeLists.txt           # 统一构建、链接与输出
-│       ├── examples/                # 原生/SNIA 算子及 sort/limit 样例
+│       ├── examples/                # 原生/SNIA 算子及 sort/avg 样例
 │       ├── csd-workmem/             # 共享工作内存库
 │       └── build/                   # 统一 .so 输出目录（不入库）
 ├── data/                            # TPC-H pgdata tar（tpch_s<SF>.tar，仓库只带 SF=0.01）

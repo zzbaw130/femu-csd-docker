@@ -15,7 +15,7 @@
 | `src/plugins/femu/` | Guest FEMU 适配器；各 femu_*.c 按功能命名 |
 | `src/plugins/femu/include/` | FEMU 设备算子的原生参数及重入辅助头 |
 | `tests/common/`、`tests/femu/` | 按 SNIA 功能命名的测试，见 tests/README.md |
-| `examples/` | 256MiB 文件排序取前5的完整 batch 应用 |
+| `examples/` | 256MiB 文件完整排序后分批计算平均值的完整 batch 应用 |
 | `doc/` | 架构、传输、兼容性和开发记录 |
 | `../../csd-programs/examples/` | 设备算子；容器内编译，在 FEMU CU 线程执行，逻辑上属于 CSD CPU |
 | `../../csd-programs/csd-workmem/` | 设备算子的共享私有工作内存分配器 |
@@ -74,7 +74,7 @@ cc application.c -Iinclude -Lbuild -lsnia-cs-api \
     -Wl,-rpath,"$PWD/build" -o application
 ```
 
-完整应用见 [文件排序示例](examples/README.md)：创建256MiB随机整数文件，按 FIEMAP extent 提交内部 LOAD，以可重入 sort.sink 生成 spill run，再运行 sort.source → limit，输出全局最大的5个数并核对参考值。
+完整应用见 [文件排序示例](examples/README.md)：创建256MiB随机整数文件，按 FIEMAP extent 提交内部 LOAD，以可重入 sort.sink 生成 spill run，再运行 sort.source → avg，完整消费排序输出并核对总和、计数与平均值。
 
 以下参数映射、程序下载和 spill 约定均属于 FEMU 插件；其他插件按其设备能力实现。
 
@@ -97,7 +97,7 @@ FEMU 的 CSF 下载描述为 `文件名\0入口符号\0`，例如 `cs-example-so
 
 完整排序示例中，sort_sink 约定 MR[0] 为4MiB输入、MR[1] 为256KiB spill I/O。第一次不传标量，cparam1=0，sink 创建状态并把64位标识作为 CompValue 返回；后续请求把这个标识放进第一个64位标量，cparam2 留给重入协议。source 接收同一标识，直接访问状态中的全部 run。
 
-应用先用一个 batch 反复提交 LOAD → sink，全部输入完成后再提交 source → limit。csConfigureBatchEntry 复制请求描述并保留算子/AFDM句柄，因此之后可释放原请求结构；它不会复制 AFDM 内的数据。batch 仍引用的 AFDM 不能释放，应先释放 batch。完整请求构造、参数更新和回收见[可执行示例](examples/cs_batch_sort_limit.c)。
+应用先用一个 batch 反复提交 LOAD → sink，全部输入完成后再提交 source → avg。csConfigureBatchEntry 复制请求描述并保留算子/AFDM句柄，因此之后可释放原请求结构；它不会复制 AFDM 内的数据。batch 仍引用的 AFDM 不能释放，应先释放 batch。完整请求构造、参数更新和回收见[可执行示例](examples/cs_batch_sort_avg.c)。
 
 当前重入协议选取**当前这一个计算请求中最后一个 AFDM**作为 STORE 数据来源或 LOAD 目的地。sort 中就是 io，设备端为 MR[1]；这不是整个 batch 最后一个 AFDM，也不是 SNIA 规定的位置，而是本设备适配器和算子共同采用的约定。
 
@@ -136,4 +136,4 @@ STORE/LOAD 数据走 D1/D0，不经过 Guest。I/O AFDM 必须容纳按 LBA 向�
 
 成功 batch 的 spill_id 可供后续 batch 使用；显式 FREE 或最后一个参与池的设备句柄关闭时回收。失败 batch 回收本批新分配的区段，之前成功 batch 的区段保留；算子私有状态由应用通过设备程序自己的清理入口销毁。标识仅在当前进程和 namespace 生命周期内有效，没有崩溃恢复。
 
-真实 Guest 测试使用完整示例：`sudo build/cs-batch-sort-limit /dev/nvme0n1 /data/cs-batch-input.bin`。程序索引为420–422；库不能枚举其他进程加载的程序，应避免索引冲突。
+真实 Guest 测试使用完整示例：`sudo build/cs-batch-sort-avg /dev/nvme0n1 /data/cs-batch-input.bin`。程序索引为420–422；库不能枚举其他进程加载的程序，应避免索引冲突。
