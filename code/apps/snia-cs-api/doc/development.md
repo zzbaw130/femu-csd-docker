@@ -174,3 +174,11 @@
 - 排序和workmem的ASan/UBSan/LeakSanitizer全部通过。
 - Guest64MiB workmem下的256MiB文件实测通过，完整归并后前5与参考一致；迁移后的workmem真实客户端两轮配额测试也通过。
 - 容器已重编两个算子，排序SO仅有sort_sink/source两个设备入口；旧演示SO已删除。
+
+## 2026-10-20：整理 batch 示例的请求构造
+
+- 删除 copy_memory 薄封装，读取结果处直接构造 CsCopyMemRequest 并调用 csQueueCopyMemRequest。
+- compute 改为 build_compute_request，只填写调用者提供的 CsComputeRequest；外层 CsBatchRequest 的 ReqType 在 main 显式设置，中文说明区分计算描述和 batch 节点。
+- LOAD 与计算节点各只分配一份缓冲；配置 API 保存副本后重复使用，删除逐块 LOAD 分配和 sink/source/limit 各自的堆对象。load_extents 改为 build_load_request，同样只填写已有存储请求。
+- 删除 single_batch，提前结束时直接调用 source 的单次计算请求；设备程序使用有名称的索引，主流程按 LOAD→sink、source→limit 两阶段排列。参考前5的更新直接放进文件生成循环，sysfs/设备几何读取函数使用明确动词命名。
+- 宿主和 Guest 目标均编译通过；Guest 256MiB完整文件测试通过，覆盖复用请求、extent LOAD、按需spill、全量归并和EOF回收，前5仍与独立参考一致。

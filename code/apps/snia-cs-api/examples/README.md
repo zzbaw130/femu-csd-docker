@@ -39,6 +39,10 @@ fsync 后用 FIEMAP 查询物理 extent。FIEMAP 地址相对于数据分区；L
 
 ## batch 执行
 
+`CsComputeRequest` 描述一次计算；`CsBatchRequest` 是 batch 节点的外层结构，用 ReqType 区分计算、复制或存储，计算内容放在 u.Compute 中。示例的 build_compute_request 只填写 CsComputeRequest；main 显式设置外层类型，再交给 csConfigureBatchEntry。直接调用 csQueueComputeRequest 时则传入内部的计算请求。
+
+main 只申请一份 LOAD 节点缓冲和一份计算节点缓冲。csConfigureBatchEntry 会复制请求描述，因此同一计算缓冲可以依次配置 sink、source、limit，不必为每个节点再申请一份。结果复制请求直接在读取循环旁构造并提交，提前收尾直接调用 source 的计算请求。
+
 ```text
 阶段一，重复64次，仅更新 LOAD 的 extent：
   LOAD(input) -> sort_sink(input, io, sort_handle)

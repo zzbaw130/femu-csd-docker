@@ -16,7 +16,13 @@
 
 #define TRY(call) do { CS_STATUS status = (call); if (status != CS_SUCCESS) { \
     fprintf(stderr, "%s: status=%d\n", #call, status); goto cleanup; } } while (0)
-struct program { const char *file, *symbol; unsigned index; CS_CSF_ID function; int loaded, active; };
+enum { SORT_SINK, SORT_SOURCE, LIMIT_FIVE, PROGRAM_COUNT };
+struct program {
+    const char *file, *symbol;
+    unsigned index;
+    CS_CSF_ID function;
+    int loaded, active;
+};
 
 static CS_STATUS load_program(CS_DEV_HANDLE device, struct program *p)
 {
@@ -66,47 +72,17 @@ static void unload_program(CS_DEV_HANDLE device, const struct program *p)
         csCSFDownload(device, &download, &id);
     }
 }
-static CS_STATUS copy_memory(CS_MEM_HANDLE memory, void *data, int bytes, CS_MEM_COPY_TYPE type)
+/* CsComputeRequest describes computation; its caller supplies the batch wrapper. */
+static void build_compute_request(CsComputeRequest *request, CS_CSF_ID function,
+                                  CS_MEM_HANDLE input, CS_MEM_HANDLE output, u64 state)
 {
-    CsCopyMemRequest request = {.Type = type, .DevMem = {memory, 0}, .u.HostVAddress = data, .Bytes = bytes};
-    return csQueueCopyMemRequest(&request, NULL, NULL, NULL, NULL, NULL);
+    request->CSFId = function;
+    request->NumArgs = 0;
+    if (input) csHelperSetComputeArg(&request->Args[request->NumArgs++], CS_AFDM_TYPE, input, 0UL);
+    if (output) csHelperSetComputeArg(&request->Args[request->NumArgs++], CS_AFDM_TYPE, output, 0UL);
+    if (state) csHelperSetComputeArg(&request->Args[request->NumArgs++], CS_64BIT_VALUE_TYPE, state);
 }
-static CsBatchRequest *compute(CS_CSF_ID function, u64 state, CS_MEM_HANDLE first, CS_MEM_HANDLE second)
-{
-    CsBatchRequest *request = calloc(1, sizeof(*request) + 2 * sizeof(CsComputeArg));
-    if (!request) return NULL;
-    request->ReqType = CS_QUEUE_COMPUTE;
-    request->u.Compute.CSFId = function;
-    unsigned n = 0;
-    if (first) csHelperSetComputeArg(&request->u.Compute.Args[n++], CS_AFDM_TYPE, first, 0UL);
-    if (second) csHelperSetComputeArg(&request->u.Compute.Args[n++], CS_AFDM_TYPE, second, 0UL);
-    if (state) csHelperSetComputeArg(&request->u.Compute.Args[n++], CS_64BIT_VALUE_TYPE, state);
-    request->u.Compute.NumArgs = n;
-    return request;
-}
-static CS_STATUS single_batch(CS_CSF_ID function, u64 state, CS_MEM_HANDLE io)
-{
-    CsBatchRequest *request = compute(function, state, io, NULL);
-    if (!request) return CS_OUT_OF_RESOURCES;
-    CS_BATCH_HANDLE batch;
-    CS_STATUS status = csAllocBatchRequest(CS_BATCH_SERIAL, 1, &batch);
-    if (status == CS_SUCCESS) {
-        CS_BATCH_INDEX entry;
-        status = csConfigureBatchEntry(batch, CS_BATCH_ADD, request, 0, 0, &entry);
-        if (status == CS_SUCCESS) status = csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, NULL);
-        csFreeBatchRequest(batch);
-    }
-    free(request);
-    return status;
-}
-static void remember_top_five(int32_t value, int32_t top[5])
-{
-    for (unsigned i = 0; i < 5; ++i) if (value > top[i]) {
-        memmove(top + i + 1, top + i, (4 - i) * sizeof(*top));
-        top[i] = value;
-        break;
-    }
-}
+
 static int generate_file(int fd, int32_t expected[5])
 {
     int32_t *buffer = malloc(SORT_CHUNK_BYTES);
@@ -117,7 +93,11 @@ static int generate_file(int fd, int32_t expected[5])
         for (unsigned i = 0; i < SORT_CHUNK_BYTES / sizeof(*buffer); ++i) {
             random ^= random << 13; random ^= random >> 17; random ^= random << 5;
             buffer[i] = (int32_t)random;
-            remember_top_five(buffer[i], expected);
+            for (unsigned j = 0; j < 5; ++j) if (buffer[i] > expected[j]) {
+                memmove(expected + j + 1, expected + j, (4 - j) * sizeof(*expected));
+                expected[j] = buffer[i];
+                break;
+            }
         }
         size_t written = 0;
         while (written < SORT_CHUNK_BYTES) {
@@ -129,7 +109,7 @@ static int generate_file(int fd, int32_t expected[5])
     free(buffer);
     return fsync(fd);
 }
-static int read_number(const char *path, unsigned long long *value)
+static int read_sysfs_number(const char *path, unsigned long long *value)
 {
     FILE *file = fopen(path, "r");
     if (!file) return -1;
@@ -138,7 +118,7 @@ static int read_number(const char *path, unsigned long long *value)
     return result;
 }
 /* FIEMAP physical offsets are partition-relative; StartLba is namespace-relative. */
-static int namespace_geometry(int file, const char *device, unsigned *lba, unsigned *nsid, u64 *start)
+static int read_namespace_geometry(int file, const char *device, unsigned *lba, unsigned *nsid, u64 *start)
 {
     struct stat data, raw;
     int fd = open(device, O_RDONLY);
@@ -149,7 +129,7 @@ static int namespace_geometry(int file, const char *device, unsigned *lba, unsig
     char path[128];
     unsigned long long value;
     snprintf(path, sizeof(path), "/sys/dev/block/%u:%u/nsid", major(raw.st_rdev), minor(raw.st_rdev));
-    if (read_number(path, &value)) return -1;
+    if (read_sysfs_number(path, &value)) return -1;
     *nsid = value;
     *start = 0;
     if (data.st_dev == raw.st_rdev) return 0;
@@ -161,21 +141,21 @@ static int namespace_geometry(int file, const char *device, unsigned *lba, unsig
     fclose(parent);
     if (!valid) return -1;
     snprintf(path, sizeof(path), "/sys/dev/block/%u:%u/start", major(data.st_dev), minor(data.st_dev));
-    if (read_number(path, &value) || value * 512 % *lba) return -1;
+    if (read_sysfs_number(path, &value) || value * 512 % *lba) return -1;
     *start = value * 512 / *lba;
     return 0;
 }
-static CsBatchRequest *load_extents(const struct fiemap *map, u64 logical, unsigned lba,
-                                    unsigned nsid, u64 start, CS_DEV_HANDLE device, CS_MEM_HANDLE input)
+/* The caller reuses one storage request; only its extent ranges change per chunk. */
+static int build_load_request(CsStorageRequest *request, const struct fiemap *map, u64 logical,
+                              unsigned lba, unsigned nsid, u64 start,
+                              CS_DEV_HANDLE device, CS_MEM_HANDLE input)
 {
-    CsBatchRequest *request = calloc(1, sizeof(*request) + map->fm_mapped_extents * sizeof(CSBlockRange));
-    if (!request) return NULL;
-    request->ReqType = CS_STORAGE_IO;
-    request->u.StorageIo.Mode = CS_STORAGE_BLOCK_IO;
-    request->u.StorageIo.DevHandle = device;
-    CsBlockIo *load = &request->u.StorageIo.u.BlockIo;
+    request->Mode = CS_STORAGE_BLOCK_IO;
+    request->DevHandle = device;
+    CsBlockIo *load = &request->u.BlockIo;
     load->Type = CS_STORAGE_LOAD_TYPE;
     load->DevMem.MemHandle = input;
+    load->NumRanges = 0;
     u64 end = logical + SORT_CHUNK_BYTES, cursor = logical;
     for (unsigned i = 0; i < map->fm_mapped_extents && cursor < end; ++i) {
         const struct fiemap_extent *extent = &map->fm_extents[i];
@@ -188,21 +168,20 @@ static CsBatchRequest *load_extents(const struct fiemap *map, u64 logical, unsig
         load->Range[load->NumRanges++] = (CSBlockRange){nsid, start + physical / lba, bytes / lba};
         cursor += bytes;
     }
-    if (cursor != end) { free(request); return NULL; }
-    return request;
+    return cursor == end ? 0 : -1;
 }
 int main(int argc, char **argv)
 {
     const char *device_path = argc > 1 ? argv[1] : "/dev/nvme0n1";
     const char *file_path = argc > 2 ? argv[2] : "/data/cs-batch-input.bin";
     struct program programs[] = {
-        {"cs-example-sort.so", "sort_sink", 420, NULL, 0, 0},
-        {"cs-example-sort.so", "sort_source", 421, NULL, 0, 0},
-        {"cs-example-limit.so", "limit_five", 422, NULL, 0, 0}};
+        [SORT_SINK] = {.file = "cs-example-sort.so", .symbol = "sort_sink", .index = 420},
+        [SORT_SOURCE] = {.file = "cs-example-sort.so", .symbol = "sort_source", .index = 421},
+        [LIMIT_FIVE] = {.file = "cs-example-limit.so", .symbol = "limit_five", .index = 422}};
     CS_DEV_HANDLE device = NULL;
     CS_MEM_HANDLE input = NULL, io = NULL, sorted = NULL, result = NULL;
     CS_BATCH_HANDLE batch = NULL;
-    CsBatchRequest *load = NULL, *sink = NULL, *source = NULL, *limit = NULL;
+    CsBatchRequest *load_entry = NULL, *compute_entry = NULL;
     CsMemFlags flags = {.FDMId = 1};
     u64 sort_state = 0, partition_start;
     unsigned lba, nsid;
@@ -210,7 +189,7 @@ int main(int argc, char **argv)
     struct fiemap *map = calloc(1, sizeof(*map) + 4096 * sizeof(struct fiemap_extent));
     if (!map) goto cleanup;
     file = open(file_path, O_CREAT | O_RDWR, 0644);
-    if (file < 0 || flock(file, LOCK_EX | LOCK_NB) || namespace_geometry(file, device_path, &lba, &nsid, &partition_start) ||
+    if (file < 0 || flock(file, LOCK_EX | LOCK_NB) || read_namespace_geometry(file, device_path, &lba, &nsid, &partition_start) ||
         ftruncate(file, 0)) { fprintf(stderr, "数据文件必须位于指定 namespace 的普通数据分区\n"); goto cleanup; }
     int32_t expected[5];
     if (generate_file(file, expected)) { perror("generate_file"); goto cleanup; }
@@ -224,50 +203,61 @@ int main(int argc, char **argv)
     printf("256 MiB random int32 file, %u extents; partition start LBA=%llu\n",
            map->fm_mapped_extents, (unsigned long long)partition_start);
     TRY(csOpenCSx(device_path, NULL, &device));
-    for (unsigned i = 0; i < 3; ++i) TRY(load_program(device, &programs[i]));
+    for (unsigned i = 0; i < PROGRAM_COUNT; ++i) TRY(load_program(device, &programs[i]));
     TRY(csAllocMem(device, SORT_CHUNK_BYTES, &flags, &input, NULL));
     TRY(csAllocMem(device, SORT_BLOCK_BYTES, &flags, &io, NULL));
     TRY(csAllocMem(device, sizeof(struct sorted_chunk), &flags, &sorted, NULL));
     flags.Flags = CS_FDM_CLEAR; // LIMIT accumulates across chunks; only its small output needs zeroing.
     TRY(csAllocMem(device, sizeof(struct top_five), &flags, &result, NULL));
-    sink = compute(programs[0].function, 0, input, io);
-    limit = compute(programs[2].function, 0, sorted, result);
-    if (!sink || !limit) goto cleanup;
-    // Reconfigure only LOAD; the sorter keeps private runs between successful batches.
+    // Allocate two batch wrappers once; the API copies each configured request.
+    load_entry = calloc(1, sizeof(*load_entry) + (map->fm_mapped_extents - 1) * sizeof(CSBlockRange));
+    compute_entry = calloc(1, sizeof(*compute_entry) + 2 * sizeof(CsComputeArg));
+    if (!load_entry || !compute_entry) goto cleanup;
+    load_entry->ReqType = CS_STORAGE_IO;
+    compute_entry->ReqType = CS_QUEUE_COMPUTE;
+
+    // Phase 1: LOAD -> sink. Reconfigure LOAD for each file chunk.
     TRY(csAllocBatchRequest(CS_BATCH_SERIAL, 2, &batch));
-    CS_BATCH_INDEX load_entry = 0, sort_entry;
+    CS_BATCH_INDEX load_node, sink_node;
+    build_compute_request(&compute_entry->u.Compute, programs[SORT_SINK].function, input, io, 0);
     for (u64 offset = 0; offset < SORT_FILE_BYTES; offset += SORT_CHUNK_BYTES) {
-        load = load_extents(map, offset, lba, nsid, partition_start, device, input);
-        if (!load) { fprintf(stderr, "extent 存在空洞或不支持的标志/对齐\n"); goto cleanup; }
-        if (!offset) {
-            TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, load, 0, 0, &load_entry));
-            TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, sink, 0, load_entry, &sort_entry));
-        } else TRY(csConfigureBatchEntry(batch, CS_BATCH_RECONFIG, load, load_entry, 0, NULL));
-        free(load); load = NULL;
-        u64 handle = 0;
+        if (build_load_request(&load_entry->u.StorageIo, map, offset, lba, nsid, partition_start, device, input)) {
+            fprintf(stderr, "extent 存在空洞或不支持的标志/对齐\n");
+            goto cleanup;
+        }
+        if (offset == 0) {
+            TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, load_entry, 0, 0, &load_node));
+            TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, compute_entry, 0, load_node, &sink_node));
+        } else {
+            TRY(csConfigureBatchEntry(batch, CS_BATCH_RECONFIG, load_entry, load_node, 0, NULL));
+        }
+        u64 handle;
         TRY(csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, &handle));
-        if (!sort_state) {
+        if (offset == 0) {
             sort_state = handle;
-            free(sink);
-            sink = compute(programs[0].function, sort_state, input, io);
-            if (!sink) goto cleanup;
-            TRY(csConfigureBatchEntry(batch, CS_BATCH_RECONFIG, sink, sort_entry, 0, NULL));
+            build_compute_request(&compute_entry->u.Compute, programs[SORT_SINK].function, input, io, sort_state);
+            TRY(csConfigureBatchEntry(batch, CS_BATCH_RECONFIG, compute_entry, sink_node, 0, NULL));
         }
         if ((offset + SORT_CHUNK_BYTES) % (64U << 20) == 0)
             printf("LOAD -> sort.sink: %llu / 256 MiB\n", (unsigned long long)((offset + SORT_CHUNK_BYTES) >> 20));
     }
-    TRY(csFreeBatchRequest(batch)); batch = NULL;
-    // Blocking boundary: all runs now exist, in workmem or spill.
-    source = compute(programs[1].function, sort_state, sorted, io);
-    if (!source) goto cleanup;
+    TRY(csFreeBatchRequest(batch));
+    batch = NULL;
+
+    // Phase 2: source -> limit. The same wrapper can configure both nodes.
     TRY(csAllocBatchRequest(CS_BATCH_SERIAL, 2, &batch));
-    CS_BATCH_INDEX source_entry, limit_entry;
-    TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, source, 0, 0, &source_entry));
-    TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, limit, 0, source_entry, &limit_entry));
+    CS_BATCH_INDEX source_node, limit_node;
+    build_compute_request(&compute_entry->u.Compute, programs[SORT_SOURCE].function, sorted, io, sort_state);
+    TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, compute_entry, 0, 0, &source_node));
+    build_compute_request(&compute_entry->u.Compute, programs[LIMIT_FIVE].function, sorted, result, 0);
+    TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, compute_entry, 0, source_node, &limit_node));
+
     struct top_five top;
+    CsCopyMemRequest read_result = {.Type = CS_COPY_FROM_DEVICE, .DevMem = {result, 0},
+        .u.HostVAddress = &top, .Bytes = sizeof(top)};
     do {
         TRY(csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, NULL));
-        TRY(copy_memory(result, &top, sizeof(top), CS_COPY_FROM_DEVICE));
+        TRY(csQueueCopyMemRequest(&read_result, NULL, NULL, NULL, NULL, NULL));
         if (top.finished) sort_state = 0; // source has released workmem and every spill token.
     } while (!top.finished);
     if (top.count != 5 || memcmp(top.values, expected, sizeof(expected))) {
@@ -278,14 +268,20 @@ int main(int argc, char **argv)
     rc = 0;
 cleanup:
     if (batch) csFreeBatchRequest(batch);
-    if (sort_state && programs[1].function) single_batch(programs[1].function, sort_state, io);
-    free(load); free(sink); free(source); free(limit); free(map);
+    if (sort_state) {
+        // Source's early-stop form only releases workmem; one compute call is sufficient.
+        build_compute_request(&compute_entry->u.Compute, programs[SORT_SOURCE].function, io, NULL, sort_state);
+        csQueueComputeRequest(&compute_entry->u.Compute, NULL, NULL, NULL, NULL, NULL);
+    }
+    free(load_entry);
+    free(compute_entry);
+    free(map);
     flags.Flags = 0;
     if (result) csFreeMem(result, &flags);
     if (sorted) csFreeMem(sorted, &flags);
     if (io) csFreeMem(io, &flags);
     if (input) csFreeMem(input, &flags);
-    for (unsigned i = 0; i < 3; ++i) unload_program(device, &programs[i]);
+    for (unsigned i = 0; i < PROGRAM_COUNT; ++i) unload_program(device, &programs[i]);
     if (device) csCloseCSx(device);
     if (file >= 0) close(file);
     return rc;
