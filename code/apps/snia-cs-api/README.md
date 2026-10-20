@@ -78,7 +78,7 @@ cc application.c -Iinclude -Lbuild -lsnia-cs-api \
 
 以下参数映射、程序下载和 spill 约定均属于 FEMU 插件；其他插件按其设备能力实现。
 
-FEMU 的 CSF 下载描述为 `文件名\0入口符号\0`，例如 `cs-example-functions.so\0cs_scale\0`。文件在容器的 `csd_program_dir` 中，Guest 不需要持有设备 `.so`。
+FEMU 的 CSF 下载描述为 `文件名\0入口符号\0`，例如 `cs-example-sort.so\0sort_sink\0`。文件在容器的 `csd_program_dir` 中，Guest 不需要持有设备 `.so`。
 
 **应用和算子自行约定参数含义。库只映射原生字段，不附加参数描述或输入 AFDM。**
 
@@ -95,35 +95,11 @@ FEMU 的 CSF 下载描述为 `文件名\0入口符号\0`，例如 `cs-example-fu
 
 当前原生 MR 只表示整块 AFDM，计算请求的非零 `ByteOffset` 返回 `CS_UNSUPPORTED`。需要偏移时，应用按算子自己的接口把偏移放入标量或输入数据中，算子自行计算地址。超过两个 64 位标量位置也返回不支持；复杂配置直接作为应用定义的输入数据传入。
 
-例如 `cs_scale` 约定两个 AFDM 为输入和输出，`cparam1` 为元素数，`cparam2` 为输入/输出偏移。普通从起始地址计算时，应用传两个 AFDM 和一个 count 即可，未传的 `cparam2` 为 0。
+完整排序示例中，sort_sink 约定 MR[0] 为4MiB输入、MR[1] 为256KiB spill I/O。第一次不传标量，cparam1=0，sink 创建状态并把64位标识作为 CompValue 返回；后续请求把这个标识放进第一个64位标量，cparam2 留给重入协议。source 接收同一标识，直接访问状态中的全部 run。
 
-应用用 `csAllocBatchRequest` 创建一个 batch，再用 `csConfigureBatchEntry` 向其中加入 LOAD、计算等请求，并指定请求之间的先后依赖，最后调用 `csQueueBatchRequest` 提交。这里的 batch 是 Guest 库管理的一组请求及其依赖关系。
+应用先用一个 batch 反复提交 LOAD → sink，全部输入完成后再提交 source → limit。csConfigureBatchEntry 复制请求描述并保留算子/AFDM句柄，因此之后可释放原请求结构；它不会复制 AFDM 内的数据。batch 仍引用的 AFDM 不能释放，应先释放 batch。完整请求构造、参数更新和回收见[可执行示例](examples/cs_batch_sort_limit.c)。
 
-下面以向 batch 加入一个 sort.sink 请求为例。假定应用已分配 `input`、`io` 两块 AFDM，获得了算子函数句柄 `sort_sink`；设备端排序初始化函数已创建 `SortState` 并返回其标识 `sort_handle`。`sort_handle` 只标识这个排序状态对象，里面保存 run 列表、待写长度等内容，与 batch 是两个不同的对象。
-
-重入算子仍使用普通 `CsComputeRequest`，约定保留 `cparam2`，应用只传至多一个标量输入。这个 sort.sink 的参数约定为：MR[0] 是待排序输入 `input`，MR[1] 是放置待写 run 的 `io`，cparam1 是 `sort_handle`。
-
-```c
-CsBatchRequest *r = calloc(1, sizeof(*r) + 2 * sizeof(CsComputeArg));
-r->ReqType = CS_QUEUE_COMPUTE;
-r->u.Compute.CSFId = sort_sink;
-r->u.Compute.NumArgs = 3;
-csHelperSetComputeArg(&r->u.Compute.Args[0], CS_AFDM_TYPE, input, 0UL);
-csHelperSetComputeArg(&r->u.Compute.Args[1], CS_AFDM_TYPE, io, 0UL);
-csHelperSetComputeArg(&r->u.Compute.Args[2], CS_64BIT_VALUE_TYPE, sort_handle);
-CS_BATCH_HANDLE batch;
-CS_BATCH_INDEX sort_entry;
-csAllocBatchRequest(CS_BATCH_SERIAL, 1, &batch);
-csConfigureBatchEntry(batch, CS_BATCH_ADD, r, 0, 0, &sort_entry);
-free(r);
-u64 result;
-CS_STATUS status = csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, &result);
-csFreeBatchRequest(batch);
-```
-
-当前重入实现从**当前这一个计算请求的参数**中取最后一个 AFDM，作为 STORE 的数据来源或 LOAD 的数据目的地。上例中它就是 `Args[1]` 的 `io`，设备端看到的是 `mr_addr[1]`；后面的 `Args[2]` 是整数，不参与这个选择。这是本项目的算子参数约定，不是整批任务的最后一块 AFDM，也不是 SNIA 规定的位置。
-
-`csConfigureBatchEntry` 会复制 `r` 中的请求描述，记录它用到的算子和 AFDM 句柄，所以之后可以 `free(r)`；它不复制 AFDM 中的数据。只要 batch 还引用这些句柄，它们就不能释放，应先释放 batch 再释放 AFDM。示例为突出流程省略逐次错误处理，实际应用应检查各 API 返回的状态。
+当前重入协议选取**当前这一个计算请求中最后一个 AFDM**作为 STORE 数据来源或 LOAD 目的地。sort 中就是 io，设备端为 MR[1]；这不是整个 batch 最后一个 AFDM，也不是 SNIA 规定的位置，而是本设备适配器和算子共同采用的约定。
 
 ## 三、设备算子：在入口判断是否重入
 
@@ -131,43 +107,13 @@ csFreeBatchRequest(batch);
 
 所有设备算子统一链接 `libcs-workmem.so`。排序缓冲、run 列表等私有数据用 `cs_work_begin/cs_work_alloc/cs_work_end` 管理；context 可跨多次入口保留。AFDM 保存输入、输出和交接数据，私有算法状态留在工作内存中。
 
-以 sort.sink 为例，下面是算法伪代码；`find_sort`、`sort_chunk` 等是算子自己的函数：
+[sort.cpp](../../csd-programs/examples/sort.cpp) 只导出 sink 和 source。sink 首次创建工作内存，成功申请的4MiB run 留在内存；只有后续申请失败才淘汰一个驻留 run。一个 run 分为16个256KiB块，重入逐次记录 STORE 的标识，合计保存完整4MiB。
 
-```c
-#include "femu-csd-kernel.h"
-#include "cs_csf.h"
-#include "cs_workmem.h"
+设备入口通过 csIsReentry 判断本次是不是内部 I/O 后的重入，通过 csReentryValue 取得完成 I/O 的 spill_id。算子自己的 pending 状态记录正在 STORE、LOAD 还是 FREE，因此无需库增加控制 AFDM 或事件参数。
 
-int64_t sort_sink(struct femu_csd_args *args)
-{
-    SortState *s = find_sort(args->cparam1);
+source 直接使用驻留 run，按需 LOAD spill 块；读缓冲申请失败也可淘汰驻留 run。最后一个输出 chunk 产生后，source FREE token、结束 workmem，在输出中设置 finished=1。提前停止或失败也由同一 source 入口收尾，具体参数见[示例说明](examples/README.md)。
 
-    if (csIsReentry(args)) {
-        /* 上次请求的 STORE 已完成；只更新记录，不重复处理输入。 */
-        uint64_t spill_id = csReentryValue(args);
-        append_run(s, spill_id, s->pending_bytes);
-        s->pending_bytes = 0;
-        return 0;  /* 本次输入处理完成。后续输入继续使用同一排序状态。 */
-    }
-
-    sort_chunk(s, args->mr_addr[0], args->mr_len[0]);
-    if (need_spill(s)) {
-        s->pending_bytes = write_sorted_run(s, args->mr_addr[1]);
-        return csNeedStore(s->pending_bytes);
-    }
-    return 0;
-}
-```
-
-实际执行顺序：
-
-1. 首次入口 `cparam2=0`，`csIsReentry(args)` 为假。
-2. 算子在声明的 I/O AFDM 中放入待写数据，返回 `csNeedStore(bytes)`。
-3. Guest 中的 FEMU 插件分配 spill LBA，通过 D1 在设备内部写入，保留 `spill_id → LBA/长度` 的映射。
-4. FEMU 插件再次调用相同 CSF，保留输入参数，把 `spill_id` 放入 `cparam2`。
-5. 此时 `csIsReentry(args)` 为真，`csReentryValue(args)` 返回该标识。算子把它和已知长度加入自己的 run 列表，再继续或完成。
-
-sort.source 也在入口做相同判断：首次根据自己的 run 游标返回 `csNeedLoad(run.spill_id)`；重入时 I/O AFDM 已有数据，消费数据并推进游标。需要释放 run 时返回 `csNeedFree(spill_id)`，重入后更新自己的记录。算子自己的 pending 状态区分刚完成的是哪项操作，不需要库另传事件配置。
+实际调用顺序是算子返回 csNeedStore(bytes)，Guest FEMU 插件分配 spill LBA 并执行内部 D1，再次调用相同 CSF，将标识填入 cparam2；CSF 的重入分支只记录标识并继续未完成的工作。LOAD 和 FREE 同理。
 
 | 算子返回 | FEMU 插件执行 | 再次调用 CSF 时 |
 | --- | --- | --- |
@@ -190,4 +136,4 @@ STORE/LOAD 数据走 D1/D0，不经过 Guest。I/O AFDM 必须容纳按 LBA 向�
 
 成功 batch 的 spill_id 可供后续 batch 使用；显式 FREE 或最后一个参与池的设备句柄关闭时回收。失败 batch 回收本批新分配的区段，之前成功 batch 的区段保留；算子私有状态由应用通过设备程序自己的清理入口销毁。标识仅在当前进程和 namespace 生命周期内有效，没有崩溃恢复。
 
-真实 Guest 测试：`sudo build/cs-batch-scheduling-live /dev/nvme0n1`。测试预留程序索引 401–407、410–416；文件排序示例预留420–425。库不能枚举其他进程已加载的程序，应用需避免索引冲突。
+真实 Guest 测试使用完整示例：`sudo build/cs-batch-sort-limit /dev/nvme0n1 /data/cs-batch-input.bin`。程序索引为420–422；库不能枚举其他进程加载的程序，应避免索引冲突。

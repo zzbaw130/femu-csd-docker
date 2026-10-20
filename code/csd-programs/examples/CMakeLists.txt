@@ -1,7 +1,6 @@
 add_csd_program(csd-vadd csd-vadd.c)
 add_csd_program(csd-original-kernels csd-original-kernels.cc)
 target_link_libraries(csd-original-kernels PRIVATE lz4)
-add_csd_program(cs-example-functions snia_compute_functions.c)
 find_program(CLANG_EXECUTABLE clang)
 if(CLANG_EXECUTABLE)
     add_custom_target(csd-vadd-bpf

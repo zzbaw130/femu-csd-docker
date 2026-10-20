@@ -80,7 +80,7 @@ static CsBatchRequest *compute(CS_CSF_ID function, u64 state, CS_MEM_HANDLE firs
     unsigned n = 0;
     if (first) csHelperSetComputeArg(&request->u.Compute.Args[n++], CS_AFDM_TYPE, first, 0UL);
     if (second) csHelperSetComputeArg(&request->u.Compute.Args[n++], CS_AFDM_TYPE, second, 0UL);
-    csHelperSetComputeArg(&request->u.Compute.Args[n++], CS_64BIT_VALUE_TYPE, state);
+    if (state) csHelperSetComputeArg(&request->u.Compute.Args[n++], CS_64BIT_VALUE_TYPE, state);
     request->u.Compute.NumArgs = n;
     return request;
 }
@@ -196,12 +196,9 @@ int main(int argc, char **argv)
     const char *device_path = argc > 1 ? argv[1] : "/dev/nvme0n1";
     const char *file_path = argc > 2 ? argv[2] : "/data/cs-batch-input.bin";
     struct program programs[] = {
-        {"cs-example-sort.so", "sort_create", 420, NULL, 0, 0},
-        {"cs-example-sort.so", "sort_sink", 421, NULL, 0, 0},
-        {"cs-example-sort.so", "sort_source", 422, NULL, 0, 0},
-        {"cs-example-sort.so", "sort_destroy", 423, NULL, 0, 0},
-        {"cs-example-sort.so", "sort_abort", 424, NULL, 0, 0},
-        {"cs-example-limit.so", "limit_five", 425, NULL, 0, 0}};
+        {"cs-example-sort.so", "sort_sink", 420, NULL, 0, 0},
+        {"cs-example-sort.so", "sort_source", 421, NULL, 0, 0},
+        {"cs-example-limit.so", "limit_five", 422, NULL, 0, 0}};
     CS_DEV_HANDLE device = NULL;
     CS_MEM_HANDLE input = NULL, io = NULL, sorted = NULL, result = NULL;
     CS_BATCH_HANDLE batch = NULL;
@@ -227,19 +224,15 @@ int main(int argc, char **argv)
     printf("256 MiB random int32 file, %u extents; partition start LBA=%llu\n",
            map->fm_mapped_extents, (unsigned long long)partition_start);
     TRY(csOpenCSx(device_path, NULL, &device));
-    for (unsigned i = 0; i < 6; ++i) TRY(load_program(device, &programs[i]));
+    for (unsigned i = 0; i < 3; ++i) TRY(load_program(device, &programs[i]));
     TRY(csAllocMem(device, SORT_CHUNK_BYTES, &flags, &input, NULL));
     TRY(csAllocMem(device, SORT_BLOCK_BYTES, &flags, &io, NULL));
     TRY(csAllocMem(device, sizeof(struct sorted_chunk), &flags, &sorted, NULL));
+    flags.Flags = CS_FDM_CLEAR; // LIMIT accumulates across chunks; only its small output needs zeroing.
     TRY(csAllocMem(device, sizeof(struct top_five), &flags, &result, NULL));
-    CsComputeRequest create = {.CSFId = programs[0].function};
-    u64 created = 0;
-    TRY(csQueueComputeRequest(&create, NULL, NULL, NULL, NULL, &created));
-    sort_state = created;
-    sink = compute(programs[1].function, sort_state, input, io);
-    source = compute(programs[2].function, sort_state, sorted, io);
-    limit = compute(programs[5].function, 0, sorted, result);
-    if (!sink || !source || !limit) goto cleanup;
+    sink = compute(programs[0].function, 0, input, io);
+    limit = compute(programs[2].function, 0, sorted, result);
+    if (!sink || !limit) goto cleanup;
     // Reconfigure only LOAD; the sorter keeps private runs between successful batches.
     TRY(csAllocBatchRequest(CS_BATCH_SERIAL, 2, &batch));
     CS_BATCH_INDEX load_entry = 0, sort_entry;
@@ -251,35 +244,48 @@ int main(int argc, char **argv)
             TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, sink, 0, load_entry, &sort_entry));
         } else TRY(csConfigureBatchEntry(batch, CS_BATCH_RECONFIG, load, load_entry, 0, NULL));
         free(load); load = NULL;
-        TRY(csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, NULL));
+        u64 handle = 0;
+        TRY(csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, &handle));
+        if (!sort_state) {
+            sort_state = handle;
+            free(sink);
+            sink = compute(programs[0].function, sort_state, input, io);
+            if (!sink) goto cleanup;
+            TRY(csConfigureBatchEntry(batch, CS_BATCH_RECONFIG, sink, sort_entry, 0, NULL));
+        }
         if ((offset + SORT_CHUNK_BYTES) % (64U << 20) == 0)
             printf("LOAD -> sort.sink: %llu / 256 MiB\n", (unsigned long long)((offset + SORT_CHUNK_BYTES) >> 20));
     }
     TRY(csFreeBatchRequest(batch)); batch = NULL;
-    // Blocking boundary: all 64 runs now exist. Merge globally, then LIMIT 5.
+    // Blocking boundary: all runs now exist, in workmem or spill.
+    source = compute(programs[1].function, sort_state, sorted, io);
+    if (!source) goto cleanup;
     TRY(csAllocBatchRequest(CS_BATCH_SERIAL, 2, &batch));
     CS_BATCH_INDEX source_entry, limit_entry;
     TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, source, 0, 0, &source_entry));
     TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, limit, 0, source_entry, &limit_entry));
-    TRY(csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, NULL));
     struct top_five top;
-    TRY(copy_memory(result, &top, sizeof(top), CS_COPY_FROM_DEVICE));
+    do {
+        TRY(csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, NULL));
+        TRY(copy_memory(result, &top, sizeof(top), CS_COPY_FROM_DEVICE));
+        if (top.finished) sort_state = 0; // source has released workmem and every spill token.
+    } while (!top.finished);
     if (top.count != 5 || memcmp(top.values, expected, sizeof(expected))) {
         fprintf(stderr, "FAIL: CSD result differs from host reference\n"); goto cleanup;
     }
     printf("Top 5: %d %d %d %d %d\n", top.values[0], top.values[1], top.values[2], top.values[3], top.values[4]);
-    TRY(single_batch(programs[3].function, sort_state, io)); sort_state = 0;
-    puts("PASS: 256 MiB, 64 runs, internal LOAD/STORE, reentry merge, LIMIT 5; spill freed");
+    puts("PASS: 256 MiB, memory-first runs, spill on allocation failure, full merge, LIMIT 5; source released all state");
     rc = 0;
 cleanup:
     if (batch) csFreeBatchRequest(batch);
-    if (sort_state && programs[4].function) single_batch(programs[4].function, sort_state, NULL);
+    if (sort_state && programs[1].function) single_batch(programs[1].function, sort_state, io);
     free(load); free(sink); free(source); free(limit); free(map);
+    flags.Flags = 0;
     if (result) csFreeMem(result, &flags);
     if (sorted) csFreeMem(sorted, &flags);
     if (io) csFreeMem(io, &flags);
     if (input) csFreeMem(input, &flags);
-    for (unsigned i = 0; i < 6; ++i) unload_program(device, &programs[i]);
+    for (unsigned i = 0; i < 3; ++i) unload_program(device, &programs[i]);
     if (device) csCloseCSx(device);
     if (file >= 0) close(file);
     return rc;

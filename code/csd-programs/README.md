@@ -5,7 +5,7 @@
 ```text
 csd-programs/
 ├── CMakeLists.txt       # 公共编译、workmem 链接和输出规则
-├── examples/            # 原生 vadd/kernels、SNIA 示例函数、sort、limit
+├── examples/            # 原生 vadd/kernels、sort、limit
 │   ├── CMakeLists.txt
 │   └── tests/           # 排序、重入和归并测试
 ├── csd-workmem/

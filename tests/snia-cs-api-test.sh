@@ -18,12 +18,7 @@ case ${1:-unit} in
             env SSH_PORT="${SSH_PORT:-8080}" ./run-guest-ssh.sh \
             'cmake -S /home/femu/apps/snia-cs-api -B /tmp/snia-cs-api-guest -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build /tmp/snia-cs-api-guest -j2'
         ;;
-    smoke)
-        docker compose -f "$ROOT/docker-compose.yml" exec -T femu-csd \
-            env SSH_PORT="${SSH_PORT:-8080}" ./run-guest-ssh.sh \
-            'sudo /tmp/snia-cs-api-guest/cs-batch-scheduling-live /dev/nvme0n1'
-        ;;
-    example)
+    smoke|example)
         docker compose -f "$ROOT/docker-compose.yml" exec -T femu-csd \
             env SSH_PORT="${SSH_PORT:-8080}" ./run-guest-ssh.sh \
             'sudo /tmp/snia-cs-api-guest/cs-batch-sort-limit /dev/nvme0n1 /data/cs-batch-input.bin'

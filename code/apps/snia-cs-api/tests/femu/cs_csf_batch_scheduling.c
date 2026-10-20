@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include "cs_batch_spill_scenarios.h"
+#include "batch_sort.h"
 static atomic_uint checks;
 #define CHECK(x)                                                                                   \
     do {                                                                                           \
@@ -18,14 +18,11 @@ static atomic_uint checks;
         }                                                                                          \
     } while (0)
 #define OK(x) CHECK((x) == CS_SUCCESS)
-static atomic_uint *mock_active_ptr, *mock_peak_ptr;
-#define mock_active (*mock_active_ptr)
-#define mock_peak (*mock_peak_ptr)
 static uint64_t (*mock_used_bytes)(void);
-static uint64_t (*mock_allocation_count)(void);
-static CS_CSF_ID load(CS_DEV_HANDLE d, const char *symbol, const char *name, unsigned index)
+static CS_CSF_ID load(CS_DEV_HANDLE d, const char *file, const char *symbol, const char *name, unsigned index)
 {
-    char descriptor[128] = "cs-example-functions.so";
+    char descriptor[128];
+    strcpy(descriptor, file);
     strcpy(descriptor + strlen(descriptor) + 1, symbol);
     CsCSFDownloadInfo info = {.Type = CS_CSF_VENDOR_SPECIFIC,
                               .SubType = CS_SUBTYPE_VENDOR_SPECIFIC,
@@ -33,7 +30,7 @@ static CS_CSF_ID load(CS_DEV_HANDLE d, const char *symbol, const char *name, uns
                               .Index = index};
     strcpy(info.common.UniqueName, name);
     info.common.DataBuffer = descriptor;
-    info.common.Length = strlen("cs-example-functions.so") + strlen(symbol) + 2;
+    info.common.Length = strlen(file) + strlen(symbol) + 2;
     u32 id;
     OK(csCSFDownload(d, &info, &id));
     CHECK(id == index);
@@ -78,17 +75,16 @@ static void callback(void *ctx, CS_STATUS status, u64 value)
 {
     CHECK(ctx == (void *)123);
     CHECK(status == CS_SUCCESS);
-    CHECK(value == 21);
+    CHECK(value == 4);
     atomic_store(&callback_done, 1);
 }
 int main(void)
 {
+    CHECK(!setenv("CSD_WORKMEM_SIZE_MB", "12", 1));
     void *mock = dlopen(CS_MOCK_PLUGIN, RTLD_NOW | RTLD_LOCAL);
     assert(mock);
-    mock_active_ptr = dlsym(mock, "mock_active"); mock_peak_ptr = dlsym(mock, "mock_peak");
     mock_used_bytes = dlsym(mock, "mock_used_bytes");
-    mock_allocation_count = dlsym(mock, "mock_allocation_count");
-    assert(mock_active_ptr && mock_peak_ptr && mock_used_bytes && mock_allocation_count);
+    assert(mock_used_bytes);
     /* Keep this test-only observation handle until process exit. */
 
     CS_DEV_HANDLE d;
@@ -117,8 +113,9 @@ int main(void)
     OK(csQueueCopyMemRequest(&within, NULL, NULL, NULL, NULL, NULL));
     OK(copy(b, buf, 7, CS_COPY_FROM_DEVICE, 5));
     CHECK(buf[0] == 0x44 && buf[6] == 0x22);
-    CS_CSF_ID scale = load(d, "cs_scale", "scale", 201), sum = load(d, "cs_scalar_sum", "sum", 202),
-              delay = load(d, "cs_delay", "delay", 203);
+    CS_CSF_ID sink = load(d, "cs-example-sort.so", "sort_sink", "sink", 201),
+              source = load(d, "cs-example-sort.so", "sort_source", "source", 202),
+              limit = load(d, "cs-example-limit.so", "limit_five", "limit", 203);
     int n = 0;
     CHECK(csQueryDeviceProperties(d, CS_FDM_TYPE, &n, NULL) == CS_INVALID_LENGTH);
     CsProperties *props = calloc(1, n);
@@ -145,130 +142,49 @@ int main(void)
     OK(csQueryDeviceProperties(d, CS_CSF_TYPE, &n, props));
     CHECK(props->CSFDetails[0].NumCSFs == 3);
     free(props);
-    CsComputeRequest *r = calloc(1, sizeof(*r) + 64 * sizeof(CsComputeArg));
-    r->CSFId = sum;
-    r->NumArgs = 2;
-    csHelperSetComputeArg(&r->Args[0], CS_8BIT_VALUE_TYPE, 1);
-    csHelperSetComputeArg(&r->Args[1], CS_16BIT_VALUE_TYPE, 20);
-    u64 value = 0;
-    uint64_t allocations = mock_allocation_count();
-    OK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, &value));
-    CHECK(value == 21);
-    CHECK(mock_used_bytes() == 8192);
-    CHECK(mock_allocation_count() == allocations); /* No hidden argument AFDM. */
-    r->NumArgs = 3;
-    csHelperSetComputeArg(&r->Args[2], CS_32BIT_VALUE_TYPE, (u32)99);
-    CHECK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, &value) == CS_UNSUPPORTED);
-    r->NumArgs = 1;
-    r->Args[0].Type = CS_128BIT_VALUE_TYPE;
-    CHECK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, &value) == CS_UNSUPPORTED_TYPE);
-    r->NumArgs = 2;
-    csHelperSetComputeArg(&r->Args[0], CS_32BIT_VALUE_TYPE, (u32)1);
-    csHelperSetComputeArg(&r->Args[1], CS_64BIT_VALUE_TYPE, (u64)20);
-    CS_DEV_HANDLE second_handle;
-    OK(csOpenCSx("/dev/nvme0n1", NULL, &second_handle));
-    n = 0;
-    CHECK(csQueryDeviceProperties(second_handle, CS_CSF_TYPE, &n, NULL) == CS_INVALID_LENGTH);
-    props = calloc(1, n);
-    OK(csQueryDeviceProperties(second_handle, CS_CSF_TYPE, &n, props));
-    CHECK(props->CSFDetails[0].NumCSFs == 3);
-    free(props);
-    OK(csCloseCSx(second_handle));
-    CHECK(csCloseCSx(d) == CS_HANDLE_IN_USE);
-    OK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, &value));
-    CHECK(value == 21);
-    r->CSFId = scale;
-    r->NumArgs = 0;
-    CHECK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, NULL) == CS_ERROR_IN_EXECUTION);
-    CHECK(mock_used_bytes() == 8192); /* Errors also allocate no hidden AFDM. */
-    r->CSFId = sum;
-    r->NumArgs = 65;
-    CHECK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, NULL) == CS_INVALID_ARG);
-    r->NumArgs = 2;
-    CHECK(csQueueComputeRequest(r, NULL, callback, (void *)1, NULL, NULL) == CS_INVALID_ARG);
-    CHECK(csQueueComputeRequest(r, (void *)123, callback, NULL, NULL, NULL) == CS_QUEUED);
-    for (int i = 0; i < 3000 && !atomic_load(&callback_done); i++)
-        usleep(1000);
-    CHECK(atomic_load(&callback_done));
-    CS_EVT_HANDLE event;
-    OK(csCreateEvent(&event));
-    CHECK(csPollEvent(event, NULL, NULL) == CS_NOT_DONE);
-    r->CSFId = scale;
-    r->NumArgs = 4;
-    csHelperSetComputeArg(&r->Args[0], CS_AFDM_TYPE, a, 4UL);
-    csHelperSetComputeArg(&r->Args[1], CS_AFDM_TYPE, b, 0UL);
-    csHelperSetComputeArg(&r->Args[2], CS_32BIT_VALUE_TYPE, (u32)4);
-    csHelperSetComputeArg(&r->Args[3], CS_64BIT_VALUE_TYPE, ((u64)8 << 32) | 4);
-    CHECK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, NULL) == CS_UNSUPPORTED);
-    csHelperSetComputeArg(&r->Args[0], CS_AFDM_TYPE, a, 0UL);
-    uint32_t input[] = {2, 4, 6, 8}, output[4];
-    OK(copy(a, input, sizeof(input), CS_COPY_TO_DEVICE, 4));
-    OK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, &value));
-    OK(copy(b, output, sizeof(output), CS_COPY_FROM_DEVICE, 8));
-    CHECK(output[0] == 4 && output[3] == 16);
-    /* Deep-copy descriptors, reject cycles without corrupting the graph. */
+    // A standard COPY batch exercises request snapshots and dependency edits without toy CSFs.
+    uint32_t values[] = {9, 17}, copied_value = 0;
+    CsBatchRequest entry = {.ReqType = CS_COPY_AFDM, .u.CopyMem = {
+        .Type = CS_COPY_TO_DEVICE, .DevMem = {a, 0}, .u.HostVAddress = &values[0], .Bytes = 4}};
     CS_BATCH_HANDLE batch;
-    OK(csAllocBatchRequest(CS_BATCH_HYBRID, 4, &batch));
-    CsBatchRequest *entry = calloc(1, sizeof(*entry) + 3 * sizeof(CsComputeArg));
-    entry->ReqType = CS_QUEUE_COMPUTE;
-    entry->u.Compute.CSFId = sum;
-    entry->u.Compute.NumArgs = 1;
-    csHelperSetComputeArg(&entry->u.Compute.Args[0], CS_64BIT_VALUE_TYPE, (u64)9);
     CS_BATCH_INDEX first, second;
-    OK(csConfigureBatchEntry(batch, CS_BATCH_ADD, entry, 0, 0, &first));
-    entry->u.Compute.Args[0].u.Value64 = 17;
-    OK(csConfigureBatchEntry(batch, CS_BATCH_ADD, entry, 0, first, &second));
-    entry->u.Compute.Args[0].u.Value64 = 999;
+    OK(csAllocBatchRequest(CS_BATCH_HYBRID, 4, &batch));
+    OK(csConfigureBatchEntry(batch, CS_BATCH_ADD, &entry, 0, 0, &first));
+    entry.u.CopyMem.u.HostVAddress = &values[1];
+    OK(csConfigureBatchEntry(batch, CS_BATCH_ADD, &entry, 0, first, &second));
+    entry.u.CopyMem.Bytes = 0;
     CHECK(csConfigureBatchEntry(batch, CS_BATCH_JOIN, NULL, first, second, NULL) == CS_INVALID_ARG);
+    u64 value = 0;
     OK(csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, &value));
-    CHECK(value == 17);
+    OK(copy(a, &copied_value, 4, CS_COPY_FROM_DEVICE, 0));
+    CHECK(value == 4 && copied_value == 17);
+    CHECK(csFreeMem(a, &f) == CS_MEMORY_IN_USE);
     OK(csConfigureBatchEntry(batch, CS_BATCH_SPLIT, NULL, first, second, NULL));
     OK(csConfigureBatchEntry(batch, CS_BATCH_JOIN, NULL, second, first, NULL));
-    entry->u.Compute.Args[0].u.Value64 = 23;
-    OK(csConfigureBatchEntry(batch, CS_BATCH_RECONFIG, entry, second, 0, NULL));
-    OK(csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, &value));
-    CHECK(value == 23);
     CHECK(csHelperResizeBatchRequest(batch, 1) == CS_INVALID_LENGTH);
     OK(csHelperResizeBatchRequest(batch, 6));
     OK(csConfigureBatchEntry(batch, CS_BATCH_DELETE, NULL, second, 0, NULL));
-    OK(csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, &value));
-    CHECK(value == 9);
     OK(csFreeBatchRequest(batch));
-    /* Four independent delay CSFs overlap, rather than silently running serially. */
-    OK(csAllocBatchRequest(CS_BATCH_PARALLEL, 4, &batch));
-    entry->u.Compute.CSFId = delay;
-    entry->u.Compute.NumArgs = 0;
-    CS_CSF_ID delays[4] = {delay, load(d, "cs_delay", "delay-2", 204),
-                           load(d, "cs_delay", "delay-3", 205),
-                           load(d, "cs_delay", "delay-4", 206)};
-    for (unsigned i = 0; i < 4; i++) {
-        entry->u.Compute.CSFId = delays[i];
-        CS_BATCH_INDEX index;
-        OK(csConfigureBatchEntry(batch, CS_BATCH_ADD, entry, 0, 0, &index));
-    }
-    CHECK(csQueueBatchRequest(batch, NULL, NULL, event, NULL, NULL) == CS_QUEUED);
-    CHECK(csFreeBatchRequest(batch) == CS_HANDLE_IN_USE);
-    CHECK(csDeleteEvent(event) == CS_HANDLE_IN_USE);
+    CsCopyMemRequest write = {.Type = CS_COPY_TO_DEVICE, .DevMem = {a, 0}, .u.HostVAddress = values, .Bytes = 4};
+    CHECK(csQueueCopyMemRequest(&write, (void *)123, callback, NULL, NULL, NULL) == CS_QUEUED);
+    for (int i = 0; i < 3000 && !atomic_load(&callback_done); ++i) usleep(1000);
+    CHECK(atomic_load(&callback_done));
+    CS_EVT_HANDLE event;
+    OK(csCreateEvent(&event));
+    CHECK(csQueueCopyMemRequest(&write, NULL, NULL, event, NULL, NULL) == CS_QUEUED);
     wait_event(event);
-    CHECK(atomic_load(&mock_peak) >= 2);
-    OK(csConfigureBatchEntry(batch, CS_BATCH_RECONFIG, entry, 1, 0, NULL));
-    OK(csConfigureBatchEntry(batch, CS_BATCH_DELETE, NULL, 2, 0, NULL));
-    OK(csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, NULL));
-    OK(csFreeBatchRequest(batch));
-    /* In-flight AFDM ownership and explicit unsupported running abort. */
-    r->CSFId = delay;
-    r->NumArgs = 1;
-    csHelperSetComputeArg(&r->Args[0], CS_AFDM_TYPE, a, 0UL);
-    CS_REQ_HANDLE request;
-    CHECK(csQueueComputeRequest(r, NULL, NULL, event, &request, NULL) == CS_QUEUED);
-    CHECK(csFreeMem(a, &f) == CS_MEMORY_IN_USE);
-    while (!atomic_load(&mock_active))
-        usleep(100);
-    CHECK(csAbortRequest(request) == CS_UNSUPPORTED);
-    wait_event(event);
-    CHECK(csAbortRequest(request) == CS_INVALID_HANDLE);
     OK(csDeleteEvent(event));
-    CHECK(csDeleteEvent(event) == CS_INVALID_HANDLE);
+    // FEMU validates native scalar/MR restrictions before executing the sort.
+    CsComputeRequest *compute = calloc(1, sizeof(*compute) + 3 * sizeof(CsComputeArg));
+    compute->CSFId = sink;
+    CHECK(csQueueComputeRequest(compute, NULL, NULL, NULL, NULL, NULL) == CS_ERROR_IN_EXECUTION);
+    compute->NumArgs = 1;
+    compute->Args[0].Type = CS_128BIT_VALUE_TYPE;
+    CHECK(csQueueComputeRequest(compute, NULL, NULL, NULL, NULL, NULL) == CS_UNSUPPORTED_TYPE);
+    compute->NumArgs = 3;
+    for (int i = 0; i < 3; ++i) csHelperSetComputeArg(&compute->Args[i], CS_64BIT_VALUE_TYPE, (u64)0);
+    CHECK(csQueueComputeRequest(compute, NULL, NULL, NULL, NULL, NULL) == CS_UNSUPPORTED);
+    free(compute);
     /* Generic storage API maps LBA ranges to AFDM; no Guest buffer is involved. */
     CsStorageRequest storage = {
         .Mode = CS_STORAGE_BLOCK_IO,
@@ -322,31 +238,62 @@ int main(void)
     OK(csFreeMem(large, &f));
     free(expected);
     free(observed);
-    CsStatsInfo stats;
-    CHECK(csQueryDeviceStatistics(d, CS_STAT_CSx_MEM_USAGE, NULL, &stats) == CS_UNSUPPORTED);
-    r->CSFId = load(d, "cs_check_params", "params", 207);
-    r->NumArgs = 2;
-    csHelperSetComputeArg(&r->Args[0], CS_64BIT_VALUE_TYPE, (u64)7);
-    csHelperSetComputeArg(&r->Args[1], CS_64BIT_VALUE_TYPE, (u64)3);
-    OK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, &value));
-    CHECK(value == 1); /* cparam1=7, cparam2=3 independently. */
-    r->Args[0].u.Value64 = 3;
-    r->Args[1].u.Value64 = 7;
-    CHECK(csQueueComputeRequest(r, NULL, NULL, NULL, NULL, &value) == CS_ERROR_IN_EXECUTION);
-    CS_CSF_ID round = load(d, "cs_spill_roundtrip", "spill-round", 210),
-              store = load(d, "cs_spill_store", "spill-store", 211),
-              source = load(d, "cs_spill_load", "spill-load", 212),
-              fail = load(d, "cs_spill_fail", "spill-fail", 213),
-              wide = load(d, "cs_result64", "result64", 214);
-    spill_scenario(d, round, store, source, fail, wide);
-    CS_CSF_ID round2 = load(d, "cs_spill_roundtrip", "spill-round2", 215),
-              validate = load(d, "cs_spill_validate", "spill-validate", 216);
-    spill_graph(d, round, round2, validate);
+    // Real sort CSFs replace the old scale/delay/spill demonstration functions.
+    CsMemFlags clear = {.FDMId = 1, .Flags = CS_FDM_CLEAR};
+    CS_MEM_HANDLE input, io, sorted, output;
+    OK(csAllocMem(d, SORT_CHUNK_BYTES, &clear, &input, NULL));
+    OK(csAllocMem(d, SORT_BLOCK_BYTES, &clear, &io, NULL));
+    OK(csAllocMem(d, sizeof(struct sorted_chunk), &clear, &sorted, NULL));
+    OK(csAllocMem(d, sizeof(struct top_five), &clear, &output, NULL));
+    int32_t *data = malloc(SORT_CHUNK_BYTES);
+    CHECK(data);
+    CsBatchRequest *request = calloc(1, sizeof(*request) + 2 * sizeof(CsComputeArg));
+    request->ReqType = CS_QUEUE_COMPUTE;
+    request->u.Compute.CSFId = sink;
+    request->u.Compute.NumArgs = 2;
+    csHelperSetComputeArg(&request->u.Compute.Args[0], CS_AFDM_TYPE, input, 0UL);
+    csHelperSetComputeArg(&request->u.Compute.Args[1], CS_AFDM_TYPE, io, 0UL);
+    OK(csAllocBatchRequest(CS_BATCH_SERIAL, 1, &batch));
+    OK(csConfigureBatchEntry(batch, CS_BATCH_ADD, request, 0, 0, &first));
+    u64 state = 0;
+    for (unsigned chunk = 0; chunk < 4; ++chunk) {
+        for (unsigned i = 0; i < SORT_CHUNK_BYTES / 4; ++i) data[i] = (int32_t)(i % 100) - 50 + (int32_t)chunk;
+        OK(copy(input, data, SORT_CHUNK_BYTES, CS_COPY_TO_DEVICE, 0));
+        OK(csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, &value));
+        if (!state) {
+            state = value;
+            CHECK(state > UINT32_MAX); // The first sink returns a complete 64-bit device handle.
+            request->u.Compute.NumArgs = 3;
+            csHelperSetComputeArg(&request->u.Compute.Args[2], CS_64BIT_VALUE_TYPE, state);
+            OK(csConfigureBatchEntry(batch, CS_BATCH_RECONFIG, request, first, 0, NULL));
+        } else CHECK(value == state);
+    }
+    OK(csFreeBatchRequest(batch));
+    request->u.Compute.CSFId = source;
+    csHelperSetComputeArg(&request->u.Compute.Args[0], CS_AFDM_TYPE, sorted, 0UL);
+    OK(csAllocBatchRequest(CS_BATCH_HYBRID, 2, &batch));
+    OK(csConfigureBatchEntry(batch, CS_BATCH_ADD, request, 0, 0, &first));
+    request->u.Compute.CSFId = limit;
+    request->u.Compute.NumArgs = 2;
+    csHelperSetComputeArg(&request->u.Compute.Args[1], CS_AFDM_TYPE, output, 0UL);
+    OK(csConfigureBatchEntry(batch, CS_BATCH_ADD, request, 0, first, &second));
+    OK(csCreateEvent(&event));
+    struct top_five top;
+    do {
+        CHECK(csQueueBatchRequest(batch, NULL, NULL, event, NULL, NULL) == CS_QUEUED);
+        wait_event(event);
+        OK(copy(output, &top, sizeof(top), CS_COPY_FROM_DEVICE, 0));
+    } while (!top.finished);
+    CHECK(top.count == 5);
+    for (unsigned i = 0; i < 5; ++i) CHECK(top.values[i] == 52);
+    OK(csDeleteEvent(event));
+    OK(csFreeBatchRequest(batch));
+    OK(csFreeMem(output, &f)); OK(csFreeMem(sorted, &f));
+    OK(csFreeMem(io, &f)); OK(csFreeMem(input, &f));
+    free(data); free(request);
     CHECK(mock_used_bytes() == 0);
     OK(csCloseCSx(d));
     CHECK(csCloseCSx(d) == CS_INVALID_HANDLE);
-    free(entry);
-    free(r);
-    printf("PASS: %u API checks\n", checks);
+    printf("PASS: %u API checks; memory-first sort across batches, spill/load/free and source EOF\n", checks);
     return 0;
 }

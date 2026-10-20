@@ -156,3 +156,21 @@
 - 迁移后的 workmem Guest 客户端两轮通过：4CU/2SO共享64MiB，均2次成功/2次ENOMEM，结束占用0。
 - Guest256MiB完整示例通过；分别遇到4个和3个文件extent，均读完64个输入块，结果为2147483640、2147483488、2147483485、2147483458、2147483243，与生成时独立维护的参考值一致。
 - SDK重装至Guest /usr/local后，独立C应用仅链接-lsnia-cs-api，完整文件排序再次通过。保留/data/cs-batch-input.bin供查看；未重启Guest或重新分区。
+
+## 2026-10-20：内存优先的双入口排序
+
+### 修改
+
+- sort.cpp 只保留 sort_sink、sort_source 两个设备入口，移除独立 create/destroy/abort。首次 sink 创建 context 并返回64位状态标识；source 直接读取该状态中的全部 run，最后一个输出 chunk 生成后 FREE token、销毁 context，并输出 finished=1。
+- 每个4MiB run 优先申请 workmem 并驻留。只有申请失败才淘汰一个驻留 run，完整保存为16个256KiB块，再复用腾出的内存；source 的归并读缓冲也按申请失败触发淘汰，没有固定 spill 阈值。
+- source 每次输出最多4MiB，全局降序流跨多个 batch 连续输出。limit 保留第一次选出的前5，并传递 finished；示例读到 EOF 展示自动销毁。提前停止或错误也使用同一 source（仅传 I/O AFDM）释放私有内存，随后关闭设备回收残留 token。
+- 删除 snia_compute_functions.c 和 cs-example-functions.so，不再保留 scale/delay/标量/合成spill设备函数。删除依赖这些函数的独立真实测试及场景头；基础复制、storage、event、依赖图检查保留，计算和跨batch spill 改为直接测试真实 sort/limit。
+- 第一个 sink 的 CompValue 取得状态标识后更新后续请求，程序槽位减少到420–422；仅 LIMIT 的小型累积结果需要清零，输入/排序输出由生产者覆盖。同步 AFDM 布局与中文文档，合并 smoke/example 测试入口。
+
+### 验证
+
+- 宿主5组 SNIA 功能测试通过；使用12MiB工作池的mock请求覆盖驻留run、申请失败spill、跨batch归并、event与EOF回收。
+- 宿主与容器4组设备测试通过。排序测试确认内存充足时STORE次数为0、内存不足时才spill，并额外占用工作池触发source的淘汰；逐项比较完整排序流，覆盖负数、重复值、满chunk EOF和提前结束，最终context/占用归零。
+- 排序和workmem的ASan/UBSan/LeakSanitizer全部通过。
+- Guest64MiB workmem下的256MiB文件实测通过，完整归并后前5与参考一致；迁移后的workmem真实客户端两轮配额测试也通过。
+- 容器已重编两个算子，排序SO仅有sort_sink/source两个设备入口；旧演示SO已删除。

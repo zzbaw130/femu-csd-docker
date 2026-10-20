@@ -1,68 +1,70 @@
 # 文件排序并取最大的5个整数
 
-`cs_batch_sort_limit.c` 是 Guest 应用，只通过 `cs.h` 和 libsnia-cs-api.so 访问设备。`batch_sort.h` 定义本示例输入规模和输出数据布局，由应用与设备算子共同采用。设备 sort/limit 源码在 `code/csd-programs/examples`，在容器内编译。
+cs_batch_sort_limit.c 在 Guest 运行，只通过 cs.h 和 libsnia-cs-api.so 调用设备。batch_sort.h 是本示例共享的数据布局；设备 sort.cpp、limit.c 位于 code/csd-programs/examples，在容器编译。排序只有 sink、source 两个入口。
 
 ## 编译运行
 
-先准备已挂载的 femu-data 分区和未挂载的 femu-spill 分区；已有分区无需重建。宿主项目根目录：
+使用已挂载的 femu-data 分区和未挂载的 femu-spill 分区。在宿主项目根目录：
 
 ```sh
 bash tests/snia-cs-api-test.sh build
 bash tests/snia-cs-api-test.sh example
 ```
 
-也可在 Guest 独立编译（SDK 已安装时）：
+SDK 已安装时，也可在 Guest 独立编译：
 
 ```sh
 cc cs_batch_sort_limit.c -O2 -lsnia-cs-api -o cs-batch-sort-limit
 sudo ./cs-batch-sort-limit /dev/nvme0n1 /data/cs-batch-input.bin
 ```
 
-应用会创建或覆盖指定文件，写入256MiB伪随机 int32，包括正数和负数；保留文件供查看。生成时独立计算参考前5，最终逐项核对 CSD 输出。固定程序索引420–425，运行期间不要让其他程序复用这些索引。
+应用创建或覆盖指定文件，写入256MiB伪随机 int32（含正负数），生成时独立维护参考前5，最终核对结果。程序索引420–422；文件保留供查看。实验期间不能写入或移动该文件。
 
-## 文件 extent 到 LOAD
+## extent 与内部 LOAD
 
-应用用 fsync 将数据落盘，再用 FIEMAP 查询文件的物理 extent。FIEMAP 地址相对于文件系统所在分区；csQueueStorageRequest 的 StartLba 相对于原始 namespace，所以必须加上分区起始位置。应用从 sysfs 读取分区起始扇区和 namespace id，从块设备读取逻辑块大小，并检查文件确实位于该设备上。
+fsync 后用 FIEMAP 查询物理 extent。FIEMAP 地址相对于数据分区；LOAD 的 StartLba 相对于 namespace，所以要加分区起始位置。应用从 sysfs 读取分区起始扇区和 namespace id，从块设备读取逻辑块大小，检查文件位于指定设备上。
 
-每次取文件逻辑范围中的4MiB，将它覆盖的一个或多个 extent 转成 CSBlockRange，按文件逻辑顺序放入同一 LOAD 请求。内部 D0 会把这些范围连续放进输入 AFDM。未分配、未写入、编码或不对齐的 extent 被拒绝；示例不修改文件布局，也不把文件正文重新读回 Guest。文件保持打开并持有协作式独占锁，实验期间不能写入或移动它。
+每次取文件逻辑范围中的4MiB，将其覆盖的一个或多个 extent 按逻辑顺序转为 CSBlockRange，放入同一 csQueueStorageRequest。内部 D0 连续写入 input AFDM，正文不经过 Guest 中转。空洞、未写入、编码或不对齐的 extent 被拒绝；文件保持打开并持有协作式独占锁。
 
-## AFDM 与算子参数
+## AFDM 与参数
 
-| 名称 | 大小 | 谁写入、谁读取 |
+| AFDM | 大小 | 使用方式 |
 | --- | --- | --- |
-| input | 4MiB | LOAD 写入，sort_sink 的 MR[0] 读取 |
-| io | 256KiB | sort_sink 的 MR[1] 写待 spill 块；sort_source 的 MR[1] 接收 LOAD 块；始终是重入请求的最后一个 AFDM |
-| sorted | sizeof(sorted_chunk)，约4KiB | sort_source 的 MR[0] 写全局降序输出，limit_five 的 MR[0] 读取 |
-| result | sizeof(top_five)，24字节 | limit_five 的 MR[1] 写，Guest 最后读回 |
+| input | 4MiB | LOAD 写入，sink 的 MR[0] 读取 |
+| io | 256KiB | sink/source 的 MR[1]，最后一个 AFDM；保存一个待 STORE 或刚 LOAD 的 spill 块 |
+| sorted | 4MiB+8字节 | source 的 MR[0] 写 count、finished 和全局降序整数；limit 的 MR[0] 读 |
+| result | sizeof(top_five) | limit 的 MR[1] 保留前5并传递 finished；Guest 只读这个小结果 |
 
-sort_create 返回排序私有状态的64位标识。后续 sort 入口以 cparam1 接收它，cparam2 保留给库填写重入完成的 spill_id。标识指向设备工作内存对象，Guest 不能解引用。limit 没有私有状态。
+首次 sink 只传 input、io，cparam1 默认为0。sink 创建状态、保存第一个 run，并把64位状态标识作为普通 CompValue 返回。Guest 把它加入之后 sink/source 请求的第一个标量位置。cparam2 始终留给库在重入时传入刚完成 I/O 的 spill_id。Guest 不解引用状态标识。
 
-## 两个阶段的 batch
-
-排序必须先看到全部输入，才能确认全局最大值来自哪个 run。因此实际组织为：
+## batch 执行
 
 ```text
-阶段一，同一 batch 配置重复64次，仅更新 LOAD 的 extent：
+阶段一，重复64次，仅更新 LOAD 的 extent：
   LOAD(input) -> sort_sink(input, io, sort_handle)
-                    |
-                    +-- NEED_STORE -> 内部 STORE -> 重入记录 token，直到4MiB全部写完
+                     |
+                     +-- workmem 申请成功：排序并驻留，不执行 STORE
+                     +-- workmem 申请失败：spill 一个驻留 run，重入记录 token，再申请新 run
 
+第一批返回 sort_handle，更新 sink 参数；后续批次继续使用同一个状态。
 全部输入完成，释放阶段一 batch。
 
-阶段二，一个新 batch：
+阶段二，重复提交同一 batch，直到 result.finished=1：
   sort_source(sorted, io, sort_handle) -> limit_five(sorted, result)
       |
-      +-- NEED_LOAD -> 内部 LOAD -> 重入归并，直到产出一个全局降序 chunk
-
-Guest 读 result，检查前5；用单节点 batch 调 sort_destroy，逐个 FREE spill，释放私有状态。
+      +-- 直接读驻留 run；spill run 通过 NEED_LOAD/重入读取下一块
+      +-- 归并读缓冲申请失败：先 spill 一个驻留 run 腾出内存
+      +-- 最后一个 chunk：FREE 所有 spill token，结束 workmem，输出 finished=1
 ```
 
-这是 LOAD → sort → limit 的阻塞执行方式。不能在每个输入块的 sort_sink 后直接接 limit 并把局部输出当作全局结果。两个阶段均通过 csAllocBatchRequest、csConfigureBatchEntry 和 csQueueBatchRequest 提交，算子内部返回 NEED_* 后由 FEMU 插件处理 I/O 和重入，应用不手工推进这些步骤。
+排序是阻塞算子，因此所有输入都到达 sink 后，source 才开始输出全局有序数据。两个阶段都通过 csAllocBatchRequest、csConfigureBatchEntry 和 csQueueBatchRequest 组织；算子返回 NEED_* 后，FEMU 插件自动执行内部 I/O 和重入。
 
-## 设备重入和内存
+## 4MiB run 与256KiB spill 块
 
-sort_sink 在第一次入口把输入复制到 workmem，原地降序排序成一个4MiB run，再逐个256KiB返回 csNeedStore。再次进入时用 csIsReentry 判断，csReentryValue 取得刚完成的 spill_id，记录后继续 STORE；本次 run 全部保存后才完成 batch 节点。
+4MiB 是一次排序的输入和一个 run 的大小。256KiB 是 I/O 及归并缓存的大小；只有需要淘汰 run 时，才连续 STORE 16次，保存完整4MiB。归并只需为每个 spill run 缓存下一段，而不是同时把所有完整 run 载入内存。
 
-全部64个 run 共占256MiB spill，超过64MiB工作内存。sort_source 为每个 run 留一个256KiB缓存，通过 NEED_LOAD 请求下一块，执行多路归并。私有内存约20MiB加少量元数据；所有动态算法内存都用 cs_workmem 申请。输入和输出 AFDM 合计约4.26MiB。
+所有 run 数据、读缓冲和描述都由同一 workmem context 分配。内存充足时没有 spill；256MiB输入在64MiB工作池下会触发申请失败、淘汰和重入。没有额外的固定 spill 阈值或预留算法内存池。
 
-sort_source 每次最多输出1024个全局有序整数，可以重复调用直到 count=0。本示例只需要前5，所以取首个输出 chunk 后结束归并。sort_destroy 仍会释放全部 spill token。错误路径调用 sort_abort 释放私有内存，并关闭设备句柄回收剩余临时区；临时 token 不提供崩溃恢复。
+source 每次最多输出4MiB，最后一批同时带 finished=1；即使最后一批恰好装满，也已经销毁状态，不能再调用一次探测 EOF。本示例把整个有序流读完，以展示正常结束自动回收；limit 始终保留首5，后续 chunk 不覆盖它们。
+
+错误或提前停止时，通过 source 的收尾用法（仅传 io 和状态标识）释放私有内存，随后关闭设备句柄回收临时区。正常 EOF 则由 source 主动 FREE 后销毁。状态/token 不提供崩溃恢复。

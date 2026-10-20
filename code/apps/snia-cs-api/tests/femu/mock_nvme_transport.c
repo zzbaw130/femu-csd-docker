@@ -2,7 +2,6 @@
 #define _GNU_SOURCE
 #include "femu_common.h"
 #include <dlfcn.h>
-#include <stdatomic.h>
 #include <glob.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -11,15 +10,13 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static void *memory[4096];
 static uint64_t sizes[4096], used;
 static unsigned next_id = 1;
-static uint64_t allocations;
-static uint8_t nvm[4U << 20];
+static uint8_t nvm[32U << 20];
 static bool nvm_initialized;
 static struct {
     bool active;
     void *library;
     int64_t (*entry)(struct femu_csd_args *);
 } programs[1024];
-__attribute__((visibility("default"))) atomic_uint mock_active, mock_peak;
 int cs_transport_open(struct cs_device *d, const char *name)
 {
     if (strcmp(name, "/dev/nvme0n1"))
@@ -57,7 +54,6 @@ CS_STATUS cs_io64(struct cs_device *d, bool admin, struct nvme_passthru_cmd64 *c
         else
             memset(nvm + first * 512, 0, (uint64_t)desc[1] * 512);
     } else if (c->opcode == 0xb0) {
-        allocations++;
         uint64_t bytes = c->cdw10 | ((uint64_t)c->cdw11 << 32);
         if (bytes > (64U << 20) - used || next_id >= 4096)
             s = CS_NOT_ENOUGH_MEMORY;
@@ -93,7 +89,9 @@ CS_STATUS cs_io64(struct cs_device *d, bool admin, struct nvme_passthru_cmd64 *c
         if (programs[id].library)
             dlclose(programs[id].library);
         programs[id].active = false;
-        programs[id].library = dlopen(CS_TEST_PROGRAM, RTLD_NOW | RTLD_LOCAL);
+        char library[4096];
+        snprintf(library, sizeof(library), "%s/%s", CS_TEST_PROGRAM_DIR, file);
+        programs[id].library = dlopen(library, RTLD_NOW | RTLD_LOCAL);
         programs[id].entry = programs[id].library ? dlsym(programs[id].library, symbol) : NULL;
         if (!programs[id].entry)
             s = CS_LOAD_ERROR;
@@ -154,12 +152,7 @@ CS_STATUS cs_io64(struct cs_device *d, bool admin, struct nvme_passthru_cmd64 *c
             .cparam2 = c->cdw12 | ((uint64_t)c->cdw13 << 32)};
         int64_t (*entry)(struct femu_csd_args *) = programs[id].entry;
         pthread_mutex_unlock(&lock);
-        unsigned active = atomic_fetch_add(&mock_active, 1) + 1;
-        unsigned peak = atomic_load(&mock_peak);
-        while (active > peak && !atomic_compare_exchange_weak(&mock_peak, &peak, active)) {
-        }
         int64_t result = entry(&ka);
-        atomic_fetch_sub(&mock_active, 1);
         pthread_mutex_lock(&lock);
         c->result = (uint64_t)result;
     } else {
@@ -189,18 +182,11 @@ CS_STATUS cs_io(struct cs_device *d, bool admin, struct nvme_passthru_cmd *c)
 int cs_spill_region(struct cs_device *d, uint64_t *start, uint64_t *blocks)
 {
     (void)d;
-    *start = (3U << 20) / 512;
-    *blocks = (1U << 20) / 512;
+    *start = (4U << 20) / 512;
+    *blocks = (sizeof(nvm) - (4U << 20)) / 512;
     return open("/dev/null", O_RDWR | O_CLOEXEC);
 }
 
-__attribute__((visibility("default"))) uint64_t mock_allocation_count(void)
-{
-    pthread_mutex_lock(&lock);
-    uint64_t count = allocations;
-    pthread_mutex_unlock(&lock);
-    return count;
-}
 int __wrap_glob(const char *pattern, int flags, int (*error)(const char *, int), glob_t *out)
 {
     (void)flags; (void)error;
