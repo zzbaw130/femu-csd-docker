@@ -247,14 +247,13 @@ option `femu_csd_ubpf`). Without it, an eBPF load fails with Invalid Field.
       moves on without sending it to the FTL thread
 
   on one of nr_cu femu-csd-cu threads (csd_worker):
-   6. take the oldest job whose program is not running already, mark the
-      program running, and call it without the CSD lock, timing it with
+   6. take the oldest job, regardless of its program ID, and call it
+      without the CSD lock, timing it with
       the host clock:
         phantom    copy range 1 into range 0
         shared lib fn(&args)
         eBPF       JIT function or ubpf_exec(&args)
-   7. lock; Dword 0 = return value (above 2^32 - 1 clamped to that; a
-      negative value keeps its low 32 bits)
+   7. lock; CQE Dwords 0 and 1 hold the full 64-bit return value
    8. with no runtime from step 4: runtime = measured host time x scale,
       and take the compute unit now
    9. put the request on the completion ring of the poller that fetched
@@ -377,8 +376,9 @@ The smallest device line that loads programs:
   is not a library are refused; `csd-fuzz` fuzzes the fields of the CSD I/O
   commands; `csd-exec-concurrency` builds a shared-library program that
   sleeps (it skips when the host has no C compiler), loads and runs it, and
-  checks that a read on another queue, an admin command and another
-  program complete while it runs, that a loaded program refuses a further
+  checks that a read on another queue and an admin command complete while
+  it runs, that two calls to the same ID overlap and a third call waits
+  when both units are occupied, that a loaded program refuses a further
   load piece, and that deleting the program's queue or disabling the
   controller under it leaves the controller working. No qtest covers the
   case where `csd_program_dir` is unset, or the `/`, `.` and `..` name
@@ -397,8 +397,9 @@ The smallest device line that loads programs:
 
 - Programs run on `nr_cu` host threads, one per compute unit, so at most
   `nr_cu` run at once on the host; further Execute commands queue for a
-  thread. Two runs of the same program never overlap; different programs
-  do. A program that never returns keeps its thread and, at device removal
+  thread. Calls to the same program can overlap; the host must order
+  dependencies, and programs must synchronize shared mutable state.
+  A program that never returns keeps its thread and, at device removal
   (`device_del`), keeps QEMU waiting for it; FEMU cannot stop native code
   it has called.
 - A program runs on the AFDMs it was given while other commands may read

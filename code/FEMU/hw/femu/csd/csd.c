@@ -43,8 +43,6 @@ typedef struct FemuCsdProgram {
     uint32_t id;
     uint32_t refs;
     FemuCsdState *csd;
-    /* running on a compute unit; runs of one program take turns */
-    bool busy;
     QSLIST_ENTRY(FemuCsdProgram) dead;
     uint8_t type;
     bool active;
@@ -1016,22 +1014,11 @@ static void csd_finish_locked(FemuCsdState *csd, FemuCsdJob *job,
     }
 }
 
-/* the first pending job whose program is not running, or NULL */
-static FemuCsdJob *csd_next_job_locked(FemuCsdState *csd)
-{
-    FemuCsdJob *job;
-
-    QTAILQ_FOREACH(job, &csd->pending, entry) {
-        if (!job->req || !job->program->busy) {
-            return job;
-        }
-    }
-    return NULL;
-}
-
 /*
  * One thread per compute unit runs the programs, so a long one holds neither
- * a poller nor any lock the pollers or the admin queue take.
+ * a poller nor any lock the pollers or the admin queue take. Program IDs do
+ * not serialize calls: the host orders dependencies and the CSF owns the
+ * synchronization of any state shared by concurrent calls.
  */
 static void *csd_worker(void *opaque)
 {
@@ -1054,7 +1041,7 @@ static void *csd_worker(void *opaque)
             continue;
         }
 
-        job = csd_next_job_locked(csd);
+        job = QTAILQ_FIRST(&csd->pending);
         if (!job) {
             qemu_cond_wait(&csd->job_cond, &csd->lock);
             continue;
@@ -1066,7 +1053,6 @@ static void *csd_worker(void *opaque)
         }
 
         QTAILQ_INSERT_TAIL(&csd->running, job, entry);
-        job->program->busy = true;
         qemu_mutex_unlock(&csd->lock);
 
         result = 0;
@@ -1075,9 +1061,6 @@ static void *csd_worker(void *opaque)
         host_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - host_ns;
 
         qemu_mutex_lock(&csd->lock);
-        job->program->busy = false;
-        /* the next run of this program may be waiting for this one */
-        qemu_cond_broadcast(&csd->job_cond);
         if (job->req) {
             csd_finish_locked(csd, job, status, result, host_ns);
         }

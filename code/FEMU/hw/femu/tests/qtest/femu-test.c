@@ -18496,7 +18496,7 @@ static void femu_test_csd_exec_concurrency(void *obj, void *data,
     NvmeCmd cmd = { 0 };
     uint64_t buf, ranges;
     uint32_t id = 0;
-    int64_t start, read_us, admin_us, other_us;
+    int64_t start, read_us, admin_us, same_us, other_us;
     bool exec_done_first;
 
     if (!femu_csd_build_slow()) {
@@ -18550,11 +18550,15 @@ static void femu_test_csd_exec_concurrency(void *obj, void *data,
     admin_us = g_get_monotonic_time() - start;
     femu_csd_expect_exec(&c, &qa);
 
-    /*
-     * Two runs of program 1, then one of program 2, on two compute units:
-     * the second run of 1 waits for the first, and must not keep program 2
-     * from the other unit.
-     */
+    /* Two calls to the same program ID must use both compute units. */
+    start = g_get_monotonic_time();
+    femu_csd_submit_exec(&c, &qa, ranges, id, FEMU_CSD_SLOW_MS);
+    femu_csd_submit_exec(&c, &qa, ranges, id, FEMU_CSD_SLOW_MS);
+    femu_csd_expect_exec(&c, &qa);
+    femu_csd_expect_exec(&c, &qa);
+    same_us = g_get_monotonic_time() - start;
+
+    /* Both units are occupied: a third call, even to another ID, must wait. */
     start = g_get_monotonic_time();
     femu_csd_submit_exec(&c, &qa, ranges, id, FEMU_CSD_SLOW_MS);
     femu_csd_submit_exec(&c, &qa, ranges, id, FEMU_CSD_SLOW_MS);
@@ -18567,13 +18571,15 @@ static void femu_test_csd_exec_concurrency(void *obj, void *data,
     femu_csd_expect_exec(&c, &qa);
 
     g_test_message("program %d ms: read on the other queue done at %" PRId64
-                   " ms, admin command at %" PRId64 " ms, another program "
-                   "at %" PRId64 " ms", FEMU_CSD_SLOW_MS, read_us / 1000,
-                   admin_us / 1000, other_us / 1000);
+                   " ms, admin command at %" PRId64 " ms, two calls to the "
+                   "same ID at %" PRId64 " ms, third call at %" PRId64 " ms",
+                   FEMU_CSD_SLOW_MS, read_us / 1000, admin_us / 1000,
+                   same_us / 1000, other_us / 1000);
     g_assert_false(exec_done_first);
     g_assert_cmpint(read_us, <, FEMU_CSD_SLOW_MS * 1000 / 2);
     g_assert_cmpint(admin_us, <, FEMU_CSD_SLOW_MS * 1000 / 2);
-    g_assert_cmpint(other_us, <, FEMU_CSD_SLOW_MS * 1000 / 2);
+    g_assert_cmpint(same_us, <, FEMU_CSD_SLOW_MS * 1000 * 3 / 2);
+    g_assert_cmpint(other_us, >=, FEMU_CSD_SLOW_MS * 1000);
 
     /*
      * Delete queue 1 under a running program and create it again at once.

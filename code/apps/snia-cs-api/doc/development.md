@@ -2,6 +2,15 @@
 
 分支 `snia_csd_dev`，基线 tag `femu-csd-with-original-postgre`。当前功能不包含 PostgreSQL SQL runtime。
 
+## 2026-10-20：允许同一程序 ID 在多个 CU 并发执行
+
+- 删除设备程序的 busy 字段和按程序 ID 选择可运行任务的扫描。CU 线程直接领取队首请求；并发仍由 nr_cu 个线程限制，主机通过 batch 依赖安排执行顺序。
+- 保留每个请求独立的参数、MR 数组、程序和 AFDM 引用计数。允许同一函数并发调用不会复制 SO 全局变量、AFDM 数据或 sort_handle；共享可变状态的同步由算子或主机负责。共享 workmem 总预算保持不变。
+- 设备程序 README 补充多 CU 调用约定，明确当前 sort_handle 仍需串行调用；更新 FEMU 执行路径与限制说明。
+- 修改现有 csd-exec-concurrency 回归：验证同一 ID 的两个任务重叠，以及 CU 全满时第三个任务等待，同时保留队列删除、重置及控制器持续响应检查。
+- 容器内增量编译 FEMU 和 qos-test。相同测试在旧二进制上因两次1秒调用合计2.001秒而按预期失败；新二进制合计1.001秒，第三个100毫秒任务等待后于1.100秒完成。csd-exec-concurrency、csd-runtime-floor、csd-info-result64 三项通过。
+- 使用独立 qtest 实例验证，现有 Guest 未重启，因此当前正在运行的 FEMU 进程仍是旧版本。容器可写层中的二进制已更新，Docker 镜像未重建。可选 uBPF 未启用，本阶段不声称验证其并发执行。
+
 ## 已完成阶段
 
 - 初始阶段：33 个 Guest API 入口、句柄与引用、SERIAL/PARALLEL/HYBRID、event/callback，以及原生 SO 加载/激活。
