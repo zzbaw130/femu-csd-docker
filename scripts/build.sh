@@ -3,7 +3,7 @@
 #
 #   默认   重建容器镜像并启动 VM（保留已有 guest 镜像，不碰 postgres）
 #   -i     同时删掉 guest 镜像 u20s.qcow2，重新做一遍 provisioning
-#   -p     再做 postgres 那几步：挂载模拟盘 → 编译安装 → 载数据启库
+#   -p     再做 postgres 那几步：初始化分区与 SNIA → 编译安装 → 载数据启库
 
 set -eu
 
@@ -31,7 +31,7 @@ docker compose build
 docker compose up -d --wait
 
 if [[ ${BUILD_POSTGRE} -eq 1 ]]; then
-    ${ROOT}/sh-guest.sh ${ROOT}/guest/mount-nvme.sh
+    ${ROOT}/sh-guest.sh ${ROOT}/guest/init-csd-env.sh
     ${ROOT}/sh-guest.sh ${ROOT}/guest/install-postgre.sh
     ${ROOT}/sh-guest.sh ${ROOT}/guest/start-postgre.sh 0.01
 fi

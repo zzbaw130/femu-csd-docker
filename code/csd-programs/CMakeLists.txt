@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD 17)
 add_compile_options(-Wall -Wextra -Werror)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
-set(CSD_FEMU_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../apps/snia-cs-api/src/plugins/femu/include")
+set(CSD_FEMU_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../apps/snia/src/plugins/femu/include")
 # All native CSFs share one allocator and find it beside their own .so.
 function(add_csd_program target)
     add_library(${target} MODULE ${ARGN})

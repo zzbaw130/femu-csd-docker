@@ -83,7 +83,7 @@ AFDM 保存输入、输出和交接数据；私有算法状态使用工作内存
 
 - [原生和 SNIA 设备示例](examples/README.md)。
 - [分配器使用规范](csd-workmem/README.md)。
-- `bash tests/snia-cs-api-test.sh unit`：本地设备程序与 SNIA 测试。
-- `bash tests/snia-cs-api-test.sh build`：容器设备程序与 Guest SDK。
-- `bash tests/snia-cs-api-test.sh example`：Guest 256MiB 文件完整排序后分批计算平均值。
+- `bash tests/snia-test.sh unit`：本地设备程序与 SNIA 测试。
+- `bash tests/snia-test.sh build`：容器设备程序与 Guest SDK。
+- `bash tests/snia-test.sh example`：Guest 256MiB 文件完整排序后分批计算平均值。
 - `bash tests/csd-workmem-test.sh unit|build|live`：工作内存模拟或真实设备测试。

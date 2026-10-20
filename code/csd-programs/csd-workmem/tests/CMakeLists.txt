@@ -20,7 +20,7 @@ foreach(target workmem-allocation workmem-shared-budget workmem-header-compatibi
     target_compile_options(${target} PRIVATE -UNDEBUG)
 endforeach()
 # The optional Guest client uses the installed SNIA library; it does not link device workmem.
-find_library(SNIA_LIBRARY snia-cs-api)
+find_library(SNIA_LIBRARY snia)
 find_path(SNIA_INCLUDE cs.h)
 if(SNIA_LIBRARY AND SNIA_INCLUDE)
     add_executable(workmem-device-client workmem_device_client.c)

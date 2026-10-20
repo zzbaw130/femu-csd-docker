@@ -17,7 +17,7 @@
 
 ## 排序的两个入口
 
-Guest 应用是 [cs_batch_sort_avg.c](../../apps/snia-cs-api/examples/cs_batch_sort_avg.c)，参数布局在旁边的 batch_sort.h；完整 batch 及 AFDM 组织见[示例说明](../../apps/snia-cs-api/examples/README.md)。
+Guest 应用是 [cs_batch_sort_avg.c](../../apps/snia/examples/cs_batch_sort_avg.c)，参数布局在旁边的 batch_sort.h；完整 batch 及 AFDM 组织见[示例说明](../../apps/snia/examples/README.md)。
 
 sort_sink的并行用法为MR[0]=4MiB输入、MR[1]=sort_sink_task、MR[2]=256KiB spill I/O。Guest为每条分支设置workers=4、state=0；第一次执行时创建context，把句柄写回task.state。后续执行复用该task。四个分支使用同一CSF程序ID，各自保留run和重入状态。
 
@@ -42,6 +42,6 @@ sudo /home/femu/apps/csd-passthru/csd-passthru /dev/nvme0n1 smoke-so-all csd-ori
 
 ## 普通文件排序对比
 
-read_merge_sort_avg.c 独立编译为 build/examples/read-merge-sort-avg，只链接同一个 workmem 分配器，不调用设备接口。输入、输出和 I/O 缓冲加 workmem 的峰值不超过64MiB；输入 O_DIRECT 读取，临时文件在输入所在目录创建并 unlink，也用 O_DIRECT 读写。两边第一阶段均四路并行，第二阶段单路归并；同样生成64个4MiB run，优先驻留、申请失败才 spill，归并每个 spill run 缓存256KiB，共用同一个大根堆实现，完整排序输出均送入AVG，直到EOF后得到全表均值。由宿主 tests/snia-cs-api-test.sh bench 传到 Guest 运行并检查 spill 工作量一致。
+read_merge_sort_avg.c 独立编译为 build/examples/read-merge-sort-avg，只链接同一个 workmem 分配器，不调用设备接口。输入、输出和 I/O 缓冲加 workmem 的峰值不超过64MiB；输入 O_DIRECT 读取，临时文件在输入所在目录创建并 unlink，也用 O_DIRECT 读写。两边第一阶段均四路并行，第二阶段单路归并；同样生成64个4MiB run，优先驻留、申请失败才 spill，归并每个 spill run 缓存256KiB，共用同一个大根堆实现，完整排序输出均送入AVG，直到EOF后得到全表均值。由宿主 tests/snia-test.sh bench 传到 Guest 运行并检查 spill 工作量一致。
 
 并行sink的墙钟统计是各次调用之和，不能与阶段延迟等同。示例统计sink/source/AVG的累计墙钟和线程CPU时间，以及run排序墙钟时间，经最后一个输出chunk传给Guest。统计使用普通时钟，不修改FEMU命令或runtime。source的统计包含各次入口执行，LOAD/STORE/TRIM等待则由Guest插件SNIA_FEMU_PROFILE=1记录；两种计时的包含关系见Guest示例说明。

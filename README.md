@@ -1,6 +1,6 @@
 > `snia_csd_dev` 分支基于 `femu-csd-with-original-postgre` tag，新增独立的
-> [Computational Storage API 库](code/apps/snia-cs-api/README.md)。Guest 应用包含
-> `cs.h` 并链接库即可使用规范 API；能力范围及软件 batch 说明见该目录文档。
+> [Computational Storage API 库](code/apps/snia/README.md)。Guest 应用包含
+> `cs.h` 并用 `-lsnia` 链接库即可使用规范 API；能力范围及软件 batch 说明见该目录文档。
 
 # FEMU CSD + PostgreSQL 实验环境
 
@@ -14,7 +14,7 @@
 ```bash
 ./scripts/build.sh              # 重建容器镜像 + 启动 VM（保留已有 guest 镜像，不碰 postgres）
 ./scripts/build.sh -i           # 额外删掉 guest 镜像 u20s.qcow2，重新做一遍 provisioning
-./scripts/build.sh -p           # 额外：挂载模拟盘 → 编译安装 PostgreSQL → 载数据启库
+./scripts/build.sh -p           # 额外：初始化分区与 SNIA → 编译安装 PostgreSQL → 载数据启库
 ./scripts/build.sh -ip          # 从零一条龙（首次构建用这个）
 ```
 
@@ -24,12 +24,12 @@
 | 删 `images/u20s.qcow2`（强制重做 guest 镜像） | | ✓ | |
 | `docker compose build` 编译 FEMU | ✓ | | |
 | `docker compose up -d --wait` 启动 CSD VM（等 healthcheck：guest SSH 可用） | ✓ | | |
-| guest `mount-nvme.sh`：模拟盘 GPT 分区，80% ext4 挂到 `/data`、20% 预留 spill | | | ✓ |
+| guest `init-csd-env.sh`：模拟盘 GPT 分区，80% ext4 挂到 `/data`、20% 预留 spill，编译安装 SNIA | | | ✓ |
 | guest `install-postgre.sh`：从 `~/apps/postgres` 编译安装 PostgreSQL 到 `~/opt/postgres/release` | | | ✓ |
 | guest `start-postgre.sh 0.01`：解压 `data/tpch_s0.01.tar` 到 `/data` 并启动 `tpch_s0.01` | | | ✓ |
 
 `images/u20s.qcow2` 不存在时（首次或用了 `-i`）会自动制作 guest 镜像：下载 Ubuntu 24.04 cloud image +
-cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,flex`（guest 里编译 PG 需要），
+cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,flex,cmake,parted`（guest 里编译 PG 需要），
 耗时几分钟。
 
 前置条件：x86_64 + **可用的 `/dev/kvm`**、docker compose v2、首次构建/首次启动需要联网；
@@ -67,7 +67,7 @@ cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,f
 │   ├── gen-pgdata.sh                # 宿主机侧生成 data/tpch_s<SF>.tar（需要本机 duckdb + pg）
 │   ├── create-tables.sql / create-indexes.sql
 │   └── guest/                       # 只在 guest 内跑的脚本
-│       ├── mount-nvme.sh            # 80% ext4 挂 /data，20% 留作 spill
+│       ├── init-csd-env.sh          # 初始化数据/spill 分区并安装 SNIA
 │       ├── install-postgre.sh       # 编译安装 PostgreSQL
 │       └── start-postgre.sh         # 解压数据 + 启库
 ├── tests/
@@ -81,7 +81,7 @@ cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,f
 │   ├── apps/
 │   │   ├── postgres/                # PostgreSQL 12 源码（guest 里编译）
 │   │   ├── csd-passthru/            # guest 侧原生命令测试
-│   │   └── snia-cs-api/             # guest SNIA API 库与完整 batch 示例
+│   │   └── snia/                    # guest SNIA API 库与完整 batch 示例
 │   └── csd-programs/                # 容器编译、FEMU CU 执行
 │       ├── CMakeLists.txt           # 统一构建、链接与输出
 │       ├── examples/                # 原生/SNIA 算子及 sort/avg 样例
@@ -103,7 +103,7 @@ cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,f
 ### guest 内（`/home/femu`）
 
 ```
-apps/     ← 9p: 宿主机 code/apps      （postgres 源码、csd-passthru）
+apps/     ← 9p: 宿主机 code/apps      （postgres 源码、csd-passthru、snia）
 data/     ← 9p: 宿主机 data           （tpch_s<SF>.tar）
 results/  ← 9p: 宿主机 results        （实验结果直接落回宿主机）
 scripts/  ← 9p: 宿主机 scripts/guest  （guest 内脚本）
@@ -113,9 +113,17 @@ tests/    ← 9p: 宿主机 tests/guest    （tpch-test.sh + queries/）
 
 模拟盘的 `femu-data` 分区约占 80%，`femu-spill` 分区约占 20%，后者不格式化、不挂载。
 Guest 需安装 `parted`。首次运行或标签不匹配时会重新分区并格式化数据区，清除原有数据；
-标签匹配时复用已有布局。执行 `./scripts/sh-guest.sh scripts/guest/mount-nvme.sh` 即可。
+标签匹配时复用已有布局。执行 `./scripts/sh-guest.sh scripts/guest/init-csd-env.sh` 即可。
 后续 SNIA 按 GPT `PARTLABEL=femu-spill` 查找 spill 分区，读取其起始位置和容量；
-分区序号不承担角色含义。当前尚未实现 spill 调度和 STORE。
+分区序号不承担角色含义。SNIA 插件通过内部 D0/D1 处理 spill LOAD/STORE。
+该脚本同时编译 `/home/femu/apps/snia`，安装 `cs.h`、`libsnia.so` 和 FEMU 插件到 `/usr/local`，
+并运行 `ldconfig`。完成后应用可直接使用：
+
+```sh
+cc application.c -lsnia -o application
+```
+
+脚本可重复执行；分区标签匹配时不会重新格式化数据区。
 
 ## 4. 设计要点（相对上游 FEMU 的改动）
 

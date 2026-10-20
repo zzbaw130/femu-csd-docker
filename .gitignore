@@ -42,4 +42,4 @@ __pycache__/
 
 # CMake 构建目录
 /code/csd-programs/build/
-/code/apps/snia-cs-api/build/
+/code/apps/snia/build/
