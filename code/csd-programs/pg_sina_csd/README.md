@@ -42,3 +42,11 @@ ctest --test-dir code/csd-programs/build -R pgSina --output-on-failure
 ```
 
 真实 PG heap、冷启动结果对照和 EXPLAIN 检查由 `tests/pg-sina-csd-test.sh query` 执行。设备算子不调用 NVMe，不持有 Guest 文件描述符，不查询 SQL 元数据。
+
+## 可选入口计时
+
+PG 的 `pg_sina_csd.profile` 默认关闭。`profile.c` 是查询算子共用的计时入口：CMake 仅在编译时将算法入口命名为 `_impl`，对外导出的原入口先判断是否计时，再调用算法。Scan/Filter/Aggregate/Sort/Limit 功能源码不加入时钟代码。
+
+本扩展的调试参数约定：关闭时 cparam1=0，MR 顺序与上表完全相同；开启时 cparam1=1，在原 MR 之后追加一个 `qs_profile` 输出 AFDM。包装入口记录调用期间的 CLOCK_MONOTONIC 与 CLOCK_THREAD_CPUTIME_ID，移除附加 MR、清零 cparam1 后调用原实现，保留返回值及调用者参数。每个并行分支独占一份计数输出，分支内顺序运行，无须原子计数；收集后由 PG 合并。第二条流水线继续使用第一个分支的计数输出。
+
+这是 PG 查询程序自己的可选输入输出约定，不是新 SNIA API，不修改 femu_csd_args。阶段0的 heap_count 参数约定不变，不接入这个开关。CPU/墙钟时间均为 FEMU 宿主线程测量，开启计时本身有时钟和小量输出传输开销；正常测量或发布时关闭即可。

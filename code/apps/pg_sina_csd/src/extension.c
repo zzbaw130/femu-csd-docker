@@ -7,6 +7,7 @@
 #include "pg_internal.h"
 PG_MODULE_MAGIC;
 int pg_sina_exe_path = 0;
+bool pg_sina_profile = false;
 static create_upper_paths_hook_type previous_upper_hook;
 static void upper_hook(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *input,RelOptInfo *output,void *extra)
 {
@@ -25,6 +26,8 @@ void _PG_init(void)
 {
     DefineCustomEnumVariable("pg_sina_csd.exe_path", "Choose native PG or supported CSD execution paths", NULL,
         &pg_sina_exe_path, 0, execution_paths, PGC_USERSET, 0, NULL, assign_path, NULL);
+    DefineCustomBoolVariable("pg_sina_csd.profile", "Collect device operator timings for EXPLAIN ANALYZE", NULL,
+        &pg_sina_profile, false, PGC_USERSET, 0, NULL, NULL, NULL);
     RegisterCustomScanMethods(&pg_sina_scan_methods);
     previous_upper_hook=create_upper_paths_hook; create_upper_paths_hook=upper_hook;
 }

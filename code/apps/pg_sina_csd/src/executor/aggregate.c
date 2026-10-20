@@ -7,7 +7,7 @@ typedef struct {
     struct qs_request request;
     struct qs_result *result;
     unsigned index;
-    bool explain_only,executed;
+    bool explain_only,executed,profiling;
 } SniaState;
 static const CustomExecMethods methods;
 static Node *create_state(CustomScan *scan)
@@ -44,7 +44,8 @@ static TupleTableSlot *execute(CustomScanState *node)
     if(s->explain_only) return ExecClearTuple(slot);
     if(!s->executed) {
         struct qs_extent *extents=pg_sina_mapping(&s->request);
-        pg_sina_execute(&s->request,extents,s->result); s->executed=true;
+        s->profiling=pg_sina_profile;
+        pg_sina_execute(&s->request,extents,s->result,s->profiling); s->executed=true;
         if(s->result->begin+s->result->rows>QS_GROUPS) elog(ERROR,"invalid CSD result range");
     }
     if(s->index==s->result->rows) return ExecClearTuple(slot);
@@ -71,6 +72,39 @@ static void rescan(CustomScanState *node)
 {
     SniaState *s=(SniaState *)node; s->executed=false; s->index=0;
 }
+static void explain_profile(const struct qs_profile *p,ExplainState *es)
+{
+    static const char *names[]={"Scan","Filter","Aggregate.sink","Aggregate.source","Sort","Limit"};
+    if(es->format==EXPLAIN_FORMAT_TEXT) {
+        appendStringInfoSpaces(es->str,es->indent*2);
+        appendStringInfoString(es->str,"CSD Profile (operator times summed across CUs):\n"); ++es->indent;
+    }
+    ExplainOpenGroup("CSD-Profile","CSD Profile",true,es);
+    ExplainPropertyFloat("Setup Wall","ms",p->setup_ns/1e6,3,es);
+    ExplainPropertyFloat("Pipeline 1 Wall","ms",p->pipeline_ns[0]/1e6,3,es);
+    ExplainPropertyFloat("Pipeline 2 Wall","ms",p->pipeline_ns[1]/1e6,3,es);
+    ExplainPropertyFloat("Cleanup Wall","ms",p->cleanup_ns/1e6,3,es);
+    ExplainPropertyFloat("Total Wall","ms",p->total_ns/1e6,3,es);
+    for(unsigned i=0;i<QS_OPERATORS;++i) if(p->operators[i].calls) {
+        const struct qs_timing *t=&p->operators[i];
+        if(es->format==EXPLAIN_FORMAT_TEXT) {
+            char summary[192];
+            snprintf(summary,sizeof(summary),"calls=%llu wall_sum=%.3f ms cpu_sum=%.3f ms wall_max=%.3f ms",
+                (unsigned long long)t->calls,t->wall_ns/1e6,t->cpu_ns/1e6,t->max_wall_ns/1e6);
+            ExplainPropertyText(names[i],summary,es);
+        } else {
+            ExplainOpenGroup("Operator",names[i],true,es);
+            ExplainPropertyText("Name",names[i],es);
+            ExplainPropertyInteger("Calls",NULL,t->calls,es);
+            ExplainPropertyFloat("Wall Sum","ms",t->wall_ns/1e6,3,es);
+            ExplainPropertyFloat("CPU Sum","ms",t->cpu_ns/1e6,3,es);
+            ExplainPropertyFloat("Wall Max","ms",t->max_wall_ns/1e6,3,es);
+            ExplainCloseGroup("Operator",names[i],true,es);
+        }
+    }
+    ExplainCloseGroup("CSD-Profile","CSD Profile",true,es);
+    if(es->format==EXPLAIN_FORMAT_TEXT) --es->indent;
+}
 static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
 {
     SniaState *s=(SniaState *)node; const struct qs_plan *p=&s->request.plan;
@@ -82,6 +116,7 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     if(p->limit>=0 || p->offset) appendStringInfoString(&graph," -> Limit");
     ExplainPropertyText("SNIA Pipelines",graph.data,es); ExplainPropertyInteger("CSD Columns",NULL,p->ncols,es);
     if(s->executed) {
+        if(s->profiling) explain_profile(&s->result->profile,es);
         ExplainPropertyInteger("CSD AFDM","bytes",s->result->metrics.fdm_bytes,es);
         ExplainPropertyInteger("CSD Chunks",NULL,s->result->metrics.chunks,es);
         ExplainPropertyInteger("CSD Workers",NULL,s->result->metrics.workers,es);

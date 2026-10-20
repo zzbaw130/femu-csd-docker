@@ -5,6 +5,8 @@
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <stdio.h>
+static int profiling;
+static struct qs_profile profile;
 typedef int64_t (*function)(struct femu_csd_args *);
 static function load(const char *path,const char *name)
 {
@@ -12,13 +14,18 @@ static function load(const char *path,const char *name)
 }
 static void run(function fn,void **addresses,long long *lengths,unsigned n)
 {
-    struct femu_csd_args a={.numr=n,.mr_addr=addresses,.mr_len=lengths}; assert(fn(&a)==0);
+    void *mr[5]; long long len[5];
+    for(unsigned i=0;i<n;++i) { mr[i]=addresses[i]; len[i]=lengths[i]; }
+    if(profiling) { mr[n]=&profile; len[n]=sizeof(profile); }
+    struct femu_csd_args a={.numr=n+profiling,.mr_addr=mr,.mr_len=len,.cparam1=profiling};
+    assert(fn(&a)==0 && a.numr==(int)(n+profiling));
 }
 int main(int argc,char **argv)
 {
-    assert(argc==5);
-    function filter=load(argv[1],"pg_sina_filter"),sink=load(argv[2],"pg_sina_aggregate_sink");
-    function source=load(argv[2],"pg_sina_aggregate_source"),sort=load(argv[3],"pg_sina_sort"),limit=load(argv[4],"pg_sina_limit");
+    assert(argc==6 || argc==7); profiling=argc==7;
+    if(profiling) assert(!strcmp(argv[6],"--profile"));
+    function scan=load(argv[1],"pg_sina_scan"),filter=load(argv[2],"pg_sina_filter"),sink=load(argv[3],"pg_sina_aggregate_sink");
+    function source=load(argv[3],"pg_sina_aggregate_source"),sort=load(argv[4],"pg_sina_sort"),limit=load(argv[5],"pg_sina_limit");
     struct qs_plan p={.nattrs=2,.ncols=2,.nexprs=4,.nkeys=1,.naggs=4,.nout=5,.norder=1,.predicate=3,.limit=1,.offset=1};
     p.cols[0]=(struct qs_column){.slot=0,.type=Q_INTEGER};p.cols[1]=(struct qs_column){.slot=1,.type=Q_DECIMAL,.scale=2};
     p.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER,.column=0};
@@ -31,6 +38,12 @@ int main(int argc,char **argv)
     p.outputs[0]=(struct qs_output){.index=0};
     for(unsigned i=1;i<5;++i) p.outputs[i]=(struct qs_output){.index=i-1,.aggregate=1};
     p.order[0]=(struct qs_order){.output=0,.descending=1};
+    unsigned char page[QS_PAGE]={0};
+    uint16_t fields[]={4,24,QS_PAGE,QS_PAGE,QS_PAGE|4}; memcpy(page+10,fields,sizeof(fields));
+    size_t empty_bytes=qs_chunk_bytes(4,2); struct qs_chunk *empty=calloc(1,empty_bytes); assert(empty);
+    empty->capacity=4; empty->ncols=2; struct qs_task scan_task={.input_bytes=QS_PAGE};
+    void *scan_mem[]={page,&p,empty,&scan_task}; long long scan_len[]={sizeof(page),sizeof(p),empty_bytes,sizeof(scan_task)};
+    run(scan,scan_mem,scan_len,4); assert(!empty->rows); free(empty);
     struct qs_group group={.count=4}; struct qs_task tasks[4]={{0}};
     for(unsigned worker=0;worker<4;++worker) {
         size_t bytes=qs_chunk_bytes(4,2); struct qs_chunk *chunk=calloc(1,bytes); assert(chunk);
@@ -61,5 +74,19 @@ int main(int argc,char **argv)
     __int128 largest=(__int128)(((unsigned __int128)1<<127)-1),large=9;
     for(unsigned i=0;i<37;++i) large*=10;
     assert(!qs_compare((struct qs_cell){.value=largest,.scale=1},(struct qs_cell){.value=large},&cmp) && cmp<0);
+    const unsigned expected[]={1,4,4,1,1,1};
+    for(unsigned i=0;i<QS_OPERATORS;++i) {
+        const struct qs_timing *t=&profile.operators[i];
+        assert(t->calls==(profiling?expected[i]:0));
+        if(profiling) assert(t->wall_ns>=t->max_wall_ns && t->max_wall_ns && t->cpu_ns);
+        else assert(!t->wall_ns && !t->cpu_ns && !t->max_wall_ns);
+    }
+    /* Instrumentation preserves both the error and the caller's MR count. */
+    struct femu_csd_args invalid={0}; int64_t error=scan(&invalid); assert(error<0);
+    void *mr[]={&profile}; long long len[]={sizeof(profile)};
+    invalid=(struct femu_csd_args){.numr=1,.mr_addr=mr,.mr_len=len,.cparam1=1};
+    assert(scan(&invalid)==error && invalid.numr==1 && invalid.cparam1==1);
+    uint64_t calls=profile.operators[QS_SCAN].calls; --len[0];
+    assert(scan(&invalid)<0 && profile.operators[QS_SCAN].calls==calls);
     free(result); puts("PASS vector filter, NULL aggregates, four-state merge, exact AVG, sort/limit and workmem cleanup"); return 0;
 }

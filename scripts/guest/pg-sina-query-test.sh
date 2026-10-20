@@ -58,7 +58,7 @@ case ${1:-query} in
         # Keep the same backend alive after cancellation: SNIA handles must
         # be reusable without relying on a worker or backend exit.
         {
-            printf "\\set ON_ERROR_STOP off\nSET statement_timeout='100ms';\n"
+            printf "SET pg_sina_csd.profile=on;\n\\set ON_ERROR_STOP off\nSET statement_timeout='100ms';\n"
             cat "$PROJECT/tests/q1.sql"
             printf '\\set ON_ERROR_STOP on\nSET statement_timeout=0;\n'
             printf 'EXPLAIN (COSTS OFF) SELECT count(*) FROM snia_query_fixture;\n'
@@ -73,6 +73,45 @@ case ${1:-query} in
         cmp "$RESULTS/q1.host.rows" "$RESULTS/after-timeout.csd.rows"
         echo 'PASS cancellation cleanup and full device reuse'
         psql -X -q -v ON_ERROR_STOP=1 -d tpch_s1 -c "DELETE FROM sina_csd.relations WHERE relid IN ('snia_query_fixture'::regclass,'snia_query_empty'::regclass); DROP TABLE snia_query_fixture,snia_query_empty"
+        ;;
+    profile)
+        [[ $(psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 -c "LOAD 'pg_sina_csd'" -c 'SHOW pg_sina_csd.profile') == off ]]
+        for name in q1 q6; do
+            sql=$(cat "$PROJECT/tests/$name.sql")
+            run_cold host "$sql" "$RESULTS/$name.host"
+            run_cold csd "SET pg_sina_csd.profile=on; $sql" "$RESULTS/$name.profile"
+            cmp "$RESULTS/$name.host.rows" "$RESULTS/$name.profile.rows"
+            printf 'SET pg_sina_csd.profile=on;\nEXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, FORMAT JSON)\n%s\n' "$sql" > "$RESULTS/current.sql"
+            sh "$COLD" csd "$RESULTS/current.sql" > "$RESULTS/$name.json"
+            # PG's own JSON parser validates EXPLAIN and numeric counters.
+            check=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 -c "
+                WITH doc AS (SELECT pg_read_file('$RESULTS/$name.json')::jsonb->0->'Plan' AS plan),
+                     data AS (SELECT plan,plan->'CSD Profile' AS p FROM doc)
+                SELECT (p->'Scan'->>'Calls')::bigint=(plan->>'CSD Chunks')::bigint
+                   AND (p->'Filter'->>'Calls')::bigint=(plan->>'CSD Chunks')::bigint
+                   AND (p->'Aggregate.sink'->>'Calls')::bigint=(plan->>'CSD Chunks')::bigint
+                   AND (p->'Aggregate.source'->>'Calls')::bigint=1
+                   AND (p->'Scan'->>'CPU Sum')::numeric>0
+                   AND (p->'Filter'->>'Wall Sum')::numeric>0
+                   AND abs((p->>'Total Wall')::numeric-(p->>'Setup Wall')::numeric
+                       -(p->>'Pipeline 1 Wall')::numeric-(p->>'Pipeline 2 Wall')::numeric
+                       -(p->>'Cleanup Wall')::numeric)<0.01
+                   AND CASE WHEN '$name'='q1' THEN (p->'Sort'->>'Calls')::bigint=1
+                            ELSE (p->'Limit'->>'Calls')::bigint=1 END
+                FROM data")
+            [[ $check == t ]]
+            echo "PASS $name: profiled cold result, structured EXPLAIN, per-operator calls and timings"
+        done
+        printf 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, FORMAT JSON)\n%s\n' "$(cat "$PROJECT/tests/q6.sql")" > "$RESULTS/current.sql"
+        sh "$COLD" csd "$RESULTS/current.sql" > "$RESULTS/q6.off.json"
+        check=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 -c "
+            WITH doc AS (SELECT pg_read_file('$RESULTS/q6.json')::jsonb->0->'Plan' AS enabled,
+                                pg_read_file('$RESULTS/q6.off.json')::jsonb->0->'Plan' AS disabled)
+            SELECT NOT (disabled ? 'CSD Profile')
+               AND (enabled->>'CSD AFDM')::bigint-(disabled->>'CSD AFDM')::bigint
+                   =4096*(enabled->>'CSD Workers')::bigint FROM doc")
+        [[ $check == t ]]
+        echo 'PASS default off: no profile output or counter AFDM allocation'
         ;;
     bench)
         printf 'query\tmode\tround\tms\n' > "$RESULTS/timings.tsv"
@@ -93,5 +132,5 @@ case ${1:-query} in
         done
         awk 'NR>1 {key=$1" "$2; sum[key]+=$4; n[key]++} END {for(key in n) printf "%s mean=%.6fs\n",key,sum[key]/n[key]/1000}' "$RESULTS/timings.tsv"
         ;;
-    *) echo 'usage: pg-sina-query-test.sh query|bench' >&2; exit 2 ;;
+    *) echo 'usage: pg-sina-query-test.sh query|profile|bench' >&2; exit 2 ;;
 esac

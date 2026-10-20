@@ -63,6 +63,8 @@ bash tests/pg-sina-csd-test.sh check
 bash tests/pg-sina-csd-test.sh sql
 # 每条查询分别冷启动：Q1/Q6、NULL/空输入/排序/回退、prepared plan 切换及取消回收
 bash tests/pg-sina-csd-test.sh query
+# 开关、逐算子计时、JSON 输出及开启计时后的结果一致性
+bash tests/pg-sina-csd-test.sh profile
 # Q1/Q6各3轮，交替host/csd，每次重新冷启动并核对结果
 bash tests/pg-sina-csd-test.sh bench
 ```
@@ -131,3 +133,36 @@ PG 扩展直接链接 `libsnia`，在当前 backend 中调用 SNIA；没有查�
 PG 查询设备 FDM/CU 容量，通常按4MiB块和最多4个 CU 分配独立分支；容量不足会减少分支或块大小。当前程序索引501–506由整个查询持有 namespace 文件锁，设备查询串行进入；这是单查询性能实验的实现，尚未支持多 PG 会话共享程序目录。
 
 EXPLAIN ANALYZE 会显示投影列数、设备 CU 数、扫描/匹配行数、内部读取量、AFDM 用量及 workmem 峰值。计时包含程序加载、SNIA 编排与回收，不只统计设备计算。具体类型和规模限制见[设备算子说明](../../csd-programs/pg_sina_csd/README.md)。
+
+## 开发阶段的算子计时
+
+```sql
+LOAD 'pg_sina_csd';
+SET pg_sina_csd.exe_path=csd;
+SET pg_sina_csd.profile=on;          -- 默认off；运行时生效，不必重新规划
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF)
+SELECT sum(l_extendedprice*l_discount)
+FROM lineitem
+WHERE l_shipdate>=date '1995-01-01' AND l_shipdate<date '1996-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity<25;
+SET pg_sina_csd.profile=off;         -- 正常测量及发布时关闭
+```
+
+TPC-H 仍须每条查询先冷启动。将 `SET pg_sina_csd.profile=on;` 和一条 EXPLAIN ANALYZE 写入 SQL 文件，再使用 `cold-query.sh csd 文件路径`；不要在同一文件反复执行查询来冒充冷启动。普通 SELECT 开启后也会收集统计，但不额外打印日志；查看统计使用 EXPLAIN ANALYZE，支持 TEXT/JSON 等格式。`TIMING OFF` 关闭 PG 逐节点计时，不关闭本开关控制的设备计时。
+
+开启后增加 CSD Profile：
+
+| 指标 | 含义 |
+| --- | --- |
+| Setup Wall | PG 执行端准备 SNIA 设备、程序、缓冲和首批请求；包含 namespace 锁等待 |
+| Pipeline 1 Wall | 整个块循环的实际墙钟时间，包含内部 LOAD、SNIA 编排/等待和 Scan/Filter/Aggregate.sink |
+| Pipeline 2 Wall | 收集局部状态、编排与执行 Aggregate.source/Sort/Limit，并读取最终结果 |
+| Cleanup Wall | 读取计时统计，释放 batch、设备状态、AFDM、程序与设备句柄 |
+| Total Wall | 上述四项之和；不包含 PG 规划、静态映射读取及结果 Datum 转换，故不等于整个 SQL Execution Time |
+| 每个算子的 calls | 实际数据算子调用次数，不包含专用于取消/回收的调用 |
+| wall_sum / CPU Sum | 入口到返回的墙钟时间 / 执行该算子的 CU 线程 CPU 时间，跨块及 CU 累计 |
+| wall_max | 最慢的一次算子调用的墙钟时间 |
+
+设备端计时覆盖 Scan、Filter、Aggregate.sink/source、Sort、Limit。多 CU 累计时间可能超过查询墙钟时间，不能将 wall_sum 相加当作查询延迟，或直接用累计值除以 Total Wall 得到耗时占比。wall_sum 包含运行期间被宿主调度挂起的时间；CPU Sum 反映 FEMU 宿主 CU 线程实际占用，不代表真实 SSD 芯片周期。入口计时不含 NVMe 排队/完成或模拟 I/O 延迟；内部 LOAD 当前包含在 Pipeline 1 Wall 中，未单独测量，剩余时间不能全部解释为 I/O。
+
+计时统一实现于设备 `profile.c` 入口包装与 PG `executor/batch.c`，没有在设备算法的行循环中插入代码。关闭时直接调用原实现，不读时钟、不分配/读取计时 AFDM；仍保留入口的一次条件判断。开启后每个 CU 增加一个计数输出 AFDM（当前按4KiB分配），一次调用读取两种时钟各两次；有额外开销，性能结论应同时保留关闭时的冷启动测量。

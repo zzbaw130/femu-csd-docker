@@ -50,5 +50,12 @@ static inline uint32_t *qs_selection(struct qs_chunk *c)
 struct qs_cell { __int128 value; uint8_t scale, dscale, isnull; };
 struct qs_row { struct qs_cell cells[QS_OUT]; };
 struct qs_metrics { uint64_t scanned, matched, input_bytes, chunks, work_peak, fdm_bytes; unsigned workers; };
-struct qs_result { int status; unsigned rows, begin; char error[160]; struct qs_metrics metrics; struct qs_row data[QS_GROUPS]; };
+/* Optional per-query measurements. Each CU owns its own AFDM counters. */
+enum qs_operator { QS_SCAN, QS_FILTER, QS_AGG_SINK, QS_AGG_SOURCE, QS_SORT, QS_LIMIT, QS_OPERATORS };
+struct qs_timing { uint64_t calls, wall_ns, cpu_ns, max_wall_ns; };
+struct qs_profile {
+    struct qs_timing operators[QS_OPERATORS];
+    uint64_t setup_ns, pipeline_ns[2], cleanup_ns, total_ns;
+};
+struct qs_result { int status; unsigned rows, begin; char error[160]; struct qs_metrics metrics; struct qs_profile profile; struct qs_row data[QS_GROUPS]; };
 #endif
