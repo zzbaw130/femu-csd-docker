@@ -3,15 +3,34 @@
 #define BATCH_SORT_H
 #include <stdint.h>
 #include <stddef.h>
+#include <time.h>
 #define SORT_FILE_BYTES (256U << 20)
 #define SORT_CHUNK_BYTES (4U << 20)
 #define SORT_BLOCK_BYTES (256U << 10)
 #define SORT_MAX_RUNS (SORT_FILE_BYTES / SORT_CHUNK_BYTES)
 #define SORT_BLOCKS_PER_RUN (SORT_CHUNK_BYTES / SORT_BLOCK_BYTES)
 #define SORT_OUTPUT_VALUES (SORT_CHUNK_BYTES / sizeof(int32_t))
+struct sort_timing { uint64_t wall_ns, cpu_ns; };
+static inline struct sort_timing sort_clock(void)
+{
+    struct timespec wall, cpu;
+    clock_gettime(CLOCK_MONOTONIC, &wall);
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu);
+    struct sort_timing stamp = {(uint64_t)wall.tv_sec * 1000000000 + wall.tv_nsec,
+                               (uint64_t)cpu.tv_sec * 1000000000 + cpu.tv_nsec};
+    return stamp;
+}
+static inline void sort_record(struct sort_timing *total, struct sort_timing start)
+{
+    struct sort_timing end = sort_clock();
+    total->wall_ns += end.wall_ns - start.wall_ns;
+    total->cpu_ns += end.cpu_ns - start.cpu_ns;
+}
 struct sort_metrics {
     uint64_t spill_write_bytes, spill_read_bytes, peak_bytes;
     uint32_t runs, spilled_runs;
+    struct sort_timing sink, source;
+    uint64_t run_sort_ns;
 };
 struct sorted_chunk {
     uint32_t count, finished;
@@ -27,6 +46,36 @@ struct top_five {
 /* Count the four I/O buffers in the same 64 MiB budget on both paths. */
 #define SORT_BUFFER_BYTES (SORT_CHUNK_BYTES + SORT_BLOCK_BYTES + sizeof(struct sorted_chunk) + sizeof(struct top_five))
 #define SORT_WORK_BYTES ((SORT_MEMORY_BYTES - SORT_BUFFER_BYTES) & ~(size_t)4095)
+
+/* Cached heads keep heap comparisons independent of spill-buffer residency. */
+struct sort_heap_entry { int32_t value; unsigned run; };
+struct sort_heap { struct sort_heap_entry entries[SORT_MAX_RUNS]; unsigned count; };
+static inline void sort_heap_push(struct sort_heap *heap, struct sort_heap_entry entry)
+{
+    unsigned i = heap->count++;
+    while (i && heap->entries[(i - 1) / 2].value < entry.value) {
+        heap->entries[i] = heap->entries[(i - 1) / 2];
+        i = (i - 1) / 2;
+    }
+    heap->entries[i] = entry;
+}
+static inline void sort_heap_replace(struct sort_heap *heap, struct sort_heap_entry entry)
+{
+    unsigned i = 0;
+    while (2 * i + 1 < heap->count) {
+        unsigned child = 2 * i + 1;
+        if (child + 1 < heap->count && heap->entries[child + 1].value > heap->entries[child].value) ++child;
+        if (heap->entries[child].value <= entry.value) break;
+        heap->entries[i] = heap->entries[child];
+        i = child;
+    }
+    heap->entries[i] = entry;
+}
+static inline void sort_heap_pop(struct sort_heap *heap)
+{
+    struct sort_heap_entry last = heap->entries[--heap->count];
+    if (heap->count) sort_heap_replace(heap, last);
+}
 
 /* Same in-place descending quicksort for the C baseline and the device CSF.
  * Recurse only on the smaller partition: stack depth is bounded by log2(n).

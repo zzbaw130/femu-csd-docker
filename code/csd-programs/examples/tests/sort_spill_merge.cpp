@@ -98,6 +98,8 @@ static void scenario(Function sink, Function source, Function limit, unsigned ch
     assert(top.metrics.spill_write_bytes == static_cast<uint64_t>(spill.stores) * SORT_BLOCK_BYTES);
     assert(top.metrics.spill_read_bytes == static_cast<uint64_t>(spill.loads) * SORT_BLOCK_BYTES);
     assert(top.metrics.spilled_runs * SORT_BLOCKS_PER_RUN == spill.stores);
+    assert(top.metrics.sink.wall_ns && top.metrics.source.wall_ns && top.metrics.run_sort_ns);
+    assert(top.metrics.run_sort_ns <= top.metrics.sink.wall_ns);
     assert(spill.frees == spill.stores && spill.loads == spill.stores);
     if (chunks > 2) {
         assert(spill.stores > sinkStores);
@@ -107,6 +109,22 @@ static void scenario(Function sink, Function source, Function limit, unsigned ch
 }
 int main(int argc, char **argv)
 {
+    // Heap replacement, removal, ties and signed extrema, independent of I/O.
+    sort_heap heap{};
+    std::vector<int32_t> heads;
+    for (unsigned i = 0; i < SORT_MAX_RUNS; ++i) {
+        int32_t value = i == 0 ? INT32_MIN : i == 1 ? INT32_MAX : static_cast<int32_t>(i % 7) - 3;
+        heads.push_back(value);
+        sort_heap_push(&heap, {value, i});
+    }
+    sort_heap_replace(&heap, {INT32_MIN, heap.entries[0].run});
+    *std::max_element(heads.begin(), heads.end()) = INT32_MIN;
+    std::sort(heads.begin(), heads.end(), std::greater<int32_t>());
+    for (auto value : heads) {
+        assert(heap.count && heap.entries[0].value == value);
+        sort_heap_pop(&heap);
+    }
+    assert(!heap.count);
     // Validate the shared C run sorter independently of both merge paths.
     for (unsigned count : {0U, 1U, 16U, 17U, 1024U}) {
         for (unsigned mode = 0; mode < 4; ++mode) {

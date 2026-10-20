@@ -31,6 +31,7 @@ case ${1:-unit} in
         bash "$0" build
         RESULT_DIR=$(mktemp -d /tmp/snia-sort-limit.XXXXXX)
         printf 'mode\tround\tstage1_s\tstage2_s\ttotal_s\n' > "$RESULT_DIR/timings.tsv"
+        printf 'mode\tround\toperation\tcalls\twall_s\tcpu_s\trun_sort_s\n' > "$RESULT_DIR/profiles.tsv"
         reference=''
         reference_workload=''
         for round in 1 2 3; do
@@ -40,11 +41,11 @@ case ${1:-unit} in
                 if [[ $method == CPU ]]; then
                     guest_command='sudo /tmp/csd-sort-bench/examples/read-sort-limit /data/cs-batch-input.bin'
                 else
-                    guest_command='sudo stdbuf -oL /tmp/snia-cs-api-guest/cs-batch-sort-limit /dev/nvme0n1 /data/cs-batch-input.bin --existing'
+                    guest_command='sudo env SNIA_FEMU_PROFILE=1 stdbuf -oL /tmp/snia-cs-api-guest/cs-batch-sort-limit /dev/nvme0n1 /data/cs-batch-input.bin --existing'
                 fi
                 logfile="$RESULT_DIR/$method-$round.log"
                 docker compose -f "$ROOT/docker-compose.yml" exec -T femu-csd \
-                    env SSH_PORT="${SSH_PORT:-8080}" ./run-guest-ssh.sh "$guest_command" | tee "$logfile"
+                    env SSH_PORT="${SSH_PORT:-8080}" ./run-guest-ssh.sh "$guest_command" 2>&1 | tee "$logfile"
                 top=$(sed -n 's/^Top 5: //p' "$logfile")
                 if [[ -z $reference ]]; then reference=$top; fi
                 if [[ -z $top || $top != "$reference" ]]; then echo 'FAIL: Top 5 mismatch' >&2; exit 1; fi
@@ -55,6 +56,12 @@ case ${1:-unit} in
                     if (peak[2] > cap[2] || cap[2] != 67108864) exit 1 }' "$logfile"
                 awk -v round="$round" '$1 == "TIMING" { printf "%s\t%d\t%s\t%s\t%s\n", $2, round, $3, $4, $5; found++ }
                     END { if (found != 1) exit 1 }' "$logfile" >> "$RESULT_DIR/timings.tsv"
+                awk -v round="$round" 'BEGIN { OFS="\t" }
+                    $1 == "PROFILE" {
+                        for (i=4; i<=NF; ++i) { split($i, pair, "="); value[pair[1]]=pair[2] }
+                        print $2, round, $3, value["calls"], value["wall_s"], value["cpu_s"], value["run_sort_s"];
+                        delete value
+                    }' "$logfile" >> "$RESULT_DIR/profiles.tsv"
             done
         done
         awk 'NR > 1 { total[$1] += $5; n[$1]++ }

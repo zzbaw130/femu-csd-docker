@@ -19,6 +19,9 @@ struct cs_device {
     struct cs_spill_pool *spill;
     char path[4096];
     struct { uint32_t workers; uint64_t fdm_bytes, features; } caps;
+    /* Optional diagnostic counters; internal to this plugin, not SNIA API. */
+    bool profile;
+    struct { uint64_t calls, wall_ns; } io_timing[5];
 };
 struct cs_memory { struct cs_device *dev; uint32_t id; uint64_t bytes; };
 struct cs_task { const CsBatchRequest *req; struct cs_device *dev; unsigned scalar_slots; uint64_t reentry; };

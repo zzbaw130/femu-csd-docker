@@ -7,7 +7,7 @@
 | common/cs_header_compatibility.cpp | csHeaderCompatibility | C++ 应用只包含 cs.h |
 | common/cs_library_management.c | csLibraryManagementRouting | 注册/注销两种插件、发现、句柄路由及请求绑定 |
 | common/cs_afdm_event_lifecycle.cpp | csAFDMEventAllocationFailure | AFDM、event、异步提交分配失败和资源回收 |
-| femu/cs_discovery.c | csDiscoveryIdentify | 生产传输的 Identify、资源查询和打开失败 |
+| femu/cs_discovery.c | csDiscoveryIdentify | 生产传输的Identify、资源查询、打开失败，以及可选命令计时分类/关闭/错误码保持 |
 | femu/cs_csf_batch_scheduling.c | csCSFSchedulingAndBatch | AFDM、storage、event、batch依赖、排序跨批次spill及EOF回收 |
 | csd-programs/examples/tests/read_sort_limit.c（设备示例目录） | 手动 read-sort-limit | 独立 C 文件读写、64MiB总算法预算、按需spill、全量归并，与CSD比较延迟 |
 | examples/cs_batch_sort_limit.c（项目 examples/） | 手动 cs-batch-sort-limit | Guest 真实设备完整文件排序与自动回收 |
@@ -23,6 +23,6 @@ bash tests/snia-cs-api-test.sh smoke
 bash tests/snia-cs-api-test.sh bench
 ```
 
-bench 复用已有256MiB示例文件，交替测量3轮并校验结果，输出分阶段耗时和临时日志目录。计时范围、直接 I/O 及内存预算见[示例说明](../examples/README.md#简单性能对比)。
+bench 复用已有256MiB示例文件，交替测量3轮并校验结果，输出分阶段耗时、profiles.tsv细分计时和临时日志目录。计时范围、直接 I/O 及内存预算见[示例说明](../examples/README.md#简单性能对比)。
 
 unit 为宿主测试单独编译设备 SO，防止混用容器系统库版本。也可用 CMake 配置测试时设置 CSD_TEST_PROGRAM_DIR，指向本机编译的 cs-example-sort.so、cs-example-limit.so 所在目录。

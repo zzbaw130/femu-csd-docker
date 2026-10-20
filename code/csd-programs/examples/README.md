@@ -23,7 +23,7 @@ sort_sink 首次接收 cparam1=0，创建 workmem context 和排序状态。为�
 
 后续 run 申请4MiB失败时，选择一个驻留 run，将它完整 spill；STORE 完成并重入后记录 token，腾出的 workmem 再用于新 run。一个4MiB run 以16个256KiB块保存，合计仍是4MiB。小块用于归并时按需读取 run 的下一段，避免每个 spill run 都要占4MiB读缓冲。
 
-sort_source 直接访问同一状态中的全部 run，驻留 run 直接读，spill run 申请256KiB读缓冲；读缓冲申请失败也会先 spill 一个驻留 run 腾出空间。它按全局降序输出，每个 chunk 最多4MiB。最后一个 chunk 生成后自动 FREE 所有 spill token、结束 context，并把输出 finished 置1；调用者不能再使用这个状态标识。
+sort_source 直接访问同一状态中的全部 run，驻留 run 直接读，spill run 申请256KiB读缓冲；读缓冲申请失败也会先 spill 一个驻留 run 腾出空间。它以固定64槽大根堆缓存run头部，每次推进堆顶对应run；重入后先完成待更新的堆顶，再按全局降序输出，每个 chunk 最多4MiB。最后一个 chunk 生成后自动 FREE 所有 spill token、结束 context，并把输出 finished 置1；调用者不能再使用这个状态标识。
 
 正常 source 的 MR[0] 为输出，MR[1] 为 spill I/O。提前停止或出错时，可调用同一个 source，仅提供 I/O AFDM（numr=1），释放私有状态；随后关闭设备句柄回收尚存的临时 token。这是同一入口的收尾用法，不需要额外 create/destroy/abort CSF。
 
@@ -42,4 +42,6 @@ sudo /home/femu/apps/csd-passthru/csd-passthru /dev/nvme0n1 smoke-so-all csd-ori
 
 ## 普通文件排序对比
 
-read_sort_limit.c 独立编译为 build/examples/read-sort-limit，只链接同一个 workmem 分配器，不调用设备接口。输入、输出和 I/O 缓冲加 workmem 的峰值不超过64MiB；输入 O_DIRECT 读取，临时文件在输入所在目录创建并 unlink，也用 O_DIRECT 读写。两边同样生成64个4MiB run，优先驻留、申请失败才 spill，归并每个 spill run 缓存256KiB，全部输出到 EOF 后取前5。由宿主 tests/snia-cs-api-test.sh bench 传到 Guest 运行并检查 spill 工作量一致。
+read_sort_limit.c 独立编译为 build/examples/read-sort-limit，只链接同一个 workmem 分配器，不调用设备接口。输入、输出和 I/O 缓冲加 workmem 的峰值不超过64MiB；输入 O_DIRECT 读取，临时文件在输入所在目录创建并 unlink，也用 O_DIRECT 读写。两边同样生成64个4MiB run，优先驻留、申请失败才 spill，归并每个 spill run 缓存256KiB，共用同一个大根堆实现，全部输出到 EOF 后取前5。由宿主 tests/snia-cs-api-test.sh bench 传到 Guest 运行并检查 spill 工作量一致。
+
+示例统计sink/source的累计墙钟和线程CPU时间，以及run排序墙钟时间，经最后一个输出chunk传给Guest。统计使用普通时钟，不修改FEMU命令或runtime。source的统计包含各次入口执行，LOAD/STORE/TRIM等待则由Guest插件SNIA_FEMU_PROFILE=1记录；两种计时的包含关系见Guest示例说明。

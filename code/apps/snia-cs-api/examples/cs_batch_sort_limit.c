@@ -289,6 +289,10 @@ int main(int argc, char **argv)
            top.metrics.runs, top.metrics.spilled_runs,
            (unsigned long long)top.metrics.spill_write_bytes, (unsigned long long)top.metrics.spill_read_bytes,
            (unsigned long long)top.metrics.peak_bytes, SORT_MEMORY_BYTES);
+    printf("PROFILE CSD sink_work wall_s=%.9f cpu_s=%.9f run_sort_s=%.9f\n",
+           top.metrics.sink.wall_ns / 1e9, top.metrics.sink.cpu_ns / 1e9, top.metrics.run_sort_ns / 1e9);
+    printf("PROFILE CSD source_work wall_s=%.9f cpu_s=%.9f\n",
+           top.metrics.source.wall_ns / 1e9, top.metrics.source.cpu_ns / 1e9);
     puts("PASS: 256 MiB, memory-first runs, spill on allocation failure, full merge, LIMIT 5; source released all state");
     rc = 0;
 cleanup:

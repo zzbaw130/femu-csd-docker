@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include "femu_common.h"
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <glob.h>
 #include <linux/nvme_ioctl.h>
@@ -13,7 +14,7 @@
 #include <sys/ioctl.h>
 
 static const char *model = "FEMU Computational Storage Controller";
-static bool fail_controller, fail_namespace;
+static bool fail_controller, fail_namespace, fail_io;
 static unsigned opens, closes, controller_reads, namespace_reads;
 
 int __wrap_open(const char *path, int flags, ...)
@@ -41,12 +42,17 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
         assert(fd == 100 || fd == 102);
         return 1;
     }
-    assert((request == NVME_IOCTL_ADMIN_CMD || request == NVME_IOCTL_ADMIN64_CMD) &&
-           (fd == 101 || fd == 103));
     va_list ap;
     va_start(ap, request);
     struct nvme_passthru_cmd *cmd = va_arg(ap, struct nvme_passthru_cmd *);
     va_end(ap);
+    if (request == NVME_IOCTL_IO_CMD || request == NVME_IOCTL_IO64_CMD) {
+        assert(fd == 100);
+        if (fail_io) { errno = EACCES; return -1; }
+        return 0;
+    }
+    assert((request == NVME_IOCTL_ADMIN_CMD || request == NVME_IOCTL_ADMIN64_CMD) &&
+           (fd == 101 || fd == 103));
     if (request == NVME_IOCTL_ADMIN64_CMD) {
         struct nvme_passthru_cmd64 *wide = (void *)cmd;
         const uint64_t info[] = {1, 64U << 20, 0, 4, 3};
@@ -100,6 +106,7 @@ static void rejected(const char *path)
 
 int main(void)
 {
+    unsetenv("SNIA_FEMU_PROFILE");
     void *dev;
     assert(femu_openCSx("/dev/nvme0n1", NULL, &dev, &(unsigned){0}) == CS_SUCCESS);
     assert(controller_reads == 1 && namespace_reads == 1);
@@ -123,6 +130,29 @@ int main(void)
     int bytes = sizeof(list);
     assert(femu_queryCSxList(&bytes, list) == CS_SUCCESS);
     assert(!strcmp(list, "/dev/nvme0n1") && bytes == (int)strlen(list) + 1);
+    assert(opens == closes);
+    setenv("SNIA_FEMU_PROFILE", "1", 1);
+    assert(femu_openCSx("/dev/nvme0n1", NULL, &dev, &(unsigned){0}) == CS_SUCCESS);
+    struct cs_device *device = dev;
+    assert(device->profile);
+    for (unsigned i = 0; i < 5; ++i) assert(!device->io_timing[i].calls); // Identify excluded.
+    struct nvme_passthru_cmd64 compute = {.opcode = 0xe1};
+    assert(cs_io64(device, false, &compute) == CS_SUCCESS);
+    const unsigned opcodes[] = {0xd0, 0xd1, 9, 0xf2};
+    for (unsigned i = 0; i < 4; ++i) {
+        struct nvme_passthru_cmd command = {.opcode = opcodes[i]};
+        assert(cs_io(device, false, &command) == CS_SUCCESS);
+    }
+    fail_io = true;
+    struct nvme_passthru_cmd denied = {.opcode = 9};
+    assert(cs_io(device, false, &denied) == CS_NO_PERMISSIONS); // Profiling preserves errno.
+    fail_io = false;
+    for (unsigned i = 0; i < 5; ++i) assert(device->io_timing[i].calls == (i == 3 ? 2U : 1U));
+    device->profile = false;
+    struct nvme_passthru_cmd unprofiled = {.opcode = 0xd0};
+    assert(cs_io(device, false, &unprofiled) == CS_SUCCESS && device->io_timing[1].calls == 1);
+    femu_closeCSx(dev);
+    unsetenv("SNIA_FEMU_PROFILE");
     assert(opens == closes);
     puts("PASS: Identify Controller identity, ordinary SSD exclusion, errors and discovery");
     return 0;

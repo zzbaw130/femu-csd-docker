@@ -24,8 +24,16 @@ struct SortState {
     IO pending;
     bool finishing;
     sort_metrics metrics;
+    sort_heap heap;
+    unsigned initialized;
+    bool root_pending;
 };
 SortState *state(femu_csd_args *args) { return reinterpret_cast<SortState *>(args->cparam1); }
+int64_t timed_result(SortState &s, sort_timing start, int64_t result, bool source)
+{
+    sort_record(source ? &s.metrics.source : &s.metrics.sink, start);
+    return result;
+}
 int resident(const SortState &s)
 {
     for (unsigned i = 0; i < s.count; ++i)
@@ -45,6 +53,23 @@ int64_t spill(SortState &s, unsigned run, femu_csd_args &args)
 {
     s.ioRun = run; s.ioBlock = 0; s.pending = IO::Store;
     return store_block(s, args);
+}
+int64_t load_head(SortState &s, unsigned index, femu_csd_args &args)
+{
+    auto &run = s.runs[index];
+    if (!run.spilled) return 0;
+    if (!run.data) {
+        run.data = static_cast<int32_t *>(cs_work_alloc(s.context, SORT_BLOCK_BYTES));
+        if (!run.data) {
+            int victim = resident(s);
+            return victim >= 0 ? spill(s, victim, args) : -2;
+        }
+        run.loadedBlock = SORT_BLOCKS_PER_RUN;
+    }
+    unsigned block = run.position / BlockValues;
+    if (run.loadedBlock == block) return 0;
+    s.ioRun = index; s.ioBlock = block; s.pending = IO::Load;
+    return csNeedLoad(run.blocks[block]);
 }
 // Reentry only acknowledges the I/O requested by the previous call.
 int64_t resume(SortState &s, femu_csd_args &args)
@@ -83,13 +108,14 @@ int64_t finish(SortState &s)
                 s.ioRun = i; s.ioBlock = j; s.pending = IO::Free;
                 return csNeedFree(s.runs[i].blocks[j]);
             }
-    return cs_work_end(s.context);
+    return 0; // Caller records final timings and destroys the context.
 }
 }
 
 // MR[0]=4 MiB input, MR[1]=spill I/O; cparam1=0 first, then the returned state handle.
 extern "C" int64_t sort_sink(femu_csd_args *args)
 {
+    auto start = sort_clock();
     if (args->numr != 2 || args->mr_len[0] < SORT_CHUNK_BYTES || args->mr_len[1] < SORT_BLOCK_BYTES) return -1;
     auto *s = state(args);
     bool first = !s;
@@ -104,24 +130,27 @@ extern "C" int64_t sort_sink(femu_csd_args *args)
     }
     if (s->count == SORT_MAX_RUNS) return -1;
     int64_t result = resume(*s, *args);
-    if (result) return result;
+    if (result) return timed_result(*s, start, result, false);
     auto *data = static_cast<int32_t *>(cs_work_alloc(s->context, SORT_CHUNK_BYTES));
     if (!data) {
         int victim = resident(*s);
-        if (victim >= 0) return spill(*s, victim, *args);
+        if (victim >= 0) return timed_result(*s, start, spill(*s, victim, *args), false);
         if (first) cs_work_end(s->context);
         return -2; // At least one run must fit to perform an in-place sort.
     }
     std::memcpy(data, args->mr_addr[0], SORT_CHUNK_BYTES);
+    auto sort_start = sort_clock();
     sort_int32_desc(data, RunValues);
+    s->metrics.run_sort_ns += sort_clock().wall_ns - sort_start.wall_ns;
     s->runs[s->count++].data = data;
-    return reinterpret_cast<int64_t>(s);
+    return timed_result(*s, start, reinterpret_cast<int64_t>(s), false);
 }
 
 // MR[0]=sorted output, MR[1]=spill I/O. Repeated calls finish and destroy the state at EOF.
 // For early stop/error, MR[0]=I/O only (numr=1) drops private memory; device close reclaims spill.
 extern "C" int64_t sort_source(femu_csd_args *args)
 {
+    auto start = sort_clock();
     auto *s = state(args);
     if (!s) return -1;
     if (args->numr == 1) return cs_work_end(s->context);
@@ -130,36 +159,35 @@ extern "C" int64_t sort_source(femu_csd_args *args)
     auto *out = static_cast<sorted_chunk *>(args->mr_addr[0]);
     if (!csIsReentry(args)) out->count = out->finished = 0;
     int64_t result = resume(*s, *args);
-    if (result) return result;
+    if (result) return timed_result(*s, start, result, true);
+    while (s->initialized < s->count) {
+        unsigned i = s->initialized;
+        result = load_head(*s, i, *args);
+        if (result) return timed_result(*s, start, result, true);
+        sort_heap_push(&s->heap, {head(s->runs[i]), i});
+        ++s->initialized;
+    }
     while (!s->finishing && out->count < SORT_OUTPUT_VALUES) {
-        int best = -1;
-        for (unsigned i = 0; i < s->count; ++i) {
-            auto &run = s->runs[i];
-            if (run.position == RunValues) continue;
-            if (run.spilled) {
-                if (!run.data) {
-                    run.data = static_cast<int32_t *>(cs_work_alloc(s->context, SORT_BLOCK_BYTES));
-                    if (!run.data) {
-                        int victim = resident(*s);
-                        return victim >= 0 ? spill(*s, victim, *args) : -2;
-                    }
-                    run.loadedBlock = SORT_BLOCKS_PER_RUN;
-                }
-                unsigned block = run.position / BlockValues;
-                if (run.loadedBlock != block) {
-                    s->ioRun = i; s->ioBlock = block; s->pending = IO::Load;
-                    return csNeedLoad(run.blocks[block]);
-                }
+        unsigned index = s->heap.entries[0].run;
+        auto &run = s->runs[index];
+        // A block refill may yield to SNIA. Repair exactly once after reentry,
+        // before emitting another value, including across output chunk boundaries.
+        if (s->root_pending) {
+            if (run.position == RunValues) {
+                cs_work_free(s->context, run.data);
+                run.data = nullptr;
+                sort_heap_pop(&s->heap);
+            } else {
+                result = load_head(*s, index, *args);
+                if (result) return timed_result(*s, start, result, true);
+                sort_heap_replace(&s->heap, {head(run), index});
             }
-            if (best < 0 || head(run) > head(s->runs[best])) best = i;
+            s->root_pending = false;
+            continue;
         }
-        if (best < 0) { s->finishing = true; break; }
-        auto &run = s->runs[best];
-        out->values[out->count++] = head(run);
-        if (++run.position == RunValues) {
-            cs_work_free(s->context, run.data);
-            run.data = nullptr;
-        }
+        out->values[out->count++] = s->heap.entries[0].value;
+        ++run.position;
+        s->root_pending = true;
         if (++s->emitted == static_cast<uint64_t>(s->count) * RunValues) s->finishing = true;
     }
     if (s->finishing) {
@@ -167,10 +195,13 @@ extern "C" int64_t sort_source(femu_csd_args *args)
         if (cs_work_get_context_stats(s->context, &stats)) return -1;
         s->metrics.peak_bytes = stats.peak_used_bytes + SORT_BUFFER_BYTES;
         s->metrics.runs = s->count;
-        out->metrics = s->metrics;
         result = finish(*s);
-        if (result) return result;
+        if (result) return timed_result(*s, start, result, true);
+        out->metrics = s->metrics;
+        cs_work_end(s->context);
+        sort_record(&out->metrics.source, start);
         out->finished = 1; // The last chunk remains in AFDM after workmem is destroyed.
+        return out->count;
     }
-    return out->count;
+    return timed_result(*s, start, out->count, true);
 }

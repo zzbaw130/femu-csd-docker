@@ -24,3 +24,7 @@
 前七个实现文件按 SNIA 功能分类，其余是本适配器复用的设备处理；文件名不表示额外 SNIA API。此设备不实现的标准能力，由公共层返回不支持。
 
 设备只执行单次 NVMe 请求；batch 图、依赖、异步通知由公共库处理。executeBatchEntry 在一个逻辑节点内循环执行 CSF 和内部 I/O，直到获得普通完成值，再交回公共调度器启动后继。finishBatchExecution 在所有线程结束后回收失败批次新分配的临时区。
+
+## 性能诊断
+
+应用以SNIA_FEMU_PROFILE=1运行时，femu_nvme_transport.c在设备关闭时向stderr打印E1、D0、D1、TRIM、F2的请求次数及累计ioctl等待秒数。默认关闭；计数用原子操作，不改变并行调度或公开API。统计覆盖句柄生命周期，不是按batch自动清零。E1包含设备CSF执行时间，不能再与算子内部计时相加；D0包括原始数据和spill的LOAD。HYBRID并发时累计等待可重叠，不能直接相加视为总延迟。此功能只用于定位当前请求开销。
