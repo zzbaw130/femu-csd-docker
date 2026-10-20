@@ -23,8 +23,8 @@ case ${1:-build} in
         guest "sudo /home/femu/opt/pg_sina_csd/build/pg-sina-csd-check 'dbname=tpch_s1 user=femu' public.pg_sina_fixture 3 && sudo /home/femu/opt/pg_sina_csd/build/pg-sina-csd-check 'dbname=tpch_s1 user=femu' public.pg_sina_empty 3"
         guest "/home/femu/opt/postgres/release/bin/psql -X -v ON_ERROR_STOP=1 -d tpch_s1 -c \"DELETE FROM sina_csd.relations WHERE relid IN ('public.pg_sina_fixture'::regclass,'public.pg_sina_empty'::regclass); DROP TABLE public.pg_sina_fixture,public.pg_sina_empty\""
         ;;
-    query|profile|bench)
+    query|profile|analyze|bench)
         guest "bash /home/femu/scripts/pg-sina-query-test.sh $1"
         ;;
-    *) echo '用法：pg-sina-csd-test.sh [build|prepare|check|sql|query|profile|bench]' >&2; exit 2 ;;
+    *) echo '用法：pg-sina-csd-test.sh [build|prepare|check|sql|query|profile|analyze|bench]' >&2; exit 2 ;;
 esac

@@ -113,6 +113,30 @@ case ${1:-query} in
         [[ $check == t ]]
         echo 'PASS default off: no profile output or counter AFDM allocation'
         ;;
+    analyze)
+        for round in 1 2 3; do
+            if ((round%2)); then modes=(host csd profiled); else modes=(profiled csd host); fi
+            for name in q1 q6; do
+                for mode in "${modes[@]}"; do
+                    path=csd; profile=off; transport=0
+                    [[ $mode != host ]] || path=host
+                    if [[ $mode == profiled ]]; then profile=on; transport=1; fi
+                    log_start=$(( $(wc -l < /data/tpch_s1/log)+1 ))
+                    {
+                        printf 'SET track_io_timing=on;\nSET pg_sina_csd.profile=%s;\n' "$profile"
+                        printf 'EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF, FORMAT JSON)\n'
+                        cat "$PROJECT/tests/$name.sql"
+                    } > "$RESULTS/current.sql"
+                    SNIA_FEMU_PROFILE=$transport sh "$COLD" "$path" "$RESULTS/current.sql" > "$RESULTS/$name.$mode.$round.json"
+                    tail -n +"$log_start" /data/tpch_s1/log > "$RESULTS/$name.$mode.$round.log"
+                    echo "DONE $name $mode round=$round"
+                done
+            done
+        done
+        # Environment profiling is only for these samples; restore normal PG.
+        unset SNIA_FEMU_PROFILE
+        pg_ctl -D /data/tpch_s1 -l /data/tpch_s1/log -o '-c autovacuum=off' -w restart >/dev/null
+        ;;
     bench)
         printf 'query\tmode\tround\tms\n' > "$RESULTS/timings.tsv"
         for round in 1 2 3; do
@@ -132,5 +156,5 @@ case ${1:-query} in
         done
         awk 'NR>1 {key=$1" "$2; sum[key]+=$4; n[key]++} END {for(key in n) printf "%s mean=%.6fs\n",key,sum[key]/n[key]/1000}' "$RESULTS/timings.tsv"
         ;;
-    *) echo 'usage: pg-sina-query-test.sh query|profile|bench' >&2; exit 2 ;;
+    *) echo 'usage: pg-sina-query-test.sh query|profile|analyze|bench' >&2; exit 2 ;;
 esac

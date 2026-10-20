@@ -166,3 +166,5 @@ TPC-H 仍须每条查询先冷启动。将 `SET pg_sina_csd.profile=on;` 和一�
 设备端计时覆盖 Scan、Filter、Aggregate.sink/source、Sort、Limit。多 CU 累计时间可能超过查询墙钟时间，不能将 wall_sum 相加当作查询延迟，或直接用累计值除以 Total Wall 得到耗时占比。wall_sum 包含运行期间被宿主调度挂起的时间；CPU Sum 反映 FEMU 宿主 CU 线程实际占用，不代表真实 SSD 芯片周期。入口计时不含 NVMe 排队/完成或模拟 I/O 延迟；内部 LOAD 当前包含在 Pipeline 1 Wall 中，未单独测量，剩余时间不能全部解释为 I/O。
 
 计时统一实现于设备 `profile.c` 入口包装与 PG `executor/batch.c`，没有在设备算法的行循环中插入代码。关闭时直接调用原实现，不读时钟、不分配/读取计时 AFDM；仍保留入口的一次条件判断。开启后每个 CU 增加一个计数输出 AFDM（当前按4KiB分配），一次调用读取两种时钟各两次；有额外开销，性能结论应同时保留关闭时的冷启动测量。
+
+Q1/Q6三轮统计、perf热点及优化顺序见[性能分析](doc/performance.md)。复现：`bash tests/pg-sina-csd-test.sh analyze`；该入口另采集host/csd/profiled三组EXPLAIN及SNIA日志，结束后恢复普通PG环境。
