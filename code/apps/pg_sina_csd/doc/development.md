@@ -24,7 +24,7 @@
 - PG backend 直接链接并调用 SNIA，不读取 heap 到应用缓冲，不执行 SQL 数据计算。原始数据通过内部 LOAD 进入 AFDM，没有改动 FEMU 或 SNIA 核心。安装时配置设备访问权限，不使用辅助进程或代理。
 - 第一条 pipeline 为 LOAD→Scan→Filter→Aggregate.sink；按设备容量，构建最多4个并行分支的 HYBRID batch。分支间使用独立缓冲和私有聚合状态，重复处理4MiB块直到输入结束。
 - 第二条 pipeline 为 Aggregate.source→Sort→Limit，采用 SERIAL batch；合并局部状态、精确 AVG 除法、排序、LIMIT 都在设备执行。Guest 只转换结果类型并返回客户端。
-- Scan 提取所需列，Filter 生成 selection vector；表达式树复用公共子表达式。参考本地 DuckDB table_scan.cpp、physical_filter.cpp 和 physical_hash_aggregate.cpp 的投影、选择向量及局部聚合组织；不直接复用其存储格式，也没有显式 SIMD。
+- Scan 提取所需列，Filter 生成 selection vector；表达式树复用公共子表达式。参考本地 DuckDB table_scan.cpp、physical_filter.cpp 和 physical_hash_aggregate.cpp 的投影、选择向量及局部聚合组织；不直接复用其存储格式；该阶段初版没有显式 SIMD，后续 Filter 向量化见性能分析。
 - numeric 以定点整数精确计算并保留显示精度，AVG 对齐 PG numeric 的精度与舍入。PG12 的 palloc 只保证8字节对齐，含 __int128 的结果显式16字节对齐。
 - AFDM 仅保存输入输出、计划和句柄，聚合状态及排序工作区使用共享 workmem 分配器。错误和取消时调用设备清理入口释放状态，再释放 AFDM、batch 和程序。查询持有 namespace 文件锁，当前只支持单个设备查询进入，不属于多会话并发调度实现。
 - EXPLAIN 展示真实 pipeline、投影列、CU 数、行数、内部读取和内存指标。Q1/Q6 以真实 SF=1 heap 验证，每条扫描6001215行、内部读取921624576字节。
@@ -117,3 +117,9 @@ SNIA已有计时记录D0=220次、累计1.523479s，E1=663次、累计3.393881s�
 | 6 | `auto`：基于可支持性、估计行数、投影宽度、传输/计算/内存与spill成本选择host/csd；支持混合子计划 | 全部22条，比较host/csd/auto与实际计划 |
 
 每实现一个算子，先看 DuckDB 中可借鉴的投影、批处理、选择向量、局部状态和阻塞边界，再决定是否需要 SIMD 等优化。多 CU 由主机显式构建依赖图；设备内部 I/O 与计算重叠另做测量后实施，不默认给所有请求加入并行策略。不能用少数Query通过代替完整SQL支持，也不能把FEMU宿主CPU执行解释为真实SSD的计算性能。
+
+## 瓶颈统计与第一轮向量过滤
+
+三轮host/csd/profiled冷启动统计、独立CU perf热点及原始数据位置见[性能分析](performance.md)。新增 analyze 采集入口，基线统计提交9868e22bb。Q6原设备CPU约48%为Scan、51%为Filter；Q1约50%为聚合（主要为表达式解释）、37%为Scan。第一pipeline占执行端墙钟约95%，CU函数有效忙碌度约49%/64%，仍有读取和命令等待。
+
+据此参考DuckDB实现复合条件的类型化列比较/AVX2选择向量。单条件候选在Q1出现查询回退，已通过交替A/B验证并保留原单谓词路径；最终Q1均值1.490→1.479s，基本持平。Q6复合条件A/B均值1.328→0.977s，Filter CPU减少约96%。9项设备测试、4项ASan/UBSan及真实PG精确结果、取消回收回归通过。后续继续推进列向量聚合、Scan解码与读取/计算重叠，每项都以查询延迟验收。

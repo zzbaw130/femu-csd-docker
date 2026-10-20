@@ -36,3 +36,13 @@ if(BUILD_TESTING)
     add_test(NAME pgSinaVectorAggregate COMMAND ${query_test_command})
     add_test(NAME pgSinaOperatorProfiling COMMAND ${query_test_command} --profile)
 endif()
+
+if(BUILD_TESTING)
+    add_executable(pg-sina-filter-test tests/filter.c)
+    target_include_directories(pg-sina-filter-test PRIVATE "${CSD_FEMU_INCLUDE}" "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
+    target_compile_options(pg-sina-filter-test PRIVATE -UNDEBUG)
+    target_link_libraries(pg-sina-filter-test PRIVATE ${CMAKE_DL_LIBS})
+    add_dependencies(pg-sina-filter-test pg-sina-filter)
+    add_test(NAME pgSinaVectorFilter COMMAND pg-sina-filter-test $<TARGET_FILE:pg-sina-filter>)
+endif()
