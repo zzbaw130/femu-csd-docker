@@ -20,6 +20,31 @@ sudo ./cs-batch-sort-limit /dev/nvme0n1 /data/cs-batch-input.bin
 
 应用创建或覆盖指定文件，写入256MiB伪随机 int32（含正负数），生成时独立维护参考前5，最终核对结果。程序索引420–422；文件保留供查看。实验期间不能写入或移动该文件。
 
+## 简单性能对比
+
+已有示例生成的数据文件后，在宿主运行：
+
+```sh
+bash tests/snia-cs-api-test.sh bench
+```
+
+脚本编译两个 Guest 程序，交替运行3轮，并检查每次前5完全一致。CPU 基线是 tests/read_sort_limit.cpp：普通 read 读完整256MiB，用单线程 std::sort 全量降序排序，再取前5；每轮先用 POSIX_FADV_DONTNEED 请求丢弃该文件的 Guest 页缓存。CSD 用 --existing 复用同一个文件，不重新生成数据，继续执行现有64MiB workmem下的按需spill和完整归并。
+
+计时排除文件生成和打开：CPU 从数组申请之后、第一次 read 之前开始；CSD 从 extent 查询、算子下载/激活及 AFDM/请求缓冲分配完成后开始，包含 batch 配置、内部 I/O、运行中的 workmem 申请、计算、重入、结果读取和 source 的 EOF 回收。日志中的 TIMING 行依次输出模式、第一阶段秒数、第二阶段秒数、总秒数：CPU 两阶段是 read 和 sort+limit，CSD 两阶段是 LOAD+sink（含排序与spill）和 source+limit（含归并与回收），阶段含义不同。
+
+脚本输出3轮平均总耗时及 CPU/CSD 比值，大于1表示这次测量中CSD更快。原始日志和 timings.tsv 写入打印出的 /tmp/snia-sort-limit.* 目录。此测试比较当前两条实现路径：CPU 使用约256MiB排序数组，CSD workmem为64MiB并产生额外临时I/O；FEMU的设备算子实际运行在宿主线程，结果不能直接代表真实SSD的CPU性能。
+
+2026-10-20 实测：Guest为8 vCPU、8GiB，CPU排序单线程，CSD batch使用SERIAL，FDM/workmem各64MiB；同一文件有3个extent，所有结果一致。
+
+| 轮次 | CPU总耗时（秒） | CSD总耗时（秒） |
+| --- | ---: | ---: |
+| 1 | 10.447 | 61.348 |
+| 2 | 10.120 | 61.576 |
+| 3 | 10.005 | 61.105 |
+| 平均 | 10.191 | 61.343 |
+
+本次CSD耗时约为CPU的6.02倍。CPU平均read为0.580秒、sort+limit为9.611秒；CSD平均LOAD+sink为8.124秒、source+limit为53.219秒。后者含spill读取、完整归并及回收，占CSD总时间约87%。当前source每输出一个整数会遍历全部run，这与CPU一次性内存排序的算法和I/O开销不同；这些阶段计时尚不能单独量化比较、重入和内部I/O各自的占比。
+
 ## extent 与内部 LOAD
 
 fsync 后用 FIEMAP 查询物理 extent。FIEMAP 地址相对于数据分区；LOAD 的 StartLba 相对于 namespace，所以要加分区起始位置。应用从 sysfs 读取分区起始扇区和 namespace id，从块设备读取逻辑块大小，检查文件位于指定设备上。

@@ -9,6 +9,7 @@
 | common/cs_afdm_event_lifecycle.cpp | csAFDMEventAllocationFailure | AFDM、event、异步提交分配失败和资源回收 |
 | femu/cs_discovery.c | csDiscoveryIdentify | 生产传输的 Identify、资源查询和打开失败 |
 | femu/cs_csf_batch_scheduling.c | csCSFSchedulingAndBatch | AFDM、storage、event、batch依赖、排序跨批次spill及EOF回收 |
+| read_sort_limit.cpp | 手动 read-sort-limit | 普通文件 read、全量排序、前5，与CSD做性能对比 |
 | examples/cs_batch_sort_limit.c（项目 examples/） | 手动 cs-batch-sort-limit | Guest 真实设备完整文件排序与自动回收 |
 
 common/mock_cs_backend.c 是第二种非NVMe设备；femu/mock_nvme_transport.c 在内存中模拟原生命令。这些文件仅提供测试后端或场景，不是标准接口实现。
@@ -19,6 +20,9 @@ common/mock_cs_backend.c 是第二种非NVMe设备；femu/mock_nvme_transport.c 
 bash tests/snia-cs-api-test.sh unit
 bash tests/snia-cs-api-test.sh build
 bash tests/snia-cs-api-test.sh smoke
+bash tests/snia-cs-api-test.sh bench
 ```
+
+bench 复用已有256MiB示例文件，交替测量3轮并校验结果，输出分阶段耗时和临时日志目录。计时范围、页缓存处理及内存预算见[示例说明](../examples/README.md#简单性能对比)。
 
 unit 为宿主测试单独编译设备 SO，防止混用容器系统库版本。也可用 CMake 配置测试时设置 CSD_TEST_PROGRAM_DIR，指向本机编译的 cs-example-sort.so、cs-example-limit.so 所在目录。

@@ -182,3 +182,13 @@
 - LOAD 与计算节点各只分配一份缓冲；配置 API 保存副本后重复使用，删除逐块 LOAD 分配和 sink/source/limit 各自的堆对象。load_extents 改为 build_load_request，同样只填写已有存储请求。
 - 删除 single_batch，提前结束时直接调用 source 的单次计算请求；设备程序使用有名称的索引，主流程按 LOAD→sink、source→limit 两阶段排列。参考前5的更新直接放进文件生成循环，sysfs/设备几何读取函数使用明确动词命名。
 - 宿主和 Guest 目标均编译通过；Guest 256MiB完整文件测试通过，覆盖复用请求、extent LOAD、按需spill、全量归并和EOF回收，前5仍与独立参考一致。
+
+## 2026-10-20：CPU 与 CSD 排序性能对比
+
+- 新增 tests/read_sort_limit.cpp：Guest普通read读取同一256MiB文件，单线程std::sort全量降序排序后取前5；read前对该文件调用POSIX_FADV_DONTNEED请求丢弃Guest页缓存。
+- 示例增加--existing只读复用数据文件，避免每轮重写；新增单调时钟计时，分别记录LOAD+sink、source+limit和总耗时。准备文件、extent查询、算子下载/激活及初始AFDM/请求分配不计时，运行中的workmem申请、spill与EOF回收计时。
+- 测试脚本增加bench，自动编译、交替执行CPU/CSD共3轮，校验全部前5并保存分阶段TSV和日志。日志使用独立/tmp目录，避免共享results挂载目录的宿主写权限限制。
+- 宿主GCC9、Guest GCC13编译通过；6次真实执行全部通过结果比对。Guest为8vCPU/8GiB，CPU使用256MiB数组，CSD保持64MiB workmem和SERIAL batch。
+- CPU三轮总耗时10.446936/10.120032/10.004880秒，平均10.190616秒；CSD为61.348394/61.575849/61.105015秒，平均61.343086秒，CSD/CPU为6.02。
+- CPU平均read/sort+limit为0.579679/9.610937秒；CSD平均LOAD+sink/source+limit为8.124240/53.218846秒。后者含完整归并、spill读取和回收，约占CSD总时间87%；源码中逐值遍历全部run的归并和不同内存预算是分析差异的重要背景，未据此把阶段时间直接解释为纯I/O带宽。
+- 本次原始数据位于/tmp/snia-sort-limit.NsgtKw/timings.tsv，中文示例说明保留三轮结果与计时口径。

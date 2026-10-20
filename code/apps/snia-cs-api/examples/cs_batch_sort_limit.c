@@ -12,6 +12,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <time.h>
 #include <unistd.h>
 
 #define TRY(call) do { CS_STATUS status = (call); if (status != CS_SUCCESS) { \
@@ -172,6 +173,11 @@ static int build_load_request(CsStorageRequest *request, const struct fiemap *ma
 }
 int main(int argc, char **argv)
 {
+    if (argc > 4 || (argc == 4 && strcmp(argv[3], "--existing"))) {
+        fprintf(stderr, "usage: %s [device] [file] [--existing]\n", argv[0]);
+        return 2;
+    }
+    int existing = argc == 4;
     const char *device_path = argc > 1 ? argv[1] : "/dev/nvme0n1";
     const char *file_path = argc > 2 ? argv[2] : "/data/cs-batch-input.bin";
     struct program programs[] = {
@@ -188,11 +194,19 @@ int main(int argc, char **argv)
     int rc = 1, file = -1;
     struct fiemap *map = calloc(1, sizeof(*map) + 4096 * sizeof(struct fiemap_extent));
     if (!map) goto cleanup;
-    file = open(file_path, O_CREAT | O_RDWR, 0644);
-    if (file < 0 || flock(file, LOCK_EX | LOCK_NB) || read_namespace_geometry(file, device_path, &lba, &nsid, &partition_start) ||
-        ftruncate(file, 0)) { fprintf(stderr, "数据文件必须位于指定 namespace 的普通数据分区\n"); goto cleanup; }
+    file = open(file_path, existing ? O_RDONLY : O_CREAT | O_RDWR, 0644);
+    if (file < 0 || flock(file, LOCK_EX | LOCK_NB) || read_namespace_geometry(file, device_path, &lba, &nsid, &partition_start)) {
+        fprintf(stderr, "数据文件必须位于指定 namespace 的普通数据分区\n"); goto cleanup;
+    }
     int32_t expected[5];
-    if (generate_file(file, expected)) { perror("generate_file"); goto cleanup; }
+    if (existing) {
+        struct stat info;
+        if (fstat(file, &info) || info.st_size != SORT_FILE_BYTES) {
+            fprintf(stderr, "existing file must contain exactly 256 MiB\n"); goto cleanup;
+        }
+    } else if (ftruncate(file, 0) || generate_file(file, expected)) {
+        perror("generate_file"); goto cleanup;
+    }
     map->fm_length = SORT_FILE_BYTES;
     map->fm_flags = FIEMAP_FLAG_SYNC;
     map->fm_extent_count = 4096;
@@ -216,6 +230,8 @@ int main(int argc, char **argv)
     load_entry->ReqType = CS_STORAGE_IO;
     compute_entry->ReqType = CS_QUEUE_COMPUTE;
 
+    struct timespec start, sink_done, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
     // Phase 1: LOAD -> sink. Reconfigure LOAD for each file chunk.
     TRY(csAllocBatchRequest(CS_BATCH_SERIAL, 2, &batch));
     CS_BATCH_INDEX load_node, sink_node;
@@ -243,6 +259,7 @@ int main(int argc, char **argv)
     }
     TRY(csFreeBatchRequest(batch));
     batch = NULL;
+    clock_gettime(CLOCK_MONOTONIC, &sink_done);
 
     // Phase 2: source -> limit. The same wrapper can configure both nodes.
     TRY(csAllocBatchRequest(CS_BATCH_SERIAL, 2, &batch));
@@ -260,10 +277,14 @@ int main(int argc, char **argv)
         TRY(csQueueCopyMemRequest(&read_result, NULL, NULL, NULL, NULL, NULL));
         if (top.finished) sort_state = 0; // source has released workmem and every spill token.
     } while (!top.finished);
-    if (top.count != 5 || memcmp(top.values, expected, sizeof(expected))) {
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    if (top.count != 5 || (!existing && memcmp(top.values, expected, sizeof(expected)))) {
         fprintf(stderr, "FAIL: CSD result differs from host reference\n"); goto cleanup;
     }
     printf("Top 5: %d %d %d %d %d\n", top.values[0], top.values[1], top.values[2], top.values[3], top.values[4]);
+    double sink_seconds = sink_done.tv_sec - start.tv_sec + (sink_done.tv_nsec - start.tv_nsec) / 1e9;
+    double source_seconds = end.tv_sec - sink_done.tv_sec + (end.tv_nsec - sink_done.tv_nsec) / 1e9;
+    printf("TIMING CSD %.6f %.6f %.6f\n", sink_seconds, source_seconds, sink_seconds + source_seconds);
     puts("PASS: 256 MiB, memory-first runs, spill on allocation failure, full merge, LIMIT 5; source released all state");
     rc = 0;
 cleanup:
