@@ -8,6 +8,7 @@
 #define SORT_CHUNK_BYTES (4U << 20)
 #define SORT_BLOCK_BYTES (256U << 10)
 #define SORT_MAX_RUNS (SORT_FILE_BYTES / SORT_CHUNK_BYTES)
+#define SORT_WORKERS 4
 #define SORT_BLOCKS_PER_RUN (SORT_CHUNK_BYTES / SORT_BLOCK_BYTES)
 #define SORT_OUTPUT_VALUES (SORT_CHUNK_BYTES / sizeof(int32_t))
 struct sort_timing { uint64_t wall_ns, cpu_ns; };
@@ -49,6 +50,20 @@ struct average_result {
 /* Count the four I/O buffers in the same 64 MiB budget on both paths. */
 #define SORT_BUFFER_BYTES (SORT_CHUNK_BYTES + SORT_BLOCK_BYTES + sizeof(struct sorted_chunk) + sizeof(struct average_result))
 #define SORT_WORK_BYTES ((SORT_MEMORY_BYTES - SORT_BUFFER_BYTES) & ~(size_t)4095)
+/* Small AFDM outputs carry opaque device handles, never algorithm workspaces.
+ * In the three-MR ABI the spill I/O AFDM is still the last MR. */
+struct sort_sink_task { uint64_t state; uint32_t workers, reserved; };
+struct sort_run_group { uint64_t states[SORT_WORKERS]; uint32_t count, reserved; };
+static inline size_t sort_buffer_bytes(unsigned workers)
+{
+    return workers == 1 ? SORT_BUFFER_BYTES :
+        workers * (SORT_CHUNK_BYTES + SORT_BLOCK_BYTES + 4096U) +
+        ((sizeof(struct sorted_chunk) + 4095U) & ~(size_t)4095U) + 8192U;
+}
+static inline size_t sort_work_bytes(unsigned workers)
+{
+    return (SORT_MEMORY_BYTES - sort_buffer_bytes(workers)) & ~(size_t)4095U;
+}
 
 /* Retain exact integer sum/count across chunks; never average batch averages.
  * 256 MiB of int32 values has a sum bounded by 2^57, so int64 is sufficient. */

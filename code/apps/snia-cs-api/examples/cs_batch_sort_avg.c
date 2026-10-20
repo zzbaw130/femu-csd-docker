@@ -75,11 +75,12 @@ static void unload_program(CS_DEV_HANDLE device, const struct program *p)
 }
 /* CsComputeRequest describes computation; its caller supplies the batch wrapper. */
 static void build_compute_request(CsComputeRequest *request, CS_CSF_ID function,
-                                  CS_MEM_HANDLE input, CS_MEM_HANDLE output, u64 state)
+                                  CS_MEM_HANDLE input, CS_MEM_HANDLE output, u64 state, CS_MEM_HANDLE control)
 {
     request->CSFId = function;
     request->NumArgs = 0;
     if (input) csHelperSetComputeArg(&request->Args[request->NumArgs++], CS_AFDM_TYPE, input, 0UL);
+    if (control) csHelperSetComputeArg(&request->Args[request->NumArgs++], CS_AFDM_TYPE, control, 0UL);
     if (output) csHelperSetComputeArg(&request->Args[request->NumArgs++], CS_AFDM_TYPE, output, 0UL);
     if (state) csHelperSetComputeArg(&request->Args[request->NumArgs++], CS_64BIT_VALUE_TYPE, state);
 }
@@ -181,11 +182,14 @@ int main(int argc, char **argv)
         [SORT_SOURCE] = {.file = "cs-example-sort.so", .symbol = "sort_source", .index = 421},
         [AVERAGE] = {.file = "cs-example-avg.so", .symbol = "avg_int32", .index = 422}};
     CS_DEV_HANDLE device = NULL;
-    CS_MEM_HANDLE input = NULL, io = NULL, sorted = NULL, result = NULL;
+    CS_MEM_HANDLE input[SORT_WORKERS] = {0}, io[SORT_WORKERS] = {0}, task[SORT_WORKERS] = {0};
+    CS_MEM_HANDLE sorted = NULL, result = NULL, group_mem = NULL;
+    struct sort_run_group group = {.count = SORT_WORKERS};
+    int group_ready = 0;
     CS_BATCH_HANDLE batch = NULL;
     CsBatchRequest *load_entry = NULL, *compute_entry = NULL;
     CsMemFlags flags = {.FDMId = 1};
-    u64 sort_state = 0, partition_start;
+    u64 partition_start;
     unsigned lba, nsid;
     int rc = 1, file = -1;
     struct fiemap *map = calloc(1, sizeof(*map) + 4096 * sizeof(struct fiemap_extent));
@@ -214,45 +218,62 @@ int main(int argc, char **argv)
            map->fm_mapped_extents, (unsigned long long)partition_start);
     TRY(csOpenCSx(device_path, NULL, &device));
     for (unsigned i = 0; i < PROGRAM_COUNT; ++i) TRY(load_program(device, &programs[i]));
-    TRY(csAllocMem(device, SORT_CHUNK_BYTES, &flags, &input, NULL));
-    TRY(csAllocMem(device, SORT_BLOCK_BYTES, &flags, &io, NULL));
+    for (unsigned i = 0; i < SORT_WORKERS; ++i) {
+        TRY(csAllocMem(device, SORT_CHUNK_BYTES, &flags, &input[i], NULL));
+        TRY(csAllocMem(device, SORT_BLOCK_BYTES, &flags, &io[i], NULL));
+        flags.Flags = CS_FDM_CLEAR;
+        TRY(csAllocMem(device, sizeof(struct sort_sink_task), &flags, &task[i], NULL));
+        struct sort_sink_task control = {.workers = SORT_WORKERS};
+        CsCopyMemRequest write = {.Type = CS_COPY_TO_DEVICE, .DevMem = {task[i], 0},
+            .u.HostVAddress = &control, .Bytes = sizeof(control)};
+        TRY(csQueueCopyMemRequest(&write, NULL, NULL, NULL, NULL, NULL));
+        flags.Flags = 0;
+    }
+    TRY(csAllocMem(device, sizeof(group), &flags, &group_mem, NULL));
     TRY(csAllocMem(device, sizeof(struct sorted_chunk), &flags, &sorted, NULL));
     flags.Flags = CS_FDM_CLEAR; // AVG accumulates across chunks; only its small output needs zeroing.
     TRY(csAllocMem(device, sizeof(struct average_result), &flags, &result, NULL));
     // Allocate two batch wrappers once; the API copies each configured request.
     load_entry = calloc(1, sizeof(*load_entry) + (map->fm_mapped_extents - 1) * sizeof(CSBlockRange));
-    compute_entry = calloc(1, sizeof(*compute_entry) + 2 * sizeof(CsComputeArg));
+    compute_entry = calloc(1, sizeof(*compute_entry) + 4 * sizeof(CsComputeArg));
     if (!load_entry || !compute_entry) goto cleanup;
     load_entry->ReqType = CS_STORAGE_IO;
     compute_entry->ReqType = CS_QUEUE_COMPUTE;
 
     struct timespec start, sink_done, end;
+    printf("CONFIG CSD sink_workers=%u merge_workers=1 work_bytes=%zu buffer_bytes=%zu\n",
+           SORT_WORKERS, sort_work_bytes(SORT_WORKERS), sort_buffer_bytes(SORT_WORKERS));
     clock_gettime(CLOCK_MONOTONIC, &start);
-    // Phase 1: LOAD -> sink. Reconfigure LOAD for each file chunk.
-    TRY(csAllocBatchRequest(CS_BATCH_SERIAL, 2, &batch));
-    CS_BATCH_INDEX load_node, sink_node;
-    build_compute_request(&compute_entry->u.Compute, programs[SORT_SINK].function, input, io, 0);
-    for (u64 offset = 0; offset < SORT_FILE_BYTES; offset += SORT_CHUNK_BYTES) {
-        if (build_load_request(&load_entry->u.StorageIo, map, offset, lba, nsid, partition_start, device, input)) {
-            fprintf(stderr, "extent 存在空洞或不支持的标志/对齐\n");
-            goto cleanup;
+    // Four independent LOAD -> sink branches. Each sink uses the same CSF ID.
+    TRY(csAllocBatchRequest(CS_BATCH_HYBRID, 2 * SORT_WORKERS, &batch));
+    CS_BATCH_INDEX load_nodes[SORT_WORKERS], sink_node;
+    for (unsigned round = 0; round < SORT_MAX_RUNS / SORT_WORKERS; ++round) {
+        for (unsigned i = 0; i < SORT_WORKERS; ++i) {
+            u64 offset = (u64)(round * SORT_WORKERS + i) * SORT_CHUNK_BYTES;
+            if (build_load_request(&load_entry->u.StorageIo, map, offset, lba, nsid, partition_start, device, input[i])) {
+                fprintf(stderr, "extent 存在空洞或不支持的标志/对齐\n"); goto cleanup;
+            }
+            if (!round) {
+                TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, load_entry, 0, 0, &load_nodes[i]));
+                build_compute_request(&compute_entry->u.Compute, programs[SORT_SINK].function, input[i], io[i], 0, task[i]);
+                TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, compute_entry, 0, load_nodes[i], &sink_node));
+            } else {
+                TRY(csConfigureBatchEntry(batch, CS_BATCH_RECONFIG, load_entry, load_nodes[i], 0, NULL));
+            }
         }
-        if (offset == 0) {
-            TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, load_entry, 0, 0, &load_node));
-            TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, compute_entry, 0, load_node, &sink_node));
-        } else {
-            TRY(csConfigureBatchEntry(batch, CS_BATCH_RECONFIG, load_entry, load_node, 0, NULL));
-        }
-        u64 handle;
-        TRY(csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, &handle));
-        if (offset == 0) {
-            sort_state = handle;
-            build_compute_request(&compute_entry->u.Compute, programs[SORT_SINK].function, input, io, sort_state);
-            TRY(csConfigureBatchEntry(batch, CS_BATCH_RECONFIG, compute_entry, sink_node, 0, NULL));
-        }
-        if ((offset + SORT_CHUNK_BYTES) % (64U << 20) == 0)
-            printf("LOAD -> sort.sink: %llu / 256 MiB\n", (unsigned long long)((offset + SORT_CHUNK_BYTES) >> 20));
+        TRY(csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, NULL));
     }
+    for (unsigned i = 0; i < SORT_WORKERS; ++i) {
+        struct sort_sink_task control;
+        CsCopyMemRequest read = {.Type = CS_COPY_FROM_DEVICE, .DevMem = {task[i], 0},
+            .u.HostVAddress = &control, .Bytes = sizeof(control)};
+        TRY(csQueueCopyMemRequest(&read, NULL, NULL, NULL, NULL, NULL));
+        group.states[i] = control.state;
+    }
+    CsCopyMemRequest write_group = {.Type = CS_COPY_TO_DEVICE, .DevMem = {group_mem, 0},
+        .u.HostVAddress = &group, .Bytes = sizeof(group)};
+    TRY(csQueueCopyMemRequest(&write_group, NULL, NULL, NULL, NULL, NULL));
+    group_ready = 1;
     TRY(csFreeBatchRequest(batch));
     batch = NULL;
     clock_gettime(CLOCK_MONOTONIC, &sink_done);
@@ -260,9 +281,9 @@ int main(int argc, char **argv)
     // Phase 2: source -> avg. The same wrapper can configure both nodes.
     TRY(csAllocBatchRequest(CS_BATCH_SERIAL, 2, &batch));
     CS_BATCH_INDEX source_node, average_node;
-    build_compute_request(&compute_entry->u.Compute, programs[SORT_SOURCE].function, sorted, io, sort_state);
+    build_compute_request(&compute_entry->u.Compute, programs[SORT_SOURCE].function, sorted, io[0], group.states[0], group_mem);
     TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, compute_entry, 0, 0, &source_node));
-    build_compute_request(&compute_entry->u.Compute, programs[AVERAGE].function, sorted, result, 0);
+    build_compute_request(&compute_entry->u.Compute, programs[AVERAGE].function, sorted, result, 0, NULL);
     TRY(csConfigureBatchEntry(batch, CS_BATCH_ADD, compute_entry, 0, source_node, &average_node));
 
     struct average_result average;
@@ -271,7 +292,6 @@ int main(int argc, char **argv)
     do {
         TRY(csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, NULL));
         TRY(csQueueCopyMemRequest(&read_result, NULL, NULL, NULL, NULL, NULL));
-        if (average.finished) sort_state = 0; // source has released workmem and every spill token.
     } while (!average.finished);
     clock_gettime(CLOCK_MONOTONIC, &end);
     if (average.count != SORT_FILE_BYTES / sizeof(int32_t) ||
@@ -294,13 +314,25 @@ int main(int argc, char **argv)
            average.metrics.source.wall_ns / 1e9, average.metrics.source.cpu_ns / 1e9);
     printf("PROFILE CSD average_work wall_s=%.9f cpu_s=%.9f\n",
            average.aggregate.wall_ns / 1e9, average.aggregate.cpu_ns / 1e9);
-    puts("PASS: 256 MiB, memory-first runs, spill on allocation failure, full merge, AVG; source released all state");
+    puts("PASS: 4 parallel sinks / 1 source; 256 MiB, memory-first runs, spill on allocation failure, full merge, AVG; source released all state");
     rc = 0;
 cleanup:
     if (batch) csFreeBatchRequest(batch);
-    if (sort_state) {
-        // Source's early-stop form only releases workmem; one compute call is sufficient.
-        build_compute_request(&compute_entry->u.Compute, programs[SORT_SOURCE].function, io, NULL, sort_state);
+    if (group_ready) {
+        CsCopyMemRequest read = {.Type = CS_COPY_FROM_DEVICE, .DevMem = {group_mem, 0},
+            .u.HostVAddress = &group, .Bytes = sizeof(group)};
+        csQueueCopyMemRequest(&read, NULL, NULL, NULL, NULL, NULL);
+    } else {
+        for (unsigned i = 0; i < SORT_WORKERS; ++i) if (task[i]) {
+            struct sort_sink_task control = {0};
+            CsCopyMemRequest read = {.Type = CS_COPY_FROM_DEVICE, .DevMem = {task[i], 0},
+                .u.HostVAddress = &control, .Bytes = sizeof(control)};
+            csQueueCopyMemRequest(&read, NULL, NULL, NULL, NULL, NULL);
+            group.states[i] = control.state;
+        }
+    }
+    for (unsigned i = 0; i < SORT_WORKERS; ++i) if (group.states[i] && compute_entry) {
+        build_compute_request(&compute_entry->u.Compute, programs[SORT_SOURCE].function, io[0], NULL, group.states[i], NULL);
         csQueueComputeRequest(&compute_entry->u.Compute, NULL, NULL, NULL, NULL, NULL);
     }
     free(load_entry);
@@ -309,8 +341,12 @@ cleanup:
     flags.Flags = 0;
     if (result) csFreeMem(result, &flags);
     if (sorted) csFreeMem(sorted, &flags);
-    if (io) csFreeMem(io, &flags);
-    if (input) csFreeMem(input, &flags);
+    if (group_mem) csFreeMem(group_mem, &flags);
+    for (unsigned i = 0; i < SORT_WORKERS; ++i) {
+        if (task[i]) csFreeMem(task[i], &flags);
+        if (io[i]) csFreeMem(io[i], &flags);
+        if (input[i]) csFreeMem(input[i], &flags);
+    }
     for (unsigned i = 0; i < PROGRAM_COUNT; ++i) unload_program(device, &programs[i]);
     if (device) csCloseCSx(device);
     if (file >= 0) close(file);

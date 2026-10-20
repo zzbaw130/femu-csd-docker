@@ -12,8 +12,11 @@
 #include <numeric>
 #include <vector>
 #include <cstdio>
+#include <mutex>
+#include <thread>
 using Function = int64_t (*)(femu_csd_args *);
 struct Spill {
+    std::mutex mutex;
     std::vector<std::vector<unsigned char>> blocks{1};
     unsigned stores = 0, loads = 0, frees = 0;
     int64_t run(Function function, femu_csd_args &args)
@@ -25,6 +28,7 @@ struct Spill {
             auto action = static_cast<uint64_t>(result) & ~CS_IO_VALUE_MASK;
             auto payload = static_cast<uint64_t>(result) & CS_IO_VALUE_MASK;
             auto *io = static_cast<unsigned char *>(args.mr_addr[args.numr - 1]);
+            std::lock_guard<std::mutex> lock(mutex);
             if (action == CS_NEED_STORE) {
                 assert(payload == SORT_BLOCK_BYTES);
                 blocks.emplace_back(io, io + payload);
@@ -132,6 +136,90 @@ static void check_average(Function average)
     input->count = 0;
     assert(average(&args) == 0 && result.count == 0 && result.average == 0 && result.finished);
 }
+static void parallel_scenario(Function sink, Function source, Function average)
+{
+    assert(!cs_work_init(SORT_MEMORY_BYTES));
+    Spill spill;
+    sort_sink_task tasks[SORT_WORKERS]{};
+    sort_run_group group{};
+    group.count = SORT_WORKERS;
+    std::thread threads[SORT_WORKERS];
+    std::vector<std::vector<int32_t>> inputs(SORT_WORKERS);
+    std::vector<std::vector<unsigned char>> ios(SORT_WORKERS);
+    std::vector<int32_t> expected;
+    // Four runs per lane exercise resident runs, spill, and source-side eviction.
+    for (unsigned lane = 0; lane < SORT_WORKERS; ++lane) {
+        tasks[lane].workers = SORT_WORKERS;
+        inputs[lane].resize(SORT_CHUNK_BYTES / 4);
+        ios[lane].resize(SORT_BLOCK_BYTES);
+        for (unsigned chunk = 0; chunk < 4; ++chunk)
+            for (unsigned i = 0; i < inputs[lane].size(); ++i)
+                expected.push_back(static_cast<int32_t>(i * 2654435761U + lane * 17 + chunk));
+        threads[lane] = std::thread([&, lane] {
+            void *addresses[] = {inputs[lane].data(), &tasks[lane], ios[lane].data()};
+            long long lengths[] = {SORT_CHUNK_BYTES, sizeof(tasks[lane]), SORT_BLOCK_BYTES};
+            femu_csd_args args{};
+            args.numr = 3; args.mr_addr = addresses; args.mr_len = lengths;
+            for (unsigned chunk = 0; chunk < 4; ++chunk) {
+                for (unsigned i = 0; i < inputs[lane].size(); ++i)
+                    inputs[lane][i] = static_cast<int32_t>(i * 2654435761U + lane * 17 + chunk);
+                auto handle = spill.run(sink, args);
+                assert(handle > 0 && tasks[lane].state == static_cast<uint64_t>(handle));
+            }
+        });
+    }
+    for (auto &thread : threads) thread.join();
+    for (unsigned i = 0; i < SORT_WORKERS; ++i) group.states[i] = tasks[i].state;
+    auto *pressure = cs_work_begin();
+    assert(pressure && cs_work_alloc(pressure, 31U << 20));
+    unsigned sink_stores = spill.stores;
+    std::sort(expected.begin(), expected.end(), std::greater<int32_t>());
+    auto output = std::make_unique<sorted_chunk>();
+    average_result result{};
+    void *addresses[] = {output.get(), &group, ios[0].data()};
+    long long lengths[] = {sizeof(*output), sizeof(group), SORT_BLOCK_BYTES};
+    femu_csd_args args{};
+    args.numr = 3; args.mr_addr = addresses; args.mr_len = lengths; args.cparam1 = group.states[0];
+    size_t offset = 0;
+    do {
+        spill.run(source, args);
+        assert(offset + output->count <= expected.size());
+        assert(std::equal(output->values, output->values + output->count, expected.begin() + offset));
+        void *avg_addresses[] = {output.get(), &result};
+        long long avg_lengths[] = {sizeof(*output), sizeof(result)};
+        femu_csd_args avg_args{};
+        avg_args.numr = 2; avg_args.mr_addr = avg_addresses; avg_args.mr_len = avg_lengths;
+        average(&avg_args);
+        offset += output->count;
+    } while (!output->finished);
+    assert(offset == expected.size() && result.count == expected.size());
+    assert(result.sum == std::accumulate(expected.begin(), expected.end(), int64_t{0}));
+    assert(result.metrics.runs == 16 && result.metrics.spilled_runs > 0);
+    assert(result.metrics.peak_bytes <= SORT_MEMORY_BYTES);
+    assert(spill.stores == spill.loads && spill.stores == spill.frees);
+    assert(spill.stores > sink_stores); // Source must evict from the run's owning context.
+    for (auto handle : group.states) assert(!handle);
+    assert(!cs_work_end(pressure));
+    check_empty();
+    // Abort after source has adopted the four contexts; only its root is owned by the caller.
+    for (unsigned lane = 0; lane < SORT_WORKERS; ++lane) {
+        tasks[lane].state = 0;
+        void *a[] = {inputs[lane].data(), &tasks[lane], ios[lane].data()};
+        long long l[] = {SORT_CHUNK_BYTES, sizeof(tasks[lane]), SORT_BLOCK_BYTES};
+        femu_csd_args call{};
+        call.numr = 3; call.mr_addr = a; call.mr_len = l;
+        spill.run(sink, call);
+        group.states[lane] = tasks[lane].state;
+    }
+    args.cparam1 = group.states[0];
+    spill.run(source, args);
+    assert(!output->finished && group.states[0]);
+    for (unsigned i = 1; i < SORT_WORKERS; ++i) assert(!group.states[i]);
+    args.numr = 1;
+    assert(source(&args) == 0);
+    check_empty();
+    puts("PASS: four concurrent sinks, cross-context global merge, complete ordering/AVG, spill and ownership cleanup");
+}
 int main(int argc, char **argv)
 {
     // Heap replacement, removal, ties and signed extrema, independent of I/O.
@@ -163,13 +251,18 @@ int main(int argc, char **argv)
             assert(values == expected);
         }
     }
-    assert(argc == 3);
+    assert(argc == 3 || (argc == 4 && !std::strcmp(argv[3], "--parallel")));
     void *sort = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL), *average = dlopen(argv[2], RTLD_NOW | RTLD_LOCAL);
     assert(sort && average);
     auto sink = reinterpret_cast<Function>(dlsym(sort, "sort_sink"));
     auto source = reinterpret_cast<Function>(dlsym(sort, "sort_source"));
     auto aggregate = reinterpret_cast<Function>(dlsym(average, "avg_int32"));
     assert(sink && source && aggregate && !dlsym(sort, "sort_create") && !dlsym(sort, "sort_abort"));
+    if (argc == 4) {
+        parallel_scenario(sink, source, aggregate);
+        dlclose(average); dlclose(sort);
+        return 0;
+    }
     check_average(aggregate);
     assert(!cs_work_init(12U << 20));
     scenario(sink, source, aggregate, 1);

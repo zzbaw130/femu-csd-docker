@@ -7,6 +7,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,10 +22,12 @@
 #define BLOCK_VALUES (SORT_BLOCK_BYTES / sizeof(int32_t))
 struct run {
     int32_t *data;
+    cs_work_context *owner;
     off_t offset;
     unsigned position, loaded_block;
     bool spilled;
 };
+struct file_timing { struct sort_timing time; uint64_t calls; };
 struct sort_state {
     cs_work_context *context;
     struct run runs[SORT_MAX_RUNS];
@@ -31,9 +35,10 @@ struct sort_state {
     struct sort_metrics metrics;
     struct sort_heap heap;
     bool root_pending;
+    struct file_timing input_read, spill_write;
 };
-struct file_timing { struct sort_timing time; uint64_t calls; };
 static struct file_timing input_read, spill_read, spill_write, release_file;
+static atomic_uint spill_next;
 static int transfer(int fd, void *buffer, size_t bytes, off_t offset, bool writing, struct file_timing *timing)
 {
     struct sort_timing start = sort_clock();
@@ -49,22 +54,22 @@ static int transfer(int fd, void *buffer, size_t bytes, off_t offset, bool writi
     ++timing->calls;
     return 0;
 }
-static int resident(const struct sort_state *s)
+static int resident(const struct sort_state *s, cs_work_context *owner)
 {
     for (unsigned i = 0; i < s->count; ++i)
-        if (!s->runs[i].spilled && s->runs[i].data) return (int)i;
+        if (s->runs[i].owner == owner && !s->runs[i].spilled && s->runs[i].data) return (int)i;
     return -1;
 }
 static int spill(struct sort_state *s, unsigned index, int file, void *io)
 {
     struct run *run = &s->runs[index];
-    run->offset = (off_t)s->metrics.spilled_runs * SORT_CHUNK_BYTES;
+    run->offset = (off_t)atomic_fetch_add(&spill_next, 1) * SORT_CHUNK_BYTES;
     for (unsigned block = 0; block < SORT_BLOCKS_PER_RUN; ++block) {
         memcpy(io, run->data + block * BLOCK_VALUES, SORT_BLOCK_BYTES);
-        if (transfer(file, io, SORT_BLOCK_BYTES, run->offset + block * SORT_BLOCK_BYTES, true, &spill_write)) return -1;
+        if (transfer(file, io, SORT_BLOCK_BYTES, run->offset + block * SORT_BLOCK_BYTES, true, &s->spill_write)) return -1;
         s->metrics.spill_write_bytes += SORT_BLOCK_BYTES;
     }
-    cs_work_free(s->context, run->data);
+    cs_work_free(run->owner, run->data);
     run->data = NULL;
     run->spilled = true;
     ++s->metrics.spilled_runs;
@@ -79,8 +84,8 @@ static int load_head(struct sort_state *s, unsigned index, int file, void *io)
     struct run *run = &s->runs[index];
     if (!run->spilled) return 0;
     if (!run->data) {
-        while (!(run->data = cs_work_alloc(s->context, SORT_BLOCK_BYTES))) {
-            int victim = resident(s);
+        while (!(run->data = cs_work_alloc(run->owner, SORT_BLOCK_BYTES))) {
+            int victim = resident(s, run->owner);
             if (victim < 0 || spill(s, (unsigned)victim, file, io)) return -1;
         }
         run->loaded_block = SORT_BLOCKS_PER_RUN;
@@ -97,15 +102,58 @@ static double seconds(struct sort_timing first, struct sort_timing last)
 {
     return (last.wall_ns - first.wall_ns) / 1e9;
 }
+struct worker {
+    int file, temporary, error;
+    unsigned lane;
+    int32_t *input;
+    void *io;
+    cs_work_context *context;
+    struct sort_state *state;
+};
+static void *generate_runs(void *opaque)
+{
+    struct worker *w = opaque;
+    w->context = cs_work_begin_limit(sort_work_bytes(SORT_WORKERS) / SORT_WORKERS);
+    struct sort_state *s = w->context ? cs_work_calloc(w->context, 1, sizeof(*s)) : NULL;
+    w->state = s;
+    if (!s) { w->error = 1; return NULL; }
+    s->context = w->context;
+    struct sort_timing start = sort_clock();
+    for (unsigned chunk = w->lane; chunk < SORT_MAX_RUNS; chunk += SORT_WORKERS) {
+        if (transfer(w->file, w->input, SORT_CHUNK_BYTES, (off_t)chunk * SORT_CHUNK_BYTES, false, &s->input_read)) {
+            w->error = 1; return NULL;
+        }
+        int32_t *data;
+        while (!(data = cs_work_alloc(s->context, SORT_CHUNK_BYTES))) {
+            int victim = resident(s, s->context);
+            if (victim < 0 || spill(s, (unsigned)victim, w->temporary, w->io)) { w->error = 1; return NULL; }
+        }
+        memcpy(data, w->input, SORT_CHUNK_BYTES);
+        struct sort_timing sort_start = sort_clock();
+        sort_int32_desc(data, RUN_VALUES);
+        s->metrics.run_sort_ns += sort_clock().wall_ns - sort_start.wall_ns;
+        s->runs[s->count].owner = s->context;
+        s->runs[s->count++].data = data;
+    }
+    struct sort_timing end = sort_clock();
+    s->metrics.sink.wall_ns = end.wall_ns - start.wall_ns - s->input_read.time.wall_ns - s->spill_write.time.wall_ns;
+    s->metrics.sink.cpu_ns = end.cpu_ns - start.cpu_ns - s->input_read.time.cpu_ns - s->spill_write.time.cpu_ns;
+    return NULL;
+}
+static void add_file_timing(struct file_timing *to, const struct file_timing *from)
+{
+    to->calls += from->calls;
+    to->time.wall_ns += from->time.wall_ns;
+    to->time.cpu_ns += from->time.cpu_ns;
+}
 int main(int argc, char **argv)
 {
     const char *path = argc > 1 ? argv[1] : "/data/cs-batch-input.bin";
     int rc = 1, file = -1, temporary = -1;
-    int32_t *input = NULL;
+    struct worker workers[SORT_WORKERS] = {0};
     void *io = NULL;
     struct sorted_chunk *output = NULL;
     struct average_result *result = NULL;
-    cs_work_context *context = NULL;
     struct stat info;
     file = open(path, O_RDONLY | O_DIRECT);
     if (file < 0 || flock(file, LOCK_SH | LOCK_NB) || fstat(file, &info) || info.st_size != SORT_FILE_BYTES) {
@@ -121,34 +169,43 @@ int main(int argc, char **argv)
     temporary = mkstemp(temporary_path);
     if (temporary < 0) goto io_error;
     if (unlink(temporary_path) || fcntl(temporary, F_SETFL, O_DIRECT)) goto io_error;
-    /* These mirror the four AFDM buffers, and are included in the 64 MiB total. */
-    if (posix_memalign((void **)&input, 4096, SORT_CHUNK_BYTES) ||
-        posix_memalign(&io, 4096, SORT_BLOCK_BYTES)) goto cleanup;
+    // Count all four input/staging pairs, task metadata and output in 64 MiB.
+    for (unsigned i = 0; i < SORT_WORKERS; ++i) {
+        workers[i].file = file; workers[i].temporary = temporary; workers[i].lane = i;
+        if (posix_memalign((void **)&workers[i].input, 4096, SORT_CHUNK_BYTES) ||
+            posix_memalign(&workers[i].io, 4096, SORT_BLOCK_BYTES)) goto cleanup;
+    }
+    io = workers[0].io;
     output = malloc(sizeof(*output));
     result = calloc(1, sizeof(*result));
-    if (!output || !result || cs_work_init(SORT_WORK_BYTES)) goto cleanup;
+    if (!output || !result || cs_work_init(sort_work_bytes(SORT_WORKERS))) goto cleanup;
+    printf("CONFIG CPU sink_workers=%u merge_workers=1 work_bytes=%zu buffer_bytes=%zu\n",
+           SORT_WORKERS, sort_work_bytes(SORT_WORKERS), sort_buffer_bytes(SORT_WORKERS));
     struct sort_timing start = sort_clock(), sink_done, end;
-    context = cs_work_begin();
-    struct sort_state *s = context ? cs_work_calloc(context, 1, sizeof(*s)) : NULL;
-    if (!s) goto cleanup;
-    s->context = context;
-    for (unsigned chunk = 0; chunk < SORT_MAX_RUNS; ++chunk) {
-        if (transfer(file, input, SORT_CHUNK_BYTES, (off_t)chunk * SORT_CHUNK_BYTES, false, &input_read)) goto io_error;
-        int32_t *data;
-        while (!(data = cs_work_alloc(context, SORT_CHUNK_BYTES))) {
-            int victim = resident(s);
-            if (victim < 0 || spill(s, (unsigned)victim, temporary, io)) goto io_error;
-        }
-        memcpy(data, input, SORT_CHUNK_BYTES);
-        struct sort_timing sort_start = sort_clock();
-        sort_int32_desc(data, RUN_VALUES);
-        s->metrics.run_sort_ns += sort_clock().wall_ns - sort_start.wall_ns;
-        s->runs[s->count++].data = data;
+    pthread_t threads[SORT_WORKERS];
+    unsigned started = 0;
+    for (; started < SORT_WORKERS; ++started)
+        if (pthread_create(&threads[started], NULL, generate_runs, &workers[started])) break;
+    for (unsigned i = 0; i < started; ++i) pthread_join(threads[i], NULL);
+    if (started != SORT_WORKERS) goto cleanup;
+    for (unsigned i = 0; i < SORT_WORKERS; ++i) if (workers[i].error) goto io_error;
+    struct sort_state *s = workers[0].state;
+    for (unsigned i = 0; i < SORT_WORKERS; ++i) {
+        struct sort_state *other = workers[i].state;
+        add_file_timing(&input_read, &other->input_read);
+        add_file_timing(&spill_write, &other->spill_write);
+        if (!i) continue;
+        memcpy(s->runs + s->count, other->runs, other->count * sizeof(*s->runs));
+        s->count += other->count;
+        s->metrics.spilled_runs += other->metrics.spilled_runs;
+        s->metrics.spill_write_bytes += other->metrics.spill_write_bytes;
+        s->metrics.sink.wall_ns += other->metrics.sink.wall_ns;
+        s->metrics.sink.cpu_ns += other->metrics.sink.cpu_ns;
+        s->metrics.run_sort_ns += other->metrics.run_sort_ns;
     }
+    s->spill_write = spill_write;
     sink_done = sort_clock();
     struct sort_timing sink_io = spill_write.time;
-    s->metrics.sink.wall_ns = sink_done.wall_ns - start.wall_ns - input_read.time.wall_ns - sink_io.wall_ns;
-    s->metrics.sink.cpu_ns = sink_done.cpu_ns - start.cpu_ns - input_read.time.cpu_ns - sink_io.cpu_ns;
     for (unsigned i = 0; i < s->count; ++i) {
         if (load_head(s, i, temporary, io)) goto io_error;
         struct sort_heap_entry entry = {head(&s->runs[i]), i};
@@ -162,7 +219,7 @@ int main(int argc, char **argv)
             struct run *run = &s->runs[index];
             if (s->root_pending) {
                 if (run->position == RUN_VALUES) {
-                    cs_work_free(context, run->data);
+                    cs_work_free(run->owner, run->data);
                     run->data = NULL;
                     sort_heap_pop(&s->heap);
                 } else {
@@ -182,13 +239,19 @@ int main(int argc, char **argv)
         if (output->finished) output->metrics = s->metrics;
         average_chunk(result, output);
     } while (emitted < SORT_FILE_BYTES / sizeof(int32_t));
-    cs_work_context_stats stats;
-    if (cs_work_get_context_stats(context, &stats)) goto cleanup;
     result->metrics = s->metrics;
     result->metrics.runs = s->count;
-    result->metrics.peak_bytes = stats.peak_used_bytes + SORT_BUFFER_BYTES;
-    cs_work_end(context);
-    context = NULL;
+    result->metrics.peak_bytes = sort_buffer_bytes(SORT_WORKERS);
+    spill_write = s->spill_write;
+    for (unsigned i = 0; i < SORT_WORKERS; ++i) {
+        cs_work_context_stats stats;
+        if (cs_work_get_context_stats(workers[i].context, &stats)) goto cleanup;
+        result->metrics.peak_bytes += stats.peak_used_bytes;
+    }
+    for (unsigned i = 0; i < SORT_WORKERS; ++i) {
+        cs_work_end(workers[i].context);
+        workers[i].context = NULL;
+    }
     /* Closing the unlinked file releases all spill extents inside the timer. */
     struct sort_timing close_start = sort_clock();
     int close_status = close(temporary);
@@ -225,8 +288,11 @@ int main(int argc, char **argv)
 io_error:
     perror("file I/O");
 cleanup:
-    if (context) cs_work_end(context);
-    free(result); free(output); free(io); free(input);
+    for (unsigned i = 0; i < SORT_WORKERS; ++i) {
+        if (workers[i].context) cs_work_end(workers[i].context);
+        free(workers[i].io); free(workers[i].input);
+    }
+    free(result); free(output);
     if (temporary >= 0) close(temporary);
     if (file >= 0) close(file);
     return rc;
