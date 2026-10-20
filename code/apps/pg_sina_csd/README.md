@@ -33,9 +33,9 @@ TPC-H测量每条语句之前使用Guest的cold-query.sh：停止PG清空shared 
 | --- | --- |
 | src/extension.c | Guest PG 扩展入口、exe_path 与 planner hook |
 | src/planner/ | Guest PG 表达式树转设备计划，选择可卸载路径 |
-| src/executor/ | Guest CustomScan 生命周期、取消回收及最终 Datum 转换 |
-| src/transport/ | Guest PG 读取已准备映射并启动 SNIA worker |
-| src/worker.c | Guest 每查询一个进程，仅负责 SNIA batch 编排与资源回收 |
+| src/executor/aggregate.c | Guest CustomScan 生命周期及最终 Datum 转换 |
+| src/executor/mapping.c | Guest PG 读取已准备的 schema/extent 映射 |
+| src/executor/batch.c | PG backend 直接调用 SNIA，编排 batch 并回收资源 |
 | src/prepare.c | Guest PG 内检查 visible/frozen，checkpoint，保存 schema/extent/LBA |
 | src/check.c | Guest 诊断工具，链接 libpq 和 libsnia；提交 LOAD→heap_count，与原生 COUNT 比较 |
 | include/ | Guest 与设备共用的查询计划、列批次、结果及诊断计数布局 |
@@ -48,7 +48,7 @@ TPC-H测量每条语句之前使用Guest的cold-query.sh：停止PG清空shared 
 
 ## 编译与准备
 
-Guest 已安装 PG12.22、SNIA，且 /data 已挂载。可用 scripts/guest/init-csd-env.sh 准备分区与 SNIA；首次或标签不匹配会清除模拟盘数据，请在恢复数据库前运行。
+Guest 已安装 PG12.22、SNIA，且 /data 已挂载。`scripts/guest/install-postgre.sh` 末尾配置 NVMe 设备权限、持久化 udev 规则，并给 postgres 设置 `cap_sys_admin=ep`；该脚本在 PG 已安装时仍会配置权限。已有 Guest 需重新运行一次并重启 PG。该 capability 权限较广，仅按本项目专用实验 Guest 的约定使用。重新安装 postgres 二进制后也需重新执行脚本恢复 capability。可用 scripts/guest/init-csd-env.sh 准备分区与 SNIA；首次或标签不匹配会清除模拟盘数据，请在恢复数据库前运行。
 
 宿主项目根目录执行：
 
@@ -109,7 +109,7 @@ sudo /home/femu/opt/pg_sina_csd/build/pg-sina-csd-check \
 
 设备输入为 MR[0] 原始页、MR[1] 计数结果；cparam1 为物理列数、cparam2 为实际有效输入字节数，保证尾块不扫描未使用的AFDM空间。算子校验页边界、tuple 边界和 frozen 标志，跳过 UNUSED/REDIRECT/DEAD line pointer。它是无状态诊断算子，不使用 spill 重入，故本入口的第二个标量可以表示长度。
 
-工具启动时检查 Guest boot ID 和 relfilenode；设备或文件变化后仍须主动重新准备。当前固定程序索引500，单次独占使用；不是跨PG backend程序目录管理方案。诊断工具通过sudo访问NVMe，不提升PG服务权限。SQL 卸载同样使用现有 sudo 权限，具体路径见下文。
+工具启动时检查 Guest boot ID 和 relfilenode；设备或文件变化后仍须主动重新准备。当前固定程序索引500，单次独占使用；不是跨PG backend程序目录管理方案。诊断工具通过sudo访问NVMe，不提升PG服务权限。SQL 卸载由完成安装时权限配置的 PG backend 直接调用 SNIA，具体路径见下文。
 
 PG 会另行执行 COUNT 校验结果，因此本工具用于正确性验收，不是 SQL 性能基准。后续阶段与验收记录见[开发记录](doc/development.md)。
 
@@ -117,15 +117,17 @@ PG 会另行执行 COUNT 校验结果，因此本工具用于正确性验收，�
 
 ```text
 Guest PG：解析/规划 → CustomScan → 读取数据库中的静态 extent 映射
-Guest worker：SNIA HYBRID batch → 多分支 LOAD → Scan → Filter → Aggregate.sink
-Guest worker：SNIA SERIAL batch → Aggregate.source → Sort → Limit
+Guest PG：调用 SNIA HYBRID batch → 多分支 LOAD → Scan → Filter → Aggregate.sink
+Guest PG：调用 SNIA SERIAL batch → Aggregate.source → Sort → Limit
 Guest PG：接收少量最终结果 → 转换 Datum → 返回客户端
 ```
 
-箭头中的 Scan/Filter/Aggregate/Sort/Limit 是设备 SO，运行在 FEMU CU；worker 本身不扫描 heap、不计算聚合、不排序。原始 heap 通过 NVM→AFDM 内部路径读取，不经过 Guest 应用缓冲。列批次保留在 AFDM，哈希表等私有状态放在受限 workmem。借鉴 DuckDB 的所需列投影、selection vector、局部聚合后合并及公共子表达式复用；当前表达式循环没有显式 SIMD，不能把批处理直接等同于 SIMD。
+箭头中的 Scan/Filter/Aggregate/Sort/Limit 是设备 SO，运行在 FEMU CU；PG backend 仅编排请求，不扫描 heap、不计算聚合、不排序。原始 heap 通过 NVM→AFDM 内部路径读取，不经过 Guest 应用缓冲。列批次保留在 AFDM，哈希表等私有状态放在受限 workmem。借鉴 DuckDB 的所需列投影、selection vector、局部聚合后合并及公共子表达式复用；当前表达式循环没有显式 SIMD，不能把批处理直接等同于 SIMD。
 
-PG 普通进程没有 vendor NVMe 命令权限，因此每次设备查询用 `sudo -n` 启动安装在 PG lib 目录的 `pg-sina-csd-worker`。它通过本地 socket 接收二进制计划和映射，不连接数据库、不解析 SQL、不是常驻代理。查询结束或取消后释放 batch、AFDM、workmem 状态和程序；取消在 batch 边界生效。该权限路径用于当前已有免密 sudo 的实验 Guest，并非生产权限隔离方案。
+PG 扩展直接链接 `libsnia`，在当前 backend 中调用 SNIA；没有查询辅助进程、sudo 调用、socket 或代理。安装时，udev 规则让 femu 用户可打开 /dev/nvme0 和 /dev/nvme0n1，postgres 的 CAP_SYS_ADMIN 满足 Linux vendor NVMe passthrough 的检查。PG 仍以 femu 用户运行，不以 root 启动。
 
-worker 查询设备 FDM/CU 容量，通常按4MiB块和最多4个 CU 分配独立分支；容量不足会减少分支或块大小。当前程序索引501–506由整个查询持有 namespace 文件锁，设备查询串行进入；这是单查询性能实验的实现，尚未支持多 PG 会话共享程序目录。
+取消在 batch 边界处理：SNIA 调用期间暂缓 PG 中断抛出，避免从 C++ 调用或批次线程中直接 longjmp；观察到取消后先释放设备状态、AFDM、batch 和程序，再由 PG 报告原始中断。错误路径执行同样的资源回收。
 
-EXPLAIN ANALYZE 会显示投影列数、设备 CU 数、扫描/匹配行数、内部读取量、AFDM 用量及 workmem 峰值。计时包含 worker 启动、程序加载与回收，不只统计设备计算。具体类型和规模限制见[设备算子说明](../../csd-programs/pg_sina_csd/README.md)。
+PG 查询设备 FDM/CU 容量，通常按4MiB块和最多4个 CU 分配独立分支；容量不足会减少分支或块大小。当前程序索引501–506由整个查询持有 namespace 文件锁，设备查询串行进入；这是单查询性能实验的实现，尚未支持多 PG 会话共享程序目录。
+
+EXPLAIN ANALYZE 会显示投影列数、设备 CU 数、扫描/匹配行数、内部读取量、AFDM 用量及 workmem 峰值。计时包含程序加载、SNIA 编排与回收，不只统计设备计算。具体类型和规模限制见[设备算子说明](../../csd-programs/pg_sina_csd/README.md)。

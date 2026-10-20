@@ -4,7 +4,7 @@
 
 ## 执行流程
 
-PG 从表达式树生成列投影、过滤、聚合、排序和 LIMIT 描述，Guest 的短生命周期 worker 用 SNIA batch 提交：
+PG 从表达式树生成列投影、过滤、聚合、排序和 LIMIT 描述，Guest 的 PG backend 直接调用 SNIA 提交 batch：
 
 ```text
 LOAD → Scan → Filter（可选）→ Aggregate.sink     # 每个 CU 一个分支，HYBRID batch
@@ -12,7 +12,7 @@ LOAD → Scan → Filter（可选）→ Aggregate.sink     # 每个 CU 一个分
 Aggregate.source → Sort（可选）→ Limit（可选）  # 合并局部状态，SERIAL batch
 ```
 
-每个分支通常处理4MiB原始页。各分支拥有独立输入缓冲、列批次和聚合状态；SNIA 按依赖并行提交，底层不猜测并行策略。整个查询的数据块循环由 Guest worker 驱动，单个 batch 的依赖执行由 SNIA 调度。当前不包含设备自主预取或读算重叠。
+每个分支通常处理4MiB原始页。各分支拥有独立输入缓冲、列批次和聚合状态；SNIA 按依赖并行提交，底层不猜测并行策略。整个查询的数据块循环由 Guest PG backend 驱动，单个 batch 的依赖执行由 SNIA 调度。当前不包含设备自主预取或读算重叠。
 
 | 源文件 / 构建产物 | 工作及 MR 参数顺序 |
 | --- | --- |

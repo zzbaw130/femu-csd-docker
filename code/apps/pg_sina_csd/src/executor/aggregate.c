@@ -2,13 +2,10 @@
 #include "executor/executor.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
-#include "utils/memutils.h"
 typedef struct {
     CustomScanState css;
     struct qs_request request;
     struct qs_result *result;
-    struct pg_sina_worker worker;
-    MemoryContextCallback cleanup;
     unsigned index;
     bool explain_only,executed;
 } SniaState;
@@ -16,7 +13,7 @@ static const CustomExecMethods methods;
 static Node *create_state(CustomScan *scan)
 {
     SniaState *s=(SniaState *)newNode(sizeof(*s),T_CustomScanState);
-    s->css.methods=&methods; s->worker.fd=-1; s->worker.pid=-1; return (Node *)s;
+    s->css.methods=&methods; return (Node *)s;
 }
 static void begin(CustomScanState *node,EState *estate,int flags)
 {
@@ -26,8 +23,7 @@ static void begin(CustomScanState *node,EState *estate,int flags)
     memcpy(&s->request.plan,VARDATA_ANY(data),sizeof(struct qs_plan));
     s->explain_only=flags&EXEC_FLAG_EXPLAIN_ONLY;
     /* PG12 palloc guarantees MAXALIGN=8; native __int128 records need 16. */
-    s->result=(void *)TYPEALIGN(16,(uintptr_t)palloc0(sizeof(*s->result)+15)); s->cleanup.func=pg_sina_close; s->cleanup.arg=&s->worker;
-    MemoryContextRegisterResetCallback(estate->es_query_cxt,&s->cleanup);
+    s->result=(void *)TYPEALIGN(16,(uintptr_t)palloc0(sizeof(*s->result)+15));
 }
 static Datum decimal(struct qs_cell value)
 {
@@ -48,7 +44,7 @@ static TupleTableSlot *execute(CustomScanState *node)
     if(s->explain_only) return ExecClearTuple(slot);
     if(!s->executed) {
         struct qs_extent *extents=pg_sina_mapping(&s->request);
-        pg_sina_execute(&s->request,extents,s->result,&s->worker); s->executed=true;
+        pg_sina_execute(&s->request,extents,s->result); s->executed=true;
         if(s->result->begin+s->result->rows>QS_GROUPS) elog(ERROR,"invalid CSD result range");
     }
     if(s->index==s->result->rows) return ExecClearTuple(slot);
@@ -70,10 +66,10 @@ static TupleTableSlot *execute(CustomScanState *node)
     ExecStoreVirtualTuple(slot);
     return node->ss.ps.ps_ProjInfo?ExecProject(node->ss.ps.ps_ProjInfo):slot;
 }
-static void end(CustomScanState *node) { pg_sina_close(&((SniaState *)node)->worker); }
+static void end(CustomScanState *node) {}
 static void rescan(CustomScanState *node)
 {
-    SniaState *s=(SniaState *)node; pg_sina_close(&s->worker); s->executed=false; s->index=0;
+    SniaState *s=(SniaState *)node; s->executed=false; s->index=0;
 }
 static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
 {

@@ -1,31 +1,14 @@
-/* One Guest process per query. PG sends its plan/mapping; this process only
- * submits SNIA batches. All scan/filter/aggregate/sort/limit work is in CSFs. */
+/* PG backend submits SNIA batches directly; all SQL data operators run in CSFs. */
+#include "pg_internal.h"
+#include "miscadmin.h"
 #include "cs.h"
-#include "query.h"
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
-#include <signal.h>
-#include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <sys/file.h>
-#include <sys/socket.h>
 #include <unistd.h>
 enum { SCAN,FILTER,SINK,SOURCE,SORT,LIMIT,FUNCTIONS };
 struct program { const char *file,*symbol; CS_CSF_ID function; unsigned index; int loaded,active; };
-static int cancelled(void)
-{
-    struct pollfd fd={.fd=0,.events=POLLIN};
-    if(poll(&fd,1,0)<=0) return 0;
-    char byte; return recv(0,&byte,1,MSG_PEEK|MSG_DONTWAIT)==0 || (fd.revents&(POLLHUP|POLLERR));
-}
-static int read_full(void *data,size_t bytes)
-{
-    unsigned char *p=data;
-    while(bytes) { ssize_t n=read(0,p,bytes); if(n<0 && errno==EINTR) continue; if(n<=0) return -1; p+=n; bytes-=n; }
-    return 0;
-}
 static CS_STATUS copy(CS_MEM_HANDLE memory,unsigned offset,void *data,int bytes,int to_device)
 {
     CsCopyMemRequest request={.Type=to_device?CS_COPY_TO_DEVICE:CS_COPY_FROM_DEVICE,.DevMem={memory,offset},.u.HostVAddress=data,.Bytes=bytes};
@@ -65,12 +48,15 @@ static void compute_request(CsBatchRequest *b,CS_CSF_ID function,CS_MEM_HANDLE *
 }
 #define TRY(call) do { CS_STATUS status=(call); if(status!=CS_SUCCESS) { \
     result->status=status; snprintf(result->error,sizeof(result->error),"%s: status=%d",#call,status); goto cleanup; } } while(0)
-int main(void)
+void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct qs_result *result)
 {
-    signal(SIGPIPE,SIG_IGN);
-    struct qs_request request; struct qs_extent *extents=NULL;
-    struct qs_result *result=calloc(1,sizeof(*result)); if(!result) return 1;
-    result->status=1; strcpy(result->error,"worker initialization failed or query cancelled");
+    CHECK_FOR_INTERRUPTS();
+    /* Do not longjmp through SNIA C++ frames or its batch threads. Poll PG's
+     * pending cancel at batch boundaries, then release resources before PG
+     * reports the interrupt. No PG allocations/errors occur while held. */
+    HOLD_INTERRUPTS();
+    memset(result,0,sizeof(*result));
+    result->status=1; strcpy(result->error,"CSD execution interrupted or initialization failed");
     CS_DEV_HANDLE device=NULL; CS_BATCH_HANDLE batch=NULL;
     CS_MEM_HANDLE plan_mem=NULL,out_mem=NULL,group_mem=NULL;
     CS_MEM_HANDLE input[QS_WORKERS]={0},vectors[QS_WORKERS]={0},tasks[QS_WORKERS]={0};
@@ -85,48 +71,45 @@ int main(void)
         [SOURCE]={.file="pg-sina-aggregate.so",.symbol="pg_sina_aggregate_source",.index=504},
         [SORT]={.file="pg-sina-sort.so",.symbol="pg_sina_sort",.index=505},
         [LIMIT]={.file="pg-sina-limit.so",.symbol="pg_sina_limit",.index=506}};
-    if(read_full(&request,sizeof(request)) || request.nextents>4096 || request.plan.ncols>QS_COLS) goto cleanup;
-    extents=calloc(request.nextents?request.nextents:1,sizeof(*extents));
-    if(!extents || read_full(extents,request.nextents*sizeof(*extents))) goto cleanup;
-    lock_fd=open(request.device,O_RDONLY|O_CLOEXEC);
+    lock_fd=open(request->device,O_RDONLY|O_CLOEXEC);
     if(lock_fd<0) { result->status=1; snprintf(result->error,sizeof(result->error),"cannot lock namespace: %s",strerror(errno)); goto cleanup; }
     while(flock(lock_fd,LOCK_EX|LOCK_NB)) {
-        if(errno!=EWOULDBLOCK || cancelled()) goto cleanup;
-        struct pollfd wait={.fd=0,.events=POLLIN}; poll(&wait,1,100);
+        if((errno!=EWOULDBLOCK && errno!=EINTR) || QueryCancelPending || ProcDiePending) goto cleanup;
+        pg_usleep(100000L);
     }
-    TRY(csOpenCSx(request.device,NULL,&device));
+    TRY(csOpenCSx(request->device,NULL,&device));
     caps=properties(device,CS_CSE_TYPE); fdm=properties(device,CS_FDM_TYPE);
     if(!caps || !fdm) { result->status=1; strcpy(result->error,"resource query failed"); goto cleanup; }
     workers=caps->CSEDetails[0].CSE[0].NumCRs;
     if(workers>QS_WORKERS) workers=QS_WORKERS;
     if(!workers) goto cleanup;
     uint64_t capacity=fdm->FDMDetails[0].FDM[0].FDMSize;
-    while((uint64_t)workers*(chunk+((qs_chunk_bytes(chunk/24,request.plan.ncols)+4095)&~(size_t)4095)+4096)+
+    while((uint64_t)workers*(chunk+((qs_chunk_bytes(chunk/24,request->plan.ncols)+4095)&~(size_t)4095)+4096)+
           sizeof(struct qs_result)+sizeof(struct qs_plan)+8192>capacity) {
         if(workers>1) --workers;
         else if(chunk>QS_PAGE) chunk/=2;
         else { result->status=1; strcpy(result->error,"insufficient FDM"); goto cleanup; }
     }
-    uint64_t nchunks=(request.bytes+chunk-1)/chunk;
+    uint64_t nchunks=(request->bytes+chunk-1)/chunk;
     if(nchunks && workers>nchunks) workers=nchunks;
     group.count=workers;
     for(unsigned i=0;i<FUNCTIONS;++i) {
-        if((i==FILTER && request.plan.predicate<0) || (i==SORT && !request.plan.norder) ||
-            (i==LIMIT && request.plan.limit<0 && !request.plan.offset)) continue;
+        if((i==FILTER && request->plan.predicate<0) || (i==SORT && !request->plan.norder) ||
+            (i==LIMIT && request->plan.limit<0 && !request->plan.offset)) continue;
         TRY(load_program(device,&programs[i]));
     }
     CsMemFlags flags={.FDMId=1};
-    TRY(csAllocMem(device,sizeof(request.plan),&flags,&plan_mem,NULL));
-    TRY(copy(plan_mem,0,&request.plan,sizeof(request.plan),1));
+    TRY(csAllocMem(device,sizeof(request->plan),&flags,&plan_mem,NULL));
+    TRY(copy(plan_mem,0,&request->plan,sizeof(request->plan),1));
     TRY(csAllocMem(device,sizeof(*result),&flags,&out_mem,NULL));
     TRY(csAllocMem(device,sizeof(group),&flags,&group_mem,NULL));
     for(unsigned i=0;i<workers;++i) {
         TRY(csAllocMem(device,chunk,&flags,&input[i],NULL));
-        TRY(csAllocMem(device,qs_chunk_bytes(chunk/24,request.plan.ncols),&flags,&vectors[i],NULL));
-        struct qs_chunk header={.capacity=chunk/24,.ncols=request.plan.ncols}; TRY(copy(vectors[i],0,&header,sizeof(header),1));
+        TRY(csAllocMem(device,qs_chunk_bytes(chunk/24,request->plan.ncols),&flags,&vectors[i],NULL));
+        struct qs_chunk header={.capacity=chunk/24,.ncols=request->plan.ncols}; TRY(copy(vectors[i],0,&header,sizeof(header),1));
         flags.Flags=CS_FDM_CLEAR; TRY(csAllocMem(device,sizeof(struct qs_task),&flags,&tasks[i],NULL)); flags.Flags=0;
     }
-    load=calloc(1,sizeof(*load)+(request.nextents+1)*sizeof(CSBlockRange));
+    load=calloc(1,sizeof(*load)+(request->nextents+1)*sizeof(CSBlockRange));
     compute=calloc(1,sizeof(*compute)+4*sizeof(CsComputeArg));
     if(!load || !compute) { result->status=1; strcpy(result->error,"host request allocation failed"); goto cleanup; }
     CS_BATCH_INDEX nodes[QS_WORKERS][4]={{0}}; unsigned nnodes[QS_WORKERS]={0};
@@ -135,22 +118,22 @@ int main(void)
     do {
         unsigned active=0;
         for(unsigned i=0;i<workers;++i) {
-            if(cursor>=request.bytes && (round || i)) {
+            if(cursor>=request->bytes && (round || i)) {
                 for(unsigned j=nnodes[i];j>0;--j) TRY(csConfigureBatchEntry(batch,CS_BATCH_DELETE,NULL,nodes[i][j-1],0,NULL));
                 nnodes[i]=0; continue;
             }
             ++active;
-            unsigned bytes=request.bytes-cursor<chunk?request.bytes-cursor:chunk;
+            unsigned bytes=request->bytes-cursor<chunk?request->bytes-cursor:chunk;
             TRY(copy(tasks[i],offsetof(struct qs_task,input_bytes),&bytes,sizeof(bytes),1));
             if(bytes) {
                 memset(load,0,sizeof(*load)); load->ReqType=CS_STORAGE_IO;
                 load->u.StorageIo=(CsStorageRequest){.Mode=CS_STORAGE_BLOCK_IO,.DevHandle=device,
                     .u.BlockIo={.Type=CS_STORAGE_LOAD_TYPE,.DevMem={input[i],0}}};
                 CsBlockIo *io=&load->u.StorageIo.u.BlockIo; uint64_t at=cursor,end=cursor+bytes;
-                for(unsigned j=0;j<request.nextents && at<end;++j) {
+                for(unsigned j=0;j<request->nextents && at<end;++j) {
                     const struct qs_extent *e=&extents[j]; if(e->logical+e->bytes<=at) continue;
                     uint64_t length=(e->logical+e->bytes<end?e->logical+e->bytes:end)-at;
-                    io->Range[io->NumRanges++]=(CSBlockRange){request.nsid,e->lba+(at-e->logical)/request.lba_bytes,length/request.lba_bytes}; at+=length;
+                    io->Range[io->NumRanges++]=(CSBlockRange){request->nsid,e->lba+(at-e->logical)/request->lba_bytes,length/request->lba_bytes}; at+=length;
                 }
                 if(!round) { TRY(csConfigureBatchEntry(batch,CS_BATCH_ADD,load,0,0,&nodes[i][nnodes[i]++])); }
                 else TRY(csConfigureBatchEntry(batch,CS_BATCH_RECONFIG,load,nodes[i][0],0,NULL));
@@ -161,7 +144,7 @@ int main(void)
                 CS_BATCH_INDEX previous=nnodes[i]?nodes[i][nnodes[i]-1]:0;
                 TRY(csConfigureBatchEntry(batch,CS_BATCH_ADD,compute,0,previous,&nodes[i][nnodes[i]++]));
                 previous=nodes[i][nnodes[i]-1];
-                if(request.plan.predicate>=0) {
+                if(request->plan.predicate>=0) {
                     CS_MEM_HANDLE filter[]={vectors[i],plan_mem}; compute_request(compute,programs[FILTER].function,filter,2);
                     TRY(csConfigureBatchEntry(batch,CS_BATCH_ADD,compute,0,previous,&nodes[i][nnodes[i]++])); previous=nodes[i][nnodes[i]-1];
                 }
@@ -170,33 +153,33 @@ int main(void)
             }
             cursor+=bytes;
         }
-        if(cancelled()) goto cleanup;
+        if(QueryCancelPending || ProcDiePending) goto cleanup;
         if(active) TRY(csQueueBatchRequest(batch,NULL,NULL,NULL,NULL,NULL));
         ++round;
-    } while(cursor<request.bytes);
+    } while(cursor<request->bytes);
     TRY(csFreeBatchRequest(batch)); batch=NULL;
     /* Empty input needs one aggregate state for the ungrouped NULL/count row. */
-    if(!request.bytes) group.count=1;
+    if(!request->bytes) group.count=1;
     for(unsigned i=0;i<group.count;++i) { struct qs_task task; TRY(copy(tasks[i],0,&task,sizeof(task),0)); group.states[i]=task.state; }
     TRY(copy(group_mem,0,&group,sizeof(group),1)); group_ready=1;
-    if(cancelled()) goto cleanup;
+    if(QueryCancelPending || ProcDiePending) goto cleanup;
     TRY(csAllocBatchRequest(CS_BATCH_SERIAL,3,&batch));
     CS_BATCH_INDEX previous=0,current;
     CS_MEM_HANDLE source[]={group_mem,out_mem}; compute_request(compute,programs[SOURCE].function,source,2);
     TRY(csConfigureBatchEntry(batch,CS_BATCH_ADD,compute,0,0,&previous));
-    if(request.plan.norder) {
+    if(request->plan.norder) {
         CS_MEM_HANDLE order[]={out_mem,plan_mem}; compute_request(compute,programs[SORT].function,order,2);
         TRY(csConfigureBatchEntry(batch,CS_BATCH_ADD,compute,0,previous,&current)); previous=current;
     }
-    if(request.plan.limit>=0 || request.plan.offset) {
+    if(request->plan.limit>=0 || request->plan.offset) {
         CS_MEM_HANDLE limit[]={out_mem,plan_mem}; compute_request(compute,programs[LIMIT].function,limit,2);
         TRY(csConfigureBatchEntry(batch,CS_BATCH_ADD,compute,0,previous,&current));
     }
     TRY(csQueueBatchRequest(batch,NULL,NULL,NULL,NULL,NULL));
     TRY(copy(out_mem,0,result,sizeof(*result),0));
-    result->metrics.fdm_bytes=((sizeof(request.plan)+4095)&~(size_t)4095)+
+    result->metrics.fdm_bytes=((sizeof(request->plan)+4095)&~(size_t)4095)+
         ((sizeof(*result)+4095)&~(size_t)4095)+4096+
-        workers*(chunk+((qs_chunk_bytes(chunk/24,request.plan.ncols)+4095)&~(size_t)4095)+4096);
+        workers*(chunk+((qs_chunk_bytes(chunk/24,request->plan.ncols)+4095)&~(size_t)4095)+4096);
 cleanup:
     if(batch) csFreeBatchRequest(batch);
     if(device && group_mem && compute && programs[SOURCE].active) {
@@ -216,8 +199,8 @@ cleanup:
     for(unsigned i=0;i<FUNCTIONS;++i) unload_program(device,&programs[i]);
     if(device)csCloseCSx(device);
     if(lock_fd>=0)close(lock_fd);
-    free(caps);free(fdm);free(extents);free(load);free(compute);
-    unsigned char *p=(void *)result; size_t remaining=sizeof(*result);
-    while(remaining) { ssize_t n=send(1,p,remaining,MSG_NOSIGNAL); if(n<0&&errno==EINTR)continue; if(n<=0)break; p+=n; remaining-=n; }
-    free(result); return remaining?1:0;
+    free(caps);free(fdm);free(load);free(compute);
+    RESUME_INTERRUPTS();
+    CHECK_FOR_INTERRUPTS();
+    if(result->status) ereport(ERROR,(errmsg("CSD execution failed: %s",result->error)));
 }

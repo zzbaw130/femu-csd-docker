@@ -55,12 +55,20 @@ case ${1:-query} in
         [[ $(grep -c 'Custom Scan (SniaCsdAggregate)' "$RESULTS/prepared.plan") == 2 ]]
         grep -q 'Seq Scan' "$RESULTS/prepared.plan"
         echo 'PASS exe_path switches invalidate cached prepared plans'
-        printf "SET statement_timeout='100ms';\n%s\n" "$(cat "$PROJECT/tests/q1.sql")" > "$RESULTS/timeout.sql"
-        if sh "$COLD" csd "$RESULTS/timeout.sql" > "$RESULTS/timeout.log" 2>&1; then
-            echo 'FAIL expected statement_timeout' >&2; exit 1
-        fi
+        # Keep the same backend alive after cancellation: SNIA handles must
+        # be reusable without relying on a worker or backend exit.
+        {
+            printf "\\set ON_ERROR_STOP off\nSET statement_timeout='100ms';\n"
+            cat "$PROJECT/tests/q1.sql"
+            printf '\\set ON_ERROR_STOP on\nSET statement_timeout=0;\n'
+            printf 'EXPLAIN (COSTS OFF) SELECT count(*) FROM snia_query_fixture;\n'
+            printf 'SELECT count(*) FROM snia_query_fixture;\nSELECT count(*) FROM snia_query_fixture;\n'
+        } > "$RESULTS/timeout.sql"
+        sh "$COLD" csd "$RESULTS/timeout.sql" > "$RESULTS/timeout.log" 2>&1
         grep -q 'canceling statement due to statement timeout' "$RESULTS/timeout.log"
-        if pgrep -f '/pg-sina-csd-worker$' >/dev/null; then echo 'FAIL worker survived cancellation' >&2; exit 1; fi
+        grep -q 'Custom Scan (SniaCsdAggregate)' "$RESULTS/timeout.log"
+        [[ $(grep -c '^8$' "$RESULTS/timeout.log") == 2 ]]
+        echo 'PASS cancellation and repeated device queries in the same PG backend'
         run_cold csd "$(cat "$PROJECT/tests/q1.sql")" "$RESULTS/after-timeout.csd"
         cmp "$RESULTS/q1.host.rows" "$RESULTS/after-timeout.csd.rows"
         echo 'PASS cancellation cleanup and full device reuse'

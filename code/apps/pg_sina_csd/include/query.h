@@ -1,4 +1,4 @@
-/* Query data exchanged by PG, its per-query Guest worker and device CSFs.
+/* Query data exchanged by the PG backend and device CSFs.
  * These are application records, not extra SNIA arguments or a device runtime. */
 #ifndef PG_SINA_QUERY_H
 #define PG_SINA_QUERY_H

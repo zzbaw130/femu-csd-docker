@@ -21,7 +21,7 @@
 
 - `pg_sina_csd.exe_path`：默认 `host`，采用原生 PG 计划；`csd` 为支持的查询增加 CustomScan，不能处理的计划继续由 PG 执行。切换时失效 prepared plan 缓存。`auto` 写入后续阶段，目前不接受该值。
 - 从 PG 表达式树生成投影列、过滤表达式、聚合、分组、排序和 LIMIT/OFFSET 描述，不识别 SQL 文本或 Query 编号。支持 Q1/Q6 的所有数据算子；当前只接入单表聚合的完整上层计划，不将部分原生执行声称为全卸载。
-- Guest 每查询启动一个 C worker，经现有 sudo 权限提交 SNIA 请求；worker 不解析 SQL，不读取 heap 到应用缓冲，不执行 SQL 计算。原始数据通过内部 LOAD 进入 AFDM。没有常驻代理，没有改动 FEMU 或 SNIA 核心。
+- PG backend 直接链接并调用 SNIA，不读取 heap 到应用缓冲，不执行 SQL 数据计算。原始数据通过内部 LOAD 进入 AFDM，没有改动 FEMU 或 SNIA 核心。安装时配置设备访问权限，不使用辅助进程或代理。
 - 第一条 pipeline 为 LOAD→Scan→Filter→Aggregate.sink；按设备容量，构建最多4个并行分支的 HYBRID batch。分支间使用独立缓冲和私有聚合状态，重复处理4MiB块直到输入结束。
 - 第二条 pipeline 为 Aggregate.source→Sort→Limit，采用 SERIAL batch；合并局部状态、精确 AVG 除法、排序、LIMIT 都在设备执行。Guest 只转换结果类型并返回客户端。
 - Scan 提取所需列，Filter 生成 selection vector；表达式树复用公共子表达式。参考本地 DuckDB table_scan.cpp、physical_filter.cpp 和 physical_hash_aggregate.cpp 的投影、选择向量及局部聚合组织；不直接复用其存储格式，也没有显式 SIMD。
@@ -37,14 +37,16 @@
 
 所有 TPC-H 被测语句执行前停止 PG，清空 shared buffers；sync 并清除 Guest OS page cache，再启动 PG。测试期间关闭 autovacuum。host 与 csd 完全采用同一流程，EXPLAIN ANALYZE 也单独冷启动。设备每次新建和回收 AFDM/workmem，不复用前次输入。FEMU 模拟 NVM 字节本身是存储介质，不作为缓存清除。
 
-普通 PG 服务重启且文件不变时复用映射；Guest/FEMU 重启、数据恢复或文件/schema 变化时重新 prepare，不为每次查询重新 FIEMAP。性能采用各3轮、交替顺序，逐次核对输出；包含 worker 启动、程序加载、查询及回收时间，不包含重启/清缓存时间。
+普通 PG 服务重启且文件不变时复用映射；Guest/FEMU 重启、数据恢复或文件/schema 变化时重新 prepare，不为每次查询重新 FIEMAP。性能采用各3轮、交替顺序，逐次核对输出；包含程序加载、查询及回收时间，不包含重启/清缓存时间。
 
 ```sh
 bash tests/pg-sina-csd-test.sh query
 bash tests/pg-sina-csd-test.sh bench
 ```
 
-## 本阶段冷启动性能（2026-10-21）
+## 阶段1初版冷启动性能（2026-10-21）
+
+以下为初版的测量记录，包含现已移除的查询辅助进程开销，不代表移除后的性能。
 
 现有 SF=1 tpch_s1，PG12.22，Guest 8 vCPU/8GiB；原生 PG 配置 shared_buffers=128MiB、work_mem=4MiB、max_parallel_workers_per_gather=2。设备4 CU、64MiB AFDM、64MiB workmem。未更改原生PG配置来制造加速。三轮交替顺序，单位为秒：
 
@@ -56,6 +58,14 @@ bash tests/pg-sina-csd-test.sh bench
 Q6差异小于本次测量波动，不能据此认定有明显加速。Q1测试去掉原查询的LIMIT 1以核对四组全部结果；另做LIMIT 1正确性验证。Q6保留原LIMIT 1。原始每轮耗时由 bench 保存到 Guest 的结果目录，后续同样用该脚本生成，不把一次 EXPLAIN 的耗时当作三轮均值。
 
 单独冷启动的 EXPLAIN ANALYZE 确认二者只有 SniaCsdAggregate，无原生 Scan/Agg/Sort；设备均4 CU、220块、扫描6001215行、内部读取921624576字节。Q1投影7列，匹配5884033行，AFDM64385024字节；Q6投影4列，匹配119810行，AFDM45248512字节。workmem峰值679872字节；AFDM与私有工作内存均未超过各自64MiB限制。这些是少量分组的聚合，不会触发spill；后续阶段必须专门覆盖内存不足。
+
+## 直接调用SNIA与安装时权限配置
+
+- 按用户要求，禁止通过临时辅助进程、代理或守护进程实现权限转发，规则保存到根目录 AGENTS.md。
+- install-postgre.sh 末尾配置 /dev/nvme0 与 /dev/nvme0n1 的设备访问及 udev 规则，给 postgres 设置 CAP_SYS_ADMIN，以满足 vendor passthrough 检查。已有安装重新运行脚本也会应用；需重启 PG，重新安装二进制后需重新设置。该配置面向本专用实验 Guest。
+- 删除 worker 可执行目标、进程启动和 socket 传输。原 batch 调度成为 executor/batch.c，由 PG backend 直接调用；静态映射读取整理到 executor/mapping.c。
+- 查询仍按 batch 边界响应取消，先释放设备状态再让 PG 处理 pending interrupt，避免跨 SNIA C++ 调用栈跳转。保持正常、失败与取消路径统一回收。
+- 验收：Guest 编译及页布局测试通过；安装脚本重复执行成功，udev 规则已安装，运行中 PG 的 UID/GID 为1000且 CapEff=0x200000。扩展动态链接 /usr/local/lib/libsnia.so，旧 worker 安装及构建产物均已删除。冷启动 Q1/Q6 和全部 SQL 边界回归通过；100ms 超时后同一个 backend 连续执行两次设备 COUNT 成功，再次冷启动的完整 Q1 与原生结果一致。
 
 ## 后续阶段与TPC-H覆盖目标
 
