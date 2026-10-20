@@ -1,6 +1,6 @@
 # 四路并行排序、单路归并后计算平均值
 
-Guest应用为cs_batch_sort_avg.c，普通CPU基线为code/csd-programs/examples/tests/read_sort_avg.c；设备sort.cpp和avg.c在容器编译为cs-example-sort.so和cs-example-avg.so，由FEMU的CU线程执行。Guest应用只包含cs.h并链接libsnia-cs-api.so。batch_sort.h是示例共用的数据布局、排序、大根堆和平均值累加实现。
+Guest应用为cs_batch_sort_avg.c，普通CPU基线为code/csd-programs/examples/tests/read_merge_sort_avg.c；设备merge-sort.cpp和avg.c在容器编译为merge-sort.so和cs-example-avg.so，由FEMU的CU线程执行。Guest应用只包含cs.h并链接libsnia-cs-api.so。batch_sort.h是示例共用的数据布局、排序、大根堆和平均值累加实现。
 
 ## 编译与运行
 
@@ -47,6 +47,56 @@ task[i]是该分支的小型输入输出结构：workers=4指定本例的工作�
 全部输入完成后，Guest读取四个task，只把句柄写到group.states[0..3]。第二条source以cparam1接收state0，首次调用将其余三组run的描述接入第一个状态，只复制描述，不复制run数据。每个run保留原来的workmem context归属；source从所有64个run产生一条全局降序流。group中其余三个句柄清零，表示它们的资源已交由source统一管理。
 
 第二条每次输出最多4MiB，AVG消费每批数据，直至source FREE全部spill token并结束四个context。最后一批finished=1、group.states[0]=0；应用结束循环。没有增加Gather Merge、create、combine或abort CSF，也未实现并行归并。
+
+## 两路 K-Way Merge Path 对照
+
+保留的设备实现为 `code/csd-programs/examples/merge-sort.cpp`，产物 `merge-sort.so`；普通主机基线为 `tests/read_merge_sort_avg.c`，产物 `read-merge-sort-avg`。新实现分别是 `merge-path-sort.cpp` / `merge-path-sort.so` 和 `tests/read_merge_path_sort_avg.c` / `read-merge-path-sort-avg`。两个算子文件独立，仍各自只有sort_sink、sort_source两个入口。
+
+两种方式都先用四个sink生成run。默认示例采用merge-sort；增加 `--merge-path` 选择两路归并：
+
+```sh
+sudo /tmp/snia-cs-api-guest/cs-batch-sort-avg /dev/nvme0n1 /data/cs-batch-input.bin --existing --merge-path
+sudo /tmp/csd-sort-bench/examples/read-merge-path-sort-avg /data/cs-batch-input.bin
+bash tests/snia-cs-api-test.sh bench
+```
+
+bench现在交替比较两种算法的CPU/CSD各3轮，按算法分别检查两条路径的spill工作量一致。全部输出的sum/count/average必须一致，内存上界都不得超过64MiB。
+
+新版本第二条pipeline如下；source 0先执行一个普通source→AVG batch，完成准备、分区并输出第一块，随后两条分支并行：
+
+```text
+R0～R3的全部run → 准备两份读缓冲 → 计算全局输出第N/2项的边界
+                                         ↓
+          source(part=0，输出[0,N/2)) → AVG(result[0])
+          source(part=1，输出[N/2,N)) → AVG(result[1])
+                                         ↓
+                         主机相加两个sum/count，计算最终均值
+```
+
+分区计算采用[DuckDB介绍的K-Way Merge Path](https://duckdb.org/2025/09/24/sorting-again)：按剩余输出条数计算探测步长，读取各run的候选值，推进可以确定属于前半段的run前缀。不是固定按某个值分组。相同值按run编号确定先后，得到精确的N/2条记录，支持重复值和倾斜数据。主机与设备共用 `merge_path_sort.h` 中的分区计算，文件和NVMe I/O各自实现。随机探测命中spill run时仍通过NEED_LOAD重入读取，边界计算的额外I/O没有排除在计时之外。
+
+sink的三个MR仍为input、task、io。两路source的四个MR为sorted、共享group、各自的merge_path_task、各自的io；cparam1是group首句柄，cparam2仍保留给重入。merge_path_task.part为0或1，其余字段输出准备耗时、分区耗时和分区读取字节数。共享group只保存状态句柄，不保存算法运行工作区。
+
+两份source状态都在workmem中，各有游标、堆、每个spill run的256KiB读缓冲。并行读取前完成所有必要分配和spill；之后run内容及token只读。先到EOF的source先复制自己的结果和计时，再发布完成标志，不再访问共享状态；最后到EOF的source负责FREE全部token并销毁四个context。不会在一个分区完成时释放另一个分区仍需要的数据。
+
+新版本预留全部AFDM缓冲26,259,456字节，工作区40,849,408字节，仍在64MiB内，工作区由四个sink平均分摊。第二阶段两个读缓存合计最多32MiB；内存压力可能导致更多驻留run被spill，准备阶段会如实统计。CPU使用同样配额和读缓冲，先准备并计算边界、输出part 0第一块，再启动两个归并线程。PROFILE新增prepare和partition的实际墙钟时间，partition另报read_bytes；source_work包含其中的计算，不能与这些阶段重复相加。
+
+2026-10-21，同一256MiB文件、64MiB算法预算，四路sink保持不变，交替测量各3轮，平均延迟如下（秒）：
+
+| 路径 | 归并方式 | 阶段1 | 阶段2（含准备/边界/AVG/回收） | 总延迟 |
+| --- | --- | ---: | ---: | ---: |
+| CPU | merge-sort，单路 | 2.646397 | 4.819976 | 7.466374 |
+| CPU | Merge Path，两路 | 2.587540 | 3.143420 | 5.730961 |
+| CSD | merge-sort，单路 | 2.519082 | 5.931433 | 8.450514 |
+| CSD | Merge Path，两路 | 2.488781 | 4.807581 | 7.296363 |
+
+CPU总延迟降低23.2%，整体加速1.303倍；CSD总延迟降低13.7%，整体加速1.158倍。第二阶段加速分别1.533/1.234倍。这里用同批次重测的merge-sort比较，没有用前一阶段的历史结果替代基线。
+
+全部12次输出均一致：count=67108864，sum=15688155813636，average=233771.73861318827。merge-sort为60个spill run，写入/回读各240MiB；两路版本为64个spill run，写入256MiB，回读569.5MiB，其中297.75MiB用于边界探测。其余271.75MiB是两路流式归并读取：边界所在块可能被两路各读一次。CPU/CSD同算法的这些字节数完全一致。
+
+两路版本的内存峰值上界CPU66,133,632字节、CSD66,165,632字节，均小于67,108,864字节。准备平均CPU0.102秒、CSD0.070秒；边界计算平均CPU0.263秒、CSD0.526秒，均已计入阶段2。并行归并降低了延迟，但更多缓存占用、边界探测、重复边界块读取和请求重入抵消了部分收益，不能期待第二阶段直接减半。
+
+原始每轮日志、timings.tsv和profiles.tsv：`/tmp/snia-merge-compare.0kvahH`。设备算子在宿主CU线程运行，CPU基线在Guest运行，比较只代表当前模拟器配置。
 
 ## AVG如何跨批次累计
 

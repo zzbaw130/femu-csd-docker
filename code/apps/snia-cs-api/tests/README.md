@@ -10,7 +10,8 @@
 | femu/cs_discovery.c | csDiscoveryIdentify | 生产传输的Identify、资源查询、打开失败，以及可选命令计时分类/关闭/错误码保持 |
 | femu/cs_csf_batch_scheduling.c | csCSFSchedulingAndBatch | AFDM、storage、event、batch依赖、排序跨批次spill、完整平均值聚合及EOF回收 |
 | csd-programs/examples/tests/sort_spill_merge.cpp（设备示例目录） | sortSpillMergeAverage、sortParallelSinkMergeAverage | 单sink和四路sink的逐项排序比对、跨context归并、spill、内存压力与中途收尾 |
-| csd-programs/examples/tests/read_sort_avg.c（设备示例目录） | 手动 read-sort-avg | 四线程读文件/生成run、单线程全局归并、64MiB总算法预算，与CSD比较完整排序和AVG延迟 |
+| csd-programs/examples/tests/merge_path_sort.cpp | sortKWayMergePathAverage | 精确N/2边界、全重复值/倾斜/极值、两路完整输出与并发回收 |
+| csd-programs/examples/tests/read_merge_sort_avg.c（设备示例目录） | 手动 read-merge-sort-avg | 四线程读文件/生成run、单线程全局归并、64MiB总算法预算，与CSD比较完整排序和AVG延迟 |
 | examples/cs_batch_sort_avg.c（项目 examples/） | 手动 cs-batch-sort-avg | Guest真实设备四路HYBRID sink、单路source、全量均值与自动回收 |
 
 common/mock_cs_backend.c 是第二种非NVMe设备；femu/mock_nvme_transport.c 在内存中模拟原生命令。这些文件仅提供测试后端或场景，不是标准接口实现。
@@ -24,6 +25,6 @@ bash tests/snia-cs-api-test.sh smoke
 bash tests/snia-cs-api-test.sh bench
 ```
 
-bench 复用已有256MiB示例文件，交替测量3轮并校验结果，输出分阶段耗时、profiles.tsv细分计时和临时日志目录。计时范围、直接 I/O 及内存预算见[示例说明](../examples/README.md#计时与性能测试)。
+bench 复用已有256MiB示例文件，交替测量merge-sort和两路Merge Path的CPU/CSD各3轮并校验结果，输出分阶段耗时、profiles.tsv细分计时和临时日志目录。计时范围、直接 I/O 及内存预算见[示例说明](../examples/README.md#计时与性能测试)。
 
-unit 为宿主测试单独编译设备 SO，防止混用容器系统库版本。也可用 CMake 配置测试时设置 CSD_TEST_PROGRAM_DIR，指向本机编译的 cs-example-sort.so、cs-example-avg.so 所在目录。
+unit 为宿主测试单独编译设备 SO，防止混用容器系统库版本。也可用 CMake 配置测试时设置 CSD_TEST_PROGRAM_DIR，指向本机编译的 merge-sort.so、cs-example-avg.so 所在目录。

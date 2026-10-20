@@ -5,7 +5,7 @@
 ```text
 csd-programs/
 ├── CMakeLists.txt       # 公共编译、workmem 链接和输出规则
-├── examples/            # 原生 vadd/kernels、sort、avg
+├── examples/            # 原生 vadd/kernels、merge-sort/merge-path-sort、avg
 │   ├── CMakeLists.txt
 │   └── tests/           # 排序、重入和归并测试
 ├── csd-workmem/
@@ -33,7 +33,7 @@ cmake --build /tmp/csd-programs-check -j2
 ctest --test-dir /tmp/csd-programs-check --output-on-failure
 ```
 
-所有 SO 直接输出到指定构建目录顶层。Compose 的 `CSD_PROGRAM_DIR` 为 `/workspace/code/csd-programs/build`；加载时只传 `cs-example-sort.so` 等文件名。可选 BPF 用 `cmake --build code/csd-programs/build --target csd-vadd-bpf`，需要 clang BPF 后端。
+所有 SO 直接输出到指定构建目录顶层。Compose 的 `CSD_PROGRAM_DIR` 为 `/workspace/code/csd-programs/build`；加载时只传 `merge-sort.so` 等文件名。可选 BPF 用 `cmake --build code/csd-programs/build --target csd-vadd-bpf`，需要 clang BPF 后端。
 
 ## 新增算子
 

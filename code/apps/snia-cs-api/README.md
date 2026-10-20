@@ -78,7 +78,7 @@ cc application.c -Iinclude -Lbuild -lsnia-cs-api \
 
 以下参数映射、程序下载和 spill 约定均属于 FEMU 插件；其他插件按其设备能力实现。
 
-FEMU 的 CSF 下载描述为 `文件名\0入口符号\0`，例如 `cs-example-sort.so\0sort_sink\0`。文件在容器的 `csd_program_dir` 中，Guest 不需要持有设备 `.so`。
+FEMU 的 CSF 下载描述为 `文件名\0入口符号\0`，例如 `merge-sort.so\0sort_sink\0`。文件在容器的 `csd_program_dir` 中，Guest 不需要持有设备 `.so`。
 
 **应用和算子自行约定参数含义。库只映射原生字段，不附加参数描述或输入 AFDM。**
 
@@ -107,7 +107,7 @@ FEMU 的 CSF 下载描述为 `文件名\0入口符号\0`，例如 `cs-example-so
 
 所有设备算子统一链接 `libcs-workmem.so`。排序缓冲、run 列表等私有数据用 `cs_work_begin/cs_work_alloc/cs_work_end` 管理；context 可跨多次入口保留。AFDM 保存输入、输出和交接数据，私有算法状态留在工作内存中。
 
-[sort.cpp](../../csd-programs/examples/sort.cpp) 只导出 sink 和 source。sink 首次创建工作内存，成功申请的4MiB run 留在内存；只有后续申请失败才淘汰一个驻留 run。一个 run 分为16个256KiB块，重入逐次记录 STORE 的标识，合计保存完整4MiB。
+[merge-sort.cpp](../../csd-programs/examples/merge-sort.cpp) 只导出 sink 和 source。sink 首次创建工作内存，成功申请的4MiB run 留在内存；只有后续申请失败才淘汰一个驻留 run。一个 run 分为16个256KiB块，重入逐次记录 STORE 的标识，合计保存完整4MiB。
 
 设备入口通过 csIsReentry 判断本次是不是内部 I/O 后的重入，通过 csReentryValue 取得完成 I/O 的 spill_id。算子自己的 pending 状态记录正在 STORE、LOAD 还是 FREE，因此无需库增加控制 AFDM 或事件参数。
 
@@ -126,7 +126,7 @@ source 直接使用驻留 run，按需 LOAD spill 块；读缓冲申请失败也
 
 FEMU 插件在 batch 节点内自动处理整个循环，直到得到普通结果才启动后继或发布 callback/event。单独 `csQueueComputeRequest` 执行一轮并返回原始 `CompValue`。
 
-设备编译可参考 `code/csd-programs/examples/CMakeLists.txt`；根 CMakeLists.txt 的 add_csd_program 统一输出位置、头文件和 workmem 链接。完整可执行重入示例见 [sort.cpp](../../csd-programs/examples/sort.cpp)。
+设备编译可参考 `code/csd-programs/examples/CMakeLists.txt`；根 CMakeLists.txt 的 add_csd_program 统一输出位置、头文件和 workmem 链接。完整可执行重入示例见 [merge-sort.cpp](../../csd-programs/examples/merge-sort.cpp)。
 
 ## spill 区与资源生命周期
 

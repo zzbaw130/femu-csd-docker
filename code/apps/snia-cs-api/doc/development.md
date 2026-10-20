@@ -2,6 +2,35 @@
 
 分支 `snia_csd_dev`，基线 tag `femu-csd-with-original-postgre`。当前功能不包含 PostgreSQL SQL runtime。
 
+## 2026-10-21：保留 merge-sort，新增两路 K-Way Merge Path
+
+- 原sort.cpp原样更名merge-sort.cpp，SO更名merge-sort.so；CPU基线更名read_merge_sort_avg.c / read-merge-sort-avg。同步CMake、下载描述、测试、脚本和当前文档；清除canonical build中的旧cs-example-sort.so和read-sort-avg，不保留重复产物。
+- 新增独立设备文件merge-path-sort.cpp / merge-path-sort.so、独立CPU文件tests/read_merge_path_sort_avg.c / read-merge-path-sort-avg。两个版本各保留sink/source两个CSF入口，第一阶段都是四路sink，新增版本第二阶段为两路source→AVG。Guest通过--merge-path选择，默认仍为merge-sort；不修改FEMU和SNIA库。
+- examples/merge_path_sort.h共享精确co-rank算法及示例分区参数。按剩余秩计算步长、比较各run候选并推进安全前缀，重复值按run编号确定顺序；精确分为N/2和N−N/2条，不是近似的值域分组。设备通过NEED_LOAD读取spill中的探测点，CPU通过文件pread，均计时。
+- source 0首次调用接管四组run，按申请失败触发spill，准备两份读缓存并计算边界，再输出第一块。之后Guest通过HYBRID构造两条source→AVG分支，每个分支有独立task/io/output/result AFDM。到EOF后从batch移除该分支，最终由主机相加两个sum/count得到AVG。
+- Source持有独立游标、堆、缓存和重入状态。并行执行期间run和token只读；先完成者先把结果和计时复制到AFDM，再原子发布完成标志，此后不访问共享状态。最后完成者FREE全部token并销毁四个context，避免并发回收造成悬空引用。
+- 两路版本从64MiB中扣除26,259,456字节AFDM预算，剩余40,849,408字节平均分给四个context；CPU采用相同预算。两份256KiB/run缓存最多32MiB，内存足够，但输入/输出缓冲和双缓存挤出了驻留run。算法保留申请失败才spill的规则。
+- 新增sortKWayMergePathAverage：400组随机小run，检查0/中点/全部秩；实际CSF检查随机值、全重复、极值倾斜、两种完成顺序的逐项全局排序、完整AVG、spill、EOF与提前收尾。宿主6组设备测试＋5组SDK测试通过，容器新测试通过，ASan/UBSan/LeakSanitizer通过。未在性能测量期间并行运行这些压力测试。
+
+### 同批性能对比
+
+同一256MiB文件、3个extent、64MiB算法预算，各方法交替3轮。单位秒；每行分别为merge-sort CPU / Merge Path CPU / merge-sort CSD / Merge Path CSD总延迟：
+
+| 轮次 | CPU单路归并 | CPU两路归并 | CSD单路归并 | CSD两路归并 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 7.610870 | 5.822173 | 8.345484 | 7.501335 |
+| 2 | 7.459820 | 5.653753 | 8.492564 | 7.136502 |
+| 3 | 7.328432 | 5.716957 | 8.513495 | 7.251252 |
+| 平均 | 7.466374 | 5.730961 | 8.450514 | 7.296363 |
+
+- 阶段1平均CPU单/双路2.646397/2.587540秒，CSD单/双路2.519082/2.488781秒。阶段2（含准备、边界、归并、AVG、回收）分别CPU4.819976/3.143420秒，CSD5.931433/4.807581秒。
+- CPU整体加速1.303倍、延迟下降23.2%；CSD整体加速1.158倍、延迟下降13.7%。阶段2加速分别1.533/1.234倍。基线为本轮重新测量的保留版本，不能混用前一阶段8.013秒的历史均值。
+- 全部12次count=67108864、sum=15688155813636、average=233771.73861318827。每种算法的CPU/CSD最终run数量、spill数量与读写字节完全一致。原文件SHA256保持9dde99b8dcf24e5c1fe46405f898a7cd955e59d3abb3a8845ccaf93602ae4d2b。
+- merge-sort为64个run、60个spill run，写入/回读各251,658,240字节（240MiB）。两路版本64个run全部spill，写入268,435,456字节（256MiB）；回读597,164,032字节（569.5MiB），其中312,213,504字节（297.75MiB）用于边界探测，其余271.75MiB为两路归并读取，含各分区边界块的重复读取。
+- 两路内存上界CPU66,133,632字节、CSD66,165,632字节，低于67,108,864字节。准备平均CPU0.101704秒、CSD0.070134秒，边界计算CPU0.262608秒、CSD0.526131秒，均计入阶段2。
+- CSD的E1从3072次增至4518次；D0从1024次增至2342次，D1/TRIM从960增至1024次。并行计算收益受到额外探测、重复读取和请求重入的抵消，第二阶段不能直接减半。累计调用时间存在重叠，不与阶段墙钟相加。
+- 原始每轮日志、timings.tsv、profiles.tsv：/tmp/snia-merge-compare.0kvahH。Docker镜像和FEMU进程未更换，本阶段直接加载新SO。
+
 ## 2026-10-21：四路 sink、单路全局归并及主机对照
 
 - Guest第一阶段改为8节点HYBRID batch，四条LOAD→sort_sink分支，每轮16MiB、共16轮。四个sink使用同一程序ID420；每条分支独立的input/task/io AFDM，task中保存该分支的状态句柄。第二阶段仍为SERIAL sort_source→avg，完整消费所有输出。

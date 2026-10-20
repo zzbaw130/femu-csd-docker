@@ -113,8 +113,8 @@ int main(void)
     OK(csQueueCopyMemRequest(&within, NULL, NULL, NULL, NULL, NULL));
     OK(copy(b, buf, 7, CS_COPY_FROM_DEVICE, 5));
     CHECK(buf[0] == 0x44 && buf[6] == 0x22);
-    CS_CSF_ID sink = load(d, "cs-example-sort.so", "sort_sink", "sink", 201),
-              source = load(d, "cs-example-sort.so", "sort_source", "source", 202),
+    CS_CSF_ID sink = load(d, "merge-sort.so", "sort_sink", "sink", 201),
+              source = load(d, "merge-sort.so", "sort_source", "source", 202),
               average = load(d, "cs-example-avg.so", "avg_int32", "avg", 203);
     int n = 0;
     CHECK(csQueryDeviceProperties(d, CS_FDM_TYPE, &n, NULL) == CS_INVALID_LENGTH);
