@@ -53,6 +53,8 @@ int64_t pg_sina_scan(struct femu_csd_args *a)
                         struct qs_heap_ref ref={page+offset+off+header,size-header};
                         memcpy(&value,&ref,sizeof(ref));
                     }
+                    else if(spec->type==Q_STRING) return -3;
+                    else if(spec->type==Q_PREFIX) { if(spec->prefix_len>sizeof(spec->prefix)) return -3; value=size-header>=spec->prefix_len && !memcmp(v,spec->prefix,spec->prefix_len); }
                     else if(spec->type==Q_DECIMAL) { if(qs_numeric_cents(v,size-header,&value,&dscale)) return -3; }
                     else if(spec->type==Q_CHAR) { if(size-header!=1 || *v>=128) return -3; value=*v; }
                     else if(size==8) memcpy(&value,v,8);

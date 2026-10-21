@@ -97,6 +97,27 @@ static void numeric_formats(void)
         assert(qs_numeric_cents((const unsigned char *)invalid[i],i==3?4:8,&value,&scale)<0);
     }
 }
+static void prefix_projection(function scan)
+{
+    unsigned char raw[2*QS_PAGE]={0}; make_pages(raw);
+    struct qs_plan p={.nattrs=4,.ncols=1};
+    for(unsigned i=0;i<4;++i) p.cols[i]=(struct qs_column){.length=i?-1:4,.align=4,.slot=-1};
+    p.cols[1].slot=0; p.cols[1].type=Q_PREFIX; p.cols[1].prefix_len=2; memcpy(p.cols[1].prefix,"ab",2);
+    /* Only this string is projected, so following attributes are not decoded. */
+    raw[QS_PAGE-64+23]&=~2U; /* NULL */
+    raw[QS_PAGE-128+28]=3; /* Empty short varlena. */
+    write32(raw+QS_PAGE-192+28,7U<<2); memcpy(raw+QS_PAGE-192+32,"abc",3);
+    size_t bytes=qs_chunk_bytes(128,1); struct qs_chunk *c=calloc(1,bytes); assert(c);
+    c->capacity=128; c->ncols=1; assert(!scan_rows(scan,&p,c,bytes,raw));
+    assert(c->rows==62 && (qs_nulls(c)[0]&1));
+    for(unsigned i=1;i<c->rows;++i) assert(qs_values(c)[i]==(i!=1));
+    p.cols[1].prefix_len=4; memcpy(p.cols[1].prefix,"abcd",4);
+    assert(!scan_rows(scan,&p,c,bytes,raw)); for(unsigned i=1;i<c->rows;++i) assert(!qs_values(c)[i]);
+    p.cols[1].prefix_len=0; assert(!scan_rows(scan,&p,c,bytes,raw));
+    for(unsigned i=1;i<c->rows;++i) assert(qs_values(c)[i]);
+    p.cols[1].type=Q_STRING; assert(scan_rows(scan,&p,c,bytes,raw)==-3);
+    free(c);
+}
 int main(int argc,char **argv)
 {
     numeric_formats();
@@ -104,6 +125,7 @@ int main(int argc,char **argv)
     void *scan_so=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL),*filter_so=dlopen(argv[2],RTLD_NOW|RTLD_LOCAL);
     assert(scan_so && filter_so);
     function scan=(function)dlsym(scan_so,"pg_sina_scan"),filter=(function)dlsym(filter_so,"pg_sina_filter"); assert(scan && filter);
+    prefix_projection(scan);
     unsigned char raw[2*QS_PAGE]={0}; make_pages(raw);
     struct qs_plan p={.nattrs=4,.ncols=3,.nexprs=7,.predicate=6};
     p.cols[0]=(struct qs_column){.length=4,.align=4,.slot=0,.type=Q_INTEGER};

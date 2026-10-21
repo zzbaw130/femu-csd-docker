@@ -31,6 +31,11 @@ static inline size_t qs_sink_memory(const struct qs_plan *p,unsigned workers)
     struct cs_work_stats stats;
     if(cs_work_get_stats(&stats) || workers>QS_WORKERS) return 0;
     size_t limit=stats.capacity_bytes/(workers?workers:1);
+    if(p->join.relid) {
+        size_t build=p->join.work_mem_bytes;
+        if(build>stats.capacity_bytes/2) build=stats.capacity_bytes/2;
+        limit=(stats.capacity_bytes-build)/(workers?workers:1);
+    }
     if(p->work_mem_bytes && p->work_mem_bytes<limit) limit=p->work_mem_bytes;
     size_t scratch=qs_filter_memory(p);
     return limit>scratch?limit-scratch:0;
@@ -42,11 +47,13 @@ static inline int qs_vector_dependency(const struct qs_plan *p,int index,uint8_t
     if(index<0 || (unsigned)index>=p->nexprs) return -1;
     if(needed[index]) return 0;
     const struct qs_expr *e=&p->exprs[index];
-    if(e->op>Q_IS_NOT_NULL) return -1;
+    if(e->op>Q_CASE) return -1; /* AGGREF/DIV are scalar final expressions. */
     if(e->op!=Q_COLUMN && e->op!=Q_CONST) {
         if(e->left<0 || e->left>=index || qs_vector_dependency(p,e->left,needed)) return -1;
         if(e->op!=Q_NOT && e->op!=Q_IS_NULL && e->op!=Q_IS_NOT_NULL &&
            (e->right<0 || e->right>=index || qs_vector_dependency(p,e->right,needed))) return -1;
+        if(e->op==Q_CASE && (e->otherwise<0 || e->otherwise>=index ||
+            qs_vector_dependency(p,e->otherwise,needed))) return -1;
     }
     needed[index]=1; return 0;
 }
@@ -195,6 +202,27 @@ static int qs_vector_evaluate(struct qs_vector_input *input,unsigned index,const
     }
     if(qs_vector_evaluate(input,e->left,rows,n)) return -1;
     const struct qs_vector *left=&input->vectors[e->left],*right=NULL;
+    if(e->op==Q_CASE) {
+        uint16_t false_rows[QS_VECTOR_ROWS]; unsigned nt=0,nf=0;
+        for(unsigned j=0;j<n;++j) {
+            unsigned i=rows[j]; if(left->errors[i]) continue;
+            if(!qs_vector_null(left,i) && qs_vector_value(left,i)) rhs[nt++]=i;
+            else false_rows[nf++]=i;
+        }
+        if(qs_vector_evaluate(input,e->right,rhs,nt) ||
+            qs_vector_evaluate(input,e->otherwise,false_rows,nf)) return -1;
+        for(unsigned j=0;j<n;++j) {
+            unsigned i=rows[j]; unsigned error=left->errors[i]; struct qs_cell v={0};
+            if(!error) {
+                unsigned branch=!qs_vector_null(left,i) && qs_vector_value(left,i)?e->right:e->otherwise;
+                v=qs_vector_cell(p,input->vectors,branch,i); error=input->vectors[branch].errors[i];
+                if(!v.isnull) error|=v.scale>e->scale || qs_scale(v.value,e->scale-v.scale,&v.value);
+            }
+            out->values[i]=v.value; out->nulls[i]=v.isnull; out->dscales[i]=v.dscale; out->errors[i]=error;
+            out->all_valid&=!error && !v.isnull;
+        }
+        out->done+=n; return 0;
+    }
     if(e->op!=Q_NOT && e->op!=Q_IS_NULL && e->op!=Q_IS_NOT_NULL) {
         const uint16_t *right_rows=rows; nrhs=n;
         if(e->op==Q_AND || e->op==Q_OR) {

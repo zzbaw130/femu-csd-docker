@@ -111,7 +111,8 @@ SNIA已有计时记录D0=220次、累计1.523479s，E1=663次、累计3.393881s�
 | 阶段 | 实现内容 | 优先验收 |
 | --- | --- | --- |
 | 2（完成） | 行排序/TopN与高基数聚合已接入，详见阶段2a/2b。workmem优先，NEED_STORE/LOAD/FREE驱动spill与重入，保留sink/source生命周期 | 大数据排序、分组和强制小内存正确性 |
-| 3 | Hash Join build/probe、投影传递、分区spill，扩展CASE和必要字符串表达式 | Q14，再Q3/Q5/Q10/Q12/Q19 |
+| 3a（完成） | 两表整数INNER Hash Join、投影、build分批spill及probe重扫，搜索CASE、前缀LIKE与聚合后数值运算 | Q14 |
+| 3b | 多表Join、Join后分组与字符串投影、分区spill以减少probe重复读取 | Q3/Q5/Q10/Q12/Q19 |
 | 4 | 多路Join与分组，子查询去相关，semi/anti join，EXISTS/NOT EXISTS，LIKE/SUBSTRING、派生表与中间聚合结果复用 | Q4/Q7/Q8/Q9/Q11/Q13/Q15/Q16/Q18/Q20/Q21/Q22 |
 | 5 | 补齐剩余表达式与嵌套聚合/标量子查询语义，逐条核查设备覆盖与原生结果 | Q2/Q17及全部22条 |
 | 6 | `auto`：基于可支持性、估计行数、投影宽度、传输/计算/内存与spill成本选择host/csd；支持混合子计划 | 全部22条，比较host/csd/auto与实际计划 |
@@ -183,4 +184,19 @@ EXPLAIN增加CSD Scheduling说明。Guest回归新增450000行多块表，覆盖
 - 保留查询预算和物理池硬上限，分别限制局部状态、部分状态run及结果排序，使两个排序阶段同时存活时也不超额。连续run保留整块缓存，检测到交错访问造成缓存反复丢失后才缩小窗口，不把缓存策略当作新的用户配置。
 - 新增超过32768组的设备差分测试，以及Guest多列/NULL分组、隐藏排序键、4MB预算、实际spill、连续结果、报错与游标提前关闭后的复用；SF=1自定义高基数聚合单独冷启动比较host/CSD。详细数据见performance.md。
 
-当前仍不支持Join、HAVING、MIN/MAX、一般字符串或全部22条TPC-H。中间记录键数加聚合数暂限16，run元数据驻留、外部聚合采用排序部分状态而非radix分区；极多run和极低预算仍需后续多轮归并。下一阶段开始Hash Join和所需表达式扩展。
+阶段2b验收时仍不支持Join、HAVING、MIN/MAX、一般字符串或全部22条TPC-H。中间记录键数加聚合数暂限16，run元数据驻留、外部聚合采用排序部分状态而非radix分区；极多run和极低预算仍需后续多轮归并。Hash Join和所需表达式扩展见下文阶段3a。
+
+## 阶段3a：两表 Hash Join 与完整 Q14
+
+- PG从规划树提取两个输入和一个整数等值连接条件，按全表行数估计选择较小build侧，校验两表映射属于同一namespace。分别生成物理Scan/Filter计划和连接后的列布局；逗号连接与显式INNER JOIN均支持，不匹配SQL文本。兼容PG预处理后已整理成List的条件，以及整数列和不同宽度整数常量的比较。
+- 新增设备`join.c`：build仅保存投影后的键/载荷，哈希桶使用重复键链；NULL键不匹配。probe按256行生成连接列批次，直接调用同一SO内的既有聚合sink，最终仍由aggregate source合并。多个probe槽共享只读build状态，切换批次前PG排空所有在途请求，不新增设备调度线程或协议。
+- 查询预算一半给build，另一半分摊给probe/聚合槽，受实际设备workmem硬上限约束。build超预算时返回NEED_STORE，SNIA用内部STORE保存64KiB块并返回token；load通过NEED_LOAD恢复一批并建桶。每批重扫probe，聚合状态跨批次保留。驻内存build不发生spill。这是当前有界实现，没有声称实现DuckDB的radix分区或动态重分区；小预算会增加probe内部读取，批次/token元数据仍驻内存。
+- 参考本地DuckDB `physical_hash_join.cpp`、`join_hashtable.cpp`的build/probe边界、键/载荷分离和列批输出；参考`expression_executor/execute_case.cpp`的真假selection，实现搜索CASE短路，只处理被选中的分支。Scan可把ASCII常量前缀LIKE提取成布尔列，Q14不存储完整p_type字符串。标量聚合结果支持numeric加减乘除，精确int128、PG显示精度及半舍规则，不用浮点近似。
+- 参数仍按既有AFDM顺序构造；共享控制记录只保存状态句柄、批次序号和统计。设备私有哈希表、批次描述和token数组放workmem，输入输出放AFDM。设备不访问Guest文件或直接提交NVMe；错误/取消排空probe后释放两类状态，再由本查询的SNIA deviceClose回收临时token。
+- 入口包装增加HashJoin.build/load/probe+Aggregate计时，最后一项包含私有聚合调用。EXPLAIN增加Build Rows/Batches、Join Rows和spill读写，分开显示Build Wall；Internal Read包含所有probe轮次。Guest只编排和转换最终Datum，FEMU和SNIA核心均未修改。
+
+验收：24项设备CTest通过，19项PG算子ASan/UBSan通过。独立Join测试按键统计预期值，核对负键、重复键、NULL、倾斜、空build/probe、3批spill、计时和异常清理；4/64MiB池与64MiB池内4MiB查询预算均核对零残留及实际内存峰值。Guest的`join`入口核对两侧过滤、重复组合、空输入、无匹配、4MiB强制spill、原生回退、build/probe错误及取消后的同backend设备复用。SF=1 Q14在4/64MiB预算下均为一个CSD CustomScan，最终结果逐字一致：`16.3807786263955401`。
+
+当前完整TPC-H覆盖为Q1/Q6/Q14；其余查询尚不能完整卸载。Join初期只支持两个heap表、一个同类型整数等值INNER条件和标量SUM/AVG/COUNT；连接后GROUP BY/行输出、多表、外/semi/anti Join、一般字符串及子查询按后续阶段推进。LIKE仅限C/C.UTF-8下ASCII前缀、末尾一个`%`，同列多个前缀或其他通配符回退PG。numeric仍受现有输入和int128表示范围限制，运行时越界报错。
+
+完整单表query/profile回归也通过，包括新CASE/聚合后运算以及原有高基数聚合、排序、prepared plan、取消/错误和提前关闭。全部检查结束后冷启动交替各3轮：Q14 host=2066.527ms、CSD=636.031ms；Q1为4543.746/861.610ms，Q6为1432.663/584.542ms。Q14 host首轮波动较大，中位数1834.704/648.166ms；完整样本、内存/spill和独立算子计时见[性能分析](performance.md)。

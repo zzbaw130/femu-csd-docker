@@ -110,6 +110,27 @@ int64_t pg_sina_aggregate_sink(struct femu_csd_args *a)
     }
     return 0;
 }
+static int finalize_group(const struct state *s,const struct group *g,struct qs_row *row)
+{
+    const struct qs_plan *p=&s->plan; struct qs_cell values[QS_AGGS];
+    for(unsigned j=0;j<p->naggs;++j) {
+        const struct qs_agg *agg=&p->aggs[j]; const struct accumulator *v=&g->aggs[s->accumulator[j]];
+        struct qs_cell value={0};
+        if(agg->kind==Q_COUNT || agg->kind==Q_COUNT_STAR) value.value=v->count;
+        else {
+            value=(struct qs_cell){.value=v->sum,.scale=p->exprs[agg->expr].scale,.dscale=v->dscale,.isnull=!v->count};
+            if(agg->kind==Q_AVG && v->count && qs_average(value,v->count,&value)) return -5;
+        }
+        values[j]=value;
+    }
+    struct qs_eval eval={.plan=p,.aggregates=values};
+    for(unsigned j=0;j<p->nout;++j) {
+        const struct qs_output *o=&p->outputs[j];
+        if(o->aggregate==2) { if(qs_evaluate(&eval,o->index,&row->cells[j])) return -5; }
+        else row->cells[j]=o->aggregate?values[o->index]:g->keys[o->index];
+    }
+    return 0;
+}
 int64_t pg_sina_aggregate_source(struct femu_csd_args *a)
 {
     if(!a || (a->numr!=1 && a->numr!=2 && a->numr!=3) || a->mr_len[0]<(long long)sizeof(struct qs_group)) return -1;
@@ -147,19 +168,8 @@ int64_t pg_sina_aggregate_source(struct femu_csd_args *a)
     }
     out->rows=s->count; out->finished=1; out->metrics=s->metrics; out->metrics.workers=group->count;
     struct cs_work_stats stats; if(!cs_work_get_stats(&stats)) out->metrics.work_peak=stats.peak_used_bytes;
-    for(unsigned i=0;i<s->count;++i) for(unsigned j=0;j<p->nout;++j) {
-        const struct qs_output *o=&p->outputs[j]; struct qs_cell value={0};
-        if(!o->aggregate) value=s->groups[i].keys[o->index];
-        else {
-            const struct qs_agg *agg=&p->aggs[o->index]; const struct accumulator *v=&s->groups[i].aggs[s->accumulator[o->index]];
-            if(agg->kind==Q_COUNT || agg->kind==Q_COUNT_STAR) value.value=v->count;
-            else {
-                value=(struct qs_cell){.value=v->sum,.scale=p->exprs[agg->expr].scale,.dscale=v->dscale,.isnull=!v->count};
-                if(agg->kind==Q_AVG && v->count && qs_average(value,v->count,&value)) return -5;
-            }
-        }
-        out->data[i].cells[j]=value;
-    }
+    for(unsigned i=0;i<s->count;++i)
+        if(finalize_group(s,&s->groups[i],&out->data[i])) return -5;
     cs_work_end(s->context); group->states[0]=0; return 0;
 }
 
@@ -307,23 +317,7 @@ static int partial_combine(struct external_state *e,const struct qs_row *row)
     return 0;
 }
 static int group_output(struct external_state *e,struct qs_row *row)
-{
-    struct state *s=&e->local; const struct qs_plan *p=&s->plan; struct group *g=&s->groups[0];
-    for(unsigned j=0;j<p->nout;++j) {
-        const struct qs_output *o=&p->outputs[j]; struct qs_cell value={0};
-        if(!o->aggregate) value=g->keys[o->index];
-        else {
-            const struct qs_agg *agg=&p->aggs[o->index]; const struct accumulator *v=&g->aggs[s->accumulator[o->index]];
-            if(agg->kind==Q_COUNT || agg->kind==Q_COUNT_STAR) value.value=v->count;
-            else {
-                value=(struct qs_cell){.value=v->sum,.scale=p->exprs[agg->expr].scale,.dscale=v->dscale,.isnull=!v->count};
-                if(agg->kind==Q_AVG && v->count && qs_average(value,v->count,&value)) return -5;
-            }
-        }
-        row->cells[j]=value;
-    }
-    return 0;
-}
+{ return finalize_group(&e->local,&e->local.groups[0],row); }
 static void external_metrics(struct external_state *e,struct qs_result *out)
 {
     out->metrics=e->local.metrics;

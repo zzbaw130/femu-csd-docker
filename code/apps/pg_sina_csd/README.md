@@ -4,7 +4,7 @@
 
 目标是把 PG 执行计划转换为 SNIA batch，由 Guest 调度 CSD 算子。只读实验使用与原生 PG 相同的全表 visible/frozen heap；实验前准备一次 schema、extent 和 LBA 映射，后续持续使用。文件、schema 或设备变化以及重启后重新准备，不设置守护连接。
 
-当前完成阶段2的外部行排序/TopN和高基数聚合：Q1/Q6 由 PG 表达式树生成动态 pipeline，通过 CustomScan 卸载 Scan、Filter、表达式、SUM/AVG/COUNT、可spill分组、结果排序与 LIMIT/OFFSET。Q1/Q6 的 SQL 数据算子都在 CSD 执行；PG 负责规划、权限检查及结果 Datum 转换。其余能力按[开发计划](doc/development.md)逐步补齐，尚未支持全部22条 TPC-H。
+当前支持外部行排序/TopN、高基数聚合，以及两表整数等值 INNER Hash Join。Q1/Q6/Q14 由 PG 表达式树生成动态 pipeline，通过 CustomScan 完整卸载；PG 负责规划、权限检查及结果 Datum 转换。其余能力按[开发计划](doc/development.md)逐步补齐，尚未支持全部22条 TPC-H。
 
 ## 执行路径与冷启动
 
@@ -16,7 +16,7 @@ SET pg_sina_csd.exe_path=csd;  -- 卸载支持的查询计划，不支持时保�
 
 `auto` 将在成本模型实现后开放，目前只接受 `host` / `csd`。切换选项会使 prepared plan 缓存失效，下一次执行按新路径重新规划。需要在规划前 LOAD 扩展；也可通过 session_preload_libraries 加载。
 
-当前为支持的单表聚合生成 `SniaCsdAggregate`，为单表 `ORDER BY` 行查询生成 `SniaCsdSort`；后者支持普通外部排序及有界 TopN，结果分批返回，不受256行总量限制。不支持的连接、HAVING、表达式等保留原生计划；当前也不在未支持外层查询的子查询中单独卸载，以避免多个分批source各自持有设备锁。后续再扩展到混合子计划，不会将不支持的算子伪装成设备执行。没有准备映射的表也保留原生路径；已有映射失效时执行报错并要求重新 prepare。可用 EXPLAIN 查看 `SniaCsdAggregate` 及实际 SNIA Pipelines。
+当前为支持的单表聚合和两表连接后标量聚合生成 `SniaCsdAggregate`，为单表 `ORDER BY` 行查询生成 `SniaCsdSort`；后者支持普通外部排序及有界 TopN，结果分批返回，不受256行总量限制。尚未支持的连接形式、HAVING、表达式等保留原生计划；当前也不在未支持外层查询的子查询中单独卸载，以避免多个分批source各自持有设备锁。后续再扩展到混合子计划。没有准备映射的表也保留原生路径；已有映射失效时执行报错并要求重新 prepare。可用 EXPLAIN 查看实际 SNIA Pipelines。
 
 TPC-H测量每条语句之前使用Guest的cold-query.sh：停止PG清空shared buffers，sync并drop_caches，再启动PG（测试期间autovacuum=off）。host和csd同样处理；不是只清除OS缓存。脚本在Guest执行：
 
@@ -40,7 +40,7 @@ TPC-H测量每条语句之前使用Guest的cold-query.sh：停止PG清空shared 
 | src/check.c | Guest 诊断工具，链接 libpq 和 libsnia；提交 LOAD→heap_count，与原生 COUNT 比较 |
 | include/ | Guest 与设备共用的查询计划、列批次、结果及诊断计数布局 |
 | sql/ | 扩展安装 SQL；sina_csd schema 保存准备结果 |
-| tests/ | PG12 页布局、准备测试、SQL 边界用例及 Q1/Q6 |
+| tests/ | PG12 页布局、准备测试、SQL 边界用例及 Q1/Q6/Q14 |
 | doc/ | 分阶段开发记录 |
 | ../../csd-programs/pg_sina_csd/ | 容器编译、FEMU CU 执行的设备算子 |
 
@@ -63,6 +63,10 @@ bash tests/pg-sina-csd-test.sh check
 bash tests/pg-sina-csd-test.sh sql
 # 每条查询分别冷启动：Q1/Q6、NULL/空输入/排序/回退、prepared plan 切换及取消回收
 bash tests/pg-sina-csd-test.sh query
+# Join 重复键、NULL、小内存spill、回退、取消及完整Q14
+bash tests/pg-sina-csd-test.sh join
+# Q14各3轮冷启动，以及独立的profile
+bash tests/pg-sina-csd-test.sh join-bench
 # 开关、逐算子计时、JSON 输出及开启计时后的结果一致性
 bash tests/pg-sina-csd-test.sh profile
 # Q1/Q6各3轮，交替host/csd，每次重新冷启动并核对结果
@@ -141,7 +145,7 @@ PG 在完成事件轮询之间检查取消。SNIA 调用期间暂缓 PG 中断�
 
 PG 查询设备 FDM/CU 容量，通常按4MiB块分配最多4个执行槽；每个槽是一套独立的输入、列批次缓冲及局部聚合状态，容量不足时减少槽数或块大小。每槽配置一个 SERIAL batch，SERIAL只约束该batch内部顺序，四个batch之间并发。PG通过共享的SNIA event取得完成槽，为它更新下一块LBA并立即重新提交；没有每四块一次的轮次等待。槽不固定绑定CU；同槽当前块完成后才复用缓冲处理下一块，没有双缓冲或预取。全部块已分配且在途batch数为零后，才进入Aggregate.source。`EXPLAIN` 的 `CSD Scheduling` 显示 `independent serial batches`。
 
-此处参考本地DuckDB `Pipeline::LaunchScanTasks` 和 `RowGroupCollection::NextParallelScan` 的任务领取方式。所有块由PG backend维护同一个输入游标，不新增任务队列框架；SNIA库线程只执行设备请求，不调用PG接口。块长度相同时不重复向设备写 input_bytes，仅初始化和尾块变化时更新。当前程序索引501–506由整个查询持有 namespace 文件锁，设备查询串行进入；这是单查询性能实验的实现，尚未支持多 PG 会话共享程序目录。
+此处参考本地DuckDB `Pipeline::LaunchScanTasks` 和 `RowGroupCollection::NextParallelScan` 的任务领取方式。所有块由PG backend维护同一个输入游标，不新增任务队列框架；SNIA库线程只执行设备请求，不调用PG接口。块长度相同时不重复向设备写 input_bytes，仅初始化和尾块变化时更新。当前程序索引501–509由整个查询持有 namespace 文件锁，设备查询串行进入；这是单查询性能实验的实现，尚未支持多 PG 会话共享程序目录。
 
 EXPLAIN ANALYZE 会显示投影列数、设备 CU 数、扫描/匹配行数、内部读取量、AFDM 用量及 workmem 峰值。计时包含程序加载、SNIA 编排与回收，不只统计设备计算。具体类型和规模限制见[设备算子说明](../../csd-programs/pg_sina_csd/README.md)。
 
@@ -195,10 +199,11 @@ TPC-H 仍须每条查询先冷启动。将 `SET pg_sina_csd.profile=on;` 和一�
 | 指标 | 含义 |
 | --- | --- |
 | Setup Wall | PG 执行端准备 SNIA 设备、程序、缓冲和首批请求；包含 namespace 锁等待 |
+| Build Wall | 仅Join出现：build表内部LOAD、Scan/Filter及HashJoin.build；最后一个spill批次的完成和载入计入Pipeline 1 |
 | Pipeline 1 Wall | 整个块循环的实际墙钟时间，包含内部 LOAD、SNIA 编排/等待和 Scan/Filter/Aggregate.sink |
 | Pipeline 2 Wall | 收集局部状态、编排与执行 Aggregate.source/Sort/Limit，并读取最终结果 |
 | Cleanup Wall | 读取计时统计，释放 batch、设备状态、AFDM、程序与设备句柄 |
-| Total Wall | 上述四项之和；不包含 PG 规划、静态映射读取及结果 Datum 转换，故不等于整个 SQL Execution Time |
+| Total Wall | 上述阶段之和（Join包含Build Wall）；不包含 PG 规划、静态映射读取及结果 Datum 转换，故不等于整个 SQL Execution Time |
 | 每个算子的 calls | 实际数据算子调用次数，不包含专用于取消/回收的调用 |
 | wall_sum / CPU Sum | 入口到返回的墙钟时间 / 执行该算子的 CU 线程 CPU 时间，跨块及 CU 累计 |
 | wall_max | 最慢的一次算子调用的墙钟时间 |
@@ -251,4 +256,25 @@ bash tests/pg-sina-csd-test.sh query
 bash tests/pg-sina-csd-test.sh aggregate-bench
 ```
 
-`aggregate-bench`使用`tests/high_aggregate.sql`在SF=1 lineitem上筛选1995年数据，按partkey聚合销售额、平均数量和计数，再按销售额取前100；这是算子验证语句，不是新增已经完成的TPC-H查询编号。Join等能力仍按开发计划推进。
+`aggregate-bench`使用`tests/high_aggregate.sql`在SF=1 lineitem上筛选1995年数据，按partkey聚合销售额、平均数量和计数，再按销售额取前100；这是算子验证语句，不是新增已经完成的TPC-H查询编号。
+
+## 两表 Hash Join 与 Q14
+
+当前支持两个已准备且属于同一namespace的heap表、一个整数等值INNER JOIN，以及连接后的标量SUM/AVG/COUNT。重复键产生所有匹配组合，NULL键不匹配。PG按表的原始行数估计选择较小表做build，分别编译两侧所需列和本地过滤条件；没有按查询编号选择算法。多表连接、连接后GROUP BY/行输出、非等值连接和外连接暂时保留原生计划。
+
+```text
+Guest PG编排；以下数据算子在FEMU CU执行：
+build表 LOAD → Scan → Filter（可选）→ HashJoin.build
+每个build批次：
+    HashJoin.load（驻内存时无需I/O；spill批次通过NEED_LOAD载入）
+    probe表 LOAD → Scan → Filter（可选）→ HashJoin.probe → Aggregate.sink
+Aggregate.source → 最终数值表达式 → 结果
+```
+
+HashJoin.build只保存投影后的键和载荷，哈希桶和记录位于workmem。查询预算一半给共享build状态，另一半由probe/聚合执行槽分摊，实际设备池仍是硬上限。build状态放不下时以64KiB块返回NEED_STORE，SNIA执行内部AFDM→NVM；重入后把token保存在设备私有批次描述中。PG只读回批次数，不读取哈希表或中间行。所有probe完成后才能载入下一批，避免并发改写共享哈希表。
+
+每批probe使用最多4个独立执行槽领取输入块，HashJoin.probe生成256行的连接列批次，并直接调用编译进同一`pg-sina-join.so`的聚合函数。该调用不提交嵌套NVMe命令、不额外占用CU；聚合状态与`pg-sina-aggregate.so`的source共用布局。多批build时重扫probe表，聚合状态一直保留到最终source。这个有界实现可处理重复键和倾斜，但没有实现DuckDB的radix分区/动态重分区；小预算下重复扫描会增加内部I/O。批次描述仍驻内存，极多批次可能耗尽元数据预算。
+
+Q14还使用向量化搜索CASE：只计算选中分支，NULL条件进入ELSE；前缀`LIKE 'PROMO%'`直接在Scan中提取为布尔列。当前只支持C/C.UTF-8排序规则下的ASCII常量前缀、末尾一个`%`，同列只能使用一个前缀，不支持通用字符串输出/排序或其他通配符。聚合后的numeric加减乘除在设备上按PG显示精度和舍入规则执行，使用受溢出检查的int128，超出表示范围报错。
+
+开启profile会显示`HashJoin.build`、`HashJoin.load`和`HashJoin.probe+Aggregate`；最后一项包含内部聚合，不能再重复相加为另一个CSF。`EXPLAIN ANALYZE`同时显示Build Rows、Build Batches、Join Rows和spill字节数。Heap Rows/Matched Rows为各轮probe累计数，Internal Read包含build和所有probe轮次。错误或取消先排空probe，再释放聚合/build工作区，最后关闭本查询SNIA设备回收全部临时token。

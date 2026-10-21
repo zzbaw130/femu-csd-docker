@@ -90,13 +90,14 @@ static void rescan(CustomScanState *node)
 }
 static void explain_profile(const struct qs_profile *p,ExplainState *es)
 {
-    static const char *names[]={"Scan","Filter","Aggregate.sink","Aggregate.source","Sort","Limit","Sort.sink","Sort.source"};
+    static const char *names[]={"Scan","Filter","Aggregate.sink","Aggregate.source","Sort","Limit","Sort.sink","Sort.source","HashJoin.build","HashJoin.load","HashJoin.probe+Aggregate"};
     if(es->format==EXPLAIN_FORMAT_TEXT) {
         appendStringInfoSpaces(es->str,es->indent*2);
         appendStringInfoString(es->str,"CSD Profile (operator times summed across CUs):\n"); ++es->indent;
     }
     ExplainOpenGroup("CSD-Profile","CSD Profile",true,es);
     ExplainPropertyFloat("Setup Wall","ms",p->setup_ns/1e6,3,es);
+    if(p->build_ns) ExplainPropertyFloat("Build Wall","ms",p->build_ns/1e6,3,es);
     ExplainPropertyFloat("Pipeline 1 Wall","ms",p->pipeline_ns[0]/1e6,3,es);
     ExplainPropertyFloat("Pipeline 2 Wall","ms",p->pipeline_ns[1]/1e6,3,es);
     ExplainPropertyFloat("Cleanup Wall","ms",p->cleanup_ns/1e6,3,es);
@@ -127,9 +128,17 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     ExplainPropertyText("Execution Path","csd",es);
     ExplainPropertyText("CSD Scheduling","independent serial batches",es);
     if(p->external_aggregate) ExplainPropertyText("CSD Aggregation","adaptive partial-state merge",es);
-    StringInfoData graph; initStringInfo(&graph); appendStringInfoString(&graph,"LOAD -> Scan");
+    StringInfoData graph; initStringInfo(&graph);
+    if(p->join.relid) {
+        ExplainPropertyText("CSD Join","inner integer hash join; build-batch replay",es);
+        appendStringInfoString(&graph,"Build: LOAD -> Scan");
+        if(p->join.predicate>=0) appendStringInfoString(&graph," -> Filter");
+        appendStringInfoString(&graph," -> HashJoin.build; each batch: HashJoin.load; Probe: ");
+    }
+    appendStringInfoString(&graph,"LOAD -> Scan");
     if(p->predicate>=0) appendStringInfoString(&graph," -> Filter");
-    if(p->ordered_rows) appendStringInfoString(&graph," -> Sort.sink; Sort.source (OFFSET/LIMIT)");
+    if(p->join.relid) appendStringInfoString(&graph," -> HashJoin.probe -> Aggregate.sink; Aggregate.source -> Projection");
+    else if(p->ordered_rows) appendStringInfoString(&graph," -> Sort.sink; Sort.source (OFFSET/LIMIT)");
     else if(p->external_aggregate) {
         appendStringInfoString(&graph," -> Aggregate.sink (local hash); Aggregate.source (merge/finalize)");
         if(p->norder) appendStringInfoString(&graph," -> Sort (small result or external sink/source)");
@@ -150,9 +159,14 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
         ExplainPropertyInteger("CSD Heap Rows",NULL,s->result->metrics.scanned,es);
         ExplainPropertyInteger("CSD Matched Rows",NULL,s->result->metrics.matched,es);
         ExplainPropertyInteger("CSD Internal Read","bytes",s->result->metrics.input_bytes,es);
-        ExplainPropertyInteger("CSD Query Memory Limit","bytes",p->work_mem_bytes*s->result->metrics.workers,es);
+        ExplainPropertyInteger("CSD Query Memory Limit","bytes",p->work_mem_bytes*s->result->metrics.workers+p->join.work_mem_bytes,es);
         ExplainPropertyInteger("CSD Workmem Peak","bytes",s->result->metrics.work_peak,es);
-        if(p->ordered_rows || p->external_aggregate) {
+        if(p->join.relid) {
+            ExplainPropertyInteger("CSD Build Rows",NULL,s->result->metrics.build_rows,es);
+            ExplainPropertyInteger("CSD Build Batches",NULL,s->result->metrics.build_batches,es);
+            ExplainPropertyInteger("CSD Join Rows",NULL,s->result->metrics.join_rows,es);
+        }
+        if(p->ordered_rows || p->external_aggregate || p->join.relid) {
             ExplainPropertyInteger("CSD Sort Runs",NULL,s->result->metrics.runs,es);
             ExplainPropertyInteger("CSD Spilled Runs",NULL,s->result->metrics.spilled_runs,es);
             ExplainPropertyInteger("CSD Spill Write","bytes",s->result->metrics.spill_write_bytes,es);

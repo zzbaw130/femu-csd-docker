@@ -13,6 +13,63 @@ run_cold() {
     sed '/^Time:/d' "$log" > "$log.rows"
 }
 case ${1:-query} in
+    join)
+        psql -X -q -v ON_ERROR_STOP=1 -d tpch_s1 -f "$PROJECT/tests/join_setup.sql"
+        while IFS=$'\t' read -r name sql; do
+            [[ -n $name ]] || continue
+            psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
+                -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path=csd" \
+                -c "EXPLAIN (COSTS OFF) $sql" > "$RESULTS/$name.plan"
+            if [[ $name == unsupported_* ]]; then ! grep -q 'Custom Scan (SniaCsd' "$RESULTS/$name.plan";
+            else grep -q 'CSD Join: inner integer hash join' "$RESULTS/$name.plan"; fi
+            run_cold host "$sql" "$RESULTS/$name.host"
+            csd_sql=$sql
+            if [[ $name == join_small_memory ]]; then csd_sql="SET pg_sina_csd.max_memory='4MB'; $sql"; fi
+            run_cold csd "$csd_sql" "$RESULTS/$name.csd"
+            cmp "$RESULTS/$name.host.rows" "$RESULTS/$name.csd.rows"
+            echo "PASS $name: cold exact results and expected join/fallback plan"
+            if [[ $name == join_small_memory ]]; then
+                run_cold csd "SET pg_sina_csd.max_memory='4MB'; SET pg_sina_csd.profile=on; EXPLAIN (ANALYZE,COSTS OFF,TIMING OFF,FORMAT JSON) $sql" "$RESULTS/$name.json"
+                check=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 -c "
+                    WITH doc AS (SELECT pg_read_file('$RESULTS/$name.json.rows')::jsonb->0->'Plan' AS p)
+                    SELECT (p->>'CSD Build Batches')::bigint>1
+                        AND (p->>'CSD Spill Write')::bigint>0 AND (p->>'CSD Spill Read')::bigint>0
+                        AND (p->>'CSD Query Memory Limit')::bigint=4194304
+                        AND (p->>'CSD Workmem Peak')::bigint<=67108864
+                        AND (p->'CSD Profile'->'Scan'->>'Calls')::bigint=(p->>'CSD Chunks')::bigint
+                        AND (p->'CSD Profile'->'HashJoin.load'->>'Calls')::bigint>1
+                        AND (p->'CSD Profile'->'HashJoin.probe+Aggregate'->>'Calls')::bigint>0
+                    FROM doc")
+                [[ $check == t ]]
+                echo 'PASS join spill/load, profiling, 4 MiB query budget and physical pool bound'
+            fi
+        done < "$PROJECT/tests/join_cases.tsv"
+        sql=$(cat "$PROJECT/tests/q14.sql")
+        psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
+            -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path=csd" \
+            -c "EXPLAIN (COSTS OFF) $sql" > "$RESULTS/q14.plan"
+        grep -q 'CSD Join: inner integer hash join' "$RESULTS/q14.plan"
+        run_cold host "$sql" "$RESULTS/q14.host"
+        for memory in 4 64; do
+            run_cold csd "SET pg_sina_csd.max_memory='${memory}MB'; $sql" "$RESULTS/q14.$memory"
+            cmp "$RESULTS/q14.host.rows" "$RESULTS/q14.$memory.rows"
+            echo "PASS full SF=1 Q14 with ${memory} MiB budget"
+        done
+        {
+            printf '\\set ON_ERROR_STOP off\n'
+            printf 'SELECT sum(b.bad) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k;\n'
+            printf 'SELECT sum(p.bad) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k;\n'
+            printf "SET statement_timeout='100ms';\n%s\nSET statement_timeout=0;\n" "$sql"
+            printf '\\set ON_ERROR_STOP on\n'
+            printf 'SELECT count(*) FROM snia_join_build;\nSELECT count(*) FROM snia_join_build;\n'
+        } > "$RESULTS/cleanup.sql"
+        sh "$COLD" csd "$RESULTS/cleanup.sql" > "$RESULTS/cleanup.log" 2>&1
+        [[ $(grep -c 'CSD execution failed' "$RESULTS/cleanup.log") == 2 ]]
+        grep -q 'canceling statement due to statement timeout' "$RESULTS/cleanup.log"
+        [[ $(grep -c '^70003$' "$RESULTS/cleanup.log") == 2 ]]
+        echo 'PASS build/probe errors and cancellation release resources before same-backend reuse'
+        psql -X -q -v ON_ERROR_STOP=1 -d tpch_s1 -c "DELETE FROM sina_csd.relations WHERE relid IN ('snia_join_build'::regclass,'snia_join_probe'::regclass,'snia_join_empty'::regclass); DROP TABLE snia_join_build,snia_join_probe,snia_join_empty"
+        ;;
     query)
         psql -X -q -v ON_ERROR_STOP=1 -d tpch_s1 -f "$PROJECT/tests/query_setup.sql"
         while IFS=$'\t' read -r name sql; do
@@ -208,10 +265,11 @@ case ${1:-query} in
         unset SNIA_FEMU_PROFILE
         pg_ctl -D /data/tpch_s1 -l /data/tpch_s1/log -o '-c autovacuum=off' -w restart >/dev/null
         ;;
-    bench|order-bench|aggregate-bench)
+    bench|order-bench|aggregate-bench|join-bench)
         queries=(q1 q6)
         if [[ $1 == order-bench ]]; then queries=(order_topn order_spill); fi
         if [[ $1 == aggregate-bench ]]; then queries=(high_aggregate); fi
+        if [[ $1 == join-bench ]]; then queries=(q14); fi
         for name in "${queries[@]}"; do
             psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
                 -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path=csd" \
@@ -242,5 +300,5 @@ case ${1:-query} in
             done
         fi
         ;;
-    *) echo 'usage: pg-sina-query-test.sh query|memory|profile|analyze|bench|order-bench|aggregate-bench' >&2; exit 2 ;;
+    *) echo 'usage: pg-sina-query-test.sh query|join|memory|profile|analyze|bench|order-bench|aggregate-bench|join-bench' >&2; exit 2 ;;
 esac

@@ -54,6 +54,12 @@ ENTRY(pg_sina_aggregate_source,QS_AGG_SOURCE,args && args->numr==4)
 ENTRY(pg_sina_sort,QS_SORT,0)
 ENTRY(pg_sina_sort_sink,QS_SORT_SINK,1)
 ENTRY(pg_sina_sort_source,QS_SORT_SOURCE,1)
+#elif defined(PROFILE_JOIN)
+ENTRY(pg_sina_join_build,QS_JOIN_BUILD,1)
+ENTRY(pg_sina_join_load,QS_JOIN_LOAD,1)
+ENTRY(pg_sina_join_probe,QS_JOIN_PROBE,0)
+extern int64_t pg_sina_join_close_impl(struct femu_csd_args *);
+int64_t pg_sina_join_close(struct femu_csd_args *args) { return pg_sina_join_close_impl(args); }
 #elif defined(PROFILE_LIMIT)
 ENTRY(pg_sina_limit,QS_LIMIT,0)
 #endif

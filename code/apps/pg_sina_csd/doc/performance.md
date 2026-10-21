@@ -376,3 +376,34 @@ Guest完整冷启动回归通过：8192组、NULL分组键、多列分组、隐�
 独立profile的新增语句：扫描6001215行，保留914963行，内部读取921624576字节；118个run、89个spill run，写93323264字节（89MiB）、读204865536字节（195.375MiB），workmem池峰值33843360字节。第一pipeline墙钟1702ms，source阶段1403ms；Scan/Filter/聚合sink/source累计CU CPU分别约899/194/1620/740ms，累计CPU不能直接相加为查询墙钟。sink有1644次、source有4551次调用，包含I/O重入。
 
 当前主要限制是局部表固定256组、部分状态排序与单source归并，以及大量重入/LOAD命令。预留的结果排序预算在TopN场景几乎没有使用，使输入排序仅利用约一半容量；后续可考虑在明确生命周期内借用预算，而不是降低全局空闲百分比阈值。极多run元数据仍可能耗尽内存，多轮归并尚未实现。Q1独立profile保持0个run/0次spill，聚合source一次，说明其继续使用小哈希快路径；新状态结构使workmem峰值约1.50MiB。
+
+## 阶段3a：Hash Join、CASE与Q14（2026-10-21）
+
+两表整数INNER Join、搜索CASE、ASCII前缀LIKE和聚合后numeric表达式接入，完整TPC-H覆盖扩展到Q1/Q6/Q14。该阶段没有修改FEMU、SNIA、设备时序参数或原生PG配置。设备仍为4 CU、64MiB AFDM、64MiB共享workmem；查询预算默认64MB，build占一半，其余由probe/聚合槽分摊。build不能驻留时分批spill并重扫probe，没有实现radix分区。
+
+24项设备CTest、19项PG算子ASan/UBSan及Guest完整query/join/profile回归通过。LeakSanitizer因现有执行环境限制关闭，独立设备测试断言workmem零占用及峰值约束。Join回归覆盖重复键、负/NULL键、两侧过滤、无匹配/空输入、4MB预算、原生回退、build/probe错误和取消后的同backend复用；Q14在4/64MB预算下与原生PG结果逐字一致。原有外部排序、高基数聚合、游标关闭和prepared plan切换也通过。
+
+### 冷启动延迟
+
+所有编译、sanitizer和回归结束后单独测量，host/CSD交替各3轮，每次停止PG并清除Guest页缓存后重新启动，profile关闭。均包含程序加载和回收，逐次比较完整输出；PG保留work_mem=4MB和既有并行配置，属于原生配置对照，不是等总内存、等核数测试。
+
+| 查询/路径 | 三轮 ms | 均值 ms | 中位数 ms |
+| --- | --- | ---: | ---: |
+| Q14/host | 2876.199 / 1488.677 / 1834.704 | 2066.527 | 1834.704 |
+| Q14/csd | 609.988 / 649.939 / 648.166 | 636.031 | 648.166 |
+| Q1/host | 4736.216 / 4382.337 / 4512.684 | 4543.746 | 4512.684 |
+| Q1/csd | 864.999 / 832.048 / 887.784 | 861.610 | 864.999 |
+| Q6/host | 1484.863 / 1408.204 / 1404.922 | 1432.663 | 1408.204 |
+| Q6/csd | 573.234 / 596.133 / 584.259 | 584.542 | 584.259 |
+
+Q14均值约3.25倍，但host首轮波动明显；中位数约2.83倍。Q1/Q6保持既有性能范围，不能将不同阶段的小幅波动认定为此处Join改动的收益。未开启的PCIe带宽模型等实验限制仍适用，这些是FEMU环境结果，不代表真实CSD芯片性能。
+
+原始日志：主机`/tmp/pg-snia-join-{guest-regression,old-regression,profile-regression,asan,all-native,bench,q1q6-bench}.log`；Guest正确性目录`/tmp/pg-sina-queries.en88Fb`、`/tmp/pg-sina-queries.WCO84y`、`/tmp/pg-sina-queries.09tGbt`，性能目录`/tmp/pg-sina-queries.PVwKR3`、`/tmp/pg-sina-queries.CqLFEE`。复现入口为`tests/pg-sina-csd-test.sh join|join-bench|bench`。
+
+### 独立profile与spill
+
+Q14的单次冷启动profile保存在主机`/tmp/pg-snia-q14-profile.json`。只有一个CSD CustomScan，build=200000行、1批，probe=6001215行、过滤后75983行，产生75983个连接组合。内部读取955187200字节（build加一轮probe），AFDM45346816字节，workmem池峰值13689712字节，无spill。
+
+执行端墙钟：Setup 68.109ms，Build 58.688ms，probe阶段480.358ms，最终source 0.688ms，Cleanup 6.802ms，总计614.646ms。Scan累计CU CPU 918.827ms，Filter 44.605ms，HashJoin.build/load 14.413/5.671ms，HashJoin.probe+Aggregate 45.475ms。Scan覆盖两表229块，probe相关调用220次。当前主要计算开销仍是heap扫描解码，连接与聚合本身较小；累计CPU不是查询关键路径，不能直接相加解释延迟。
+
+4MB预算的重复键测试使用70003行build、150003行probe，产生1289854个组合。build分3批，probe实际累计扫描450009行，STORE/LOAD各2949120字节；共享池该次峰值2343088字节。数据见`/tmp/pg-snia-join-small-profile.json`。独立设备4MiB池和64MiB池内4MiB预算测试另行严格断言实际峰值不超预算；Guest的池峰值可能包含历史查询，不作为通用的逐查询上限判据。重扫保证当前有界实现的完整语义，后续多表/大build应考虑分区以减少重复内部读取。

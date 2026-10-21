@@ -114,6 +114,51 @@ static void arithmetic(void)
     free(c);
 }
 typedef int64_t (*function)(struct femu_csd_args *);
+static void case_and_division(void)
+{
+    struct qs_plan p={.nattrs=2,.ncols=2,.nexprs=9};
+    p.cols[0]=(struct qs_column){.slot=0,.type=Q_BOOLEAN};
+    p.cols[1]=(struct qs_column){.slot=1,.type=Q_DECIMAL,.scale=2};
+    p.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.column=0,.type=Q_BOOLEAN};
+    p.exprs[1]=(struct qs_expr){.op=Q_COLUMN,.column=1,.type=Q_DECIMAL,.scale=2};
+    p.exprs[2]=(struct qs_expr){.op=Q_CONST,.type=Q_DECIMAL};
+    p.exprs[3]=(struct qs_expr){.op=Q_CASE,.left=0,.right=1,.otherwise=2,.type=Q_DECIMAL,.scale=2};
+    p.exprs[4]=(struct qs_expr){.op=Q_CONST,.constant=INT64_MAX,.type=Q_INTEGER};
+    p.exprs[5]=(struct qs_expr){.op=Q_MUL,.left=4,.right=4,.type=Q_DECIMAL};
+    p.exprs[6]=(struct qs_expr){.op=Q_MUL,.left=5,.right=4,.type=Q_DECIMAL};
+    p.exprs[7]=(struct qs_expr){.op=Q_CONST,.type=Q_BOOLEAN};
+    p.exprs[8]=(struct qs_expr){.op=Q_CASE,.left=7,.right=6,.otherwise=3,.type=Q_DECIMAL,.scale=2};
+    struct qs_chunk *c=calloc(1,qs_chunk_bytes(257,2)); assert(c);
+    c->capacity=c->rows=257; c->ncols=2;
+    for(unsigned i=0;i<c->rows;++i) {
+        qs_values(c)[i]=i%2; qs_values(c)[c->capacity+i]=(int64_t)i*71-10000;
+        qs_dscales(c)[c->capacity+i]=i%3; qs_selection(c)[i]=c->rows-1-i;
+        if(i%5==0) qs_nulls(c)[i/8]|=1U<<(i%8);
+        if(i%7==0) qs_nulls(c)[(c->capacity+7)/8+i/8]|=1U<<(i%8);
+    }
+    struct qs_vector *vectors=calloc(p.nexprs,sizeof(*vectors)); assert(vectors);
+    uint8_t needed[QS_EXPRS]={0}; assert(!qs_vector_require(&p,8,needed));
+    for(unsigned first=0;first<c->rows;first+=QS_VECTOR_ROWS) {
+        unsigned count=c->rows-first; if(count>QS_VECTOR_ROWS) count=QS_VECTOR_ROWS;
+        assert(!qs_vector_execute(&p,c,qs_selection(c),first,count,needed,vectors));
+        for(unsigned i=0;i<count;++i) {
+            struct qs_eval e={.plan=&p,.chunk=c,.row=qs_selection(c)[first+i]}; struct qs_cell want;
+            assert(!qs_evaluate(&e,8,&want)); struct qs_cell got=qs_vector_cell(&p,vectors,8,i);
+            assert(!vectors[8].errors[i] && got.isnull==want.isnull);
+            if(!got.isnull) assert(got.value==want.value && got.scale==want.scale && got.dscale==want.dscale);
+            assert(vectors[6].errors[i]==2); /* Unselected overflowing branch. */
+        }
+    }
+    struct qs_cell out;
+    assert(!qs_divide((struct qs_cell){.value=1},(struct qs_cell){.value=3},&out));
+    assert(out.scale==20 && out.value==(__int128)3333333333333333333LL*10+3);
+    assert(!qs_divide((struct qs_cell){.value=-1},(struct qs_cell){.value=6},&out));
+    assert(out.scale==20 && out.value==-((__int128)1666666666666666666LL*10+7));
+    assert(!qs_divide((struct qs_cell){.value=100},(struct qs_cell){.value=3},&out));
+    assert(out.scale==16 && out.value==333333333333333333LL);
+    assert(qs_divide((struct qs_cell){.value=1},(struct qs_cell){0},&out));
+    free(vectors); free(c);
+}
 static void aggregates(const char *path)
 {
     void *library=dlopen(path,RTLD_NOW|RTLD_LOCAL); assert(library);
@@ -149,6 +194,6 @@ static void aggregates(const char *path)
 }
 int main(int argc,char **argv)
 {
-    assert(argc==2); expressions(); arithmetic(); aggregates(argv[1]);
+    assert(argc==2); expressions(); arithmetic(); case_and_division(); aggregates(argv[1]);
     puts("PASS batch expressions vs scalar, NULL/short-circuit/overflow, selection tails and shared aggregate states"); return 0;
 }

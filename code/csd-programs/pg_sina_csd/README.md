@@ -12,6 +12,10 @@ Aggregate.source（小哈希合并，或外部部分状态归并；按需排序�
 
 LOAD → Scan → Filter（可选）→ Sort.sink
 Sort.source（多路归并、OFFSET/LIMIT，分批输出）
+
+build表 LOAD → Scan → Filter（可选）→ HashJoin.build
+每个build批次：HashJoin.load；probe表 LOAD → Scan → Filter → HashJoin.probe → Aggregate.sink
+Aggregate.source → 最终数值表达式
 ```
 
 第一条流水线按最多4个独立执行槽并行，每槽一个 SERIAL batch；完成的槽立即领取下一块。第二条流水线等待全部输入完成。通常每块4MiB原始heap，同一槽没有下一块预取或双缓冲。
@@ -25,6 +29,10 @@ Sort.source（多路归并、OFFSET/LIMIT，分批输出）
 | sort.c / pg-sina-sort.so | pg_sina_sort_sink：列批次、计划、分支任务、spill I/O AFDM |
 | sort.c / pg-sina-sort.so | pg_sina_sort_source：局部状态句柄组、结果、spill I/O AFDM |
 | limit.c / pg-sina-limit.so | limit：小聚合结果、计划；调整结果范围 |
+| join.c / pg-sina-join.so | pg_sina_join_build：build列批次、完整计划、共享build控制记录、spill I/O AFDM |
+| join.c / pg-sina-join.so | pg_sina_join_load：共享build控制记录、spill I/O AFDM；current由PG指定 |
+| join.c / pg-sina-join.so | pg_sina_join_probe：probe列批次、完整计划、分支聚合任务、共享build控制记录、连接输出列批次 |
+| join.c / pg-sina-join.so | pg_sina_join_close：共享build控制记录；只释放workmem，临时token由本查询deviceClose回收 |
 | heap_count.c / pg-sina-heap-count.so | 诊断：原始页、计数；cparam1为物理列数，cparam2为有效字节 |
 
 `apps/pg_sina_csd/include/query.h` 是本应用的数据布局，不是新的设备协议。参数按表中顺序构造，没有参数解码框架。结果块最多256行，用finished表示source结束；行排序总行数不受这个块容量限制，分组聚合也支持跨块输出，256仅是局部哈希表容量，满表会flush部分状态。
@@ -35,13 +43,15 @@ Aggregate.source 的单MR调用释放私有状态。Sort.source 的单MR调用�
 
 Scan解析PG12/x86-64/8KiB、全visible/frozen的heap，仅提取所需列。列批次包含int64值、NULL位图、numeric显示精度和selection vector；仍须遍历变长属性边界，不减少heap页读取量。
 
-numeric输入必须有限、至多两位小数，可精确表示为int64百分数；支持整数、date、bool、ASCII bpchar(1)，尚无通用varchar/text。规划时已知不支持的能力回退PG；运行时数据超出设备表示范围时报错，不伪装成透明回退。
+numeric输入必须有限、至多两位小数，可精确表示为int64百分数；支持整数、date、bool、ASCII bpchar(1)。varchar/text仅支持Scan将指定ASCII前缀匹配提取为布尔列，尚无通用字符串列输出。规划时已知不支持的能力回退PG；运行时数据超出设备表示范围时报错，不伪装成透明回退。
 
 PG估计过滤后剩余不足一半行时，所需numeric可以延迟解码，包括WHERE使用的列。Scan将原始AFDM中的`{offset, bytes}`暂存在原8字节值槽。简单AND先用SIMD处理已解码列，再按存活行逐个判断其余列，同列相邻上下界共用一次解码；复杂AND/OR只把仍需判断的行传给后续表达式。最终存活行的所有延迟列会在Filter中转换为正常列值，因此下游无需理解原始位置。原始AFDM一直保留到当前槽sink完成。
 
 `query_vector.h` 每批最多256行。列直接引用原列和selection，常量只保存一份，计算结果才写临时列；公共表达式按行缓存，保留NULL三值逻辑、短路和溢出语义。无NULL/错误批次可用AVX2执行比较、加减和int32×int32→int64乘法；加减检查溢出，其余情况回退精确int128。没有浮点近似或JIT。
 
 Aggregate批量计算表达式和分组位置，再按输入列更新；同表达式SUM/AVG/COUNT共享sum/count，无分组COUNT(*)按批增加。AVG在设备上按PG numeric精度和舍入规则完成，Guest只转换最终Datum。小聚合结果Sort只交换行号，最终统一复制；Limit只调整结果范围。
+
+搜索CASE用selection拆分真/假分支，只计算实际选中的行；NULL条件走ELSE，公共表达式仍按行缓存。标量聚合后的numeric加减乘除使用int128，除法遵循PG的显示精度选择和远离零的半舍规则；数值表示范围仍有限，溢出报错。
 
 ## 外部行排序与 TopN
 
@@ -85,3 +95,13 @@ source保留一个正在合并的组及一块部分状态输入。没有SQL排�
 归并读缓存起初保留完整64KiB块，适合连续读取。检测到反复提前丢弃尚未消费完的缓存后，按该上下文的剩余预算和spill run数缩小窗口；每次内部LOAD仍为64KiB，只将当前窗口复制到workmem。这样避免在顺序访问中无条件缩小缓存，也减少交错run在低预算下的反复加载。多轮归并尚未实现，不能保证任意数量run都能驻留元数据。
 
 `tests/aggregate.c`用独立sum/count预期值核对超过32768组的全结果，覆盖多槽、NULL键、显示精度、加权AVG、按聚合结果排序、LIMIT/OFFSET、空输入、跨256行输出、提前关闭和失败scope回收。分别测试4/8/64MiB池与64MiB池内4MiB查询预算；`aggregate-bench`在真实Guest运行独立冷启动host/CSD对照。
+
+## 有界整数 Hash Join
+
+`join.c`实现两个输入的INNER JOIN，完整保留重复键组合，NULL键不匹配。PG选build表并生成两个物理扫描计划；完整计划定义连接后列的位置。Scan只提取各侧需要的列，build记录只保存投影键/载荷及NULL和显示精度。Q14的text前缀已变成布尔列，原始字符串不进入哈希表。哈希桶、记录和批次描述都在workmem；AFDM保存输入输出、计划和控制记录。控制记录只含设备状态句柄、批次序号与统计，不含哈希表本体。
+
+build共用一半查询预算，probe/聚合槽分摊其余预算；设备实际池容量继续限制总分配。build缓冲满时将当前记录按64KiB块NEED_STORE，保存token后复用缓冲。最后一次build后由load完成剩余记录的spill；若全表可驻留则直接建桶，无内部STORE/LOAD。对每个spill批次，load通过NEED_LOAD恢复记录并重建桶，PG随后并行扫描完整probe表；所有probe完成才切换批次，桶在probe期间只读。
+
+probe生成256行连接列批次，调用同一SO内的`aggregate.c`私有sink；仅支持无分组聚合，不产生嵌套spill请求。各槽聚合状态跨build批次保留，最后由普通aggregate source合并并计算最终表达式。该调用不消耗另一个CU，也不向主机返回中间行。profile的`HashJoin.probe+Aggregate`包含两者时间；build/load支持I/O重入，计数AFDM按约定放在最后I/O缓冲之前。
+
+参考DuckDB的build/probe阻塞边界、键/载荷投影和分批列输出；本阶段没有照搬其radix分区。内存不足时重扫probe，可能明显增加内部I/O；极多build批次也可能耗尽驻内存的token元数据，尚不保证任意规模输入。`tests/join.c`以独立按键统计核对重复键、负键、NULL、倾斜、空输入、分批spill和异常清理，分别验证4/64MiB池及64MiB池内4MiB查询预算。

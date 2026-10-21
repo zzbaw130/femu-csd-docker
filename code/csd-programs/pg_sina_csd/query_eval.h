@@ -33,7 +33,8 @@ static inline int qs_compare(struct qs_cell a, struct qs_cell b, int *result)
     *result=cmp*(a.value<0?-1:1); return 0;
 }
 
-struct qs_eval { const struct qs_plan *plan; struct qs_chunk *chunk; unsigned row; uint8_t valid[QS_EXPRS]; struct qs_cell cells[QS_EXPRS]; };
+static inline int qs_divide(struct qs_cell,struct qs_cell,struct qs_cell *);
+struct qs_eval { const struct qs_plan *plan; struct qs_chunk *chunk; unsigned row; uint8_t valid[QS_EXPRS]; struct qs_cell cells[QS_EXPRS]; const struct qs_cell *aggregates; };
 static inline int qs_evaluate(struct qs_eval *e, int index, struct qs_cell *out)
 {
     if(index<0 || (unsigned)index>=e->plan->nexprs) return -1;
@@ -41,6 +42,10 @@ static inline int qs_evaluate(struct qs_eval *e, int index, struct qs_cell *out)
     const struct qs_expr *x=&e->plan->exprs[index];
     struct qs_cell v={.scale=x->scale,.dscale=x->dscale},a={0},b={0};
     if(x->op==Q_CONST) { v.value=x->constant; v.isnull=x->isnull; }
+    else if(x->op==Q_AGGREF) {
+        if(!e->aggregates || x->column<0 || (unsigned)x->column>=e->plan->naggs) return -1;
+        v=e->aggregates[x->column];
+    }
     else if(x->op==Q_COLUMN) {
         int slot=e->plan->cols[x->column].slot;
         if(slot<0 || (unsigned)slot>=e->chunk->ncols) return -1;
@@ -49,6 +54,12 @@ static inline int qs_evaluate(struct qs_eval *e, int index, struct qs_cell *out)
         v.isnull=(qs_nulls(e->chunk)[(size_t)slot*((e->chunk->capacity+7)/8)+e->row/8]>>(e->row%8))&1;
     } else {
         if(qs_evaluate(e,x->left,&a)) return -1;
+        if(x->op==Q_CASE) {
+            if(qs_evaluate(e,!a.isnull && a.value?x->right:x->otherwise,&v)) return -1;
+            if(!v.isnull && (v.scale>x->scale || qs_scale(v.value,x->scale-v.scale,&v.value))) return -1;
+            v.scale=x->scale;
+            e->valid[index]=1; e->cells[index]=v; *out=v; return 0;
+        }
         if(x->op==Q_AND && !a.isnull && !a.value) { *out=a; return 0; }
         if(x->op==Q_OR && !a.isnull && a.value) { *out=a; return 0; }
         if(x->op==Q_NOT) { v=a; v.value=!a.value; }
@@ -63,12 +74,16 @@ static inline int qs_evaluate(struct qs_eval *e, int index, struct qs_cell *out)
             } else if(!v.isnull) {
                 if(x->op==Q_MUL) {
                     if(__builtin_mul_overflow(a.value,b.value,&v.value)) return -1;
+                    v.scale=a.scale+b.scale;
                     v.dscale=a.dscale+b.dscale;
                 } else if(x->op==Q_ADD || x->op==Q_SUB) {
+                    v.scale=a.scale>b.scale?a.scale:b.scale;
                     __int128 left,right;
                     if(qs_scale(a.value,v.scale-a.scale,&left)||qs_scale(b.value,v.scale-b.scale,&right)) return -1;
                     if(x->op==Q_ADD ? __builtin_add_overflow(left,right,&v.value) : __builtin_sub_overflow(left,right,&v.value)) return -1;
                     v.dscale=a.dscale>b.dscale?a.dscale:b.dscale;
+                } else if(x->op==Q_DIV) {
+                    if(qs_divide(a,b,&v)) return -1;
                 } else {
                     int cmp; if(qs_compare(a,b,&cmp)) return -1;
                     switch(x->op) {
@@ -115,6 +130,31 @@ static inline int qs_average(struct qs_cell sum, uint64_t count, struct qs_cell 
     __int128 quotient=numerator/divisor,remainder=numerator%divisor;
     unsigned __int128 abs_remainder=remainder<0?0-(unsigned __int128)remainder:(unsigned __int128)remainder;
     if(abs_remainder>=(unsigned __int128)(divisor/2+divisor%2)) quotient+=numerator<0?-1:1;
+    *out=(struct qs_cell){.value=quotient,.scale=scale,.dscale=scale}; return 0;
+}
+/* Same select_div_scale/half-away-from-zero rule as PG numeric division. */
+static inline int qs_divide(struct qs_cell a,struct qs_cell b,struct qs_cell *out)
+{
+    if(!b.value) return -1;
+    unsigned __int128 av=a.value<0?0-(unsigned __int128)a.value:(unsigned __int128)a.value;
+    unsigned __int128 bv=b.value<0?0-(unsigned __int128)b.value:(unsigned __int128)b.value;
+    int w1,w2; unsigned d1,d2;
+    qs_leading(av,a.scale,&w1,&d1); qs_leading(bv,b.scale,&w2,&d2);
+    int scale=16-(w1-w2-(d1<=d2))*4;
+    if(scale<a.dscale) scale=a.dscale;
+    if(scale<b.dscale) scale=b.dscale;
+    if(scale<0) scale=0;
+    if(scale>30) return -1;
+    int shift=scale+(int)b.scale-(int)a.scale;
+    __int128 numerator=a.value,divisor=b.value;
+    if(shift>=0) { if(qs_scale(numerator,shift,&numerator)) return -1; }
+    else if(qs_scale(divisor,-shift,&divisor)) return -1;
+    if(divisor<0 && (__builtin_sub_overflow((__int128)0,divisor,&divisor) ||
+        __builtin_sub_overflow((__int128)0,numerator,&numerator))) return -1;
+    __int128 quotient=numerator/divisor,remainder=numerator%divisor;
+    unsigned __int128 rem=remainder<0?0-(unsigned __int128)remainder:(unsigned __int128)remainder;
+    if(rem>=(unsigned __int128)(divisor/2+divisor%2) &&
+        __builtin_add_overflow(quotient,(__int128)(numerator<0?-1:1),&quotient)) return -1;
     *out=(struct qs_cell){.value=quotient,.scale=scale,.dscale=scale}; return 0;
 }
 #endif

@@ -1,0 +1,13 @@
+join_duplicates	SELECT count(*),count(p.price),sum(p.price),avg(p.price),sum(b.amount) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k;
+join_case	SELECT 100.00*sum(CASE WHEN b.flag LIKE 'PROMO%' THEN p.price*(1-p.discount) ELSE 0 END)/sum(p.price*(1-p.discount)) FROM snia_join_probe p,snia_join_build b WHERE p.k=b.k AND p.d>=date '1995-09-01' AND p.d<date '1995-10-01';
+join_filtered	SELECT count(*),sum(p.price*b.amount),avg(b.amount) FROM snia_join_build b JOIN snia_join_probe p ON p.k=b.k WHERE b.flag LIKE 'PROMO%' AND b.amount>10 AND p.price>500;
+join_small_memory	SELECT count(*),count(p.price),sum(p.price),avg(p.price),sum(b.amount) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k;
+join_empty_build	SELECT count(*),sum(p.price),avg(p.price) FROM snia_join_probe p JOIN snia_join_empty b ON p.k=b.k;
+join_no_match	SELECT count(*),sum(p.price),avg(p.price) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k WHERE p.k>100000;
+join_empty_filter	SELECT count(*),sum(p.price) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k WHERE b.amount>10000;
+unsupported_outer	SELECT count(*) FROM snia_join_probe p LEFT JOIN snia_join_build b ON p.k=b.k;
+unsupported_extra_condition	SELECT count(*) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k AND p.price>b.amount;
+unsupported_group_join	SELECT p.k,count(*) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k GROUP BY p.k ORDER BY p.k;
+unsupported_string_join	SELECT count(*) FROM snia_join_build a JOIN snia_join_empty b ON a.flag=b.flag;
+unsupported_like	SELECT sum(CASE WHEN b.flag LIKE 'PR_MO%' THEN p.price ELSE 0 END) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k;
+unsupported_prefixes	SELECT sum(CASE WHEN b.flag LIKE 'PROMO%' THEN p.price ELSE 0 END),sum(CASE WHEN b.flag LIKE 'STAND%' THEN p.price ELSE 0 END) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k;
