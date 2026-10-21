@@ -124,7 +124,9 @@ Guest PG：调用 SNIA SERIAL batch → Aggregate.source → Sort → Limit
 Guest PG：接收少量最终结果 → 转换 Datum → 返回客户端
 ```
 
-箭头中的 Scan/Filter/Aggregate/Sort/Limit 是设备 SO，运行在 FEMU CU；PG backend 仅编排请求，不扫描 heap、不计算聚合、不排序。原始 heap 通过 NVM→AFDM 内部路径读取，不经过 Guest 应用缓冲。列批次保留在 AFDM，哈希表等私有状态放在受限 workmem。借鉴 DuckDB 的所需列投影、selection vector、局部聚合后合并及公共子表达式复用；Filter 的复合 AND 比较条件已使用类型化列循环，支持 AVX2 时一次比较4个 int64；其他表达式和聚合求值目前仍是标量循环。
+箭头中的 Scan/Filter/Aggregate/Sort/Limit 是设备 SO，运行在 FEMU CU；PG backend 仅编排请求，不扫描 heap、不计算聚合、不排序。原始 heap 通过 NVM→AFDM 内部路径读取，不经过 Guest 应用缓冲。列批次保留在 AFDM，哈希表等私有状态放在受限 workmem。借鉴 DuckDB 的所需列投影、selection vector、局部聚合后合并及公共子表达式复用；Filter 的列/常量比较（单条件或复合 AND）使用类型化列循环，支持 AVX2 时一次比较4个 int64。复杂过滤和聚合共用 `query_vector.h`：按每批256行、每个表达式处理列向量，复用公共子表达式；不再逐行递归解释。NULL、小数显示精度及溢出语义保持不变。向量化表示按批次执行；精确 int128 算术仍使用标量整数指令，未改成浮点数。
+
+聚合先批量计算表达式和分组位置，再按聚合输入列更新状态；同一表达式的 SUM、AVG、COUNT 共用一份 sum/count，最终按各输出类型分别计算。无分组 COUNT(*) 按批次累加。表达式临时列通过 workmem 分配并复用，未把私有计算空间移入 AFDM。Scan 为常见 numeric 增加直接整数解码，其他格式仍走通用路径；小结果 Sort 排序行号后统一重排，Limit 仅调整结果范围。
 
 PG 估计过滤后保留的行数少于全表一半时，仅供过滤后分组或聚合使用的 numeric 列采用延迟解码：Scan 在列值槽中暂存原始 AFDM 数据的偏移和长度；Filter 先生成 selection vector，再只为通过的行转换这些 numeric。WHERE 表达式使用的列始终提前解码。Q6 因此只为匹配行转换 extendedprice；Q1 保留绝大多数行，仍采用提前解码。`EXPLAIN` 的 `CSD Deferred Columns` 显示延迟解码列数。这是当前的简单性能启发式；统计估计失准会影响收益，不影响结果。
 
@@ -134,7 +136,7 @@ PG 扩展直接链接 `libsnia`，在当前 backend 中调用 SNIA；没有查�
 
 取消在 batch 边界处理：SNIA 调用期间暂缓 PG 中断抛出，避免从 C++ 调用或批次线程中直接 longjmp；观察到取消后先释放设备状态、AFDM、batch 和程序，再由 PG 报告原始中断。错误路径执行同样的资源回收。
 
-PG 查询设备 FDM/CU 容量，通常按4MiB块和最多4个 CU 分配独立分支；容量不足会减少分支或块大小。当前程序索引501–506由整个查询持有 namespace 文件锁，设备查询串行进入；这是单查询性能实验的实现，尚未支持多 PG 会话共享程序目录。
+PG 查询设备 FDM/CU 容量，通常按4MiB块和最多4个 CU 分配独立分支；容量不足会减少分支或块大小。四分支同轮提交并等待全部完成，再复用原缓冲提交下一轮。同轮不同分支的LOAD与计算可交错；本轮未增加下一块预取或跨轮异步推进。块长度相同时不重复向设备写 input_bytes，仅初始化和尾块变化时更新。当前程序索引501–506由整个查询持有 namespace 文件锁，设备查询串行进入；这是单查询性能实验的实现，尚未支持多 PG 会话共享程序目录。
 
 EXPLAIN ANALYZE 会显示投影列数、设备 CU 数、扫描/匹配行数、内部读取量、AFDM 用量及 workmem 峰值。计时包含程序加载、SNIA 编排与回收，不只统计设备计算。具体类型和规模限制见[设备算子说明](../../csd-programs/pg_sina_csd/README.md)。
 

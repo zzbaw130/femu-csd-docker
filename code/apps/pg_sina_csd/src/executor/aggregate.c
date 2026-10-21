@@ -65,6 +65,8 @@ static TupleTableSlot *execute(CustomScanState *node)
         }
     }
     ExecStoreVirtualTuple(slot);
+    /* Non-identity projections (e.g. duplicate output columns) read this slot. */
+    node->ss.ps.ps_ExprContext->ecxt_scantuple=slot;
     return node->ss.ps.ps_ProjInfo?ExecProject(node->ss.ps.ps_ProjInfo):slot;
 }
 static void end(CustomScanState *node) {}

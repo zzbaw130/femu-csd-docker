@@ -49,10 +49,20 @@ endif()
 
 if(BUILD_TESTING)
     add_executable(pg-sina-scan-test tests/scan.c)
-    target_include_directories(pg-sina-scan-test PRIVATE "${CSD_FEMU_INCLUDE}"
+    target_include_directories(pg-sina-scan-test PRIVATE "${CSD_FEMU_INCLUDE}" "${CMAKE_CURRENT_SOURCE_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
     target_compile_options(pg-sina-scan-test PRIVATE -UNDEBUG)
     target_link_libraries(pg-sina-scan-test PRIVATE ${CMAKE_DL_LIBS})
     add_dependencies(pg-sina-scan-test pg-sina-scan pg-sina-filter)
     add_test(NAME pgSinaLateDecoding COMMAND pg-sina-scan-test $<TARGET_FILE:pg-sina-scan> $<TARGET_FILE:pg-sina-filter>)
+endif()
+
+if(BUILD_TESTING)
+    add_executable(pg-sina-vector-test tests/vector.c)
+    target_include_directories(pg-sina-vector-test PRIVATE "${CSD_FEMU_INCLUDE}" "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
+    target_compile_options(pg-sina-vector-test PRIVATE -UNDEBUG)
+    target_link_libraries(pg-sina-vector-test PRIVATE cs-workmem ${CMAKE_DL_LIBS})
+    add_dependencies(pg-sina-vector-test pg-sina-aggregate)
+    add_test(NAME pgSinaBatchExpressions COMMAND pg-sina-vector-test $<TARGET_FILE:pg-sina-aggregate>)
 endif()

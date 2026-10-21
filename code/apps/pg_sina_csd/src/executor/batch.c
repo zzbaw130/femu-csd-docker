@@ -76,7 +76,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     CsProperties *caps=NULL,*fdm=NULL;
     CsBatchRequest *load=NULL,*compute=NULL;
     struct qs_group group={0}; int group_ready=0,lock_fd=-1;
-    unsigned workers=0,chunk=QS_CHUNK;
+    unsigned workers=0,chunk=QS_CHUNK,previous_bytes[QS_WORKERS]={0};
     struct program programs[FUNCTIONS]={
         [SCAN]={.file="pg-sina-scan.so",.symbol="pg_sina_scan",.index=501},
         [FILTER]={.file="pg-sina-filter.so",.symbol="pg_sina_filter",.index=502},
@@ -142,7 +142,10 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
             }
             ++active;
             unsigned bytes=request->bytes-cursor<chunk?request->bytes-cursor:chunk;
-            TRY(copy(tasks[i],offsetof(struct qs_task,input_bytes),&bytes,sizeof(bytes),1));
+            if(bytes!=previous_bytes[i]) {
+                TRY(copy(tasks[i],offsetof(struct qs_task,input_bytes),&bytes,sizeof(bytes),1));
+                previous_bytes[i]=bytes;
+            }
             if(bytes) {
                 memset(load,0,sizeof(*load)); load->ReqType=CS_STORAGE_IO;
                 load->u.StorageIo=(CsStorageRequest){.Mode=CS_STORAGE_BLOCK_IO,.DevHandle=device,

@@ -16,13 +16,13 @@ static int compare(const struct qs_row *a,const struct qs_row *b,const struct qs
     }
     return 0;
 }
-static void sift(struct qs_row *rows,unsigned n,unsigned root,const struct qs_plan *p)
+static void sift(const struct qs_row *rows,uint16_t *order,unsigned n,unsigned root,const struct qs_plan *p)
 {
     for(;;) {
         unsigned child=root*2+1; if(child>=n) break;
-        if(child+1<n && compare(&rows[child],&rows[child+1],p)<0) ++child;
-        if(compare(&rows[root],&rows[child],p)>=0) break;
-        struct qs_row temp=rows[root]; rows[root]=rows[child]; rows[child]=temp; root=child;
+        if(child+1<n && compare(&rows[order[child]],&rows[order[child+1]],p)<0) ++child;
+        if(compare(&rows[order[root]],&rows[order[child]],p)>=0) break;
+        uint16_t temp=order[root]; order[root]=order[child]; order[child]=temp; root=child;
     }
 }
 int64_t pg_sina_sort(struct femu_csd_args *a)
@@ -32,12 +32,14 @@ int64_t pg_sina_sort(struct femu_csd_args *a)
     if(out->rows>QS_GROUPS || p->norder>QS_OUT) return -1;
     if(out->rows<2) return 0;
     cs_work_context *ctx=cs_work_begin(); if(!ctx) return -4;
-    struct qs_row *rows=cs_work_alloc(ctx,out->rows*sizeof(*rows));
+    struct qs_row *rows=cs_work_alloc(ctx,out->rows*(sizeof(*rows)+sizeof(uint16_t)));
     if(!rows) { cs_work_end(ctx); return -4; }
-    memcpy(rows,out->data,out->rows*sizeof(*rows));
-    for(unsigned i=out->rows/2;i>0;--i) sift(rows,out->rows,i-1,p);
+    uint16_t *order=(void *)(rows+out->rows);
+    for(unsigned i=0;i<out->rows;++i) order[i]=i;
+    for(unsigned i=out->rows/2;i>0;--i) sift(out->data,order,out->rows,i-1,p);
     for(unsigned n=out->rows;n>1;--n) {
-        struct qs_row temp=rows[0]; rows[0]=rows[n-1]; rows[n-1]=temp; sift(rows,n-1,0,p);
+        uint16_t temp=order[0]; order[0]=order[n-1]; order[n-1]=temp; sift(out->data,order,n-1,0,p);
     }
+    for(unsigned i=0;i<out->rows;++i) rows[i]=out->data[order[i]];
     memcpy(out->data,rows,out->rows*sizeof(*rows)); cs_work_end(ctx); return 0;
 }

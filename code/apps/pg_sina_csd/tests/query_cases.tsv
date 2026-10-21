@@ -13,3 +13,6 @@ late_numeric	SELECT sum(a),avg(a),sum(a*(1-b)),count(a),count(*) FROM snia_query
 late_group_key	SELECT a,sum(b),count(*) FROM snia_query_fixture WHERE d<date '1994-01-01' GROUP BY a ORDER BY a;
 late_empty	SELECT sum(a),avg(a),count(a),count(*) FROM snia_query_fixture WHERE d<date '1990-01-01';
 late_fallback	SELECT sum(a),avg(a),count(a),count(*) FROM snia_query_fixture WHERE d<date '1994-01-01' OR d IS NULL;
+vector_filter	SELECT sum(a),avg(a),count(a),count(*) FROM snia_query_fixture WHERE (a*(1-b)>1 AND d>=date '1994-01-01') OR a IS NULL;
+vector_boolean_count	SELECT count(a>0),count(a*(1-b)>0),count(NOT (a>0)),count(a),sum(a),avg(a) FROM snia_query_fixture;
+vector_shared_constant	SELECT count(1.00),sum(1.00),avg(1.00),count(*),count(*) FROM snia_query_fixture WHERE d>=date '1994-01-01';

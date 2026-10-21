@@ -1,5 +1,6 @@
 #include "femu-csd-kernel.h"
-#include "query_eval.h"
+#include "query_vector.h"
+#include "cs_workmem.h"
 #include "heap_numeric.h"
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
@@ -90,19 +91,28 @@ int64_t pg_sina_filter(struct femu_csd_args *a)
         c->ncols!=p->ncols || c->rows>c->capacity || p->nattrs>QS_COLS || p->nexprs>QS_EXPRS) return -1;
     c->selected=0;
     struct comparison predicates[QS_EXPRS]; unsigned count=0;
-    /* For a lone predicate the existing pipeline currently has better query
-     * latency (Q1 A/B), despite a faster comparison loop. Keep that path until
-     * submission/wait scheduling is addressed; accelerate conjunctions only. */
-    if(comparisons(p,c,p->predicate,predicates,&count) && count>1) {
+    if(comparisons(p,c,p->predicate,predicates,&count) && count) {
 #if defined(__x86_64__) || defined(__i386__)
         if(__builtin_cpu_supports("avx2")) select_avx2(c,predicates,count);
         else
 #endif
             select_scalar(c,predicates,count,0);
-    } else for(unsigned row=0;row<c->rows;++row) {
-        struct qs_eval e; e.plan=p; e.chunk=c; e.row=row; memset(e.valid,0,p->nexprs); struct qs_cell value;
-        if(qs_evaluate(&e,p->predicate,&value)) return -2;
-        if(!value.isnull && value.value) qs_selection(c)[c->selected++]=row;
+    } else {
+        uint8_t needed[QS_EXPRS]={0};
+        if(qs_vector_require(p,p->predicate,needed)) return -2;
+        cs_work_context *context=cs_work_begin(); if(!context) return -4;
+        struct qs_vector *vectors=cs_work_alloc(context,(p->predicate+1)*sizeof(*vectors));
+        if(!vectors) { cs_work_end(context); return -4; }
+        for(unsigned first=0;first<c->rows;first+=QS_VECTOR_ROWS) {
+            unsigned n=c->rows-first; if(n>QS_VECTOR_ROWS) n=QS_VECTOR_ROWS;
+            if(qs_vector_execute(p,c,NULL,first,n,needed,vectors)) { cs_work_end(context); return -2; }
+            const struct qs_vector *result=&vectors[p->predicate];
+            for(unsigned i=0;i<n;++i) {
+                if(result->errors[i]) { cs_work_end(context); return -2; }
+                if(!result->nulls[i] && result->values[i]) qs_selection(c)[c->selected++]=first+i;
+            }
+        }
+        cs_work_end(context);
     }
     /* The raw LOAD buffer stays in AFDM until Aggregate.sink finishes.
      * Decode aggregate-only numerics here to avoid an extra CSF command. */

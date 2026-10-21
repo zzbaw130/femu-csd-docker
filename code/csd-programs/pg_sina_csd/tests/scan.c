@@ -2,6 +2,7 @@
  * values which cannot be decoded by the device's finite numeric profile. */
 #include "femu-csd-kernel.h"
 #include "query.h"
+#include "heap_numeric.h"
 #include <assert.h>
 #include <dlfcn.h>
 #include <stdio.h>
@@ -74,8 +75,29 @@ static void compare(function scan,function filter,struct qs_plan *p,struct qs_ch
         }
     }
 }
+static void numeric_formats(void)
+{
+    const uint16_t payloads[][5]={
+        {0x8100}, {0x8100,12,3400}, {0xa100,12,3400}, {0x817f,1200},
+        {0x8101,12,34,5600}, {0xa101,12,34,5600},
+        {2,0,12,3400}, {0x8102,1,2,3,4000}
+    };
+    const unsigned sizes[]={2,6,6,4,8,8,8,10};
+    const int64_t expected[]={0,1234,-1234,12,12003456,-12003456,1234,10002000340LL};
+    for(unsigned i=0;i<sizeof(sizes)/sizeof(*sizes);++i) {
+        int64_t value; unsigned scale;
+        assert(!qs_numeric_cents((const unsigned char *)payloads[i],sizes[i],&value,&scale));
+        assert(value==expected[i] && scale==2);
+    }
+    const uint16_t invalid[][4]={{0x8101,12,34,1},{0x8101,12,10000,0},{0x8181,12,34,0},{0x8104,9999}};
+    for(unsigned i=0;i<4;++i) {
+        int64_t value; unsigned scale;
+        assert(qs_numeric_cents((const unsigned char *)invalid[i],i==3?4:8,&value,&scale)<0);
+    }
+}
 int main(int argc,char **argv)
 {
+    numeric_formats();
     assert(argc==3);
     void *scan_so=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL),*filter_so=dlopen(argv[2],RTLD_NOW|RTLD_LOCAL);
     assert(scan_so && filter_so);

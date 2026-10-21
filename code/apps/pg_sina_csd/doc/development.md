@@ -131,3 +131,13 @@ Guest PG 在规划过滤表达式时先确定其所需列，再分配分组/聚�
 CSD Scan 在原有列值槽中暂存 numeric 在原始AFDM块中的偏移和长度，CSD Filter 完成选择向量后只转换保留行，并恢复正常列值/显示精度。Guest 为 Filter 增加原始输入AFDM参数；同一块数据保留到sink完成，批次图与NVMe命令数量不变，AFDM分配不变，FEMU/SNIA无需修改。`heap_numeric.h` 共享原有数值解码实现。Filter计时现在包含补解码，应比较Scan+Filter合计CPU。
 
 新增设备差分用例覆盖真实heap布局、两种numeric头、NULL/精度、跨页与批次复用、复合条件及复杂表达式回退；被过滤的不支持数值不会被转换，选中后仍报错。Guest新增延迟聚合、numeric分组键、空结果和OR/NULL过滤的冷启动对照，均与原生PG完全一致；Q1/Q6全结果、取消后同backend重复查询及设备复用通过。10项设备CTest、5项PG设备ASan/UBSan检查通过。性能数据记录于[性能分析](performance.md)。
+
+## 阶段1优化：共用向量表达式与基础算子
+
+PG规划与动态batch的结构保持不变；本阶段不修改FEMU/SNIA调度，不增加读算重叠或可重入协议。当前每轮HYBRID batch有最多4条 `LOAD → Scan → Filter → Aggregate.sink` 分支，四分支结束后PG才复用缓冲并提交下一轮；SF=1为220块、通常55轮。全部输入结束后提交SERIAL `Aggregate.source → Sort（可选）→ Limit（可选）`。CU不固定绑定分支，四份聚合状态跨轮保留。
+
+CSD Filter和Aggregate共用 `query_vector.h`，按256行处理一个表达式，替代逐行递归；保留精确整数、NULL、小数显示精度及每行AND/OR短路错误语义。简单单条件和复合AND比较使用AVX2；复杂过滤使用通用向量表达式。表达式临时列通过workmem分配，聚合跨块复用。SUM/AVG/COUNT同表达式共享累加状态，无分组COUNT(*)按批累加；source按输出类型分别完成计算。
+
+Scan为常见numeric增加直接整数转换；Sort交换行号后统一重排；Limit保持仅调整范围。Guest的块长度相同时不再重复写input_bytes，220块由220次降为4份初始化加1份尾块更新（按代码路径计数）。没有改变NVM读取量、4 CU数量或AFDM缓冲分配。
+
+新增差分测试覆盖完整表达式集合、NULL、短路溢出、选择向量和尾部；新增SQL覆盖计算型过滤、布尔COUNT、SUM/AVG/COUNT共享及重复输出。重复输出用例暴露CustomScan未设置 `ecxt_scantuple` 的既有问题，已在投影前设置当前结果槽，避免PG在非直接投影时异常退出。完整冷启动结果、取消回收、计时开关、11项设备CTest和6项PG设备ASan/UBSan验证通过；性能详见[性能分析](performance.md)。

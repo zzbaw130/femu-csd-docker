@@ -1,10 +1,12 @@
 /* Per-CU workmem hash aggregation, then device merge and exact finalization. */
 #include "femu-csd-kernel.h"
 #include "cs_workmem.h"
-#include "query_eval.h"
+#include "query_vector.h"
 struct accumulator { __int128 sum; uint64_t count; uint8_t dscale; };
 struct group { struct qs_cell keys[QS_KEYS]; struct accumulator aggs[QS_AGGS]; };
 struct state { cs_work_context *context; struct qs_plan plan; struct qs_metrics metrics;
+    struct qs_vector *vectors;
+    uint8_t needed[QS_EXPRS], accumulator[QS_AGGS], sum_required[QS_AGGS];
     unsigned count; uint16_t buckets[1024]; struct group groups[QS_GROUPS]; };
 static struct group *get_group(struct state *s,struct qs_cell *keys)
 {
@@ -33,24 +35,62 @@ int64_t pg_sina_aggregate_sink(struct femu_csd_args *a)
     if(!s) {
         cs_work_context *context=cs_work_begin(); if(!context) return -4;
         s=cs_work_calloc(context,1,sizeof(*s)); if(!s) { cs_work_end(context); return -4; }
-        s->context=context; s->plan=*p; task->state=(uintptr_t)s;
+        s->context=context; s->plan=*p;
+        if(p->nexprs) s->vectors=cs_work_alloc(context,p->nexprs*sizeof(*s->vectors));
+        if(p->nexprs && !s->vectors) { cs_work_end(context); return -4; }
+        for(unsigned k=0;k<p->nkeys;++k)
+            if(qs_vector_require(p,p->keys[k],s->needed)) { cs_work_end(context); return -5; }
+        for(unsigned j=0;j<p->naggs;++j) {
+            const struct qs_agg *agg=&p->aggs[j]; unsigned shared=0;
+            if(agg->kind!=Q_COUNT_STAR && qs_vector_require(p,agg->expr,s->needed)) { cs_work_end(context); return -5; }
+            for(;shared<j;++shared)
+                if(p->aggs[shared].expr==agg->expr &&
+                   (p->aggs[shared].kind==Q_COUNT_STAR)==(agg->kind==Q_COUNT_STAR)) break;
+            s->accumulator[j]=shared<j?s->accumulator[shared]:j;
+            if(agg->kind==Q_SUM || agg->kind==Q_AVG) s->sum_required[s->accumulator[j]]=1;
+        }
+        task->state=(uintptr_t)s;
         if(!p->nkeys) { struct qs_cell keys[QS_KEYS]={{0}}; get_group(s,keys); }
     }
     s->metrics.scanned+=c->rows; s->metrics.matched+=c->selected;
     s->metrics.input_bytes+=task->input_bytes; ++s->metrics.chunks;
-    for(unsigned i=0;i<c->selected;++i) {
-        unsigned row=qs_selection(c)[i]; if(row>=c->rows) return -1;
-        struct qs_eval e; e.plan=p; e.chunk=c; e.row=row; memset(e.valid,0,p->nexprs); struct qs_cell keys[QS_KEYS];
-        for(unsigned k=0;k<p->nkeys;++k) if(qs_evaluate(&e,p->keys[k],&keys[k])) return -5;
-        struct group *g=get_group(s,keys); if(!g) return -6;
+    for(unsigned first=0;first<c->selected;first+=QS_VECTOR_ROWS) {
+        unsigned count=c->selected-first; if(count>QS_VECTOR_ROWS) count=QS_VECTOR_ROWS;
+        if(qs_vector_execute(p,c,qs_selection(c),first,count,s->needed,s->vectors)) return -5;
+        struct group *groups[QS_VECTOR_ROWS];
+        for(unsigned i=0;i<count;++i) {
+            if(!p->nkeys) { groups[i]=&s->groups[0]; continue; }
+            struct qs_cell keys[QS_KEYS];
+            for(unsigned k=0;k<p->nkeys;++k) {
+                if(s->vectors[p->keys[k]].errors[i]) return -5;
+                keys[k]=qs_vector_cell(p,s->vectors,p->keys[k],i);
+            }
+            groups[i]=get_group(s,keys); if(!groups[i]) return -6;
+        }
+        /* One update per distinct input expression: SUM/AVG/COUNT(expr) share
+         * its accumulator, and each output is finalized independently. */
         for(unsigned j=0;j<p->naggs;++j) {
-            const struct qs_agg *agg=&p->aggs[j]; struct qs_cell value={0};
-            if(agg->kind!=Q_COUNT_STAR && qs_evaluate(&e,agg->expr,&value)) return -5;
-            if(value.isnull) continue;
-            struct accumulator *v=&g->aggs[j]; ++v->count;
-            if(agg->kind==Q_SUM || agg->kind==Q_AVG) {
-                if(__builtin_add_overflow(v->sum,value.value,&v->sum)) return -5;
-                if(value.dscale>v->dscale) v->dscale=value.dscale;
+            if(s->accumulator[j]!=j) continue;
+            const struct qs_agg *agg=&p->aggs[j];
+            if(agg->kind==Q_COUNT_STAR) {
+                if(!p->nkeys) s->groups[0].aggs[j].count+=count;
+                else for(unsigned i=0;i<count;++i) ++groups[i]->aggs[j].count;
+                continue;
+            }
+            const struct qs_vector *values=&s->vectors[agg->expr];
+            if(s->sum_required[j]) {
+                for(unsigned i=0;i<count;++i) {
+                    if(values->errors[i]) return -5;
+                    if(values->nulls[i]) continue;
+                    struct accumulator *v=&groups[i]->aggs[j]; ++v->count;
+                    if(__builtin_add_overflow(v->sum,values->values[i],&v->sum)) return -5;
+                    if(values->dscales[i]>v->dscale) v->dscale=values->dscales[i];
+                }
+            } else {
+                for(unsigned i=0;i<count;++i) {
+                    if(values->errors[i]) return -5;
+                    if(!values->nulls[i]) ++groups[i]->aggs[j].count;
+                }
             }
         }
     }
@@ -75,6 +115,7 @@ int64_t pg_sina_aggregate_source(struct femu_csd_args *a)
         for(unsigned j=0;j<other->count;++j) {
             struct group *g=get_group(s,other->groups[j].keys); if(!g) return -6;
             for(unsigned k=0;k<p->naggs;++k) {
+                if(s->accumulator[k]!=k) continue;
                 struct accumulator *dest=&g->aggs[k],*src=&other->groups[j].aggs[k];
                 if(__builtin_add_overflow(dest->sum,src->sum,&dest->sum)) return -5;
                 dest->count+=src->count; if(src->dscale>dest->dscale) dest->dscale=src->dscale;
@@ -90,7 +131,7 @@ int64_t pg_sina_aggregate_source(struct femu_csd_args *a)
         const struct qs_output *o=&p->outputs[j]; struct qs_cell value={0};
         if(!o->aggregate) value=s->groups[i].keys[o->index];
         else {
-            const struct qs_agg *agg=&p->aggs[o->index]; const struct accumulator *v=&s->groups[i].aggs[o->index];
+            const struct qs_agg *agg=&p->aggs[o->index]; const struct accumulator *v=&s->groups[i].aggs[s->accumulator[o->index]];
             if(agg->kind==Q_COUNT || agg->kind==Q_COUNT_STAR) value.value=v->count;
             else {
                 value=(struct qs_cell){.value=v->sum,.scale=p->exprs[agg->expr].scale,.dscale=v->dscale,.isnull=!v->count};
