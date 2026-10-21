@@ -79,9 +79,16 @@ static TupleTableSlot *execute(CustomScanState *node)
                 if(value.value<1 || value.value>p->nstrings) elog(ERROR,"unknown CSD string result");
                 text=p->strings[(unsigned)value.value-1].bytes;
             } else if(p->exprs[expr].type==Q_STRING) {
-                unsigned length=qs_cell_string(&value);
-                if(length>QS_STRING_MAX) elog(ERROR,"CSD string result exceeds inline limit");
-                memcpy(inline_text,qs_cell_string_bytes(&value),length); inline_text[length]=0; text=inline_text;
+                if(qs_cell_is_string_ref(&value)) {
+                    unsigned offset=(unsigned)value.value, length=qs_cell_string(&value);
+                    if(offset+length>sizeof(s->result->str_data)) elog(ERROR,"invalid CSD string reference");
+                    char *copy=palloc(length+1); memcpy(copy,s->result->str_data+offset,length); copy[length]=0; text=copy;
+                } else {
+                    if(value.dscale==2) elog(ERROR,"unresolved CSD string dictionary ID");
+                    unsigned length=qs_cell_string(&value);
+                    if(length>QS_STRING_MAX) elog(ERROR,"CSD string result exceeds inline limit");
+                    memcpy(inline_text,qs_cell_string_bytes(&value),length); inline_text[length]=0; text=inline_text;
+                }
             }
             slot->tts_values[i]=o->type_oid==1042?
                 DirectFunctionCall3(bpcharin,CStringGetDatum(text),ObjectIdGetDatum(InvalidOid),Int32GetDatum(o->typmod)):
@@ -195,7 +202,7 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     for(unsigned i=0;i<p->nattrs;++i) deferred+=p->cols[i].deferred!=0;
     ExplainPropertyInteger("CSD Deferred Columns",NULL,deferred,es);
     if(p->nstrings) ExplainPropertyInteger("CSD String Literals",NULL,p->nstrings,es);
-    if(p->runtime_dict) ExplainPropertyText("CSD Runtime Strings","low-cardinality dictionary",es);
+    if(p->runtime_dict) ExplainPropertyText("CSD Runtime Strings",p->dict_big?"large string dictionary":"low-cardinality dictionary",es);
     if(s->executed) {
         if(s->profiling) explain_profile(&s->result->profile,es);
         ExplainPropertyInteger("CSD AFDM","bytes",s->result->metrics.fdm_bytes,es);

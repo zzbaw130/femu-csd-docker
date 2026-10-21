@@ -4,7 +4,7 @@
 
 目标是把 PG 执行计划转换为 SNIA batch，由 Guest 调度 CSD 算子。只读实验使用与原生 PG 相同的全表 visible/frozen heap；实验前准备一次 schema、extent 和 LBA 映射，后续持续使用。文件、schema 或设备变化以及重启后重新准备，不设置守护连接。
 
-当前支持外部行排序/TopN、高基数聚合、多表整数等值 INNER Hash Join、B-tree 索引连接及连接后的分组/排序。Q1/Q3/Q5/Q6/Q12/Q14/Q19 由 PG 表达式树生成动态 pipeline，通过 CustomScan 完整卸载；PG 负责规划、权限检查及结果 Datum 转换。其余能力按[开发计划](doc/development.md)逐步补齐，尚未支持全部22条 TPC-H。
+当前支持外部行排序/TopN、高基数聚合、多表整数等值 INNER Hash Join、B-tree 索引连接及连接后的分组/排序。Q1/Q3/Q5/Q6/Q10/Q12/Q14/Q19 由 PG 表达式树生成动态 pipeline，通过 CustomScan 完整卸载；PG 负责规划、权限检查及结果 Datum 转换。其余能力按[开发计划](doc/development.md)逐步补齐，尚未支持全部22条 TPC-H。
 
 ## 执行路径与冷启动
 
@@ -40,7 +40,7 @@ TPC-H测量每条语句之前使用Guest的cold-query.sh：停止PG清空shared 
 | src/check.c | Guest 诊断工具，链接 libpq 和 libsnia；提交 LOAD→heap_count，与原生 COUNT 比较 |
 | include/ | Guest 与设备共用的查询计划、列批次、结果及诊断计数布局 |
 | sql/ | 扩展安装 SQL；sina_csd schema 保存准备结果 |
-| tests/ | PG12 页布局、准备测试、SQL 边界用例及 Q1/Q3/Q5/Q6/Q12/Q14/Q19 |
+| tests/ | PG12 页布局、准备测试、SQL 边界用例及 Q1/Q3/Q5/Q6/Q10/Q12/Q14/Q19 |
 | doc/ | 分阶段开发记录 |
 | ../../csd-programs/pg_sina_csd/ | 容器编译、FEMU CU 执行的设备算子 |
 
@@ -63,11 +63,11 @@ bash tests/pg-sina-csd-test.sh check
 bash tests/pg-sina-csd-test.sh sql
 # 每条查询分别冷启动：Q1/Q6、NULL/空输入/排序/回退、prepared plan 切换及取消回收
 bash tests/pg-sina-csd-test.sh query
-# Join重复键、NULL、连接后分组、字符串、小内存spill及完整Q3/Q5/Q12/Q14/Q19
+# Join重复键、NULL、连接后分组、字符串、小内存spill及完整Q3/Q5/Q10/Q12/Q14/Q19
 bash tests/pg-sina-csd-test.sh join
 # B-tree索引、不同整数宽度、4MB预算、失效回退及Q3
 bash tests/pg-sina-csd-test.sh index
-# Q3/Q5/Q12/Q14/Q19各3轮冷启动，以及独立的profile
+# Q3/Q5/Q10/Q12/Q14/Q19各3轮冷启动，以及独立的profile
 bash tests/pg-sina-csd-test.sh join-bench
 # 开关、逐算子计时、JSON 输出及开启计时后的结果一致性
 bash tests/pg-sina-csd-test.sh profile
@@ -334,22 +334,22 @@ PG从两表INNER JOIN的条件中选择一个直接整数列等值条件作为�
 
 ### 多表连接与Q3
 
-目前支持最多8个已准备heap表组成的连通INNER等值连接链，受既有64个物理属性、128个表达式、4个分组键等布局上限约束。PG先选原始行数最多的表作为probe，再依次选择通过直接整数列等值条件与已有前缀相连的表；多个候选时优先选择过滤后估计行数较少者。两表查询仍保留原来的方向选择。其他跨表谓词在最终列批次上执行，尚未实现任意树形连接计划或代价优化。
+目前支持最多8个已准备heap表组成的连通INNER等值连接链，受既有64个物理属性、128个表达式、8个分组键等布局上限约束。无索引形状时，设备按“单列唯一键优先、唯一键候选中过滤后较大关系优先”的顺序选择probe链；两表查询仍保留原来的方向选择。其他跨表谓词在最终列批次上执行，尚未实现任意树形连接计划或代价优化。
 
 每张build表有独立workmem哈希状态和控制AFDM，PG依次提交其并行LOAD/Scan/Filter与单写入build。probe时使用一个控制AFDM汇总这些不透明状态句柄、批次编号和统计，不读取哈希表。当前FEMU计算参数不接受非零AFDM偏移，因此控制AFDM保持独立，不修改SNIA或设备接口。
 
 一个probe计算请求在同一CU内依次执行各Join。每级输出最多256行的列批次，保存在该槽joined AFDM的独立区域，直接交给下一级；只有最后一级送入Filter(join)/Aggregate.sink。每级游标保留在各自build workmem中。聚合请求NEED_STORE/LOAD时，整条调用链返回该完成值，重入逐级恢复未完成的子计算，不重复输出。没有把中间行传回Guest，也没有为每级Join另发NVMe计算请求。
 
-查询预算仍一半给build、一半给probe/聚合；build份额当前按表数均分，设备还按实际物理池容量限制每张表的份额。每张表先在自身份额内增长，超限spill。PG加载各表批次的一种组合，排空所有probe请求后才切换组合；因此多张表都spill时，probe重扫次数为各表批次数的乘积。`CSD Build Batches`表示组合数，Build Rows为各build表原始行数之和；`CSD Join Count`、Build Relation列表和SNIA Pipelines显示实际连接链。均分可能让小表闲置份额而大表反复spill，后续需要改进预约分配或分区连接，不能把本实现称作DuckDB的完整内存调度器。
+查询预算仍一半给build、一半给probe/聚合；build份额按每表过滤后行数、投影列数和2的幂容量估算单批字节后按比例分配，小表保留1MiB下限，设备还按实际物理池容量限制每张表的份额。每张表先在自身份额内增长，超限spill。PG加载各表批次的一种组合，排空所有probe请求后才切换组合；因此多张表都spill时，probe重扫次数为各表批次数的乘积。`CSD Build Batches`表示组合数，Build Rows为各build表原始行数之和；`CSD Join Count`、Build Relation列表和SNIA Pipelines显示实际连接链。估算失准仍可能让小表闲置或大表多批，后续再改进预约分配或分区连接，不能把本实现称作DuckDB的完整内存调度器。
 
 Q3 SQL位于`tests/q3.sql`，使用原有qgen参数。三表、四表、后级键来自前级build载荷、重复键、NULL、空表、小内存spill及断开连接图的回退均纳入join回归。任意字符串输出、非INNER连接、HAVING和子查询仍需后续实现。
 
-## 运行期字符串字典与 Q5
+## 运行期字符串字典与 Q5/Q10
 
-Q5 的 `n_name` 没有顶层等于/IN 约束，不能使用 SQL 常量字典。本阶段新增一个查询级运行期字符串字典 AFDM：Scan 把 `char/varchar` 的空格处理结果插入字典并输出 8 字节 ID；Hash Join、分组和排序只传 ID；Aggregate.source 在最终结果前恢复字节。结果仍写回原 16 字节 `qs_cell`，字节放入 `value`、长度放入 `scale`，上限 15 字节。Q5 的 nation 名称去尾空格后最长 14 字节，因此不需要改变 `qs_cell`、Hash Join 记录、Sort run 或 spill 布局。
+Q5/Q10 的字符串没有顶层等于/IN 约束，不能使用 SQL 常量字典。查询级运行期字符串字典 AFDM：Scan 把 `char/varchar` 的空格处理结果插入字典并输出 8 字节 ID；Hash Join、分组和排序只传 ID；Aggregate.source 在最终结果块离开设备前恢复字节。Q5 使用 512 项/64KB 小字典，短字符串内联在 16 字节 cell；Q10 使用 1,048,576 项/20MB 大字典，超过 15 字节的字符串通过 `qs_result` 的 64KiB arena 回传。两种档位都不改变 `qs_cell`、Hash Join 记录、Sort run 或 spill 布局。
 
-当前字典上限为 512 项/64KB，只适合低基数分组/输出字符串；超过 15 字节、超过容量，或 `ORDER BY` 字符串时保留原生路径。Q10 的 `c_name/c_address/c_comment` 长字符串尚未实现，下一阶段需要 FD 输出 payload/可 spill 字符串。静态 SQL 常量字典仍用于 `r_name='AFRICA'` 这类过滤，两种字典不混用。
+Q10 的 SQL 虽然 GROUP BY 7 列，PG 会按主键函数依赖去掉 5 列；规划端把这些 FD 输出列重新加入分组键，因此设备仍只哈希整数 ID，不需要变长 group record。大字典在 Scan 阶段会插入 customer 全部 150k 行的字符串（约 19.6MB），超过容量时设备报错，不回退。字符串 `ORDER BY` 仍保留原生路径；Q5/Q10 都按 revenue 排序。
 
 Q5 的多表连接顺序也做了调整：候选表按“单列唯一键优先、唯一键候选中过滤后较大的关系优先”加入，避免先按 `c_nationkey=s_nationkey` 连接 customer/supplier 产生巨大中间结果。Q5 实际链为 lineitem→orders→customer→supplier→nation→region，最后执行 `c_nationkey=s_nationkey` 残差。Build 预算按每表过滤后行数、投影列数和 2 的幂容量计算单批所需字节，再按比例分配；默认 64MB 下 Q5 五张 build 表均为 1 批，lineitem 只扫描一次。
 
-Q5 默认 64MB 冷启动三轮：host 2460.080/1926.239/1939.466ms（均值 2108.595），CSD 989.475/929.035/919.904ms（均值 946.138），约 2.23 倍；结果逐字一致。16MB 查询预算下 CSD 6440.564ms，结果一致，但属于内存受限的多批重扫；取消后同一 backend 可继续执行 CSD COUNT。`tests/q5.sql` 是不带 smoke `LIMIT 1` 的完整查询，入口为 `tests/pg-sina-csd-test.sh join|join-bench`。
+Q5 默认 64MB 冷启动三轮：host 2108.595ms、CSD 946.138ms（均值，约 2.23 倍）；Q10 host 2380.000ms、CSD 1391.789ms（约 1.71 倍）。两条查询结果均与 host 逐字一致。Q10 16MB 查询预算下 7433.795ms，12 个 build 批次、33 个 spill run，写 23,789,568/读 65,208,320 字节，属于内存受限。取消后同一 backend 可继续执行 CSD COUNT。`tests/q5.sql`、`tests/q10.sql` 为完整查询，入口为 `tests/pg-sina-csd-test.sh join|join-bench`。

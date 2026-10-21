@@ -9,7 +9,7 @@
 #define QS_COLS 64
 #define QS_EXPRS 128
 #define QS_AGGS 16
-#define QS_KEYS 4
+#define QS_KEYS 8
 #define QS_OUT 16
 #define QS_GROUPS 256
 #define QS_RESULT_ROWS 256
@@ -18,9 +18,12 @@
 #define QS_CHUNK (4U*1024*1024)
 #define QS_SORT_IO_BYTES (64U*1024)
 #define QS_STRINGS 32
-#define QS_STRING_MAX 15 /* Inline final-result bytes; larger values stay native for now. */
-#define QS_DICT_ENTRIES 512
-#define QS_DICT_DATA (64U*1024U)
+#define QS_STRING_MAX 15 /* Inline final-result bytes; longer values use the result arena. */
+#define QS_DICT_SMALL_ENTRIES 512
+#define QS_DICT_SMALL_DATA (64U*1024U)
+#define QS_DICT_BIG_ENTRIES (1024U*1024U)
+#define QS_DICT_BIG_DATA (20U*1024U*1024U)
+#define QS_RESULT_STRING_BYTES (64U*1024U)
 #define QS_INDEX_READS 64
 #define QS_INDEX_CACHE 128
 #define QS_INDEX_WORK_BYTES (128U*1024) /* Cursor/tag state; page input stays in AFDM. */
@@ -29,7 +32,7 @@ enum qs_type { Q_DECIMAL, Q_INTEGER, Q_DATE, Q_CHAR, Q_BOOLEAN, Q_STRING, Q_PREF
 enum qs_op { Q_COLUMN, Q_CONST, Q_ADD, Q_SUB, Q_MUL, Q_EQ, Q_NE, Q_LT, Q_LE, Q_GT, Q_GE,
              Q_AND, Q_OR, Q_NOT, Q_IS_NULL, Q_IS_NOT_NULL, Q_CASE, Q_AGGREF, Q_DIV };
 enum qs_agg_kind { Q_SUM, Q_AVG, Q_COUNT, Q_COUNT_STAR };
-struct qs_column { int16_t length, slot; uint8_t align, type, scale, deferred, prefix_len, trim_spaces, restricted; char prefix[32]; };
+struct qs_column { int16_t length, slot; uint8_t align, type, scale, deferred, prefix_len, trim_spaces, restricted, dict_big; char prefix[32]; };
 /* SQL literal dictionary: IDs 1..nstrings; 0 means another non-NULL string.
  * Only a proven equality/IN restriction permits returning/grouping a string. */
 struct qs_string { uint8_t column, length; char bytes[128]; };
@@ -49,7 +52,8 @@ struct qs_join {
 struct qs_plan {
     uint32_t relid, relfilenode;
     unsigned nattrs, ncols, nexprs, naggs, nkeys, nout, norder, nstrings;
-    unsigned runtime_dict; /* Low-cardinality Q_STRING columns need the runtime dictionary. */
+    unsigned runtime_dict; /* At least one Q_STRING column uses the runtime dictionary. */
+    unsigned dict_big; /* At least one Q_STRING column comes from a large relation. */
     int predicate;
     unsigned ordered_rows; /* 1: SQL row sort; 2: internal full-row input. */
     unsigned external_aggregate;
@@ -109,45 +113,78 @@ static inline uint32_t *qs_selection(struct qs_chunk *c)
 { return (uint32_t *)(((uintptr_t)(qs_dscales(c)+(size_t)c->capacity*c->ncols)+7)&~(uintptr_t)7); }
 struct qs_cell { __int128 value; uint8_t scale, dscale, isnull; };
 /* A final string result is packed into the existing 16-byte cell: value holds
- * the bytes and scale holds the length. Values longer than QS_STRING_MAX stay
- * on the native path in this stage. */
+ * the bytes and scale holds the length. Values longer than QS_STRING_MAX use
+ * qs_result.str_data and store an offset/length reference in the cell. */
 static inline void qs_cell_set_string(struct qs_cell *cell,const char *bytes,unsigned length)
 {
     cell->value=0; cell->scale=(uint8_t)length; cell->dscale=0; cell->isnull=0;
     if(length) memcpy(&cell->value,bytes,length);
 }
+static inline void qs_cell_set_string_ref(struct qs_cell *cell,uint32_t offset,unsigned length)
+{
+    cell->value=offset; cell->scale=(uint8_t)length; cell->dscale=1; cell->isnull=0;
+}
 static inline unsigned qs_cell_string(const struct qs_cell *cell)
 { return cell->scale; }
 static inline const char *qs_cell_string_bytes(const struct qs_cell *cell)
 { return (const char *)&cell->value; }
-/* Shared by every scan slot in a query. The device publishes entries before
- * incrementing count; source readers only run after all scans are drained. */
-struct qs_dict_entry { uint16_t offset, length; };
+static inline int qs_cell_is_string_ref(const struct qs_cell *cell)
+{ return cell->dscale==1; }
+/* Shared by every scan slot in a query. The dictionary header is followed by
+ * an open-addressing bucket array, entries, and a byte arena; PG allocates the
+ * whole AFDM and initializes the header. */
+struct qs_dict_entry { uint32_t offset; uint16_t length; };
 struct qs_dict {
-    uint32_t lock, count, bytes;
-    struct qs_dict_entry entries[QS_DICT_ENTRIES];
-    char data[QS_DICT_DATA];
+    uint32_t lock, count, bytes, entries, capacity, data;
 };
-static inline int qs_dict_lookup(const struct qs_dict *dict,const char *bytes,unsigned length)
+static inline size_t qs_dict_bytes(unsigned entries,unsigned data)
 {
-    unsigned count=__atomic_load_n(&dict->count,__ATOMIC_ACQUIRE);
-    for(unsigned i=0;i<count;++i) {
-        const struct qs_dict_entry *e=&dict->entries[i];
-        if(e->length==length && (!length || !memcmp(dict->data+e->offset,bytes,length))) return i+1;
+    return sizeof(struct qs_dict)+(size_t)entries*sizeof(struct qs_dict_entry)+
+        (size_t)entries*sizeof(uint32_t)+data;
+}
+static inline struct qs_dict_entry *qs_dict_entries(struct qs_dict *dict)
+{ return (void *)(dict+1); }
+static inline uint32_t *qs_dict_buckets(struct qs_dict *dict)
+{ return (void *)(qs_dict_entries(dict)+dict->entries); }
+static inline char *qs_dict_data(struct qs_dict *dict)
+{ return (char *)(qs_dict_buckets(dict)+dict->capacity); }
+static inline uint32_t qs_dict_hash(const char *bytes,unsigned length)
+{
+    uint32_t hash=2166136261U;
+    for(unsigned i=0;i<length;++i) { hash^=(unsigned char)bytes[i]; hash*=16777619U; }
+    return hash;
+}
+/* Caller holds the insert lock for lookup/insert. */
+static inline int qs_dict_find(struct qs_dict *dict,const char *bytes,unsigned length)
+{
+    struct qs_dict_entry *entries=qs_dict_entries(dict);
+    uint32_t *buckets=qs_dict_buckets(dict),mask=dict->capacity-1;
+    uint32_t at=qs_dict_hash(bytes,length)&mask;
+    for(unsigned probes=0;probes<dict->capacity;++probes) {
+        uint32_t id=buckets[at];
+        if(!id) return 0;
+        struct qs_dict_entry *e=&entries[id-1];
+        if(e->length==length && (!length || !memcmp(qs_dict_data(dict)+e->offset,bytes,length))) return (int)id;
+        at=(at+1)&mask;
     }
     return 0;
 }
 static inline int qs_dict_insert(struct qs_dict *dict,const char *bytes,unsigned length)
 {
     while(__sync_lock_test_and_set(&dict->lock,1U)) { }
-    int id=qs_dict_lookup(dict,bytes,length);
+    if(dict->count>=dict->entries) { __sync_lock_release(&dict->lock); return -1; }
+    int id=qs_dict_find(dict,bytes,length);
     if(!id) {
         unsigned count=dict->count,used=dict->bytes;
-        if(count>=QS_DICT_ENTRIES || used+length>QS_DICT_DATA || length>QS_STRING_MAX) id=-1;
+        if(count>=dict->entries || used+length>dict->data || length>65535U) id=-1;
         else {
-            dict->entries[count]=(struct qs_dict_entry){(uint16_t)used,(uint16_t)length};
-            memcpy(dict->data+used,bytes,length);
+            qs_dict_entries(dict)[count]=(struct qs_dict_entry){used,(uint16_t)length};
+            memcpy(qs_dict_data(dict)+used,bytes,length);
             dict->bytes=used+length;
+            uint32_t *buckets=qs_dict_buckets(dict),mask=dict->capacity-1;
+            uint32_t at=qs_dict_hash(bytes,length)&mask;
+            while(buckets[at]) at=(at+1)&mask;
+            buckets[at]=count+1;
             __atomic_store_n(&dict->count,count+1,__ATOMIC_RELEASE);
             id=(int)count+1;
         }
@@ -157,10 +194,11 @@ static inline int qs_dict_insert(struct qs_dict *dict,const char *bytes,unsigned
 }
 static inline int qs_dict_get(const struct qs_dict *dict,unsigned id,const char **bytes,unsigned *length)
 {
-    unsigned count=__atomic_load_n(&dict->count,__ATOMIC_ACQUIRE);
-    if(!id || id>count || id>QS_DICT_ENTRIES) return -1;
-    const struct qs_dict_entry *e=&dict->entries[id-1];
-    *bytes=dict->data+e->offset; *length=e->length; return 0;
+    if(!dict || !id || id>dict->count || id>dict->entries) return -1;
+    const struct qs_dict_entry *e=&((const struct qs_dict_entry *)(dict+1))[id-1];
+    const char *base=(const char *)(((const struct qs_dict_entry *)(dict+1))+dict->entries)+
+        (size_t)dict->capacity*sizeof(uint32_t);
+    *bytes=base+e->offset; *length=e->length; return 0;
 }
 struct qs_row { struct qs_cell cells[QS_OUT]; };
 struct qs_metrics {
@@ -178,5 +216,5 @@ struct qs_profile {
     struct qs_timing operators[QS_OPERATORS];
     uint64_t setup_ns, build_ns, pipeline_ns[2], cleanup_ns, total_ns;
 };
-struct qs_result { int status; unsigned rows, begin, finished; char error[160]; struct qs_metrics metrics; struct qs_profile profile; struct qs_row data[QS_RESULT_ROWS]; };
+struct qs_result { int status; unsigned rows, begin, finished; char error[160]; struct qs_metrics metrics; struct qs_profile profile; struct qs_row data[QS_RESULT_ROWS]; uint32_t str_bytes; char str_data[QS_RESULT_STRING_BYTES]; };
 #endif

@@ -614,3 +614,24 @@ Q5 均值约 2.23 倍、中位数约 2.09 倍；结果与 host 逐字一致。�
 16MB 查询预算下 Q5 CSD=6440.564ms，结果仍一致，profile 显示12个build批次、spill写17367040字节/读39780352字节，属于内存受限；默认 64MB 不采用该配置。Q5 200ms 超时取消后，同一 backend 连续两次 CSD COUNT 均返回 6001215。既有 Q1/Q6/Q12/Q14/Q19 冷启动结果无回退，Q3 单次冷启动 1869.695ms。
 
 原始数据：Guest `/tmp/q5-bench.log`、`/tmp/q5.host.*.log`、`/tmp/q5.csd.*.log`、`/tmp/q5_mem_16.log`、`/tmp/q5_cancel.sql`；复现入口 `tests/pg-sina-csd-test.sh join|join-bench`。
+
+## 阶段3g：Q10 长字符串与 FD 分组键（2026-10-22）
+
+Q10 的 SQL 有 7 个分组列，PG 按主键函数依赖把计划压缩到 `c_custkey,n_name`；本阶段规划端把其余非聚合输出列重新加入设备分组键，因此设备仍只保存整数字典 ID，不需要变长 FD payload。运行期字典扩成 1,048,576 项/20MB 大档；bucket 由 64KiB 拷贝清零，避免大块 FDM fill。最终结果增加 64KiB arena，超过 15 字节的地址/备注等按 offset/len 回传；partial state、sort run 和 spill 仍为定长 cell。
+
+大字典约 33.5MB，FDM 容量循环在字典较大时先把每槽输入块从 4MiB 缩到 1MiB，再决定是否减少 worker。Q10 最终保持 4 CU、3 张 build 各 1 批、无 spill；profile 的 CSD AFDM 指标为 32,894,976 字节（不含完整字典区），workmem 峰值 45,794,960 字节，Joined Rows 114028，Sort Runs 17。
+
+### 冷启动对比
+
+host/CSD 交替各 3 轮，每条 SQL 前停止 PG、清 Guest 页缓存并重启，关闭 profile，完整结果逐次 cmp。
+
+| 查询/路径 | 三轮 ms | 均值 ms | 中位数 ms |
+| --- | --- | ---: | ---: |
+| Q10/host | 3050.724 / 2028.636 / 2060.642 | 2380.000 | 2060.642 |
+| Q10/csd | 1356.773 / 1388.854 / 1429.740 | 1391.789 | 1388.854 |
+
+Q10 均值约 1.71 倍、中位数约 1.48 倍；全部20行与host逐字一致。独立profile的EXPLAIN ANALYZE为1456.291ms，包含程序加载和回收，不与关闭profile的三轮均值混用。
+
+16MB 查询预算下 Q10 CSD=7433.795ms，结果一致；profile 显示 12 个 build 批次、54 个 sort run、33 个 spill run，spill 写23,789,568字节/读65,208,320字节，workmem峰值14,237,584字节。200ms 超时取消后同一 backend 连续两次 CSD COUNT 均返回6001215。既有 Q1/Q5/Q6/Q12/Q14/Q19 单轮冷启动结果一致。
+
+当前限制：字符串 `ORDER BY` 仍回退；字典不 spill，Q10 的 customer 全量字符串约19.6MB，依赖20MB区；更长/更大基数需要 FD payload 或可 spill 字符串。原始日志：Guest `/tmp/q10-bench.log`、`/tmp/q10.host.*.log`、`/tmp/q10.csd.*.log`、`/tmp/q10_16.log`、`/tmp/q10_profile16.sql`；入口 `tests/pg-sina-csd-test.sh join|join-bench`。

@@ -243,11 +243,18 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     if(workers>QS_WORKERS) workers=QS_WORKERS;
     if(!workers) goto cleanup;
     uint64_t capacity=fdm->FDMDetails[0].FDM[0].FDMSize;
+    unsigned dict_entries=request->plan.dict_big?QS_DICT_BIG_ENTRIES:QS_DICT_SMALL_ENTRIES;
+    unsigned dict_data=request->plan.dict_big?QS_DICT_BIG_DATA:QS_DICT_SMALL_DATA;
+    size_t dict_size=request->plan.runtime_dict?qs_dict_bytes(dict_entries,dict_data):0;
     while((uint64_t)workers*(chunk+((qs_chunk_bytes(chunk/24,scan_cols)+4095)&~(size_t)4095)+4096+(profiling?4096:0)+((joined_bytes+4095)&~(size_t)4095))+
           ((sizeof(struct qs_result)+4095)&~(size_t)4095)+((sizeof(struct qs_plan)+4095)&~(size_t)4095)+4096+
-          (request->plan.runtime_dict?((sizeof(struct qs_dict)+4095)&~(size_t)4095):0)+
+          ((dict_size+4095)&~(size_t)4095)+
           (joining?2*((sizeof(struct qs_plan)+4095)&~(size_t)4095)+(njoins+1)*4096:0)>capacity) {
-        if(workers>1) --workers;
+        /* Large dictionaries dominate the FDM. Shrink the per-slot column
+         * vectors before dropping CU parallelism; more workers still win for
+         * the scan/join pipeline. Small dictionaries reduce workers first. */
+        if(dict_size>(size_t)capacity/4 && chunk>1024*1024U) chunk/=2;
+        else if(workers>1) --workers;
         else if(chunk>QS_PAGE) chunk/=2;
         else { result->status=1; strcpy(result->error,"insufficient FDM"); goto cleanup; }
     }
@@ -287,9 +294,22 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     TRY(csAllocMem(device,sizeof(*result),&flags,&out_mem,NULL));
     TRY(csAllocMem(device,sizeof(group),&flags,&group_mem,NULL));
     if(request->plan.runtime_dict) {
-        flags.Flags=CS_FDM_CLEAR;
-        TRY(csAllocMem(device,sizeof(struct qs_dict),&flags,&dict_mem,NULL));
         flags.Flags=0;
+        TRY(csAllocMem(device,dict_size,&flags,&dict_mem,NULL));
+        struct qs_dict header={.lock=0,.count=0,.bytes=0,.entries=dict_entries,.capacity=dict_entries,.data=dict_data};
+        TRY(copy(dict_mem,0,&header,sizeof(header),1));
+        /* Only the open-addressing bucket array must start zeroed. Use small
+         * host copies instead of a large FDM fill command; the 1MiB transport
+         * chunk path is not reliable for this multi-megabyte initialization. */
+        size_t bucket_offset=sizeof(struct qs_dict)+(size_t)dict_entries*sizeof(struct qs_dict_entry);
+        size_t bucket_bytes=(size_t)dict_entries*sizeof(uint32_t), zero_chunk=64U*1024U;
+        void *zeros=calloc(1,zero_chunk);
+        if(!zeros) { result->status=1; strcpy(result->error,"cannot allocate dictionary zero buffer"); goto cleanup; }
+        for(size_t at=0;at<bucket_bytes;at+=zero_chunk) {
+            size_t n=bucket_bytes-at<zero_chunk?bucket_bytes-at:zero_chunk;
+            TRY(copy(dict_mem,bucket_offset+at,zeros,n,1));
+        }
+        free(zeros);
     }
     for(unsigned i=0;i<workers;++i) {
         TRY(csAllocMem(device,chunk,&flags,&input[i],NULL));

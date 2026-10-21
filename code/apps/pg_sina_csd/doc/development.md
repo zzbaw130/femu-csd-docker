@@ -292,3 +292,14 @@ Guest完整Join回归54项、单表及旧查询55项通过。Q3在16/64MB下与h
 - 未实现：原生计划中间位置的 Index Join（Q5仍走Hash链）；运行期字典>15字节或>512项；字符串排序比较器；FD输出payload；Q10的 c_name/c_address/c_comment 长字符串。Q5的性能来自一次lineitem扫描、4 CU并行probe和单批build，不代表已实现通用path编译器。
 
 验收：Q5完整结果与host逐字一致（3轮cmp均通过）；默认64MB下五张build表各1批、无build组合重扫；16MB查询预算下结果仍一致，profile显示12个build批次、spill写17.4MB/读39.8MB，属内存受限。Q5默认64MB冷启动三轮host=2460.080/1926.239/1939.466ms（均值2108.595），CSD=989.475/929.035/919.904ms（均值946.138），约2.23倍；16MB查询预算CSD=6440.564ms。Q5取消（200ms statement_timeout）后同一backend连续两次CSD COUNT均返回6001215。既有Q1/Q6/Q12/Q14/Q19冷启动结果无回退，Q3单次冷启动1869.695ms。复现入口为`tests/pg-sina-csd-test.sh join`和`join-bench`，Q5 SQL位于`tests/q5.sql`。
+
+## 阶段3g：FD分组键、长字符串结果与完整 Q10（2026-10-22）
+
+- 运行期字典扩成大小两档：Q5 512项/64KB；Q10 1,048,576项/20MB。字典头后依次是开放寻址bucket、entry和字节区，bucket由Guest按64KiB拷贝清零，避免大块FDM fill。大字典实际分配约33.5MB。
+- 规划端把PG因函数依赖从`groupClause`去掉的非聚合输出列重新加入分组键。Q10的7个SQL分组列因此仍作为7个整数ID键进入设备，不需要变长FD payload记录；Q10字典在Scan阶段插入customer全部150k行字符串，约19.6MB，未超过20MB区。
+- 最终结果增加64KiB字符串arena：不超过15字节仍内联在16字节cell；更长的c_address/c_comment等写arena，cell保存offset/len。Aggregate.source只在最终结果块离开设备前解析字典ID，partial state、sort run和spill仍只保存定长ID。
+- FDM容量循环在字典较大时先缩小每槽4MiB输入块到1MiB，再减少worker数；Q10保持4 CU、bucket清零和字典分配成功。Q10 profile为4 workers、3张build各1批、无spill，EXPLAIN的CSD AFDM为32,894,976字节（该指标不含完整字典区，字典约33.5MB），workmem峰值45,794,960字节。
+
+验收：Q10完整结果与host逐字一致（3轮cmp均通过）。默认64MB冷启动三轮host=3050.724/2028.636/2060.642ms（均值2380.000），CSD=1356.773/1388.854/1429.740ms（均值1391.789），约1.71倍；Q10独立profile 1456.291ms，Hash Join 114028行，Sort 17个run且无spill。16MB查询预算下CSD=7433.795ms，结果一致，profile显示12个build批次、54个sort run、33个spill run，写23,789,568/读65,208,320字节，workmem峰值14,237,584字节。Q10取消（200ms statement_timeout）后同一backend连续两次CSD COUNT均返回6001215。既有Q1/Q5/Q6/Q12/Q14/Q19单轮冷启动结果全部一致。
+
+当前限制：字符串`ORDER BY`仍回退原生；大字典只在Query级、不支持spill，Q10的20MB区依赖customer全量字符串约19.6MB，超过即报设备错误；尚未实现FD payload/可spill字符串。复现入口`tests/pg-sina-csd-test.sh join|join-bench`，SQL位于`tests/q10.sql`。

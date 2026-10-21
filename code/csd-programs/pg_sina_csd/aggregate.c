@@ -110,16 +110,6 @@ int64_t pg_sina_aggregate_sink(struct femu_csd_args *a)
     }
     return 0;
 }
-static int restore_string(const struct state *s,int expr,struct qs_cell *cell)
-{
-    const struct qs_plan *p=&s->plan;
-    if(expr<0 || p->exprs[expr].type!=Q_STRING) return 0;
-    if(!s->dict) return -1;
-    const char *bytes=NULL; unsigned length=0;
-    if(qs_dict_get(s->dict,(unsigned)cell->value,&bytes,&length) || length>QS_STRING_MAX) return -1;
-    qs_cell_set_string(cell,bytes,length);
-    return 0;
-}
 static int finalize_group(const struct state *s,const struct group *g,struct qs_row *row)
 {
     const struct qs_plan *p=&s->plan; struct qs_cell values[QS_AGGS];
@@ -140,7 +130,37 @@ static int finalize_group(const struct state *s,const struct group *g,struct qs_
         else if(o->aggregate) row->cells[j]=values[o->index];
         else {
             row->cells[j]=g->keys[o->index];
-            if(restore_string(s,p->keys[o->index],&row->cells[j])) return -5;
+            if(p->exprs[p->keys[o->index]].type==Q_STRING) row->cells[j].dscale=2;
+        }
+    }
+    return 0;
+}
+static int output_expr(const struct qs_plan *p,unsigned j)
+{
+    const struct qs_output *o=&p->outputs[j];
+    if(o->aggregate==0) return p->keys[o->index];
+    if(o->aggregate==2) return o->index;
+    return -1;
+}
+/* Resolve dictionary IDs only when a final result block leaves the source;
+ * group keys and partial states stay fixed-size IDs through sorting/spill. */
+static int resolve_result_strings(const struct state *s,struct qs_result *out)
+{
+    const struct qs_plan *p=&s->plan;
+    out->str_bytes=0;
+    for(unsigned r=0;r<out->rows;++r) for(unsigned j=0;j<p->nout;++j) {
+        int expr=output_expr(p,j); if(expr<0 || p->exprs[expr].type!=Q_STRING) continue;
+        struct qs_cell *cell=&out->data[r].cells[j];
+        if(cell->isnull || cell->dscale!=2) continue;
+        if(!s->dict) return -1;
+        const char *bytes=NULL; unsigned length=0;
+        if(qs_dict_get(s->dict,(unsigned)cell->value,&bytes,&length)) return -1;
+        if(length<=QS_STRING_MAX) qs_cell_set_string(cell,bytes,length);
+        else {
+            if(out->str_bytes+length>QS_RESULT_STRING_BYTES || length>255) return -1;
+            memcpy(out->str_data+out->str_bytes,bytes,length);
+            qs_cell_set_string_ref(cell,out->str_bytes,length);
+            out->str_bytes+=length;
         }
     }
     return 0;
@@ -360,7 +380,7 @@ static int64_t external_source(struct femu_csd_args *a)
     if(a->numr==4) e->local.dict=a->mr_addr[2];
     struct state *s=&e->local; const struct qs_plan *p=&s->plan; struct qs_result *out=a->mr_addr[1];
     struct femu_csd_args call=*a; call.cparam1=0;
-    if(!csIsReentry(a)) { out->status=0; out->rows=out->begin=out->finished=0; }
+    if(!csIsReentry(a)) { out->status=0; out->rows=out->begin=out->finished=0; out->str_bytes=0; }
     /* Estimates choose costs, not correctness. If no local table has flushed
      * and their union certainly fits, retain the original small hash merge. */
     if(!e->finalize && !e->input_started && !csIsReentry(a)) {
@@ -379,6 +399,7 @@ static int64_t external_source(struct femu_csd_args *a)
             out->begin=(uint64_t)plan.offset>out->rows?out->rows:(unsigned)plan.offset;
             out->rows-=out->begin;
             if(plan.limit>=0 && (uint64_t)plan.limit<out->rows) out->rows=plan.limit;
+            if(resolve_result_strings(s,out)) return -5;
             return 0;
         }
     }
@@ -418,7 +439,10 @@ static int64_t external_source(struct femu_csd_args *a)
                 int64_t status=pg_sina_sort_source_impl(&call); if(status) return status;
                 call.cparam2=0;
             }
-            out->finished=1; external_metrics(e,out); external_drop(group); return 0;
+            out->finished=1; external_metrics(e,out);
+            if(resolve_result_strings(s,out)) return -5;
+            external_drop(group);
+            return 0;
         }
         if(e->reducing_finished) {
             if(!p->norder) { e->finishing=1; continue; }
@@ -426,6 +450,7 @@ static int64_t external_source(struct femu_csd_args *a)
             call.numr=3; call.mr_addr=mr; call.mr_len=len;
             int64_t status=pg_sina_sort_source_impl(&call); if(status) return status;
             e->output_metrics=out->metrics; external_metrics(e,out);
+            if(resolve_result_strings(s,out)) return -5;
             if(out->finished) external_drop(group);
             return 0;
         }
@@ -449,7 +474,7 @@ static int64_t external_source(struct femu_csd_args *a)
             if(!p->norder && p->limit>=0 && e->emitted>=(uint64_t)p->limit) e->finishing=1;
             if(out->rows==QS_RESULT_ROWS) {
                 if(p->norder) e->output_pending=1;
-                else { external_metrics(e,out); return 0; }
+                else { external_metrics(e,out); if(resolve_result_strings(s,out)) return -5; return 0; }
             }
             if(e->output_pending || e->finishing) continue;
         }

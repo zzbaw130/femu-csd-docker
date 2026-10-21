@@ -15,6 +15,7 @@
 #include "optimizer/restrictinfo.h"
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
+#include "rewrite/rewriteManip.h"
 #include "utils/builtins.h"
 #include "utils/array.h"
 #include "utils/date.h"
@@ -364,7 +365,11 @@ static bool describe(PlannerInfo *root,Index rti,struct qs_plan *p,unsigned buil
         if(a->atttypid==NUMERICOID) { c->type=Q_DECIMAL; c->scale=2; }
         else if(a->atttypid==INT2OID || a->atttypid==INT4OID || a->atttypid==INT8OID) c->type=Q_INTEGER;
         else if(a->atttypid==DATEOID) c->type=Q_DATE;
-        else if(a->atttypid==TEXTOID || a->atttypid==VARCHAROID || a->atttypid==BPCHAROID) { c->type=Q_STRING; c->trim_spaces=a->atttypid==BPCHAROID; }
+        else if(a->atttypid==TEXTOID || a->atttypid==VARCHAROID || a->atttypid==BPCHAROID) {
+            c->type=Q_STRING; c->trim_spaces=a->atttypid==BPCHAROID;
+            RelOptInfo *rel=root->simple_rel_array[rti];
+            c->dict_big=rel && rel->tuples>4096;
+        }
         else if(a->atttypid==BOOLOID) c->type=Q_BOOLEAN;
         if(a->atttypid==BPCHAROID && a->atttypmod==5 && byte_collation(a->attcollation)) c->type=Q_CHAR;
     }
@@ -418,11 +423,25 @@ static bool compile(PlannerInfo *root,List *relations,List *joins,List *quals,st
     }
     /* Columns assigned slots so far are needed by WHERE, including nested
      * arithmetic/OR/NULL tests. Later slots are only used after filtering. */
+    List *key_exprs=NIL;
     foreach(cell,root->parse->groupClause) {
         if(p->nkeys==QS_KEYS) return false;
         TargetEntry *entry=get_sortgroupclause_tle(lfirst(cell),root->processed_tlist);
         int key=expression((Node *)entry->expr,rti,p); if(key<0 || p->exprs[key].op!=Q_COLUMN) return false;
-        p->keys[p->nkeys++]=key;
+        p->keys[p->nkeys++]=key; key_exprs=lappend(key_exprs,entry->expr);
+    }
+    /* PG may remove columns functionally dependent on a primary key from
+     * groupClause. Add such output columns back as keys: by FD they cannot
+     * split a group, and the device keeps fixed-size dictionary IDs instead
+     * of variable-length FD payloads. */
+    if(p->nkeys) foreach(cell,root->processed_tlist) {
+        TargetEntry *entry=lfirst_node(TargetEntry,cell);
+        if(IsA(entry->expr,Aggref) || contain_aggs_of_level((Node *)entry->expr,0)) continue;
+        bool present=false; ListCell *k; foreach(k,key_exprs) if(equal(entry->expr,lfirst(k))) { present=true; break; }
+        if(present) continue;
+        int key=expression((Node *)entry->expr,rti,p); if(key<0 || p->exprs[key].op!=Q_COLUMN) return false;
+        if(p->nkeys==QS_KEYS) return false;
+        p->keys[p->nkeys++]=key; key_exprs=lappend(key_exprs,entry->expr);
     }
     foreach(cell,root->processed_tlist) {
         TargetEntry *entry=lfirst_node(TargetEntry,cell); if(p->nout==QS_OUT) return false;
@@ -443,9 +462,8 @@ static bool compile(PlannerInfo *root,List *relations,List *joins,List *quals,st
             if(out->index<0) return false;
         } else {
             unsigned i=0; ListCell *key;
-            foreach(key,root->parse->groupClause) {
-                TargetEntry *group=get_sortgroupclause_tle(lfirst(key),root->processed_tlist);
-                if(equal(entry->expr,group->expr)) break;
+            foreach(key,key_exprs) {
+                if(equal(entry->expr,lfirst(key))) break;
                 ++i;
             }
             if(i==p->nkeys) return false;
@@ -485,8 +503,10 @@ static bool compile(PlannerInfo *root,List *relations,List *joins,List *quals,st
         base+=count; ++side;
     }
     order_strings(p);
-    for(unsigned i=0;i<p->nattrs;++i)
-        if(p->cols[i].slot>=0 && p->cols[i].type==Q_STRING) p->runtime_dict=1;
+    for(unsigned i=0;i<p->nattrs;++i) if(p->cols[i].slot>=0 && p->cols[i].type==Q_STRING) {
+        p->runtime_dict=1;
+        if(p->cols[i].dict_big) p->dict_big=1;
+    }
     return limit_value(root->parse->limitCount,&p->limit) && limit_value(root->parse->limitOffset,&p->offset);
 }
 static Plan *plan_path(PlannerInfo *root,RelOptInfo *rel,CustomPath *path,List *tlist,List *clauses,List *plans)

@@ -118,7 +118,11 @@ Guest将字符串字面量放在`qs_plan.strings`，每项记录物理属性号�
 
 ## 运行期字符串字典
 
-Q5 的 `n_name` 没有 SQL 常量约束，使用独立的运行期字典：Scan 收到一个字典 AFDM（`struct qs_dict`，512项/64KB），把去尾空格后的字符串插入并输出 ID；Join/分组/排序只传 ID，Aggregate.source 在最终结果前恢复字节。为不改变 `qs_cell`、Hash Join 记录和 Sort run 的固定布局，恢复后的字符串写回原 16 字节 cell（字节放 `value`，长度放 `scale`），上限 15 字节。当前只支持低基数、≤15 字节的分组/输出；超过容量、更长字符串或字符串 `ORDER BY` 保留原生路径。Q10 的 FD 长字符串 payload 尚未接入。
+Q5/Q10 的 `n_name`、客户姓名/地址/电话/备注没有 SQL 常量约束，使用独立的运行期字典：Scan 收到一个字典 AFDM，把去尾空格后的字符串插入并输出 ID；Join/分组/排序只传 ID，Aggregate.source 在最终结果块离开设备前恢复字节。字典有大小两档：低基数 Q5 用 512 项/64KB；Q10 用 1,048,576 项/20MB。字典头、开放寻址 bucket 数组、entry 数组和字符串字节区在同一 AFDM 内，bucket 由 Guest 用 64KiB 拷贝清零，避免大块 FDM fill 命令。
+
+为不改变 `qs_cell`、Hash Join 记录和 Sort run 的固定布局，Q5 的短字符串仍内联在 16 字节 cell；Q10 超过 15 字节的字符串通过 `qs_result` 的 64KiB arena 回传，cell 保存 arena offset 和长度。PG 从 `groupClause` 去掉的 FD 输出列（如 Q10 的 `c_name/c_acctbal/c_address/c_phone/c_comment`）由规划端重新加入分组键；FD 保证不会拆分分组，设备端因此仍只哈希整数 ID，不需要变长 group record 或 FD payload 记录。
+
+当前字典按“列所在关系行数 >4096”选择大档，Q10 会插入 customer 全部 150k 行的字符串（约 19.6MB，20MB 区内）；超过容量时报设备错误，不回退。字符串 `ORDER BY` 仍保留原生路径；Q5/Q10 均按 revenue 排序，不受影响。Q10 后续若要支持更长/更大基数，需要 FD payload 或可 spill 字符串。
 
 
 连接后过滤复用`filter.c`，与`aggregate.c`、`sort.c`一起编译进`pg-sina-join.so`。PG计划的`join.residual`保存剩余跨表条件的表达式索引加一（0表示没有）；这不是SNIA参数或FEMU接口。probe输出列批次后先应用此条件，再把选择向量交给聚合。过滤结束即释放临时workmem，聚合状态继续存活，因此预算仍需预留后续批次过滤空间。NEED_STORE/LOAD重入只恢复已经过滤的批次，不重复过滤或计数；统计和计时包含在probe入口内。

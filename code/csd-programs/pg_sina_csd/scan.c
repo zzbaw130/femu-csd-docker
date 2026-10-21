@@ -43,7 +43,6 @@ int qs_scan_tuple(const struct qs_plan *p,const unsigned char *raw,unsigned offs
                 if(!dict) return -3;
                 unsigned length=size-header;
                 if(spec->trim_spaces) while(length && v[length-1]==' ') --length;
-                if(length>QS_STRING_MAX) return -3;
                 int id=qs_dict_insert(dict,(const char *)v,length); if(id<0) return -3;
                 value=id;
             }
