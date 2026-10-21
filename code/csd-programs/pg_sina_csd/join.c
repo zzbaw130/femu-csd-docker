@@ -19,7 +19,7 @@ struct hash_join {
     unsigned char *data;
     uint32_t *buckets;
     struct build_batch *batches;
-    unsigned ncols, key, stride, capacity, max_capacity, slots, rows;
+    unsigned ncols, key, key2, stride, capacity, max_capacity, slots, rows;
     unsigned count, batch_capacity, input_position, block, loaded;
     int building, storing, loading, resident;
     struct probe_cursor probes[QS_WORKERS]; /* Private workmem, one per input slot. */
@@ -34,11 +34,12 @@ static struct hash_row *row_at(struct hash_join *h,unsigned row)
 static int64_t *row_values(struct hash_row *r) { return (void *)(r+1); }
 static unsigned char *row_scales(struct hash_join *h,struct hash_row *r)
 { return (void *)(row_values(r)+h->ncols); }
-static unsigned build_columns(const struct qs_plan *p,unsigned *key)
+static unsigned build_columns(const struct qs_plan *p,unsigned *key,unsigned *key2)
 {
-    unsigned n=0;
+    unsigned n=0; *key=*key2=UINT_MAX;
     for(unsigned col=p->nattrs-p->join.nattrs;col<p->nattrs;++col) if(p->cols[col].slot>=0) {
         if((int)col==p->join.build_key) *key=n;
+        if((int)col==p->join.build_key2) *key2=n;
         ++n;
     }
     return n;
@@ -49,11 +50,11 @@ static int init_join(const struct qs_plan *p,struct qs_join_control *control,str
     size_t limit=p->join.work_mem_bytes;
     /* PG assigns this stage's share from the total build budget. The device
      * still enforces the physical half-pool as a hard ceiling. */
-    size_t physical=stats.capacity_bytes/2;
+    size_t physical=stats.capacity_bytes;
     int indexed=p->njoins>1 && qs_join_at(p,p->njoins-1)->indexid;
     if(indexed && physical>QS_INDEX_WORK_BYTES) physical-=QS_INDEX_WORK_BYTES;
     if(!limit || limit>physical) limit=physical;
-    unsigned key=UINT_MAX,ncols=build_columns(p,&key);
+    unsigned key=UINT_MAX,key2=UINT_MAX,ncols=build_columns(p,&key,&key2);
     size_t stride=(sizeof(struct hash_row)+(size_t)ncols*9+7)&~(size_t)7;
     if(!p->join.relid || !ncols || key==UINT_MAX || limit<sizeof(struct hash_join)+2*QS_SORT_IO_BYTES) return -4;
     size_t max_rows=(limit-sizeof(struct hash_join)-QS_SORT_IO_BYTES)/(stride+8);
@@ -67,7 +68,7 @@ static int init_join(const struct qs_plan *p,struct qs_join_control *control,str
     cs_work_context *context=cs_work_begin_limit(limit); if(!context) return -4;
     struct hash_join *h=cs_work_calloc(context,1,sizeof(*h));
     if(!h) { cs_work_end(context); return -4; }
-    h->context=context; h->ncols=ncols; h->key=key; h->stride=stride; h->capacity=capacity; h->max_capacity=max_capacity; h->slots=2*capacity;
+    h->context=context; h->ncols=ncols; h->key=key; h->key2=key2; h->stride=stride; h->capacity=capacity; h->max_capacity=max_capacity; h->slots=2*capacity;
     h->data=cs_work_alloc(context,(size_t)capacity*stride);
     h->buckets=cs_work_alloc(context,(size_t)h->slots*sizeof(*h->buckets));
     if(!h->data || !h->buckets) { cs_work_end(context); return -4; }
@@ -137,6 +138,7 @@ int64_t pg_sina_join_build(struct femu_csd_args *a)
         if(h->rows==h->capacity && !grow_join(h)) { int64_t status=store_batch(h,control,a); if(status) return status; }
         unsigned row=qs_selection(c)[h->input_position++]; if(row>=c->rows) return -1;
         if(qs_nulls(c)[(size_t)h->key*((c->capacity+7)/8)+row/8]&(1U<<(row%8))) continue;
+        if(h->key2!=UINT_MAX && (qs_nulls(c)[(size_t)h->key2*((c->capacity+7)/8)+row/8]&(1U<<(row%8)))) continue;
         struct hash_row *r=row_at(h,h->rows++); r->next=UINT_MAX; r->nulls=0;
         for(unsigned col=0;col<h->ncols;++col) {
             if(qs_nulls(c)[(size_t)col*((c->capacity+7)/8)+row/8]&(1U<<(row%8))) r->nulls|=UINT64_C(1)<<col;
@@ -146,11 +148,23 @@ int64_t pg_sina_join_build(struct femu_csd_args *a)
     }
     return 0;
 }
+static uint64_t hash_pair(struct hash_join *h,struct hash_row *r)
+{
+    uint64_t hash=hash_key(row_values(r)[h->key]);
+    if(h->key2!=UINT_MAX) hash=hash_key(hash^((uint64_t)row_values(r)[h->key2]+UINT64_C(0x9e3779b97f4a7c15)));
+    return hash;
+}
+static uint64_t value_pair(struct hash_join *h,int64_t a,int64_t b)
+{
+    uint64_t hash=hash_key((uint64_t)a);
+    if(h->key2!=UINT_MAX) hash=hash_key(hash^((uint64_t)b+UINT64_C(0x9e3779b97f4a7c15)));
+    return hash;
+}
 static void index_batch(struct hash_join *h)
 {
     memset(h->buckets,0xff,(size_t)h->slots*sizeof(*h->buckets));
     for(unsigned i=0;i<h->rows;++i) {
-        struct hash_row *r=row_at(h,i); unsigned bucket=hash_key(row_values(r)[h->key])&(h->slots-1);
+        struct hash_row *r=row_at(h,i); unsigned bucket=hash_pair(h,r)&(h->slots-1);
         r->next=h->buckets[bucket]; h->buckets[bucket]=i;
     }
 }
@@ -217,9 +231,13 @@ static int64_t probe_stage(unsigned stage,struct qs_chunk *c,const struct qs_pla
     struct qs_chunk *out=(void *)((unsigned char *)a->mr_addr[4]+stage*qs_join_chunk_stride(p));
     unsigned base=qs_probe_attrs(p);
     for(unsigned i=0;i<stage;++i) base+=qs_join_at(p,i)->nattrs;
-    unsigned probe_cols[QS_COLS],build_cols[QS_COLS],np=0,nb=0,key=UINT_MAX;
+    unsigned probe_cols[QS_COLS],build_cols[QS_COLS],np=0,nb=0,key=UINT_MAX,key2=UINT_MAX;
     for(unsigned i=0;i<base+j->nattrs;++i) if(p->cols[i].slot>=0) {
-        if(i<base) { if((int)i==j->probe_key) key=stage?(unsigned)p->cols[i].slot:np; probe_cols[np++]=p->cols[i].slot; }
+        if(i<base) {
+            if((int)i==j->probe_key) key=stage?(unsigned)p->cols[i].slot:np;
+            if((int)i==j->probe_key2) key2=stage?(unsigned)p->cols[i].slot:np;
+            probe_cols[np++]=p->cols[i].slot;
+        }
         else build_cols[nb++]=p->cols[i].slot;
     }
     if((!stage && np!=c->ncols) || nb!=h->ncols || key==UINT_MAX) return -1;
@@ -232,14 +250,19 @@ static int64_t probe_stage(unsigned stage,struct qs_chunk *c,const struct qs_pla
     while(cursor->position<c->selected) {
         unsigned row=qs_selection(c)[cursor->position]; if(row>=c->rows) return -1;
         if(qs_nulls(c)[(size_t)key*((c->capacity+7)/8)+row/8]&(1U<<(row%8))) { ++cursor->position; continue; }
-        int64_t value=qs_values(c)[(size_t)key*c->capacity+row];
-        unsigned at=cursor->match?cursor->match-1:h->buckets[hash_key(value)&(h->slots-1)];
+        int64_t value=qs_values(c)[(size_t)key*c->capacity+row],value2=0;
+        if(key2!=UINT_MAX) {
+            if(qs_nulls(c)[(size_t)key2*((c->capacity+7)/8)+row/8]&(1U<<(row%8))) { ++cursor->position; continue; }
+            value2=qs_values(c)[(size_t)key2*c->capacity+row];
+        }
+        unsigned at=cursor->match?cursor->match-1:h->buckets[value_pair(h,value,value2)&(h->slots-1)];
         if(at==UINT_MAX) { ++cursor->position; continue; }
         struct hash_row *r=row_at(h,at);
         /* Save the next pair before a possibly reentrant aggregate call. */
         cursor->match=r->next==UINT_MAX?0:r->next+1;
         if(!cursor->match) ++cursor->position;
         if(row_values(r)[h->key]!=value) continue;
+        if(h->key2!=UINT_MAX && row_values(r)[h->key2]!=value2) continue;
         if(!out->rows) memset(qs_nulls(out),0,((out->capacity+7)/8)*(size_t)out->ncols);
         unsigned dest=out->rows;
         for(unsigned col=0;col<np+nb;++col) {

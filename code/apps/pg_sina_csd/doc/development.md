@@ -303,3 +303,14 @@ Guest完整Join回归54项、单表及旧查询55项通过。Q3在16/64MB下与h
 验收：Q10完整结果与host逐字一致（3轮cmp均通过）。默认64MB冷启动三轮host=3050.724/2028.636/2060.642ms（均值2380.000），CSD=1356.773/1388.854/1429.740ms（均值1391.789），约1.71倍；Q10独立profile 1456.291ms，Hash Join 114028行，Sort 17个run且无spill。16MB查询预算下CSD=7433.795ms，结果一致，profile显示12个build批次、54个sort run、33个spill run，写23,789,568/读65,208,320字节，workmem峰值14,237,584字节。Q10取消（200ms statement_timeout）后同一backend连续两次CSD COUNT均返回6001215。既有Q1/Q5/Q6/Q12/Q14/Q19单轮冷启动结果全部一致。
 
 当前限制：字符串`ORDER BY`仍回退原生；大字典只在Query级、不支持spill，Q10的20MB区依赖customer全量字符串约19.6MB，超过即报设备错误；尚未实现FD payload/可spill字符串。复现入口`tests/pg-sina-csd-test.sh join|join-bench`，SQL位于`tests/q10.sql`。
+
+## 阶段3h：复合连接键与 Q9（2026-10-22）
+
+- 支持第二组整数等值键：`qs_join.build_key2/probe_key2` 同时参与 build/probe 哈希和相等判断。Q9 的 `partsupp` 按 `(ps_partkey,ps_suppkey)=(l_partkey,l_suppkey)` 连接，避免单键连接后再用残差过滤造成的四倍中间行。
+- 新增 `Q_YEAR`：识别 PG12 `date_part('year', date::timestamp)`，设备把 date 转为年份整数，结果按 float8 返回；新增 `Q_PATTERN` Scan glob，支持 `%floral%` 这类中间通配；短字符串结果排序改为 inline 字节序比较。
+- 连接顺序改为“单列唯一键优先，唯一键候选中过滤后较小关系优先”；build预算增加按目标批次数分配，Q9 的 build组合从42批降到6批。
+- 尝试过 orders_pkey 作为链尾索引：复合键后 Index Heap Tuples 从25.9M降到323844，但随机页加载62849次，耗时10.9s，比Hash慢，已撤回。
+
+验收：Q9 175行结果与host逐字一致（3轮cmp通过）。默认64MB冷启动三轮host=4161.373/3068.764/3073.949ms（均值3434.695），CSD=7702.432/7386.411/7677.284ms（均值7588.709），约2.21倍。Q9 profile为6个build批次、Internal Read 5921865728字节、Spill Write 98631680/Read 158793728字节、4 workers、Execution 8073.135ms。32MB查询预算CSD=42491.859ms，结果一致；16MB超过55s未返回，当前最低验收内存为32MB，推荐64MB。200ms取消后同backend连续两次CSD COUNT均返回6001215。
+
+限制：Q9仍有6次lineitem重扫，64MB下2.21倍host；16MB不可用。问题来自orders 1.5M与partsupp 800k无法同时单批驻留，下一步需要分区Hash Join或probe物化，不能把当前结果当作性能完成。复现入口`tests/pg-sina-csd-test.sh join|join-bench`，SQL位于`tests/q9.sql`。

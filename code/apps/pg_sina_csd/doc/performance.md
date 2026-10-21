@@ -635,3 +635,20 @@ Q10 均值约 1.71 倍、中位数约 1.48 倍；全部20行与host逐字一致�
 16MB 查询预算下 Q10 CSD=7433.795ms，结果一致；profile 显示 12 个 build 批次、54 个 sort run、33 个 spill run，spill 写23,789,568字节/读65,208,320字节，workmem峰值14,237,584字节。200ms 超时取消后同一 backend 连续两次 CSD COUNT 均返回6001215。既有 Q1/Q5/Q6/Q12/Q14/Q19 单轮冷启动结果一致。
 
 当前限制：字符串 `ORDER BY` 仍回退；字典不 spill，Q10 的 customer 全量字符串约19.6MB，依赖20MB区；更长/更大基数需要 FD payload 或可 spill 字符串。原始日志：Guest `/tmp/q10-bench.log`、`/tmp/q10.host.*.log`、`/tmp/q10.csd.*.log`、`/tmp/q10_16.log`、`/tmp/q10_profile16.sql`；入口 `tests/pg-sina-csd-test.sh join|join-bench`。
+
+## 阶段3h：Q9 复合连接键（2026-10-22）
+
+Q9 新增复合连接键 `(l_partkey,l_suppkey)=(ps_partkey,ps_suppkey)`，避免 partsupp 单键连接后的四倍中间行；同时加入 Q_YEAR、% 通配 Scan 和字符串排序。Build 组合从42批降到6批，但 64MB 下 orders 1.5M 与 partsupp 800k 仍不能同时单批驻留，6 次 lineitem 重扫是剩余瓶颈。
+
+### 冷启动对比
+
+host/CSD 交替各 3 轮，完整 175 行结果逐次 cmp，均通过。
+
+| 查询/路径 | 三轮 ms | 均值 ms |
+| --- | --- | ---: |
+| Q9/host | 4161.373 / 3068.764 / 3073.949 | 3434.695 |
+| Q9/csd | 7702.432 / 7386.411 / 7677.284 | 7588.709 |
+
+Q9 均值约2.21倍 host；profile Execution 8073.135ms，Build Batches=6、Internal Read 5921865728字节、Spill Write 98631680/Read 158793728字节、4 workers。32MB 查询预算 CSD=42491.859ms，结果一致；16MB 超过55s未返回，当前最低验收内存32MB，推荐64MB。
+
+索引实验：orders_pkey 链尾在复合键后 Index Heap Tuples 323844、Pages Loaded 62849，耗时10.9s，仍慢于Hash，已撤回。下一步需要分区Hash Join或probe物化，将6次重扫压到1–2次。原始日志：Guest `/tmp/q9-bench2.log`、`/tmp/q9.host.*.log`、`/tmp/q9.csd.*.log`、`/tmp/q9_32.log`；入口 `tests/pg-sina-csd-test.sh join|join-bench`。

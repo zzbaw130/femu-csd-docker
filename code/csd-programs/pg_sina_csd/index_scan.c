@@ -22,7 +22,7 @@ static uint32_t u32(const unsigned char *p) { uint32_t x; memcpy(&x,p,4); return
 int qs_index_init(const struct qs_plan *p,struct qs_join_control *control)
 {
     struct cs_work_stats stats; if(cs_work_get_stats(&stats)) return -4;
-    size_t limit=p->join.work_mem_bytes,physical=stats.capacity_bytes/2;
+    size_t limit=p->join.work_mem_bytes,physical=stats.capacity_bytes;
     if(!limit || limit>physical) limit=physical;
     cs_work_context *ctx=cs_work_begin_limit(limit); if(!ctx) return -4;
     struct index_join *h=cs_work_calloc(ctx,1,sizeof(*h));

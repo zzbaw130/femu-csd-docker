@@ -5,6 +5,18 @@
 #include "heap_numeric.h"
 static uint16_t read16(const unsigned char *p) { uint16_t v; memcpy(&v,p,2); return v; }
 static uint32_t read32(const unsigned char *p) { uint32_t v; memcpy(&v,p,4); return v; }
+/* Small '%' glob matcher for scan-level LIKE; '_' and escapes stay native. */
+static int glob_match(const char *pattern,unsigned plen,const char *text,unsigned tlen)
+{
+    if(!plen) return !tlen;
+    if(pattern[0]=='%') {
+        while(plen && pattern[0]=='%') { ++pattern; --plen; }
+        if(!plen) return 1;
+        for(unsigned i=0;i<=tlen;++i) if(glob_match(pattern,plen,text+i,tlen-i)) return 1;
+        return 0;
+    }
+    return tlen && pattern[0]==text[0] && glob_match(pattern+1,plen-1,text+1,tlen-1);
+}
 /* Decode one already-located immutable tuple into its projected column slots.
  * Index scans use the same decoder and visibility checks as full heap scans. */
 int qs_scan_tuple(const struct qs_plan *p,const unsigned char *raw,unsigned offset,unsigned len,unsigned page,struct qs_chunk *c,unsigned row,struct qs_dict *dict)
@@ -56,6 +68,7 @@ int qs_scan_tuple(const struct qs_plan *p,const unsigned char *raw,unsigned offs
                 }
             }
             else if(spec->type==Q_PREFIX) { if(spec->prefix_len>sizeof(spec->prefix)) return -3; value=size-header>=spec->prefix_len && !memcmp(v,spec->prefix,spec->prefix_len); }
+            else if(spec->type==Q_PATTERN) { if(spec->prefix_len>sizeof(spec->prefix)) return -3; value=glob_match(spec->prefix,spec->prefix_len,(const char *)v,size-header); }
             else if(spec->type==Q_DECIMAL) { if(qs_numeric_cents(v,size-header,&value,&dscale)) return -3; }
             else if(spec->type==Q_CHAR) { if(size-header!=1 || *v>=128) return -3; value=*v; }
             else if(size==8) memcpy(&value,v,8);

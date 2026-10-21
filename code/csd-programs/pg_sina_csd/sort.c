@@ -5,7 +5,7 @@ static int compare(const struct qs_row *a,const struct qs_row *b,const struct qs
 {
     for(unsigned i=0;i<p->norder;++i) {
         const struct qs_order *key=&p->order[i];
-        struct qs_cell x=a->cells[key->output],y=b->cells[key->output]; int cmp;
+        struct qs_cell x=a->cells[key->output],y=b->cells[key->output]; int cmp=0;
         if(x.isnull || y.isnull) {
             cmp=(x.isnull?1:0)-(y.isnull?1:0); if(key->nulls_first) cmp=-cmp;
         } else {
@@ -81,7 +81,7 @@ enum { ROW_NONE, ROW_STORE, ROW_LOAD, ROW_FREE };
 static int row_compare(const struct qs_cell *a,const struct qs_cell *b,const struct qs_plan *p)
 {
     for(unsigned i=0;i<p->norder;++i) {
-        const struct qs_order *key=&p->order[i]; struct qs_cell x=a[key->output],y=b[key->output]; int cmp;
+        const struct qs_order *key=&p->order[i]; struct qs_cell x=a[key->output],y=b[key->output]; int cmp=0;
         if(x.isnull || y.isnull) {
             cmp=(x.isnull?1:0)-(y.isnull?1:0); if(key->nulls_first) cmp=-cmp;
         } else { qs_compare(x,y,&cmp); if(key->descending) cmp=-cmp; }

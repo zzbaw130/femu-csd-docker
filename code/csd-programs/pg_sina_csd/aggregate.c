@@ -360,7 +360,19 @@ static int partial_combine(struct external_state *e,const struct qs_row *row)
     return 0;
 }
 static int group_output(struct external_state *e,struct qs_row *row)
-{ return finalize_group(&e->local,&e->local.groups[0],row); }
+{
+    if(finalize_group(&e->local,&e->local.groups[0],row)) return -5;
+    const struct qs_plan *p=&e->local.plan;
+    for(unsigned j=0;j<p->nout;++j) {
+        int expr=output_expr(p,j); if(expr<0 || p->exprs[expr].type!=Q_STRING) continue;
+        struct qs_cell *cell=&row->cells[j];
+        if(cell->isnull || cell->dscale!=2) continue;
+        const char *bytes=NULL; unsigned length=0;
+        if(!e->local.dict || qs_dict_get(e->local.dict,(unsigned)cell->value,&bytes,&length)) return -5;
+        if(length<=QS_STRING_MAX) qs_cell_set_string_sort(cell,bytes,length);
+    }
+    return 0;
+}
 static void external_metrics(struct external_state *e,struct qs_result *out)
 {
     out->metrics=e->local.metrics;

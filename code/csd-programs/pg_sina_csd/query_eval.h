@@ -9,8 +9,29 @@ static inline int qs_scale(__int128 value, unsigned places, __int128 *out)
     while(places--) if(__builtin_mul_overflow(value,(__int128)10,&value)) return -1;
     *out=value; return 0;
 }
+static inline int qs_pgdate_year(int32_t days)
+{
+    /* PostgreSQL date is days since 2000-01-01; convert to civil year. */
+    int64_t z=(int64_t)days+10957+719468;
+    int64_t era=(z>=0?z:z-146096)/146097;
+    unsigned doe=(unsigned)(z-era*146097);
+    unsigned yoe=(doe-doe/1460+doe/36524-doe/146096)/365;
+    int64_t year=(int64_t)yoe+era*400;
+    unsigned doy=doe-(365*yoe+yoe/4-yoe/100);
+    unsigned mp=(5*doy+2)/153;
+    unsigned month=mp+(mp<10?3:-9);
+    if(month<=2) ++year;
+    return (int)year;
+}
 static inline int qs_compare(struct qs_cell a, struct qs_cell b, int *result)
 {
+    if(a.dscale==3 || b.dscale==3) {
+        if(a.dscale!=3 || b.dscale!=3) return -1;
+        unsigned al=a.scale,bl=b.scale,n=al<bl?al:bl;
+        int cmp=memcmp(&a.value,&b.value,n);
+        if(!cmp) cmp=(al>bl)-(al<bl);
+        *result=(cmp>0)-(cmp<0); return 0;
+    }
     if(a.scale==b.scale) { *result=(a.value>b.value)-(a.value<b.value); return 0; }
     unsigned scale=a.scale>b.scale?a.scale:b.scale; __int128 x,y;
     if(!qs_scale(a.value,scale-a.scale,&x) && !qs_scale(b.value,scale-b.scale,&y)) {
@@ -52,6 +73,10 @@ static inline int qs_evaluate(struct qs_eval *e, int index, struct qs_cell *out)
         v.value=qs_values(e->chunk)[(size_t)slot*e->chunk->capacity+e->row];
         v.dscale=qs_dscales(e->chunk)[(size_t)slot*e->chunk->capacity+e->row];
         v.isnull=(qs_nulls(e->chunk)[(size_t)slot*((e->chunk->capacity+7)/8)+e->row/8]>>(e->row%8))&1;
+    } else if(x->op==Q_YEAR) {
+        if(qs_evaluate(e,x->left,&a)) return -1;
+        v.isnull=a.isnull; v.scale=v.dscale=0;
+        if(!v.isnull) v.value=qs_pgdate_year((int32_t)a.value);
     } else {
         if(qs_evaluate(e,x->left,&a)) return -1;
         if(x->op==Q_CASE) {

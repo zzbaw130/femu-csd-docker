@@ -97,6 +97,16 @@ static uint64_t stage_build_bytes(const struct qs_plan *p,unsigned stage)
     while(capacity<rows && capacity<UINT32_MAX/2) capacity*=2;
     return capacity*(stride+8)+1024*1024;
 }
+static uint64_t stage_limit_bytes(const struct qs_plan *p,unsigned stage,unsigned batches)
+{
+    const struct qs_join *j=qs_join_at(p,stage);
+    unsigned base=qs_probe_attrs(p); for(unsigned i=0;i<stage;++i) base+=qs_join_at(p,i)->nattrs;
+    unsigned cols=0; for(unsigned i=base;i<base+j->nattrs;++i) cols+=p->cols[i].slot>=0;
+    unsigned stride=(16+cols*9+7)&~7U;
+    uint64_t rows=j->rows?j->rows:1,target=(rows+batches-1)/batches,capacity=256;
+    while(capacity<target && capacity<UINT32_MAX/2) capacity*=2;
+    return capacity*(stride+8)+1024*1024;
+}
 /* Physical side scans only project that relation's required columns. */
 static void join_scan_plan(const struct qs_plan *combined,struct qs_plan *scan,bool build)
 {
@@ -267,8 +277,21 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     if(nchunks && workers>nchunks) workers=nchunks;
     /* One budget shared by all concurrent slots, including Filter scratch.
      * CSFs also clamp each share to the physical workmem pool capacity. */
-    request->plan.join.work_mem_bytes=joining?(uint64_t)pg_sina_max_memory*1024/2:0;
-    request->plan.work_mem_bytes=((uint64_t)pg_sina_max_memory*1024-request->plan.join.work_mem_bytes)/workers;
+    uint64_t query_budget=(uint64_t)pg_sina_max_memory*1024;
+    uint64_t build_budget=joining?query_budget/2:0;
+    if(joining) {
+        uint64_t estimated=0;
+        for(unsigned i=0;i<njoins;++i) if(!qs_join_at(&request->plan,i)->indexid)
+            estimated+=stage_build_bytes(&request->plan,i);
+        if(estimated>build_budget) {
+            uint64_t reserve=Max((uint64_t)4*1024*1024,query_budget/16);
+            uint64_t candidate=query_budget>reserve?query_budget-reserve:query_budget/2;
+            if(candidate>build_budget) build_budget=Min(candidate,estimated);
+        }
+    }
+    if(build_budget>query_budget) build_budget=query_budget;
+    request->plan.join.work_mem_bytes=build_budget;
+    request->plan.work_mem_bytes=(query_budget-build_budget)/workers;
     if(joining) {
         join_scan_plan(&request->plan,&probe_plan,false);
     }
@@ -341,6 +364,18 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
         }
         uint64_t index_budget=indexed_stages?QS_INDEX_WORK_BYTES*indexed_stages:0;
         uint64_t hash_budget=build_budget>index_budget?build_budget-index_budget:0;
+        uint64_t limits[QS_JOINS]={0};
+        bool tuned=false;
+        for(unsigned batches=1;batches<=8 && !tuned;++batches) {
+            uint64_t total=0;
+            for(unsigned i=0;i<njoins;++i) if(!qs_join_at(&request->plan,i)->indexid)
+                total+=stage_limit_bytes(&request->plan,i,batches);
+            if(total<=hash_budget) {
+                for(unsigned i=0;i<njoins;++i) if(!qs_join_at(&request->plan,i)->indexid)
+                    limits[i]=stage_limit_bytes(&request->plan,i,batches);
+                tuned=true;
+            }
+        }
         uint64_t assigned=0;
         unsigned base=qs_probe_attrs(&request->plan);
         for(unsigned stage=0;stage<njoins;++stage) {
@@ -348,6 +383,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
             struct qs_plan view=request->plan; view.join=*qs_join_at(&request->plan,stage); view.njoins=njoins;
             base+=view.join.nattrs; view.nattrs=base; view.join.residual=0;
             if(view.join.indexid) view.join.work_mem_bytes=QS_INDEX_WORK_BYTES;
+            else if(tuned) view.join.work_mem_bytes=limits[stage];
             else if(weight_sum) {
                 uint64_t share=hash_budget*weights[stage]/weight_sum;
                 if(share<1024*1024U) share=hash_budget?Min((uint64_t)(1024*1024U),hash_budget):0;

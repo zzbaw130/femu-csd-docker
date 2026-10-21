@@ -28,9 +28,9 @@
 #define QS_INDEX_CACHE 128
 #define QS_INDEX_WORK_BYTES (128U*1024) /* Cursor/tag state; page input stays in AFDM. */
 #define QS_INDEX_WAIT 1 /* Private join continuation; never a SNIA status. */
-enum qs_type { Q_DECIMAL, Q_INTEGER, Q_DATE, Q_CHAR, Q_BOOLEAN, Q_STRING, Q_PREFIX, Q_DICTIONARY };
+enum qs_type { Q_DECIMAL, Q_INTEGER, Q_DATE, Q_CHAR, Q_BOOLEAN, Q_STRING, Q_PREFIX, Q_PATTERN, Q_DICTIONARY };
 enum qs_op { Q_COLUMN, Q_CONST, Q_ADD, Q_SUB, Q_MUL, Q_EQ, Q_NE, Q_LT, Q_LE, Q_GT, Q_GE,
-             Q_AND, Q_OR, Q_NOT, Q_IS_NULL, Q_IS_NOT_NULL, Q_CASE, Q_AGGREF, Q_DIV };
+             Q_AND, Q_OR, Q_NOT, Q_IS_NULL, Q_IS_NOT_NULL, Q_CASE, Q_YEAR, Q_AGGREF, Q_DIV };
 enum qs_agg_kind { Q_SUM, Q_AVG, Q_COUNT, Q_COUNT_STAR };
 struct qs_column { int16_t length, slot; uint8_t align, type, scale, deferred, prefix_len, trim_spaces, restricted, dict_big; char prefix[32]; };
 /* SQL literal dictionary: IDs 1..nstrings; 0 means another non-NULL string.
@@ -44,6 +44,7 @@ struct qs_join {
     uint32_t relid, relfilenode, rti;
     unsigned nattrs;
     int build_key, probe_key, predicate;
+    int build_key2, probe_key2; /* Optional second integer equality key. */
     int residual; /* Joined-row predicate index + 1; 0 means no residual. */
     uint64_t rows, work_mem_bytes;
     uint32_t indexid, indexnode, indexroot;
@@ -123,6 +124,11 @@ static inline void qs_cell_set_string(struct qs_cell *cell,const char *bytes,uns
 static inline void qs_cell_set_string_ref(struct qs_cell *cell,uint32_t offset,unsigned length)
 {
     cell->value=offset; cell->scale=(uint8_t)length; cell->dscale=1; cell->isnull=0;
+}
+static inline void qs_cell_set_string_sort(struct qs_cell *cell,const char *bytes,unsigned length)
+{
+    cell->value=0; cell->scale=(uint8_t)length; cell->dscale=3; cell->isnull=0;
+    if(length) memcpy(&cell->value,bytes,length);
 }
 static inline unsigned qs_cell_string(const struct qs_cell *cell)
 { return cell->scale; }

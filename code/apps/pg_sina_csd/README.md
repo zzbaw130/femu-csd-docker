@@ -4,7 +4,7 @@
 
 目标是把 PG 执行计划转换为 SNIA batch，由 Guest 调度 CSD 算子。只读实验使用与原生 PG 相同的全表 visible/frozen heap；实验前准备一次 schema、extent 和 LBA 映射，后续持续使用。文件、schema 或设备变化以及重启后重新准备，不设置守护连接。
 
-当前支持外部行排序/TopN、高基数聚合、多表整数等值 INNER Hash Join、B-tree 索引连接及连接后的分组/排序。Q1/Q3/Q5/Q6/Q10/Q12/Q14/Q19 由 PG 表达式树生成动态 pipeline，通过 CustomScan 完整卸载；PG 负责规划、权限检查及结果 Datum 转换。其余能力按[开发计划](doc/development.md)逐步补齐，尚未支持全部22条 TPC-H。
+当前支持外部行排序/TopN、高基数聚合、多表整数等值 INNER Hash Join、B-tree 索引连接及连接后的分组/排序。Q1/Q3/Q5/Q6/Q9/Q10/Q12/Q14/Q19 由 PG 表达式树生成动态 pipeline，通过 CustomScan 完整卸载；PG 负责规划、权限检查及结果 Datum 转换。其余能力按[开发计划](doc/development.md)逐步补齐，尚未支持全部22条 TPC-H。
 
 ## 执行路径与冷启动
 
@@ -40,7 +40,7 @@ TPC-H测量每条语句之前使用Guest的cold-query.sh：停止PG清空shared 
 | src/check.c | Guest 诊断工具，链接 libpq 和 libsnia；提交 LOAD→heap_count，与原生 COUNT 比较 |
 | include/ | Guest 与设备共用的查询计划、列批次、结果及诊断计数布局 |
 | sql/ | 扩展安装 SQL；sina_csd schema 保存准备结果 |
-| tests/ | PG12 页布局、准备测试、SQL 边界用例及 Q1/Q3/Q5/Q6/Q10/Q12/Q14/Q19 |
+| tests/ | PG12 页布局、准备测试、SQL 边界用例及 Q1/Q3/Q5/Q6/Q9/Q10/Q12/Q14/Q19 |
 | doc/ | 分阶段开发记录 |
 | ../../csd-programs/pg_sina_csd/ | 容器编译、FEMU CU 执行的设备算子 |
 
@@ -63,11 +63,11 @@ bash tests/pg-sina-csd-test.sh check
 bash tests/pg-sina-csd-test.sh sql
 # 每条查询分别冷启动：Q1/Q6、NULL/空输入/排序/回退、prepared plan 切换及取消回收
 bash tests/pg-sina-csd-test.sh query
-# Join重复键、NULL、连接后分组、字符串、小内存spill及完整Q3/Q5/Q10/Q12/Q14/Q19
+# Join重复键、NULL、连接后分组、字符串、小内存spill及完整Q3/Q5/Q9/Q10/Q12/Q14/Q19
 bash tests/pg-sina-csd-test.sh join
 # B-tree索引、不同整数宽度、4MB预算、失效回退及Q3
 bash tests/pg-sina-csd-test.sh index
-# Q3/Q5/Q10/Q12/Q14/Q19各3轮冷启动，以及独立的profile
+# Q3/Q5/Q9/Q10/Q12/Q14/Q19各3轮冷启动，以及独立的profile
 bash tests/pg-sina-csd-test.sh join-bench
 # 开关、逐算子计时、JSON 输出及开启计时后的结果一致性
 bash tests/pg-sina-csd-test.sh profile
@@ -353,3 +353,5 @@ Q10 的 SQL 虽然 GROUP BY 7 列，PG 会按主键函数依赖去掉 5 列；�
 Q5 的多表连接顺序也做了调整：候选表按“单列唯一键优先、唯一键候选中过滤后较大的关系优先”加入，避免先按 `c_nationkey=s_nationkey` 连接 customer/supplier 产生巨大中间结果。Q5 实际链为 lineitem→orders→customer→supplier→nation→region，最后执行 `c_nationkey=s_nationkey` 残差。Build 预算按每表过滤后行数、投影列数和 2 的幂容量计算单批所需字节，再按比例分配；默认 64MB 下 Q5 五张 build 表均为 1 批，lineitem 只扫描一次。
 
 Q5 默认 64MB 冷启动三轮：host 2108.595ms、CSD 946.138ms（均值，约 2.23 倍）；Q10 host 2380.000ms、CSD 1391.789ms（约 1.71 倍）。两条查询结果均与 host 逐字一致。Q10 16MB 查询预算下 7433.795ms，12 个 build 批次、33 个 spill run，写 23,789,568/读 65,208,320 字节，属于内存受限。取消后同一 backend 可继续执行 CSD COUNT。`tests/q5.sql`、`tests/q10.sql` 为完整查询，入口为 `tests/pg-sina-csd-test.sh join|join-bench`。
+
+Q9 进一步增加复合连接键 `(l_partkey,l_suppkey)=(ps_partkey,ps_suppkey)`、`Q_YEAR`、`%` 通配 Scan 和短字符串排序。175 行结果与 host 一致；64MB 三轮 host=3434.695ms、CSD=7588.709ms（约2.21倍），Build Batches=6，仍有6次lineitem重扫。32MB 下CSD=42491.859ms且结果一致；16MB超过55s未返回，当前最低验收内存32MB。Q9的性能仍未达到“接近host”的目标，后续需要分区Hash Join或probe物化，详见[开发记录](doc/development.md)。

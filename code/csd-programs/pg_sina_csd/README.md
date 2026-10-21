@@ -122,7 +122,9 @@ Q5/Q10 的 `n_name`、客户姓名/地址/电话/备注没有 SQL 常量约束�
 
 为不改变 `qs_cell`、Hash Join 记录和 Sort run 的固定布局，Q5 的短字符串仍内联在 16 字节 cell；Q10 超过 15 字节的字符串通过 `qs_result` 的 64KiB arena 回传，cell 保存 arena offset 和长度。PG 从 `groupClause` 去掉的 FD 输出列（如 Q10 的 `c_name/c_acctbal/c_address/c_phone/c_comment`）由规划端重新加入分组键；FD 保证不会拆分分组，设备端因此仍只哈希整数 ID，不需要变长 group record 或 FD payload 记录。
 
-当前字典按“列所在关系行数 >4096”选择大档，Q10 会插入 customer 全部 150k 行的字符串（约 19.6MB，20MB 区内）；超过容量时报设备错误，不回退。字符串 `ORDER BY` 仍保留原生路径；Q5/Q10 均按 revenue 排序，不受影响。Q10 后续若要支持更长/更大基数，需要 FD payload 或可 spill 字符串。
+当前字典按“列所在关系行数 >4096”选择大档，Q10 会插入 customer 全部 150k 行的字符串（约 19.6MB，20MB 区内）；超过容量时报设备错误，不回退。字符串 `ORDER BY` 由 Aggregate.source 在排序前把短字符串解析为 inline 字节序，长字符串仍回退；Q10 按 revenue 排序不受影响。
+
+Q9 增加第二组整数等值键（`build_key2/probe_key2`），build/probe 哈希和相等判断同时使用两个键；Q9 的 `partsupp` 因此按 `(ps_partkey,ps_suppkey)` 连接。`Q_YEAR` 在设备内把 PG date 转年份，`Q_PATTERN` 在 Scan 内处理 `%` 中间通配。Q9 目前仍受 build 组合重扫限制，详见开发记录。Q10 后续若要支持更长/更大基数，需要 FD payload 或可 spill 字符串。
 
 
 连接后过滤复用`filter.c`，与`aggregate.c`、`sort.c`一起编译进`pg-sina-join.so`。PG计划的`join.residual`保存剩余跨表条件的表达式索引加一（0表示没有）；这不是SNIA参数或FEMU接口。probe输出列批次后先应用此条件，再把选择向量交给聚合。过滤结束即释放临时workmem，聚合状态继续存活，因此预算仍需预留后续批次过滤空间。NEED_STORE/LOAD重入只恢复已经过滤的批次，不重复过滤或计数；统计和计时包含在probe入口内。

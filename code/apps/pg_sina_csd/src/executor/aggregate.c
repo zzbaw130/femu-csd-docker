@@ -96,6 +96,7 @@ static TupleTableSlot *execute(CustomScanState *node)
             break;
         }
         case 16:slot->tts_values[i]=BoolGetDatum(value.value!=0);break;
+        case 701:slot->tts_values[i]=Float8GetDatum((double)value.value);break;
         case 21:slot->tts_values[i]=Int16GetDatum((int16)value.value);break;
         case 23:case 1082:slot->tts_values[i]=Int32GetDatum((int32)value.value);break;
         case 20:if(value.value>PG_INT64_MAX || value.value<PG_INT64_MIN) elog(ERROR,"CSD bigint overflow");slot->tts_values[i]=Int64GetDatum((int64)value.value);break;
