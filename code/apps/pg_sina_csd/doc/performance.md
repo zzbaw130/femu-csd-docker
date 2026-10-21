@@ -703,4 +703,4 @@ CSD约4.7倍 host，性能未达标。同规模合成表（150k customer/1.5M or
 
 ## 阶段3m（部分）：Q18 HAVING（2026-10-22）
 
-Q18 使用 IN→HAVING 消解，小规模三表 host/CSD 结果逐字一致。SF1 规模 host Q18 可完成（104 行）；CSD 6M 在 120s 内未返回并导致 guest 失去响应。尚无 64MB/16MB/三轮性能数据，未标记完成。
+Q18 使用 IN→HAVING 消解，小规模三表 host/CSD 结果逐字一致。SF1 规模 host Q18 可完成（104 行）；单轮 host 6M=14905.102ms、CSD=15088.137ms，100行 cmp 通过；3轮冷启动再次导致 guest 失去响应，16MB/取消未完成，未标记完成。
