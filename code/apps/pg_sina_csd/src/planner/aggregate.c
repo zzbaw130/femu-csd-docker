@@ -177,7 +177,6 @@ static bool compile(PlannerInfo *root,Index rti,RelOptInfo *rel,struct qs_plan *
     }
     /* Columns assigned slots so far are needed by WHERE, including nested
      * arithmetic/OR/NULL tests. Later slots are only used after filtering. */
-    unsigned predicate_columns=p->ncols;
     foreach(cell,root->parse->groupClause) {
         if(p->nkeys==QS_KEYS) return false;
         TargetEntry *entry=get_sortgroupclause_tle(lfirst(cell),root->processed_tlist);
@@ -227,12 +226,12 @@ static bool compile(PlannerInfo *root,Index rti,RelOptInfo *rel,struct qs_plan *
         p->order[p->norder++]=(struct qs_order){index,descending,sort->nulls_first};
     }
     /* Late decoding pays off for selective filters. Keep the eager path when
-     * PG estimates at least half the rows survive (e.g. Q1). Only numeric
-     * conversion is expensive enough to defer with the current heap layout. */
+     * PG estimates at least half the rows survive (e.g. Q1). Predicate
+     * numerics are also lazy: AND/OR pass only needed rows to their children. */
     if(p->predicate>=0 && rel->rows<rel->tuples/2)
         for(unsigned i=0;i<p->nattrs;++i) {
             struct qs_column *c=&p->cols[i];
-            c->deferred=c->type==Q_DECIMAL && c->slot>=(int)predicate_columns;
+            c->deferred=c->type==Q_DECIMAL && c->slot>=0;
         }
     return limit_value(root->parse->limitCount,&p->limit) && limit_value(root->parse->limitOffset,&p->offset);
 }

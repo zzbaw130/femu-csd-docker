@@ -8,7 +8,7 @@
 /* Like DuckDB's typed SelectExpression loops: normalize a conjunction once,
  * then compare column vectors and emit only a selection vector. Other SQL
  * expressions retain the exact evaluator (including three-valued logic). */
-struct comparison { const int64_t *values; const unsigned char *nulls; int64_t constant; unsigned op; };
+struct comparison { const int64_t *values; const unsigned char *nulls; int64_t constant; unsigned op, expression; };
 static int comparisons(const struct qs_plan *p,struct qs_chunk *c,int index,
                        struct comparison *out,unsigned *count)
 {
@@ -37,7 +37,7 @@ static int comparisons(const struct qs_plan *p,struct qs_chunk *c,int index,
     }
     if(value<INT64_MIN || value>INT64_MAX) return 0;
     out[(*count)++]=(struct comparison){qs_values(c)+(size_t)slot*c->capacity,
-        qs_nulls(c)+(size_t)slot*((c->capacity+7)/8),(int64_t)value,op}; return 1;
+        qs_nulls(c)+(size_t)slot*((c->capacity+7)/8),(int64_t)value,op,(unsigned)(column-p->exprs)}; return 1;
 }
 static int matches(int64_t value,const struct comparison *p)
 {
@@ -83,20 +83,74 @@ static void select_avx2(struct qs_chunk *c,const struct comparison *predicates,u
     select_scalar(c,predicates,count,row);
 }
 #endif
+/* Keep the SIMD prefix (e.g. date bounds), then pass its selection through
+ * numeric predicates. Adjacent bounds on one column share a single decode;
+ * no boolean vectors or decoded copies are needed for this simple AND path. */
+static int select_deferred(const struct qs_plan *p,struct qs_chunk *c,const struct comparison *predicates,
+    unsigned count,unsigned prefix,const void *raw,uint64_t bytes)
+{
+    if(!raw) return -1;
+    if(prefix) {
+#if defined(__x86_64__) || defined(__i386__)
+        if(__builtin_cpu_supports("avx2")) select_avx2(c,predicates,prefix);
+        else
+#endif
+            select_scalar(c,predicates,prefix,0);
+    } else {
+        c->selected=c->rows;
+        for(unsigned i=0;i<c->rows;++i) qs_selection(c)[i]=i;
+    }
+    unsigned ends[QS_EXPRS];
+    for(unsigned k=prefix;k<count;k=ends[k]) {
+        ends[k]=k+1;
+        while(ends[k]<count && predicates[ends[k]].values==predicates[k].values) ++ends[k];
+    }
+    unsigned selected=c->selected; c->selected=0;
+    for(unsigned i=0;i<selected;++i) {
+        unsigned row=qs_selection(c)[i],k=prefix;
+        /* All remaining columns of this row are close in the original heap.
+         * Test them together instead of revisiting the raw block per column. */
+        for(;k<count;k=ends[k]) {
+            const struct comparison *test=&predicates[k];
+            const struct qs_column *col=&p->cols[p->exprs[test->expression].column];
+            if(test->nulls[row/8]&(1U<<(row%8))) break;
+            int64_t value=test->values[row];
+            if(col->deferred) {
+                struct qs_heap_ref ref; memcpy(&ref,&value,sizeof(ref));
+                if(ref.offset>bytes || ref.bytes>bytes-ref.offset) return -2;
+                unsigned scale;
+                if(qs_numeric_cents((const unsigned char *)raw+ref.offset,ref.bytes,&value,&scale)) return -2;
+            }
+            unsigned j=k;
+            for(;j<ends[k];++j) if(!matches(value,&predicates[j])) break;
+            if(j!=ends[k]) break;
+        }
+        if(k==count) qs_selection(c)[c->selected++]=row;
+    }
+    return 0;
+}
 int64_t pg_sina_filter(struct femu_csd_args *a)
 {
     if(!a || (a->numr!=2 && a->numr!=3) || a->mr_len[1]<(long long)sizeof(struct qs_plan)) return -1;
+    if(a->numr==3 && (a->mr_len[2]<0 || !a->mr_addr[2])) return -1;
     struct qs_chunk *c=a->mr_addr[0]; const struct qs_plan *p=a->mr_addr[1];
     if(a->mr_len[0]<(long long)sizeof(*c) || qs_chunk_bytes(c->capacity,c->ncols)>(uint64_t)a->mr_len[0] ||
         c->ncols!=p->ncols || c->rows>c->capacity || p->nattrs>QS_COLS || p->nexprs>QS_EXPRS) return -1;
     c->selected=0;
     struct comparison predicates[QS_EXPRS]; unsigned count=0;
     if(comparisons(p,c,p->predicate,predicates,&count) && count) {
+        unsigned prefix=0;
+        while(prefix<count && !p->cols[p->exprs[predicates[prefix].expression].column].deferred) ++prefix;
+        if(prefix<count) {
+            int status=select_deferred(p,c,predicates,count,prefix,a->numr==3?a->mr_addr[2]:NULL,a->numr==3?a->mr_len[2]:0);
+            if(status) return status;
+        } else {
 #if defined(__x86_64__) || defined(__i386__)
-        if(__builtin_cpu_supports("avx2")) select_avx2(c,predicates,count);
-        else
+            if(__builtin_cpu_supports("avx2")) select_avx2(c,predicates,count);
+            else
 #endif
-            select_scalar(c,predicates,count,0);
+                select_scalar(c,predicates,count,0);
+        }
     } else {
         uint8_t needed[QS_EXPRS]={0};
         if(qs_vector_require(p,p->predicate,needed)) return -2;
@@ -105,11 +159,12 @@ int64_t pg_sina_filter(struct femu_csd_args *a)
         if(!vectors) { cs_work_end(context); return -4; }
         for(unsigned first=0;first<c->rows;first+=QS_VECTOR_ROWS) {
             unsigned n=c->rows-first; if(n>QS_VECTOR_ROWS) n=QS_VECTOR_ROWS;
-            if(qs_vector_execute(p,c,NULL,first,n,needed,vectors)) { cs_work_end(context); return -2; }
+            if(qs_vector_execute_raw(p,c,NULL,first,n,needed,vectors,
+                a->numr==3?a->mr_addr[2]:NULL,a->numr==3?a->mr_len[2]:0)) { cs_work_end(context); return -2; }
             const struct qs_vector *result=&vectors[p->predicate];
             for(unsigned i=0;i<n;++i) {
                 if(result->errors[i]) { cs_work_end(context); return -2; }
-                if(!result->nulls[i] && result->values[i]) qs_selection(c)[c->selected++]=first+i;
+                if(!qs_vector_null(result,i) && qs_vector_value(result,i)) qs_selection(c)[c->selected++]=first+i;
             }
         }
         cs_work_end(context);

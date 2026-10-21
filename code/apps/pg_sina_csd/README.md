@@ -125,11 +125,11 @@ Guest PG：调用 SNIA SERIAL batch → Aggregate.source → Sort → Limit
 Guest PG：接收少量最终结果 → 转换 Datum → 返回客户端
 ```
 
-箭头中的 Scan/Filter/Aggregate/Sort/Limit 是设备 SO，运行在 FEMU CU；PG backend 仅编排请求，不扫描 heap、不计算聚合、不排序。原始 heap 通过 NVM→AFDM 内部路径读取，不经过 Guest 应用缓冲。列批次保留在 AFDM，哈希表等私有状态放在受限 workmem。借鉴 DuckDB 的所需列投影、selection vector、局部聚合后合并及公共子表达式复用；Filter 的列/常量比较（单条件或复合 AND）使用类型化列循环，支持 AVX2 时一次比较4个 int64。复杂过滤和聚合共用 `query_vector.h`：按每批256行、每个表达式处理列向量，复用公共子表达式；不再逐行递归解释。NULL、小数显示精度及溢出语义保持不变。向量化表示按批次执行；精确 int128 算术仍使用标量整数指令，未改成浮点数。
+箭头中的 Scan/Filter/Aggregate/Sort/Limit 是设备 SO，运行在 FEMU CU；PG backend 仅编排请求，不扫描 heap、不计算聚合、不排序。原始 heap 通过 NVM→AFDM 内部路径读取，不经过 Guest 应用缓冲。列批次保留在 AFDM，哈希表等私有状态放在受限 workmem。借鉴 DuckDB 的所需列投影、selection vector、局部聚合后合并及公共子表达式复用；Filter 的列/常量比较（单条件或复合 AND）使用类型化列循环，支持 AVX2 时一次比较4个 int64。复杂过滤和聚合共用 `query_vector.h`，每批最多256行：列引用直接使用原始列和 selection vector，常量只保存一份值，计算结果才物化为临时列。AND/OR 根据左侧结果将仍需判断的行传给右侧；共享表达式缓存每行已完成的结果，避免重复计算，也不会求值被短路忽略的表达式。AVX2 还用于无 NULL/错误批次的加减、乘法及通用比较；乘法要求两个输入均在 int32 范围内，产生精确 int64 结果，加减检查 int64 溢出。不满足条件时回退精确 int128 标量计算，保留 NULL、小数显示精度和溢出语义，不使用浮点近似。
 
 聚合先批量计算表达式和分组位置，再按聚合输入列更新状态；同一表达式的 SUM、AVG、COUNT 共用一份 sum/count，最终按各输出类型分别计算。无分组 COUNT(*) 按批次累加。表达式临时列通过 workmem 分配并复用，未把私有计算空间移入 AFDM。Scan 为常见 numeric 增加直接整数解码，其他格式仍走通用路径；小结果 Sort 排序行号后统一重排，Limit 仅调整结果范围。
 
-PG 估计过滤后保留的行数少于全表一半时，仅供过滤后分组或聚合使用的 numeric 列采用延迟解码：Scan 在列值槽中暂存原始 AFDM 数据的偏移和长度；Filter 先生成 selection vector，再只为通过的行转换这些 numeric。WHERE 表达式使用的列始终提前解码。Q6 因此只为匹配行转换 extendedprice；Q1 保留绝大多数行，仍采用提前解码。`EXPLAIN` 的 `CSD Deferred Columns` 显示延迟解码列数。这是当前的简单性能启发式；统计估计失准会影响收益，不影响结果。
+PG 估计过滤后保留的行数少于全表一半时，所需 numeric 列采用延迟解码：Scan 在列值槽中暂存原始 AFDM 数据的偏移和长度。Filter 执行 WHERE 时，仅解码当前条件仍需判断的行；简单 AND 先通过已解码列的 SIMD 比较，再依次处理存活行，同一列相邻的上下界共用一次 numeric 解码。复杂 AND/OR 也只把仍需判断的行传给后续表达式。过滤结束后，Filter 为最终存活行物化所有延迟列，供分组和聚合直接读取。Q6 的 quantity、discount、extendedprice 因此都可以延迟解码；Q1 保留绝大多数行，仍采用提前解码。`EXPLAIN` 的 `CSD Deferred Columns` 显示延迟解码列数。这是当前的简单性能启发式；统计估计失准会影响收益，不影响结果。
 
 Filter 的第三个 AFDM 参数是当前块的原始 heap 输入，复用 LOAD 已读入的缓冲，直到 Aggregate.sink 完成后才覆盖；不增加设备命令或 AFDM 分配。原始列位置仅在本分支中使用，不传回 Guest。Filter 计时包含筛选后的 numeric 解码，分析收益应比较 Scan 与 Filter 的合计 CPU 时间。此优化减少数值转换，不减少行存 heap 的内部读取字节数。
 

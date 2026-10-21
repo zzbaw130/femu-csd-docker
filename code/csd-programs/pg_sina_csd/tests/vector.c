@@ -64,7 +64,54 @@ static void expressions(void)
             }
         }
     }
+    /* A shared child needed only by a short-circuited RHS stays unevaluated.
+     * Requesting that child separately must still produce all of its rows. */
+    uint8_t needed[QS_EXPRS]={0};
+    assert(!qs_vector_require(&p,12,needed));
+    assert(!qs_vector_execute(&p,c,NULL,0,QS_VECTOR_ROWS,needed,vectors));
+    for(unsigned i=0;i<QS_VECTOR_ROWS;++i) assert(vectors[10].errors[i]==2);
+    assert(!qs_vector_require(&p,10,needed));
+    assert(!qs_vector_execute(&p,c,NULL,0,QS_VECTOR_ROWS,needed,vectors));
+    for(unsigned i=0;i<QS_VECTOR_ROWS;++i) assert(vectors[10].errors[i]!=2);
     free(vectors); free(c);
+}
+static void arithmetic(void)
+{
+    struct qs_plan p={.nattrs=2,.ncols=2,.nexprs=3};
+    for(unsigned i=0;i<2;++i) {
+        p.cols[i]=(struct qs_column){.slot=i,.type=Q_DECIMAL,.scale=2};
+        p.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.column=i,.type=Q_DECIMAL,.scale=2};
+    }
+    size_t bytes=qs_chunk_bytes(513,2); struct qs_chunk *c=calloc(1,bytes); assert(c);
+    c->capacity=c->rows=513; c->ncols=2;
+    struct qs_vector vectors[3];
+    for(unsigned variant=0;variant<4;++variant) {
+        for(unsigned i=0;i<c->rows;++i) {
+            qs_selection(c)[i]=c->rows-1-i;
+            qs_values(c)[i]=variant==0?(int64_t)i*314159-90000000:variant==1?INT64_MAX-i:variant==2?INT64_MIN+i:(int64_t)i-256;
+            qs_values(c)[c->capacity+i]=variant==0?(int64_t)i*1907-490000:variant==1?(int64_t)i+1:variant==2?-(int64_t)i-1:INT32_MIN;
+            qs_dscales(c)[i]=i%3; qs_dscales(c)[c->capacity+i]=(i+1)%3;
+        }
+        for(unsigned selected=0;selected<2;++selected) for(unsigned op=Q_ADD;op<=Q_GE;++op) {
+            p.exprs[2]=(struct qs_expr){.op=op,.left=0,.right=1,.type=Q_DECIMAL,.scale=op==Q_MUL?4:2};
+            uint8_t needed[QS_EXPRS]={0}; assert(!qs_vector_require(&p,2,needed));
+            for(unsigned first=0;first<c->rows;first+=QS_VECTOR_ROWS) {
+                unsigned n=c->rows-first; if(n>QS_VECTOR_ROWS) n=QS_VECTOR_ROWS;
+                assert(!qs_vector_execute(&p,c,selected?qs_selection(c):NULL,first,n,needed,vectors));
+                assert(vectors[0].kind==QS_REFERENCE && vectors[1].kind==QS_REFERENCE);
+#if defined(__x86_64__) || defined(__i386__)
+                if(variant==0 && __builtin_cpu_supports("avx2")) assert(vectors[2].kind==QS_NARROW);
+#endif
+                for(unsigned i=0;i<n;++i) {
+                    struct qs_eval e={.plan=&p,.chunk=c,.row=selected?qs_selection(c)[first+i]:first+i};
+                    struct qs_cell expected,actual=qs_vector_cell(&p,vectors,2,i);
+                    assert(!qs_evaluate(&e,2,&expected) && !vectors[2].errors[i]);
+                    assert(expected.value==actual.value && expected.scale==actual.scale && expected.dscale==actual.dscale);
+                }
+            }
+        }
+    }
+    free(c);
 }
 typedef int64_t (*function)(struct femu_csd_args *);
 static void aggregates(const char *path)
@@ -102,6 +149,6 @@ static void aggregates(const char *path)
 }
 int main(int argc,char **argv)
 {
-    assert(argc==2); expressions(); aggregates(argv[1]);
+    assert(argc==2); expressions(); arithmetic(); aggregates(argv[1]);
     puts("PASS batch expressions vs scalar, NULL/short-circuit/overflow, selection tails and shared aggregate states"); return 0;
 }

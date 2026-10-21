@@ -81,15 +81,16 @@ int64_t pg_sina_aggregate_sink(struct femu_csd_args *a)
             if(s->sum_required[j]) {
                 for(unsigned i=0;i<count;++i) {
                     if(values->errors[i]) return -5;
-                    if(values->nulls[i]) continue;
+                    if(qs_vector_null(values,i)) continue;
                     struct accumulator *v=&groups[i]->aggs[j]; ++v->count;
-                    if(__builtin_add_overflow(v->sum,values->values[i],&v->sum)) return -5;
-                    if(values->dscales[i]>v->dscale) v->dscale=values->dscales[i];
+                    if(__builtin_add_overflow(v->sum,qs_vector_value(values,i),&v->sum)) return -5;
+                    unsigned dscale=qs_vector_dscale(values,i);
+                    if(dscale>v->dscale) v->dscale=dscale;
                 }
             } else {
                 for(unsigned i=0;i<count;++i) {
                     if(values->errors[i]) return -5;
-                    if(!values->nulls[i]) ++groups[i]->aggs[j].count;
+                    if(!qs_vector_null(values,i)) ++groups[i]->aggs[j].count;
                 }
             }
         }

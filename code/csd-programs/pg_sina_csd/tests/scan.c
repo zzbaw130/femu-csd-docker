@@ -12,6 +12,7 @@ typedef int64_t (*function)(struct femu_csd_args *);
 static void write16(unsigned char *p,uint16_t v) { memcpy(p,&v,2); }
 static void write32(unsigned char *p,uint32_t v) { memcpy(p,&v,4); }
 static unsigned amount_offsets[62];
+static unsigned predicate_offsets[62];
 static void make_pages(unsigned char *raw)
 {
     for(unsigned page=0;page<2;++page) {
@@ -41,8 +42,9 @@ static void make_pages(unsigned char *raw)
                 write16(t+at,row); at+=2;
                 write16(t+at,scale==2?1200:scale==1?1000:0); at+=2;
             }
-            t[at++]=11; write16(t+at,0x8000); at+=2;
-            write16(t+at,row%3); /* predicate numeric, never deferred */
+            t[at++]=11; predicate_offsets[row]=page*QS_PAGE+offset+at;
+            write16(t+at,0x8000); at+=2;
+            write16(t+at,row%3);
         }
     }
 }
@@ -137,6 +139,25 @@ int main(int argc,char **argv)
     struct qs_heap_ref invalid={2*QS_PAGE-1,2};
     memcpy(&qs_values(late)[2*late->capacity+33],&invalid,sizeof(invalid));
     assert(filter_rows(filter,&p,late,bytes,raw)==-2);
+    /* Predicate numerics can be lazy too. Rejected rows must not be decoded,
+     * and OR must still evaluate its RHS when the left side is false. */
+    make_pages(raw); p.cols[2].deferred=0; p.cols[3].deferred=0;
+    assert(!scan_rows(scan,&p,eager,bytes,raw) && !filter_rows(filter,&p,eager,bytes,raw));
+    p.cols[2].deferred=p.cols[3].deferred=1;
+    assert(!scan_rows(scan,&p,late,bytes,raw) && !filter_rows(filter,&p,late,bytes,raw));
+    assert(eager->selected==late->selected);
+    for(unsigned i=0;i<eager->selected;++i) {
+        unsigned row=qs_selection(eager)[i]; assert(row==qs_selection(late)[i]);
+        for(unsigned col=0;col<3;++col) {
+            size_t at=(size_t)col*eager->capacity+row;
+            assert(qs_values(eager)[at]==qs_values(late)[at]);
+            assert(qs_dscales(eager)[at]==qs_dscales(late)[at]);
+        }
+    }
+    write16(raw+predicate_offsets[1],0xc000);
+    assert(!scan_rows(scan,&p,late,bytes,raw) && !filter_rows(filter,&p,late,bytes,raw));
+    p.exprs[6].op=Q_OR;
+    assert(!scan_rows(scan,&p,late,bytes,raw) && filter_rows(filter,&p,late,bytes,raw)==-2);
     free(eager); free(late); dlclose(scan_so); dlclose(filter_so);
     puts("PASS eager/late heap decoding, NULL/scales, numeric formats, SIMD/fallback selection, reuse and rejected values");
     return 0;

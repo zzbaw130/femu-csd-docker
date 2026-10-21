@@ -149,3 +149,13 @@ Scan为常见numeric增加直接整数转换；Sort交换行号后统一重排�
 复用csQueueBatchRequest/csPollEvent/csAbortRequest，不改FEMU、SNIA或设备算子ABI，不增加PG辅助线程、进程、代理、双缓冲或预取。SNIA库既有线程仅运行设备请求；PG API始终由backend调用。取消/错误时停止补充任务，尽可能撤销尚未开始的请求，收完所有在途完成事件，释放batch引用后才清理聚合状态及AFDM；已开始请求无法强制撤销，必须等其结束。
 
 EXPLAIN增加CSD Scheduling说明。Guest回归新增450000行多块表，覆盖COUNT、分组、选择性过滤、无匹配和尾块；投影异常numeric触发设备错误时验证其余请求排空后同backend可连续再次完整查询。Q1/Q6精确结果、取消和profile开关验证通过。冷启动对照见[性能分析](performance.md)。
+
+## 阶段1优化：按需解码、引用向量与算术 SIMD
+
+参考本地 DuckDB `execute_reference.cpp`、`execute_constant.cpp`、`execute_conjunction.cpp` 和 `binary_executor.hpp`。Guest PG 继续负责表达式规划，仅扩大现有选择性过滤启发式的适用范围：WHERE 所需的 numeric 也可以延迟解码。CSD Scan 继续输出相同 AFDM 列布局，记录原始 numeric 位置；设备 Filter 按条件判断实际需要的行，过滤结束后为最终存活行物化所有延迟列，再交给 Aggregate。
+
+简单 AND 保留已有已解码列的 SIMD 前缀，再单遍处理通过前缀的行：每行按顺序检查后续列，不通过就跳过该行剩余条件；同一列相邻的上下界只解码一次。这样减少多次遍历选择向量及重复访问原始 heap。复杂 AND/OR 按批次向子表达式传递仍需判断的行，保留 NULL 三值逻辑；共享表达式按行缓存，避免不同分支重复计算。单个表达式如果也被聚合或分组直接引用，会补齐该结果需要的行，不会误用另一个分支只计算了部分行的缓存。
+
+列向量直接引用 AFDM 原列与选择向量，常量仅保存一份，不再逐元素广播或把输入 int64 整列复制成 int128。计算结果才写入工作内存。AVX2 扩展到无 NULL/错误批次的加减、乘法和通用比较，支持列引用、常量和 int64 中间结果。加减检查溢出，乘法使用精确的 int32×int32→int64；不满足条件、NULL、非 AVX2 或需要更宽结果时回退精确 int128。聚合累加器仍为 int128，不以窄整数或浮点近似替代精确聚合。
+
+没有增加设备命令、SNIA 参数、AFDM 字段、调度框架或配置项，同一槽仍无下一块预取。设备测试对照原标量求值器，补充非连续选择、SIMD 尾部、正负 int64 边界和宽结果回退；真实 heap 测试确认被短路排除的 predicate numeric 不解码，实际需要时仍报错。结果与性能验收见[性能分析](performance.md)。
