@@ -667,3 +667,14 @@ Q7 的 nation n1/n2 是同一基表两个实例；设备按 RTI 分别描述列�
 | Q7/csd | 3676.067 / 3691.620 / 3619.526 | 3662.404 |
 
 Q7 均值约1.38倍；4行完整结果3轮cmp通过。profile Execution 3590.978ms、Build Batches=4、Internal Read 3931471872字节、Spill Write 66191360/Read 126287872字节、4 workers。16MB查询预算 CSD=8348.123ms，结果一致；200ms取消后同backend连续两次CSD COUNT均返回6001215。原始日志：Guest `/tmp/q7-bench.log`、`/tmp/q7.host.*.log`、`/tmp/q7.csd.*.log`、`/tmp/q7_16.log`。
+
+## 阶段3j：Q8 8表/7join（2026-10-22）
+
+Q8 的 8表/7join 在64MB单批完成；`sum(CASE...)/sum(...)` 由 final_expression 在分组后计算，CASE 条件使用静态字典。
+
+| 查询/路径 | 三轮 ms | 均值 ms |
+| --- | --- | ---: |
+| Q8/host | 2951.971 / 2393.437 / 2259.607 | 2535.005 |
+| Q8/csd | 846.824 / 859.838 / 901.284 | 869.315 |
+
+CSD 约快2.9倍；2行结果3轮cmp通过。profile Execution 807.220ms、Build Rows=1860055、Build Batches=1、Internal Read 1200168960字节、Spill 0、4 workers。16MB查询预算 CSD=11484.375ms，结果一致；200ms取消后同backend连续两次CSD COUNT均返回6001215。原始日志：Guest `/tmp/q8-bench.log`、`/tmp/q8.host.*.log`、`/tmp/q8.csd.*.log`、`/tmp/q8_16.log`。

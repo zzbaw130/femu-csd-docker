@@ -324,3 +324,11 @@ Q9提交后复核Q5/Q10（连接顺序/预算已变化）：Q5 host均值2275.09
 - 字符串 `ORDER BY` 使用短字符串 inline 字节序；Q7 的 `supp_nation,cust_nation,l_year` 排序在设备完成。
 
 验收：Q7 4行结果与host逐字一致（3轮cmp通过）。默认64MB冷启动三轮host=3251.633/2329.948/2404.706ms（均值2662.096），CSD=3676.067/3691.620/3619.526ms（均值3662.404），约1.38倍。Q7 profile：Build Batches=4、Internal Read 3931471872字节、Spill Write 66191360/Read 126287872字节、4 workers、Execution 3590.978ms。16MB查询预算CSD=8348.123ms，结果一致。200ms取消后同backend连续两次CSD COUNT均返回6001215。复现入口`tests/pg-sina-csd-test.sh join|join-bench`，SQL位于`tests/q7.sql`。
+
+## 阶段3j：Q8 8表/7join 与聚合比值（2026-10-22）
+
+- Q8 的 8 张表合计60列，设备计划列上限64，`describe`/join绑定支持满7级build；nation n1/n2 两个RTE按RTI独立绑定。
+- `p->nkeys` 非空时，输出若包含聚合表达式（`contain_aggs_of_level`），走 `final_expression` 生成分组后的标量树；Q8 的 `sum(CASE...)/sum(volume)` 编译为 `Q_DIV(Q_AGGREF,Q_AGGREF)`，不再要求输出必须是裸Aggref或分组键。
+- CASE 条件 `nation='JORDAN'` 使用静态字典；p_type/r_name 过滤同路径。
+
+验收：Q8 2行结果与host逐字一致（3轮cmp通过）。默认64MB冷启动三轮host=2951.971/2393.437/2259.607ms（均值2535.005），CSD=846.824/859.838/901.284ms（均值869.315），CSD约快2.9倍。Q8 profile：Build Rows=1860055、Build Batches=1、Internal Read 1200168960字节、Spill 0、4 workers、Execution 807.220ms。16MB查询预算CSD=11484.375ms，结果一致。200ms取消后同backend连续两次CSD COUNT均返回6001215。复现入口同上，SQL位于`tests/q8.sql`。

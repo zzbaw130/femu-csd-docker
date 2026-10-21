@@ -126,7 +126,9 @@ Q5/Q10 的 `n_name`、客户姓名/地址/电话/备注没有 SQL 常量约束�
 
 Q9 增加第二组整数等值键（`build_key2/probe_key2`），build/probe 哈希和相等判断同时使用两个键；Q9 的 `partsupp` 因此按 `(ps_partkey,ps_suppkey)` 连接。`Q_YEAR` 在设备内把 PG date 转年份，`Q_PATTERN` 在 Scan 内处理 `%` 中间通配。Q9 目前仍受 build 组合重扫限制，详见开发记录。
 
-Q7 验证同一基表的两个 RangeTblEntry（nation n1/n2）：规划按 RTI 分别绑定列区间，连接链保留两个实例；OR 字符串等值使用静态字典，未知字符串在结果输出时报错，不做静默合并。Q7 的短字符串分组/排序由运行期/静态字典 ID 完成。Q10 后续若要支持更长/更大基数，需要 FD payload 或可 spill 字符串。
+Q7 验证同一基表的两个 RangeTblEntry（nation n1/n2）：规划按 RTI 分别绑定列区间，连接链保留两个实例；OR 字符串等值使用静态字典，未知字符串在结果输出时报错，不做静默合并。Q7 的短字符串分组/排序由运行期/静态字典 ID 完成。
+
+Q8 进一步支持 8 表/7 join，并在有分组键时把 `sum(CASE...)/sum(...)` 编译成分组后的 `Q_DIV(Q_AGGREF,Q_AGGREF)`；CASE 条件使用静态字典，结果按分组键排序后返回。Q10 后续若要支持更长/更大基数，需要 FD payload 或可 spill 字符串。
 
 
 连接后过滤复用`filter.c`，与`aggregate.c`、`sort.c`一起编译进`pg-sina-join.so`。PG计划的`join.residual`保存剩余跨表条件的表达式索引加一（0表示没有）；这不是SNIA参数或FEMU接口。probe输出列批次后先应用此条件，再把选择向量交给聚合。过滤结束即释放临时workmem，聚合状态继续存活，因此预算仍需预留后续批次过滤空间。NEED_STORE/LOAD重入只恢复已经过滤的批次，不重复过滤或计数；统计和计时包含在probe入口内。

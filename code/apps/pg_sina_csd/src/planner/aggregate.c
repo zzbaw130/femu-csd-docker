@@ -524,6 +524,11 @@ static bool compile(PlannerInfo *root,List *relations,List *joins,List *quals,st
         } else if(!p->nkeys) {
             out->index=final_expression((Node *)entry->expr,rti,p); out->aggregate=2;
             if(out->index<0) return false;
+        } else if(contain_aggs_of_level((Node *)entry->expr,0)) {
+            /* Ratios such as Q8 sum(CASE...)/sum(volume) combine aggregate
+             * values after grouping; compile them as a final scalar tree. */
+            out->index=final_expression((Node *)entry->expr,rti,p); out->aggregate=2;
+            if(out->index<0) return false;
         } else {
             unsigned i=0; ListCell *key;
             foreach(key,key_exprs) {
