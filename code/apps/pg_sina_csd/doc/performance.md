@@ -700,3 +700,7 @@ Q13 采用 NULL 垫底行 + nested source 二级聚合，41行结果3轮cmp通�
 | Q13/csd | 5631.952 / 5418.754 / 5892.680 | 5647.795 |
 
 CSD约4.7倍 host，性能未达标。同规模合成表（150k customer/1.5M orders）32MB查询预算完成，CSD=11941.874ms；16MB长时间不返回，最低验收内存暂定32MB；Q13 profile未采集。原始日志：Guest `/tmp/q13_host_*.log`、`/tmp/q13_csd_*.log`。
+
+## 阶段3m（部分）：Q18 HAVING（2026-10-22）
+
+Q18 使用 IN→HAVING 消解，小规模三表 host/CSD 结果逐字一致。SF1 规模装载阶段 guest 失去响应，尚无 64MB/16MB/三轮性能数据，未标记完成。

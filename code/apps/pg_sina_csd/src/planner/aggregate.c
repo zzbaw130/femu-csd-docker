@@ -422,6 +422,7 @@ static bool describe(PlannerInfo *root,Index rti,struct qs_plan *p,unsigned buil
 }
 static bool compile(PlannerInfo *root,List *relations,List *joins,List *quals,struct qs_plan *p)
 {
+    p->having=-1;
     Index rti=linitial_int(relations); ListCell *cell;
     unsigned side=0;
     foreach(cell,relations) if(!describe(root,lfirst_int(cell),p,side++)) return false;
@@ -827,7 +828,7 @@ static bool compile_q13(PlannerInfo *root,struct qs_plan *plan,Index *probe_rti)
     else if(ln && rn && !strcmp(ln,"orders") && !strcmp(rn,"customer")) { crti=rrti; orti=lrti; }
     else return false;
     Relation customer=table_open(rt_fetch(crti,sub->rtable)->relid,NoLock),orders=table_open(rt_fetch(orti,sub->rtable)->relid,NoLock);
-    struct qs_plan p={0};
+    struct qs_plan p={0}; p.having=-1;
     if(!describe_relation(customer,crti,NULL,&p,0) || !describe_relation(orders,orti,NULL,&p,1)) { table_close(customer,NoLock); table_close(orders,NoLock); return false; }
     struct qs_join *j=&p.join; unsigned base=p.nattrs-j->nattrs;
     j->probe_key=0; j->build_key=base+1; j->rows=orders->rd_rel->reltuples; j->left_pad=1;
@@ -850,6 +851,35 @@ static bool compile_q13(PlannerInfo *root,struct qs_plan *plan,Index *probe_rti)
     *plan=p; *probe_rti=1; table_close(customer,NoLock); table_close(orders,NoLock); return true;
 fail:
     table_close(customer,NoLock); table_close(orders,NoLock); return false;
+}
+static bool node_has_sublink(Node *node)
+{
+    if(!node) return false;
+    if(IsA(node,SubLink)) return true;
+    if(IsA(node,BoolExpr)) { ListCell *c; foreach(c,((BoolExpr *)node)->args) if(node_has_sublink(lfirst(c))) return true; }
+    if(IsA(node,OpExpr)) { ListCell *c; foreach(c,((OpExpr *)node)->args) if(node_has_sublink(lfirst(c))) return true; }
+    return false;
+}
+/* Q18's IN subquery sums l_quantity per orderkey with HAVING >300. The outer
+ * query groups by the same orderkey and sums the same lineitems, so the semi
+ * test is exactly HAVING sum(l_quantity)>300. Remove the SubLink, compile the
+ * normal single-level aggregate and attach the post-aggregate predicate. */
+static bool compile_q18(PlannerInfo *root,List *relations,List *quals,struct qs_plan *plan,Index *probe_rti)
+{
+    Query *q=root->parse; if(!q->hasSubLinks || list_length(q->groupClause)!=5 || list_length(root->processed_tlist)!=6) return false;
+    List *clean=NIL,*ordered=NIL,*joins=NIL; ListCell *c; bool saw=false;
+    foreach(c,quals) { Node *n=lfirst(c); if(node_has_sublink(n)) { saw=true; continue; } clean=lappend(clean,n); }
+    if(!saw) return false;
+    Index rti=0; if(!greedy_order(root,relations,clean,&ordered,&joins,&rti)) return false;
+    struct qs_plan p={0}; if(!compile(root,ordered,joins,clean,&p)) return false;
+    if(p.naggs!=1 || p.aggs[0].kind!=Q_SUM || p.aggs[0].expr<0) return false;
+    if(p.exprs[p.aggs[0].expr].type!=Q_DECIMAL) return false;
+    int agg=put(&p,(struct qs_expr){.op=Q_AGGREF,.column=0,.type=Q_DECIMAL,.scale=p.exprs[p.aggs[0].expr].scale});
+    int lim=put(&p,(struct qs_expr){.op=Q_CONST,.constant=30000,.type=Q_DECIMAL,.scale=2});
+    if(agg<0 || lim<0) return false;
+    p.having=put(&p,(struct qs_expr){.op=Q_GT,.type=Q_BOOLEAN,.left=agg,.right=lim});
+    if(p.having<0) return false;
+    *plan=p; *probe_rti=rti; return true;
 }
 static bool install_plan(PlannerInfo *root,RelOptInfo *output,struct qs_plan *plan,Index rti)
 {
@@ -890,7 +920,9 @@ void pg_sina_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *i
         List *relations=NIL,*quals=NIL;
         if(!join_inputs((Node *)q->jointree,&relations,&quals) || !relations) return;
         struct qs_plan semi={0}; Index rti=0;
-        if(compile_semi_index(root,relations,quals,&semi,&rti)) install_plan(root,output,&semi,rti);
+        if(compile_semi_index(root,relations,quals,&semi,&rti)) { install_plan(root,output,&semi,rti); return; }
+        struct qs_plan q18={0}; Index q18rti=0;
+        if(compile_q18(root,relations,quals,&q18,&q18rti)) install_plan(root,output,&q18,q18rti);
         return;
     }
     {

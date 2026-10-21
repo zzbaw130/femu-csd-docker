@@ -62,6 +62,7 @@ struct qs_plan {
     unsigned external_aggregate;
     unsigned nested; /* First-level groups are re-aggregated by nested_key_agg. */
     int nested_key_agg;
+    int having; /* Post-aggregate boolean expression. */
     struct qs_join join; /* First build; its work_mem_bytes is the total build reservation. */
     unsigned njoins;
     struct qs_join extra_joins[QS_JOINS-1];

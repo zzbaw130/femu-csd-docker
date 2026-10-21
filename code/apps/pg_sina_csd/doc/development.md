@@ -348,3 +348,11 @@ Q9提交后复核Q5/Q10（连接顺序/预算已变化）：Q5 host均值2275.09
 - 小库 q13_test 与 10 万客户/100 万订单场景验证通过后，再接 TPCH 主库。
 
 验收：Q13 41行结果与host逐字一致（3轮cmp通过）。64MB冷启动三轮host=1312.491/1134.331/1150.842ms（均值1199.221），CSD=5631.952/5418.754/5892.680ms（均值5647.795），约4.7倍。同规模合成表（150k customer/1.5M orders）在32MB查询预算完成（11941.874ms）；16MB查询预算长时间不返回，当前最低验收内存为32MB；性能和16MB小内存仍未达标。Q13 profile未在崩溃前采集。SQL位于`tests/q13.sql`。
+
+## 阶段3m（部分）：Q18 IN 消解为 HAVING（2026-10-22）
+
+- Q18 的 IN 子查询对 lineitem 按 orderkey 求和 `>300`；外层主查询同样按 orderkey 汇总同一批 lineitem，因此 IN 等价于主聚合后的 `HAVING sum(l_quantity)>300`。
+- 设备计划增加 post-aggregate `having` 表达式；`finalize_group` 在输出前用 Q_AGGREF 求值，不满足的组直接跳过。
+- Q18 专用 planner 移除 SubLink、编译正常三表聚合，并附加 Q_GT(Q_AGGREF,300)。
+- 验证：10k customer/20k orders/60k lineitem 测试表上 host/CSD 结果逐字一致，LIMIT 100 通过。
+- 未完成：SF1 规模三表装载时 guest NVMe I/O 失去响应，尚未做 64MB 三轮、16MB、取消和延迟记录；Q18 暂不能标记完成。

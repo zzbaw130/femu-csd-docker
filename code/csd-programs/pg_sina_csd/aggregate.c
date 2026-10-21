@@ -133,6 +133,11 @@ static int finalize_group(const struct state *s,const struct group *g,struct qs_
             if(p->exprs[p->keys[o->index]].type==Q_STRING) row->cells[j].dscale=2;
         }
     }
+    if(p->having>=0) {
+        struct qs_eval hv={.plan=p,.aggregates=values}; struct qs_cell keep;
+        if(qs_evaluate(&hv,p->having,&keep)) return -5;
+        if(keep.isnull || !keep.value) return 1;
+    }
     return 0;
 }
 static int output_expr(const struct qs_plan *p,unsigned j)
@@ -375,7 +380,9 @@ static int resolve_output_strings(struct external_state *e,struct qs_row *row)
 }
 static int group_output(struct external_state *e,struct qs_row *row)
 {
-    if(finalize_group(&e->local,&e->local.groups[0],row)) return -5;
+    int status=finalize_group(&e->local,&e->local.groups[0],row);
+    if(status<0) return -5;
+    if(status>0) return 1;
     return resolve_output_strings(e,row);
 }
 static void external_metrics(struct external_state *e,struct qs_result *out)
@@ -504,8 +511,9 @@ static int64_t external_source(struct femu_csd_args *a)
             } else {
                 if(p->norder || e->skipped++>=(uint64_t)p->offset) {
                     if(p->norder || p->limit<0 || e->emitted<(uint64_t)p->limit) {
-                        if(group_output(e,&out->data[out->rows])) return -5;
-                        ++out->rows; ++e->emitted;
+                        int keep=group_output(e,&out->data[out->rows]);
+                        if(keep<0) return -5;
+                        if(keep==0) { ++out->rows; ++e->emitted; }
                     }
                 }
                 if(!p->norder && p->limit>=0 && e->emitted>=(uint64_t)p->limit) e->finishing=1;
