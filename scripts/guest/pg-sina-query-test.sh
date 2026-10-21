@@ -22,7 +22,10 @@ case ${1:-query} in
                 -c "EXPLAIN (COSTS OFF) $sql" > "$RESULTS/$name.plan"
             if [[ $name == unsupported_* ]]; then ! grep -q 'Custom Scan (SniaCsd' "$RESULTS/$name.plan";
             elif [[ $name == string_* ]]; then grep -q 'CSD String Literals:' "$RESULTS/$name.plan";
-            else grep -q 'CSD Join: inner integer hash join' "$RESULTS/$name.plan"; fi
+            else
+                grep -q 'CSD Join: inner integer hash join' "$RESULTS/$name.plan"
+                grep -q 'CSD Build Scheduling: parallel scan/filter; single hash writer' "$RESULTS/$name.plan"
+            fi
             run_cold host "$sql" "$RESULTS/$name.host"
             csd_sql=$sql
             if [[ $name == join_small_* ]]; then csd_sql="SET pg_sina_csd.max_memory='4MB'; $sql"; fi
@@ -59,6 +62,7 @@ case ${1:-query} in
                 -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path=csd" \
                 -c "EXPLAIN (COSTS OFF) $sql" > "$RESULTS/$query.plan"
             grep -q 'CSD Join: inner integer hash join' "$RESULTS/$query.plan"
+            grep -q 'CSD Build Scheduling: parallel scan/filter; single hash writer' "$RESULTS/$query.plan"
             run_cold host "$sql" "$RESULTS/$query.host"
             memories=(4 64); if [[ $query == q12 ]]; then memories=(16 64); fi
             for memory in "${memories[@]}"; do
@@ -71,7 +75,8 @@ case ${1:-query} in
             printf '\\set ON_ERROR_STOP off\n'
             printf 'SELECT sum(b.bad) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k;\n'
             printf 'SELECT sum(p.bad) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k;\n'
-            printf "SET statement_timeout='100ms';\n%s\nSET statement_timeout=0;\n" "$sql"
+            # Leave setup time so cancellation reaches Q12's parallel build.
+            printf "SET statement_timeout='300ms';\n%s\nSET statement_timeout=0;\n" "$sql"
             printf '\\set ON_ERROR_STOP on\n'
             printf 'SELECT count(*) FROM snia_join_build;\nSELECT count(*) FROM snia_join_build;\n'
         } > "$RESULTS/cleanup.sql"

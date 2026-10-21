@@ -222,3 +222,15 @@ Q12通过PG表达式树生成两侧Scan/Filter、Hash Join和分组流水线。o
 Guest完整Join/字符串回归通过，包括4MB高基数分组、source多次输出、早关游标/错误/取消后同backend复用；Q12在16/64MB、Q14在4/64MB下与host逐字一致。原有query/profile回归也通过。最终冷启动各3轮：Q12 host=2022.529ms、CSD=3431.078ms，当前没有加速；Q1为4409.330/949.128ms，Q6为1489.840/758.201ms，Q14为1770.129/687.198ms。Q1/Q6第三轮CSD偏高，完整样本及中位数一并保留。
 
 Q12方向调整将内部读取从约2.98GB降至1.14GB、CSD均值从3819.775ms降至3431.078ms，但build侧Scan/Filter仍为单槽，独立profile的Build Wall约3204ms，成为主要瓶颈。4MB高基数场景另有明显归并读取放大，需要多轮归并/分区。详细样本和资源统计见[性能分析](performance.md)；不将完整卸载等同于已经获得加速。
+
+## 阶段3b.2：并行build扫描（2026-10-22）
+
+上一阶段Q12的Build Wall约3204ms，主要是单槽heap扫描与过滤，HashJoin.build本身仅约8ms。本阶段参考本地DuckDB `pipeline_executor.cpp`的独立执行状态和`physical_hash_join.cpp`的局部输入/合并边界，复用PG已有执行槽：每槽一个SERIAL batch执行LOAD→Scan→Filter，PG通过SNIA完成事件领取已完成列批次，用一个独立的单条目batch执行HashJoin.build，然后立即为该槽补入下一个输入块。没有四块一轮的等待屏障。
+
+本实现仍只有一个共享哈希表写入者，没有照搬DuckDB的每线程局部哈希表。其他槽的扫描/过滤可以在追加或spill时继续运行；同一个槽只有在追加结束后才能复用输入缓冲。单条目build batch继续由SNIA自动处理NEED_STORE重入。build结束后排空所有槽，释放其batch，清零输入长度，再切换为原有并行probe；计时缓冲累计保留。错误或取消沿用现有在途请求排空与设备状态回收，不新增代理、设备接口、内存参数或AFDM状态字段。
+
+`EXPLAIN`增加`CSD Build Scheduling: parallel scan/filter; single hash writer`；README同步说明PG调度与设备计算的边界。该调度属于跨槽并行，没有在一个槽内加入下一块的双缓冲读算重叠。
+
+验收：PG扩展在Guest重新编译安装；完整join回归34项检查通过，包括两侧过滤、重复键、空build、4MB双重spill、结果分页、字符串回退、报错/取消/提前关闭后的同backend复用。另以300ms超时取消完整Q12，随后同backend连续两次CSD COUNT均得到6001215。测试脚本的Join取消时间同步改为300ms，给程序加载留出时间，覆盖并行build阶段。
+
+独立冷启动各3轮，完整输出一致：Q12 host/CSD均值1924.764/1199.416ms，Q14为1646.389/641.160ms。Q12第二轮CSD为1438.838ms，已保留。单独profile确认Build Wall从上一阶段3204.146ms降至834.015ms，内部读取仍1135394816字节且无spill。设备CSF未修改，不重复其上一阶段容量/sanitizer测试；完整数据和限制见[性能分析](performance.md)。本阶段没有增加完整TPC-H Query覆盖，后续仍需扩展多表Join、一般字符串、HAVING及子查询。

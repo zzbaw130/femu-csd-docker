@@ -450,3 +450,24 @@ Q12当前CSD约为host的1.70倍延迟，未获得加速；Q1/Q6/Q14仍有收益
 独立设备压力测试扩大到1471273个连接组合、7001个潜在分组。4MiB池及64MiB池内4MiB查询预算均通过，峰值3562368字节，build分3批，STORE 1143次、LOAD 188408次；64MiB预算无spill。实际分配及结束时零残留均断言。恢复游标在build workmem中，每槽独占并隔开缓存行；AFDM只传槽编号、句柄和统计。
 
 Guest的1289854组合测试，在4MB预算下用2槽，build分3批，source汇总487个run、478个spill run；写65601536字节、读12875333632字节，池峰值3551664字节，profile耗时26245.991ms。数据为`/tmp/pg-snia-q12-small-groups-profile.json`。其中build自身写/读约2.8MiB，其余主要是部分状态归并；源数据与状态并非真的有12GiB，而是小读缓存交错访问导致反复LOAD。结果和内存界限通过，不代表这种低内存场景具备良好性能。多轮归并或分区仍是需要解决的性能限制，不能用提高默认内存掩盖。
+
+## 阶段3b.2：并行build扫描（2026-10-22）
+
+保持同一Guest、4 CU、64MiB AFDM和64MB查询/物理workmem上限。先完成Guest回归，再单独执行`join-bench`；host/CSD交替各3轮，每次停止PG、清Guest页缓存并启动，profile关闭，每轮完整结果逐字一致。原生PG的work_mem与并行设置不变。没有同时运行编译、其他回归或sanitizer。
+
+| 查询/路径 | 三轮 ms | 均值 ms | 中位数 ms |
+| --- | --- | ---: | ---: |
+| Q12/host | 1868.417 / 2033.948 / 1871.927 | 1924.764 | 1871.927 |
+| Q12/csd | 1077.520 / 1438.838 / 1081.889 | 1199.416 | 1081.889 |
+| Q14/host | 2037.881 / 1475.466 / 1425.821 | 1646.389 | 1475.466 |
+| Q14/csd | 609.213 / 665.657 / 648.609 | 641.160 | 648.609 |
+
+本轮Q12按均值约1.60倍加速，Q14约2.57倍。Q12第二轮CSD偏高，保留全部样本；中位数比约1.73倍。上一阶段Q12 CSD均值3431.078ms，本轮1199.416ms，但两组host延迟也有变化，因此应结合下面的分阶段计时确认收益，不能把跨组均值比当成严格同条件的孤立微基准。Q1/Q6的执行代码没有变化，本阶段未重测其延迟，沿用上一节记录时须保留测量日期。
+
+另行冷启动的Q12 profile：Setup=99.355ms，Build Wall=834.015ms，probe阶段=137.332ms，source=0.467ms，Cleanup=7.940ms，Total=1079.109ms。上一阶段独立profile的Build Wall为3204.146ms。4槽并行build后，build阶段仍约占本次总时间77%，但已经明显缩短。Scan累计CU CPU=1446.165ms、Filter=1082.987ms；HashJoin.build为220次、CPU=8.781ms，load=1.036ms，probe+Aggregate=136.848ms。累计CPU包含并发工作，不能与墙钟直接相加。
+
+输入和算法结果保持一致：build为lineitem的6001215行，probe为orders的1500000行，连接30988行，271块、1个驻内存build批次；内部读取1135394816字节，AFDM51761152字节，无spill，设备返回的池峰值4312880字节。没有降低读取量、提前终止或跳过聚合来取得本阶段收益。哈希写入成本很小，继续增加并发写入和局部哈希合并暂无测量依据；扫描解码、过滤及调度开销仍是主要优化方向。低预算部分状态归并的读取放大仍未解决。
+
+Guest完整`join`回归34项检查通过，覆盖重复键、空build、两侧过滤、4MB build与分组双重spill、多页输出、字符串/原生回退，以及错误/取消/提前关闭后同backend复用。另以300ms超时取消完整Q12，再在同一backend连续两次CSD COUNT得到6001215，验证并行build在途请求排空后可继续使用。未修改设备CSF，未重复运行其上一阶段已通过的24项CTest和19项ASan/UBSan；本阶段重新编译安装PG扩展并执行真实Guest调度路径。
+
+日志：主机`/tmp/pg-snia-parallel-build-join.log`、`/tmp/pg-snia-parallel-build-bench.log`、`/tmp/pg-snia-parallel-build-q12-profile.json`、`/tmp/pg-snia-parallel-build-cancel.log`；Guest回归目录`/tmp/pg-sina-queries.cslVMo`、测量目录`/tmp/pg-sina-queries.fBBPOM`。FEMU PCIe带宽模型未启用等既有限制仍适用；这是当前仿真环境对照，不代表真实设备或等总内存、等核数测试。

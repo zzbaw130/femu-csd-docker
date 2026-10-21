@@ -145,6 +145,7 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     if(p->join.relid) {
         ExplainPropertyText("CSD Join","inner integer hash join; build-batch replay",es);
         ExplainPropertyText("CSD Build Relation",get_rel_name(p->join.relid),es);
+        ExplainPropertyText("CSD Build Scheduling","parallel scan/filter; single hash writer",es);
         appendStringInfoString(&graph,"Build: LOAD -> Scan");
         if(p->join.predicate>=0) appendStringInfoString(&graph," -> Filter");
         appendStringInfoString(&graph," -> HashJoin.build; each batch: HashJoin.load; Probe: ");

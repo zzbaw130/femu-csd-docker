@@ -264,12 +264,15 @@ bash tests/pg-sina-csd-test.sh aggregate-bench
 
 ```text
 Guest PG编排；以下数据算子在FEMU CU执行：
-build表 LOAD → Scan → Filter（可选）→ HashJoin.build
+build表：多个独立槽 LOAD → Scan → Filter（可选）
+        完成一块 → 单写入者 HashJoin.build → 该槽领取下一块
 每个build批次：
     HashJoin.load（驻内存时无需I/O；spill批次通过NEED_LOAD载入）
     probe表 LOAD → Scan → Filter（可选）→ HashJoin.probe → Aggregate.sink
 Aggregate.source → 分组归并/结果排序（按需）或标量数值表达式 → 结果
 ```
+
+build侧复用最多4个独立执行槽并行LOAD/Scan/Filter；完成一个槽后，PG用该槽的列批次提交一次HashJoin.build，再补入下一块，不等待其余槽。HashJoin.build仍单写入：追加或spill期间，其他槽可扫描/过滤，但不能同时修改共享哈希表。所有build输入消费完毕后才开始probe；错误/取消先排空在途扫描，再释放设备状态。`EXPLAIN`中的`CSD Build Scheduling`说明这个调度方式。没有为单槽加入双缓冲预取。
 
 HashJoin.build只保存投影后的键和载荷，哈希桶和记录位于workmem。查询预算一半给共享build状态，另一半由probe/聚合执行槽分摊，实际设备池仍是硬上限。build状态放不下时以64KiB块返回NEED_STORE，SNIA执行内部AFDM→NVM；重入后把token保存在设备私有批次描述中。PG只读回批次数，不读取哈希表或中间行。所有probe完成后才能载入下一批，避免并发改写共享哈希表。
 

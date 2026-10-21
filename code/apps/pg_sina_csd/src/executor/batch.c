@@ -261,32 +261,67 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     uint64_t cursor=0; bool empty_pending=!request->bytes;
     if(profiling) { uint64_t now=clock_ns(); stats.setup_ns=now-phase; phase=now; }
     if(joining) {
-        TRY(csAllocBatchRequest(CS_BATCH_SERIAL,4,&build_batch));
-        CS_BATCH_INDEX load_index=0,previous=0,current=0;
-        uint64_t at=0; bool first=true;
-        do {
+        /* Parallel scan/filter slots feed one build writer. Other slots may
+         * compute while it appends or spills, but cannot mutate the hash state. */
+        TRY(csAllocBatchRequest(CS_BATCH_SERIAL,1,&build_batch));
+        CS_BATCH_INDEX current=0,append_index=0;
+        uint64_t at=0; bool empty_build=!build.bytes,first_build=true;
+        for(;;) {
             if(QueryCancelPending || ProcDiePending) goto cleanup;
-            unsigned bytes=build.bytes-at<chunk?build.bytes-at:chunk;
-            TRY(copy(tasks[0],offsetof(struct qs_task,input_bytes),&bytes,sizeof(bytes),1));
-            if(bytes) {
-                build_storage_request(load,device,input[0],&build,build_extents,at,bytes);
-                if(first) { TRY(csConfigureBatchEntry(build_batch,CS_BATCH_ADD,load,0,0,&load_index)); previous=load_index; }
-                else TRY(csConfigureBatchEntry(build_batch,CS_BATCH_RECONFIG,load,load_index,0,NULL));
-            }
-            if(first) {
-                CS_MEM_HANDLE scan[]={input[0],scan_mem,vectors[0],tasks[0]}; compute_request(compute,programs[SCAN].function,scan,4,counters[0]);
-                TRY(csConfigureBatchEntry(build_batch,CS_BATCH_ADD,compute,0,previous,&current)); previous=current;
-                if(build_plan.predicate>=0) {
-                    CS_MEM_HANDLE filter[]={vectors[0],scan_mem,input[0]}; compute_request(compute,programs[FILTER].function,filter,3,counters[0]);
-                    TRY(csConfigureBatchEntry(build_batch,CS_BATCH_ADD,compute,0,previous,&current)); previous=current;
+            for(unsigned i=0;i<workers;++i) {
+                struct slot *slot=&slots[i];
+                if(slot->request || (at>=build.bytes && !empty_build)) continue;
+                empty_build=false;
+                unsigned bytes=build.bytes-at<chunk?build.bytes-at:chunk;
+                if(bytes!=slot->bytes) {
+                    TRY(copy(tasks[i],offsetof(struct qs_task,input_bytes),&bytes,sizeof(bytes),1));
+                    slot->bytes=bytes;
                 }
-                CS_MEM_HANDLE memory[]={vectors[0],plan_mem,join_mem,input[0]}; compute_io_request(compute,programs[JOIN_BUILD].function,memory,4,counters[0]);
-                TRY(csConfigureBatchEntry(build_batch,CS_BATCH_ADD,compute,0,previous,&current));
-                first=false;
+                bool first=!slot->batch;
+                if(first) TRY(csAllocBatchRequest(CS_BATCH_SERIAL,3,&slot->batch));
+                if(bytes) {
+                    build_storage_request(load,device,input[i],&build,build_extents,at,bytes);
+                    if(first) TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_ADD,load,0,0,&slot->load));
+                    else TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_RECONFIG,load,slot->load,0,NULL));
+                }
+                if(first) {
+                    CS_BATCH_INDEX previous=slot->load;
+                    CS_MEM_HANDLE scan[]={input[i],scan_mem,vectors[i],tasks[i]}; compute_request(compute,programs[SCAN].function,scan,4,counters[i]);
+                    TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_ADD,compute,0,previous,&current)); previous=current;
+                    if(build_plan.predicate>=0) {
+                        CS_MEM_HANDLE filter[]={vectors[i],scan_mem,input[i]}; compute_request(compute,programs[FILTER].function,filter,3,counters[i]);
+                        TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_ADD,compute,0,previous,&current));
+                    }
+                }
+                CS_STATUS status=csQueueBatchRequest(slot->batch,slot,NULL,event,&slot->request,NULL);
+                if(status!=CS_QUEUED) {
+                    result->status=status==CS_SUCCESS?CS_ERROR_IN_EXECUTION:status;
+                    snprintf(result->error,sizeof(result->error),"csQueueBatchRequest(build scan): status=%d",status); goto cleanup;
+                }
+                ++inflight; at+=bytes;
             }
-            TRY(csQueueBatchRequest(build_batch,NULL,NULL,NULL,NULL,NULL)); ++build_chunks; at+=bytes;
-        } while(at<build.bytes);
+            if(!inflight) break;
+            void *completed=NULL;
+            CS_STATUS status=csPollEvent(event,&completed,NULL);
+            if(status==CS_NOT_DONE) { pg_usleep(50L); continue; }
+            --inflight; struct slot *slot=completed; slot->request=NULL;
+            if(status!=CS_SUCCESS) {
+                result->status=status; snprintf(result->error,sizeof(result->error),"csPollEvent(build scan): status=%d",status); goto cleanup;
+            }
+            unsigned i=slot-slots;
+            CS_MEM_HANDLE memory[]={vectors[i],plan_mem,join_mem,input[i]}; compute_io_request(compute,programs[JOIN_BUILD].function,memory,4,counters[i]);
+            /* A one-entry batch retains SNIA's automatic NEED_STORE handling. */
+            if(first_build) TRY(csConfigureBatchEntry(build_batch,CS_BATCH_ADD,compute,0,0,&append_index));
+            else TRY(csConfigureBatchEntry(build_batch,CS_BATCH_RECONFIG,compute,append_index,0,NULL));
+            first_build=false;
+            TRY(csQueueBatchRequest(build_batch,NULL,NULL,NULL,NULL,NULL)); ++build_chunks;
+        }
         TRY(csFreeBatchRequest(build_batch)); build_batch=NULL;
+        for(unsigned i=0;i<workers;++i) {
+            if(slots[i].batch) TRY(csFreeBatchRequest(slots[i].batch));
+            slots[i]=(struct slot){0};
+            unsigned bytes=0; TRY(copy(tasks[i],offsetof(struct qs_task,input_bytes),&bytes,sizeof(bytes),1));
+        }
         TRY(copy(scan_mem,0,&probe_plan,sizeof(probe_plan),1));
         for(unsigned i=0;i<workers;++i) {
             struct qs_chunk header={.capacity=chunk/24,.ncols=probe_plan.ncols}; TRY(copy(vectors[i],0,&header,sizeof(header),1));
