@@ -4,6 +4,7 @@
 #define PG_SINA_QUERY_H
 #include <stdint.h>
 #include <stddef.h>
+#define QS_JOINS 7
 #define QS_COLS 64
 #define QS_EXPRS 128
 #define QS_AGGS 16
@@ -41,7 +42,9 @@ struct qs_plan {
     int predicate;
     unsigned ordered_rows; /* 1: SQL row sort; 2: internal full-row input. */
     unsigned external_aggregate;
-    struct qs_join join;
+    struct qs_join join; /* First build; its work_mem_bytes is the total build reservation. */
+    unsigned njoins;
+    struct qs_join extra_joins[QS_JOINS-1];
     uint64_t work_mem_bytes; /* Per execution slot, set at execution; 0 uses device capacity. */
     int64_t limit, offset;
     struct qs_column cols[QS_COLS];
@@ -52,6 +55,16 @@ struct qs_plan {
     struct qs_output outputs[QS_OUT];
     struct qs_order order[QS_OUT];
 };
+static inline unsigned qs_join_count(const struct qs_plan *p)
+{ return p->njoins?p->njoins:p->join.relid?1:0; }
+static inline const struct qs_join *qs_join_at(const struct qs_plan *p,unsigned i)
+{ return i?&p->extra_joins[i-1]:&p->join; }
+static inline unsigned qs_probe_attrs(const struct qs_plan *p)
+{
+    unsigned n=p->nattrs;
+    for(unsigned i=0;i<qs_join_count(p);++i) n-=qs_join_at(p,i)->nattrs;
+    return n;
+}
 struct qs_extent { uint64_t logical, lba, bytes; };
 struct qs_request { struct qs_plan plan; char device[128]; uint32_t nsid, lba_bytes, nextents; uint64_t bytes; };
 struct qs_task {
@@ -72,6 +85,8 @@ struct qs_heap_ref { uint32_t offset, bytes; };
 struct qs_chunk { uint32_t capacity, ncols, rows, selected; };
 static inline size_t qs_chunk_bytes(unsigned capacity, unsigned ncols)
 { return sizeof(struct qs_chunk)+(size_t)capacity*ncols*8+((capacity+7)/8)*(size_t)ncols+(size_t)capacity*ncols+7+(size_t)capacity*4; }
+static inline size_t qs_join_chunk_stride(const struct qs_plan *p)
+{ return (qs_chunk_bytes(256,p->ncols)+7)&~(size_t)7; }
 static inline int64_t *qs_values(struct qs_chunk *c) { return (int64_t *)(c+1); }
 static inline unsigned char *qs_nulls(struct qs_chunk *c) { return (unsigned char *)(qs_values(c)+(size_t)c->capacity*c->ncols); }
 static inline unsigned char *qs_dscales(struct qs_chunk *c) { return qs_nulls(c)+((c->capacity+7)/8)*(size_t)c->ncols; }

@@ -144,7 +144,13 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     StringInfoData graph; initStringInfo(&graph);
     if(p->join.relid) {
         ExplainPropertyText("CSD Join","inner integer hash join; build-batch replay",es);
-        ExplainPropertyText("CSD Build Relation",get_rel_name(p->join.relid),es);
+        StringInfoData names; initStringInfo(&names);
+        for(unsigned i=0;i<qs_join_count(p);++i) {
+            if(i) appendStringInfoString(&names,", ");
+            appendStringInfoString(&names,get_rel_name(qs_join_at(p,i)->relid));
+        }
+        ExplainPropertyText("CSD Build Relation",names.data,es);
+        ExplainPropertyInteger("CSD Join Count",NULL,qs_join_count(p),es);
         ExplainPropertyText("CSD Build Scheduling","parallel scan/filter; single hash writer",es);
         appendStringInfoString(&graph,"Build: LOAD -> Scan");
         if(p->join.predicate>=0) appendStringInfoString(&graph," -> Filter");
@@ -153,7 +159,7 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     appendStringInfoString(&graph,"LOAD -> Scan");
     if(p->predicate>=0) appendStringInfoString(&graph," -> Filter");
     if(p->join.relid) {
-        appendStringInfoString(&graph," -> HashJoin.probe");
+        for(unsigned i=0;i<qs_join_count(p);++i) appendStringInfoString(&graph," -> HashJoin.probe");
         if(p->join.residual) appendStringInfoString(&graph," -> Filter(join)");
         appendStringInfoString(&graph," -> Aggregate.sink; Aggregate.source");
         if(p->external_aggregate && p->norder) appendStringInfoString(&graph," -> Sort");

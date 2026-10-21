@@ -65,11 +65,15 @@ static bool decimal_constant(Const *c,struct qs_expr *out)
 }
 static int var_column(Var *v,Index rti,const struct qs_plan *p)
 {
-    unsigned probe=p->nattrs-p->join.nattrs;
+    unsigned probe=qs_probe_attrs(p);
     if(v->varlevelsup || v->varattno<=0) return -1;
     if(v->varno==rti && (unsigned)v->varattno<=probe) return v->varattno-1;
-    if(p->join.relid && v->varno==p->join.rti && (unsigned)v->varattno<=p->join.nattrs)
-        return probe+v->varattno-1;
+    unsigned base=probe;
+    for(unsigned i=0;i<qs_join_count(p);++i) {
+        const struct qs_join *j=qs_join_at(p,i);
+        if(v->varno==j->rti && (unsigned)v->varattno<=j->nattrs) return base+v->varattno-1;
+        base+=j->nattrs;
+    }
     return -1;
 }
 static Node *unlabel(Node *node)
@@ -334,14 +338,16 @@ static bool limit_value(Node *node,int64 *value)
     else return false;
     return *value>=0;
 }
-static bool describe(PlannerInfo *root,Index rti,struct qs_plan *p,int build)
+static bool describe(PlannerInfo *root,Index rti,struct qs_plan *p,unsigned build)
 {
     RangeTblEntry *rte=rt_fetch(rti,root->parse->rtable); Relation table=table_open(rte->relid,NoLock);
     TupleDesc desc=RelationGetDescr(table); unsigned base=p->nattrs;
     if(!desc->natts || base+desc->natts>QS_COLS) { table_close(table,NoLock); return false; }
     if(build) {
-        p->join.relid=rte->relid; p->join.relfilenode=table->rd_node.relNode;
-        p->join.rti=rti; p->join.nattrs=desc->natts;
+        struct qs_join *j=build==1?&p->join:&p->extra_joins[build-2];
+        j->relid=rte->relid; j->relfilenode=table->rd_node.relNode;
+        j->rti=rti; j->nattrs=desc->natts; j->predicate=-1;
+        p->njoins=build;
     } else { p->relid=rte->relid; p->relfilenode=table->rd_node.relNode; }
     for(unsigned i=0;i<(unsigned)desc->natts;++i) {
         Form_pg_attribute a=TupleDescAttr(desc,i); struct qs_column *c=&p->cols[base+i];
@@ -356,37 +362,42 @@ static bool describe(PlannerInfo *root,Index rti,struct qs_plan *p,int build)
     }
     p->nattrs+=desc->natts; table_close(table,NoLock); return true;
 }
-static bool compile(PlannerInfo *root,Index rti,RelOptInfo *rel,Index build_rti,RelOptInfo *build_rel,OpExpr *join,List *quals,struct qs_plan *p)
+static bool compile(PlannerInfo *root,List *relations,List *joins,List *quals,struct qs_plan *p)
 {
-    if(!describe(root,rti,p,0) || (build_rti && !describe(root,build_rti,p,1))) return false;
-    p->join.predicate=-1;
-    if(join) {
-        int left=expression(linitial(join->args),rti,p),right=expression(lsecond(join->args),rti,p);
+    Index rti=linitial_int(relations); ListCell *cell;
+    unsigned side=0;
+    foreach(cell,relations) if(!describe(root,lfirst_int(cell),p,side++)) return false;
+    unsigned base=qs_probe_attrs(p);
+    for(unsigned i=0;i<p->njoins;++i) {
+        struct qs_join *j=i?&p->extra_joins[i-1]:&p->join;
+        OpExpr *key=list_nth(joins,i);
+        int left=expression(linitial(key->args),rti,p),right=expression(lsecond(key->args),rti,p);
         if(left<0 || right<0 || p->exprs[left].op!=Q_COLUMN || p->exprs[right].op!=Q_COLUMN ||
             p->exprs[left].type!=Q_INTEGER || p->exprs[right].type!=Q_INTEGER) return false;
-        int a=p->exprs[left].column,b=p->exprs[right].column; unsigned probe=p->nattrs-p->join.nattrs;
-        if((unsigned)a>=probe && (unsigned)b<probe) { int swap=a; a=b; b=swap; }
-        if((unsigned)a>=probe || (unsigned)b<probe) return false;
-        p->join.probe_key=a; p->join.build_key=b; p->join.rows=Max(build_rel->rows,1);
+        int a=p->exprs[left].column,b=p->exprs[right].column;
+        if((unsigned)a>=base && (unsigned)b<base) { int swap=a; a=b; b=swap; }
+        if((unsigned)a>=base || (unsigned)b<base || (unsigned)b>=base+j->nattrs) return false;
+        j->probe_key=a; j->build_key=b; j->rows=Max(root->simple_rel_array[j->rti]->rows,1);
+        base+=j->nattrs;
     }
     p->ordered_rows=!root->parse->hasAggs;
-    ListCell *cell; p->predicate=-1; p->limit=-1;
-    foreach(cell,rel->baserestrictinfo) {
-        RestrictInfo *r=lfirst_node(RestrictInfo,cell); int next=expression((Node *)r->clause,rti,p); if(next<0) return false;
-        restrict_string((Node *)r->clause,rti,p);
-        if(p->predicate<0) p->predicate=next;
-        else { p->predicate=put(p,(struct qs_expr){.op=Q_AND,.type=Q_BOOLEAN,.left=p->predicate,.right=next}); if(p->predicate<0) return false; }
+    p->predicate=-1; p->limit=-1;
+    side=0; base=0;
+    foreach(cell,relations) {
+        Index current=lfirst_int(cell); RelOptInfo *rel=root->simple_rel_array[current];
+        struct qs_join *j=side?side==1?&p->join:&p->extra_joins[side-2]:NULL;
+        int *predicate=j?&j->predicate:&p->predicate; ListCell *qual;
+        foreach(qual,rel->baserestrictinfo) {
+            RestrictInfo *r=lfirst_node(RestrictInfo,qual); int next=expression((Node *)r->clause,rti,p); if(next<0) return false;
+            restrict_string((Node *)r->clause,rti,p);
+            if(*predicate<0) *predicate=next;
+            else { *predicate=put(p,(struct qs_expr){.op=Q_AND,.type=Q_BOOLEAN,.left=*predicate,.right=next}); if(*predicate<0) return false; }
+        }
+        base+=j?j->nattrs:qs_probe_attrs(p); ++side;
     }
-    if(build_rel) foreach(cell,build_rel->baserestrictinfo) {
-        RestrictInfo *r=lfirst_node(RestrictInfo,cell); int next=expression((Node *)r->clause,rti,p); if(next<0) return false;
-        restrict_string((Node *)r->clause,rti,p);
-        if(p->join.predicate<0) p->join.predicate=next;
-        else { p->join.predicate=put(p,(struct qs_expr){.op=Q_AND,.type=Q_BOOLEAN,.left=p->join.predicate,.right=next}); if(p->join.predicate<0) return false; }
-    }
-    /* PG pushes single-relation predicates into baserestrictinfo. Keep every
-     * remaining mixed predicate after the hash equality, including OR trees. */
-    if(join) foreach(cell,quals) {
-        Node *node=lfirst(cell); if(node==(Node *)join) continue;
+    /* All non-key mixed predicates see the final joined column layout. */
+    if(p->njoins) foreach(cell,quals) {
+        Node *node=lfirst(cell); if(list_member_ptr(joins,node)) continue;
         Bitmapset *vars=pull_varnos(node); bool mixed=bms_num_members(vars)>1; bms_free(vars);
         if(!mixed) continue;
         int next=expression(node,rti,p); if(next<0) return false;
@@ -451,14 +462,15 @@ static bool compile(PlannerInfo *root,Index rti,RelOptInfo *rel,Index build_rti,
     /* Late decoding pays off for selective filters. Keep the eager path when
      * PG estimates at least half the rows survive (e.g. Q1). Predicate
      * numerics are also lazy: AND/OR pass only needed rows to their children. */
-    if(p->predicate>=0 && rel->rows<rel->tuples/2)
-        for(unsigned i=0;i<p->nattrs-p->join.nattrs;++i) {
-            struct qs_column *c=&p->cols[i];
-            c->deferred=c->type==Q_DECIMAL && c->slot>=0;
-        }
-    if(build_rel && p->join.predicate>=0 && build_rel->rows<build_rel->tuples/2)
-        for(unsigned i=p->nattrs-p->join.nattrs;i<p->nattrs;++i)
-            p->cols[i].deferred=p->cols[i].type==Q_DECIMAL && p->cols[i].slot>=0;
+    side=0; base=0;
+    foreach(cell,relations) {
+        RelOptInfo *rel=root->simple_rel_array[lfirst_int(cell)];
+        const struct qs_join *j=side?qs_join_at(p,side-1):NULL;
+        unsigned count=j?j->nattrs:qs_probe_attrs(p);
+        if((j?j->predicate:p->predicate)>=0 && rel->rows<rel->tuples/2)
+            for(unsigned i=base;i<base+count;++i) p->cols[i].deferred=p->cols[i].type==Q_DECIMAL && p->cols[i].slot>=0;
+        base+=count; ++side;
+    }
     order_strings(p);
     return limit_value(root->parse->limitCount,&p->limit) && limit_value(root->parse->limitOffset,&p->offset);
 }
@@ -474,7 +486,7 @@ static const CustomPathMethods path_methods={.CustomName="SniaCsdAggregate",.Pla
 static const CustomPathMethods order_path_methods={.CustomName="SniaCsdSort",.PlanCustomPath=plan_path};
 static bool join_inputs(Node *node,List **relations,List **quals)
 {
-    if(IsA(node,RangeTblRef)) { *relations=lappend_int(*relations,((RangeTblRef *)node)->rtindex); return list_length(*relations)<=2; }
+    if(IsA(node,RangeTblRef)) { *relations=lappend_int(*relations,((RangeTblRef *)node)->rtindex); return list_length(*relations)<=QS_JOINS+1; }
     if(IsA(node,FromExpr)) {
         FromExpr *f=(FromExpr *)node; ListCell *cell;
         foreach(cell,f->fromlist) if(!join_inputs(lfirst(cell),relations,quals)) return false;
@@ -489,23 +501,21 @@ static bool join_inputs(Node *node,List **relations,List **quals)
     }
     return false;
 }
-static OpExpr *equality_join(List *quals,Index a,Index b)
+static OpExpr *equality_join(List *quals,List *prefix,Index next)
 {
-    OpExpr *join=NULL; ListCell *cell;
+    ListCell *cell;
     foreach(cell,quals) {
-        Node *node=lfirst(cell); Bitmapset *vars=pull_varnos(node);
-        int count=bms_num_members(vars); bool mixed=bms_is_member(a,vars) && bms_is_member(b,vars); bms_free(vars);
-        if(!count) return NULL; /* Keep constant-gated joins wholly native. */
-        if(!mixed) { if(count!=1) return NULL; continue; }
-        if(join || !IsA(node,OpExpr)) continue;
+        Node *node=lfirst(cell); if(!IsA(node,OpExpr)) continue;
         OpExpr *op=(OpExpr *)node; if(list_length(op->args)!=2) continue;
         Oid fn=OidIsValid(op->opfuncid)?op->opfuncid:get_opcode(op->opno);
         if(!builtin(fn,"int2eq") && !builtin(fn,"int4eq") && !builtin(fn,"int8eq")) continue;
         Node *left=unlabel(linitial(op->args)),*right=unlabel(lsecond(op->args));
-        if(!IsA(left,Var) || !IsA(right,Var) || ((Var *)left)->varno==((Var *)right)->varno) continue;
-        join=op;
+        if(!IsA(left,Var) || !IsA(right,Var)) continue;
+        Var *a=(Var *)left,*b=(Var *)right;
+        if((a->varno==next && list_member_int(prefix,b->varno)) ||
+           (b->varno==next && list_member_int(prefix,a->varno))) return op;
     }
-    return join;
+    return NULL;
 }
 static double build_bytes(const struct qs_plan *p,double rows)
 {
@@ -528,41 +538,57 @@ void pg_sina_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *i
         q->windowClause || q->groupingSets || q->cteList || q->hasSubLinks || q->hasRowSecurity || q->hasTargetSRFs ||
         q->rowMarks || q->distinctClause || q->setOperations || root->append_rel_list || root->join_info_list) return;
     List *relations=NIL,*quals=NIL;
-    if(!join_inputs((Node *)q->jointree,&relations,&quals) || !relations || list_length(relations)>2) return;
-    Index rti=linitial_int(relations),build_rti=0; RelOptInfo *build_rel=NULL; OpExpr *join=NULL;
-    RangeTblEntry *rte=rt_fetch(rti,q->rtable); if(rte->rtekind!=RTE_RELATION || rte->tablesample) return;
-    RelOptInfo *rel=root->simple_rel_array[rti]; if(!rel) return;
-    if(list_length(relations)==2) {
-        if(!q->hasAggs) return;
-        build_rti=lsecond_int(relations); RangeTblEntry *build_rte=rt_fetch(build_rti,q->rtable);
-        if(build_rte->rtekind!=RTE_RELATION || build_rte->tablesample) return;
-        build_rel=root->simple_rel_array[build_rti]; if(!build_rel) return;
-        if(rel->tuples<build_rel->tuples) { Index swap=rti; rti=build_rti; build_rti=swap; RelOptInfo *other=rel; rel=build_rel; build_rel=other; }
-        join=equality_join(quals,rti,build_rti); if(!join) return;
+    if(!join_inputs((Node *)q->jointree,&relations,&quals) || !relations) return;
+    ListCell *cell; Index rti=0; double largest=-1;
+    foreach(cell,relations) {
+        Index index=lfirst_int(cell); RangeTblEntry *rte=rt_fetch(index,q->rtable);
+        RelOptInfo *rel=root->simple_rel_array[index];
+        if(rte->rtekind!=RTE_RELATION || rte->tablesample || !rel) return;
+        if(rel->tuples>largest) { largest=rel->tuples; rti=index; }
     }
-    struct qs_plan plan={0}; if(!compile(root,rti,rel,build_rti,build_rel,join,quals,&plan)) return;
-    /* Preserve the cheap raw-size choice when it fits. If it would spill,
-     * compare filtered projected records on the other side as well. Estimates
-     * only choose orientation; bounded batches still guarantee correctness. */
-    if(build_rel && build_bytes(&plan,build_rel->rows)>(double)pg_sina_max_memory*1024/2) {
-        struct qs_plan other={0};
-        if(compile(root,build_rti,build_rel,rti,rel,join,quals,&other) && build_bytes(&other,rel->rows)<build_bytes(&plan,build_rel->rows)) {
-            plan=other; Index swap=rti; rti=build_rti; build_rti=swap;
-            RelOptInfo *swap_rel=rel; rel=build_rel; build_rel=swap_rel;
+    if(list_length(relations)>1 && !q->hasAggs) return;
+    foreach(cell,quals) {
+        Bitmapset *vars=pull_varnos(lfirst(cell)); bool constant=bms_is_empty(vars); bms_free(vars);
+        if(constant && list_length(relations)>1) return;
+    }
+    List *ordered=list_make1_int(rti),*joins=NIL;
+    while(list_length(ordered)<list_length(relations)) {
+        Index next=0; double smallest=0; OpExpr *key=NULL;
+        foreach(cell,relations) {
+            Index index=lfirst_int(cell); if(list_member_int(ordered,index)) continue;
+            OpExpr *candidate=equality_join(quals,ordered,index);
+            double rows=root->simple_rel_array[index]->rows;
+            if(candidate && (!next || rows<smallest)) { next=index; smallest=rows; key=candidate; }
         }
+        if(!next) return;
+        ordered=lappend_int(ordered,next); joins=lappend(joins,key);
     }
+    struct qs_plan plan={0}; if(!compile(root,ordered,joins,quals,&plan)) return;
+    /* Keep the two-table orientation heuristic; multi-join probes follow a
+     * connected order and retain all build states under one shared budget. */
+    if(plan.njoins==1 && build_bytes(&plan,root->simple_rel_array[plan.join.rti]->rows)>(double)pg_sina_max_memory*1024/2) {
+        struct qs_plan other={0}; List *reverse=list_make2_int(plan.join.rti,rti);
+        if(compile(root,reverse,joins,quals,&other) && build_bytes(&other,root->simple_rel_array[rti]->rows)<
+           build_bytes(&plan,root->simple_rel_array[plan.join.rti]->rows)) { plan=other; rti=linitial_int(reverse); }
+    }
+    RelOptInfo *rel=root->simple_rel_array[rti];
     plan.external_aggregate=plan.nkeys!=0;
     if(plan.external_aggregate && plan.nkeys+plan.naggs>QS_OUT) return;
     Oid nsp=get_namespace_oid("sina_csd",true);
     if(!OidIsValid(nsp) || !OidIsValid(get_relname_relid("relations",nsp))) return;
     if(SPI_connect()!=SPI_OK_CONNECT) elog(ERROR,"SPI_connect failed");
     Oid types[]={OIDOID,OIDOID,OIDOID,OIDOID};
-    Datum values[]={ObjectIdGetDatum(plan.relid),ObjectIdGetDatum(plan.relfilenode),ObjectIdGetDatum(plan.join.relid),ObjectIdGetDatum(plan.join.relfilenode)};
-    const char *sql=plan.join.relid?
-        "SELECT 1 FROM sina_csd.relations r WHERE r.relid=$1 AND r.relfilenode=$2 AND EXISTS (SELECT 1 FROM sina_csd.relations b WHERE b.relid=$3 AND b.relfilenode=$4 AND b.device=r.device AND b.namespace_id=r.namespace_id AND b.lba_bytes=r.lba_bytes)":
-        "SELECT 1 FROM sina_csd.relations WHERE relid=$1 AND relfilenode=$2";
-    int status=SPI_execute_with_args(sql,plan.join.relid?4:2,types,values,NULL,true,1);
-    bool prepared=status==SPI_OK_SELECT && SPI_processed==1; SPI_finish(); if(!prepared) return;
+    bool prepared=true;
+    for(unsigned i=0;i<(plan.njoins?plan.njoins:1);++i) {
+        const struct qs_join *j=qs_join_at(&plan,i);
+        Datum values[]={ObjectIdGetDatum(plan.relid),ObjectIdGetDatum(plan.relfilenode),ObjectIdGetDatum(j->relid),ObjectIdGetDatum(j->relfilenode)};
+        const char *sql=plan.njoins?
+            "SELECT 1 FROM sina_csd.relations r WHERE r.relid=$1 AND r.relfilenode=$2 AND EXISTS (SELECT 1 FROM sina_csd.relations b WHERE b.relid=$3 AND b.relfilenode=$4 AND b.device=r.device AND b.namespace_id=r.namespace_id AND b.lba_bytes=r.lba_bytes)":
+            "SELECT 1 FROM sina_csd.relations WHERE relid=$1 AND relfilenode=$2";
+        int status=SPI_execute_with_args(sql,plan.njoins?4:2,types,values,NULL,true,1);
+        if(status!=SPI_OK_SELECT || SPI_processed!=1) { prepared=false; break; }
+    }
+    SPI_finish(); if(!prepared) return;
     bytea *data=palloc(VARHDRSZ+sizeof(plan)); SET_VARSIZE(data,VARHDRSZ+sizeof(plan)); memcpy(VARDATA(data),&plan,sizeof(plan));
     CustomPath *path=makeNode(CustomPath); path->path.pathtype=T_CustomScan; path->path.parent=output;
     path->path.pathtarget=create_pathtarget(root,root->processed_tlist);

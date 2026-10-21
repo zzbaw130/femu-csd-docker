@@ -251,3 +251,18 @@ Q12方向调整将内部读取从约2.98GB降至1.14GB、CSD均值从3819.775ms�
 验收：最初24项设备CTest、19项PG算子ASan/UBSan全部通过；补充动态扩容后重新运行24项CTest及3项Join ASan/UBSan，均通过。Guest单表/既有查询55项检查通过，包含数值IN的NULL/显示精度、空数组和NOT IN回退、Q1/Q6、prepared plan及资源清理；最终扩容版完整Join检查45项通过，包含跨表大小比较、附加等值、OR/NULL、4MB聚合spill、Q12/Q14、Q19原SQL及不同参数写法的4/64MB对照，以及报错/取消/早关游标后同backend复用。仍未实现多表Join、一般字符串、HAVING/MIN/MAX/COUNT DISTINCT、semi/anti和子查询；后续优先扩展多表连接与其所需的列/中间结果传递。
 
 最终扩容版各3轮冷启动均值：Q12 host/CSD=1969.966/1065.199ms，Q14=1752.395/604.802ms，Q19=2088.169/1068.240ms，完整输出一致。Q14/Q19 host波动较大，全部样本保留。Q19独立profile确认build从2批变为1批、内部读取从1876811776降至955187200字节，无spill，Scan/Filter从449次降至229次；总计1007.579ms。原始样本、指标及限制见[性能分析](performance.md)。
+
+## 阶段3d：连续多表Hash Join与完整Q3（2026-10-22）
+
+- PG从最多8个base relation的INNER连接图选择连通的probe链。先以原始行数最多的表为起点，再选与当前前缀有直接整数等值键的表；多个候选按过滤后估计行数排序。保留两表方向启发式。Var按每张表的物理属性区间绑定，单表过滤与投影、最终跨表过滤、GROUP BY/排序仍复用原表达式编译，不识别SQL编号。所有输入映射都校验同一设备/namespace/LBA几何。
+- 每张表复用原HashJoin.build/load/close，有自己的workmem、批次元数据和控制AFDM。query.h中追加的连接描述仅是本应用计划。当前FEMU adapter的compute AFDM offset非零会返回不支持，故不改SNIA/设备，PG在probe前汇总控制记录中的不透明句柄；不读取哈希记录或中间行。
+- 参考DuckDB pipeline对列批次的持续传递和HashJoin的独立build状态，在同一个probe CSF/CU内将每级最多256行的列批次传给下一级，最后再过滤/聚合。每级游标在自己的build workmem，各槽中间列批次在joined AFDM的独立对齐区。聚合NEED_STORE/LOAD沿调用链返回；重入从未完成的子级恢复，父级输入与选择保持不变。没有新增算子运行框架或设备调度API。
+- build总预算仍为查询的一半，再按表数均分；设备还以物理池的一半除以表数限制每个build，因此查询GUC高于物理池时也不会各自申请完整份额。估计只决定初始分配，原有有界扩容/spill继续生效。其余预算由probe/聚合执行槽共享。source开始前释放全部build，供结果排序使用。
+- PG先完成每张build的首批载入，再遍历各批次的组合。所有probe完成后才替换其中任何一张表的数据；原始probe只在新组合下重扫。Build Batches统计组合数，Build Rows为build原始行数总和，Internal Read包含全部重扫。组合数乘积会造成读放大，均分会使小表留下闲置份额；没有宣称实现DuckDB的动态内存预约、radix分区或任意树形计划。后续需据profile改进这部分。
+- 完整Q3使用原有qgen参数：lineitem依次probe orders、customer，再按orderkey/date/priority分组、设备排序和LIMIT 10。Q1/Q3/Q6/Q12/Q14/Q19现已具备完整卸载路径；一般字符串、非INNER连接、HAVING/MIN/MAX/COUNT DISTINCT与子查询仍未完成。
+
+设备差分测试在原join.c测试中增加三表链，键来自前一级build载荷，独立按乘数计算预期值，覆盖重复键、负键、NULL、空末级、跨结果页、最终残余过滤和聚合spill。4MiB池及64MiB池内4MiB预算验证多个build批次组合与零残留；64MiB可驻留。另测试查询预算为物理池两倍，检查总峰值不超查询和物理池。24项CTest、19项PG算子ASan/UBSan通过；最后补物理份额限制后3项Join容量CTest及3项对应sanitizer复测通过。
+
+Guest完整Join回归54项、单表及旧查询55项通过。Q3在16/64MB下与host一致，三表/四表、4MB链式分组、空表及断开连接图回退均通过；最终物理份额版本另测16/64/128MB查询上限与64MiB物理池，结果一致。独立检查第一/后续build报错、链式聚合溢出、Q12/Q3取消后同backend设备复用。
+
+最终各3轮冷启动均值host/CSD：Q3=2610.340/4277.033ms，Q12=2219.740/1084.600ms，Q14=2081.506/632.370ms，Q19=1696.802/1059.619ms。Q3尚未加速；独立profile有6个build批次组合、lineitem累计扫描36007290行、内部读取5772886016字节，主要瓶颈是重复扫描；最终source/排序仅19.332ms。完整样本、均分预算的限制和后续方向见[性能分析](performance.md)。

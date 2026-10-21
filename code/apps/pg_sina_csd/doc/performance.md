@@ -512,3 +512,42 @@ Setup/Build/probe/source/Cleanup分别为77.367/50.175/869.702/0.789/9.546ms，�
 - 4MB跨表分组压力用例得到7001组、318524个连接行，build分3批，聚合也有实际spill，按现有规则降低为1槽。较小的归并窗口仍可能产生明显读取放大；本阶段不掩盖这一限制。
 
 主机日志：`/tmp/pg-snia-q19-native.log`、`/tmp/pg-snia-q19-asan.log`、`/tmp/pg-snia-q19-growth-native.log`、`/tmp/pg-snia-q19-growth-asan.log`、`/tmp/pg-snia-q19-final-guest.log`、`/tmp/pg-snia-q19-growth-guest-join.log`、`/tmp/pg-snia-q19-growth-bench.log`。Guest单表目录`/tmp/pg-sina-queries.1nwb9b`，最终Join目录`/tmp/pg-sina-queries.MabHoz`，最终性能目录`/tmp/pg-sina-queries.h4vM3R`。入口为`tests/pg-sina-csd-test.sh query|join|join-bench`。
+
+## 阶段3d：连续多表Join与Q3（2026-10-22）
+
+Q3使用原有qgen参数MACHINERY、1995-03-31，设备完整执行lineitem→orders→customer两个Join、按orderkey/date/priority分组、排序及LIMIT 10，Guest只编排与转换Datum。控制记录独立AFDM解决现有adapter不接受compute非零AFDM offset的限制，没有修改FEMU/SNIA。以下为最终代码、所有构建/回归/sanitizer结束后单独测量的数据。
+
+### 冷启动延迟
+
+仍为4 CU、64MiB AFDM、64MiB物理workmem和64MB查询上限；原生PG保持既有work_mem与并行配置。host/CSD交替各3轮，每次停止PG、清Guest页缓存并启动，关闭profile，完整输出逐次一致。全部样本保留，没有同时运行编译或本项目其他测试。
+
+| 查询/路径 | 三轮 ms | 均值 ms | 中位数 ms |
+| --- | --- | ---: | ---: |
+| Q3/host | 3033.323 / 2548.007 / 2249.691 | 2610.340 | 2548.007 |
+| Q3/csd | 4477.359 / 4182.655 / 4171.084 | 4277.033 | 4182.655 |
+| Q12/host | 2012.860 / 2716.468 / 1929.892 | 2219.740 | 2012.860 |
+| Q12/csd | 1071.458 / 1093.861 / 1088.480 | 1084.600 | 1088.480 |
+| Q14/host | 3251.101 / 1513.215 / 1480.202 | 2081.506 | 1513.215 |
+| Q14/csd | 575.419 / 657.107 / 664.584 | 632.370 | 657.107 |
+| Q19/host | 1702.472 / 1717.042 / 1670.891 | 1696.802 | 1702.472 |
+| Q19/csd | 1064.353 / 1050.492 / 1064.011 | 1059.619 | 1064.011 |
+
+Q3当前CSD约为host的1.64倍延迟，没有加速。其他三条仍有收益；Q14 host首轮、Q12 host第二轮偏高，均值不能消除这些波动。Q1/Q6通过完整结果回归，本阶段未重测其三轮延迟。FEMU未启用PCIe带宽模型等既有限制仍适用，这不是等总内存或等核数对照。
+
+### Q3瓶颈：build份额均分与重复probe
+
+独立冷启动profile见`/tmp/pg-snia-chain-q3-profile.json`。只有一个CSD CustomScan，Join Count=2，build为orders和customer；两表原始行数共1650000。当前build总份额32MiB均分为每表16MiB。orders过滤后数据分6批，customer可驻留，因此组合数6。lineitem累计扫描36007290行，物理过滤后19208604行，两个Join之后29866行进入聚合，最终返回排序后的10行。1379块，内部读取5772886016字节；build spill写/读各41615360字节。局部聚合/排序有5个run，均驻内存，没有聚合run spill。
+
+Setup/Build/probe/最终source与排序/Cleanup为53.602/340.891/3725.149/19.332/40.567ms，总计4179.542ms。Scan累计CU CPU为6691.273ms，Filter328.021ms，HashJoin.build/load为56.230/33.993ms，整条probe链含聚合1165.479ms。Scan/Filter各1379次，probe入口1320次；同CU内部的后续Join不另发NVMe，包含在probe计时内，不能再重复计入独立CSF。
+
+AFDM45506560字节，设备报告workmem池峰值15868528字节，查询上限仍67108864字节。低于上限不表示应该继续缩小内存：均分预约与容量按2次幂取整使小表/聚合留下空闲份额，而orders仍反复spill。后续应改进各表预约和容量选择，或引入分区连接减少重扫；不能仅以增加CU或优化最终10行排序解决本次瓶颈。本阶段没有实现DuckDB完整的临时内存预约管理器或radix分区。
+
+首次功能profile也确认6次probe重扫，但当时与native验证重叠，不用于延迟比较；上表及本节最终profile在全部验证结束后单独采集。
+
+### 正确性、容量与失败回收
+
+24项设备CTest和19项PG算子ASan/UBSan通过，最后增加物理份额约束后另外3项Join容量及3项sanitizer复测通过。差分测试包含三表链、后级键来自前级载荷、负键/重复键/NULL、空末级、分批结果、最终复合过滤，以及多个build批次与聚合spill同时发生；4MiB池、64MiB池内4MiB查询预算均断言完整结果、峰值界限和结束时零残留。另以查询预算为物理池两倍运行三表分组，检查物理上限。
+
+Guest完整Join检查54项、单表/既有查询55项通过：三表/四表、跨表过滤、4MB链式分组、空表、断开连接图回退；Q3分别在16/64MB与host完整输出一致，Q12/Q14/Q19保持正确。最终版本另行核对Q3在16/64/128MB查询上限、64MiB实际池下结果一致；验证第一/后续build错误、链式聚合溢出、Q12/Q3取消之后，同一backend两次CSD COUNT都成功，确保排空在途请求后释放全部build状态。
+
+主机日志为`/tmp/pg-snia-chain-all-native.log`、`/tmp/pg-snia-chain-all-asan.log`、`/tmp/pg-snia-chain-cap-native.log`、`/tmp/pg-snia-chain-cap-asan.log`、`/tmp/pg-snia-chain-guest-regression.log`、`/tmp/pg-snia-chain-final-check.log`、`/tmp/pg-snia-chain-bench.log`。Guest Join/单表目录为`/tmp/pg-sina-queries.Pxwb9Y`、`/tmp/pg-sina-queries.eCcDVi`，最终失败/容量检查目录`/tmp/pg-sina-chain-check.xmawDe`，性能目录`/tmp/pg-sina-queries.rIB7FR`。复现入口仍为`tests/pg-sina-csd-test.sh join|query|join-bench`。

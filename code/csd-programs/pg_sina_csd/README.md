@@ -121,3 +121,6 @@ Guest将字符串字面量放在`qs_plan.strings`，每项记录物理属性号�
 
 
 Hash Join的行数估计只决定首次分配。build满表后尝试倍增记录和桶数组，仍受原build预算及共享workmem池限制；扩容失败或到达最大容量才生成spill批次。分配器复制期间同时计入新旧数组，因此不会靠瞬时超额分配扩容。桶数组增长失败会缩回新增记录空间并沿用原容量；已有spill批次的行数和token独立记录，不受后续容量变化影响。
+
+
+多表probe仍用原来的MR顺序：列批次、完整计划、槽任务、build控制数组、joined列批次区、可选spill I/O。每个Join在joined区占一个对齐的256行列批次；前一级直接调用下一级，最后一级调用聚合。`query.h`的njoins和extra_joins只描述本应用的连接链，不是新增SNIA参数。游标在各自build workmem，NEED_STORE/LOAD沿调用链向外返回，重入先恢复子级再继续本级。build/load/close仍每次接收一个独立控制AFDM。全体probe结束后才替换任何build批次，source之前释放所有build状态。

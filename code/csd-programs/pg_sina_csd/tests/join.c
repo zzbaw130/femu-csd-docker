@@ -177,9 +177,131 @@ static void check(function build,function load,function probe,function close,fun
     void *mr[]={&control}; long long len[]={sizeof(control)};
     struct femu_csd_args a={.numr=1,.mr_addr=mr,.mr_len=len}; assert(!close(&a) && !control.state);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats));
-    assert(!stats.used_bytes && !stats.active_contexts && stats.peak_used_bytes<=budget);
+    assert(!stats.used_bytes && !stats.active_contexts && stats.peak_used_bytes<=budget && stats.peak_used_bytes<=capacity);
     printf("build=%u probe=%u pairs=%llu passes=%u peak=%zu stores=%u loads=%u\n",build_rows,probe_rows,(unsigned long long)expected_rows,passes,stats.peak_used_bytes,stores,loads);
     free(c); free(io); free(joined);
+}
+/* Three-table chain, with a key read from the preceding build payload.
+ * Oracle counts build/probe multiplicities independently of hash traversal. */
+static void check_chain(function build,function load,function probe,function close,function source,int grouped,int empty)
+{
+    next_token=1; stores=loads=0;
+    struct qs_plan p={.nattrs=5,.ncols=5,.nexprs=7,.naggs=3,.nout=3,.predicate=-1,.limit=-1,.njoins=2,
+        .work_mem_bytes=budget/2,.join={.relid=1,.nattrs=2,.probe_key=0,.build_key=1,.rows=35003,.work_mem_bytes=budget/2,.residual=7}};
+    p.extra_joins[0]=(struct qs_join){.relid=2,.nattrs=2,.probe_key=2,.build_key=3,.rows=25003};
+    for(unsigned i=0;i<5;++i) p.cols[i]=(struct qs_column){.slot=i,.type=Q_INTEGER};
+    p.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.column=0,.type=Q_INTEGER};
+    p.exprs[1]=(struct qs_expr){.op=Q_COLUMN,.column=4,.type=Q_INTEGER};
+    p.exprs[2]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER};
+    p.exprs[3]=(struct qs_expr){.op=Q_GT,.left=1,.right=2,.type=Q_BOOLEAN};
+    p.exprs[4]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=-2400};
+    p.exprs[5]=(struct qs_expr){.op=Q_LT,.left=0,.right=4,.type=Q_BOOLEAN};
+    p.exprs[6]=(struct qs_expr){.op=Q_OR,.left=3,.right=5,.type=Q_BOOLEAN};
+    p.aggs[0]=(struct qs_agg){.kind=Q_COUNT_STAR,.expr=-1};
+    p.aggs[1]=(struct qs_agg){.kind=Q_SUM,.expr=1}; p.aggs[2]=(struct qs_agg){.kind=Q_AVG,.expr=1};
+    for(unsigned i=0;i<3;++i) p.outputs[i]=(struct qs_output){.aggregate=1,.index=i};
+    if(grouped) {
+        p.external_aggregate=1; p.nkeys=p.norder=1; p.nout=4; p.keys[0]=0;
+        p.outputs[0]=(struct qs_output){.index=0};
+        for(unsigned i=1;i<4;++i) p.outputs[i]=(struct qs_output){.aggregate=1,.index=i-1};
+        p.order[0]=(struct qs_order){.output=0};
+    }
+    struct qs_join_control controls[2]={{0}};
+    size_t bytes=qs_chunk_bytes(997,2); struct qs_chunk *c=calloc(1,bytes); assert(c); c->capacity=997; c->ncols=2;
+    void *io=calloc(1,QS_SORT_IO_BYTES); assert(io);
+    unsigned all[701]={0},valid[701]={0},positive[701]={0},probes[5003]={0};
+    int64_t totals[701]={0},positive_totals[701]={0};
+    for(unsigned stage=0;stage<2;++stage) {
+        struct qs_plan view=p; view.join=*qs_join_at(&p,stage); view.njoins=2; view.nattrs=stage?5:3;
+        view.join.residual=0; view.join.work_mem_bytes=budget/4;
+        unsigned rows=stage?empty?0:25003:35003;
+        for(unsigned first=0;first<rows || !controls[stage].state;first+=997) {
+            unsigned n=rows-first; if(n>997) n=997; c->rows=c->selected=n;
+            memset(qs_nulls(c),0,2*((c->capacity+7)/8));
+            for(unsigned i=0;i<n;++i) {
+                unsigned at=first+i,key=stage?at%701:at%5003; int null_key=at%(stage?83:97)==0;
+                int null_value=at%(stage?17:109)==0;
+                qs_values(c)[i]=stage?(int)key:(int)key-2500;
+                qs_values(c)[c->capacity+i]=stage?(int)(at%61)-30:(int)((at*7+3)%701);
+                if(null_key) qs_nulls(c)[i/8]|=1U<<(i%8);
+                if(null_value) qs_nulls(c)[(c->capacity+7)/8+i/8]|=1U<<(i%8);
+                qs_selection(c)[i]=i;
+                if(stage && !null_key) {
+                    ++all[key];
+                    if(!null_value) {
+                        int value=(int)(at%61)-30; ++valid[key]; totals[key]+=value;
+                        if(value>0) { ++positive[key]; positive_totals[key]+=value; }
+                    }
+                }
+            }
+            void *mr[]={c,&view,&controls[stage],io}; long long len[]={bytes,sizeof(view),sizeof(controls[0]),QS_SORT_IO_BYTES};
+            struct femu_csd_args a={.numr=4,.mr_addr=mr,.mr_len=len}; assert(!run(build,&a));
+        }
+        void *mr[]={&controls[stage],io}; long long len[]={sizeof(controls[0]),QS_SORT_IO_BYTES};
+        struct femu_csd_args a={.numr=2,.mr_addr=mr,.mr_len=len}; assert(!run(load,&a));
+    }
+    uint64_t counts[5003]={0},values[5003]={0}; int64_t sums[5003]={0};
+    for(unsigned at=0;at<9003;++at) if(at%113) ++probes[at%5003];
+    for(unsigned at=0;at<35003;++at) if(at%97 && at%109) {
+        unsigned key=at%5003,link=(at*7+3)%701;
+        counts[key]+=(uint64_t)probes[key]*(key<100?all[link]:positive[link]);
+        values[key]+=(uint64_t)probes[key]*(key<100?valid[link]:positive[link]);
+        sums[key]+=(int64_t)probes[key]*(key<100?totals[link]:positive_totals[link]);
+    }
+    size_t stride=qs_join_chunk_stride(&p); void *joined=calloc(2,stride); assert(joined);
+    for(unsigned i=0;i<2;++i) { struct qs_chunk *out=(void *)((char *)joined+i*stride); out->capacity=256; out->ncols=5; }
+    struct qs_task task={.workers=1}; uint64_t passes=(uint64_t)controls[0].batches*controls[1].batches;
+    for(uint64_t pass=0;pass<passes;++pass) {
+        uint64_t divisor=1;
+        for(unsigned i=0;i<2;++i) {
+            controls[i].current=(pass/divisor)%controls[i].batches; divisor*=controls[i].batches;
+            void *mr[]={&controls[i],io}; long long len[]={sizeof(controls[0]),QS_SORT_IO_BYTES};
+            struct femu_csd_args a={.numr=2,.mr_addr=mr,.mr_len=len}; assert(!run(load,&a));
+        }
+        c->ncols=1;
+        for(unsigned first=0;first<9003;first+=997) {
+            unsigned n=9003-first; if(n>997) n=997; c->rows=c->selected=n;
+            memset(qs_nulls(c),0,(c->capacity+7)/8); memset(qs_dscales(c),0,c->capacity);
+            for(unsigned i=0;i<n;++i) {
+                unsigned at=first+i; qs_values(c)[i]=(int)(at%5003)-2500; qs_selection(c)[i]=i;
+                if(at%113==0) qs_nulls(c)[i/8]|=1U<<(i%8);
+            }
+            void *mr[]={c,&p,&task,controls,joined,io}; long long len[]={bytes,sizeof(p),sizeof(task),sizeof(controls),2*stride,QS_SORT_IO_BYTES};
+            struct femu_csd_args a={.numr=grouped?6:5,.mr_addr=mr,.mr_len=len}; assert(!run(probe,&a));
+        }
+    }
+    for(unsigned i=0;i<2;++i) {
+        void *mr[]={&controls[i]}; long long len[]={sizeof(controls[0])}; struct femu_csd_args a={.numr=1,.mr_addr=mr,.mr_len=len}; assert(!close(&a));
+    }
+    struct qs_group group={.count=1,.states={task.state}};
+    struct qs_result *out=calloc(1,sizeof(*out)); assert(out);
+    void *mr[]={&group,out,io}; long long len[]={sizeof(group),sizeof(*out),QS_SORT_IO_BYTES};
+    struct femu_csd_args a={.numr=grouped?3:2,.mr_addr=mr,.mr_len=len};
+    unsigned next=0; uint64_t expected=0,total_values=0; int64_t total_sum=0;
+    for(unsigned i=0;i<5003;++i) { expected+=counts[i]; total_values+=values[i]; total_sum+=sums[i]; }
+    assert(task.joined==expected && task.scanned==9003*passes);
+    do {
+        assert(!run(source,&a));
+        for(unsigned row=0;row<out->rows;++row) {
+            unsigned key=0;
+            if(grouped) { while(next<5003 && !counts[next]) ++next; assert(next<5003); key=next++; }
+            const struct qs_cell *v=out->data[row].cells;
+            uint64_t count=grouped?counts[key]:expected,non_null=grouped?values[key]:total_values;
+            int64_t sum=grouped?sums[key]:total_sum;
+            if(grouped) { assert(v[0].value==(int)key-2500); ++v; }
+            assert(v[0].value==count && v[1].isnull==!non_null && v[2].isnull==!non_null);
+            if(non_null) {
+                struct qs_cell avg; assert(!qs_average((struct qs_cell){.value=sum},non_null,&avg));
+                assert(v[1].value==sum && v[2].value==avg.value && v[2].scale==avg.scale);
+            }
+        }
+    } while(!out->finished);
+    if(grouped) { while(next<5003 && !counts[next]) ++next; assert(next==5003); }
+    for(unsigned i=1;i<next_token;++i) { free(blocks[i]); blocks[i]=NULL; }
+    struct cs_work_stats stats; assert(!cs_work_get_stats(&stats));
+    assert(!stats.used_bytes && !stats.active_contexts && stats.peak_used_bytes<=budget && stats.peak_used_bytes<=capacity);
+    printf("chain grouped=%d empty=%d pairs=%llu combinations=%llu stores=%u loads=%u peak=%zu\n",grouped,empty,(unsigned long long)expected,(unsigned long long)passes,stores,loads,stats.peak_used_bytes);
+    free(c); free(io); free(joined); free(out);
 }
 int main(int argc,char **argv)
 {
@@ -207,5 +329,9 @@ int main(int argc,char **argv)
     check(build,load,probe,close,source,0,2003,0,0,0,1,1);
     estimated_rows=256;
     check(build,load,probe,close,source,70003,17003,0,0,1,0,1);
+    check_chain(build,load,probe,close,source,0,0);
+    check_chain(build,load,probe,close,source,1,0);
+    check_chain(build,load,probe,close,source,1,1);
+    if(budget==capacity) { budget=capacity*2; check_chain(build,load,probe,close,source,1,0); budget=capacity; }
     dlclose(agg); dlclose(join); puts("PASS hash join duplicates, negative/NULL keys, spill/replay, CASE, final projection and cleanup"); return 0;
 }

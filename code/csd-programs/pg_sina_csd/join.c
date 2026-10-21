@@ -46,7 +46,10 @@ static int init_join(const struct qs_plan *p,struct qs_join_control *control,str
 {
     struct cs_work_stats stats; if(cs_work_get_stats(&stats)) return -4;
     size_t limit=p->join.work_mem_bytes;
-    if(!limit || limit>stats.capacity_bytes/2) limit=stats.capacity_bytes/2;
+    /* A build view selects one descriptor but retains the chain length, so
+     * the sum of build shares also fits when the query limit exceeds the pool. */
+    size_t physical=stats.capacity_bytes/2/(p->njoins?p->njoins:1);
+    if(!limit || limit>physical) limit=physical;
     unsigned key=UINT_MAX,ncols=build_columns(p,&key);
     size_t stride=(sizeof(struct hash_row)+(size_t)ncols*9+7)&~(size_t)7;
     if(!p->join.relid || !ncols || key==UINT_MAX || limit<sizeof(struct hash_join)+2*QS_SORT_IO_BYTES) return -4;
@@ -190,39 +193,36 @@ static int64_t aggregate_chunk(struct qs_chunk *out,const struct qs_plan *p,stru
     struct femu_csd_args call={.numr=p->external_aggregate?4:3,.mr_addr=mr,.mr_len=len,.cparam2=reentry?outer->cparam2:0};
     int64_t status=pg_sina_aggregate_sink_impl(&call); task->state=inner.state; return status;
 }
-/* probe columns, combined plan, aggregate task, shared build control,
- * joined column batch, optional spill I/O. The aggregate is a private call;
- * no nested NVMe submission or extra CU is involved. */
-int64_t pg_sina_join_probe(struct femu_csd_args *a)
+/* All stages keep their cursor in their own build workmem. AFDM contains
+ * only the input/output column batches; a child may retain its input while
+ * the final aggregate yields NEED_STORE/LOAD through the whole call chain. */
+static int64_t probe_stage(unsigned,struct qs_chunk *,const struct qs_plan *,struct qs_task *,struct qs_join_control *,struct femu_csd_args *,int);
+static int64_t consume_join(unsigned stage,struct qs_chunk *out,const struct qs_plan *p,struct qs_task *task,
+    struct qs_join_control *control,struct femu_csd_args *a,int reentry)
 {
-    if(!a || (a->numr!=5 && a->numr!=6) || a->mr_len[1]<(long long)sizeof(struct qs_plan) ||
-        a->mr_len[2]<(long long)sizeof(struct qs_task) || a->mr_len[3]<(long long)sizeof(struct qs_join_control)) return -1;
-    struct qs_chunk *c=a->mr_addr[0],*out=a->mr_addr[4]; const struct qs_plan *p=a->mr_addr[1];
-    struct qs_task *task=a->mr_addr[2]; struct qs_join_control *control=a->mr_addr[3];
-    struct hash_join *h=(void *)(uintptr_t)control->state;
-    if(p->nattrs>QS_COLS || p->join.nattrs>p->nattrs || p->ncols>QS_COLS ||
-        !h || h->building || h->loaded!=control->current || task->slot>=QS_WORKERS ||
-        (p->external_aggregate && (a->numr!=6 || a->mr_len[5]<QS_SORT_IO_BYTES)) ||
-        a->mr_len[0]<(long long)sizeof(*c) || c->rows>c->capacity || c->selected>c->rows ||
-        qs_chunk_bytes(c->capacity,c->ncols)>(uint64_t)a->mr_len[0] ||
-        a->mr_len[4]<(long long)sizeof(*out) || !out->capacity || out->ncols!=p->ncols ||
-        qs_chunk_bytes(out->capacity,out->ncols)>(uint64_t)a->mr_len[4]) return -1;
+    if(stage+1<qs_join_count(p)) return probe_stage(stage+1,out,p,task,control,a,reentry);
+    return aggregate_chunk(out,p,task,a,reentry);
+}
+static int64_t probe_stage(unsigned stage,struct qs_chunk *c,const struct qs_plan *p,struct qs_task *task,
+    struct qs_join_control *control,struct femu_csd_args *a,int reentry)
+{
+    const struct qs_join *j=qs_join_at(p,stage);
+    struct hash_join *h=(void *)(uintptr_t)control[stage].state;
+    struct qs_chunk *out=(void *)((unsigned char *)a->mr_addr[4]+stage*qs_join_chunk_stride(p));
+    unsigned base=qs_probe_attrs(p);
+    for(unsigned i=0;i<stage;++i) base+=qs_join_at(p,i)->nattrs;
     unsigned probe_cols[QS_COLS],build_cols[QS_COLS],np=0,nb=0,key=UINT_MAX;
-    for(unsigned i=0;i<p->nattrs;++i) if(p->cols[i].slot>=0) {
-        if(i<p->nattrs-p->join.nattrs) { if((int)i==p->join.probe_key) key=np; probe_cols[np++]=p->cols[i].slot; }
+    for(unsigned i=0;i<base+j->nattrs;++i) if(p->cols[i].slot>=0) {
+        if(i<base) { if((int)i==j->probe_key) key=stage?(unsigned)p->cols[i].slot:np; probe_cols[np++]=p->cols[i].slot; }
         else build_cols[nb++]=p->cols[i].slot;
     }
-    if(np!=c->ncols || nb!=h->ncols || key==UINT_MAX) return -1;
+    if((!stage && np!=c->ncols) || nb!=h->ncols || key==UINT_MAX) return -1;
     struct probe_cursor *cursor=&h->probes[task->slot];
-    if(csIsReentry(a)) {
+    if(reentry) {
         if(!cursor->pending) return -1;
-        int64_t status=aggregate_chunk(out,p,task,a,1); if(status) return status;
+        int64_t status=consume_join(stage,out,p,task,control,a,1); if(status) return status;
         cursor->pending=0; out->rows=out->selected=0;
-    } else {
-        cursor->position=cursor->match=cursor->pending=0; out->rows=out->selected=0;
-        if(!task->state) { int64_t status=aggregate_chunk(out,p,task,a,0); if(status) return status; }
-        task->scanned+=c->rows; task->matched+=c->selected;
-    }
+    } else { cursor->position=cursor->match=cursor->pending=0; out->rows=out->selected=0; }
     while(cursor->position<c->selected) {
         unsigned row=qs_selection(c)[cursor->position]; if(row>=c->rows) return -1;
         if(qs_nulls(c)[(size_t)key*((c->capacity+7)/8)+row/8]&(1U<<(row%8))) { ++cursor->position; continue; }
@@ -238,22 +238,52 @@ int64_t pg_sina_join_probe(struct femu_csd_args *a)
         unsigned dest=out->rows;
         for(unsigned col=0;col<np+nb;++col) {
             unsigned local=col<np?col:col-np,slot=col<np?probe_cols[local]:build_cols[local];
-            int null=col<np?!!(qs_nulls(c)[(size_t)local*((c->capacity+7)/8)+row/8]&(1U<<(row%8))):!!(r->nulls&(UINT64_C(1)<<local));
-            qs_values(out)[(size_t)slot*out->capacity+dest]=col<np?qs_values(c)[(size_t)local*c->capacity+row]:row_values(r)[local];
-            qs_dscales(out)[(size_t)slot*out->capacity+dest]=col<np?qs_dscales(c)[(size_t)local*c->capacity+row]:row_scales(h,r)[local];
+            int null=col<np?!!(qs_nulls(c)[(size_t)(stage?slot:local)*((c->capacity+7)/8)+row/8]&(1U<<(row%8))):!!(r->nulls&(UINT64_C(1)<<local));
+            qs_values(out)[(size_t)slot*out->capacity+dest]=col<np?qs_values(c)[(size_t)(stage?slot:local)*c->capacity+row]:row_values(r)[local];
+            qs_dscales(out)[(size_t)slot*out->capacity+dest]=col<np?qs_dscales(c)[(size_t)(stage?slot:local)*c->capacity+row]:row_scales(h,r)[local];
             if(null) qs_nulls(out)[(size_t)slot*((out->capacity+7)/8)+dest/8]|=1U<<(dest%8);
         }
         qs_selection(out)[dest]=dest; ++out->rows; ++out->selected;
         if(out->rows==out->capacity) {
-            cursor->pending=1; int64_t status=aggregate_chunk(out,p,task,a,0); if(status) return status;
+            cursor->pending=1; int64_t status=consume_join(stage,out,p,task,control,a,0); if(status) return status;
             cursor->pending=0; out->rows=out->selected=0;
         }
     }
     if(out->rows) {
-        cursor->pending=1; int64_t status=aggregate_chunk(out,p,task,a,0); if(status) return status;
+        cursor->pending=1; int64_t status=consume_join(stage,out,p,task,control,a,0); if(status) return status;
         cursor->pending=0;
     }
     return 0;
+}
+/* MR order remains unchanged: probe columns, plan, task, build controls,
+ * intermediate joined column batches, optional spill I/O. */
+int64_t pg_sina_join_probe(struct femu_csd_args *a)
+{
+    if(!a || (a->numr!=5 && a->numr!=6) || a->mr_len[1]<(long long)sizeof(struct qs_plan) ||
+        a->mr_len[2]<(long long)sizeof(struct qs_task)) return -1;
+    struct qs_chunk *c=a->mr_addr[0]; const struct qs_plan *p=a->mr_addr[1]; struct qs_task *task=a->mr_addr[2];
+    unsigned count=qs_join_count(p);
+    if(!count || count>QS_JOINS || p->nattrs>QS_COLS || p->ncols>QS_COLS || task->slot>=QS_WORKERS ||
+        a->mr_len[3]<(long long)(count*sizeof(struct qs_join_control)) ||
+        (p->external_aggregate && (a->numr!=6 || a->mr_len[5]<QS_SORT_IO_BYTES)) ||
+        a->mr_len[0]<(long long)sizeof(*c) || c->rows>c->capacity || c->selected>c->rows ||
+        qs_chunk_bytes(c->capacity,c->ncols)>(uint64_t)a->mr_len[0] ||
+        a->mr_len[4]<(long long)((count-1)*qs_join_chunk_stride(p)+qs_chunk_bytes(256,p->ncols))) return -1;
+    struct qs_join_control *control=a->mr_addr[3];
+    for(unsigned i=0;i<count;++i) {
+        struct hash_join *h=(void *)(uintptr_t)control[i].state;
+        struct qs_chunk *out=(void *)((unsigned char *)a->mr_addr[4]+i*qs_join_chunk_stride(p));
+        if(!h || h->building || h->loaded!=control[i].current || out->capacity!=256 || out->ncols!=p->ncols) return -1;
+    }
+    if(!csIsReentry(a)) {
+        if(!task->state) {
+            struct qs_chunk *out=(void *)((unsigned char *)a->mr_addr[4]+(count-1)*qs_join_chunk_stride(p));
+            out->rows=out->selected=0;
+            int64_t status=aggregate_chunk(out,p,task,a,0); if(status) return status;
+        }
+        task->scanned+=c->rows; task->matched+=c->selected;
+    }
+    return probe_stage(0,c,p,task,control,a,csIsReentry(a));
 }
 /* Device close owns token reclamation, including already-rolled-back tokens. */
 int64_t pg_sina_join_close(struct femu_csd_args *a)

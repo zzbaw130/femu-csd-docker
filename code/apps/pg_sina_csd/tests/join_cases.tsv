@@ -30,3 +30,9 @@ join_residual_null	SELECT count(*),sum(p.price) FROM snia_join_probe p JOIN snia
 unsupported_residual_string_null	SELECT count(*),sum(p.price) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k WHERE p.price>b.amount OR (p.price IS NULL AND b.flag IS NULL);
 join_residual_equality	SELECT count(*),sum(p.price) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k AND p.price=b.amount;
 unsupported_no_equality	SELECT count(*) FROM snia_join_probe p JOIN snia_join_build b ON p.price>b.amount WHERE p.k=1 AND b.k=2;
+join_chain_scalar	SELECT count(*),sum(p.price*c.v),avg(b.amount),count(c.v) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k JOIN snia_join_chain c ON b.link=c.k WHERE p.price>990;
+join_small_chain_groups	SELECT p.k,count(*),sum(p.price),sum(c.v) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k JOIN snia_join_chain c ON b.link=c.k WHERE p.price>990 GROUP BY p.k ORDER BY sum(c.v) DESC,p.k LIMIT 20;
+join_chain_residual	SELECT count(*),sum(p.price*c.v),avg(b.amount) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k JOIN snia_join_chain c ON b.link=c.k WHERE p.price>990 AND (p.price>b.amount+c.v OR c.v IS NULL);
+join_chain_four	SELECT count(*),sum(p.price*c2.v) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k JOIN snia_join_chain c ON b.link=c.k JOIN snia_join_chain c2 ON c.k=c2.k WHERE p.price>999.5;
+join_chain_empty	SELECT count(*),sum(p.price) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k JOIN snia_join_empty c ON b.k=c.k;
+unsupported_disconnected_chain	SELECT count(*) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k CROSS JOIN snia_join_chain c WHERE p.k=1 AND b.k=1 AND c.k=1;

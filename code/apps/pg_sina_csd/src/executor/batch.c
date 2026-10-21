@@ -89,9 +89,10 @@ static void compute_io_request(CsBatchRequest *b,CS_CSF_ID function,CS_MEM_HANDL
 static void join_scan_plan(const struct qs_plan *combined,struct qs_plan *scan,bool build)
 {
     *scan=*combined; unsigned base=build?combined->nattrs-combined->join.nattrs:0;
-    scan->nattrs=build?combined->join.nattrs:combined->nattrs-combined->join.nattrs; scan->ncols=0;
+    scan->nattrs=build?combined->join.nattrs:qs_probe_attrs(combined); scan->ncols=0;
     if(build) { scan->relid=combined->join.relid; scan->relfilenode=combined->join.relfilenode; }
     scan->predicate=build?combined->join.predicate:combined->predicate;
+    scan->njoins=0; scan->join.relid=0; scan->join.residual=0;
     for(unsigned i=0;i<scan->nattrs;++i) {
         scan->cols[i]=combined->cols[base+i];
         if(scan->cols[i].slot>=0) scan->cols[i].slot=scan->ncols++;
@@ -140,13 +141,16 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     struct qs_profile stats={0};
     CHECK_FOR_INTERRUPTS();
     bool joining=request->plan.join.relid!=0;
-    struct qs_request build={0}; struct qs_extent *build_extents=NULL;
+    unsigned njoins=qs_join_count(&request->plan);
+    struct qs_request builds[QS_JOINS]={0}; struct qs_extent *build_extents[QS_JOINS]={0};
+    unsigned max_extents=request->nextents; uint64_t build_bytes=0;
     struct qs_plan probe_plan={0},build_plan={0};
-    if(joining) {
-        build.plan.relid=request->plan.join.relid; build.plan.relfilenode=request->plan.join.relfilenode;
-        build_extents=pg_sina_mapping(&build);
-        if(strcmp(build.device,request->device) || build.nsid!=request->nsid || build.lba_bytes!=request->lba_bytes)
-            elog(ERROR,"CSD joins require both relations in the same namespace");
+    for(unsigned i=0;i<njoins;++i) {
+        const struct qs_join *j=qs_join_at(&request->plan,i); struct qs_request *b=&builds[i];
+        b->plan.relid=j->relid; b->plan.relfilenode=j->relfilenode;
+        build_extents[i]=pg_sina_mapping(b); max_extents=Max(max_extents,b->nextents); build_bytes+=b->bytes;
+        if(strcmp(b->device,request->device) || b->nsid!=request->nsid || b->lba_bytes!=request->lba_bytes)
+            elog(ERROR,"CSD joins require all relations in the same namespace");
     }
     bool streaming=request->plan.ordered_rows || request->plan.external_aggregate;
     struct pg_sina_stream *saved=streaming?calloc(1,sizeof(*saved)):NULL;
@@ -160,9 +164,9 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     result->status=1; strcpy(result->error,"CSD execution interrupted or initialization failed");
     CS_DEV_HANDLE device=NULL; CS_BATCH_HANDLE batch=NULL,build_batch=NULL,load_batch=NULL; CS_EVT_HANDLE event=NULL;
     struct slot slots[QS_WORKERS]={{0}}; unsigned inflight=0;
-    CS_MEM_HANDLE plan_mem=NULL,out_mem=NULL,group_mem=NULL,scan_mem=NULL,join_mem=NULL;
-    CS_MEM_HANDLE joined[QS_WORKERS]={0};
-    struct qs_join_control join_control={0};
+    CS_MEM_HANDLE plan_mem=NULL,out_mem=NULL,group_mem=NULL,scan_mem=NULL,join_mem=NULL,build_mem=NULL;
+    CS_MEM_HANDLE joined[QS_WORKERS]={0},controls_mem[QS_JOINS]={0};
+    struct qs_join_control join_control[QS_JOINS]={{0}};
     struct qs_metrics join_totals={0};
     unsigned build_chunks=0;
     CS_MEM_HANDLE input[QS_WORKERS]={0},vectors[QS_WORKERS]={0},tasks[QS_WORKERS]={0},counters[QS_WORKERS]={0};
@@ -181,10 +185,15 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
         [JOIN_LOAD]={.file="pg-sina-join.so",.symbol="pg_sina_join_load",.index=508},
         [JOIN_CLOSE]={.file="pg-sina-join.so",.symbol="pg_sina_join_close",.index=509}};
     if(joining) { programs[SINK].file="pg-sina-join.so"; programs[SINK].symbol="pg_sina_join_probe"; }
-    unsigned scan_cols=request->plan.ncols,joined_bytes=joining?qs_chunk_bytes(256,request->plan.ncols):0;
+    unsigned scan_cols=request->plan.ncols,joined_bytes=njoins*qs_join_chunk_stride(&request->plan);
     if(joining) {
-        join_scan_plan(&request->plan,&probe_plan,false); join_scan_plan(&request->plan,&build_plan,true);
-        scan_cols=Max(probe_plan.ncols,build_plan.ncols);
+        join_scan_plan(&request->plan,&probe_plan,false); scan_cols=probe_plan.ncols;
+        unsigned base=qs_probe_attrs(&request->plan);
+        for(unsigned i=0;i<njoins;++i) {
+            struct qs_plan view=request->plan; view.join=*qs_join_at(&request->plan,i); view.njoins=1;
+            base+=view.join.nattrs; view.nattrs=base;
+            join_scan_plan(&view,&build_plan,true); scan_cols=Max(scan_cols,build_plan.ncols);
+        }
     }
     if(request->plan.ordered_rows) {
         programs[SINK].file=programs[SOURCE].file="pg-sina-sort.so";
@@ -204,7 +213,8 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     if(!workers) goto cleanup;
     uint64_t capacity=fdm->FDMDetails[0].FDM[0].FDMSize;
     while((uint64_t)workers*(chunk+((qs_chunk_bytes(chunk/24,scan_cols)+4095)&~(size_t)4095)+4096+(profiling?4096:0)+((joined_bytes+4095)&~(size_t)4095))+
-          sizeof(struct qs_result)+sizeof(struct qs_plan)+8192+(joining?sizeof(struct qs_plan)+4096:0)>capacity) {
+          ((sizeof(struct qs_result)+4095)&~(size_t)4095)+((sizeof(struct qs_plan)+4095)&~(size_t)4095)+4096+
+          (joining?2*((sizeof(struct qs_plan)+4095)&~(size_t)4095)+(njoins+1)*4096:0)>capacity) {
         if(workers>1) --workers;
         else if(chunk>QS_PAGE) chunk/=2;
         else { result->status=1; strcpy(result->error,"insufficient FDM"); goto cleanup; }
@@ -220,12 +230,14 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     request->plan.join.work_mem_bytes=joining?(uint64_t)pg_sina_max_memory*1024/2:0;
     request->plan.work_mem_bytes=((uint64_t)pg_sina_max_memory*1024-request->plan.join.work_mem_bytes)/workers;
     if(joining) {
-        join_scan_plan(&request->plan,&probe_plan,false); join_scan_plan(&request->plan,&build_plan,true);
+        join_scan_plan(&request->plan,&probe_plan,false);
     }
     group.count=workers;
+    bool has_filter=request->plan.predicate>=0;
+    for(unsigned i=0;i<njoins;++i) has_filter=has_filter || qs_join_at(&request->plan,i)->predicate>=0;
     for(unsigned i=0;i<FUNCTIONS;++i) {
         if((!joining && i>=JOIN_BUILD) || (streaming && (i==SORT || i==LIMIT)) ||
-            (i==FILTER && request->plan.predicate<0 && (!joining || request->plan.join.predicate<0)) || (i==SORT && !request->plan.norder) ||
+            (i==FILTER && !has_filter) || (i==SORT && !request->plan.norder) ||
             (i==LIMIT && request->plan.limit<0 && !request->plan.offset)) continue;
         TRY(load_program(device,&programs[i]));
     }
@@ -234,111 +246,150 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     TRY(copy(plan_mem,0,&request->plan,sizeof(request->plan),1));
     if(joining) {
         TRY(csAllocMem(device,sizeof(request->plan),&flags,&scan_mem,NULL));
-        TRY(copy(scan_mem,0,&build_plan,sizeof(build_plan),1));
-        flags.Flags=CS_FDM_CLEAR; TRY(csAllocMem(device,sizeof(join_control),&flags,&join_mem,NULL)); flags.Flags=0;
+        TRY(csAllocMem(device,sizeof(request->plan),&flags,&build_mem,NULL));
+        flags.Flags=CS_FDM_CLEAR; TRY(csAllocMem(device,njoins*sizeof(join_control[0]),&flags,&join_mem,NULL));
+        for(unsigned i=0;i<njoins;++i) TRY(csAllocMem(device,sizeof(join_control[0]),&flags,&controls_mem[i],NULL));
+        flags.Flags=0;
     }
     TRY(csAllocMem(device,sizeof(*result),&flags,&out_mem,NULL));
     TRY(csAllocMem(device,sizeof(group),&flags,&group_mem,NULL));
     for(unsigned i=0;i<workers;++i) {
         TRY(csAllocMem(device,chunk,&flags,&input[i],NULL));
         TRY(csAllocMem(device,qs_chunk_bytes(chunk/24,scan_cols),&flags,&vectors[i],NULL));
-        struct qs_chunk header={.capacity=chunk/24,.ncols=joining?build_plan.ncols:request->plan.ncols}; TRY(copy(vectors[i],0,&header,sizeof(header),1));
+        struct qs_chunk header={.capacity=chunk/24,.ncols=joining?probe_plan.ncols:request->plan.ncols}; TRY(copy(vectors[i],0,&header,sizeof(header),1));
         flags.Flags=CS_FDM_CLEAR; TRY(csAllocMem(device,sizeof(struct qs_task),&flags,&tasks[i],NULL)); flags.Flags=0;
         struct qs_task task={.workers=workers,.slot=i}; TRY(copy(tasks[i],0,&task,sizeof(task),1));
         if(joining) {
             TRY(csAllocMem(device,joined_bytes,&flags,&joined[i],NULL));
-            struct qs_chunk header={.capacity=256,.ncols=request->plan.ncols}; TRY(copy(joined[i],0,&header,sizeof(header),1));
+            struct qs_chunk header={.capacity=256,.ncols=request->plan.ncols}; for(unsigned j=0;j<njoins;++j) TRY(copy(joined[i],j*qs_join_chunk_stride(&request->plan),&header,sizeof(header),1));
         }
         if(profiling) {
             flags.Flags=CS_FDM_CLEAR;
             TRY(csAllocMem(device,sizeof(stats),&flags,&counters[i],NULL)); flags.Flags=0;
         }
     }
-    load=calloc(1,sizeof(*load)+(Max(request->nextents,build.nextents)+1)*sizeof(CSBlockRange));
+    load=calloc(1,sizeof(*load)+(max_extents+1)*sizeof(CSBlockRange));
     compute=calloc(1,sizeof(*compute)+8*sizeof(CsComputeArg));
     if(!load || !compute) { result->status=1; strcpy(result->error,"host request allocation failed"); goto cleanup; }
     TRY(csCreateEvent(&event));
     uint64_t cursor=0; bool empty_pending=!request->bytes;
     if(profiling) { uint64_t now=clock_ns(); stats.setup_ns=now-phase; phase=now; }
     if(joining) {
-        /* Parallel scan/filter slots feed one build writer. Other slots may
-         * compute while it appends or spills, but cannot mutate the hash state. */
-        TRY(csAllocBatchRequest(CS_BATCH_SERIAL,1,&build_batch));
-        CS_BATCH_INDEX current=0,append_index=0;
-        uint64_t at=0; bool empty_build=!build.bytes,first_build=true;
-        for(;;) {
-            if(QueryCancelPending || ProcDiePending) goto cleanup;
+        unsigned base=qs_probe_attrs(&request->plan);
+        for(unsigned stage=0;stage<njoins;++stage) {
+            struct qs_request *build=&builds[stage];
+            struct qs_plan view=request->plan; view.join=*qs_join_at(&request->plan,stage); view.njoins=njoins;
+            base+=view.join.nattrs; view.nattrs=base; view.join.residual=0;
+            view.join.work_mem_bytes=request->plan.join.work_mem_bytes/njoins;
+            join_scan_plan(&view,&build_plan,true);
+            TRY(copy(build_mem,0,&view,sizeof(view),1)); TRY(copy(scan_mem,0,&build_plan,sizeof(build_plan),1));
             for(unsigned i=0;i<workers;++i) {
-                struct slot *slot=&slots[i];
-                if(slot->request || (at>=build.bytes && !empty_build)) continue;
-                empty_build=false;
-                unsigned bytes=build.bytes-at<chunk?build.bytes-at:chunk;
-                if(bytes!=slot->bytes) {
-                    TRY(copy(tasks[i],offsetof(struct qs_task,input_bytes),&bytes,sizeof(bytes),1));
-                    slot->bytes=bytes;
-                }
-                bool first=!slot->batch;
-                if(first) TRY(csAllocBatchRequest(CS_BATCH_SERIAL,3,&slot->batch));
-                if(bytes) {
-                    build_storage_request(load,device,input[i],&build,build_extents,at,bytes);
-                    if(first) TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_ADD,load,0,0,&slot->load));
-                    else TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_RECONFIG,load,slot->load,0,NULL));
-                }
-                if(first) {
-                    CS_BATCH_INDEX previous=slot->load;
-                    CS_MEM_HANDLE scan[]={input[i],scan_mem,vectors[i],tasks[i]}; compute_request(compute,programs[SCAN].function,scan,4,counters[i]);
-                    TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_ADD,compute,0,previous,&current)); previous=current;
-                    if(build_plan.predicate>=0) {
-                        CS_MEM_HANDLE filter[]={vectors[i],scan_mem,input[i]}; compute_request(compute,programs[FILTER].function,filter,3,counters[i]);
-                        TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_ADD,compute,0,previous,&current));
+                struct qs_chunk header={.capacity=chunk/24,.ncols=build_plan.ncols}; TRY(copy(vectors[i],0,&header,sizeof(header),1));
+            }
+            /* Parallel scan/filter slots feed one build writer. Other slots may
+             * compute while it appends or spills, but cannot mutate the hash state. */
+            TRY(csAllocBatchRequest(CS_BATCH_SERIAL,1,&build_batch));
+            CS_BATCH_INDEX current=0,append_index=0;
+            uint64_t at=0; bool empty_build=!build->bytes,first_build=true;
+            for(;;) {
+                if(QueryCancelPending || ProcDiePending) goto cleanup;
+                for(unsigned i=0;i<workers;++i) {
+                    struct slot *slot=&slots[i];
+                    if(slot->request || (at>=build->bytes && !empty_build)) continue;
+                    empty_build=false;
+                    unsigned bytes=build->bytes-at<chunk?build->bytes-at:chunk;
+                    if(bytes!=slot->bytes) {
+                        TRY(copy(tasks[i],offsetof(struct qs_task,input_bytes),&bytes,sizeof(bytes),1));
+                        slot->bytes=bytes;
                     }
+                    bool first=!slot->batch;
+                    if(first) TRY(csAllocBatchRequest(CS_BATCH_SERIAL,3,&slot->batch));
+                    if(bytes) {
+                        build_storage_request(load,device,input[i],build,build_extents[stage],at,bytes);
+                        if(first) TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_ADD,load,0,0,&slot->load));
+                        else TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_RECONFIG,load,slot->load,0,NULL));
+                    }
+                    if(first) {
+                        CS_BATCH_INDEX previous=slot->load;
+                        CS_MEM_HANDLE scan[]={input[i],scan_mem,vectors[i],tasks[i]}; compute_request(compute,programs[SCAN].function,scan,4,counters[i]);
+                        TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_ADD,compute,0,previous,&current)); previous=current;
+                        if(build_plan.predicate>=0) {
+                            CS_MEM_HANDLE filter[]={vectors[i],scan_mem,input[i]}; compute_request(compute,programs[FILTER].function,filter,3,counters[i]);
+                            TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_ADD,compute,0,previous,&current));
+                        }
+                    }
+                    CS_STATUS status=csQueueBatchRequest(slot->batch,slot,NULL,event,&slot->request,NULL);
+                    if(status!=CS_QUEUED) {
+                        result->status=status==CS_SUCCESS?CS_ERROR_IN_EXECUTION:status;
+                        snprintf(result->error,sizeof(result->error),"csQueueBatchRequest(build scan): status=%d",status); goto cleanup;
+                    }
+                    ++inflight; at+=bytes;
                 }
-                CS_STATUS status=csQueueBatchRequest(slot->batch,slot,NULL,event,&slot->request,NULL);
-                if(status!=CS_QUEUED) {
-                    result->status=status==CS_SUCCESS?CS_ERROR_IN_EXECUTION:status;
-                    snprintf(result->error,sizeof(result->error),"csQueueBatchRequest(build scan): status=%d",status); goto cleanup;
+                if(!inflight) break;
+                void *completed=NULL;
+                CS_STATUS status=csPollEvent(event,&completed,NULL);
+                if(status==CS_NOT_DONE) { pg_usleep(50L); continue; }
+                --inflight; struct slot *slot=completed; slot->request=NULL;
+                if(status!=CS_SUCCESS) {
+                    result->status=status; snprintf(result->error,sizeof(result->error),"csPollEvent(build scan): status=%d",status); goto cleanup;
                 }
-                ++inflight; at+=bytes;
+                unsigned i=slot-slots;
+                CS_MEM_HANDLE memory[]={vectors[i],build_mem,controls_mem[stage],input[i]}; compute_io_request(compute,programs[JOIN_BUILD].function,memory,4,counters[i]);
+                /* A one-entry batch retains SNIA's automatic NEED_STORE handling. */
+                if(first_build) TRY(csConfigureBatchEntry(build_batch,CS_BATCH_ADD,compute,0,0,&append_index));
+                else TRY(csConfigureBatchEntry(build_batch,CS_BATCH_RECONFIG,compute,append_index,0,NULL));
+                first_build=false;
+                TRY(csQueueBatchRequest(build_batch,NULL,NULL,NULL,NULL,NULL)); ++build_chunks;
             }
-            if(!inflight) break;
-            void *completed=NULL;
-            CS_STATUS status=csPollEvent(event,&completed,NULL);
-            if(status==CS_NOT_DONE) { pg_usleep(50L); continue; }
-            --inflight; struct slot *slot=completed; slot->request=NULL;
-            if(status!=CS_SUCCESS) {
-                result->status=status; snprintf(result->error,sizeof(result->error),"csPollEvent(build scan): status=%d",status); goto cleanup;
+            TRY(csFreeBatchRequest(build_batch)); build_batch=NULL;
+            for(unsigned i=0;i<workers;++i) {
+                if(slots[i].batch) TRY(csFreeBatchRequest(slots[i].batch));
+                slots[i]=(struct slot){0};
+                unsigned bytes=0; TRY(copy(tasks[i],offsetof(struct qs_task,input_bytes),&bytes,sizeof(bytes),1));
             }
-            unsigned i=slot-slots;
-            CS_MEM_HANDLE memory[]={vectors[i],plan_mem,join_mem,input[i]}; compute_io_request(compute,programs[JOIN_BUILD].function,memory,4,counters[i]);
-            /* A one-entry batch retains SNIA's automatic NEED_STORE handling. */
-            if(first_build) TRY(csConfigureBatchEntry(build_batch,CS_BATCH_ADD,compute,0,0,&append_index));
-            else TRY(csConfigureBatchEntry(build_batch,CS_BATCH_RECONFIG,compute,append_index,0,NULL));
-            first_build=false;
-            TRY(csQueueBatchRequest(build_batch,NULL,NULL,NULL,NULL,NULL)); ++build_chunks;
-        }
-        TRY(csFreeBatchRequest(build_batch)); build_batch=NULL;
-        for(unsigned i=0;i<workers;++i) {
-            if(slots[i].batch) TRY(csFreeBatchRequest(slots[i].batch));
-            slots[i]=(struct slot){0};
-            unsigned bytes=0; TRY(copy(tasks[i],offsetof(struct qs_task,input_bytes),&bytes,sizeof(bytes),1));
-        }
+        } /* Every build uses its own workmem share and control record. */
         TRY(copy(scan_mem,0,&probe_plan,sizeof(probe_plan),1));
         for(unsigned i=0;i<workers;++i) {
             struct qs_chunk header={.capacity=chunk/24,.ncols=probe_plan.ncols}; TRY(copy(vectors[i],0,&header,sizeof(header),1));
         }
         TRY(csAllocBatchRequest(CS_BATCH_SERIAL,1,&load_batch));
-        CS_MEM_HANDLE memory[]={join_mem,input[0]}; compute_io_request(compute,programs[JOIN_LOAD].function,memory,2,counters[0]);
+        CS_MEM_HANDLE memory[]={controls_mem[0],input[0]}; compute_io_request(compute,programs[JOIN_LOAD].function,memory,2,counters[0]);
+        CS_BATCH_INDEX current;
         TRY(csConfigureBatchEntry(load_batch,CS_BATCH_ADD,compute,0,0,&current));
         if(profiling) { uint64_t now=clock_ns(); stats.build_ns=now-phase; phase=now; }
     }
-    unsigned passes=1;
-    for(unsigned pass=0;pass<passes;++pass) {
-        cursor=0; empty_pending=!request->bytes;
-        if(joining) {
-            TRY(copy(join_mem,offsetof(struct qs_join_control,current),&pass,sizeof(pass),1));
+    uint64_t passes=1;
+    if(joining) {
+        /* Finalize/load every first build batch before computing the product.
+         * Later combinations only replace tables whose batch index changed. */
+        for(unsigned i=0;i<njoins;++i) {
+            CS_MEM_HANDLE memory[]={controls_mem[i],input[0]}; compute_io_request(compute,programs[JOIN_LOAD].function,memory,2,counters[0]);
+            TRY(csConfigureBatchEntry(load_batch,CS_BATCH_RECONFIG,compute,1,0,NULL));
             TRY(csQueueBatchRequest(load_batch,NULL,NULL,NULL,NULL,NULL));
-            TRY(copy(join_mem,0,&join_control,sizeof(join_control),0)); passes=join_control.batches;
-            if(!passes) { result->status=1; strcpy(result->error,"CSD hash join produced no build batch"); goto cleanup; }
+            TRY(copy(controls_mem[i],0,&join_control[i],sizeof(join_control[0]),0));
+        }
+        TRY(copy(join_mem,0,join_control,njoins*sizeof(join_control[0]),1));
+        for(unsigned i=0;i<njoins;++i) {
+            unsigned n=join_control[i].batches;
+            if(!n || passes>UINT64_MAX/n) { result->status=1; strcpy(result->error,"invalid CSD build batch product"); goto cleanup; }
+            passes*=n;
+        }
+    }
+    for(uint64_t pass=0;pass<passes;++pass) {
+        cursor=0; empty_pending=!request->bytes;
+        if(joining && pass) {
+            uint64_t divisor=1;
+            for(unsigned i=0;i<njoins;++i) {
+                unsigned current=(pass/divisor)%join_control[i].batches; divisor*=join_control[i].batches;
+                if(current==join_control[i].current) continue;
+                join_control[i].current=current;
+                TRY(copy(controls_mem[i],offsetof(struct qs_join_control,current),&current,sizeof(current),1));
+                CS_MEM_HANDLE memory[]={controls_mem[i],input[0]}; compute_io_request(compute,programs[JOIN_LOAD].function,memory,2,counters[0]);
+                TRY(csConfigureBatchEntry(load_batch,CS_BATCH_RECONFIG,compute,1,0,NULL));
+                TRY(csQueueBatchRequest(load_batch,NULL,NULL,NULL,NULL,NULL));
+                TRY(copy(controls_mem[i],0,&join_control[i],sizeof(join_control[0]),0));
+            }
+            TRY(copy(join_mem,0,join_control,njoins*sizeof(join_control[0]),1));
         }
     /* Like DuckDB's parallel scan tasks, each completed slot claims the next
      * unassigned range. There is no four-chunk round barrier. */
@@ -399,8 +450,10 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     if(joining) {
         /* No source reads the hash table. Release it before grouped source
          * uses that reservation for final-result sorting. */
-        CS_MEM_HANDLE memory[]={join_mem}; compute_request(compute,programs[JOIN_CLOSE].function,memory,1,NULL);
-        TRY(csQueueComputeRequest(&compute->u.Compute,NULL,NULL,NULL,NULL,NULL));
+        for(unsigned i=0;i<njoins;++i) {
+            CS_MEM_HANDLE memory[]={controls_mem[i]}; compute_request(compute,programs[JOIN_CLOSE].function,memory,1,NULL);
+            TRY(csQueueComputeRequest(&compute->u.Compute,NULL,NULL,NULL,NULL,NULL));
+        }
     }
     if(profiling) { uint64_t now=clock_ns(); stats.pipeline_ns[0]=now-phase; phase=now; }
     for(unsigned i=0;i<workers;++i) if(slots[i].batch) { TRY(csFreeBatchRequest(slots[i].batch)); slots[i].batch=NULL; }
@@ -429,18 +482,21 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     result->metrics.fdm_bytes=((sizeof(request->plan)+4095)&~(size_t)4095)+
         ((sizeof(*result)+4095)&~(size_t)4095)+4096+
         workers*(chunk+((qs_chunk_bytes(chunk/24,scan_cols)+4095)&~(size_t)4095)+4096+(profiling?4096:0)+((joined_bytes+4095)&~(size_t)4095))+
-        (joining?((sizeof(request->plan)+4095)&~(size_t)4095)+4096:0);
+        (joining?2*((sizeof(request->plan)+4095)&~(size_t)4095)+(njoins+1)*4096:0);
     if(joining) {
-        TRY(copy(join_mem,0,&join_control,sizeof(join_control),0));
+        TRY(copy(join_mem,0,join_control,njoins*sizeof(join_control[0]),0));
         for(unsigned i=0;i<group.count;++i) {
             struct qs_task task; TRY(copy(tasks[i],0,&task,sizeof(task),0));
             join_totals.scanned+=task.scanned; join_totals.matched+=task.matched; join_totals.join_rows+=task.joined;
         }
-        join_totals.build_rows=join_control.rows; join_totals.build_batches=passes;
-        join_totals.input_bytes=request->bytes*passes+build.bytes;
+        join_totals.build_batches=passes;
+        join_totals.input_bytes=request->bytes*passes+build_bytes;
         join_totals.chunks=nchunks*passes+build_chunks;
-        join_totals.spill_write_bytes=join_control.spill_write_bytes;
-        join_totals.spill_read_bytes=join_control.spill_read_bytes;
+        for(unsigned i=0;i<njoins;++i) {
+            join_totals.build_rows+=join_control[i].rows;
+            join_totals.spill_write_bytes+=join_control[i].spill_write_bytes;
+            join_totals.spill_read_bytes+=join_control[i].spill_read_bytes;
+        }
         join_metrics(&result->metrics,&join_totals);
     }
     if(profiling) {
@@ -499,13 +555,17 @@ cleanup:
         }
     }
     if(join_mem && compute && programs[JOIN_CLOSE].active) {
-        CS_MEM_HANDLE memory[]={join_mem}; compute_request(compute,programs[JOIN_CLOSE].function,memory,1,NULL);
-        csQueueComputeRequest(&compute->u.Compute,NULL,NULL,NULL,NULL,NULL);
+        for(unsigned i=0;i<njoins;++i) if(controls_mem[i]) {
+            CS_MEM_HANDLE memory[]={controls_mem[i]}; compute_request(compute,programs[JOIN_CLOSE].function,memory,1,NULL);
+            csQueueComputeRequest(&compute->u.Compute,NULL,NULL,NULL,NULL,NULL);
+        }
     }
     CsMemFlags release={.FDMId=1};
     for(unsigned i=0;i<QS_WORKERS;++i) { if(input[i])csFreeMem(input[i],&release); if(vectors[i])csFreeMem(vectors[i],&release); if(tasks[i])csFreeMem(tasks[i],&release); if(counters[i])csFreeMem(counters[i],&release); if(joined[i])csFreeMem(joined[i],&release); }
     if(scan_mem)csFreeMem(scan_mem,&release);
+    if(build_mem)csFreeMem(build_mem,&release);
     if(join_mem)csFreeMem(join_mem,&release);
+    for(unsigned i=0;i<njoins;++i) if(controls_mem[i]) csFreeMem(controls_mem[i],&release);
     if(plan_mem)csFreeMem(plan_mem,&release);
     if(out_mem)csFreeMem(out_mem,&release);
     if(group_mem)csFreeMem(group_mem,&release);

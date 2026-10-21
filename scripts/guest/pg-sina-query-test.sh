@@ -29,6 +29,9 @@ case ${1:-query} in
             if [[ $name == join_residual_* || $name == join_small_residual_* ]]; then
                 grep -q 'Filter(join)' "$RESULTS/$name.plan"
             fi
+            if [[ $name == join_chain_* || $name == join_small_chain_* ]]; then
+                grep -Eq 'CSD Join Count: [23]' "$RESULTS/$name.plan"
+            fi
             run_cold host "$sql" "$RESULTS/$name.host"
             csd_sql=$sql
             if [[ $name == join_small_* ]]; then csd_sql="SET pg_sina_csd.max_memory='4MB'; $sql"; fi
@@ -59,7 +62,7 @@ case ${1:-query} in
                 echo 'PASS join spill/load, profiling, 4 MiB query budget and physical pool bound'
             fi
         done < "$PROJECT/tests/join_cases.tsv"
-        for query in q14 q12 q19 q19_variant; do
+        for query in q14 q12 q19 q19_variant q3; do
             sql=$(cat "$PROJECT/tests/$query.sql")
             psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
                 -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path=csd" \
@@ -67,7 +70,7 @@ case ${1:-query} in
             grep -q 'CSD Join: inner integer hash join' "$RESULTS/$query.plan"
             grep -q 'CSD Build Scheduling: parallel scan/filter; single hash writer' "$RESULTS/$query.plan"
             run_cold host "$sql" "$RESULTS/$query.host"
-            memories=(4 64); if [[ $query == q12 ]]; then memories=(16 64); fi
+            memories=(4 64); if [[ $query == q12 || $query == q3 ]]; then memories=(16 64); fi
             for memory in "${memories[@]}"; do
                 run_cold csd "SET pg_sina_csd.max_memory='${memory}MB'; $sql" "$RESULTS/$query.$memory"
                 cmp "$RESULTS/$query.host.rows" "$RESULTS/$query.$memory.rows"
@@ -79,13 +82,16 @@ case ${1:-query} in
             printf '\\set ON_ERROR_STOP off\n'
             printf 'SELECT sum(b.bad) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k;\n'
             printf 'SELECT sum(p.bad) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k;\n'
+            printf 'SELECT count(*) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k JOIN snia_join_chain c ON b.link=c.k WHERE c.v*10000000000000000.00*10000000000000000.00>0;\n'
+            printf 'SELECT sum(p.price*c.v*10000000000000000.00*10000000000000000.00) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k JOIN snia_join_chain c ON b.link=c.k;\n'
             # Leave setup time so cancellation reaches Q12's parallel build.
             printf "SET statement_timeout='300ms';\n%s\nSET statement_timeout=0;\n" "$sql"
+            printf "SET statement_timeout='1500ms';\n%s\nSET statement_timeout=0;\n" "$(cat "$PROJECT/tests/q3.sql")"
             printf '\\set ON_ERROR_STOP on\n'
             printf 'SELECT count(*) FROM snia_join_build;\nSELECT count(*) FROM snia_join_build;\n'
         } > "$RESULTS/cleanup.sql"
         sh "$COLD" csd "$RESULTS/cleanup.sql" > "$RESULTS/cleanup.log" 2>&1
-        [[ $(grep -c 'CSD execution failed' "$RESULTS/cleanup.log") == 2 ]]
+        [[ $(grep -c 'CSD execution failed' "$RESULTS/cleanup.log") == 4 ]]
         grep -q 'canceling statement due to statement timeout' "$RESULTS/cleanup.log"
         [[ $(grep -c '^70003$' "$RESULTS/cleanup.log") == 2 ]]
         echo 'PASS build/probe errors and cancellation release resources before same-backend reuse'
@@ -96,7 +102,7 @@ case ${1:-query} in
             -c 'SELECT count(*) FROM snia_join_build' > "$RESULTS/join-close.log"
         grep -q '^70003$' "$RESULTS/join-close.log"
         echo 'PASS early close of spilled join aggregation and same-backend reuse'
-        psql -X -q -v ON_ERROR_STOP=1 -d tpch_s1 -c "DELETE FROM sina_csd.relations WHERE relid IN ('snia_join_build'::regclass,'snia_join_probe'::regclass,'snia_join_empty'::regclass,'snia_join_strings'::regclass); DROP TABLE snia_join_build,snia_join_probe,snia_join_empty,snia_join_strings"
+        psql -X -q -v ON_ERROR_STOP=1 -d tpch_s1 -c "DELETE FROM sina_csd.relations WHERE relid IN ('snia_join_build'::regclass,'snia_join_probe'::regclass,'snia_join_empty'::regclass,'snia_join_strings'::regclass,'snia_join_chain'::regclass); DROP TABLE snia_join_build,snia_join_probe,snia_join_empty,snia_join_strings,snia_join_chain"
         ;;
     query)
         psql -X -q -v ON_ERROR_STOP=1 -d tpch_s1 -f "$PROJECT/tests/query_setup.sql"
@@ -297,7 +303,7 @@ case ${1:-query} in
         queries=(q1 q6)
         if [[ $1 == order-bench ]]; then queries=(order_topn order_spill); fi
         if [[ $1 == aggregate-bench ]]; then queries=(high_aggregate); fi
-        if [[ $1 == join-bench ]]; then queries=(q14 q12 q19); fi
+        if [[ $1 == join-bench ]]; then queries=(q14 q12 q19 q3); fi
         for name in "${queries[@]}"; do
             psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
                 -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path=csd" \

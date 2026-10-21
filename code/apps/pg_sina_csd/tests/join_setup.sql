@@ -1,13 +1,13 @@
 \set ON_ERROR_STOP on
 DELETE FROM sina_csd.relations WHERE relid IN
- (to_regclass('public.snia_join_build'),to_regclass('public.snia_join_probe'),to_regclass('public.snia_join_empty'),to_regclass('public.snia_join_strings'));
-DROP TABLE IF EXISTS snia_join_build,snia_join_probe,snia_join_empty,snia_join_strings;
+ (to_regclass('public.snia_join_build'),to_regclass('public.snia_join_probe'),to_regclass('public.snia_join_empty'),to_regclass('public.snia_join_strings'),to_regclass('public.snia_join_chain'));
+DROP TABLE IF EXISTS snia_join_build,snia_join_probe,snia_join_empty,snia_join_strings,snia_join_chain;
 CREATE TABLE snia_join_build AS
 SELECT CASE WHEN i%97=0 THEN NULL ELSE (i%7001)-3500 END::bigint AS k,
        CASE WHEN i%13=0 THEN NULL WHEN i%3=0 THEN 'PROMO BRUSHED' ELSE 'STANDARD' END::text AS flag,
        (i%31)::numeric(12,2) AS amount,
        CASE WHEN i=1 THEN 1e30::numeric ELSE 0::numeric END AS bad,
-       repeat('x',48) AS unused
+       repeat('x',48) AS unused, ((i*7+3)%4093-2046)::int AS link
 FROM generate_series(1,70003) g(i);
 CREATE TABLE snia_join_probe AS
 SELECT CASE WHEN i%113=0 THEN NULL ELSE (i%8001)-4000 END::bigint AS k,
@@ -32,3 +32,9 @@ INSERT INTO snia_join_strings VALUES
  (9,'MAIL','MAIL','MAIL',-2.0),(10,'ZZZ','ZZZ','ZZZ',10.00);
 VACUUM (FREEZE, ANALYZE) snia_join_strings;
 SELECT sina_csd.prepare('snia_join_strings');
+
+CREATE TABLE snia_join_chain AS
+SELECT (i%4093-2046)::int AS k, CASE WHEN i%23=0 THEN NULL ELSE (i%31)::numeric(12,2) END AS v,
+       repeat('z',48) AS unused FROM generate_series(1,35003) AS g(i);
+VACUUM (FREEZE, ANALYZE) snia_join_chain;
+SELECT sina_csd.prepare('snia_join_chain');
