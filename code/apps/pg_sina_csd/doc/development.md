@@ -314,3 +314,5 @@ Guest完整Join回归54项、单表及旧查询55项通过。Q3在16/64MB下与h
 验收：Q9 175行结果与host逐字一致（3轮cmp通过）。默认64MB冷启动三轮host=4161.373/3068.764/3073.949ms（均值3434.695），CSD=7702.432/7386.411/7677.284ms（均值7588.709），约2.21倍。Q9 profile为6个build批次、Internal Read 5921865728字节、Spill Write 98631680/Read 158793728字节、4 workers、Execution 8073.135ms。32MB查询预算CSD=42491.859ms，结果一致；16MB超过55s未返回，当前最低验收内存为32MB，推荐64MB。200ms取消后同backend连续两次CSD COUNT均返回6001215。
 
 限制：Q9仍有6次lineitem重扫，64MB下2.21倍host；16MB不可用。问题来自orders 1.5M与partsupp 800k无法同时单批驻留，下一步需要分区Hash Join或probe物化，不能把当前结果当作性能完成。复现入口`tests/pg-sina-csd-test.sh join|join-bench`，SQL位于`tests/q9.sql`。
+
+Q9提交后复核Q5/Q10（连接顺序/预算已变化）：Q5 host均值2275.099ms、CSD均值1212.940ms，约1.88倍；Q10 host均值2287.015ms、CSD均值1531.757ms，约1.49倍；各3轮结果cmp通过。16MB查询预算Q5=11102.431ms、Q10=5062.922ms，结果一致；旧Q5/Q10的64MB/16MB记录以本次复核为准。

@@ -651,4 +651,8 @@ host/CSD 交替各 3 轮，完整 175 行结果逐次 cmp，均通过。
 
 Q9 均值约2.21倍 host；profile Execution 8073.135ms，Build Batches=6、Internal Read 5921865728字节、Spill Write 98631680/Read 158793728字节、4 workers。32MB 查询预算 CSD=42491.859ms，结果一致；16MB 超过55s未返回，当前最低验收内存32MB，推荐64MB。
 
+### Q9提交后 Q5/Q10 复核
+
+Q9 的复合键/连接顺序/预算改动影响全部多表查询，提交后重新做3轮冷启动：Q5 host=2935.133/1967.948/1922.216ms（均值2275.099），CSD=1306.055/1170.357/1162.407ms（均值1212.940），约1.88倍；Q10 host=2186.796/2260.944/2413.306ms（均值2287.015），CSD=1449.362/1439.418/1706.491ms（均值1531.757），约1.49倍。两条各3轮完整结果 cmp 通过。16MB 查询预算 Q5=11102.431ms、Q10=5062.922ms，结果一致；该16MB档为内存受限，不使用旧记录中的 Q5 6440ms/Q10 7433ms。Q5/Q10 的独立profile数字未在本轮重采，性能表以这三轮关闭profile数据为准。
+
 索引实验：orders_pkey 链尾在复合键后 Index Heap Tuples 323844、Pages Loaded 62849，耗时10.9s，仍慢于Hash，已撤回。下一步需要分区Hash Join或probe物化，将6次重扫压到1–2次。原始日志：Guest `/tmp/q9-bench2.log`、`/tmp/q9.host.*.log`、`/tmp/q9.csd.*.log`、`/tmp/q9_32.log`；入口 `tests/pg-sina-csd-test.sh join|join-bench`。

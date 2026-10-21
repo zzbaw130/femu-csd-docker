@@ -352,6 +352,6 @@ Q10 的 SQL 虽然 GROUP BY 7 列，PG 会按主键函数依赖去掉 5 列；�
 
 Q5 的多表连接顺序也做了调整：候选表按“单列唯一键优先、唯一键候选中过滤后较大的关系优先”加入，避免先按 `c_nationkey=s_nationkey` 连接 customer/supplier 产生巨大中间结果。Q5 实际链为 lineitem→orders→customer→supplier→nation→region，最后执行 `c_nationkey=s_nationkey` 残差。Build 预算按每表过滤后行数、投影列数和 2 的幂容量计算单批所需字节，再按比例分配；默认 64MB 下 Q5 五张 build 表均为 1 批，lineitem 只扫描一次。
 
-Q5 默认 64MB 冷启动三轮：host 2108.595ms、CSD 946.138ms（均值，约 2.23 倍）；Q10 host 2380.000ms、CSD 1391.789ms（约 1.71 倍）。两条查询结果均与 host 逐字一致。Q10 16MB 查询预算下 7433.795ms，12 个 build 批次、33 个 spill run，写 23,789,568/读 65,208,320 字节，属于内存受限。取消后同一 backend 可继续执行 CSD COUNT。`tests/q5.sql`、`tests/q10.sql` 为完整查询，入口为 `tests/pg-sina-csd-test.sh join|join-bench`。
+Q5 默认 64MB 冷启动三轮（Q9 提交后复核）：host 2275.099ms、CSD 1212.940ms（均值，约 1.88 倍）；Q10 host 2287.015ms、CSD 1531.757ms（约 1.49 倍）。两条查询结果均与 host 逐字一致。Q5/Q10 16MB 查询预算下分别为 11102.431ms 和 5062.922ms，结果一致，属于内存受限 spill。取消后同一 backend 可继续执行 CSD COUNT。`tests/q5.sql`、`tests/q10.sql` 为完整查询，入口为 `tests/pg-sina-csd-test.sh join|join-bench`。
 
 Q9 进一步增加复合连接键 `(l_partkey,l_suppkey)=(ps_partkey,ps_suppkey)`、`Q_YEAR`、`%` 通配 Scan 和短字符串排序。175 行结果与 host 一致；64MB 三轮 host=3434.695ms、CSD=7588.709ms（约2.21倍），Build Batches=6，仍有6次lineitem重扫。32MB 下CSD=42491.859ms且结果一致；16MB超过55s未返回，当前最低验收内存32MB。Q9的性能仍未达到“接近host”的目标，后续需要分区Hash Join或probe物化，详见[开发记录](doc/development.md)。
