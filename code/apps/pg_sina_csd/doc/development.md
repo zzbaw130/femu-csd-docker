@@ -282,3 +282,13 @@ Guest完整Join回归54项、单表及旧查询55项通过。Q3在16/64MB下与h
 验收：25项设备CTest、Guest页布局及相关ASan/UBSan检查通过。原生索引测试覆盖不同键宽、跨叶重复值、513行输出、超过页槽容量的256个Heap页、HOT、空根、错误/取消回收；Guest索引专项13项、既有Join54项、单表55项检查通过。Q3在4/16/64/128MB预算下结果一致，索引计算溢出或取消后同backend能连续执行两个CSD COUNT。Guest已升级0.2并为八张冻结表保存索引映射。
 
 全部检查结束后独立冷启动各3轮：Q3 host/CSD均值2467.175/1868.293ms，约1.32倍，CSD较历史六轮重扫均值4277.033ms降低约56%。Q12/Q14/Q19分别为2004.954/1092.405、1640.833/654.222、1769.881/1079.401ms。Q3独立profile中顺序扫描1500000行、索引Heap解码589580行，内部读取1095892992字节，7733次probe入口，build组合数1且无spill；数据和剩余继续执行开销见[性能分析](performance.md)。
+
+## 阶段3f：低基数运行期字符串字典与完整 Q5（2026-10-22）
+
+- 新增查询级运行期字符串字典 AFDM（`struct qs_dict`，最多512项、64KB字节区），仅承接低基数、可安全内联的字符串：Scan把去尾空格后的字节插入字典并输出ID，Join/分组/排序只传ID；Aggregate.source在最终结果前把ID恢复成字节。结果仍放在原有16字节 `qs_cell` 中，字节写入 `value`、长度写入 `scale`，上限15字节。Q5的 `n_name` 最长14字节（char(25)去尾空格），因此不需要改 `qs_cell`、Hash Join stride、Sort run 或 spill 记录布局。
+- 规划端允许 `Q_STRING` 列作为分组键/输出；SQL 常量等于/IN 仍沿用原静态字典，不改成运行期字典。字典与静态字典不混用。字符串 `ORDER BY` 暂不做：运行期ID按首次出现分配，不是字节序；规划时对 `ORDER BY` 字符串直接回退原生路径，避免输出错误顺序。Q5按 revenue 排序，不受此限制。
+- 多表连接顺序改为优先选择“单列唯一键”候选，并在多个唯一键候选中优先较大的过滤后关系。此前Q5按最小估计行数先连 customer 与 supplier 的 `c_nationkey=s_nationkey`，会先生成约 customer×同国supplier 的大中间结果，再连orders，实测超过42s；调整后链为 lineitem→orders→customer→supplier→nation→region，`c_nationkey=s_nationkey` 留作最终残差，避免该放大。
+- build预算不再按表数均分：按每表过滤后行数、投影列数、按2的幂容量计算的“单批所需字节 + 1MiB”比例分配，设备仍受查询预算一半和物理池硬上限约束。Q5在默认64MB查询预算下五张build表均为1批，probe只扫描lineitem一次；16MB查询预算下仍正确，但发生内存受限的多批重扫。
+- 未实现：原生计划中间位置的 Index Join（Q5仍走Hash链）；运行期字典>15字节或>512项；字符串排序比较器；FD输出payload；Q10的 c_name/c_address/c_comment 长字符串。Q5的性能来自一次lineitem扫描、4 CU并行probe和单批build，不代表已实现通用path编译器。
+
+验收：Q5完整结果与host逐字一致（3轮cmp均通过）；默认64MB下五张build表各1批、无build组合重扫；16MB查询预算下结果仍一致，profile显示12个build批次、spill写17.4MB/读39.8MB，属内存受限。Q5默认64MB冷启动三轮host=2460.080/1926.239/1939.466ms（均值2108.595），CSD=989.475/929.035/919.904ms（均值946.138），约2.23倍；16MB查询预算CSD=6440.564ms。Q5取消（200ms statement_timeout）后同一backend连续两次CSD COUNT均返回6001215。既有Q1/Q6/Q12/Q14/Q19冷启动结果无回退，Q3单次冷启动1869.695ms。复现入口为`tests/pg-sina-csd-test.sh join`和`join-bench`，Q5 SQL位于`tests/q5.sql`。

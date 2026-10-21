@@ -593,3 +593,24 @@ Q3本轮host/CSD均值为2467.175/1868.293ms，约1.32倍；原六轮重扫实�
 Guest索引专项13项检查通过：复合索引NULL载荷/重复值、smallint/bigint、局部与跨表过滤、4/64MB差分、空表、REINDEX后旧映射回退、计算溢出和取消后的同backend复用；Q3在4/16/64/128MB查询预算下与host逐字一致。原有Join54项、单表/既有查询55项回归全部通过，包含既有低内存spill、错误/取消和source早关回收。
 
 宿主日志：`/tmp/pg-snia-index-native-tests.log`、`/tmp/pg-snia-index-asan-tests.log`、`/tmp/pg-snia-index-asan-final.log`、`/tmp/pg-snia-index-guest-layout.log`、`/tmp/pg-snia-index-guest-final.log`、`/tmp/pg-snia-index-join-regression.log`、`/tmp/pg-snia-index-query-regression.log`、`/tmp/pg-snia-index-bench.log`；最终profile为`/tmp/pg-snia-index-q3-profile.json`，原始时延为`/tmp/pg-snia-index-timings.tsv`。Guest专项目录`/tmp/pg-sina-index.0GX7mE`，Join/单表目录`/tmp/pg-sina-queries.y4KXAX`、`/tmp/pg-sina-queries.45y6Kx`，性能目录`/tmp/pg-sina-queries.vEjZQu`。复现入口为`tests/pg-sina-csd-test.sh index|join|query|join-bench`。
+
+## 阶段3f：运行期字符串字典与 Q5（2026-10-22）
+
+Q5 的 `n_name` 是无约束字符串，静态 SQL 常量字典不适用。首版用查询级运行期字典 AFDM：Scan 插入去尾空格后的字节并输出 ID，Join/分组只传 ID，Aggregate.source 在最终结果前恢复字节；字符串仍写回原 16 字节 cell，最大 15 字节。Q5 的 nation 名称最长 14 字节，因此没有改变 join/sort/spill 记录布局。字符串 `ORDER BY` 暂回退，避免按首次出现 ID 排序产生错误顺序。
+
+多表连接顺序从“最小过滤后行数”改为“单列唯一键优先、唯一键候选中较大关系优先”。此前 Q5 先按 `c_nationkey=s_nationkey` 连 customer/supplier，先生成约 customer×同国 supplier 的中间结果，单次实测超过 42s；调整后链为 lineitem→orders→customer→supplier→nation→region，最后执行 nationkey 残差。Build 预算按每表过滤后行数/投影列数/2 的幂容量计算“单批所需字节+1MiB”后按比例分配；默认 64MB 下五张 build 均为 1 批，lineitem 只扫描一次。
+
+### 冷启动对比
+
+每条 SQL 前停止 PG、清 Guest 页缓存并重启，host/CSD 交替各 3 轮，关闭 profile，完整结果逐次 cmp。设备仍为 4 CU、64MiB AFDM/workmem、64MB 查询预算；host 保持原生并行与 `work_mem=4MB`。
+
+| 查询/路径 | 三轮 ms | 均值 ms | 中位数 ms |
+| --- | --- | ---: | ---: |
+| Q5/host | 2460.080 / 1926.239 / 1939.466 | 2108.595 | 1939.466 |
+| Q5/csd | 989.475 / 929.035 / 919.904 | 946.138 | 929.035 |
+
+Q5 均值约 2.23 倍、中位数约 2.09 倍；结果与 host 逐字一致。这是当前 FEMU 配置下的样本，不是等总内存/等核数硬件结论，也不代表已实现通用原生 path 编译器；Q5 仍走 Hash 链，优势来自唯一键连接顺序、单批 build 和一次 lineitem 扫描。
+
+16MB 查询预算下 Q5 CSD=6440.564ms，结果仍一致，profile 显示12个build批次、spill写17367040字节/读39780352字节，属于内存受限；默认 64MB 不采用该配置。Q5 200ms 超时取消后，同一 backend 连续两次 CSD COUNT 均返回 6001215。既有 Q1/Q6/Q12/Q14/Q19 冷启动结果无回退，Q3 单次冷启动 1869.695ms。
+
+原始数据：Guest `/tmp/q5-bench.log`、`/tmp/q5.host.*.log`、`/tmp/q5.csd.*.log`、`/tmp/q5_mem_16.log`、`/tmp/q5_cancel.sql`；复现入口 `tests/pg-sina-csd-test.sh join|join-bench`。

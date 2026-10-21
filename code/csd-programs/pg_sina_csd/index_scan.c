@@ -22,7 +22,7 @@ static uint32_t u32(const unsigned char *p) { uint32_t x; memcpy(&x,p,4); return
 int qs_index_init(const struct qs_plan *p,struct qs_join_control *control)
 {
     struct cs_work_stats stats; if(cs_work_get_stats(&stats)) return -4;
-    size_t limit=p->join.work_mem_bytes,physical=stats.capacity_bytes/2/(p->njoins?p->njoins:1);
+    size_t limit=p->join.work_mem_bytes,physical=stats.capacity_bytes/2;
     if(!limit || limit>physical) limit=physical;
     cs_work_context *ctx=cs_work_begin_limit(limit); if(!ctx) return -4;
     struct index_join *h=cs_work_calloc(ctx,1,sizeof(*h));
@@ -194,7 +194,7 @@ int64_t qs_index_probe(unsigned stage,struct qs_chunk *c,const struct qs_plan *p
                     if(!tuple || len<23) return -2;
                     unsigned dest=out->rows;
                     if(!dest) memset(qs_nulls(out),0,((out->capacity+7)/8)*(size_t)out->ncols);
-                    int status=qs_scan_tuple(&h->scan,page,tuple-page,len,0,out,dest); if(status) return status;
+                    int status=qs_scan_tuple(&h->scan,page,tuple-page,len,0,out,dest,NULL); if(status) return status;
                     unsigned local=0;
                     for(unsigned col=0;col<base;++col) if(p->cols[col].slot>=0) {
                         unsigned slot=p->cols[col].slot,src=stage?slot:local++;

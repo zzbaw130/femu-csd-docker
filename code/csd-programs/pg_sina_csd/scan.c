@@ -7,7 +7,7 @@ static uint16_t read16(const unsigned char *p) { uint16_t v; memcpy(&v,p,2); ret
 static uint32_t read32(const unsigned char *p) { uint32_t v; memcpy(&v,p,4); return v; }
 /* Decode one already-located immutable tuple into its projected column slots.
  * Index scans use the same decoder and visibility checks as full heap scans. */
-int qs_scan_tuple(const struct qs_plan *p,const unsigned char *raw,unsigned offset,unsigned len,unsigned page,struct qs_chunk *c,unsigned row)
+int qs_scan_tuple(const struct qs_plan *p,const unsigned char *raw,unsigned offset,unsigned len,unsigned page,struct qs_chunk *c,unsigned row,struct qs_dict *dict)
 {
     int last=-1; for(unsigned i=0;i<p->nattrs;++i) if(p->cols[i].slot>=0) last=i;
     const unsigned char *tuple=raw+offset; unsigned mask=read16(tuple+20),off=tuple[22];
@@ -39,7 +39,14 @@ int qs_scan_tuple(const struct qs_plan *p,const unsigned char *raw,unsigned offs
                 struct qs_heap_ref ref={page+offset+off+header,size-header};
                 memcpy(&value,&ref,sizeof(ref));
             }
-            else if(spec->type==Q_STRING) return -3;
+            else if(spec->type==Q_STRING) {
+                if(!dict) return -3;
+                unsigned length=size-header;
+                if(spec->trim_spaces) while(length && v[length-1]==' ') --length;
+                if(length>QS_STRING_MAX) return -3;
+                int id=qs_dict_insert(dict,(const char *)v,length); if(id<0) return -3;
+                value=id;
+            }
             else if(spec->type==Q_DICTIONARY) {
                 unsigned length=size-header;
                 if(spec->trim_spaces) while(length && v[length-1]==' ') --length;
@@ -66,8 +73,9 @@ int qs_scan_tuple(const struct qs_plan *p,const unsigned char *raw,unsigned offs
 }
 int64_t pg_sina_scan(struct femu_csd_args *a)
 {
-    if(!a || a->numr!=4 || a->mr_len[1]<(long long)sizeof(struct qs_plan) || a->mr_len[3]<(long long)sizeof(struct qs_task)) return -1;
+    if(!a || (a->numr!=4 && a->numr!=5) || a->mr_len[1]<(long long)sizeof(struct qs_plan) || a->mr_len[3]<(long long)sizeof(struct qs_task)) return -1;
     const struct qs_plan *p=a->mr_addr[1]; struct qs_chunk *c=a->mr_addr[2];
+    struct qs_dict *dict=a->numr==5?a->mr_addr[4]:NULL;
     unsigned bytes=((struct qs_task *)a->mr_addr[3])->input_bytes;
     if(p->nattrs>QS_COLS || p->ncols>p->nattrs || p->nstrings>QS_STRINGS || a->mr_len[2]<(long long)sizeof(*c) ||
         c->ncols!=p->ncols || qs_chunk_bytes(c->capacity,c->ncols)>(uint64_t)a->mr_len[2] ||
@@ -82,7 +90,7 @@ int64_t pg_sina_scan(struct femu_csd_args *a)
             uint32_t lp=read32(raw+24+4*i); unsigned offset=lp&0x7fff,flags=(lp>>15)&3,len=lp>>17;
             if(flags!=1) continue;
             if(offset<upper || offset>QS_PAGE || len<23 || len>QS_PAGE-offset || c->rows>=c->capacity) return -2;
-            int status=qs_scan_tuple(p,raw,offset,len,page,c,c->rows); if(status) return status;
+            int status=qs_scan_tuple(p,raw,offset,len,page,c,c->rows,dict); if(status) return status;
             qs_selection(c)[c->rows]=c->rows; ++c->rows;
         }
     }

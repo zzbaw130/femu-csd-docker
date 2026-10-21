@@ -9,7 +9,7 @@ static void external_drop(struct qs_group *);
 struct accumulator { __int128 sum; uint64_t count; uint8_t dscale; };
 struct group { struct qs_cell keys[QS_KEYS]; struct accumulator aggs[QS_AGGS]; };
 struct state { cs_work_context *context; struct qs_plan plan; struct qs_metrics metrics;
-    struct qs_vector *vectors;
+    struct qs_vector *vectors; struct qs_dict *dict;
     uint8_t needed[QS_EXPRS], accumulator[QS_AGGS], sum_required[QS_AGGS];
     unsigned count; uint16_t buckets[1024]; struct group groups[QS_GROUPS]; };
 static struct group *get_group(struct state *s,struct qs_cell *keys)
@@ -110,6 +110,16 @@ int64_t pg_sina_aggregate_sink(struct femu_csd_args *a)
     }
     return 0;
 }
+static int restore_string(const struct state *s,int expr,struct qs_cell *cell)
+{
+    const struct qs_plan *p=&s->plan;
+    if(expr<0 || p->exprs[expr].type!=Q_STRING) return 0;
+    if(!s->dict) return -1;
+    const char *bytes=NULL; unsigned length=0;
+    if(qs_dict_get(s->dict,(unsigned)cell->value,&bytes,&length) || length>QS_STRING_MAX) return -1;
+    qs_cell_set_string(cell,bytes,length);
+    return 0;
+}
 static int finalize_group(const struct state *s,const struct group *g,struct qs_row *row)
 {
     const struct qs_plan *p=&s->plan; struct qs_cell values[QS_AGGS];
@@ -127,16 +137,20 @@ static int finalize_group(const struct state *s,const struct group *g,struct qs_
     for(unsigned j=0;j<p->nout;++j) {
         const struct qs_output *o=&p->outputs[j];
         if(o->aggregate==2) { if(qs_evaluate(&eval,o->index,&row->cells[j])) return -5; }
-        else row->cells[j]=o->aggregate?values[o->index]:g->keys[o->index];
+        else if(o->aggregate) row->cells[j]=values[o->index];
+        else {
+            row->cells[j]=g->keys[o->index];
+            if(restore_string(s,p->keys[o->index],&row->cells[j])) return -5;
+        }
     }
     return 0;
 }
 int64_t pg_sina_aggregate_source(struct femu_csd_args *a)
 {
-    if(!a || (a->numr!=1 && a->numr!=2 && a->numr!=3) || a->mr_len[0]<(long long)sizeof(struct qs_group)) return -1;
+    if(!a || (a->numr!=1 && a->numr!=2 && a->numr!=3 && a->numr!=4) || a->mr_len[0]<(long long)sizeof(struct qs_group)) return -1;
     struct qs_group *group=a->mr_addr[0];
     if(!group->count || group->count>QS_WORKERS) return -1;
-    if(a->numr==3) return external_source(a);
+    if(a->numr==3 || a->numr==4) return external_source(a);
     if(a->numr==1) {
         for(unsigned i=0;i<group->count;++i) if(group->states[i]) {
             struct state *s=(void *)(uintptr_t)group->states[i];
@@ -338,9 +352,12 @@ static void external_metrics(struct external_state *e,struct qs_result *out)
 }
 static int64_t external_source(struct femu_csd_args *a)
 {
-    if(a->mr_len[1]<(long long)sizeof(struct qs_result) || a->mr_len[2]<QS_SORT_IO_BYTES) return -1;
+    if(a->mr_len[1]<(long long)sizeof(struct qs_result) ||
+       a->mr_len[a->numr-1]<QS_SORT_IO_BYTES) return -1;
+    void *io=a->mr_addr[a->numr-1]; long long io_bytes=a->mr_len[a->numr-1];
     struct qs_group *group=a->mr_addr[0]; struct external_state *e=(void *)(uintptr_t)group->states[0];
     if(!e) return -1;
+    if(a->numr==4) e->local.dict=a->mr_addr[2];
     struct state *s=&e->local; const struct qs_plan *p=&s->plan; struct qs_result *out=a->mr_addr[1];
     struct femu_csd_args call=*a; call.cparam1=0;
     if(!csIsReentry(a)) { out->status=0; out->rows=out->begin=out->finished=0; }
@@ -368,7 +385,7 @@ static int64_t external_source(struct femu_csd_args *a)
     /* Flush each local table once. Reentry continues the current owner's I/O. */
     while(e->finalize<group->count) {
         struct external_state *owner=(void *)(uintptr_t)group->states[e->finalize];
-        int64_t status=partial_flush(owner,&call,a->mr_addr[2],a->mr_len[2]); if(status) return status;
+        int64_t status=partial_flush(owner,&call,io,io_bytes); if(status) return status;
         if(owner->local.vectors) { cs_work_free(owner->local.context,owner->local.vectors); owner->local.vectors=NULL; }
         e->inputs.states[e->finalize]=owner->sort_task.state;
         if(e->finalize) {
@@ -387,8 +404,8 @@ static int64_t external_source(struct femu_csd_args *a)
     }
     for(;;) {
         if(e->output_pending) {
-            void *mr[]={out,&e->sort_plan,&e->output_task,a->mr_addr[2]};
-            long long len[]={sizeof(*out),sizeof(e->sort_plan),sizeof(e->output_task),a->mr_len[2]};
+            void *mr[]={out,&e->sort_plan,&e->output_task,io};
+            long long len[]={sizeof(*out),sizeof(e->sort_plan),sizeof(e->output_task),io_bytes};
             call.numr=4; call.mr_addr=mr; call.mr_len=len;
             int64_t status=pg_sina_sort_sink_impl(&call); e->output.states[0]=e->output_task.state;
             if(status) return status;
@@ -396,7 +413,7 @@ static int64_t external_source(struct femu_csd_args *a)
         }
         if(e->finishing) {
             if(e->inputs.states[0]) {
-                void *mr[]={&e->inputs,a->mr_addr[2]}; long long len[]={sizeof(e->inputs),a->mr_len[2]};
+                void *mr[]={&e->inputs,io}; long long len[]={sizeof(e->inputs),io_bytes};
                 call.numr=2; call.mr_addr=mr; call.mr_len=len;
                 int64_t status=pg_sina_sort_source_impl(&call); if(status) return status;
                 call.cparam2=0;
@@ -405,7 +422,7 @@ static int64_t external_source(struct femu_csd_args *a)
         }
         if(e->reducing_finished) {
             if(!p->norder) { e->finishing=1; continue; }
-            void *mr[]={&e->output,out,a->mr_addr[2]}; long long len[]={sizeof(e->output),sizeof(*out),a->mr_len[2]};
+            void *mr[]={&e->output,out,io}; long long len[]={sizeof(e->output),sizeof(*out),io_bytes};
             call.numr=3; call.mr_addr=mr; call.mr_len=len;
             int64_t status=pg_sina_sort_source_impl(&call); if(status) return status;
             e->output_metrics=out->metrics; external_metrics(e,out);
@@ -413,7 +430,7 @@ static int64_t external_source(struct femu_csd_args *a)
             return 0;
         }
         if(e->pulling || (e->partial_position==e->partial->rows && !e->input_finished)) {
-            void *mr[]={&e->inputs,e->partial,a->mr_addr[2]}; long long len[]={sizeof(e->inputs),sizeof(*e->partial),a->mr_len[2]};
+            void *mr[]={&e->inputs,e->partial,io}; long long len[]={sizeof(e->inputs),sizeof(*e->partial),io_bytes};
             call.numr=3; call.mr_addr=mr; call.mr_len=len;
             e->pulling=1;
             int64_t status=pg_sina_sort_source_impl(&call); if(status) return status;

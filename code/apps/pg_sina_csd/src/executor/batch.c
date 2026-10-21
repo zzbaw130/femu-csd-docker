@@ -15,7 +15,7 @@ struct program { const char *file,*symbol; CS_CSF_ID function; unsigned index; i
 struct pg_sina_stream {
     CS_DEV_HANDLE device;
     CS_BATCH_HANDLE batch;
-    CS_MEM_HANDLE output,group,io,counter;
+    CS_MEM_HANDLE output,group,io,counter,dict;
     struct program source;
     int lock_fd;
     bool profiling;
@@ -84,6 +84,18 @@ static void compute_io_request(CsBatchRequest *b,CS_CSF_ID function,CS_MEM_HANDL
         csHelperSetComputeArg(&b->u.Compute.Args[n],CS_64BIT_VALUE_TYPE,(u64)1);
         ++b->u.Compute.NumArgs;
     }
+}
+static uint64_t stage_build_bytes(const struct qs_plan *p,unsigned stage)
+{
+    const struct qs_join *j=qs_join_at(p,stage);
+    unsigned base=qs_probe_attrs(p);
+    for(unsigned i=0;i<stage;++i) base+=qs_join_at(p,i)->nattrs;
+    unsigned cols=0;
+    for(unsigned i=base;i<base+j->nattrs;++i) cols+=p->cols[i].slot>=0;
+    unsigned stride=(16+cols*9+7)&~7U;
+    uint64_t rows=j->rows?j->rows:1,capacity=256;
+    while(capacity<rows && capacity<UINT32_MAX/2) capacity*=2;
+    return capacity*(stride+8)+1024*1024;
 }
 /* Physical side scans only project that relation's required columns. */
 static void join_scan_plan(const struct qs_plan *combined,struct qs_plan *scan,bool build)
@@ -183,7 +195,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     result->status=1; strcpy(result->error,"CSD execution interrupted or initialization failed");
     CS_DEV_HANDLE device=NULL; CS_BATCH_HANDLE batch=NULL,build_batch=NULL,load_batch=NULL; CS_EVT_HANDLE event=NULL;
     struct slot slots[QS_WORKERS]={{0}}; unsigned inflight=0;
-    CS_MEM_HANDLE plan_mem=NULL,out_mem=NULL,group_mem=NULL,scan_mem=NULL,join_mem=NULL,build_mem=NULL;
+    CS_MEM_HANDLE plan_mem=NULL,out_mem=NULL,group_mem=NULL,scan_mem=NULL,join_mem=NULL,build_mem=NULL,dict_mem=NULL;
     CS_MEM_HANDLE joined[QS_WORKERS]={0},controls_mem[QS_JOINS]={0};
     struct qs_join_control join_control[QS_JOINS]={{0}};
     struct qs_metrics join_totals={0};
@@ -233,6 +245,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     uint64_t capacity=fdm->FDMDetails[0].FDM[0].FDMSize;
     while((uint64_t)workers*(chunk+((qs_chunk_bytes(chunk/24,scan_cols)+4095)&~(size_t)4095)+4096+(profiling?4096:0)+((joined_bytes+4095)&~(size_t)4095))+
           ((sizeof(struct qs_result)+4095)&~(size_t)4095)+((sizeof(struct qs_plan)+4095)&~(size_t)4095)+4096+
+          (request->plan.runtime_dict?((sizeof(struct qs_dict)+4095)&~(size_t)4095):0)+
           (joining?2*((sizeof(struct qs_plan)+4095)&~(size_t)4095)+(njoins+1)*4096:0)>capacity) {
         if(workers>1) --workers;
         else if(chunk>QS_PAGE) chunk/=2;
@@ -273,6 +286,11 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     }
     TRY(csAllocMem(device,sizeof(*result),&flags,&out_mem,NULL));
     TRY(csAllocMem(device,sizeof(group),&flags,&group_mem,NULL));
+    if(request->plan.runtime_dict) {
+        flags.Flags=CS_FDM_CLEAR;
+        TRY(csAllocMem(device,sizeof(struct qs_dict),&flags,&dict_mem,NULL));
+        flags.Flags=0;
+    }
     for(unsigned i=0;i<workers;++i) {
         TRY(csAllocMem(device,chunk,&flags,&input[i],NULL));
         TRY(csAllocMem(device,qs_chunk_bytes(chunk/24,scan_cols),&flags,&vectors[i],NULL));
@@ -295,13 +313,27 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     uint64_t cursor=0; bool empty_pending=!request->bytes;
     if(profiling) { uint64_t now=clock_ns(); stats.setup_ns=now-phase; phase=now; }
     if(joining) {
+        uint64_t weights[QS_JOINS]={0},weight_sum=0,build_budget=request->plan.join.work_mem_bytes;
+        unsigned indexed_stages=0;
+        for(unsigned i=0;i<njoins;++i) {
+            if(qs_join_at(&request->plan,i)->indexid) { ++indexed_stages; continue; }
+            weights[i]=stage_build_bytes(&request->plan,i); weight_sum+=weights[i];
+        }
+        uint64_t index_budget=indexed_stages?QS_INDEX_WORK_BYTES*indexed_stages:0;
+        uint64_t hash_budget=build_budget>index_budget?build_budget-index_budget:0;
+        uint64_t assigned=0;
         unsigned base=qs_probe_attrs(&request->plan);
         for(unsigned stage=0;stage<njoins;++stage) {
             struct qs_request *build=&builds[stage];
             struct qs_plan view=request->plan; view.join=*qs_join_at(&request->plan,stage); view.njoins=njoins;
             base+=view.join.nattrs; view.nattrs=base; view.join.residual=0;
-            view.join.work_mem_bytes=indexed && stage+1==njoins?QS_INDEX_WORK_BYTES:
-                (request->plan.join.work_mem_bytes-(indexed?QS_INDEX_WORK_BYTES:0))/(njoins-indexed);
+            if(view.join.indexid) view.join.work_mem_bytes=QS_INDEX_WORK_BYTES;
+            else if(weight_sum) {
+                uint64_t share=hash_budget*weights[stage]/weight_sum;
+                if(share<1024*1024U) share=hash_budget?Min((uint64_t)(1024*1024U),hash_budget):0;
+                if(assigned+share>hash_budget) share=hash_budget>assigned?hash_budget-assigned:0;
+                view.join.work_mem_bytes=share; assigned+=share;
+            } else view.join.work_mem_bytes=njoins?hash_budget/njoins:hash_budget;
             if(view.join.indexid) {
                 TRY(copy(build_mem,0,&view,sizeof(view),1));
                 CS_MEM_HANDLE memory[]={vectors[0],build_mem,controls_mem[stage],input[0]};
@@ -339,7 +371,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
                     }
                     if(first) {
                         CS_BATCH_INDEX previous=slot->load;
-                        CS_MEM_HANDLE scan[]={input[i],scan_mem,vectors[i],tasks[i]}; compute_request(compute,programs[SCAN].function,scan,4,counters[i]);
+                        CS_MEM_HANDLE scan[]={input[i],scan_mem,vectors[i],tasks[i],dict_mem}; compute_request(compute,programs[SCAN].function,scan,dict_mem?5:4,counters[i]);
                         TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_ADD,compute,0,previous,&current)); previous=current;
                         if(build_plan.predicate>=0) {
                             CS_MEM_HANDLE filter[]={vectors[i],scan_mem,input[i]}; compute_request(compute,programs[FILTER].function,filter,3,counters[i]);
@@ -441,8 +473,8 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
             }
             if(first) {
                 CS_BATCH_INDEX previous=slot->load,current;
-                CS_MEM_HANDLE memory[]={input[i],joining?scan_mem:plan_mem,vectors[i],tasks[i]};
-                compute_request(compute,programs[SCAN].function,memory,4,counters[i]);
+                CS_MEM_HANDLE memory[]={input[i],joining?scan_mem:plan_mem,vectors[i],tasks[i],dict_mem};
+                compute_request(compute,programs[SCAN].function,memory,dict_mem?5:4,counters[i]);
                 TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_ADD,compute,0,previous,&current)); previous=current;
                 if(request->plan.predicate>=0) {
                     CS_MEM_HANDLE filter[]={vectors[i],joining?scan_mem:plan_mem,input[i]}; compute_request(compute,programs[FILTER].function,filter,3,counters[i]);
@@ -526,9 +558,16 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     if(QueryCancelPending || ProcDiePending) goto cleanup;
     TRY(csAllocBatchRequest(CS_BATCH_SERIAL,3,&batch));
     CS_BATCH_INDEX previous=0,current;
-    CS_MEM_HANDLE source[]={group_mem,out_mem,input[0]};
-    if(streaming) compute_io_request(compute,programs[SOURCE].function,source,3,counters[0]);
-    else compute_request(compute,programs[SOURCE].function,source,2,counters[0]);
+    if(streaming && dict_mem) {
+        CS_MEM_HANDLE source[]={group_mem,out_mem,dict_mem,input[0]};
+        compute_io_request(compute,programs[SOURCE].function,source,4,counters[0]);
+    } else if(streaming) {
+        CS_MEM_HANDLE source[]={group_mem,out_mem,input[0]};
+        compute_io_request(compute,programs[SOURCE].function,source,3,counters[0]);
+    } else {
+        CS_MEM_HANDLE source[]={group_mem,out_mem};
+        compute_request(compute,programs[SOURCE].function,source,2,counters[0]);
+    }
     TRY(csConfigureBatchEntry(batch,CS_BATCH_ADD,compute,0,0,&previous));
     if(request->plan.norder && !streaming) {
         CS_MEM_HANDLE order[]={out_mem,plan_mem}; compute_request(compute,programs[SORT].function,order,2,counters[0]);
@@ -577,6 +616,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
         saved->device=device; saved->batch=batch; batch=NULL;
         saved->output=out_mem; out_mem=NULL;
         saved->group=group_mem; group_mem=NULL;
+        saved->dict=dict_mem; dict_mem=NULL;
         saved->io=input[0]; input[0]=NULL;
         saved->counter=counters[0]; counters[0]=NULL;
         saved->source=programs[SOURCE]; programs[SOURCE].active=programs[SOURCE].loaded=0;
@@ -631,6 +671,7 @@ cleanup:
     if(plan_mem)csFreeMem(plan_mem,&release);
     if(out_mem)csFreeMem(out_mem,&release);
     if(group_mem)csFreeMem(group_mem,&release);
+    if(dict_mem)csFreeMem(dict_mem,&release);
     for(unsigned i=0;i<FUNCTIONS;++i) unload_program(device,&programs[i]);
     if(device && !*stream)csCloseCSx(device);
     if(lock_fd>=0)close(lock_fd);
@@ -656,6 +697,7 @@ void pg_sina_close(struct pg_sina_stream *s)
     drop_source(s->source.function,s->group,compute);
     CsMemFlags flags={.FDMId=1};
     csFreeMem(s->output,&flags); csFreeMem(s->group,&flags); csFreeMem(s->io,&flags);
+    if(s->dict) csFreeMem(s->dict,&flags);
     if(s->counter) csFreeMem(s->counter,&flags);
     unload_program(s->device,&s->source); csCloseCSx(s->device);
     if(s->lock_fd>=0) close(s->lock_fd);

@@ -47,11 +47,11 @@ static int init_join(const struct qs_plan *p,struct qs_join_control *control,str
 {
     struct cs_work_stats stats; if(cs_work_get_stats(&stats)) return -4;
     size_t limit=p->join.work_mem_bytes;
-    /* Hash builds share half the physical pool. An index join needs only
-     * bounded cursor/tag state, rather than one equal hash-table share. */
-    unsigned builds=p->njoins?p->njoins:1;
+    /* PG assigns this stage's share from the total build budget. The device
+     * still enforces the physical half-pool as a hard ceiling. */
+    size_t physical=stats.capacity_bytes/2;
     int indexed=p->njoins>1 && qs_join_at(p,p->njoins-1)->indexid;
-    size_t physical=(stats.capacity_bytes/2-(indexed?QS_INDEX_WORK_BYTES:0))/(builds-indexed);
+    if(indexed && physical>QS_INDEX_WORK_BYTES) physical-=QS_INDEX_WORK_BYTES;
     if(!limit || limit>physical) limit=physical;
     unsigned key=UINT_MAX,ncols=build_columns(p,&key);
     size_t stride=(sizeof(struct hash_row)+(size_t)ncols*9+7)&~(size_t)7;

@@ -1,6 +1,6 @@
 > 当前 `pg_sina_csd_dev` 从 `sina-femu-csd` 标签开始开发
 > [pg_sina_csd 扩展](code/apps/pg_sina_csd/README.md)，通过 SNIA 调用设备算子。
-> 当前已实现冻结 heap 映射、host/csd 路径选择及 Q1/Q6 完整数据算子卸载；TPC-H 测试统一冷启动。
+> 当前已实现冻结 heap 映射、host/csd 路径选择及 Q1/Q3/Q5/Q6/Q12/Q14/Q19 完整数据算子卸载；TPC-H 测试统一冷启动。
 
 > `snia_csd_dev` 分支基于 `femu-csd-with-original-postgre` tag，新增独立的
 > [Computational Storage API 库](code/apps/snia/README.md)。Guest 应用包含
@@ -86,7 +86,7 @@ cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,f
 │   │   ├── postgres/                # PostgreSQL 12 源码（guest 里编译）
 │   │   ├── csd-passthru/            # guest 侧原生命令测试
 │   │   ├── snia/                    # guest SNIA API 库与完整 batch 示例
-│   │   └── pg_sina_csd/             # guest PG 扩展、Q1/Q6 卸载与 SNIA 编排
+│   │   └── pg_sina_csd/             # guest PG 扩展、TPC-H 卸载与 SNIA 编排
 │   └── csd-programs/                # 容器编译、FEMU CU 执行
 │       ├── CMakeLists.txt           # 统一构建、链接与输出
 │       ├── examples/                # 原生/SNIA 算子及 sort/avg 样例

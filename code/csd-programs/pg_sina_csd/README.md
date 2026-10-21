@@ -43,7 +43,7 @@ Aggregate.source 的单MR调用释放私有状态。Sort.source 的单MR调用�
 
 Scan解析PG12/x86-64/8KiB、全visible/frozen的heap，仅提取所需列。列批次包含int64值、NULL位图、numeric显示精度和selection vector；仍须遍历变长属性边界，不减少heap页读取量。
 
-numeric输入必须有限、至多两位小数，可精确表示为int64百分数；支持整数、date、bool、ASCII bpchar(1)。较长字符串支持ASCII常量等于/不等于、IN和前缀LIKE。只有顶层等于/IN证明值属于计划字典时，才支持该列的投影/分组/排序，尚无任意字符串列输出。规划时已知不支持的能力回退PG；运行时数据超出设备表示范围时报错，不伪装成透明回退。
+numeric输入必须有限、至多两位小数，可精确表示为int64百分数；支持整数、date、bool、ASCII bpchar(1)。较长字符串支持ASCII常量等于/不等于、IN和前缀LIKE；低基数、去尾空格后不超过15字节的分组/输出字符串通过运行期字典AFDM传ID，Aggregate.source恢复字节。只有顶层等于/IN证明值属于计划字典时，才支持该列使用静态字典进行投影/分组/排序。规划时已知不支持的能力回退PG；运行时数据超出设备表示范围时报错，不伪装成透明回退。
 
 PG估计过滤后剩余不足一半行时，所需numeric可以延迟解码，包括WHERE使用的列。Scan将原始AFDM中的`{offset, bytes}`暂存在原8字节值槽。简单AND先用SIMD处理已解码列，再按存活行逐个判断其余列，同列相邻上下界共用一次解码；复杂AND/OR只把仍需判断的行传给后续表达式。最终存活行的所有延迟列会在Filter中转换为正常列值，因此下游无需理解原始位置。原始AFDM一直保留到当前槽sink完成。
 
@@ -114,7 +114,11 @@ Guest将字符串字面量放在`qs_plan.strings`，每项记录物理属性号�
 
 等于/不等于与IN使用这些整数编号进行向量比较。0仅表示“不等于本计划中的任何常量”，不能用于任意字符串间比较或不受约束的分组。PG仅在顶层等于/IN过滤能保证每个存活值有正编号时编译字符串原值的投影/分组/排序；OR或CASE内的比较不能单独作此保证。不支持的表达式回退PG，不合并未知字符串。最终设备结果仍是编号，Guest按同一计划恢复Datum；不会把设备指针或未序列化字符串写入spill。
 
-这使用了字典编码/选择向量思路，没有复制DuckDB的完整DictionaryVector。通用字符串、非ASCII常量和其他排序规则仍待实现。`tests/scan.c`覆盖短/长varlena、NULL、空串、未匹配编号及bpchar尾空格；真实Guest的join回归检查text/varchar/bpchar、NULL数组项、顺序和拒绝不安全表达式。完整Q12示例在Guest扩展的`tests/q12.sql`。
+这使用了字典编码/选择向量思路，没有复制DuckDB的完整DictionaryVector。`tests/scan.c`覆盖短/长varlena、NULL、空串、未匹配编号及bpchar尾空格；真实Guest的join回归检查text/varchar/bpchar、NULL数组项、顺序和拒绝不安全表达式。完整Q12示例在Guest扩展的`tests/q12.sql`。
+
+## 运行期字符串字典
+
+Q5 的 `n_name` 没有 SQL 常量约束，使用独立的运行期字典：Scan 收到一个字典 AFDM（`struct qs_dict`，512项/64KB），把去尾空格后的字符串插入并输出 ID；Join/分组/排序只传 ID，Aggregate.source 在最终结果前恢复字节。为不改变 `qs_cell`、Hash Join 记录和 Sort run 的固定布局，恢复后的字符串写回原 16 字节 cell（字节放 `value`，长度放 `scale`），上限 15 字节。当前只支持低基数、≤15 字节的分组/输出；超过容量、更长字符串或字符串 `ORDER BY` 保留原生路径。Q10 的 FD 长字符串 payload 尚未接入。
 
 
 连接后过滤复用`filter.c`，与`aggregate.c`、`sort.c`一起编译进`pg-sina-join.so`。PG计划的`join.residual`保存剩余跨表条件的表达式索引加一（0表示没有）；这不是SNIA参数或FEMU接口。probe输出列批次后先应用此条件，再把选择向量交给聚合。过滤结束即释放临时workmem，聚合状态继续存活，因此预算仍需预留后续批次过滤空间。NEED_STORE/LOAD重入只恢复已经过滤的批次，不重复过滤或计数；统计和计时包含在probe入口内。

@@ -158,7 +158,14 @@ static int expression(Node *node,Index rti,struct qs_plan *p)
         Var *v=(Var *)node;
         int col=var_column(v,rti,p); if(col<0) return -1;
         struct qs_column *c=&p->cols[col];
-        if(c->type==Q_STRING || c->type==Q_PREFIX || (c->type==Q_DICTIONARY && !c->restricted)) return -1;
+        if(c->type==Q_STRING) {
+            /* Low-cardinality runtime dictionary: Scan stores an ID, and the
+             * source restores the bytes before the final Datum. */
+            if(c->slot<0) c->slot=p->ncols++;
+            e.op=Q_COLUMN; e.column=col; e.type=Q_STRING; e.scale=e.dscale=c->scale;
+            return put(p,e);
+        }
+        if(c->type==Q_PREFIX || (c->type==Q_DICTIONARY && !c->restricted)) return -1;
         if(c->type==255 || (c->type==Q_CHAR && !byte_collation(v->varcollid))) return -1;
         if(c->slot<0) c->slot=p->ncols++;
         e.op=Q_COLUMN; e.column=col; e.type=c->type; e.scale=e.dscale=c->scale;
@@ -450,6 +457,11 @@ static bool compile(PlannerInfo *root,List *relations,List *joins,List *quals,st
         SortGroupClause *sort=lfirst(cell); TargetEntry *entry=get_sortgroupclause_tle(sort,root->processed_tlist);
         unsigned index=0; ListCell *t; foreach(t,root->processed_tlist) { if(lfirst(t)==entry) break; ++index; }
         if(index==p->nout) return false;
+        int sort_expr=p->ordered_rows?p->outputs[index].index:
+            (p->outputs[index].aggregate==0?p->keys[p->outputs[index].index]:-1);
+        /* Runtime string IDs are assigned in first-seen order, not byte order.
+         * Keep ORDER BY string native until the string comparator lands. */
+        if(sort_expr>=0 && p->exprs[sort_expr].type==Q_STRING) return false;
         Oid function=get_opcode(sort->sortop); bool descending=false,found=false;
         static const char *less[]={"numeric_lt","int2lt","int4lt","int8lt","date_lt","bpcharlt","boollt","text_lt"};
         static const char *greater[]={"numeric_gt","int2gt","int4gt","int8gt","date_gt","bpchargt","boolgt","text_gt"};
@@ -473,6 +485,8 @@ static bool compile(PlannerInfo *root,List *relations,List *joins,List *quals,st
         base+=count; ++side;
     }
     order_strings(p);
+    for(unsigned i=0;i<p->nattrs;++i)
+        if(p->cols[i].slot>=0 && p->cols[i].type==Q_STRING) p->runtime_dict=1;
     return limit_value(root->parse->limitCount,&p->limit) && limit_value(root->parse->limitOffset,&p->offset);
 }
 static Plan *plan_path(PlannerInfo *root,RelOptInfo *rel,CustomPath *path,List *tlist,List *clauses,List *plans)
@@ -517,6 +531,25 @@ static OpExpr *equality_join(List *quals,List *prefix,Index next)
            (b->varno==next && list_member_int(prefix,a->varno))) return op;
     }
     return NULL;
+}
+/* A single-column unique key is a safe high-selectivity lookup. Prefer these
+ * over fact/dimension joins on low-cardinality columns (Q5 must not join
+ * customer to supplier on nationkey before joining orders on custkey). */
+static bool unique_join_key(PlannerInfo *root,Index rti,OpExpr *key)
+{
+    if(!root || rti<=0 || rti>(Index)root->simple_rel_array_size) return false;
+    Node *left=unlabel(linitial(key->args)),*right=unlabel(lsecond(key->args));
+    Var *var=NULL;
+    if(IsA(left,Var) && ((Var *)left)->varno==rti) var=(Var *)left;
+    else if(IsA(right,Var) && ((Var *)right)->varno==rti) var=(Var *)right;
+    if(!var || var->varattno<=0) return false;
+    RelOptInfo *rel=root->simple_rel_array[rti]; if(!rel) return false;
+    ListCell *cell;
+    foreach(cell,rel->indexlist) {
+        IndexOptInfo *info=lfirst(cell);
+        if(info->unique && info->nkeycolumns==1 && info->indexkeys[0]==var->varattno) return true;
+    }
+    return false;
 }
 /* Reuse the native planner's chosen access path. Accept a left-deep hash
  * prefix followed by one parameterized B-tree index join; other trees keep
@@ -619,12 +652,18 @@ void pg_sina_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *i
     }
     List *ordered=list_make1_int(rti),*joins=NIL;
     while(list_length(ordered)<list_length(relations)) {
-        Index next=0; double smallest=0; OpExpr *key=NULL;
+        Index next=0; double best_rows=0; OpExpr *key=NULL; bool best_unique=false;
         foreach(cell,relations) {
             Index index=lfirst_int(cell); if(list_member_int(ordered,index)) continue;
             OpExpr *candidate=equality_join(quals,ordered,index);
+            if(!candidate) continue;
             double rows=root->simple_rel_array[index]->rows;
-            if(candidate && (!next || rows<smallest)) { next=index; smallest=rows; key=candidate; }
+            bool unique=unique_join_key(root,index,candidate);
+            /* Prefer a unique-key lookup, then the larger relation among
+             * unique keys (fact-like build), then the smaller non-unique. */
+            bool better=!next || (unique && (!best_unique || rows>best_rows)) ||
+                (!unique && !best_unique && rows<best_rows);
+            if(better) { next=index; best_rows=rows; key=candidate; best_unique=unique; }
         }
         if(!next) return;
         ordered=lappend_int(ordered,next); joins=lappend(joins,key);

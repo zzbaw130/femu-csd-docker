@@ -62,7 +62,7 @@ case ${1:-query} in
                 echo 'PASS join spill/load, profiling, 4 MiB query budget and physical pool bound'
             fi
         done < "$PROJECT/tests/join_cases.tsv"
-        for query in q14 q12 q19 q19_variant q3; do
+        for query in q14 q12 q19 q19_variant q3 q5; do
             sql=$(cat "$PROJECT/tests/$query.sql")
             psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
                 -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path=csd" \
@@ -70,7 +70,7 @@ case ${1:-query} in
             grep -q 'CSD Join: inner integer hash join' "$RESULTS/$query.plan"
             grep -q 'CSD Build Scheduling: parallel scan/filter; single hash writer' "$RESULTS/$query.plan"
             run_cold host "$sql" "$RESULTS/$query.host"
-            memories=(4 64); if [[ $query == q12 || $query == q3 ]]; then memories=(16 64); fi
+            memories=(4 64); if [[ $query == q12 || $query == q3 || $query == q5 ]]; then memories=(16 64); fi
             for memory in "${memories[@]}"; do
                 run_cold csd "SET pg_sina_csd.max_memory='${memory}MB'; $sql" "$RESULTS/$query.$memory"
                 cmp "$RESULTS/$query.host.rows" "$RESULTS/$query.$memory.rows"
@@ -303,7 +303,7 @@ case ${1:-query} in
         queries=(q1 q6)
         if [[ $1 == order-bench ]]; then queries=(order_topn order_spill); fi
         if [[ $1 == aggregate-bench ]]; then queries=(high_aggregate); fi
-        if [[ $1 == join-bench ]]; then queries=(q14 q12 q19 q3); fi
+        if [[ $1 == join-bench ]]; then queries=(q14 q12 q19 q3 q5); fi
         for name in "${queries[@]}"; do
             psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
                 -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path=csd" \

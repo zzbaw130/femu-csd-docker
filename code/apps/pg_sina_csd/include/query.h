@@ -4,6 +4,7 @@
 #define PG_SINA_QUERY_H
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 #define QS_JOINS 7
 #define QS_COLS 64
 #define QS_EXPRS 128
@@ -17,6 +18,9 @@
 #define QS_CHUNK (4U*1024*1024)
 #define QS_SORT_IO_BYTES (64U*1024)
 #define QS_STRINGS 32
+#define QS_STRING_MAX 15 /* Inline final-result bytes; larger values stay native for now. */
+#define QS_DICT_ENTRIES 512
+#define QS_DICT_DATA (64U*1024U)
 #define QS_INDEX_READS 64
 #define QS_INDEX_CACHE 128
 #define QS_INDEX_WORK_BYTES (128U*1024) /* Cursor/tag state; page input stays in AFDM. */
@@ -45,6 +49,7 @@ struct qs_join {
 struct qs_plan {
     uint32_t relid, relfilenode;
     unsigned nattrs, ncols, nexprs, naggs, nkeys, nout, norder, nstrings;
+    unsigned runtime_dict; /* Low-cardinality Q_STRING columns need the runtime dictionary. */
     int predicate;
     unsigned ordered_rows; /* 1: SQL row sort; 2: internal full-row input. */
     unsigned external_aggregate;
@@ -103,6 +108,60 @@ static inline unsigned char *qs_dscales(struct qs_chunk *c) { return qs_nulls(c)
 static inline uint32_t *qs_selection(struct qs_chunk *c)
 { return (uint32_t *)(((uintptr_t)(qs_dscales(c)+(size_t)c->capacity*c->ncols)+7)&~(uintptr_t)7); }
 struct qs_cell { __int128 value; uint8_t scale, dscale, isnull; };
+/* A final string result is packed into the existing 16-byte cell: value holds
+ * the bytes and scale holds the length. Values longer than QS_STRING_MAX stay
+ * on the native path in this stage. */
+static inline void qs_cell_set_string(struct qs_cell *cell,const char *bytes,unsigned length)
+{
+    cell->value=0; cell->scale=(uint8_t)length; cell->dscale=0; cell->isnull=0;
+    if(length) memcpy(&cell->value,bytes,length);
+}
+static inline unsigned qs_cell_string(const struct qs_cell *cell)
+{ return cell->scale; }
+static inline const char *qs_cell_string_bytes(const struct qs_cell *cell)
+{ return (const char *)&cell->value; }
+/* Shared by every scan slot in a query. The device publishes entries before
+ * incrementing count; source readers only run after all scans are drained. */
+struct qs_dict_entry { uint16_t offset, length; };
+struct qs_dict {
+    uint32_t lock, count, bytes;
+    struct qs_dict_entry entries[QS_DICT_ENTRIES];
+    char data[QS_DICT_DATA];
+};
+static inline int qs_dict_lookup(const struct qs_dict *dict,const char *bytes,unsigned length)
+{
+    unsigned count=__atomic_load_n(&dict->count,__ATOMIC_ACQUIRE);
+    for(unsigned i=0;i<count;++i) {
+        const struct qs_dict_entry *e=&dict->entries[i];
+        if(e->length==length && (!length || !memcmp(dict->data+e->offset,bytes,length))) return i+1;
+    }
+    return 0;
+}
+static inline int qs_dict_insert(struct qs_dict *dict,const char *bytes,unsigned length)
+{
+    while(__sync_lock_test_and_set(&dict->lock,1U)) { }
+    int id=qs_dict_lookup(dict,bytes,length);
+    if(!id) {
+        unsigned count=dict->count,used=dict->bytes;
+        if(count>=QS_DICT_ENTRIES || used+length>QS_DICT_DATA || length>QS_STRING_MAX) id=-1;
+        else {
+            dict->entries[count]=(struct qs_dict_entry){(uint16_t)used,(uint16_t)length};
+            memcpy(dict->data+used,bytes,length);
+            dict->bytes=used+length;
+            __atomic_store_n(&dict->count,count+1,__ATOMIC_RELEASE);
+            id=(int)count+1;
+        }
+    }
+    __sync_lock_release(&dict->lock);
+    return id;
+}
+static inline int qs_dict_get(const struct qs_dict *dict,unsigned id,const char **bytes,unsigned *length)
+{
+    unsigned count=__atomic_load_n(&dict->count,__ATOMIC_ACQUIRE);
+    if(!id || id>count || id>QS_DICT_ENTRIES) return -1;
+    const struct qs_dict_entry *e=&dict->entries[id-1];
+    *bytes=dict->data+e->offset; *length=e->length; return 0;
+}
 struct qs_row { struct qs_cell cells[QS_OUT]; };
 struct qs_metrics {
     uint64_t scanned, matched, input_bytes, chunks, work_peak, fdm_bytes;
