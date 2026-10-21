@@ -17,7 +17,7 @@ enum qs_type { Q_DECIMAL, Q_INTEGER, Q_DATE, Q_CHAR, Q_BOOLEAN };
 enum qs_op { Q_COLUMN, Q_CONST, Q_ADD, Q_SUB, Q_MUL, Q_EQ, Q_NE, Q_LT, Q_LE, Q_GT, Q_GE,
              Q_AND, Q_OR, Q_NOT, Q_IS_NULL, Q_IS_NOT_NULL };
 enum qs_agg_kind { Q_SUM, Q_AVG, Q_COUNT, Q_COUNT_STAR };
-struct qs_column { int16_t length, slot; uint8_t align, type, scale; };
+struct qs_column { int16_t length, slot; uint8_t align, type, scale, deferred; };
 struct qs_expr { int16_t left, right, column; uint8_t op, type, scale, dscale, isnull; int64_t constant; };
 struct qs_agg { int16_t expr; uint8_t kind; };
 struct qs_output { int16_t index; uint8_t aggregate; uint32_t type_oid; int32_t typmod; };
@@ -38,6 +38,10 @@ struct qs_extent { uint64_t logical, lba, bytes; };
 struct qs_request { struct qs_plan plan; char device[128]; uint32_t nsid, lba_bytes, nextents; uint64_t bytes; };
 struct qs_task { uint64_t state; uint32_t input_bytes; };
 struct qs_group { uint64_t states[QS_WORKERS]; unsigned count; };
+/* For a deferred numeric column, Scan stores this raw AFDM payload location
+ * in its 8-byte value slot. Filter decodes only selected rows before Aggregate.
+ * No device pointer escapes to the PG backend. */
+struct qs_heap_ref { uint32_t offset, bytes; };
 /* Column values, NULL bitmaps and numeric display scales, then selection. */
 struct qs_chunk { uint32_t capacity, ncols, rows, selected; };
 static inline size_t qs_chunk_bytes(unsigned capacity, unsigned ncols)

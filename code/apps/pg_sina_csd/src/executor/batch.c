@@ -163,7 +163,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
                 TRY(csConfigureBatchEntry(batch,CS_BATCH_ADD,compute,0,previous,&nodes[i][nnodes[i]++]));
                 previous=nodes[i][nnodes[i]-1];
                 if(request->plan.predicate>=0) {
-                    CS_MEM_HANDLE filter[]={vectors[i],plan_mem}; compute_request(compute,programs[FILTER].function,filter,2,counters[i]);
+                    CS_MEM_HANDLE filter[]={vectors[i],plan_mem,input[i]}; compute_request(compute,programs[FILTER].function,filter,3,counters[i]);
                     TRY(csConfigureBatchEntry(batch,CS_BATCH_ADD,compute,0,previous,&nodes[i][nnodes[i]++])); previous=nodes[i][nnodes[i]-1];
                 }
                 CS_MEM_HANDLE aggregate[]={vectors[i],plan_mem,tasks[i]}; compute_request(compute,programs[SINK].function,aggregate,3,counters[i]);

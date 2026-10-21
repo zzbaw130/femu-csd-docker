@@ -25,6 +25,9 @@ case ${1:-query} in
                 zero_limit) ;; # PG may eliminate the whole query with LIMIT 0.
                 *) grep -q 'SniaCsdAggregate' "$RESULTS/$name.plan" ;;
             esac
+            if [[ $name == late_* ]]; then
+                grep -Eq 'CSD Deferred Columns: [1-9]' "$RESULTS/$name.plan"
+            fi
             run_cold host "$sql" "$RESULTS/$name.host"
             run_cold csd "$sql" "$RESULTS/$name.csd"
             cmp "$RESULTS/$name.host.rows" "$RESULTS/$name.csd.rows"

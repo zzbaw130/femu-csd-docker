@@ -1,5 +1,6 @@
 #include "femu-csd-kernel.h"
 #include "query_eval.h"
+#include "heap_numeric.h"
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #endif
@@ -83,10 +84,10 @@ static void select_avx2(struct qs_chunk *c,const struct comparison *predicates,u
 #endif
 int64_t pg_sina_filter(struct femu_csd_args *a)
 {
-    if(!a || a->numr!=2 || a->mr_len[1]<(long long)sizeof(struct qs_plan)) return -1;
+    if(!a || (a->numr!=2 && a->numr!=3) || a->mr_len[1]<(long long)sizeof(struct qs_plan)) return -1;
     struct qs_chunk *c=a->mr_addr[0]; const struct qs_plan *p=a->mr_addr[1];
     if(a->mr_len[0]<(long long)sizeof(*c) || qs_chunk_bytes(c->capacity,c->ncols)>(uint64_t)a->mr_len[0] ||
-        c->ncols!=p->ncols || c->rows>c->capacity || p->nexprs>QS_EXPRS) return -1;
+        c->ncols!=p->ncols || c->rows>c->capacity || p->nattrs>QS_COLS || p->nexprs>QS_EXPRS) return -1;
     c->selected=0;
     struct comparison predicates[QS_EXPRS]; unsigned count=0;
     /* For a lone predicate the existing pipeline currently has better query
@@ -98,12 +99,29 @@ int64_t pg_sina_filter(struct femu_csd_args *a)
         else
 #endif
             select_scalar(c,predicates,count,0);
-        return 0;
-    }
-    for(unsigned row=0;row<c->rows;++row) {
+    } else for(unsigned row=0;row<c->rows;++row) {
         struct qs_eval e; e.plan=p; e.chunk=c; e.row=row; memset(e.valid,0,p->nexprs); struct qs_cell value;
         if(qs_evaluate(&e,p->predicate,&value)) return -2;
         if(!value.isnull && value.value) qs_selection(c)[c->selected++]=row;
+    }
+    /* The raw LOAD buffer stays in AFDM until Aggregate.sink finishes.
+     * Decode aggregate-only numerics here to avoid an extra CSF command. */
+    for(unsigned col=0;col<p->nattrs;++col) {
+        const struct qs_column *spec=&p->cols[col];
+        if(!spec->deferred) continue;
+        if(a->numr!=3 || spec->type!=Q_DECIMAL || spec->slot<0 || (unsigned)spec->slot>=c->ncols || a->mr_len[2]<0) return -1;
+        int64_t *values=qs_values(c)+(size_t)spec->slot*c->capacity;
+        unsigned char *nulls=qs_nulls(c)+(size_t)spec->slot*((c->capacity+7)/8);
+        unsigned char *scales=qs_dscales(c)+(size_t)spec->slot*c->capacity;
+        for(unsigned i=0;i<c->selected;++i) {
+            unsigned row=qs_selection(c)[i];
+            if(nulls[row/8]&(1U<<(row%8))) continue;
+            struct qs_heap_ref ref; memcpy(&ref,&values[row],sizeof(ref));
+            if(ref.offset>(uint64_t)a->mr_len[2] || ref.bytes>(uint64_t)a->mr_len[2]-ref.offset) return -2;
+            unsigned dscale;
+            if(qs_numeric_cents((const unsigned char *)a->mr_addr[2]+ref.offset,ref.bytes,&values[row],&dscale)) return -3;
+            scales[row]=dscale;
+        }
     }
     return 0;
 }

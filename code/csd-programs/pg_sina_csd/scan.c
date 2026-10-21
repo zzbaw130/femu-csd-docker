@@ -2,35 +2,9 @@
 #include "femu-csd-kernel.h"
 #include "query.h"
 #include <string.h>
-#include <limits.h>
+#include "heap_numeric.h"
 static uint16_t read16(const unsigned char *p) { uint16_t v; memcpy(&v,p,2); return v; }
 static uint32_t read32(const unsigned char *p) { uint32_t v; memcpy(&v,p,4); return v; }
-static int numeric_cents(const unsigned char *p,unsigned size,int64_t *out,unsigned *display_scale)
-{
-    if(size<2) return -1;
-    uint16_t head=read16(p); int weight; unsigned header,negative,dscale;
-    if((head&0xc000)==0xc000) return -1;
-    if((head&0xc000)==0x8000) {
-        header=2; negative=head&0x2000; weight=(head&0x3f)-((head&0x40)?64:0); dscale=(head&0x1f80)>>7;
-    } else {
-        if(size<4) return -1;
-        header=4; negative=head&0x4000; weight=(int16_t)read16(p+2); dscale=head&0x3fff;
-    }
-    if(dscale>2 || (size-header)%2) return -1;
-    __int128 value=0;
-    for(unsigned i=header;i<size;i+=2,--weight) {
-        unsigned digit=read16(p+i); if(digit>=10000) return -1;
-        if(!digit) continue;
-        __int128 part=digit;
-        if(weight==-1) { if(digit%100) return -1; part/=100; }
-        else if(weight>=0 && weight<=4) { part*=100; for(int j=0;j<weight;++j) part*=10000; }
-        else return -1;
-        value+=part;
-    }
-    if(negative) value=-value;
-    if(value>INT64_MAX || value<INT64_MIN) return -1;
-    *out=value; *display_scale=dscale; return 0;
-}
 int64_t pg_sina_scan(struct femu_csd_args *a)
 {
     if(!a || a->numr!=4 || a->mr_len[1]<(long long)sizeof(struct qs_plan) || a->mr_len[3]<(long long)sizeof(struct qs_task)) return -1;
@@ -73,7 +47,13 @@ int64_t pg_sina_scan(struct femu_csd_args *a)
                 if(slot>=0) {
                     int64_t value=0; unsigned dscale=0; const unsigned char *v=tuple+off+header;
                     if(compressed) return -3;
-                    if(spec->type==Q_DECIMAL) { if(numeric_cents(v,size-header,&value,&dscale)) return -3; }
+                    if(spec->deferred) {
+                        /* Reuse this value slot for the raw payload location.
+                         * Filter replaces it with a number only for survivors. */
+                        struct qs_heap_ref ref={page+offset+off+header,size-header};
+                        memcpy(&value,&ref,sizeof(ref));
+                    }
+                    else if(spec->type==Q_DECIMAL) { if(qs_numeric_cents(v,size-header,&value,&dscale)) return -3; }
                     else if(spec->type==Q_CHAR) { if(size-header!=1 || *v>=128) return -3; value=*v; }
                     else if(size==8) memcpy(&value,v,8);
                     else if(size==4) value=(int32_t)read32(v);

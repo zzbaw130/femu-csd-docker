@@ -75,7 +75,7 @@ Q6差异小于本次测量波动，不能据此认定有明显加速。Q1测试�
 
 SNIA已有计时记录D0=220次、累计1.523479s，E1=663次、累计3.393881s，F2=5次、累计0.000237s。这是并发请求各自墙钟时间之和，包含等待/提交/完成，不能相加当作查询时间，也不能直接当作纯CU计算时间。原生PG的I/O读时间3.016022s同样包含并行进程累计时间。现有数据仍不足以划分Scan、Filter和Aggregate的精确占比。
 
-实现中可确认的额外成本：Scan先为全部行解码四列并写入列批次，再运行逐行递归解释的Filter；即使98%行会被过滤，extendedprice也已转换。当前有列批次和selection vector，但没有显式SIMD，也没有按过滤结果延后解码聚合输入。每4MiB块分为LOAD/Scan/Filter/sink命令，各轮之间等待完成，尚无跨轮预取。Q1有大量匹配行和多项numeric聚合，定点局部聚合的收益更易覆盖这些共同成本。
+该次诊断对应的实现中可确认的额外成本：Scan先为全部行解码四列并写入列批次，再运行逐行递归解释的Filter；即使98%行会被过滤，extendedprice也已转换。当前有列批次和selection vector，但没有显式SIMD，也没有按过滤结果延后解码聚合输入。每4MiB块分为LOAD/Scan/Filter/sink命令，各轮之间等待完成，尚无跨轮预取。Q1有大量匹配行和多项numeric聚合，定点局部聚合的收益更易覆盖这些共同成本。
 
 核实实际QEMU设备命令行及默认值：未设置pcie_bandwidth_mbps/pcie_prop_delay_ns，默认均为0，PCIe带宽模型未开启；ch_xfer_lat也为0。当前内部LOAD仍使用与普通读取相同的FTL/NAND时序，跳过Guest DMA；不能据此声称实验已体现真实设备的内外部带宽差。没有在现有运行中修改SSD参数或重启FEMU。
 
@@ -123,3 +123,11 @@ SNIA已有计时记录D0=220次、累计1.523479s，E1=663次、累计3.393881s�
 三轮host/csd/profiled冷启动统计、独立CU perf热点及原始数据位置见[性能分析](performance.md)。新增 analyze 采集入口，基线统计提交9868e22bb。Q6原设备CPU约48%为Scan、51%为Filter；Q1约50%为聚合（主要为表达式解释）、37%为Scan。第一pipeline占执行端墙钟约95%，CU函数有效忙碌度约49%/64%，仍有读取和命令等待。
 
 据此参考DuckDB实现复合条件的类型化列比较/AVX2选择向量。单条件候选在Q1出现查询回退，已通过交替A/B验证并保留原单谓词路径；最终Q1均值1.490→1.479s，基本持平。Q6复合条件A/B均值1.328→0.977s，Filter CPU减少约96%。9项设备测试、4项ASan/UBSan及真实PG精确结果、取消回收回归通过。后续继续推进列向量聚合、Scan解码与读取/计算重叠，每项都以查询延迟验收。
+
+## 阶段1优化：选择性过滤后的 numeric 解码
+
+Guest PG 在规划过滤表达式时先确定其所需列，再分配分组/聚合所需列；后者中的 numeric 可以延迟解码。根据现有PG行数估计，仅在过滤后保留不足全表一半行时启用，避免 Q1 这类大部分行通过的查询承担额外遍历。EXPLAIN 显示 `CSD Deferred Columns`，Q6为1、Q1为0。
+
+CSD Scan 在原有列值槽中暂存 numeric 在原始AFDM块中的偏移和长度，CSD Filter 完成选择向量后只转换保留行，并恢复正常列值/显示精度。Guest 为 Filter 增加原始输入AFDM参数；同一块数据保留到sink完成，批次图与NVMe命令数量不变，AFDM分配不变，FEMU/SNIA无需修改。`heap_numeric.h` 共享原有数值解码实现。Filter计时现在包含补解码，应比较Scan+Filter合计CPU。
+
+新增设备差分用例覆盖真实heap布局、两种numeric头、NULL/精度、跨页与批次复用、复合条件及复杂表达式回退；被过滤的不支持数值不会被转换，选中后仍报错。Guest新增延迟聚合、numeric分组键、空结果和OR/NULL过滤的冷启动对照，均与原生PG完全一致；Q1/Q6全结果、取消后同backend重复查询及设备复用通过。10项设备CTest、5项PG设备ASan/UBSan检查通过。性能数据记录于[性能分析](performance.md)。

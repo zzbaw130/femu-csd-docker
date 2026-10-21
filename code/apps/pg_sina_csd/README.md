@@ -126,6 +126,10 @@ Guest PG：接收少量最终结果 → 转换 Datum → 返回客户端
 
 箭头中的 Scan/Filter/Aggregate/Sort/Limit 是设备 SO，运行在 FEMU CU；PG backend 仅编排请求，不扫描 heap、不计算聚合、不排序。原始 heap 通过 NVM→AFDM 内部路径读取，不经过 Guest 应用缓冲。列批次保留在 AFDM，哈希表等私有状态放在受限 workmem。借鉴 DuckDB 的所需列投影、selection vector、局部聚合后合并及公共子表达式复用；Filter 的复合 AND 比较条件已使用类型化列循环，支持 AVX2 时一次比较4个 int64；其他表达式和聚合求值目前仍是标量循环。
 
+PG 估计过滤后保留的行数少于全表一半时，仅供过滤后分组或聚合使用的 numeric 列采用延迟解码：Scan 在列值槽中暂存原始 AFDM 数据的偏移和长度；Filter 先生成 selection vector，再只为通过的行转换这些 numeric。WHERE 表达式使用的列始终提前解码。Q6 因此只为匹配行转换 extendedprice；Q1 保留绝大多数行，仍采用提前解码。`EXPLAIN` 的 `CSD Deferred Columns` 显示延迟解码列数。这是当前的简单性能启发式；统计估计失准会影响收益，不影响结果。
+
+Filter 的第三个 AFDM 参数是当前块的原始 heap 输入，复用 LOAD 已读入的缓冲，直到 Aggregate.sink 完成后才覆盖；不增加设备命令或 AFDM 分配。原始列位置仅在本分支中使用，不传回 Guest。Filter 计时包含筛选后的 numeric 解码，分析收益应比较 Scan 与 Filter 的合计 CPU 时间。此优化减少数值转换，不减少行存 heap 的内部读取字节数。
+
 PG 扩展直接链接 `libsnia`，在当前 backend 中调用 SNIA；没有查询辅助进程、sudo 调用、socket 或代理。安装时，udev 规则让 femu 用户可打开 /dev/nvme0 和 /dev/nvme0n1，postgres 的 CAP_SYS_ADMIN 满足 Linux vendor NVMe passthrough 的检查。PG 仍以 femu 用户运行，不以 root 启动。
 
 取消在 batch 边界处理：SNIA 调用期间暂缓 PG 中断抛出，避免从 C++ 调用或批次线程中直接 longjmp；观察到取消后先释放设备状态、AFDM、batch 和程序，再由 PG 报告原始中断。错误路径执行同样的资源回收。

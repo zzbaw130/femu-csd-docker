@@ -115,6 +115,9 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     if(p->norder) appendStringInfoString(&graph," -> Sort");
     if(p->limit>=0 || p->offset) appendStringInfoString(&graph," -> Limit");
     ExplainPropertyText("SNIA Pipelines",graph.data,es); ExplainPropertyInteger("CSD Columns",NULL,p->ncols,es);
+    unsigned deferred=0;
+    for(unsigned i=0;i<p->nattrs;++i) deferred+=p->cols[i].deferred!=0;
+    ExplainPropertyInteger("CSD Deferred Columns",NULL,deferred,es);
     if(s->executed) {
         if(s->profiling) explain_profile(&s->result->profile,es);
         ExplainPropertyInteger("CSD AFDM","bytes",s->result->metrics.fdm_bytes,es);

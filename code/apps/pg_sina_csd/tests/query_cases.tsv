@@ -9,3 +9,7 @@ constant_aggregate	SELECT sum(1),avg(1.0),count(*) FROM snia_query_fixture;
 zero_limit	SELECT k,sum(a) FROM snia_query_fixture GROUP BY k ORDER BY k LIMIT 0;
 unsupported_aggregate	SELECT min(a),max(a) FROM snia_query_fixture;
 unsupported_having	SELECT k,sum(a) FROM snia_query_fixture GROUP BY k HAVING count(*)>0 ORDER BY k;
+late_numeric	SELECT sum(a),avg(a),sum(a*(1-b)),count(a),count(*) FROM snia_query_fixture WHERE d<date '1994-01-01';
+late_group_key	SELECT a,sum(b),count(*) FROM snia_query_fixture WHERE d<date '1994-01-01' GROUP BY a ORDER BY a;
+late_empty	SELECT sum(a),avg(a),count(a),count(*) FROM snia_query_fixture WHERE d<date '1990-01-01';
+late_fallback	SELECT sum(a),avg(a),count(a),count(*) FROM snia_query_fixture WHERE d<date '1994-01-01' OR d IS NULL;
