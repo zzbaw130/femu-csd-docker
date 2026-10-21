@@ -7,12 +7,12 @@
 PG 从表达式树生成列投影、过滤、聚合、排序和 LIMIT 描述，Guest 的 PG backend 直接调用 SNIA 提交 batch：
 
 ```text
-LOAD → Scan → Filter（可选）→ Aggregate.sink     # 每个 CU 一个分支，HYBRID batch
+LOAD → Scan → Filter（可选）→ Aggregate.sink     # 每个执行槽一个SERIAL batch，多个batch异步并发
                    ...重复读取后续 chunk...
 Aggregate.source → Sort（可选）→ Limit（可选）  # 合并局部状态，SERIAL batch
 ```
 
-每个分支通常处理4MiB原始页。各分支拥有独立输入缓冲、列批次和聚合状态；SNIA 按依赖并行提交，底层不猜测并行策略。整个查询的数据块循环由 Guest PG backend 驱动，单个 batch 的依赖执行由 SNIA 调度。当前不包含设备自主预取或读算重叠。
+每个执行槽通常处理4MiB原始页，拥有独立输入缓冲、列批次和聚合状态，不固定绑定CU。Guest PG为每槽异步提交一个SERIAL batch，通过共享完成事件为先完成的槽分配下一块；SERIAL仅约束槽内顺序，各槽可并发。SNIA负责batch内执行，CSD SO仍只处理各自输入输出。原输入保留到本槽sink完成才复用，不增加双缓冲或预取；聚合source仍等待全部输入完成。
 
 | 源文件 / 构建产物 | 工作及 MR 参数顺序 |
 | --- | --- |
@@ -71,4 +71,4 @@ Aggregate先为本批计算分组键、聚合输入和分组位置，然后按�
 
 Scan仍按PG heap变长属性边界解析元组；常见零至三个base-10000数字、weight为-1/0/1的numeric直接转为int64百分数，其他合法表示保留通用解码路径。未减少必须读取的heap页，也未增加缓存。
 
-实现借鉴本地DuckDB的ExpressionExecutor/SelectionVector和类型化向量循环，保留本项目的PG数据格式及精确numeric表示。`tests/vector.c`对照原逐行求值器验证算术、比较、NULL、短路、溢出、稀疏选择和批次尾部，并验证多CU/多块合并时共享聚合状态不重复累加。运行时请求顺序及四分支轮次等待保持不变。
+实现借鉴本地DuckDB的ExpressionExecutor/SelectionVector和类型化向量循环，保留本项目的PG数据格式及精确numeric表示。`tests/vector.c`对照原逐行求值器验证算术、比较、NULL、短路、溢出、稀疏选择和批次尾部，并验证多CU/多块合并时共享聚合状态不重复累加。当前由Guest按独立异步执行槽推进各块，槽内算子顺序保持不变；详见apps/pg_sina_csd的执行流程。

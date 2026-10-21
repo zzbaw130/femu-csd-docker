@@ -119,7 +119,8 @@ PG 会另行执行 COUNT 校验结果，因此本工具用于正确性验收，�
 
 ```text
 Guest PG：解析/规划 → CustomScan → 读取数据库中的静态 extent 映射
-Guest PG：调用 SNIA HYBRID batch → 多分支 LOAD → Scan → Filter → Aggregate.sink
+Guest PG：异步提交最多4个 SERIAL batch → 各自 LOAD → Scan → Filter → Aggregate.sink
+Guest PG：接收任意 batch 完成事件 → 为该执行槽补充下一块，直到输入耗尽
 Guest PG：调用 SNIA SERIAL batch → Aggregate.source → Sort → Limit
 Guest PG：接收少量最终结果 → 转换 Datum → 返回客户端
 ```
@@ -134,9 +135,11 @@ Filter 的第三个 AFDM 参数是当前块的原始 heap 输入，复用 LOAD �
 
 PG 扩展直接链接 `libsnia`，在当前 backend 中调用 SNIA；没有查询辅助进程、sudo 调用、socket 或代理。安装时，udev 规则让 femu 用户可打开 /dev/nvme0 和 /dev/nvme0n1，postgres 的 CAP_SYS_ADMIN 满足 Linux vendor NVMe passthrough 的检查。PG 仍以 femu 用户运行，不以 root 启动。
 
-取消在 batch 边界处理：SNIA 调用期间暂缓 PG 中断抛出，避免从 C++ 调用或批次线程中直接 longjmp；观察到取消后先释放设备状态、AFDM、batch 和程序，再由 PG 报告原始中断。错误路径执行同样的资源回收。
+PG 在完成事件轮询之间检查取消。SNIA 调用期间暂缓 PG 中断抛出，避免从 C++ 调用栈跳转；观察到取消或设备错误后停止补充任务，尝试撤销未开始请求，并收完全部在途 batch 的完成事件，再释放聚合状态、AFDM、batch 和程序。当前SNIA后端不能强制终止已经执行的请求，因此必须等它们结束后再让 PG 报告原始中断。
 
-PG 查询设备 FDM/CU 容量，通常按4MiB块和最多4个 CU 分配独立分支；容量不足会减少分支或块大小。四分支同轮提交并等待全部完成，再复用原缓冲提交下一轮。同轮不同分支的LOAD与计算可交错；本轮未增加下一块预取或跨轮异步推进。块长度相同时不重复向设备写 input_bytes，仅初始化和尾块变化时更新。当前程序索引501–506由整个查询持有 namespace 文件锁，设备查询串行进入；这是单查询性能实验的实现，尚未支持多 PG 会话共享程序目录。
+PG 查询设备 FDM/CU 容量，通常按4MiB块分配最多4个执行槽；每个槽是一套独立的输入、列批次缓冲及局部聚合状态，容量不足时减少槽数或块大小。每槽配置一个 SERIAL batch，SERIAL只约束该batch内部顺序，四个batch之间并发。PG通过共享的SNIA event取得完成槽，为它更新下一块LBA并立即重新提交；没有每四块一次的轮次等待。槽不固定绑定CU；同槽当前块完成后才复用缓冲处理下一块，没有双缓冲或预取。全部块已分配且在途batch数为零后，才进入Aggregate.source。`EXPLAIN` 的 `CSD Scheduling` 显示 `independent serial batches`。
+
+此处参考本地DuckDB `Pipeline::LaunchScanTasks` 和 `RowGroupCollection::NextParallelScan` 的任务领取方式。所有块由PG backend维护同一个输入游标，不新增任务队列框架；SNIA库线程只执行设备请求，不调用PG接口。块长度相同时不重复向设备写 input_bytes，仅初始化和尾块变化时更新。当前程序索引501–506由整个查询持有 namespace 文件锁，设备查询串行进入；这是单查询性能实验的实现，尚未支持多 PG 会话共享程序目录。
 
 EXPLAIN ANALYZE 会显示投影列数、设备 CU 数、扫描/匹配行数、内部读取量、AFDM 用量及 workmem 峰值。计时包含程序加载、SNIA 编排与回收，不只统计设备计算。具体类型和规模限制见[设备算子说明](../../csd-programs/pg_sina_csd/README.md)。
 

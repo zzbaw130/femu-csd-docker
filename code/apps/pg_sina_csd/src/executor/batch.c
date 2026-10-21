@@ -9,6 +9,8 @@
 #include <unistd.h>
 #include <time.h>
 enum { SCAN,FILTER,SINK,SOURCE,SORT,LIMIT,FUNCTIONS };
+/* One SERIAL batch and one reusable set of buffers per execution slot. */
+struct slot { CS_BATCH_HANDLE batch; CS_REQ_HANDLE request; CS_BATCH_INDEX load; unsigned bytes; };
 struct program { const char *file,*symbol; CS_CSF_ID function; unsigned index; int loaded,active; };
 static uint64_t clock_ns(void)
 {
@@ -65,18 +67,19 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     struct qs_profile stats={0};
     CHECK_FOR_INTERRUPTS();
     /* Do not longjmp through SNIA C++ frames or its batch threads. Poll PG's
-     * pending cancel at batch boundaries, then release resources before PG
+     * pending cancel between event polls, then release resources before PG
      * reports the interrupt. No PG allocations/errors occur while held. */
     HOLD_INTERRUPTS();
     memset(result,0,sizeof(*result));
     result->status=1; strcpy(result->error,"CSD execution interrupted or initialization failed");
-    CS_DEV_HANDLE device=NULL; CS_BATCH_HANDLE batch=NULL;
+    CS_DEV_HANDLE device=NULL; CS_BATCH_HANDLE batch=NULL; CS_EVT_HANDLE event=NULL;
+    struct slot slots[QS_WORKERS]={{0}}; unsigned inflight=0;
     CS_MEM_HANDLE plan_mem=NULL,out_mem=NULL,group_mem=NULL;
     CS_MEM_HANDLE input[QS_WORKERS]={0},vectors[QS_WORKERS]={0},tasks[QS_WORKERS]={0},counters[QS_WORKERS]={0};
     CsProperties *caps=NULL,*fdm=NULL;
     CsBatchRequest *load=NULL,*compute=NULL;
     struct qs_group group={0}; int group_ready=0,lock_fd=-1;
-    unsigned workers=0,chunk=QS_CHUNK,previous_bytes[QS_WORKERS]={0};
+    unsigned workers=0,chunk=QS_CHUNK;
     struct program programs[FUNCTIONS]={
         [SCAN]={.file="pg-sina-scan.so",.symbol="pg_sina_scan",.index=501},
         [FILTER]={.file="pg-sina-filter.so",.symbol="pg_sina_filter",.index=502},
@@ -129,23 +132,24 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     load=calloc(1,sizeof(*load)+(request->nextents+1)*sizeof(CSBlockRange));
     compute=calloc(1,sizeof(*compute)+6*sizeof(CsComputeArg));
     if(!load || !compute) { result->status=1; strcpy(result->error,"host request allocation failed"); goto cleanup; }
-    CS_BATCH_INDEX nodes[QS_WORKERS][4]={{0}}; unsigned nnodes[QS_WORKERS]={0};
-    TRY(csAllocBatchRequest(CS_BATCH_HYBRID,4*workers,&batch));
-    uint64_t cursor=0; unsigned round=0;
+    TRY(csCreateEvent(&event));
+    uint64_t cursor=0; bool empty_pending=!request->bytes;
     if(profiling) { uint64_t now=clock_ns(); stats.setup_ns=now-phase; phase=now; }
-    do {
-        unsigned active=0;
+    /* Like DuckDB's parallel scan tasks, each completed slot claims the next
+     * unassigned range. There is no four-chunk round barrier. */
+    for(;;) {
+        if(QueryCancelPending || ProcDiePending) goto cleanup;
         for(unsigned i=0;i<workers;++i) {
-            if(cursor>=request->bytes && (round || i)) {
-                for(unsigned j=nnodes[i];j>0;--j) TRY(csConfigureBatchEntry(batch,CS_BATCH_DELETE,NULL,nodes[i][j-1],0,NULL));
-                nnodes[i]=0; continue;
-            }
-            ++active;
+            struct slot *slot=&slots[i];
+            if(slot->request || (cursor>=request->bytes && !empty_pending)) continue;
+            empty_pending=false;
             unsigned bytes=request->bytes-cursor<chunk?request->bytes-cursor:chunk;
-            if(bytes!=previous_bytes[i]) {
+            if(bytes!=slot->bytes) {
                 TRY(copy(tasks[i],offsetof(struct qs_task,input_bytes),&bytes,sizeof(bytes),1));
-                previous_bytes[i]=bytes;
+                slot->bytes=bytes;
             }
+            bool first=!slot->batch;
+            if(first) TRY(csAllocBatchRequest(CS_BATCH_SERIAL,4,&slot->batch));
             if(bytes) {
                 memset(load,0,sizeof(*load)); load->ReqType=CS_STORAGE_IO;
                 load->u.StorageIo=(CsStorageRequest){.Mode=CS_STORAGE_BLOCK_IO,.DevHandle=device,
@@ -156,30 +160,40 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
                     uint64_t length=(e->logical+e->bytes<end?e->logical+e->bytes:end)-at;
                     io->Range[io->NumRanges++]=(CSBlockRange){request->nsid,e->lba+(at-e->logical)/request->lba_bytes,length/request->lba_bytes}; at+=length;
                 }
-                if(!round) { TRY(csConfigureBatchEntry(batch,CS_BATCH_ADD,load,0,0,&nodes[i][nnodes[i]++])); }
-                else TRY(csConfigureBatchEntry(batch,CS_BATCH_RECONFIG,load,nodes[i][0],0,NULL));
+                if(first) TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_ADD,load,0,0,&slot->load));
+                else TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_RECONFIG,load,slot->load,0,NULL));
             }
-            if(!round) {
+            if(first) {
+                CS_BATCH_INDEX previous=slot->load,current;
                 CS_MEM_HANDLE memory[]={input[i],plan_mem,vectors[i],tasks[i]};
                 compute_request(compute,programs[SCAN].function,memory,4,counters[i]);
-                CS_BATCH_INDEX previous=nnodes[i]?nodes[i][nnodes[i]-1]:0;
-                TRY(csConfigureBatchEntry(batch,CS_BATCH_ADD,compute,0,previous,&nodes[i][nnodes[i]++]));
-                previous=nodes[i][nnodes[i]-1];
+                TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_ADD,compute,0,previous,&current)); previous=current;
                 if(request->plan.predicate>=0) {
                     CS_MEM_HANDLE filter[]={vectors[i],plan_mem,input[i]}; compute_request(compute,programs[FILTER].function,filter,3,counters[i]);
-                    TRY(csConfigureBatchEntry(batch,CS_BATCH_ADD,compute,0,previous,&nodes[i][nnodes[i]++])); previous=nodes[i][nnodes[i]-1];
+                    TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_ADD,compute,0,previous,&current)); previous=current;
                 }
                 CS_MEM_HANDLE aggregate[]={vectors[i],plan_mem,tasks[i]}; compute_request(compute,programs[SINK].function,aggregate,3,counters[i]);
-                TRY(csConfigureBatchEntry(batch,CS_BATCH_ADD,compute,0,previous,&nodes[i][nnodes[i]++]));
+                TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_ADD,compute,0,previous,&current));
             }
-            cursor+=bytes;
+            CS_STATUS status=csQueueBatchRequest(slot->batch,slot,NULL,event,&slot->request,NULL);
+            if(status!=CS_QUEUED) {
+                result->status=status==CS_SUCCESS?CS_ERROR_IN_EXECUTION:status;
+                snprintf(result->error,sizeof(result->error),"csQueueBatchRequest: status=%d",status); goto cleanup;
+            }
+            ++inflight; cursor+=bytes;
         }
-        if(QueryCancelPending || ProcDiePending) goto cleanup;
-        if(active) TRY(csQueueBatchRequest(batch,NULL,NULL,NULL,NULL,NULL));
-        ++round;
-    } while(cursor<request->bytes);
+        if(!inflight) break;
+        void *completed=NULL;
+        CS_STATUS status=csPollEvent(event,&completed,NULL);
+        if(status==CS_NOT_DONE) { pg_usleep(50L); continue; }
+        --inflight; ((struct slot *)completed)->request=NULL;
+        if(status!=CS_SUCCESS) {
+            result->status=status; snprintf(result->error,sizeof(result->error),"csPollEvent: status=%d",status); goto cleanup;
+        }
+    }
     if(profiling) { uint64_t now=clock_ns(); stats.pipeline_ns[0]=now-phase; phase=now; }
-    TRY(csFreeBatchRequest(batch)); batch=NULL;
+    for(unsigned i=0;i<workers;++i) if(slots[i].batch) { TRY(csFreeBatchRequest(slots[i].batch)); slots[i].batch=NULL; }
+    TRY(csDeleteEvent(event)); event=NULL;
     /* Empty input needs one aggregate state for the ungrouped NULL/count row. */
     if(!request->bytes) group.count=1;
     for(unsigned i=0;i<group.count;++i) { struct qs_task task; TRY(copy(tasks[i],0,&task,sizeof(task),0)); group.states[i]=task.state; }
@@ -215,6 +229,19 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     }
 cleanup:
     if(profiling && !cleanup_start) cleanup_start=clock_ns();
+    /* Requests already executing cannot be forcibly aborted by this backend.
+     * Stop refilling, abort queued requests where possible, and drain every
+     * completion before freeing buffers or reading/freeing aggregate states. */
+    if(event) {
+        for(unsigned i=0;i<workers;++i) if(slots[i].request) csAbortRequest(slots[i].request);
+        while(inflight) {
+            CS_STATUS status=csPollEvent(event,NULL,NULL);
+            if(status==CS_NOT_DONE) pg_usleep(50L);
+            else --inflight;
+        }
+        csDeleteEvent(event);
+    }
+    for(unsigned i=0;i<workers;++i) if(slots[i].batch) csFreeBatchRequest(slots[i].batch);
     if(batch) csFreeBatchRequest(batch);
     if(device && group_mem && compute && programs[SOURCE].active) {
         if(!group_ready) {

@@ -111,6 +111,7 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
 {
     SniaState *s=(SniaState *)node; const struct qs_plan *p=&s->request.plan;
     ExplainPropertyText("Execution Path","csd",es);
+    ExplainPropertyText("CSD Scheduling","independent serial batches",es);
     StringInfoData graph; initStringInfo(&graph); appendStringInfoString(&graph,"LOAD -> Scan");
     if(p->predicate>=0) appendStringInfoString(&graph," -> Filter");
     appendStringInfoString(&graph," -> Aggregate.sink; Aggregate.source");

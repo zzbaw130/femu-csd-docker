@@ -22,7 +22,7 @@
 - `pg_sina_csd.exe_path`：默认 `host`，采用原生 PG 计划；`csd` 为支持的查询增加 CustomScan，不能处理的计划继续由 PG 执行。切换时失效 prepared plan 缓存。`auto` 写入后续阶段，目前不接受该值。
 - 从 PG 表达式树生成投影列、过滤表达式、聚合、分组、排序和 LIMIT/OFFSET 描述，不识别 SQL 文本或 Query 编号。支持 Q1/Q6 的所有数据算子；当前只接入单表聚合的完整上层计划，不将部分原生执行声称为全卸载。
 - PG backend 直接链接并调用 SNIA，不读取 heap 到应用缓冲，不执行 SQL 数据计算。原始数据通过内部 LOAD 进入 AFDM，没有改动 FEMU 或 SNIA 核心。安装时配置设备访问权限，不使用辅助进程或代理。
-- 第一条 pipeline 为 LOAD→Scan→Filter→Aggregate.sink；按设备容量，构建最多4个并行分支的 HYBRID batch。分支间使用独立缓冲和私有聚合状态，重复处理4MiB块直到输入结束。
+- 阶段1初版的第一条 pipeline 为 LOAD→Scan→Filter→Aggregate.sink；按设备容量，构建最多4个并行分支的 HYBRID batch，当前异步执行槽改进见本文末尾。分支间使用独立缓冲和私有聚合状态，重复处理4MiB块直到输入结束。
 - 第二条 pipeline 为 Aggregate.source→Sort→Limit，采用 SERIAL batch；合并局部状态、精确 AVG 除法、排序、LIMIT 都在设备执行。Guest 只转换结果类型并返回客户端。
 - Scan 提取所需列，Filter 生成 selection vector；表达式树复用公共子表达式。参考本地 DuckDB table_scan.cpp、physical_filter.cpp 和 physical_hash_aggregate.cpp 的投影、选择向量及局部聚合组织；不直接复用其存储格式；该阶段初版没有显式 SIMD，后续 Filter 向量化见性能分析。
 - numeric 以定点整数精确计算并保留显示精度，AVG 对齐 PG numeric 的精度与舍入。PG12 的 palloc 只保证8字节对齐，含 __int128 的结果显式16字节对齐。
@@ -141,3 +141,11 @@ CSD Filter和Aggregate共用 `query_vector.h`，按256行处理一个表达式�
 Scan为常见numeric增加直接整数转换；Sort交换行号后统一重排；Limit保持仅调整范围。Guest的块长度相同时不再重复写input_bytes，220块由220次降为4份初始化加1份尾块更新（按代码路径计数）。没有改变NVM读取量、4 CU数量或AFDM缓冲分配。
 
 新增差分测试覆盖完整表达式集合、NULL、短路溢出、选择向量和尾部；新增SQL覆盖计算型过滤、布尔COUNT、SUM/AVG/COUNT共享及重复输出。重复输出用例暴露CustomScan未设置 `ecxt_scantuple` 的既有问题，已在投影前设置当前结果槽，避免PG在非直接投影时异常退出。完整冷启动结果、取消回收、计时开关、11项设备CTest和6项PG设备ASan/UBSan验证通过；性能详见[性能分析](performance.md)。
+
+## 阶段1调度：独立异步执行槽
+
+参考本地DuckDB的Pipeline并行任务及NextParallelScan：PG backend维护唯一输入游标，最多4个执行槽完成后领取下一个范围。每槽包含原有独立AFDM缓冲和局部聚合状态，以及一个SERIAL batch；共享一个SNIA event，通过Context识别完成槽。只重配已完成槽的LOAD请求，再异步提交；没有每四块一次的屏障，也不固定绑定CU。全部输入分配完成且所有请求完成后，原第二条SERIAL pipeline合并/输出结果。
+
+复用csQueueBatchRequest/csPollEvent/csAbortRequest，不改FEMU、SNIA或设备算子ABI，不增加PG辅助线程、进程、代理、双缓冲或预取。SNIA库既有线程仅运行设备请求；PG API始终由backend调用。取消/错误时停止补充任务，尽可能撤销尚未开始的请求，收完所有在途完成事件，释放batch引用后才清理聚合状态及AFDM；已开始请求无法强制撤销，必须等其结束。
+
+EXPLAIN增加CSD Scheduling说明。Guest回归新增450000行多块表，覆盖COUNT、分组、选择性过滤、无匹配和尾块；投影异常numeric触发设备错误时验证其余请求排空后同backend可连续再次完整查询。Q1/Q6精确结果、取消和profile开关验证通过。冷启动对照见[性能分析](performance.md)。

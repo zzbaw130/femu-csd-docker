@@ -16,3 +16,7 @@ late_fallback	SELECT sum(a),avg(a),count(a),count(*) FROM snia_query_fixture WHE
 vector_filter	SELECT sum(a),avg(a),count(a),count(*) FROM snia_query_fixture WHERE (a*(1-b)>1 AND d>=date '1994-01-01') OR a IS NULL;
 vector_boolean_count	SELECT count(a>0),count(a*(1-b)>0),count(NOT (a>0)),count(a),sum(a),avg(a) FROM snia_query_fixture;
 vector_shared_constant	SELECT count(1.00),sum(1.00),avg(1.00),count(*),count(*) FROM snia_query_fixture WHERE d>=date '1994-01-01';
+parallel_count	SELECT count(*) FROM snia_query_parallel;
+parallel_groups	SELECT k,sum(a),avg(a),count(a),count(*) FROM snia_query_parallel GROUP BY k ORDER BY k;
+parallel_selective	SELECT sum(a),avg(a),count(*) FROM snia_query_parallel WHERE k=0;
+parallel_empty	SELECT sum(a),avg(a),count(*) FROM snia_query_parallel WHERE k<0;

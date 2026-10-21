@@ -23,7 +23,8 @@ case ${1:-query} in
             case $name in
                 unsupported_*) ! grep -q 'SniaCsdAggregate' "$RESULTS/$name.plan" ;;
                 zero_limit) ;; # PG may eliminate the whole query with LIMIT 0.
-                *) grep -q 'SniaCsdAggregate' "$RESULTS/$name.plan" ;;
+                *) grep -q 'SniaCsdAggregate' "$RESULTS/$name.plan"
+                   grep -q 'CSD Scheduling: independent serial batches' "$RESULTS/$name.plan" ;;
             esac
             if [[ $name == late_* ]]; then
                 grep -Eq 'CSD Deferred Columns: [1-9]' "$RESULTS/$name.plan"
@@ -75,7 +76,17 @@ case ${1:-query} in
         run_cold csd "$(cat "$PROJECT/tests/q1.sql")" "$RESULTS/after-timeout.csd"
         cmp "$RESULTS/q1.host.rows" "$RESULTS/after-timeout.csd.rows"
         echo 'PASS cancellation cleanup and full device reuse'
-        psql -X -q -v ON_ERROR_STOP=1 -d tpch_s1 -c "DELETE FROM sina_csd.relations WHERE relid IN ('snia_query_fixture'::regclass,'snia_query_empty'::regclass); DROP TABLE snia_query_fixture,snia_query_empty"
+        # Scan fails in one slot while other batches may still be in flight.
+        # Drain them before the same backend starts the following full scan.
+        {
+            printf '\\set ON_ERROR_STOP off\nSELECT sum(bad) FROM snia_query_parallel;\n'
+            printf '\\set ON_ERROR_STOP on\nSELECT count(*) FROM snia_query_parallel;\nSELECT count(*) FROM snia_query_parallel;\n'
+        } > "$RESULTS/error.sql"
+        sh "$COLD" csd "$RESULTS/error.sql" > "$RESULTS/error.log" 2>&1
+        grep -q 'CSD execution failed' "$RESULTS/error.log"
+        [[ $(grep -c '^450000$' "$RESULTS/error.log") == 2 ]]
+        echo 'PASS device error drains outstanding batches before same-backend reuse'
+        psql -X -q -v ON_ERROR_STOP=1 -d tpch_s1 -c "DELETE FROM sina_csd.relations WHERE relid IN ('snia_query_fixture'::regclass,'snia_query_empty'::regclass,'snia_query_parallel'::regclass); DROP TABLE snia_query_fixture,snia_query_empty,snia_query_parallel"
         ;;
     profile)
         [[ $(psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 -c "LOAD 'pg_sina_csd'" -c 'SHOW pg_sina_csd.profile') == off ]]
