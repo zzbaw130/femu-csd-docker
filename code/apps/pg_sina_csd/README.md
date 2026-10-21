@@ -362,4 +362,4 @@ Q8 进一步验证 8 表/7 join、nation 两次自连接和 `sum(CASE...)/sum(..
 
 Q4 验证 EXISTS 半连接：`orders` 为 probe，`lineitem_pkey` 为链尾索引，每个 order 最多输出一次；`l_commitdate<l_receiptdate` 在 B-tree heap tuple 上先过滤。5 行结果与 host 一致；64MB 三轮 host=2215.896ms、CSD=1282.650ms（CSD约快1.7倍），16MB CSD=1237.619ms且结果一致。小结果快速路径现在会在排序前解析字符串，避免按字典 ID 排序。
 
-Q13 实现 LEFT JOIN + 两级聚合：每个 customer 先输出一条 NULL orders 垫底行，`count(o_orderkey)` 忽略 NULL；Aggregate.source 再把第一级 c_count 分布聚合成 custdist。41 行结果与 host 一致；64MB 三轮 host=1199.221ms、CSD=5647.795ms（约4.7倍）。16MB 下会长时间不返回，当前 Q13 最低验收内存为64MB，性能和小内存仍未达标。
+Q13 实现 LEFT JOIN + 两级聚合：每个 customer 先输出一条 NULL orders 垫底行，`count(o_orderkey)` 忽略 NULL；Aggregate.source 再把第一级 c_count 分布聚合成 custdist。41 行结果与 host 一致；64MB 三轮 host=1199.221ms、CSD=5647.795ms（约4.7倍）。同规模合成表（150k customer/1.5M orders）32MB 可完成（11.94s）；16MB 会长时间不返回，当前 Q13 最低验收内存为32MB，性能和小内存仍未完全达标。

@@ -72,7 +72,7 @@ case ${1:-query} in
             run_cold host "$sql" "$RESULTS/$query.host"
             memories=(4 64); if [[ $query == q12 || $query == q3 || $query == q4 || $query == q5 || $query == q10 ]]; then memories=(16 64); fi
             if [[ $query == q7 || $query == q8 || $query == q9 ]]; then memories=(16 64); fi
-            if [[ $query == q13 ]]; then memories=(64); fi
+            if [[ $query == q13 ]]; then memories=(32 64); fi
             if [[ $query == q9 ]]; then memories=(32 64); fi
             for memory in "${memories[@]}"; do
                 run_cold csd "SET pg_sina_csd.max_memory='${memory}MB'; $sql" "$RESULTS/$query.$memory"
