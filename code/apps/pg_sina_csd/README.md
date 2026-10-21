@@ -4,7 +4,7 @@
 
 目标是把 PG 执行计划转换为 SNIA batch，由 Guest 调度 CSD 算子。只读实验使用与原生 PG 相同的全表 visible/frozen heap；实验前准备一次 schema、extent 和 LBA 映射，后续持续使用。文件、schema 或设备变化以及重启后重新准备，不设置守护连接。
 
-当前支持外部行排序/TopN、高基数聚合、多表整数等值 INNER Hash Join及连接后的分组/排序。Q1/Q3/Q6/Q12/Q14/Q19 由 PG 表达式树生成动态 pipeline，通过 CustomScan 完整卸载；PG 负责规划、权限检查及结果 Datum 转换。其余能力按[开发计划](doc/development.md)逐步补齐，尚未支持全部22条 TPC-H。
+当前支持外部行排序/TopN、高基数聚合、多表整数等值 INNER Hash Join、B-tree 索引连接及连接后的分组/排序。Q1/Q3/Q6/Q12/Q14/Q19 由 PG 表达式树生成动态 pipeline，通过 CustomScan 完整卸载；PG 负责规划、权限检查及结果 Datum 转换。其余能力按[开发计划](doc/development.md)逐步补齐，尚未支持全部22条 TPC-H。
 
 ## 执行路径与冷启动
 
@@ -65,6 +65,8 @@ bash tests/pg-sina-csd-test.sh sql
 bash tests/pg-sina-csd-test.sh query
 # Join重复键、NULL、连接后分组、字符串、小内存spill及完整Q3/Q12/Q14/Q19
 bash tests/pg-sina-csd-test.sh join
+# B-tree索引、不同整数宽度、4MB预算、失效回退及Q3
+bash tests/pg-sina-csd-test.sh index
 # Q3/Q12/Q14/Q19各3轮冷启动，以及独立的profile
 bash tests/pg-sina-csd-test.sh join-bench
 # 开关、逐算子计时、JSON 输出及开启计时后的结果一致性
@@ -88,12 +90,15 @@ cmake --install /home/femu/opt/pg_sina_csd/build
 
 ```sql
 CREATE EXTENSION pg_sina_csd;
+-- 已安装0.1时，重新编译安装后执行：
+-- ALTER EXTENSION pg_sina_csd UPDATE TO '0.2';
 SELECT sina_csd.version();
 -- 只对尚未满足冻结条件的实验表执行；已有冻结归档无需重新制作。
 VACUUM (FREEZE, ANALYZE) lineitem;
 SELECT sina_csd.prepare('public.lineitem');
 SELECT * FROM sina_csd.relations;
 SELECT * FROM sina_csd.columns WHERE relid='public.lineitem'::regclass;
+SELECT * FROM sina_csd.indexes WHERE heaprelid='public.lineitem'::regclass;
 SELECT * FROM sina_csd.extents WHERE relid='public.lineitem'::regclass ORDER BY logical_offset;
 ```
 
@@ -102,6 +107,30 @@ PostgreSQL 保留 pg_ 前缀的 schema 名，因此扩展名为 pg_sina_csd，sc
 prepare 必须由 PG superuser 调用。它检查 heap、visible/frozen 和物理列信息，等待 PG checkpoint，然后查询 FIEMAP；数据文件可以跨多个1GiB段。分区内物理偏移加上分区起始位置转换为 namespace LBA，支持当前80%数据区/20%spill布局。错误使整次准备事务回滚，不保留部分映射。
 
 准备结果保存在数据库，不需要独立 JSON 清单或后台代理。重新准备同一关系会原子替换旧记录；当前不支持 dropped column。实验期间保证映射关系不变，不在每次查询重复检查所有文件。
+
+## 索引访问路径
+
+`prepare(heap)` 同时准备其可用索引，不需要另建一份键值索引。`sina_csd.indexes` 记录索引 OID、所属 Heap、前导属性、根页及键宽度；原有 `relations/extents` 表保存索引文件的物理映射。当前支持 PG12、B-tree v4、升序且 NULLS LAST 的内置 smallint/int/bigint 前导键等值查找，可使用复合索引的前导键。表达式索引、部分索引及其他排序/操作符类保留原有路径。
+
+规划端检查原生 PG 最优路径中的参数化 IndexScan/IndexOnlyScan，当前转换形状为“零个或多个 Hash Join，最后接一个 Index Join”；原生路径不适用或索引未准备时继续使用已有 Hash Join。这里只借用 PG 的访问路径选择，设备仍需读取 Heap，没有实现 Index Only Scan。REINDEX 改变 relfilenode 后旧索引映射不会被选中，重新 `prepare(heap)` 才能再次使用；实验中仍须遵守文件不变的约定。
+
+Q3 的执行流程为：
+
+```text
+Customer: LOAD → Scan → Filter → HashJoin.build
+Orders:   LOAD → Scan → Filter → HashJoin.probe
+          → IndexJoin(lineitem_pkey → TID → Heap投影/过滤)
+          → Aggregate.sink
+Aggregate.source → Sort/Top10 → PG Datum
+```
+
+设备每次处理最多64个查找键。索引缺页时，设备在任务 AFDM 中返回文件类别、页号及目标页槽；PG 仅将这些地址转换为 SNIA `csQueueStorageRequest`，用内部 NVM→AFDM 命令加载，再提交只含 Join 的继续执行 batch。相邻目标槽合并为一个请求，连续物理范围合并读取。它是 `query.h` 中的应用层继续执行约定，不是新增 SNIA 状态；原有 NEED_STORE/LOAD 仍只用于 spill token。
+
+页输入保留在当前槽的 AFDM，最多128页，下一次物理扫描复用缓冲时失效，不跨查询缓存。B-tree 比较、TID 解析、Heap 解码、局部和跨表过滤都在 CSD 执行；PG 不读取索引键、中间 Tuple 或数据页。查询私有游标和页槽标签从 workmem 分配；每个索引状态预留128KiB，其余 build 预算分配给哈希表，两者仍受查询和物理池限制。
+
+EXPLAIN 显示扫描表、索引名、内部页加载次数和实际解码的索引 Heap Tuple 数。Index Join 及其局部过滤的 CPU 时间包含在 `HashJoin.probe+Aggregate` 内；`CSD Heap Rows` 是顺序扫描的 probe 行数，索引 Tuple 另计，`CSD Internal Read` 包含两种读取。
+
+当前没有通用 Bitmap Scan、独立常量范围 Index Scan 或任意位置的多个 Index Join。既有 Hash Join 的外部批次算法仍可能重扫 probe；本阶段使 Q3 改为可驻留的小表 build 加索引查找，没有把该算法描述为已实现分区 Hash Join。
 
 ## 内部读取校验
 

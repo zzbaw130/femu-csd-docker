@@ -17,6 +17,10 @@
 #define QS_CHUNK (4U*1024*1024)
 #define QS_SORT_IO_BYTES (64U*1024)
 #define QS_STRINGS 32
+#define QS_INDEX_READS 64
+#define QS_INDEX_CACHE 128
+#define QS_INDEX_WORK_BYTES (128U*1024) /* Cursor/tag state; page input stays in AFDM. */
+#define QS_INDEX_WAIT 1 /* Private join continuation; never a SNIA status. */
 enum qs_type { Q_DECIMAL, Q_INTEGER, Q_DATE, Q_CHAR, Q_BOOLEAN, Q_STRING, Q_PREFIX, Q_DICTIONARY };
 enum qs_op { Q_COLUMN, Q_CONST, Q_ADD, Q_SUB, Q_MUL, Q_EQ, Q_NE, Q_LT, Q_LE, Q_GT, Q_GE,
              Q_AND, Q_OR, Q_NOT, Q_IS_NULL, Q_IS_NOT_NULL, Q_CASE, Q_AGGREF, Q_DIV };
@@ -35,6 +39,8 @@ struct qs_join {
     int build_key, probe_key, predicate;
     int residual; /* Joined-row predicate index + 1; 0 means no residual. */
     uint64_t rows, work_mem_bytes;
+    uint32_t indexid, indexnode, indexroot;
+    uint8_t index_key_bytes; /* PG12 ascending integer B-tree leading key. */
 };
 struct qs_plan {
     uint32_t relid, relfilenode;
@@ -67,14 +73,18 @@ static inline unsigned qs_probe_attrs(const struct qs_plan *p)
 }
 struct qs_extent { uint64_t logical, lba, bytes; };
 struct qs_request { struct qs_plan plan; char device[128]; uint32_t nsid, lba_bytes, nextents; uint64_t bytes; };
+struct qs_index_read { uint32_t block; uint16_t slot, heap; };
 struct qs_task {
     uint64_t state;
     uint32_t input_bytes, workers, slot; /* slot is a PG-assigned input index. */
     uint64_t scanned, matched, joined;
+    uint64_t index_pages, index_tuples;
+    uint32_t index_pending, index_nreads;
+    struct qs_index_read index_reads[QS_INDEX_READS];
 };
 struct qs_join_control {
     uint64_t state, rows, spill_write_bytes, spill_read_bytes;
-    uint32_t batches, current;
+    uint32_t batches, current, indexed;
 };
 struct qs_group { uint64_t states[QS_WORKERS]; unsigned count; };
 /* For a deferred numeric column, Scan stores this raw AFDM payload location
@@ -98,6 +108,7 @@ struct qs_metrics {
     uint64_t scanned, matched, input_bytes, chunks, work_peak, fdm_bytes;
     uint64_t spill_write_bytes, spill_read_bytes, runs, spilled_runs;
     uint64_t build_rows, join_rows, build_batches;
+    uint64_t index_pages, index_tuples;
     unsigned workers;
 };
 /* Optional per-query measurements. Each CU owns its own AFDM counters. */

@@ -1,0 +1,5 @@
+index_duplicates	SELECT count(*),sum(r.v),avg(r.v) FROM snia_index_keys k JOIN snia_index_rows r ON k.k=r.k;
+index_filtered_groups	SELECT k.k,count(*),sum(r.v) FROM snia_index_keys k JOIN snia_index_rows r ON k.k=r.k WHERE r.v>2.00 GROUP BY k.k ORDER BY k.k;
+index_residual	SELECT count(*),sum(r.v) FROM snia_index_keys k JOIN snia_index_rows r ON k.k=r.k WHERE r.v>2.00 OR k.k<0;
+index_bigint	SELECT count(*),sum(r.v) FROM snia_index_big_keys k JOIN snia_index_big_rows r ON k.k=r.k;
+index_smallint	SELECT count(*),sum(r.v) FROM snia_index_small_keys k JOIN snia_index_small_rows r ON k.k=r.k;

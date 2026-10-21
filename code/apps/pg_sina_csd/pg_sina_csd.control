@@ -1,5 +1,5 @@
 comment = 'PostgreSQL frozen-heap execution through SNIA and FEMU CSD'
-default_version = '0.1'
+default_version = '0.2'
 module_pathname = '$libdir/pg_sina_csd'
 schema = 'sina_csd'
 relocatable = false

@@ -2,6 +2,8 @@
 #include "postgres.h"
 #include "fmgr.h"
 #include "access/relation.h"
+#include "access/nbtree.h"
+#include "catalog/pg_opfamily_d.h"
 #include "access/visibilitymap.h"
 #include "access/xlog.h"
 #include "catalog/pg_am_d.h"
@@ -36,6 +38,45 @@ static void execute(const char *sql, int count, Oid *types, Datum *values)
 {
     if (SPI_execute_with_args(sql, count, types, values, NULL, false, 0) < 0)
         elog(ERROR, "cannot save pg_sina_csd mapping");
+}
+static void save_extents(Oid relid,char *base,uint64 total,dev_t data_device,uint64 partition,uint64 lba,uint64 namespace_bytes)
+{
+    uint64 mapped = 0;
+    for (unsigned segment = 0; mapped < total; ++segment) {
+        char *path = segment ? psprintf("%s.%u",base,segment) : base;
+        int fd = OpenTransientFile(path,O_RDONLY | PG_BINARY);
+        struct stat before, after;
+        if (fd < 0 || fstat(fd,&before) || before.st_dev != data_device || before.st_size <= 0 ||
+            (uint64)before.st_size > total-mapped || before.st_size % BLCKSZ)
+            ereport(ERROR,(errmsg("invalid heap segment: %s",path)));
+        struct fiemap *map = palloc0(sizeof(*map) + 128 * sizeof(struct fiemap_extent));
+        uint64 cursor = 0;
+        while (cursor < (uint64)before.st_size) {
+            CHECK_FOR_INTERRUPTS();
+            map->fm_start = cursor; map->fm_length = before.st_size-cursor;
+            map->fm_flags = FIEMAP_FLAG_SYNC; map->fm_extent_count = 128; map->fm_mapped_extents = 0;
+            if (ioctl(fd,FS_IOC_FIEMAP,map) || !map->fm_mapped_extents)
+                ereport(ERROR,(errmsg("FIEMAP failed for %s: %m",path)));
+            for (unsigned i = 0; i < map->fm_mapped_extents && cursor < (uint64)before.st_size; ++i) {
+                struct fiemap_extent *e = &map->fm_extents[i];
+                uint64 bytes = Min(e->fe_length,(uint64)before.st_size-cursor);
+                uint64 physical = partition + e->fe_physical;
+                if (e->fe_logical != cursor || !bytes ||
+                    (e->fe_flags & ~(FIEMAP_EXTENT_LAST | FIEMAP_EXTENT_MERGED)) ||
+                    bytes % lba || physical % lba || physical > namespace_bytes || bytes > namespace_bytes-physical)
+                    ereport(ERROR,(errmsg("heap extent is sparse, uninitialized or outside the namespace")));
+                Oid types[] = {OIDOID,INT8OID,INT8OID,INT8OID};
+                Datum values[] = {ObjectIdGetDatum(relid),Int64GetDatum(mapped+cursor),Int64GetDatum(physical/lba),Int64GetDatum(bytes)};
+                execute("INSERT INTO sina_csd.extents VALUES($1,$2,$3,$4)",4,types,values);
+                cursor += bytes;
+            }
+        }
+        if (fstat(fd,&after) || before.st_ino != after.st_ino || before.st_size != after.st_size ||
+            before.st_mtim.tv_sec != after.st_mtim.tv_sec || before.st_mtim.tv_nsec != after.st_mtim.tv_nsec)
+            ereport(ERROR,(errmsg("heap changed while preparing")));
+        CloseTransientFile(fd); pfree(map); mapped += before.st_size;
+        if (segment) pfree(path);
+    }
 }
 Datum pg_sina_csd_prepare(PG_FUNCTION_ARGS)
 {
@@ -94,6 +135,7 @@ Datum pg_sina_csd_prepare(PG_FUNCTION_ARGS)
     FreeFile(boot); boot_id[strcspn(boot_id,"\n")] = 0;
     if (SPI_connect() != SPI_OK_CONNECT) elog(ERROR,"SPI_connect failed");
     Oid id_type[] = {OIDOID}; Datum id_value[] = {ObjectIdGetDatum(relid)};
+    execute("DELETE FROM sina_csd.relations WHERE relid IN (SELECT indexid FROM sina_csd.indexes WHERE heaprelid=$1)",1,id_type,id_value);
     execute("DELETE FROM sina_csd.relations WHERE relid=$1",1,id_type,id_value);
     Oid relation_types[] = {OIDOID,OIDOID,TEXTOID,INT4OID,INT4OID,INT8OID,INT4OID,TEXTOID};
     Datum relation_values[] = {ObjectIdGetDatum(relid),ObjectIdGetDatum(relation->rd_node.relNode),
@@ -109,41 +151,36 @@ Datum pg_sina_csd_prepare(PG_FUNCTION_ARGS)
             CharGetDatum(a->attalign),BoolGetDatum(a->attnotnull),ObjectIdGetDatum(a->attcollation)};
         execute("INSERT INTO sina_csd.columns VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",9,types,values);
     }
-    uint64 mapped = 0;
-    for (unsigned segment = 0; mapped < total; ++segment) {
-        char *path = segment ? psprintf("%s.%u",base,segment) : base;
-        int fd = OpenTransientFile(path,O_RDONLY | PG_BINARY);
-        struct stat before, after;
-        if (fd < 0 || fstat(fd,&before) || before.st_dev != data.st_dev || before.st_size <= 0 ||
-            (uint64)before.st_size > total-mapped || before.st_size % BLCKSZ)
-            ereport(ERROR,(errmsg("invalid heap segment: %s",path)));
-        struct fiemap *map = palloc0(sizeof(*map) + 128 * sizeof(struct fiemap_extent));
-        uint64 cursor = 0;
-        while (cursor < (uint64)before.st_size) {
-            CHECK_FOR_INTERRUPTS();
-            map->fm_start = cursor; map->fm_length = before.st_size-cursor;
-            map->fm_flags = FIEMAP_FLAG_SYNC; map->fm_extent_count = 128; map->fm_mapped_extents = 0;
-            if (ioctl(fd,FS_IOC_FIEMAP,map) || !map->fm_mapped_extents)
-                ereport(ERROR,(errmsg("FIEMAP failed for %s: %m",path)));
-            for (unsigned i = 0; i < map->fm_mapped_extents && cursor < (uint64)before.st_size; ++i) {
-                struct fiemap_extent *e = &map->fm_extents[i];
-                uint64 bytes = Min(e->fe_length,(uint64)before.st_size-cursor);
-                uint64 physical = partition + e->fe_physical;
-                if (e->fe_logical != cursor || !bytes ||
-                    (e->fe_flags & ~(FIEMAP_EXTENT_LAST | FIEMAP_EXTENT_MERGED)) ||
-                    bytes % lba || physical % lba || physical > namespace_bytes || bytes > namespace_bytes-physical)
-                    ereport(ERROR,(errmsg("heap extent is sparse, uninitialized or outside the namespace")));
-                Oid types[] = {OIDOID,INT8OID,INT8OID,INT8OID};
-                Datum values[] = {ObjectIdGetDatum(relid),Int64GetDatum(mapped+cursor),Int64GetDatum(physical/lba),Int64GetDatum(bytes)};
-                execute("INSERT INTO sina_csd.extents VALUES($1,$2,$3,$4)",4,types,values);
-                cursor += bytes;
-            }
+    save_extents(relid,base,total,data.st_dev,partition,lba,namespace_bytes);
+    /* Map eligible native indexes once, alongside the frozen heap. This stores
+     * file extents and metadata only, never a copy of index keys or tuples. */
+    List *indexes=RelationGetIndexList(relation); ListCell *cell;
+    foreach(cell,indexes) {
+        Relation idx=relation_open(lfirst_oid(cell),AccessShareLock);
+        Form_pg_index info=idx->rd_index;
+        if(idx->rd_rel->relam!=BTREE_AM_OID || !info->indisvalid || !info->indisready || info->indcheckxmin ||
+           info->indnkeyatts<1 || info->indkey.values[0]<=0 || idx->rd_indoption[0] ||
+           idx->rd_opfamily[0]!=INTEGER_BTREE_FAM_OID || RelationGetIndexPredicate(idx)!=NIL || RelationGetIndexExpressions(idx)!=NIL) {
+            relation_close(idx,AccessShareLock); continue;
         }
-        if (fstat(fd,&after) || before.st_ino != after.st_ino || before.st_size != after.st_size ||
-            before.st_mtim.tv_sec != after.st_mtim.tv_sec || before.st_mtim.tv_nsec != after.st_mtim.tv_nsec)
-            ereport(ERROR,(errmsg("heap changed while preparing")));
-        CloseTransientFile(fd); pfree(map); mapped += before.st_size;
-        if (segment) pfree(path);
+        Form_pg_attribute key=TupleDescAttr(RelationGetDescr(idx),0);
+        if(key->atttypid!=INT2OID && key->atttypid!=INT4OID && key->atttypid!=INT8OID) { relation_close(idx,AccessShareLock); continue; }
+        Buffer buffer=ReadBuffer(idx,0); LockBuffer(buffer,BUFFER_LOCK_SHARE);
+        BTMetaPageData meta=*BTPageGetMeta(BufferGetPage(buffer)); UnlockReleaseBuffer(buffer);
+        if(meta.btm_magic!=BTREE_MAGIC || meta.btm_version!=4) { relation_close(idx,AccessShareLock); continue; }
+        Oid iid=RelationGetRelid(idx); uint64 size=(uint64)RelationGetNumberOfBlocks(idx)*BLCKSZ;
+        char *path=relpathperm(idx->rd_node,MAIN_FORKNUM); struct stat index_stat;
+        if(stat(path,&index_stat) || index_stat.st_dev!=data.st_dev) elog(ERROR,"index is not on the heap filesystem");
+        Datum value[]={ObjectIdGetDatum(iid)};
+        execute("DELETE FROM sina_csd.relations WHERE relid=$1",1,id_type,value);
+        relation_values[0]=ObjectIdGetDatum(iid); relation_values[1]=ObjectIdGetDatum(idx->rd_node.relNode);
+        relation_values[5]=Int64GetDatum(size); relation_values[6]=Int32GetDatum(RelationGetDescr(idx)->natts);
+        execute("INSERT INTO sina_csd.relations(relid,relfilenode,device,namespace_id,lba_bytes,bytes,nattrs,boot_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",8,relation_types,relation_values);
+        save_extents(iid,path,size,data.st_dev,partition,lba,namespace_bytes);
+        Oid types[]={OIDOID,OIDOID,INT2OID,INT8OID,INT2OID};
+        Datum values[]={ObjectIdGetDatum(iid),ObjectIdGetDatum(relid),Int16GetDatum(info->indkey.values[0]),Int64GetDatum(meta.btm_root),Int16GetDatum(key->attlen)};
+        execute("INSERT INTO sina_csd.indexes VALUES($1,$2,$3,$4,$5)",5,types,values);
+        pfree(path); relation_close(idx,AccessShareLock);
     }
     SPI_finish(); relation_close(relation,AccessShareLock);
     PG_RETURN_INT64(pages);

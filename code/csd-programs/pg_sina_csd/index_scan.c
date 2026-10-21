@@ -1,0 +1,219 @@
+/* PG12 B-tree leading-integer equality join. PG transfers page addresses only;
+ * key search, TID extraction, heap projection and filtering execute in this CSF.
+ * Page data stays in the slot's I/O AFDM; cursors/tags use bounded workmem. */
+#include "femu-csd-kernel.h"
+#include "cs_workmem.h"
+#include "cs_csf.h"
+#include "index_scan.h"
+#include <limits.h>
+#include <string.h>
+extern int64_t pg_sina_filter_impl(struct femu_csd_args *);
+#define INDEX_KEYS 64
+struct page_tag { uint32_t block; uint16_t heap, state; }; /* 0 absent, 1 loaded, 2 requested */
+struct lookup { unsigned row, block, item, heap_block, heap_item, phase; int64_t key; };
+struct index_cursor {
+    struct page_tag tags[QS_INDEX_CACHE];
+    struct lookup keys[INDEX_KEYS];
+    unsigned position, count, hand, waiting, pending;
+};
+struct index_join { cs_work_context *context; struct qs_plan scan; struct index_cursor cursors[QS_WORKERS]; };
+static uint16_t u16(const unsigned char *p) { uint16_t x; memcpy(&x,p,2); return x; }
+static uint32_t u32(const unsigned char *p) { uint32_t x; memcpy(&x,p,4); return x; }
+int qs_index_init(const struct qs_plan *p,struct qs_join_control *control)
+{
+    struct cs_work_stats stats; if(cs_work_get_stats(&stats)) return -4;
+    size_t limit=p->join.work_mem_bytes,physical=stats.capacity_bytes/2/(p->njoins?p->njoins:1);
+    if(!limit || limit>physical) limit=physical;
+    cs_work_context *ctx=cs_work_begin_limit(limit); if(!ctx) return -4;
+    struct index_join *h=cs_work_calloc(ctx,1,sizeof(*h));
+    if(!h) { cs_work_end(ctx); return -4; }
+    h->context=ctx; h->scan=*p;
+    unsigned base=p->nattrs-p->join.nattrs; h->scan.nattrs=p->join.nattrs;
+    for(unsigned i=0;i<h->scan.nattrs;++i) { h->scan.cols[i]=p->cols[base+i]; h->scan.cols[i].deferred=0; }
+    for(unsigned i=0;i<p->nstrings;++i) h->scan.strings[i].column=p->strings[i].column>=base?p->strings[i].column-base:255;
+    control->state=(uintptr_t)h; control->indexed=1; control->batches=1;
+    return 0;
+}
+void qs_index_reset(struct qs_join_control *control,unsigned slot)
+{
+    struct index_join *h=(void *)(uintptr_t)control->state;
+    memset(h->cursors[slot].tags,0,sizeof(h->cursors[slot].tags));
+}
+void qs_index_close(struct qs_join_control *control)
+{
+    struct index_join *h=(void *)(uintptr_t)control->state;
+    if(h) { cs_work_context *ctx=h->context; control->state=0; cs_work_end(ctx); }
+}
+static const unsigned char *page_at(struct index_cursor *c,struct qs_task *task,void *io,unsigned block,unsigned heap)
+{
+    for(unsigned i=0;i<QS_INDEX_CACHE;++i) if(c->tags[i].state && c->tags[i].block==block && c->tags[i].heap==heap)
+        return c->tags[i].state==1?(unsigned char *)io+QS_SORT_IO_BYTES+(size_t)i*QS_PAGE:NULL;
+    if(task->index_nreads==QS_INDEX_READS) return NULL;
+    for(unsigned n=0;n<QS_INDEX_CACHE;++n) {
+        unsigned slot=c->hand++%QS_INDEX_CACHE;
+        if(c->tags[slot].state==2) continue;
+        c->tags[slot]=(struct page_tag){block,heap,2};
+        task->index_reads[task->index_nreads++]=(struct qs_index_read){block,slot,heap};
+        return NULL;
+    }
+    return NULL;
+}
+/* Validate an on-disk page/item before following its TID/downlink. */
+static int page_items(const unsigned char *p,int index)
+{
+    unsigned lower=u16(p+12),upper=u16(p+14),special=u16(p+16);
+    if(lower<24 || lower>upper || upper>special || special>QS_PAGE || (lower-24)%4 || u16(p+18)!=(QS_PAGE|4)) return -1;
+    if(index) { if(special!=QS_PAGE-16 || (u16(p+special+12)&(4|8|16|128))) return -1; }
+    else if(special!=QS_PAGE || !(u16(p+10)&4)) return -1;
+    return (lower-24)/4;
+}
+static const unsigned char *item_at(const unsigned char *p,unsigned item,unsigned *length)
+{
+    if(!item || item>(unsigned)(u16(p+12)-24)/4) return NULL;
+    uint32_t lp=u32(p+24+(item-1)*4); unsigned off=lp&32767,flags=(lp>>15)&3;
+    *length=lp>>17;
+    /* LP_DEAD index tuples retain valid keys/TIDs; the frozen heap is checked. */
+    if((flags!=1 && flags!=3) || off<u16(p+14) || off>QS_PAGE || *length>QS_PAGE-off) return NULL;
+    return p+off;
+}
+/* Compare the stored leading key to the lookup value. NULL sorts last.
+ * PG12 pivot suffix truncation preserves the first key except the -infinity
+ * downlink, which is handled separately. No posting-list format exists in v12. */
+static int compare(const unsigned char *t,unsigned len,unsigned bytes,int64_t key,int *cmp)
+{
+    if(len<8 || (u16(t+6)&8191)!=len) return -1;
+    unsigned info=u16(t+6),off=(info&0x8000)?16:8;
+    if((info&0x8000) && !(t[8]&1)) { *cmp=1; return 0; }
+    if(len<off+bytes) return -1;
+    int64_t value=0;
+    if(bytes==2) value=(int16_t)u16(t+off);
+    else if(bytes==4) value=(int32_t)u32(t+off);
+    else if(bytes==8) memcpy(&value,t+off,8);
+    else return -1;
+    *cmp=(value>key)-(value<key); return 0;
+}
+static int seek(const unsigned char *page,struct lookup *key,unsigned bytes)
+{
+    int count=page_items(page,1); if(count<0) return -2;
+    const unsigned char *opaque=page+QS_PAGE-16;
+    unsigned first=u32(opaque+4)?2:1,leaf=u16(opaque+12)&1;
+    unsigned lo=first+(leaf?0:1),hi=count+1;
+    if(first>(unsigned)count && (!leaf || first!=(unsigned)count+1)) return -2;
+    while(lo<hi) {
+        unsigned mid=lo+(hi-lo)/2,len=0; const unsigned char *t=item_at(page,mid,&len); int cmp;
+        if(!t || compare(t,len,bytes,key->key,&cmp)) return -2;
+        if(cmp<0) lo=mid+1; else hi=mid;
+    }
+    if(leaf) { key->item=lo; key->phase=2; }
+    else {
+        unsigned len=0; const unsigned char *t=item_at(page,lo-1,&len);
+        if(!t || len<8) return -2;
+        unsigned next=((uint32_t)u16(t)<<16)|u16(t+2);
+        if(!next || next==key->block) return -2;
+        key->block=next;
+    }
+    return 0;
+}
+static int64_t flush(unsigned stage,struct qs_chunk *out,const struct qs_plan *p,struct qs_task *task,
+    struct qs_join_control *control,struct femu_csd_args *a,struct index_cursor *cursor,int resume)
+{
+    if(!resume && qs_join_at(p,stage)->predicate>=0) {
+        struct qs_plan filter=*p; filter.predicate=qs_join_at(p,stage)->predicate;
+        for(unsigned i=0;i<filter.nattrs;++i) filter.cols[i].deferred=0;
+        void *mr[]={out,&filter}; long long len[]={qs_chunk_bytes(out->capacity,out->ncols),sizeof(filter)};
+        struct femu_csd_args call={.numr=2,.mr_addr=mr,.mr_len=len};
+        int64_t status=pg_sina_filter_impl(&call); if(status) return status;
+    }
+    cursor->pending=1;
+    int64_t status=qs_join_consume(stage,out,p,task,control,a,resume); if(status) return status;
+    cursor->pending=0; out->rows=out->selected=0; return 0;
+}
+int64_t qs_index_probe(unsigned stage,struct qs_chunk *c,const struct qs_plan *p,struct qs_task *task,
+    struct qs_join_control *control,struct femu_csd_args *a,int resume)
+{
+    const struct qs_join *j=qs_join_at(p,stage); struct index_join *h=(void *)(uintptr_t)control[stage].state;
+    struct index_cursor *cursor=&h->cursors[task->slot];
+    struct qs_chunk *out=(void *)((unsigned char *)a->mr_addr[4]+stage*qs_join_chunk_stride(p));
+    if(a->numr!=6 || a->mr_len[5]<QS_SORT_IO_BYTES+(long long)QS_INDEX_CACHE*QS_PAGE) return -1;
+    if(cursor->waiting) {
+        for(unsigned i=0;i<QS_INDEX_CACHE;++i) if(cursor->tags[i].state==2) cursor->tags[i].state=1;
+        cursor->waiting=0; task->index_pending=task->index_nreads=0;
+    }
+    if(!resume) {
+        cursor->position=cursor->count=cursor->pending=0; out->rows=out->selected=0;
+    } else if(cursor->pending) {
+        int64_t status=flush(stage,out,p,task,control,a,cursor,csIsReentry(a)); if(status) return status;
+    }
+    unsigned base=qs_probe_attrs(p); for(unsigned i=0;i<stage;++i) base+=qs_join_at(p,i)->nattrs;
+    unsigned keyslot=stage?(unsigned)p->cols[j->probe_key].slot:0;
+    if(!stage) for(int i=0;i<j->probe_key;++i) keyslot+=p->cols[i].slot>=0;
+    for(;;) {
+        if(!cursor->count) {
+            while(cursor->position<c->selected && cursor->count<INDEX_KEYS) {
+                unsigned row=qs_selection(c)[cursor->position++]; if(row>=c->rows) return -1;
+                if(qs_nulls(c)[(size_t)keyslot*((c->capacity+7)/8)+row/8]&(1U<<(row%8))) continue;
+                cursor->keys[cursor->count++]=(struct lookup){.row=row,.block=j->indexroot,.phase=j->indexroot?1:4,.key=qs_values(c)[(size_t)keyslot*c->capacity+row]};
+            }
+            if(!cursor->count) break;
+        }
+        unsigned done=0;
+        for(unsigned k=0;k<cursor->count;++k) {
+            struct lookup *key=&cursor->keys[k];
+            while(key->phase!=4) {
+                int heap=key->phase==3;
+                const unsigned char *page=page_at(cursor,task,a->mr_addr[5],heap?key->heap_block:key->block,heap);
+                if(!page) break;
+                if(key->phase==1) { int status=seek(page,key,j->index_key_bytes); if(status) return status; continue; }
+                if(key->phase==2) {
+                    int count=page_items(page,1); if(count<0) return -2;
+                    if(key->item>(unsigned)count) {
+                        key->block=u32(page+QS_PAGE-12);
+                        if(!key->block) key->phase=4;
+                        else key->phase=1; /* lower-bound on the next leaf */
+                        continue;
+                    }
+                    unsigned len=0; const unsigned char *tuple=item_at(page,key->item++,&len); int cmp;
+                    if(!tuple || compare(tuple,len,j->index_key_bytes,key->key,&cmp)) return -2;
+                    if(((u32(page+24+(key->item-2)*4)>>15)&3)==3) continue;
+                    if(cmp>0) { key->phase=4; continue; }
+                    if(cmp<0) continue;
+                    key->heap_block=((uint32_t)u16(tuple)<<16)|u16(tuple+2); key->heap_item=u16(tuple+4); key->phase=3;
+                } else {
+                    if(page_items(page,0)<0) return -2;
+                    unsigned item=key->heap_item,steps=0;
+                    /* VACUUM may leave an all-visible HOT root redirected to
+                     * its surviving heap-only tuple on this same page. */
+                    for(;;) {
+                        if(!item || item>(unsigned)(u16(page+12)-24)/4 || ++steps>QS_PAGE/4) return -2;
+                        uint32_t lp=u32(page+24+(item-1)*4); unsigned flags=(lp>>15)&3;
+                        if(flags==2) { item=lp&32767; continue; }
+                        if(flags!=1) return -2;
+                        break;
+                    }
+                    unsigned len=0; const unsigned char *tuple=item_at(page,item,&len);
+                    if(!tuple || len<23) return -2;
+                    unsigned dest=out->rows;
+                    if(!dest) memset(qs_nulls(out),0,((out->capacity+7)/8)*(size_t)out->ncols);
+                    int status=qs_scan_tuple(&h->scan,page,tuple-page,len,0,out,dest); if(status) return status;
+                    unsigned local=0;
+                    for(unsigned col=0;col<base;++col) if(p->cols[col].slot>=0) {
+                        unsigned slot=p->cols[col].slot,src=stage?slot:local++;
+                        qs_values(out)[(size_t)slot*out->capacity+dest]=qs_values(c)[(size_t)src*c->capacity+key->row];
+                        qs_dscales(out)[(size_t)slot*out->capacity+dest]=qs_dscales(c)[(size_t)src*c->capacity+key->row];
+                        if(qs_nulls(c)[(size_t)src*((c->capacity+7)/8)+key->row/8]&(1U<<(key->row%8))) qs_nulls(out)[(size_t)slot*((out->capacity+7)/8)+dest/8]|=1U<<(dest%8);
+                    }
+                    ++task->index_tuples; key->phase=2;
+                    qs_selection(out)[dest]=dest; ++out->rows; ++out->selected;
+                    if(out->rows==out->capacity) { int64_t status=flush(stage,out,p,task,control,a,cursor,0); if(status) return status; }
+                }
+            }
+            done+=key->phase==4;
+        }
+        if(done==cursor->count) { cursor->count=0; continue; }
+        if(!task->index_nreads) return -2;
+        cursor->waiting=1; task->index_pending=1; task->index_pages+=task->index_nreads;
+        return QS_INDEX_WAIT;
+    }
+    if(out->rows) return flush(stage,out,p,task,control,a,cursor,0);
+    return 0;
+}

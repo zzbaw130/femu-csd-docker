@@ -1,6 +1,7 @@
 /* Compile PG expression trees; unsupported semantics retain native PG paths. */
 #include "pg_internal.h"
 #include "access/table.h"
+#include "access/relation.h"
 #include "catalog/pg_namespace_d.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_collation_d.h"
@@ -517,6 +518,71 @@ static OpExpr *equality_join(List *quals,List *prefix,Index next)
     }
     return NULL;
 }
+/* Reuse the native planner's chosen access path. Accept a left-deep hash
+ * prefix followed by one parameterized B-tree index join; other trees keep
+ * the existing hash plan. This avoids a second, query-specific cost model. */
+static bool index_join_order(Path *path,List *quals,List **ordered,List **joins,Index *indexed,Oid *indexid)
+{
+    if(!path) return false;
+    switch(nodeTag(path)) {
+    case T_AggPath:return index_join_order(((AggPath *)path)->subpath,quals,ordered,joins,indexed,indexid);
+    case T_GroupPath:return index_join_order(((GroupPath *)path)->subpath,quals,ordered,joins,indexed,indexid);
+    case T_SortPath:return index_join_order(((SortPath *)path)->subpath,quals,ordered,joins,indexed,indexid);
+    case T_ProjectionPath:return index_join_order(((ProjectionPath *)path)->subpath,quals,ordered,joins,indexed,indexid);
+    case T_GatherPath:return index_join_order(((GatherPath *)path)->subpath,quals,ordered,joins,indexed,indexid);
+    case T_GatherMergePath:return index_join_order(((GatherMergePath *)path)->subpath,quals,ordered,joins,indexed,indexid);
+    default:break;
+    }
+    if(IsA(path,HashPath) || IsA(path,NestPath)) {
+        JoinPath *join=(JoinPath *)path;
+        if(join->jointype!=JOIN_INNER || *indexed || !index_join_order(join->outerjoinpath,quals,ordered,joins,indexed,indexid)) return false;
+        Path *inner=join->innerjoinpath;
+        if(!inner->parent || inner->parent->relid<=0 || *indexed) return false;
+        Index next=inner->parent->relid; OpExpr *key=equality_join(quals,*ordered,next); if(!key) return false;
+        if(IsA(path,NestPath)) {
+            if(!IsA(inner,IndexPath)) return false;
+            *indexed=next; *indexid=((IndexPath *)inner)->indexinfo->indexoid;
+        }
+        *ordered=lappend_int(*ordered,next); *joins=lappend(*joins,key); return true;
+    }
+    if(path->parent && path->parent->relid>0 && !*ordered) {
+        *ordered=list_make1_int(path->parent->relid); return true;
+    }
+    return false;
+}
+static bool compile_index_path(PlannerInfo *root,RelOptInfo *input,List *relations,List *quals,struct qs_plan *plan,Index *probe_rti)
+{
+    List *ordered=NIL,*joins=NIL; Index indexed=0; Oid indexid=InvalidOid;
+    Path *native=input->cheapest_total_path;
+    if(!native) { ListCell *cell; foreach(cell,input->pathlist) { Path *p=lfirst(cell); if(!native || p->total_cost<native->total_cost) native=p; } }
+    if(!index_join_order(native,quals,&ordered,&joins,&indexed,&indexid) || !indexed ||
+        list_length(ordered)!=list_length(relations) || llast_int(ordered)!=(int)indexed) return false;
+    struct qs_plan candidate={0}; if(!compile(root,ordered,joins,quals,&candidate) || !candidate.njoins) return false;
+    struct qs_join *j=candidate.njoins==1?&candidate.join:&candidate.extra_joins[candidate.njoins-2];
+    unsigned base=candidate.nattrs-j->nattrs;
+    IndexOptInfo *info=NULL; ListCell *cell;
+    foreach(cell,root->simple_rel_array[indexed]->indexlist) { IndexOptInfo *i=lfirst(cell); if(i->indexoid==indexid) info=i; }
+    if(!info || info->indpred || info->indexprs || info->nkeycolumns<1 || info->indexkeys[0]!=j->build_key-(int)base+1) return false;
+    Oid ns=get_namespace_oid("sina_csd",true);
+    if(!OidIsValid(ns) || !OidIsValid(get_relname_relid("indexes",ns))) return false;
+    if(SPI_connect()!=SPI_OK_CONNECT) elog(ERROR,"SPI_connect failed");
+    Oid types[]={OIDOID,OIDOID,INT2OID}; Datum values[]={ObjectIdGetDatum(indexid),ObjectIdGetDatum(j->relid),Int16GetDatum(j->build_key-base+1)};
+    int status=SPI_execute_with_args("SELECT r.relfilenode,i.root,i.key_bytes FROM sina_csd.indexes i JOIN sina_csd.relations r ON r.relid=i.indexid WHERE i.indexid=$1 AND i.heaprelid=$2 AND i.attnum=$3",3,types,values,NULL,true,1);
+    bool found=status==SPI_OK_SELECT && SPI_processed==1;
+    if(found) {
+        bool null; HeapTuple tuple=SPI_tuptable->vals[0]; TupleDesc desc=SPI_tuptable->tupdesc;
+        j->indexid=indexid; j->indexnode=DatumGetObjectId(SPI_getbinval(tuple,desc,1,&null));
+        j->indexroot=DatumGetInt64(SPI_getbinval(tuple,desc,2,&null)); j->index_key_bytes=DatumGetInt16(SPI_getbinval(tuple,desc,3,&null));
+        {
+            Relation idx=relation_open(indexid,AccessShareLock);
+            found=idx->rd_node.relNode==j->indexnode && idx->rd_index->indisvalid && idx->rd_index->indisready && !idx->rd_index->indcheckxmin && !idx->rd_indoption[0];
+            relation_close(idx,NoLock);
+        }
+    }
+    SPI_finish();
+    if(found) { *plan=candidate; *probe_rti=linitial_int(ordered); }
+    return found;
+}
 static double build_bytes(const struct qs_plan *p,double rows)
 {
     unsigned columns=0;
@@ -571,6 +637,8 @@ void pg_sina_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *i
         if(compile(root,reverse,joins,quals,&other) && build_bytes(&other,root->simple_rel_array[rti]->rows)<
            build_bytes(&plan,root->simple_rel_array[plan.join.rti]->rows)) { plan=other; rti=linitial_int(reverse); }
     }
+    struct qs_plan indexed={0};
+    if(plan.njoins && compile_index_path(root,input,relations,quals,&indexed,&rti)) plan=indexed;
     RelOptInfo *rel=root->simple_rel_array[rti];
     plan.external_aggregate=plan.nkeys!=0;
     if(plan.external_aggregate && plan.nkeys+plan.naggs>QS_OUT) return;

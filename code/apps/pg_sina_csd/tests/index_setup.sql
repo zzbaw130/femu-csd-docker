@@ -1,0 +1,33 @@
+\set ON_ERROR_STOP on
+DELETE FROM sina_csd.relations WHERE relid IN (SELECT indexid FROM sina_csd.indexes WHERE heaprelid IN (SELECT oid FROM pg_class WHERE relname LIKE 'snia_index_%'));
+DELETE FROM sina_csd.relations WHERE relid IN (SELECT oid FROM pg_class WHERE relname LIKE 'snia_index_%');
+DROP TABLE IF EXISTS snia_index_keys,snia_index_rows,snia_index_empty,snia_index_big_keys,snia_index_big_rows,snia_index_small_keys,snia_index_small_rows CASCADE;
+CREATE TABLE snia_index_keys(k int);
+INSERT INTO snia_index_keys VALUES (-2),(7),(7),(9),(20001),(NULL);
+CREATE TABLE snia_index_rows(k int,v numeric(12,2));
+INSERT INTO snia_index_rows SELECT i%10000-2,(i%997)::numeric/100 FROM generate_series(1,100000) i;
+INSERT INTO snia_index_rows SELECT 7,i::numeric/100 FROM generate_series(1,1000) i;
+INSERT INTO snia_index_rows VALUES(9,NULL),(7,NULL),(NULL,3.14);
+CREATE INDEX snia_index_rows_kv ON snia_index_rows(k,v);
+CREATE TABLE snia_index_empty(k int,v numeric(12,2));
+CREATE INDEX snia_index_empty_k ON snia_index_empty(k);
+CREATE TABLE snia_index_big_keys(k bigint);
+INSERT INTO snia_index_big_keys VALUES (-9000000000),(9000000007),(NULL);
+CREATE TABLE snia_index_big_rows(k bigint,v int) WITH (fillfactor=70);
+INSERT INTO snia_index_big_rows SELECT i::bigint+9000000000,i FROM generate_series(1,30000) i;
+INSERT INTO snia_index_big_rows VALUES(-9000000000,12);
+CREATE INDEX snia_index_big_rows_k ON snia_index_big_rows(k);
+UPDATE snia_index_big_rows SET v=v+1 WHERE k=9000000007; -- HOT root redirect after VACUUM
+CREATE TABLE snia_index_small_keys(k smallint);
+INSERT INTO snia_index_small_keys VALUES (-2),(7),(NULL);
+CREATE TABLE snia_index_small_rows(k smallint,v int);
+INSERT INTO snia_index_small_rows SELECT (i%2000-3)::smallint,i FROM generate_series(1,30000) i;
+CREATE INDEX snia_index_small_rows_k ON snia_index_small_rows(k);
+VACUUM (FREEZE, ANALYZE) snia_index_keys;
+VACUUM (FREEZE, ANALYZE) snia_index_rows;
+VACUUM (FREEZE, ANALYZE) snia_index_empty;
+VACUUM (FREEZE, ANALYZE) snia_index_big_keys;
+VACUUM (FREEZE, ANALYZE) snia_index_big_rows;
+VACUUM (FREEZE, ANALYZE) snia_index_small_keys;
+VACUUM (FREEZE, ANALYZE) snia_index_small_rows;
+SELECT sina_csd.prepare(c.oid) FROM pg_class c WHERE c.relname IN ('snia_index_keys','snia_index_rows','snia_index_empty','snia_index_big_keys','snia_index_big_rows','snia_index_small_keys','snia_index_small_rows') ORDER BY c.relname;

@@ -266,3 +266,19 @@ Q12方向调整将内部读取从约2.98GB降至1.14GB、CSD均值从3819.775ms�
 Guest完整Join回归54项、单表及旧查询55项通过。Q3在16/64MB下与host一致，三表/四表、4MB链式分组、空表及断开连接图回退均通过；最终物理份额版本另测16/64/128MB查询上限与64MiB物理池，结果一致。独立检查第一/后续build报错、链式聚合溢出、Q12/Q3取消后同backend设备复用。
 
 最终各3轮冷启动均值host/CSD：Q3=2610.340/4277.033ms，Q12=2219.740/1084.600ms，Q14=2081.506/632.370ms，Q19=1696.802/1059.619ms。Q3尚未加速；独立profile有6个build批次组合、lineitem累计扫描36007290行、内部读取5772886016字节，主要瓶颈是重复扫描；最终source/排序仅19.332ms。完整样本、均分预算的限制和后续方向见[性能分析](performance.md)。
+
+## 阶段3e：原生 B-tree 索引访问与 Q3 连接顺序（2026-10-22）
+
+- 先核对原生 Q3：work_mem=4MB，两个并行 worker；customer 的共享哈希表约1472KiB、一个batch，聚合前各排序约1.1MiB，最终Top10为26KiB，没有临时文件I/O。其路径是customer过滤后连接orders，再参数化查找lineitem_pkey。之前CSD六次扫描lineitem的原因包括缺少索引路径、连接方向和有界批次策略，不能仅归因于64MB内存不足。
+- 参考本地DuckDB `physical_table_scan.cpp` 的投影及独立扫描状态、`join_order_optimizer.cpp` 的统计/访问路径选择；PG索引格式以本仓库PG12 `nbtsearch.c`、`nbtree.h`、`itup.h`为准，不套用DuckDB的ART格式。规划端复用PG已选成本最低路径中的连接方向和参数化IndexPath，当前只接受左深Hash前缀加链尾一个整数等值Index Join，不按Q3编号匹配SQL，不另造成本模型。不支持的访问形状继续原有Hash路径。
+- 扩展版本0.2新增`sina_csd.indexes`，0.1通过ALTER EXTENSION升级。prepare(heap)在同一次checkpoint后为可用的原生索引保存extent和根页等元数据，复用原relations/extents及FIEMAP实现，没有复制键值、构建影子索引或每查询重新准备。仅支持PG12 B-tree v4、内置整数操作符族、升序NULLS LAST前导整数键；可处理复合索引、NULL、重复键跨叶页和VACUUM后的HOT根重定向。REINDEX造成物理文件变化时不选旧索引映射，重新prepare(heap)后恢复。
+- 设备`index_scan.c`与原join/scan/filter/aggregate一起链接到join SO；与全表Scan共用Tuple解码器。每批最多64个外侧键执行B-tree下探，按TID仅解码命中Heap Tuple，右表局部过滤后进入既有跨表过滤和聚合。没有把B-tree比较、Heap解码或中间Tuple传回Guest。
+- 复用各槽的输入AFDM作为页输入，spill区之后最多128个8KiB页槽；物理Scan复用输入时失效，不跨查询缓存。游标、页标签和键状态受workmem限额，每索引状态预留128KiB，剩余build份额由哈希表使用；物理上限按相同角色划分。没有把AFDM用作哈希表或私有运行时空间。
+- 缺页时CSF把文件类别、页号和目标槽写入任务AFDM，PG只转换地址并提交原有SNIA内部LOAD，再执行仅包含Join的继续batch；合并相邻目标槽和连续物理范围。应用私有QS_INDEX_WAIT只在SO内部传播，CSF对SNIA仍正常完成，PG检查任务记录继续；没有扩展CS_STATUS、FEMU runtime或SNIA库。聚合NEED_STORE/LOAD沿既有重入路径处理，父级Hash游标保留未完成的子级批次。
+- Q3改为customer build、orders顺序Scan/Filter→HashJoin→lineitem索引连接→分组/排序/Top10。EXPLAIN新增实际扫描表、索引、页加载次数和索引Heap解码数；内部读字节同时包含顺序扫描和索引页/Heap页。Index Join计时包含在现有probe+Aggregate入口内，不能把其余墙钟全部称作设备I/O。
+
+本阶段没有实现一般常量范围Index Scan、Bitmap Heap Scan、Index Only Scan的设备实现、多处Index Join或通用分区Hash Join。原生IndexOnlyScan只用于选择候选路径，设备仍查Heap；非索引路径的build批次组合仍可能重扫probe。Q3通过小表build加索引访问消除了该实例的六轮重扫，不能据此声称已解决全部Join spill场景。
+
+验收：25项设备CTest、Guest页布局及相关ASan/UBSan检查通过。原生索引测试覆盖不同键宽、跨叶重复值、513行输出、超过页槽容量的256个Heap页、HOT、空根、错误/取消回收；Guest索引专项13项、既有Join54项、单表55项检查通过。Q3在4/16/64/128MB预算下结果一致，索引计算溢出或取消后同backend能连续执行两个CSD COUNT。Guest已升级0.2并为八张冻结表保存索引映射。
+
+全部检查结束后独立冷启动各3轮：Q3 host/CSD均值2467.175/1868.293ms，约1.32倍，CSD较历史六轮重扫均值4277.033ms降低约56%。Q12/Q14/Q19分别为2004.954/1092.405、1640.833/654.222、1769.881/1079.401ms。Q3独立profile中顺序扫描1500000行、索引Heap解码589580行，内部读取1095892992字节，7733次probe入口，build组合数1且无spill；数据和剩余继续执行开销见[性能分析](performance.md)。

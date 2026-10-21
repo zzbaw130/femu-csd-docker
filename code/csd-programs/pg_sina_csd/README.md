@@ -124,3 +124,13 @@ Hash Join的行数估计只决定首次分配。build满表后尝试倍增记录
 
 
 多表probe仍用原来的MR顺序：列批次、完整计划、槽任务、build控制数组、joined列批次区、可选spill I/O。每个Join在joined区占一个对齐的256行列批次；前一级直接调用下一级，最后一级调用聚合。`query.h`的njoins和extra_joins只描述本应用的连接链，不是新增SNIA参数。游标在各自build workmem，NEED_STORE/LOAD沿调用链向外返回，重入先恢复子级再继续本级。build/load/close仍每次接收一个独立控制AFDM。全体probe结束后才替换任何build批次，source之前释放所有build状态。
+
+## PG12 B-tree 索引连接
+
+`index_scan.c` 与 `join.c`、既有扫描/过滤/聚合代码一起编译进 `pg-sina-join.so`。`index_scan.h` 只是这些实现之间的私有函数声明，没有新增设备 runtime 或 SNIA API。
+
+Guest 准备索引文件的 extent、根页和前导整数键宽度；设备对最多64个外侧连接键批量执行 B-tree 下探，处理跨叶页的重复键，再根据 TID 仅解码对应 Heap Tuple。与全表扫描共用 `qs_scan_tuple`，保留 frozen/visible 校验，支持已被 VACUUM 整理的 HOT 根重定向。索引右侧过滤在产生的列批次上执行，再交给原有连接后过滤和聚合。
+
+缺少的页只以地址记录写入任务 AFDM：`qs_task.index_reads` 给出索引/Heap 页号和输入槽，`index_pending` 表示本次 Join 尚未完成。Guest 用原有 SNIA 内部 LOAD 填充输入槽后，再调用同一 Join 入口。私有返回值 `QS_INDEX_WAIT` 只在 SO 内部传播，外部 CSF 正常完成值仍为0，PG根据 AFDM 任务记录继续；它不冒充标准 CS_STATUS。聚合发生 spill 时仍由 SNIA 自动处理 NEED_STORE/LOAD，父级连接游标保持存活。
+
+页数据占用 I/O AFDM 的64KiB spill区之后最多128个8KiB输入槽；它不是算法工作内存。cursor/tag/key状态由共享 workmem 分配器限额，当前每个索引状态预留128KiB，查询结束统一 close。页槽在下一次物理 Scan 前失效，不跨查询缓存。当前形状只允许链尾一个 Index Join；不支持部分/表达式/降序索引、其他操作符类或 PG13+ posting-list 格式。

@@ -38,5 +38,5 @@ void _PG_init(void)
 PG_FUNCTION_INFO_V1(pg_sina_csd_version);
 Datum pg_sina_csd_version(PG_FUNCTION_ARGS)
 {
-    PG_RETURN_TEXT_P(cstring_to_text("pg_sina_csd 0.1: SNIA vector query execution"));
+    PG_RETURN_TEXT_P(cstring_to_text("pg_sina_csd 0.2: SNIA vector query execution"));
 }

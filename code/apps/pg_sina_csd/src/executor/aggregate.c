@@ -139,27 +139,39 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
 {
     SniaState *s=(SniaState *)node; const struct qs_plan *p=&s->request.plan;
     ExplainPropertyText("Execution Path","csd",es);
+    ExplainPropertyText("CSD Scan Relation",get_rel_name(p->relid),es);
     ExplainPropertyText("CSD Scheduling","independent serial batches",es);
     if(p->external_aggregate) ExplainPropertyText("CSD Aggregation","adaptive partial-state merge",es);
     StringInfoData graph; initStringInfo(&graph);
     if(p->join.relid) {
-        ExplainPropertyText("CSD Join","inner integer hash join; build-batch replay",es);
+        bool indexed=qs_join_at(p,qs_join_count(p)-1)->indexid!=0;
+        ExplainPropertyText("CSD Join",indexed?(qs_join_count(p)==1?"inner integer B-tree index join":"inner integer hash join + B-tree index join"):"inner integer hash join; build-batch replay",es);
+        if(indexed) {
+            const struct qs_join *j=qs_join_at(p,qs_join_count(p)-1);
+            ExplainPropertyText("CSD Index",get_rel_name(j->indexid),es);
+            ExplainPropertyText("CSD Index Relation",get_rel_name(j->relid),es);
+            ExplainPropertyText("CSD Index I/O","batched device page requests; internal NVM -> AFDM",es);
+        }
         StringInfoData names; initStringInfo(&names);
         for(unsigned i=0;i<qs_join_count(p);++i) {
-            if(i) appendStringInfoString(&names,", ");
+            if(qs_join_at(p,i)->indexid) continue;
+            if(names.len) appendStringInfoString(&names,", ");
             appendStringInfoString(&names,get_rel_name(qs_join_at(p,i)->relid));
         }
-        ExplainPropertyText("CSD Build Relation",names.data,es);
+        ExplainPropertyText("CSD Build Relation",names.len?names.data:"none (index lookup)",es);
         ExplainPropertyInteger("CSD Join Count",NULL,qs_join_count(p),es);
-        ExplainPropertyText("CSD Build Scheduling","parallel scan/filter; single hash writer",es);
-        appendStringInfoString(&graph,"Build: LOAD -> Scan");
-        if(p->join.predicate>=0) appendStringInfoString(&graph," -> Filter");
-        appendStringInfoString(&graph," -> HashJoin.build; each batch: HashJoin.load; Probe: ");
+        ExplainPropertyText("CSD Build Scheduling",indexed && qs_join_count(p)==1?"index state initialization; no hash build":"parallel scan/filter; single hash writer",es);
+        if(indexed && qs_join_count(p)==1) appendStringInfoString(&graph,"Index state init; Probe: ");
+        else {
+            appendStringInfoString(&graph,"Build: LOAD -> Scan");
+            if(p->join.predicate>=0) appendStringInfoString(&graph," -> Filter");
+            appendStringInfoString(&graph," -> HashJoin.build; each batch: HashJoin.load; Probe: ");
+        }
     }
     appendStringInfoString(&graph,"LOAD -> Scan");
     if(p->predicate>=0) appendStringInfoString(&graph," -> Filter");
     if(p->join.relid) {
-        for(unsigned i=0;i<qs_join_count(p);++i) appendStringInfoString(&graph," -> HashJoin.probe");
+        for(unsigned i=0;i<qs_join_count(p);++i) appendStringInfoString(&graph,qs_join_at(p,i)->indexid?" -> IndexJoin (B-tree -> TID -> Heap)":" -> HashJoin.probe");
         if(p->join.residual) appendStringInfoString(&graph," -> Filter(join)");
         appendStringInfoString(&graph," -> Aggregate.sink; Aggregate.source");
         if(p->external_aggregate && p->norder) appendStringInfoString(&graph," -> Sort");
@@ -193,6 +205,10 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
             ExplainPropertyInteger("CSD Build Rows",NULL,s->result->metrics.build_rows,es);
             ExplainPropertyInteger("CSD Build Batches",NULL,s->result->metrics.build_batches,es);
             ExplainPropertyInteger("CSD Join Rows",NULL,s->result->metrics.join_rows,es);
+            if(s->result->metrics.index_pages) {
+                ExplainPropertyInteger("CSD Index/Heap Pages Loaded",NULL,s->result->metrics.index_pages,es);
+                ExplainPropertyInteger("CSD Index Heap Tuples",NULL,s->result->metrics.index_tuples,es);
+            }
         }
         if(p->ordered_rows || p->external_aggregate || p->join.relid) {
             ExplainPropertyInteger("CSD Sort Runs",NULL,s->result->metrics.runs,es);

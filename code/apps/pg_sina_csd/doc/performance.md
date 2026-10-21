@@ -551,3 +551,45 @@ AFDM45506560字节，设备报告workmem池峰值15868528字节，查询上限�
 Guest完整Join检查54项、单表/既有查询55项通过：三表/四表、跨表过滤、4MB链式分组、空表、断开连接图回退；Q3分别在16/64MB与host完整输出一致，Q12/Q14/Q19保持正确。最终版本另行核对Q3在16/64/128MB查询上限、64MiB实际池下结果一致；验证第一/后续build错误、链式聚合溢出、Q12/Q3取消之后，同一backend两次CSD COUNT都成功，确保排空在途请求后释放全部build状态。
 
 主机日志为`/tmp/pg-snia-chain-all-native.log`、`/tmp/pg-snia-chain-all-asan.log`、`/tmp/pg-snia-chain-cap-native.log`、`/tmp/pg-snia-chain-cap-asan.log`、`/tmp/pg-snia-chain-guest-regression.log`、`/tmp/pg-snia-chain-final-check.log`、`/tmp/pg-snia-chain-bench.log`。Guest Join/单表目录为`/tmp/pg-sina-queries.Pxwb9Y`、`/tmp/pg-sina-queries.eCcDVi`，最终失败/容量检查目录`/tmp/pg-sina-chain-check.xmawDe`，性能目录`/tmp/pg-sina-queries.rIB7FR`。复现入口仍为`tests/pg-sina-csd-test.sh join|query|join-bench`。
+
+## 阶段3e：Q3原生B-tree索引访问（2026-10-22）
+
+原生PG独立冷启动EXPLAIN确认work_mem=4MB、max_parallel_workers_per_gather=2、shared_buffers=128MB。Customer哈希表约1472KiB、一个batch；聚合前各排序约1.1MiB、Top10为26KiB，整条计划Temp Read/Written均为0。PG先过滤/连接Customer和Orders，再147213次参数化查找lineitem_pkey，不是构建全部Orders后反复扫描Lineitem。原始计划保存在宿主`/tmp/pg-snia-q3-native-profile.json`，其单次EXPLAIN为3554.464ms，不与下表三轮均值混用。
+
+本阶段准备原生索引的extent/根页，PG根据原生最优访问路径生成customer Hash Build、orders Scan/Filter/Hash Probe、lineitem B-tree Index Join。索引下探、TID提取、命中Heap的投影/过滤以及聚合均在设备SO内完成。页缺失以地址记录交给PG用原有SNIA内部LOAD填充；相邻目标槽和连续LBA合并。数据不经过Guest应用缓冲，也没有修改SNIA/FEMU核心或增加进程。
+
+### 最终冷启动对比
+
+所有构建、native/sanitizer和Guest正确性检查结束后，为八张冻结表重新prepare以保存可用索引映射，独立执行join-bench。仍为4 CU、64MiB AFDM、64MiB物理workmem、64MB查询预算；PG保持4MB work_mem和原并行配置。每条SQL之前重启PG并清Guest页缓存，关闭profile，交替host/CSD各3轮，逐次完整输出一致。
+
+| 查询/路径 | 三轮 ms | 均值 ms | 中位数 ms |
+| --- | --- | ---: | ---: |
+| Q3/host | 2349.495 / 2629.771 / 2422.259 | 2467.175 | 2422.259 |
+| Q3/csd | 1867.821 / 1887.052 / 1850.005 | 1868.293 | 1867.821 |
+| Q12/host | 1926.758 / 2126.550 / 1961.555 | 2004.954 | 1961.555 |
+| Q12/csd | 1095.991 / 1098.803 / 1082.422 | 1092.405 | 1095.991 |
+| Q14/host | 1492.252 / 1774.612 / 1655.635 | 1640.833 | 1655.635 |
+| Q14/csd | 624.483 / 672.294 / 665.888 | 654.222 | 665.888 |
+| Q19/host | 1676.636 / 1836.133 / 1796.875 | 1769.881 | 1796.875 |
+| Q19/csd | 1079.055 / 1083.574 / 1075.573 | 1079.401 | 1079.055 |
+
+Q3本轮host/CSD均值为2467.175/1868.293ms，约1.32倍；原六轮重扫实现的CSD历史均值为4277.033ms，当前降低约56%。历史对照来自上一节，未将旧实现与新实现混装在一轮测试中。Q12/Q14/Q19仍通过完整结果比较，延迟与此前量级一致。FEMU未启用PCIe带宽模型等既有限制仍适用；这是当前模拟配置下的结果，不是等核数、等总内存的硬件性能结论。
+
+### Q3独立profile与剩余开销
+
+三轮计时结束后再次冷启动、单独开启profile：Setup/Build/probe/最终source和排序/Cleanup为50.482/20.051/1653.953/20.496/6.374ms，设备总计1751.356ms，EXPLAIN执行总计1752.861ms。一次profile不替代上述关闭profile的三轮均值。
+
+- Orders顺序probe扫描1500000行，局部过滤后737165行；Customer原始build输入150000行，过滤后的哈希表驻留，build组合数1。Index Join解码589580个命中Heap Tuple，右表shipdate过滤及连接后剩29866行进入聚合，最终返回10行。
+- 顺序Scan/Filter各59次，索引/Heap页加载104096次；总内部读取1095892992字节（约1.02GiB），包含顺序读取和重复加载的索引/Heap页，不是唯一页数。上一阶段为5772886016字节、六轮Lineitem顺序扫描。
+- Scan累计CU CPU为276.133ms，Filter14.545ms，build/load为2.192/0.620ms，含Index Join和聚合的probe为881.789ms。probe入口调用7733次；剩余数千次继续执行及细粒度页读取值得进一步拆分，不把墙钟减CPU的差值全部称作设备I/O。
+- AFDM45506560字节，设备报告workmem池峰值7502880字节；该峰值仍是分配器池统计，不是隔离的逐查询峰值。聚合/排序有5个驻内存run，build和聚合均无spill。没有通过提高64MB查询预算来避免本次重扫。
+
+第一版索引路径逐页建立Storage请求，独立诊断约3482ms。合并相邻目标槽/连续物理范围后，最终独立profile约1751ms。两者仅为开发诊断，不混入最终三轮样本；改进的是命令和调度开销，不是凭空提高模拟NAND带宽。
+
+### 验证与复现
+
+25项设备CTest和Guest页布局测试通过；相关向量/扫描/Hash Join的6项ASan/UBSan通过，补充页槽复用、HOT、空根页、坏页错误后再次运行索引sanitizer通过，环境限制仍关闭LeakSanitizer。索引原生差分测试涵盖2/4/8字节键、复合前导键、重复值跨叶页、NULL外侧键、无匹配、513行跨批输出、256个不同Heap页超过128输入槽、右侧过滤、空根、HOT重定向、取消及坏页错误后的零残留。
+
+Guest索引专项13项检查通过：复合索引NULL载荷/重复值、smallint/bigint、局部与跨表过滤、4/64MB差分、空表、REINDEX后旧映射回退、计算溢出和取消后的同backend复用；Q3在4/16/64/128MB查询预算下与host逐字一致。原有Join54项、单表/既有查询55项回归全部通过，包含既有低内存spill、错误/取消和source早关回收。
+
+宿主日志：`/tmp/pg-snia-index-native-tests.log`、`/tmp/pg-snia-index-asan-tests.log`、`/tmp/pg-snia-index-asan-final.log`、`/tmp/pg-snia-index-guest-layout.log`、`/tmp/pg-snia-index-guest-final.log`、`/tmp/pg-snia-index-join-regression.log`、`/tmp/pg-snia-index-query-regression.log`、`/tmp/pg-snia-index-bench.log`；最终profile为`/tmp/pg-snia-index-q3-profile.json`，原始时延为`/tmp/pg-snia-index-timings.tsv`。Guest专项目录`/tmp/pg-sina-index.0GX7mE`，Join/单表目录`/tmp/pg-sina-queries.y4KXAX`、`/tmp/pg-sina-queries.45y6Kx`，性能目录`/tmp/pg-sina-queries.vEjZQu`。复现入口为`tests/pg-sina-csd-test.sh index|join|query|join-bench`。

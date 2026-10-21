@@ -10,7 +10,7 @@
 #include <time.h>
 enum { SCAN,FILTER,SINK,SOURCE,SORT,LIMIT,JOIN_BUILD,JOIN_LOAD,JOIN_CLOSE,FUNCTIONS };
 /* One SERIAL batch and one reusable set of buffers per execution slot. */
-struct slot { CS_BATCH_HANDLE batch; CS_REQ_HANDLE request; CS_BATCH_INDEX load; unsigned bytes; };
+struct slot { CS_BATCH_HANDLE batch,resume; CS_REQ_HANDLE request; CS_BATCH_INDEX load; unsigned bytes; };
 struct program { const char *file,*symbol; CS_CSF_ID function; unsigned index; int loaded,active; };
 struct pg_sina_stream {
     CS_DEV_HANDLE device;
@@ -106,18 +106,28 @@ static void join_scan_plan(const struct qs_plan *combined,struct qs_plan *scan,b
         scan->strings[i].column=col>=base && col<base+scan->nattrs?col-base:255;
     }
 }
+/* Append physical ranges in destination order; adjacent pages become one
+ * internal read rather than one NVMe command per 8KiB page. */
+static void append_ranges(CsBlockIo *io,const struct qs_request *request,const struct qs_extent *extents,uint64_t cursor,unsigned bytes)
+{
+    uint64_t at=cursor,end=cursor+bytes;
+    for(unsigned j=0;j<request->nextents && at<end;++j) {
+        const struct qs_extent *e=&extents[j]; if(e->logical+e->bytes<=at) continue;
+        uint64_t length=(e->logical+e->bytes<end?e->logical+e->bytes:end)-at;
+        CSBlockRange range={request->nsid,e->lba+(at-e->logical)/request->lba_bytes,length/request->lba_bytes};
+        CSBlockRange *last=io->NumRanges?&io->Range[io->NumRanges-1]:NULL;
+        if(last && last->NamespaceId==range.NamespaceId && last->StartLba+last->NumBlocks==range.StartLba) last->NumBlocks+=range.NumBlocks;
+        else io->Range[io->NumRanges++]=range;
+        at+=length;
+    }
+}
 static void build_storage_request(CsBatchRequest *load,CS_DEV_HANDLE device,CS_MEM_HANDLE memory,
     const struct qs_request *request,const struct qs_extent *extents,uint64_t cursor,unsigned bytes)
 {
     memset(load,0,sizeof(*load)); load->ReqType=CS_STORAGE_IO;
     load->u.StorageIo=(CsStorageRequest){.Mode=CS_STORAGE_BLOCK_IO,.DevHandle=device,
         .u.BlockIo={.Type=CS_STORAGE_LOAD_TYPE,.DevMem={memory,0}}};
-    CsBlockIo *io=&load->u.StorageIo.u.BlockIo; uint64_t at=cursor,end=cursor+bytes;
-    for(unsigned j=0;j<request->nextents && at<end;++j) {
-        const struct qs_extent *e=&extents[j]; if(e->logical+e->bytes<=at) continue;
-        uint64_t length=(e->logical+e->bytes<end?e->logical+e->bytes:end)-at;
-        io->Range[io->NumRanges++]=(CSBlockRange){request->nsid,e->lba+(at-e->logical)/request->lba_bytes,length/request->lba_bytes}; at+=length;
-    }
+    append_ranges(&load->u.StorageIo.u.BlockIo,request,extents,cursor,bytes);
 }
 static void drop_source(CS_CSF_ID source,CS_MEM_HANDLE group,CsBatchRequest *compute)
 {
@@ -130,6 +140,7 @@ static void join_metrics(struct qs_metrics *out,const struct qs_metrics *join)
 {
     if(!join->build_batches) return;
     out->scanned=join->scanned; out->matched=join->matched; out->chunks=join->chunks; out->input_bytes=join->input_bytes;
+    out->index_pages=join->index_pages; out->index_tuples=join->index_tuples;
     out->build_rows=join->build_rows; out->build_batches=join->build_batches; out->join_rows=join->join_rows;
     out->spill_write_bytes+=join->spill_write_bytes; out->spill_read_bytes+=join->spill_read_bytes;
 }
@@ -142,15 +153,23 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     CHECK_FOR_INTERRUPTS();
     bool joining=request->plan.join.relid!=0;
     unsigned njoins=qs_join_count(&request->plan);
+    bool indexed=njoins && qs_join_at(&request->plan,njoins-1)->indexid;
     struct qs_request builds[QS_JOINS]={0}; struct qs_extent *build_extents[QS_JOINS]={0};
+    struct qs_request index_request={0}; struct qs_extent *index_extents=NULL;
     unsigned max_extents=request->nextents; uint64_t build_bytes=0;
     struct qs_plan probe_plan={0},build_plan={0};
     for(unsigned i=0;i<njoins;++i) {
         const struct qs_join *j=qs_join_at(&request->plan,i); struct qs_request *b=&builds[i];
         b->plan.relid=j->relid; b->plan.relfilenode=j->relfilenode;
-        build_extents[i]=pg_sina_mapping(b); max_extents=Max(max_extents,b->nextents); build_bytes+=b->bytes;
+        build_extents[i]=pg_sina_mapping(b); max_extents=Max(max_extents,b->nextents); if(!j->indexid) build_bytes+=b->bytes;
         if(strcmp(b->device,request->device) || b->nsid!=request->nsid || b->lba_bytes!=request->lba_bytes)
             elog(ERROR,"CSD joins require all relations in the same namespace");
+    }
+    if(indexed) {
+        const struct qs_join *j=qs_join_at(&request->plan,njoins-1);
+        index_request.plan.relid=j->indexid; index_request.plan.relfilenode=j->indexnode;
+        index_extents=pg_sina_mapping(&index_request); max_extents=Max(max_extents,index_request.nextents);
+        if(strcmp(index_request.device,request->device) || index_request.nsid!=request->nsid || index_request.lba_bytes!=request->lba_bytes) elog(ERROR,"CSD index and heap must share a namespace");
     }
     bool streaming=request->plan.ordered_rows || request->plan.external_aggregate;
     struct pg_sina_stream *saved=streaming?calloc(1,sizeof(*saved)):NULL;
@@ -219,6 +238,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
         else if(chunk>QS_PAGE) chunk/=2;
         else { result->status=1; strcpy(result->error,"insufficient FDM"); goto cleanup; }
     }
+    if(indexed && chunk<QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE) { strcpy(result->error,"insufficient AFDM for index pages"); goto cleanup; }
     uint64_t nchunks=(request->bytes+chunk-1)/chunk;
     /* Keep room for grouped state and spill buffers (1 MiB), or the larger
      * expression scratch retained alongside a residual join filter (2 MiB). */
@@ -268,7 +288,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
             TRY(csAllocMem(device,sizeof(stats),&flags,&counters[i],NULL)); flags.Flags=0;
         }
     }
-    load=calloc(1,sizeof(*load)+(max_extents+1)*sizeof(CSBlockRange));
+    load=calloc(1,sizeof(*load)+(max_extents+1)*QS_INDEX_READS*sizeof(CSBlockRange));
     compute=calloc(1,sizeof(*compute)+8*sizeof(CsComputeArg));
     if(!load || !compute) { result->status=1; strcpy(result->error,"host request allocation failed"); goto cleanup; }
     TRY(csCreateEvent(&event));
@@ -280,7 +300,15 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
             struct qs_request *build=&builds[stage];
             struct qs_plan view=request->plan; view.join=*qs_join_at(&request->plan,stage); view.njoins=njoins;
             base+=view.join.nattrs; view.nattrs=base; view.join.residual=0;
-            view.join.work_mem_bytes=request->plan.join.work_mem_bytes/njoins;
+            view.join.work_mem_bytes=indexed && stage+1==njoins?QS_INDEX_WORK_BYTES:
+                (request->plan.join.work_mem_bytes-(indexed?QS_INDEX_WORK_BYTES:0))/(njoins-indexed);
+            if(view.join.indexid) {
+                TRY(copy(build_mem,0,&view,sizeof(view),1));
+                CS_MEM_HANDLE memory[]={vectors[0],build_mem,controls_mem[stage],input[0]};
+                compute_io_request(compute,programs[JOIN_BUILD].function,memory,4,counters[0]);
+                TRY(csQueueComputeRequest(&compute->u.Compute,NULL,NULL,NULL,NULL,NULL));
+                continue;
+            }
             join_scan_plan(&view,&build_plan,true);
             TRY(copy(build_mem,0,&view,sizeof(view),1)); TRY(copy(scan_mem,0,&build_plan,sizeof(build_plan),1));
             for(unsigned i=0;i<workers;++i) {
@@ -423,7 +451,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
                 CS_MEM_HANDLE aggregate[]={vectors[i],plan_mem,tasks[i],input[i]};
                 if(joining) {
                     CS_MEM_HANDLE memory[]={vectors[i],plan_mem,tasks[i],join_mem,joined[i],input[i]};
-                    if(streaming) compute_io_request(compute,programs[SINK].function,memory,6,counters[i]);
+                    if(streaming || indexed) compute_io_request(compute,programs[SINK].function,memory,6,counters[i]);
                     else compute_request(compute,programs[SINK].function,memory,5,counters[i]);
                 } else if(streaming) compute_io_request(compute,programs[SINK].function,aggregate,4,counters[i]);
                 else compute_request(compute,programs[SINK].function,aggregate,3,counters[i]);
@@ -443,6 +471,39 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
         --inflight; ((struct slot *)completed)->request=NULL;
         if(status!=CS_SUCCESS) {
             result->status=status; snprintf(result->error,sizeof(result->error),"csPollEvent: status=%d",status); goto cleanup;
+        }
+        if(indexed) {
+            struct slot *slot=completed; unsigned i=slot-slots; struct qs_task task;
+            TRY(copy(tasks[i],0,&task,sizeof(task),0));
+            if(slot->resume) { TRY(csFreeBatchRequest(slot->resume)); slot->resume=NULL; }
+            if(task.index_pending) {
+                if(!task.index_nreads || task.index_nreads>QS_INDEX_READS) { strcpy(result->error,"invalid CSD index page request"); goto cleanup; }
+                TRY(csAllocBatchRequest(CS_BATCH_SERIAL,task.index_nreads+1,&slot->resume));
+                CS_BATCH_INDEX previous=0,current;
+                /* Only addresses cross to PG. Each LOAD uses the existing
+                 * NVM->AFDM command; index/heap bytes never visit Guest RAM. */
+                for(unsigned j=0;j<task.index_nreads;) {
+                    unsigned first=j;
+                    memset(load,0,sizeof(*load)); load->ReqType=CS_STORAGE_IO;
+                    load->u.StorageIo=(CsStorageRequest){.Mode=CS_STORAGE_BLOCK_IO,.DevHandle=device,
+                        .u.BlockIo={.Type=CS_STORAGE_LOAD_TYPE,.DevMem={input[i],QS_SORT_IO_BYTES+task.index_reads[j].slot*QS_PAGE}}};
+                    do {
+                        const struct qs_index_read *read=&task.index_reads[j];
+                        const struct qs_request *file=read->heap?&builds[njoins-1]:&index_request;
+                        const struct qs_extent *map=read->heap?build_extents[njoins-1]:index_extents;
+                        uint64_t at=(uint64_t)read->block*QS_PAGE;
+                        if(read->heap>1 || read->slot>=QS_INDEX_CACHE || at>file->bytes || QS_PAGE>file->bytes-at) { strcpy(result->error,"CSD index page is outside its prepared file"); goto cleanup; }
+                        append_ranges(&load->u.StorageIo.u.BlockIo,file,map,at,QS_PAGE); ++j;
+                    } while(j<task.index_nreads && task.index_reads[j].slot==task.index_reads[first].slot+j-first);
+                    TRY(csConfigureBatchEntry(slot->resume,CS_BATCH_ADD,load,0,previous,&current)); previous=current;
+                }
+                CS_MEM_HANDLE memory[]={vectors[i],plan_mem,tasks[i],join_mem,joined[i],input[i]};
+                compute_io_request(compute,programs[SINK].function,memory,6,counters[i]);
+                TRY(csConfigureBatchEntry(slot->resume,CS_BATCH_ADD,compute,0,previous,&current));
+                status=csQueueBatchRequest(slot->resume,slot,NULL,event,&slot->request,NULL);
+                if(status!=CS_QUEUED) { result->status=status; snprintf(result->error,sizeof(result->error),"index continuation: status=%d",status); goto cleanup; }
+                ++inflight;
+            }
         }
     }
     } /* All probe batches finish before loading the next build batch. */
@@ -488,9 +549,10 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
         for(unsigned i=0;i<group.count;++i) {
             struct qs_task task; TRY(copy(tasks[i],0,&task,sizeof(task),0));
             join_totals.scanned+=task.scanned; join_totals.matched+=task.matched; join_totals.join_rows+=task.joined;
+            join_totals.index_pages+=task.index_pages; join_totals.index_tuples+=task.index_tuples;
         }
         join_totals.build_batches=passes;
-        join_totals.input_bytes=request->bytes*passes+build_bytes;
+        join_totals.input_bytes=request->bytes*passes+build_bytes+join_totals.index_pages*QS_PAGE;
         join_totals.chunks=nchunks*passes+build_chunks;
         for(unsigned i=0;i<njoins;++i) {
             join_totals.build_rows+=join_control[i].rows;
@@ -538,7 +600,7 @@ cleanup:
         }
         csDeleteEvent(event);
     }
-    for(unsigned i=0;i<workers;++i) if(slots[i].batch) csFreeBatchRequest(slots[i].batch);
+    for(unsigned i=0;i<workers;++i) { if(slots[i].batch) csFreeBatchRequest(slots[i].batch); if(slots[i].resume) csFreeBatchRequest(slots[i].resume); }
     if(batch) csFreeBatchRequest(batch);
     if(build_batch) csFreeBatchRequest(build_batch);
     if(load_batch) csFreeBatchRequest(load_batch);
