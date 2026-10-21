@@ -33,7 +33,8 @@ int64_t pg_sina_aggregate_sink(struct femu_csd_args *a)
         c->selected>c->rows || c->rows>c->capacity) return -1;
     struct state *s=(void *)(uintptr_t)task->state;
     if(!s) {
-        cs_work_context *context=cs_work_begin(); if(!context) return -4;
+        size_t limit=qs_sink_memory(p,task->workers); if(!limit) return -4;
+        cs_work_context *context=cs_work_begin_limit(limit); if(!context) return -4;
         s=cs_work_calloc(context,1,sizeof(*s)); if(!s) { cs_work_end(context); return -4; }
         s->context=context; s->plan=*p;
         if(p->nexprs) s->vectors=cs_work_alloc(context,p->nexprs*sizeof(*s->vectors));
@@ -126,7 +127,7 @@ int64_t pg_sina_aggregate_source(struct femu_csd_args *a)
         s->metrics.input_bytes+=other->metrics.input_bytes; s->metrics.chunks+=other->metrics.chunks;
         cs_work_end(other->context); group->states[i]=0;
     }
-    out->rows=s->count; out->metrics=s->metrics; out->metrics.workers=group->count;
+    out->rows=s->count; out->finished=1; out->metrics=s->metrics; out->metrics.workers=group->count;
     struct cs_work_stats stats; if(!cs_work_get_stats(&stats)) out->metrics.work_peak=stats.peak_used_bytes;
     for(unsigned i=0;i<s->count;++i) for(unsigned j=0;j<p->nout;++j) {
         const struct qs_output *o=&p->outputs[j]; struct qs_cell value={0};

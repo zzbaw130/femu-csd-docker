@@ -30,9 +30,17 @@ fi
 sudo tee /etc/udev/rules.d/99-pg-csd.rules >/dev/null <<'RULES'
 SUBSYSTEM=="nvme", KERNEL=="nvme0", OWNER="femu", MODE="0660"
 SUBSYSTEM=="block", KERNEL=="nvme0n1", OWNER="femu", MODE="0660"
+SUBSYSTEM=="block", KERNEL=="nvme0n1p*", ENV{PARTNAME}=="femu-spill", OWNER="femu", MODE="0660"
 RULES
 sudo udevadm control --reload-rules
 sudo chown femu /dev/nvme0 /dev/nvme0n1
 sudo chmod 0660 /dev/nvme0 /dev/nvme0n1
+# SNIA 根据 GPT 标签查找并独占 spill 分区，不假定 p1/p2 的角色。
+for partition in /sys/class/block/nvme0n1p*; do
+    if grep -qx 'PARTNAME=femu-spill' "$partition/uevent"; then
+        sudo chown femu "/dev/${partition##*/}"
+        sudo chmod 0660 "/dev/${partition##*/}"
+    fi
+done
 sudo setcap cap_sys_admin=ep "${install_dir}/bin/postgres"
 echo "PostgreSQL installed; direct CSD access configured (restart PG to apply)."

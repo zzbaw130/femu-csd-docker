@@ -1,4 +1,6 @@
 \set ON_ERROR_STOP on
+DELETE FROM sina_csd.relations WHERE relid IN
+ (to_regclass('public.snia_query_fixture'),to_regclass('public.snia_query_empty'),to_regclass('public.snia_query_parallel'));
 DROP TABLE IF EXISTS public.snia_query_fixture,public.snia_query_empty,public.snia_query_parallel;
 CREATE TABLE public.snia_query_fixture(k char(1), a numeric, b numeric, d date, unused text);
 INSERT INTO public.snia_query_fixture VALUES

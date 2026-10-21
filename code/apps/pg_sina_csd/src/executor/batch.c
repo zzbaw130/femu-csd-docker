@@ -12,6 +12,16 @@ enum { SCAN,FILTER,SINK,SOURCE,SORT,LIMIT,FUNCTIONS };
 /* One SERIAL batch and one reusable set of buffers per execution slot. */
 struct slot { CS_BATCH_HANDLE batch; CS_REQ_HANDLE request; CS_BATCH_INDEX load; unsigned bytes; };
 struct program { const char *file,*symbol; CS_CSF_ID function; unsigned index; int loaded,active; };
+struct pg_sina_stream {
+    CS_DEV_HANDLE device;
+    CS_BATCH_HANDLE batch;
+    CS_MEM_HANDLE output,group,io,counter;
+    struct program source;
+    int lock_fd;
+    bool profiling;
+    uint64_t start,fdm_bytes;
+    struct qs_profile profile,last_counter;
+};
 static uint64_t clock_ns(void)
 {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
@@ -59,13 +69,36 @@ static void compute_request(CsBatchRequest *b,CS_CSF_ID function,CS_MEM_HANDLE *
         b->u.Compute.NumArgs+=2;
     }
 }
+/* The batch scheduler uses the last AFDM for spill I/O. Put the optional
+ * profiling buffer before it; the device entry wrapper removes that buffer. */
+static void compute_io_request(CsBatchRequest *b,CS_CSF_ID function,CS_MEM_HANDLE *memory,unsigned count,CS_MEM_HANDLE counter)
+{
+    CS_MEM_HANDLE args[8]; unsigned n=0;
+    for(unsigned i=0;i<count;++i) {
+        if(i+1==count && counter) args[n++]=counter;
+        args[n++]=memory[i];
+    }
+    compute_request(b,function,args,n,NULL);
+    if(counter) {
+        csHelperSetComputeArg(&b->u.Compute.Args[n],CS_64BIT_VALUE_TYPE,(u64)1);
+        ++b->u.Compute.NumArgs;
+    }
+}
+static void drop_sort(CS_CSF_ID source,CS_MEM_HANDLE group,CsBatchRequest *compute)
+{
+    CS_MEM_HANDLE memory[]={group}; compute_request(compute,source,memory,1,NULL);
+    csQueueComputeRequest(&compute->u.Compute,NULL,NULL,NULL,NULL,NULL);
+}
 #define TRY(call) do { CS_STATUS status=(call); if(status!=CS_SUCCESS) { \
     result->status=status; snprintf(result->error,sizeof(result->error),"%s: status=%d",#call,status); goto cleanup; } } while(0)
-void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct qs_result *result,bool profiling)
+void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct qs_result *result,bool profiling,struct pg_sina_stream **stream)
 {
     uint64_t start=profiling?clock_ns():0,phase=start,cleanup_start=0;
     struct qs_profile stats={0};
     CHECK_FOR_INTERRUPTS();
+    struct pg_sina_stream *saved=request->plan.ordered_rows?calloc(1,sizeof(*saved)):NULL;
+    if(request->plan.ordered_rows && !saved) elog(ERROR,"cannot allocate CSD result stream");
+    *stream=NULL;
     /* Do not longjmp through SNIA C++ frames or its batch threads. Poll PG's
      * pending cancel between event polls, then release resources before PG
      * reports the interrupt. No PG allocations/errors occur while held. */
@@ -87,6 +120,10 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
         [SOURCE]={.file="pg-sina-aggregate.so",.symbol="pg_sina_aggregate_source",.index=504},
         [SORT]={.file="pg-sina-sort.so",.symbol="pg_sina_sort",.index=505},
         [LIMIT]={.file="pg-sina-limit.so",.symbol="pg_sina_limit",.index=506}};
+    if(request->plan.ordered_rows) {
+        programs[SINK].file=programs[SOURCE].file="pg-sina-sort.so";
+        programs[SINK].symbol="pg_sina_sort_sink"; programs[SOURCE].symbol="pg_sina_sort_source";
+    }
     lock_fd=open(request->device,O_RDONLY|O_CLOEXEC);
     if(lock_fd<0) { result->status=1; snprintf(result->error,sizeof(result->error),"cannot lock namespace: %s",strerror(errno)); goto cleanup; }
     while(flock(lock_fd,LOCK_EX|LOCK_NB)) {
@@ -108,9 +145,13 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     }
     uint64_t nchunks=(request->bytes+chunk-1)/chunk;
     if(nchunks && workers>nchunks) workers=nchunks;
+    /* One budget shared by all concurrent slots, including Filter scratch.
+     * CSFs also clamp each share to the physical workmem pool capacity. */
+    request->plan.work_mem_bytes=(uint64_t)pg_sina_max_memory*1024/workers;
     group.count=workers;
     for(unsigned i=0;i<FUNCTIONS;++i) {
-        if((i==FILTER && request->plan.predicate<0) || (i==SORT && !request->plan.norder) ||
+        if((request->plan.ordered_rows && i>=SORT) ||
+            (i==FILTER && request->plan.predicate<0) || (i==SORT && !request->plan.norder) ||
             (i==LIMIT && request->plan.limit<0 && !request->plan.offset)) continue;
         TRY(load_program(device,&programs[i]));
     }
@@ -124,6 +165,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
         TRY(csAllocMem(device,qs_chunk_bytes(chunk/24,request->plan.ncols),&flags,&vectors[i],NULL));
         struct qs_chunk header={.capacity=chunk/24,.ncols=request->plan.ncols}; TRY(copy(vectors[i],0,&header,sizeof(header),1));
         flags.Flags=CS_FDM_CLEAR; TRY(csAllocMem(device,sizeof(struct qs_task),&flags,&tasks[i],NULL)); flags.Flags=0;
+        struct qs_task task={.workers=workers}; TRY(copy(tasks[i],0,&task,sizeof(task),1));
         if(profiling) {
             flags.Flags=CS_FDM_CLEAR;
             TRY(csAllocMem(device,sizeof(stats),&flags,&counters[i],NULL)); flags.Flags=0;
@@ -172,7 +214,9 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
                     CS_MEM_HANDLE filter[]={vectors[i],plan_mem,input[i]}; compute_request(compute,programs[FILTER].function,filter,3,counters[i]);
                     TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_ADD,compute,0,previous,&current)); previous=current;
                 }
-                CS_MEM_HANDLE aggregate[]={vectors[i],plan_mem,tasks[i]}; compute_request(compute,programs[SINK].function,aggregate,3,counters[i]);
+                CS_MEM_HANDLE aggregate[]={vectors[i],plan_mem,tasks[i],input[i]};
+                if(request->plan.ordered_rows) compute_io_request(compute,programs[SINK].function,aggregate,4,counters[i]);
+                else compute_request(compute,programs[SINK].function,aggregate,3,counters[i]);
                 TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_ADD,compute,0,previous,&current));
             }
             CS_STATUS status=csQueueBatchRequest(slot->batch,slot,NULL,event,&slot->request,NULL);
@@ -201,13 +245,15 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     if(QueryCancelPending || ProcDiePending) goto cleanup;
     TRY(csAllocBatchRequest(CS_BATCH_SERIAL,3,&batch));
     CS_BATCH_INDEX previous=0,current;
-    CS_MEM_HANDLE source[]={group_mem,out_mem}; compute_request(compute,programs[SOURCE].function,source,2,counters[0]);
+    CS_MEM_HANDLE source[]={group_mem,out_mem,input[0]};
+    if(request->plan.ordered_rows) compute_io_request(compute,programs[SOURCE].function,source,3,counters[0]);
+    else compute_request(compute,programs[SOURCE].function,source,2,counters[0]);
     TRY(csConfigureBatchEntry(batch,CS_BATCH_ADD,compute,0,0,&previous));
-    if(request->plan.norder) {
+    if(request->plan.norder && !request->plan.ordered_rows) {
         CS_MEM_HANDLE order[]={out_mem,plan_mem}; compute_request(compute,programs[SORT].function,order,2,counters[0]);
         TRY(csConfigureBatchEntry(batch,CS_BATCH_ADD,compute,0,previous,&current)); previous=current;
     }
-    if(request->plan.limit>=0 || request->plan.offset) {
+    if(!request->plan.ordered_rows && (request->plan.limit>=0 || request->plan.offset)) {
         CS_MEM_HANDLE limit[]={out_mem,plan_mem}; compute_request(compute,programs[LIMIT].function,limit,2,counters[0]);
         TRY(csConfigureBatchEntry(batch,CS_BATCH_ADD,compute,0,previous,&current));
     }
@@ -225,7 +271,20 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
                 t->calls+=p->calls; t->wall_ns+=p->wall_ns; t->cpu_ns+=p->cpu_ns;
                 if(p->max_wall_ns>t->max_wall_ns) t->max_wall_ns=p->max_wall_ns;
             }
+            if(!i && saved) saved->last_counter=partial;
         }
+    }
+    if(saved && !result->finished) {
+        saved->device=device; saved->batch=batch; batch=NULL;
+        saved->output=out_mem; out_mem=NULL;
+        saved->group=group_mem; group_mem=NULL;
+        saved->io=input[0]; input[0]=NULL;
+        saved->counter=counters[0]; counters[0]=NULL;
+        saved->source=programs[SOURCE]; programs[SOURCE].active=programs[SOURCE].loaded=0;
+        saved->lock_fd=lock_fd; lock_fd=-1;
+        saved->profiling=profiling; saved->start=start; saved->profile=stats;
+        saved->fdm_bytes=result->metrics.fdm_bytes;
+        *stream=saved; saved=NULL;
     }
 cleanup:
     if(profiling && !cleanup_start) cleanup_start=clock_ns();
@@ -249,8 +308,11 @@ cleanup:
             for(unsigned i=0;i<workers;++i) if(tasks[i]) { struct qs_task task={0}; copy(tasks[i],0,&task,sizeof(task),0); group.states[i]=task.state; }
             copy(group_mem,0,&group,sizeof(group),1);
         }
-        CS_MEM_HANDLE memory[]={group_mem}; compute_request(compute,programs[SOURCE].function,memory,1,NULL);
-        csQueueComputeRequest(&compute->u.Compute,NULL,NULL,NULL,NULL,NULL);
+        if(request->plan.ordered_rows) drop_sort(programs[SOURCE].function,group_mem,compute);
+        else {
+            CS_MEM_HANDLE memory[]={group_mem}; compute_request(compute,programs[SOURCE].function,memory,1,NULL);
+            csQueueComputeRequest(&compute->u.Compute,NULL,NULL,NULL,NULL,NULL);
+        }
     }
     CsMemFlags release={.FDMId=1};
     for(unsigned i=0;i<QS_WORKERS;++i) { if(input[i])csFreeMem(input[i],&release); if(vectors[i])csFreeMem(vectors[i],&release); if(tasks[i])csFreeMem(tasks[i],&release); if(counters[i])csFreeMem(counters[i],&release); }
@@ -258,14 +320,73 @@ cleanup:
     if(out_mem)csFreeMem(out_mem,&release);
     if(group_mem)csFreeMem(group_mem,&release);
     for(unsigned i=0;i<FUNCTIONS;++i) unload_program(device,&programs[i]);
-    if(device)csCloseCSx(device);
+    if(device && !*stream)csCloseCSx(device);
     if(lock_fd>=0)close(lock_fd);
     free(caps);free(fdm);free(load);free(compute);
+    free(saved);
     if(profiling) {
         uint64_t now=clock_ns(); stats.cleanup_ns=now-cleanup_start; stats.total_ns=now-start;
         result->profile=stats;
+        if(*stream) (*stream)->profile=stats;
     }
     RESUME_INTERRUPTS();
     CHECK_FOR_INTERRUPTS();
     if(result->status) ereport(ERROR,(errmsg("CSD execution failed: %s",result->error)));
+}
+
+void pg_sina_close(struct pg_sina_stream *s)
+{
+    if(!s) return;
+    HOLD_INTERRUPTS();
+    unsigned char storage[sizeof(CsBatchRequest)+6*sizeof(CsComputeArg)] __attribute__((aligned(16)));
+    CsBatchRequest *compute=(void *)storage;
+    if(s->batch) csFreeBatchRequest(s->batch);
+    drop_sort(s->source.function,s->group,compute);
+    CsMemFlags flags={.FDMId=1};
+    csFreeMem(s->output,&flags); csFreeMem(s->group,&flags); csFreeMem(s->io,&flags);
+    if(s->counter) csFreeMem(s->counter,&flags);
+    unload_program(s->device,&s->source); csCloseCSx(s->device);
+    if(s->lock_fd>=0) close(s->lock_fd);
+    free(s); RESUME_INTERRUPTS();
+}
+
+void pg_sina_fetch(struct pg_sina_stream **cursor,struct qs_result *result)
+{
+    struct pg_sina_stream *s=*cursor;
+    HOLD_INTERRUPTS();
+    uint64_t start=s->profiling?clock_ns():0;
+    CS_STATUS status=csQueueBatchRequest(s->batch,NULL,NULL,NULL,NULL,NULL);
+    if(status==CS_SUCCESS) status=copy(s->output,0,result,sizeof(*result),0);
+    if(status==CS_SUCCESS && s->profiling) {
+        struct qs_profile current;
+        status=copy(s->counter,0,&current,sizeof(current),0);
+        if(status==CS_SUCCESS) {
+            for(unsigned i=0;i<QS_OPERATORS;++i) {
+                struct qs_timing *t=&s->profile.operators[i],*c=&current.operators[i],*old=&s->last_counter.operators[i];
+                t->calls+=c->calls-old->calls; t->cpu_ns+=c->cpu_ns-old->cpu_ns; t->wall_ns+=c->wall_ns-old->wall_ns;
+                if(c->max_wall_ns>t->max_wall_ns) t->max_wall_ns=c->max_wall_ns;
+            }
+            s->last_counter=current;
+            s->profile.pipeline_ns[1]+=clock_ns()-start;
+        }
+    }
+    if(status==CS_SUCCESS) result->metrics.fdm_bytes=s->fdm_bytes;
+    bool closing=status!=CS_SUCCESS || result->status || result->finished || QueryCancelPending || ProcDiePending;
+    if(s->profiling) {
+        result->profile=s->profile;
+        result->profile.total_ns=clock_ns()-s->start;
+    }
+    if(closing) {
+        uint64_t cleanup=s->profiling?clock_ns():0;
+        bool profiling=s->profiling; *cursor=NULL; pg_sina_close(s);
+        if(profiling) {
+            uint64_t elapsed=clock_ns()-cleanup;
+            result->profile.cleanup_ns+=elapsed; result->profile.total_ns+=elapsed;
+            /* Time waiting for the PG consumer is outside active pipeline work. */
+            result->profile.total_ns=result->profile.setup_ns+result->profile.pipeline_ns[0]+
+                result->profile.pipeline_ns[1]+result->profile.cleanup_ns;
+        }
+    }
+    RESUME_INTERRUPTS(); CHECK_FOR_INTERRUPTS();
+    if(status!=CS_SUCCESS || result->status) ereport(ERROR,(errmsg("CSD result fetch failed: status=%d",status)));
 }

@@ -31,7 +31,7 @@
 
 验收：7项设备 CTest 和 Guest PG12 页布局测试通过；计数及列批次聚合的 ASan/UBSan 测试通过（环境限制关闭 LeakSanitizer）。SQL 回归覆盖 NULL/空输入/无匹配、布尔条件、精确 SUM/AVG/COUNT、排序/NULL顺序/OFFSET/LIMIT、原生回退、prepared plan 路径切换及100ms超时取消后完整设备复用。Q1四组全部列（含精度和小数位）与Q6结果逐字节一致，另验证Q1 LIMIT 1。每次执行均独立冷启动。
 
-当前限制：最多256个分组，排序仅处理聚合结果；numeric 输入仅支持有限、至多两位小数并可表示为int64百分数的值。规划时已知不支持的能力回退PG；运行时数据越界或组数超预期报错。尚未实现通用高基数聚合/行排序spill、Join或所有22条TPC-H。
+阶段1验收时的限制：最多256个分组，排序仅处理聚合结果；numeric 输入仅支持有限、至多两位小数并可表示为int64百分数的值。规划时已知不支持的能力回退PG；运行时数据越界或组数超预期报错。尚未实现通用高基数聚合/行排序spill、Join或所有22条TPC-H。
 
 ## 统一冷启动测量规则
 
@@ -110,7 +110,7 @@ SNIA已有计时记录D0=220次、累计1.523479s，E1=663次、累计3.393881s�
 
 | 阶段 | 实现内容 | 优先验收 |
 | --- | --- | --- |
-| 2 | 通用阻塞边界：行排序/TopN、高基数聚合，workmem优先，NEED_STORE/LOAD/FREE驱动spill与重入；保留sink/source状态生命周期 | 大数据排序、分组和强制小内存正确性 |
+| 2（进行中） | 行排序/TopN已接入，详见阶段2a；继续实现高基数聚合。workmem优先，NEED_STORE/LOAD/FREE驱动spill与重入，保留sink/source生命周期 | 大数据排序、分组和强制小内存正确性 |
 | 3 | Hash Join build/probe、投影传递、分区spill，扩展CASE和必要字符串表达式 | Q14，再Q3/Q5/Q10/Q12/Q19 |
 | 4 | 多路Join与分组，子查询去相关，semi/anti join，EXISTS/NOT EXISTS，LIKE/SUBSTRING、派生表与中间聚合结果复用 | Q4/Q7/Q8/Q9/Q11/Q13/Q15/Q16/Q18/Q20/Q21/Q22 |
 | 5 | 补齐剩余表达式与嵌套聚合/标量子查询语义，逐条核查设备覆盖与原生结果 | Q2/Q17及全部22条 |
@@ -159,3 +159,17 @@ EXPLAIN增加CSD Scheduling说明。Guest回归新增450000行多块表，覆盖
 列向量直接引用 AFDM 原列与选择向量，常量仅保存一份，不再逐元素广播或把输入 int64 整列复制成 int128。计算结果才写入工作内存。AVX2 扩展到无 NULL/错误批次的加减、乘法和通用比较，支持列引用、常量和 int64 中间结果。加减检查溢出，乘法使用精确的 int32×int32→int64；不满足条件、NULL、非 AVX2 或需要更宽结果时回退精确 int128。聚合累加器仍为 int128，不以窄整数或浮点近似替代精确聚合。
 
 没有增加设备命令、SNIA 参数、AFDM 字段、调度框架或配置项，同一槽仍无下一块预取。设备测试对照原标量求值器，补充非连续选择、SIMD 尾部、正负 int64 边界和宽结果回退；真实 heap 测试确认被短路排除的 predicate numeric 不解码，实际需要时仍报错。结果与性能验收见[性能分析](performance.md)。
+
+## 阶段2a：外部行排序、TopN与分批结果（完成）
+
+这是面向其余TPC-H的第一个阻塞算子阶段，不代表新增了TPC-H整条查询的覆盖。目前完整卸载仍为Q1/Q6；高基数聚合、Hash Join、字符串、CASE和子查询仍按上述阶段推进。
+
+- Guest PG 从单表行查询生成 `SniaCsdSort`，仍由表达式树驱动，不按Query编号识别。第一条pipeline是多槽 LOAD→Scan→Filter→Sort.sink；第二条为Sort.source归并并处理OFFSET/LIMIT。不支持的结果类型在规划时回退PG。当前不在未支持外层查询的子查询中单独插入CustomScan，避免两个分批source各自持有namespace锁时相互等待；混合计划将随统一查询资源生命周期实现。
+- 参考本地DuckDB的 `physical_order.cpp` 和 `physical_top_n.cpp`：局部排序、sink/source阻塞边界、有界TopN堆。设备Sort在原sort.c扩展，保留原小聚合结果快路径；投影后的行按实际列数存储。每段至多1MiB，优先保留workmem，下一段超预算或分配失败时经最后一个AFDM请求NEED_STORE。64KiB spill块属于同一个段，不增加归并段数。
+- source保留每段的头部，按小根堆归并，NEED_LOAD按需补充数据；读缓冲可回收重载，因此不会要求所有段的读窗口同时驻留。正常结束主动释放token及私有内存；PG提前关闭或失败时先释放私有上下文，再关闭本查询的SNIA设备回收临时空间。失败batch可能已回滚部分token，不把重复释放失效token作为内存清理的前提。
+- 区分256行结果块与原聚合256组上限；Guest保留source batch和设备句柄，逐块取结果。查询内存上下文回调用于错误、取消和游标提前关闭，不把全部最终结果收集到Guest工作表。计时新增Sort.sink/source，统计包含I/O重入调用；计数AFDM位于I/O AFDM之前，包装后算法MR顺序保持不变。
+- 首次真实spill暴露了安装权限缺口：SNIA需打开标签femu-spill的分区，原脚本只配置了namespace。install-postgre.sh已补充按标签的udev和当前设备权限；不假定p1/p2角色，也不采用代理。
+
+验收：17项设备CTest通过，最终相关12项重复检查通过；新增外部排序测试以4/8/16/64/128MiB workmem处理约96MiB完整行数据，覆盖四sink、spill重入、归并窗口压力、全部输出顺序/NULL/显示精度、TopN/OFFSET、最大int64 OFFSET、提前退出和失败scope已回收token后的清理；12项PG算子ASan/UBSan及最终6项外部排序容量重复检查通过（环境限制关闭LeakSanitizer）。Guest覆盖普通排序、隐藏排序键、空结果、跨256行输出、大结果spill、游标提前关闭与同backend复用，旧Q1/Q6、取消、计时开关也通过。SF=1 TopN和外部排序各3轮冷启动与原生输出精确一致，数字见[性能分析](performance.md)。
+
+阶段2a同时增加`pg_sina_csd.max_memory`（默认64MB，执行时生效），按执行槽分摊并保留过滤临时空间，以设备共享workmem池为硬上限。排序按下一段是否超预算触发spill，容量降低时缩小run；不是全局空闲比例阈值。后续Hash Join和高基数聚合应沿用同一查询预算，并为自身不可spill状态留出空间，不能各自再申请一份完整上限。当前固定256组聚合尚未改成外部聚合，Join尚未接入。

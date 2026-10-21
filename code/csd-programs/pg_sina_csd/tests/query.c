@@ -74,11 +74,11 @@ int main(int argc,char **argv)
     __int128 largest=(__int128)(((unsigned __int128)1<<127)-1),large=9;
     for(unsigned i=0;i<37;++i) large*=10;
     assert(!qs_compare((struct qs_cell){.value=largest,.scale=1},(struct qs_cell){.value=large},&cmp) && cmp<0);
-    const unsigned expected[]={1,4,4,1,1,1};
+    const unsigned expected[QS_OPERATORS]={1,4,4,1,1,1};
     for(unsigned i=0;i<QS_OPERATORS;++i) {
         const struct qs_timing *t=&profile.operators[i];
         assert(t->calls==(profiling?expected[i]:0));
-        if(profiling) assert(t->wall_ns>=t->max_wall_ns && t->max_wall_ns && t->cpu_ns);
+        if(profiling && expected[i]) assert(t->wall_ns>=t->max_wall_ns && t->max_wall_ns && t->cpu_ns);
         else assert(!t->wall_ns && !t->cpu_ns && !t->max_wall_ns);
     }
     /* Instrumentation preserves both the error and the caller's MR count. */

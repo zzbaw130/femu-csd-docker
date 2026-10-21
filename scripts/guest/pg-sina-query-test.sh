@@ -21,7 +21,9 @@ case ${1:-query} in
                 -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path=csd" \
                 -c "EXPLAIN (COSTS OFF) $sql" > "$RESULTS/$name.plan"
             case $name in
-                unsupported_*) ! grep -q 'SniaCsdAggregate' "$RESULTS/$name.plan" ;;
+                unsupported_*) ! grep -q 'Custom Scan (SniaCsd' "$RESULTS/$name.plan" ;;
+                order_*) grep -q 'SniaCsdSort' "$RESULTS/$name.plan"
+                         grep -q 'Sort.sink; Sort.source' "$RESULTS/$name.plan" ;;
                 zero_limit) ;; # PG may eliminate the whole query with LIMIT 0.
                 *) grep -q 'SniaCsdAggregate' "$RESULTS/$name.plan"
                    grep -q 'CSD Scheduling: independent serial batches' "$RESULTS/$name.plan" ;;
@@ -33,6 +35,20 @@ case ${1:-query} in
             run_cold csd "$sql" "$RESULTS/$name.csd"
             cmp "$RESULTS/$name.host.rows" "$RESULTS/$name.csd.rows"
             echo "PASS $name: cold host/csd exact results and expected plan"
+            if [[ $name == order_spill ]]; then
+                printf 'SET pg_sina_csd.profile=on;\nEXPLAIN (ANALYZE,COSTS OFF,TIMING OFF,FORMAT JSON)\n%s\n' "$sql" > "$RESULTS/current.sql"
+                sh "$COLD" csd "$RESULTS/current.sql" > "$RESULTS/$name.json"
+                check=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 -c "
+                    WITH doc AS (SELECT pg_read_file('$RESULTS/$name.json')::jsonb->0->'Plan' AS p)
+                    SELECT (p->>'CSD Spilled Runs')::bigint>0
+                        AND (p->>'CSD Spill Write')::bigint>0
+                        AND (p->>'CSD Spill Read')::bigint>0
+                        AND (p->>'CSD Workmem Peak')::bigint<=67108864
+                        AND (p->'CSD Profile'->'Sort.source'->>'Calls')::bigint>1
+                    FROM doc")
+                [[ $check == t ]]
+                echo 'PASS external row sort actually spills, resumes and stays within 64 MiB workmem'
+            fi
         done < "$PROJECT/tests/query_cases.tsv"
         for name in q1 q6; do
             sql=$(cat "$PROJECT/tests/$name.sql")
@@ -86,7 +102,37 @@ case ${1:-query} in
         grep -q 'CSD execution failed' "$RESULTS/error.log"
         [[ $(grep -c '^450000$' "$RESULTS/error.log") == 2 ]]
         echo 'PASS device error drains outstanding batches before same-backend reuse'
+        # Consume one chunk, then close a spilled sort before its source EOF.
+        psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
+            -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path=csd; BEGIN" \
+            -c 'DECLARE sort_cursor CURSOR FOR SELECT k,a,a*1.00,a*2.00,a*3.00,a*4.00,a*5.00,a*6.00 FROM snia_query_parallel ORDER BY a,k' \
+            -c 'FETCH 1 FROM sort_cursor; CLOSE sort_cursor; COMMIT' \
+            -c 'SELECT count(*) FROM snia_query_parallel' > "$RESULTS/sort-close.log"
+        grep -q '^450000$' "$RESULTS/sort-close.log"
+        echo 'PASS closing a partially consumed sort releases workmem and spill before same-backend reuse'
         psql -X -q -v ON_ERROR_STOP=1 -d tpch_s1 -c "DELETE FROM sina_csd.relations WHERE relid IN ('snia_query_fixture'::regclass,'snia_query_empty'::regclass,'snia_query_parallel'::regclass); DROP TABLE snia_query_fixture,snia_query_empty,snia_query_parallel"
+        ;;
+    memory)
+        # Each measured execution has its own cold start, including host oracles.
+        for name in q1 q6 order_spill; do
+            sql=$(cat "$PROJECT/tests/$name.sql")
+            run_cold host "$sql" "$RESULTS/$name.host"
+            for memory in 4 16 64 128; do
+                run_cold csd "SET pg_sina_csd.max_memory='${memory}MB'; $sql" "$RESULTS/$name.$memory"
+                cmp "$RESULTS/$name.host.rows" "$RESULTS/$name.$memory.rows"
+                echo "PASS $name with max_memory=${memory}MB: exact cold results"
+            done
+        done
+        # A cached plan reads the setting at execution, not at PREPARE time.
+        printf "PREPARE memory_test AS SELECT count(*) FROM lineitem;\nSET pg_sina_csd.max_memory='4MB';\nEXPLAIN (ANALYZE,COSTS OFF,TIMING OFF) EXECUTE memory_test;\nSET pg_sina_csd.max_memory='64MB';\nEXPLAIN (ANALYZE,COSTS OFF,TIMING OFF) EXECUTE memory_test;\n" > "$RESULTS/current.sql"
+        sh "$COLD" csd "$RESULTS/current.sql" > "$RESULTS/prepared-memory.log"
+        grep -q 'CSD Query Memory Limit: 4194304 bytes' "$RESULTS/prepared-memory.log"
+        grep -q 'CSD Query Memory Limit: 67108864 bytes' "$RESULTS/prepared-memory.log"
+        echo 'PASS prepared execution uses the current query memory limit'
+        for memory in 4 16 64 128; do
+            printf "SET pg_sina_csd.max_memory='%sMB';\nEXPLAIN (ANALYZE,COSTS OFF,TIMING OFF,FORMAT JSON)\n%s\n" "$memory" "$(cat "$PROJECT/tests/order_spill.sql")" > "$RESULTS/current.sql"
+            sh "$COLD" csd "$RESULTS/current.sql" > "$RESULTS/spill.$memory.json"
+        done
         ;;
     profile)
         [[ $(psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 -c "LOAD 'pg_sina_csd'" -c 'SHOW pg_sina_csd.profile') == off ]]
@@ -151,11 +197,19 @@ case ${1:-query} in
         unset SNIA_FEMU_PROFILE
         pg_ctl -D /data/tpch_s1 -l /data/tpch_s1/log -o '-c autovacuum=off' -w restart >/dev/null
         ;;
-    bench)
+    bench|order-bench)
+        queries=(q1 q6)
+        if [[ $1 == order-bench ]]; then queries=(order_topn order_spill); fi
+        for name in "${queries[@]}"; do
+            psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
+                -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path=csd" \
+                -c "EXPLAIN (COSTS OFF) $(cat "$PROJECT/tests/$name.sql")" > "$RESULTS/$name.plan"
+            grep -q 'Custom Scan (SniaCsd' "$RESULTS/$name.plan"
+        done
         printf 'query\tmode\tround\tms\n' > "$RESULTS/timings.tsv"
         for round in 1 2 3; do
             if ((round%2)); then modes=(host csd); else modes=(csd host); fi
-            for name in q1 q6; do
+            for name in "${queries[@]}"; do
                 for mode in "${modes[@]}"; do
                     log="$RESULTS/$name.$mode.$round"
                     run_cold "$mode" "$(cat "$PROJECT/tests/$name.sql")" "$log"
@@ -169,6 +223,12 @@ case ${1:-query} in
             done
         done
         awk 'NR>1 {key=$1" "$2; sum[key]+=$4; n[key]++} END {for(key in n) printf "%s mean=%.6fs\n",key,sum[key]/n[key]/1000}' "$RESULTS/timings.tsv"
+        if [[ $1 == order-bench ]]; then
+            for name in "${queries[@]}"; do
+                printf 'SET pg_sina_csd.profile=on;\nEXPLAIN (ANALYZE,COSTS OFF,TIMING OFF,FORMAT JSON)\n%s\n' "$(cat "$PROJECT/tests/$name.sql")" > "$RESULTS/current.sql"
+                sh "$COLD" csd "$RESULTS/current.sql" > "$RESULTS/$name.json"
+            done
+        fi
         ;;
-    *) echo 'usage: pg-sina-query-test.sh query|profile|analyze|bench' >&2; exit 2 ;;
+    *) echo 'usage: pg-sina-query-test.sh query|memory|profile|analyze|bench|order-bench' >&2; exit 2 ;;
 esac

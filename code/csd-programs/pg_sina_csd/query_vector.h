@@ -5,6 +5,7 @@
 #define QS_VECTOR_H
 #include "query_eval.h"
 #include "heap_numeric.h"
+#include "cs_workmem.h"
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #endif
@@ -20,6 +21,20 @@ struct qs_vector {
     const uint32_t *selection;
     unsigned first;
 };
+/* Filter scratch is temporary but can coexist with a retained sink state on
+ * every slot. Keep its charged allocation (including allocator metadata) out
+ * of the sink budget; both contexts together stay below that slot's share. */
+static inline size_t qs_filter_memory(const struct qs_plan *p)
+{ return p->predicate<0?0:((size_t)(p->predicate+1)*sizeof(struct qs_vector)+4095)/4096*4096+4096; }
+static inline size_t qs_sink_memory(const struct qs_plan *p,unsigned workers)
+{
+    struct cs_work_stats stats;
+    if(cs_work_get_stats(&stats) || workers>QS_WORKERS) return 0;
+    size_t limit=stats.capacity_bytes/(workers?workers:1);
+    if(p->work_mem_bytes && p->work_mem_bytes<limit) limit=p->work_mem_bytes;
+    size_t scratch=qs_filter_memory(p);
+    return limit>scratch?limit-scratch:0;
+}
 /* Bit 1 marks a dependency; bit 2 marks an explicitly requested result. A
  * shared child can also be a result, so keep both instead of inferring roots. */
 static inline int qs_vector_dependency(const struct qs_plan *p,int index,uint8_t *needed)

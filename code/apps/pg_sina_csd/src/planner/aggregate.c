@@ -169,6 +169,7 @@ static bool compile(PlannerInfo *root,Index rti,RelOptInfo *rel,struct qs_plan *
         else if(a->atttypid==BPCHAROID && a->atttypmod==5 && byte_collation(a->attcollation)) c->type=Q_CHAR;
     }
     table_close(table,NoLock);
+    p->ordered_rows=!root->parse->hasAggs;
     ListCell *cell; p->predicate=-1; p->limit=-1;
     foreach(cell,rel->baserestrictinfo) {
         RestrictInfo *r=lfirst_node(RestrictInfo,cell); int next=expression((Node *)r->clause,rti,p); if(next<0) return false;
@@ -186,7 +187,14 @@ static bool compile(PlannerInfo *root,Index rti,RelOptInfo *rel,struct qs_plan *
     foreach(cell,root->processed_tlist) {
         TargetEntry *entry=lfirst_node(TargetEntry,cell); if(p->nout==QS_OUT) return false;
         struct qs_output *out=&p->outputs[p->nout++]; out->type_oid=exprType((Node *)entry->expr); out->typmod=exprTypmod((Node *)entry->expr);
-        if(IsA(entry->expr,Aggref)) {
+        /* Timestamp constants are accepted as midnight date bounds above,
+         * but are not a supported result Datum. Reject at planning time. */
+        if(out->type_oid!=NUMERICOID && out->type_oid!=INT2OID && out->type_oid!=INT4OID &&
+            out->type_oid!=INT8OID && out->type_oid!=BOOLOID && out->type_oid!=DATEOID && out->type_oid!=BPCHAROID) return false;
+        if(p->ordered_rows) {
+            out->index=expression((Node *)entry->expr,rti,p);
+            if(out->index<0) return false;
+        } else if(IsA(entry->expr,Aggref)) {
             Aggref *agg=(Aggref *)entry->expr; if(p->naggs==QS_AGGS || agg->aggfilter || agg->aggdistinct || agg->aggorder || agg->agglevelsup || agg->aggvariadic) return false;
             struct qs_agg *a=&p->aggs[p->naggs]; a->expr=-1;
             if(builtin(agg->aggfnoid,"sum")) a->kind=Q_SUM;
@@ -239,14 +247,20 @@ static Plan *plan_path(PlannerInfo *root,RelOptInfo *rel,CustomPath *path,List *
 {
     CustomScan *scan=makeNode(CustomScan); scan->scan.plan.targetlist=tlist; scan->scan.scanrelid=0;
     scan->custom_scan_tlist=copyObject(root->processed_tlist);
-    scan->custom_private=copyObject(path->custom_private); scan->methods=&pg_sina_scan_methods;
+    scan->custom_private=copyObject(path->custom_private);
+    scan->methods=root->parse->hasAggs?&pg_sina_scan_methods:&pg_sina_order_methods;
     return (Plan *)scan;
 }
 static const CustomPathMethods path_methods={.CustomName="SniaCsdAggregate",.PlanCustomPath=plan_path};
+static const CustomPathMethods order_path_methods={.CustomName="SniaCsdSort",.PlanCustomPath=plan_path};
 void pg_sina_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *input,RelOptInfo *output,void *extra)
 {
     Query *q=root->parse;
-    if(!pg_sina_exe_path || stage!=UPPERREL_FINAL || q->commandType!=CMD_SELECT || !q->hasAggs || q->havingQual ||
+    /* A query owns the namespace until its streaming source ends. Until mixed
+     * plans share one device session, nested custom scans could wait on their
+     * own outer scan's lock. Keep unsupported outer queries wholly native. */
+    if(!pg_sina_exe_path || root->parent_root || stage!=UPPERREL_FINAL || q->commandType!=CMD_SELECT || q->havingQual ||
+        (!q->hasAggs && (!q->sortClause || q->groupClause)) ||
         q->windowClause || q->groupingSets || q->cteList || q->hasSubLinks || q->hasRowSecurity || q->hasTargetSRFs ||
         q->rowMarks || q->distinctClause || q->setOperations || root->append_rel_list || root->join_info_list ||
         list_length(q->jointree->fromlist)!=1 || !IsA(linitial(q->jointree->fromlist),RangeTblRef)) return;
@@ -263,8 +277,9 @@ void pg_sina_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *i
     bool prepared=status==SPI_OK_SELECT && SPI_processed==1; SPI_finish(); if(!prepared) return;
     bytea *data=palloc(VARHDRSZ+sizeof(plan)); SET_VARSIZE(data,VARHDRSZ+sizeof(plan)); memcpy(VARDATA(data),&plan,sizeof(plan));
     CustomPath *path=makeNode(CustomPath); path->path.pathtype=T_CustomScan; path->path.parent=output;
-    path->path.pathtarget=create_pathtarget(root,root->processed_tlist); path->path.rows=plan.nkeys?4:1;
+    path->path.pathtarget=create_pathtarget(root,root->processed_tlist);
+    path->path.rows=plan.ordered_rows?rel->rows:plan.nkeys?4:1;
     path->path.pathkeys=root->sort_pathkeys; path->path.startup_cost=path->path.total_cost=0;
     path->custom_private=list_make1(makeConst(BYTEAOID,-1,InvalidOid,-1,PointerGetDatum(data),false,false));
-    path->methods=&path_methods; add_path(output,&path->path);
+    path->methods=plan.ordered_rows?&order_path_methods:&path_methods; add_path(output,&path->path);
 }

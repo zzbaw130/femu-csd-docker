@@ -154,7 +154,9 @@ int64_t pg_sina_filter(struct femu_csd_args *a)
     } else {
         uint8_t needed[QS_EXPRS]={0};
         if(qs_vector_require(p,p->predicate,needed)) return -2;
-        cs_work_context *context=cs_work_begin(); if(!context) return -4;
+        size_t scratch=qs_filter_memory(p);
+        if(p->work_mem_bytes && scratch>p->work_mem_bytes) return -4;
+        cs_work_context *context=cs_work_begin_limit(scratch); if(!context) return -4;
         struct qs_vector *vectors=cs_work_alloc(context,(p->predicate+1)*sizeof(*vectors));
         if(!vectors) { cs_work_end(context); return -4; }
         for(unsigned first=0;first<c->rows;first+=QS_VECTOR_ROWS) {

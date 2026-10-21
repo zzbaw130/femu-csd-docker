@@ -4,7 +4,7 @@
 
 目标是把 PG 执行计划转换为 SNIA batch，由 Guest 调度 CSD 算子。只读实验使用与原生 PG 相同的全表 visible/frozen heap；实验前准备一次 schema、extent 和 LBA 映射，后续持续使用。文件、schema 或设备变化以及重启后重新准备，不设置守护连接。
 
-当前完成阶段1：Q1/Q6 由 PG 表达式树生成动态 pipeline，通过 CustomScan 卸载 Scan、Filter、表达式、SUM/AVG/COUNT、低基数分组、结果排序与 LIMIT/OFFSET。Q1/Q6 的 SQL 数据算子都在 CSD 执行；PG 负责规划、权限检查及结果 Datum 转换。其余能力按[开发计划](doc/development.md)逐步补齐，尚未支持全部22条 TPC-H。
+当前完成阶段1，并接入阶段2的外部行排序/TopN：Q1/Q6 由 PG 表达式树生成动态 pipeline，通过 CustomScan 卸载 Scan、Filter、表达式、SUM/AVG/COUNT、低基数分组、结果排序与 LIMIT/OFFSET。Q1/Q6 的 SQL 数据算子都在 CSD 执行；PG 负责规划、权限检查及结果 Datum 转换。其余能力按[开发计划](doc/development.md)逐步补齐，尚未支持全部22条 TPC-H。
 
 ## 执行路径与冷启动
 
@@ -16,7 +16,7 @@ SET pg_sina_csd.exe_path=csd;  -- 卸载支持的查询计划，不支持时保�
 
 `auto` 将在成本模型实现后开放，目前只接受 `host` / `csd`。切换选项会使 prepared plan 缓存失效，下一次执行按新路径重新规划。需要在规划前 LOAD 扩展；也可通过 session_preload_libraries 加载。
 
-当前只为单表聚合生成完整 CustomScan；不支持的连接、HAVING、表达式等保留原生计划。后续再扩展到混合子计划，不会将不支持的算子伪装成设备执行。没有准备映射的表也保留原生路径；已有映射失效时执行报错并要求重新 prepare。可用 EXPLAIN 查看 `SniaCsdAggregate` 及实际 SNIA Pipelines。
+当前为支持的单表聚合生成 `SniaCsdAggregate`，为单表 `ORDER BY` 行查询生成 `SniaCsdSort`；后者支持普通外部排序及有界 TopN，结果分批返回，不受256行总量限制。不支持的连接、HAVING、表达式等保留原生计划；当前也不在未支持外层查询的子查询中单独卸载，以避免多个分批source各自持有设备锁。后续再扩展到混合子计划，不会将不支持的算子伪装成设备执行。没有准备映射的表也保留原生路径；已有映射失效时执行报错并要求重新 prepare。可用 EXPLAIN 查看 `SniaCsdAggregate` 及实际 SNIA Pipelines。
 
 TPC-H测量每条语句之前使用Guest的cold-query.sh：停止PG清空shared buffers，sync并drop_caches，再启动PG（测试期间autovacuum=off）。host和csd同样处理；不是只清除OS缓存。脚本在Guest执行：
 
@@ -33,7 +33,7 @@ TPC-H测量每条语句之前使用Guest的cold-query.sh：停止PG清空shared 
 | --- | --- |
 | src/extension.c | Guest PG 扩展入口、exe_path 与 planner hook |
 | src/planner/ | Guest PG 表达式树转设备计划，选择可卸载路径 |
-| src/executor/aggregate.c | Guest CustomScan 生命周期及最终 Datum 转换 |
+| src/executor/aggregate.c | Guest 聚合/排序 CustomScan 生命周期、分批取结果及最终 Datum 转换 |
 | src/executor/mapping.c | Guest PG 读取已准备的 schema/extent 映射 |
 | src/executor/batch.c | PG backend 直接调用 SNIA，编排 batch 并回收资源 |
 | src/prepare.c | Guest PG 内检查 visible/frozen，checkpoint，保存 schema/extent/LBA |
@@ -67,6 +67,8 @@ bash tests/pg-sina-csd-test.sh query
 bash tests/pg-sina-csd-test.sh profile
 # Q1/Q6各3轮，交替host/csd，每次重新冷启动并核对结果
 bash tests/pg-sina-csd-test.sh bench
+# SF=1 lineitem 上的 TopN 与外部行排序，各3轮冷启动核对和计时
+bash tests/pg-sina-csd-test.sh order-bench
 ```
 
 Guest 中也可手动：
@@ -143,6 +145,35 @@ PG 查询设备 FDM/CU 容量，通常按4MiB块分配最多4个执行槽；每�
 
 EXPLAIN ANALYZE 会显示投影列数、设备 CU 数、扫描/匹配行数、内部读取量、AFDM 用量及 workmem 峰值。计时包含程序加载、SNIA 编排与回收，不只统计设备计算。具体类型和规模限制见[设备算子说明](../../csd-programs/pg_sina_csd/README.md)。
 
+## 外部行排序与 TopN
+
+单表行查询例如：
+
+```sql
+SET pg_sina_csd.exe_path=csd;
+SELECT l_orderkey,l_extendedprice
+FROM lineitem
+ORDER BY l_extendedprice DESC,l_orderkey
+LIMIT 100;
+```
+
+PG 根据表达式生成两条设备流水线：
+
+```text
+LOAD → Scan → Filter（可选）→ Sort.sink  # 多个独立执行槽，重复处理输入
+Sort.source                            # 等待全部sink完成，归并并按批输出
+```
+
+这里的 Sort.sink/source 都是 `csd-programs/pg_sina_csd/sort.c` 中的设备 CSF，Guest 不排序。借鉴 DuckDB 的局部排序、阻塞边界及 TopN 堆：`OFFSET+LIMIT` 足够小时，每个sink只保留最优的这些行；否则生成有序段，优先保留在 workmem，预算不足以容纳下一段时通过 NEED_STORE 请求 SNIA 内部 STORE。source 用小根堆归并各执行槽的有序段，通过 NEED_LOAD 读取 spill 数据，完成后通过 NEED_FREE 释放 token。排序输入按实际输出列数紧凑存储；排序目前沿用已支持的 numeric、整数、date、bool、bpchar(1)，不代表已经支持任意字符串。
+
+每次source最多输出256行，PG保留当前查询的 SNIA 设备、batch、结果AFDM和状态句柄，继续提交同一个source batch，直到设备报告结束。256是结果块容量，聚合的256组上限仍需后续阶段解除。OFFSET/LIMIT在设备source处理，不在Guest重复切分。
+
+原始输入AFDM在当前块的Scan/Filter结束后可作为sink的spill I/O缓冲，列结果仍保留在独立AFDM；没有把排序工作区放到AFDM。输入结束后，仅保留source需要的句柄、I/O和结果缓冲，其他输入槽立即释放。单个有序段至多1MiB，spill I/O块为64KiB；这里的64KiB用于归并时按需读入，多个块属于同一个有序段，不会增加归并段数。读缓冲不足时可释放已有spill副本的读缓冲，保留段头，再按需加载。workmem容量由设备配置决定；每个局部上下文按查询上限和实际执行槽数限额。
+
+正常结束先释放token再销毁私有上下文。错误、取消、重扫或提前关闭游标时，先排空在途请求并释放设备私有内存，再关闭本查询的SNIA设备以回收其临时空间；即使失败batch已回滚部分token，内存回收也不依赖再次释放这些失效token。PG查询内存上下文的清理回调负责兜住异常退出，无辅助进程。
+
+`EXPLAIN ANALYZE` 增加 `CSD Sort Runs`、`CSD Spilled Runs`、`CSD Spill Write/Read`；开启profile后分别展示 `Sort.sink` 和 `Sort.source`。累计调用包含I/O重入，不等于输入块数。
+
 ## 开发阶段的算子计时
 
 ```sql
@@ -177,3 +208,19 @@ TPC-H 仍须每条查询先冷启动。将 `SET pg_sina_csd.profile=on;` 和一�
 计时统一实现于设备 `profile.c` 入口包装与 PG `executor/batch.c`，没有在设备算法的行循环中插入代码。关闭时直接调用原实现，不读时钟、不分配/读取计时 AFDM；仍保留入口的一次条件判断。开启后每个 CU 增加一个计数输出 AFDM（当前按4KiB分配），一次调用读取两种时钟各两次；有额外开销，性能结论应同时保留关闭时的冷启动测量。
 
 Q1/Q6三轮统计、perf热点及优化顺序见[性能分析](doc/performance.md)。复现：`bash tests/pg-sina-csd-test.sh analyze`；该入口另采集host/csd/profiled三组EXPLAIN及SNIA日志，结束后恢复普通PG环境。
+
+### 查询工作内存上限
+
+```sql
+SET pg_sina_csd.max_memory = '64MB';
+-- 对同一条查询测试较小预算：
+SET pg_sina_csd.max_memory = '16MB';
+```
+
+这是本项目的PG参数，默认64MB、最小4MB，限制一条设备查询全部执行槽的workmem，不包括独立的AFDM输入输出缓冲、Guest编排内存或FEMU进程本身。参数在执行时读取，已PREPARE的查询也使用当前值。各槽平均分配预算，设备再以共享池实际容量限额；设备池的硬上限仍由启动时的`CSD_WORKMEM_SIZE_MB`决定，参数设得更大不会扩充设备内存。修改设备池容量须在下一次启动FEMU时生效，不能在有存活状态时调整池大小。
+
+例如查询预算16MB、4槽，每槽最多4MB。每槽先为可能并发使用的Filter表达式临时列及其分配元数据留出空间，剩余预算交给Sort/聚合私有上下文。这样各槽Filter与sink即使同时运行，也不会因分别使用完整预算而超限。当前槽间采用静态均分，尚未实现DuckDB的动态预算再分配；复杂表达式的不可spill工作区若连最低预算都无法容纳，会报告设备执行错误。
+
+排序不采用“空闲低于50%”的固定触发线。参考本地DuckDB `src/common/sort/sort.cpp`的预算/线程分摊和外部排序判定：当前实现先保留内存段，准备下一段时检查“已用内存＋新段＋64KiB归并I/O余量＋分配开销”是否超过槽预算，超过则将已排序内存段spill。实际分配失败也会触发spill，以处理共享池竞争或碎片。预算减小时单段容量从1MiB逐步缩小，最低64KiB；归并仍按64KiB加载所需块，并可丢弃已有NVM副本的读缓存。
+
+`EXPLAIN ANALYZE`的`CSD Query Memory Limit`显示执行时配置的查询上限，实际仍受设备池容量限制；`CSD Workmem Peak`来自设备共享分配器，是该池生命周期的历史峰值，不应用它判断某条低预算查询是否超限。独立进程的设备测试会核对实际峰值及清理后的零占用。运行`bash tests/pg-sina-csd-test.sh memory`可冷启动核对4/16/64/128MB预算下Q1、Q6和外部排序结果，以及已PREPARE查询的参数切换。

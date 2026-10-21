@@ -8,12 +8,20 @@ typedef struct {
     struct qs_result *result;
     unsigned index;
     bool explain_only,executed,profiling;
+    struct pg_sina_stream *stream;
+    MemoryContextCallback cleanup;
 } SniaState;
 static const CustomExecMethods methods;
+static const CustomExecMethods order_methods;
 static Node *create_state(CustomScan *scan)
 {
     SniaState *s=(SniaState *)newNode(sizeof(*s),T_CustomScanState);
-    s->css.methods=&methods; return (Node *)s;
+    s->css.methods=scan->methods==&pg_sina_order_methods?&order_methods:&methods; return (Node *)s;
+}
+static void release(void *arg)
+{
+    SniaState *s=arg;
+    if(s->stream) { pg_sina_close(s->stream); s->stream=NULL; }
 }
 static void begin(CustomScanState *node,EState *estate,int flags)
 {
@@ -24,6 +32,8 @@ static void begin(CustomScanState *node,EState *estate,int flags)
     s->explain_only=flags&EXEC_FLAG_EXPLAIN_ONLY;
     /* PG12 palloc guarantees MAXALIGN=8; native __int128 records need 16. */
     s->result=(void *)TYPEALIGN(16,(uintptr_t)palloc0(sizeof(*s->result)+15));
+    s->cleanup.func=release; s->cleanup.arg=s;
+    MemoryContextRegisterResetCallback(estate->es_query_cxt,&s->cleanup);
 }
 static Datum decimal(struct qs_cell value)
 {
@@ -45,8 +55,12 @@ static TupleTableSlot *execute(CustomScanState *node)
     if(!s->executed) {
         struct qs_extent *extents=pg_sina_mapping(&s->request);
         s->profiling=pg_sina_profile;
-        pg_sina_execute(&s->request,extents,s->result,s->profiling); s->executed=true;
-        if(s->result->begin+s->result->rows>QS_GROUPS) elog(ERROR,"invalid CSD result range");
+        pg_sina_execute(&s->request,extents,s->result,s->profiling,&s->stream); s->executed=true;
+        if(s->result->begin+s->result->rows>QS_RESULT_ROWS) elog(ERROR,"invalid CSD result range");
+    }
+    while(s->index==s->result->rows && !s->result->finished && s->stream) {
+        pg_sina_fetch(&s->stream,s->result); s->index=0;
+        if(s->result->begin+s->result->rows>QS_RESULT_ROWS) elog(ERROR,"invalid CSD result range");
     }
     if(s->index==s->result->rows) return ExecClearTuple(slot);
     ResetExprContext(node->ss.ps.ps_ExprContext); ExecClearTuple(slot);
@@ -69,14 +83,14 @@ static TupleTableSlot *execute(CustomScanState *node)
     node->ss.ps.ps_ExprContext->ecxt_scantuple=slot;
     return node->ss.ps.ps_ProjInfo?ExecProject(node->ss.ps.ps_ProjInfo):slot;
 }
-static void end(CustomScanState *node) {}
+static void end(CustomScanState *node) { release(node); }
 static void rescan(CustomScanState *node)
 {
-    SniaState *s=(SniaState *)node; s->executed=false; s->index=0;
+    SniaState *s=(SniaState *)node; release(s); s->executed=false; s->index=0;
 }
 static void explain_profile(const struct qs_profile *p,ExplainState *es)
 {
-    static const char *names[]={"Scan","Filter","Aggregate.sink","Aggregate.source","Sort","Limit"};
+    static const char *names[]={"Scan","Filter","Aggregate.sink","Aggregate.source","Sort","Limit","Sort.sink","Sort.source"};
     if(es->format==EXPLAIN_FORMAT_TEXT) {
         appendStringInfoSpaces(es->str,es->indent*2);
         appendStringInfoString(es->str,"CSD Profile (operator times summed across CUs):\n"); ++es->indent;
@@ -114,9 +128,12 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     ExplainPropertyText("CSD Scheduling","independent serial batches",es);
     StringInfoData graph; initStringInfo(&graph); appendStringInfoString(&graph,"LOAD -> Scan");
     if(p->predicate>=0) appendStringInfoString(&graph," -> Filter");
-    appendStringInfoString(&graph," -> Aggregate.sink; Aggregate.source");
-    if(p->norder) appendStringInfoString(&graph," -> Sort");
-    if(p->limit>=0 || p->offset) appendStringInfoString(&graph," -> Limit");
+    if(p->ordered_rows) appendStringInfoString(&graph," -> Sort.sink; Sort.source (OFFSET/LIMIT)");
+    else {
+        appendStringInfoString(&graph," -> Aggregate.sink; Aggregate.source");
+        if(p->norder) appendStringInfoString(&graph," -> Sort");
+        if(p->limit>=0 || p->offset) appendStringInfoString(&graph," -> Limit");
+    }
     ExplainPropertyText("SNIA Pipelines",graph.data,es); ExplainPropertyInteger("CSD Columns",NULL,p->ncols,es);
     unsigned deferred=0;
     for(unsigned i=0;i<p->nattrs;++i) deferred+=p->cols[i].deferred!=0;
@@ -129,9 +146,19 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
         ExplainPropertyInteger("CSD Heap Rows",NULL,s->result->metrics.scanned,es);
         ExplainPropertyInteger("CSD Matched Rows",NULL,s->result->metrics.matched,es);
         ExplainPropertyInteger("CSD Internal Read","bytes",s->result->metrics.input_bytes,es);
+        ExplainPropertyInteger("CSD Query Memory Limit","bytes",p->work_mem_bytes*s->result->metrics.workers,es);
         ExplainPropertyInteger("CSD Workmem Peak","bytes",s->result->metrics.work_peak,es);
+        if(p->ordered_rows) {
+            ExplainPropertyInteger("CSD Sort Runs",NULL,s->result->metrics.runs,es);
+            ExplainPropertyInteger("CSD Spilled Runs",NULL,s->result->metrics.spilled_runs,es);
+            ExplainPropertyInteger("CSD Spill Write","bytes",s->result->metrics.spill_write_bytes,es);
+            ExplainPropertyInteger("CSD Spill Read","bytes",s->result->metrics.spill_read_bytes,es);
+        }
     }
 }
 static const CustomExecMethods methods={.CustomName="SniaCsdAggregate",.BeginCustomScan=begin,.ExecCustomScan=execute,
     .EndCustomScan=end,.ReScanCustomScan=rescan,.ExplainCustomScan=explain};
 const CustomScanMethods pg_sina_scan_methods={.CustomName="SniaCsdAggregate",.CreateCustomScanState=create_state};
+static const CustomExecMethods order_methods={.CustomName="SniaCsdSort",.BeginCustomScan=begin,.ExecCustomScan=execute,
+    .EndCustomScan=end,.ReScanCustomScan=rescan,.ExplainCustomScan=explain};
+const CustomScanMethods pg_sina_order_methods={.CustomName="SniaCsdSort",.CreateCustomScanState=create_state};

@@ -279,3 +279,55 @@ Q1聚合CPU减少约13.4%，三者合计减少4.4%；其Scan代码及提前解�
 验收：11项设备CTest及最终改动相关的6项重复检查通过；6项PG设备ASan/UBSan通过（当前执行环境无法运行LeakSanitizer，设置detect_leaks=0；workmem释放仍由测试断言检查）。最终Guest完整冷启动SQL回归、Q1/Q6全部结果、prepared路径切换、取消后同backend重复执行、设备报错排空后复用，以及profile开关和计数检查全部通过。
 
 最终Guest回归目录和主机日志分别记录在 `/tmp/pg-snia-vector-fused-{query,profile,host-csd}.log`；host/CSD原始计时另存主机 `/tmp/pg-snia-vector-fused-host-csd.tsv`。
+
+
+## 阶段2a：外部行排序、TopN与可配置工作内存（2026-10-21）
+
+本阶段增加单表行排序，Guest PG编排`LOAD→Scan→Filter（可选）→Sort.sink`四槽独立batch；输入耗尽后由设备`Sort.source`归并并执行OFFSET/LIMIT。小LIMIT使用局部TopN堆。输出按256行连续返回PG，256是结果块容量，不再限制排序总行数。全部run、表达式工作区、段头和归并堆通过workmem分配，AFDM仅用于输入、列批次、结果与spill传输。SNIA按NEED_STORE/LOAD/FREE完成设备内部数据移动与重入，无SQL runtime、辅助进程或Guest文件排序。
+
+`pg_sina_csd.max_memory`默认64MB，为单条设备查询全部槽的工作内存上限；每槽先保留Filter临时空间，sink使用剩余份额，并受物理池容量限制。下一份run将超预算时spill，实际分配失败也会尝试腾出空间；没有统一的“空闲不足50%”阈值。参考本地DuckDB `src/common/sort/sort.cpp`的预算/线程分摊及外部排序判定，当前未引入其动态预算管理器。完整run对齐到64KiB传输块所能容纳的行数，避免仅几行的额外尾块。
+
+### 容量升降验证
+
+本地独立进程以1,048,583行、每行3个32字节单元（约96MiB），4槽sink、单source完整归并，与原生qsort逐行比较NULL顺序、值和小数显示精度。测试NVM仅模拟STORE/LOAD/FREE，不是设备带宽测试。每次结束断言全部token、上下文和分配已回收。
+
+| 物理池 / 查询预算 MiB | 全部用例期间池峰值 bytes | 96MiB数据STORE次数 | LOAD次数 |
+| --- | ---: | ---: | ---: |
+| 4 / 4 | 4049296 | 1500 | 1867 |
+| 8 / 8 | 8190704 | 1464 | 1621 |
+| 16 / 16 | 16614992 | 1392 | 1419 |
+| 64 / 64 | 65522528 | 624 | 624 |
+| 128 / 128 | 103880016 | 0 | 0 |
+| 64 / 4 | 4049296 | 1500 | 1867 |
+
+每次传输64KiB；较小预算下，已有NVM副本的读缓冲可丢弃再加载，所以LOAD次数可能大于STORE次数。峰值包含该进程先前的小规模、TopN及提前关闭测试，不是只统计96MiB这一用例。64MiB池/4MiB预算与4MiB池行为一致，说明查询预算实际约束分配；128MiB池能保留全部数据而不spill。
+
+17项设备CTest通过；最终改动相关12项重复检查以及6个外部排序容量ASan/UBSan检查通过。ASan设置detect_leaks=0，环境不支持LeakSanitizer，资源回收由workmem和token断言另行核对。Guest完整冷启动SQL回归通过，覆盖连续输出、实际spill、TopN/OFFSET、空输入、NULL、原生回退、prepared路径切换、报错/取消及游标提前关闭后的设备复用；不支持的外层查询整体回退PG，避免嵌套设备扫描争用同一设备锁。
+
+完整TPC-H查询仍只验收Q1/Q6；下述排序语句是SF=1 heap上的算子验证，不是新增已完成的TPC-H查询编号。高基数聚合与Join继续属于下一阶段。
+
+Guest最终容量实验 `/tmp/pg-sina-queries.J4XFak`：Q1、Q6及`tests/order_spill.sql`在4/16/64/128MB查询上限下分别冷启动，全部输出与host精确相等；PREPARE后的4→64MB切换也通过。物理池维持64MiB、不重启FEMU。下表为独立冷启动EXPLAIN，不与关闭profile的延迟样本混合：
+
+| 查询上限 MiB | run数 / spill run数 | STORE bytes | LOAD bytes |
+| --- | --- | ---: | ---: |
+| 4 | 895 / 875 | 114688000 | 1399455744 |
+| 16 | 225 / 197 | 103284736 | 1112539136 |
+| 64 | 114 / 54 | 56623104 | 3538944 |
+| 128 | 114 / 54 | 56623104 | 3538944 |
+
+64/128MB行为相同，符合64MiB物理池上限。小预算下结果和内存限制正确，但当前直接多路归并不能为每个run保留64KiB读缓冲，丢弃和重读导致明显的读取放大；仅有LIMIT/OFFSET也不能消除为找出下一个最小行所需的补读。后续应增加受预算限制的多轮归并或更细的读缓存组织，不能把当前4/16MB实现描述为已完成I/O优化。所有run元数据仍需驻留，极大量run还有内存边界。
+
+最终完整SQL回归日志 `/tmp/pg-snia-memory-final-query.log`，Guest `/tmp/pg-sina-queries.1hAsuE`；最终容量日志 `/tmp/pg-snia-memory-aligned-matrix.log`，profile快照 `/tmp/pg-snia-memory-final-matrix.json`。设备测试 `/tmp/pg-snia-memory-aligned-tests.log`，容量sanitizer `/tmp/pg-snia-memory-aligned-asan.log`。
+
+### 最终版本SF=1排序延迟
+
+Guest `/tmp/pg-sina-queries.KjmMQM`，主机日志 `/tmp/pg-snia-memory-order-bench.log`。全部为关闭profile、独立冷启动的3轮交替host/CSD，每次核对全部返回结果，未删除样本。原生PG保留既有`work_mem=4MB`及并行配置；CSD为4 CU、64MiB查询预算与64MiB物理池。这是现有两条执行路径的对照，不能解释为等核数、等总内存的排序算法比较。
+
+| 测试 / 路径 | 三轮 ms | 均值 ms | 中位数 ms |
+| --- | --- | ---: | ---: |
+| order_topn / host | 2342.514 / 1627.240 / 1887.978 | 1952.577 | 1887.978 |
+| order_topn / csd | 580.339 / 515.125 / 534.893 | 543.452 | 534.893 |
+| order_spill / host | 2240.059 / 1987.981 / 2353.129 | 2193.723 | 2240.059 |
+| order_spill / csd | 1353.913 / 1321.059 / 1328.090 | 1334.354 | 1328.090 |
+
+TopN扫描lineitem后按extendedprice降序、orderkey升序取100行。外部排序筛选1995年发货记录，按四列排序后OFFSET 10000、LIMIT 12000，约117MiB紧凑行数据超过64MiB预算，验证实际spill。独立开启profile的样本保存在同目录两个JSON中，不混入延迟均值。FEMU带宽模型参数未调整，少量样本不代表真实SSD的固定收益。
