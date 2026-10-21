@@ -234,3 +234,20 @@ Q12方向调整将内部读取从约2.98GB降至1.14GB、CSD均值从3819.775ms�
 验收：PG扩展在Guest重新编译安装；完整join回归34项检查通过，包括两侧过滤、重复键、空build、4MB双重spill、结果分页、字符串回退、报错/取消/提前关闭后的同backend复用。另以300ms超时取消完整Q12，随后同backend连续两次CSD COUNT均得到6001215。测试脚本的Join取消时间同步改为300ms，给程序加载留出时间，覆盖并行build阶段。
 
 独立冷启动各3轮，完整输出一致：Q12 host/CSD均值1924.764/1199.416ms，Q14为1646.389/641.160ms。Q12第二轮CSD为1438.838ms，已保留。单独profile确认Build Wall从上一阶段3204.146ms降至834.015ms，内部读取仍1135394816字节且无spill。设备CSF未修改，不重复其上一阶段容量/sanitizer测试；完整数据和限制见[性能分析](performance.md)。本阶段没有增加完整TPC-H Query覆盖，后续仍需扩展多表Join、一般字符串、HAVING及子查询。
+
+## 阶段3c：跨表复合过滤、数值IN与完整Q19（2026-10-22）
+
+- 从两表INNER JOIN中选择一个直接整数列等值条件建哈希表，其余跨表表达式在probe产生的列批次上处理，不再因额外比较或AND/OR而整体回退。单表谓词仍交给各自物理Filter，全部所需列继续由PG投影。
+- 参考DuckDB `join_hashtable.cpp` 的候选匹配后选择，以及已有`physical_filter.cpp`/列向量实现：将原filter.c编译进join SO，直接复用比较、SIMD、NULL三值逻辑与AND/OR短路。没有另发设备请求或新增CU；`HashJoin.probe+Aggregate`计时包含此Filter，EXPLAIN标出Filter(join)。
+- 连接列值已由物理Filter完成numeric解码，连接后Filter禁用heap偏移解释。聚合spill时保留已经过滤的selection和probe位置，恢复只执行待提交聚合，避免重复过滤与Join Rows计数；Join Rows改为跨表过滤后的行数，原来无额外谓词时含义不变。
+- 过滤临时空间按本地与跨表表达式中较大的需求预留，聚合常驻期间仍能执行下一批Filter。小查询预算下带跨表过滤的Join为每槽保留约2MiB，减少并行度，而非提高总预算。4MB可退为1槽；既有无跨表过滤的分组Join规则不变。
+- 常量IN扩展到smallint/int/bigint/numeric，单数组最多32项，复用比较与OR表达式以及公共子表达式。参考DuckDB `in_clause_rewriter.cpp` 的小集合展开；没有实现其大集合MARK JOIN。空数组、NOT IN和未支持的数组形式仍按PG原生计划执行。
+- Q19使用现有qgen参数及OR分支重复连接键的原SQL，另保留不同参数、公共连接键在OR之外的写法。PG处理表达式树，不识别查询编号。未编码完整字符串上的跨表NULL判断仍不支持，并有显式回退用例；不能据此声称一般字符串已经完成。
+
+首次Q19测量发现一个原有内存策略问题：哈希容量被PG过滤行数估计固定住，64MB预算下仅用少量内存也提前分成2批，lineitem重扫两遍。本阶段补充build动态扩容：估计只决定首次分配，满表后在build上下文限额内逐次加倍记录和桶数组，扩容失败或到达按预算计算的最大容量才spill。桶扩容失败时缩回新增记录空间，保留原容量继续spill；不留下失配数组。统一分配器在复制扩容期间同时计入新旧块，因此瞬时峰值也受硬上限约束，可能比最终布局允许的容量更早spill。新增估计256行、实际70003行的差分测试，64MB时断言不发生build spill；4MB预算仍验证多批与完整结果。
+
+扩容策略参考本地DuckDB `PhysicalHashJoin::Finalize`：按实际总大小和当前内存预约判断是否外部执行，而非用基数估计直接决定spill。本项目采用现有连续记录数组的最小改动，没有引入其临时内存管理器或radix分区框架。
+
+验收：最初24项设备CTest、19项PG算子ASan/UBSan全部通过；补充动态扩容后重新运行24项CTest及3项Join ASan/UBSan，均通过。Guest单表/既有查询55项检查通过，包含数值IN的NULL/显示精度、空数组和NOT IN回退、Q1/Q6、prepared plan及资源清理；最终扩容版完整Join检查45项通过，包含跨表大小比较、附加等值、OR/NULL、4MB聚合spill、Q12/Q14、Q19原SQL及不同参数写法的4/64MB对照，以及报错/取消/早关游标后同backend复用。仍未实现多表Join、一般字符串、HAVING/MIN/MAX/COUNT DISTINCT、semi/anti和子查询；后续优先扩展多表连接与其所需的列/中间结果传递。
+
+最终扩容版各3轮冷启动均值：Q12 host/CSD=1969.966/1065.199ms，Q14=1752.395/604.802ms，Q19=2088.169/1068.240ms，完整输出一致。Q14/Q19 host波动较大，全部样本保留。Q19独立profile确认build从2批变为1批、内部读取从1876811776降至955187200字节，无spill，Scan/Filter从449次降至229次；总计1007.579ms。原始样本、指标及限制见[性能分析](performance.md)。

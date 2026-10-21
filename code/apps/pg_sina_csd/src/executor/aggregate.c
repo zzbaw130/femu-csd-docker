@@ -153,7 +153,9 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     appendStringInfoString(&graph,"LOAD -> Scan");
     if(p->predicate>=0) appendStringInfoString(&graph," -> Filter");
     if(p->join.relid) {
-        appendStringInfoString(&graph," -> HashJoin.probe -> Aggregate.sink; Aggregate.source");
+        appendStringInfoString(&graph," -> HashJoin.probe");
+        if(p->join.residual) appendStringInfoString(&graph," -> Filter(join)");
+        appendStringInfoString(&graph," -> Aggregate.sink; Aggregate.source");
         if(p->external_aggregate && p->norder) appendStringInfoString(&graph," -> Sort");
         appendStringInfoString(&graph," -> Projection");
     }

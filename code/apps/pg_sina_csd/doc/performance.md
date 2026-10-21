@@ -471,3 +471,44 @@ Guest的1289854组合测试，在4MB预算下用2槽，build分3批，source汇�
 Guest完整`join`回归34项检查通过，覆盖重复键、空build、两侧过滤、4MB build与分组双重spill、多页输出、字符串/原生回退，以及错误/取消/提前关闭后同backend复用。另以300ms超时取消完整Q12，再在同一backend连续两次CSD COUNT得到6001215，验证并行build在途请求排空后可继续使用。未修改设备CSF，未重复运行其上一阶段已通过的24项CTest和19项ASan/UBSan；本阶段重新编译安装PG扩展并执行真实Guest调度路径。
 
 日志：主机`/tmp/pg-snia-parallel-build-join.log`、`/tmp/pg-snia-parallel-build-bench.log`、`/tmp/pg-snia-parallel-build-q12-profile.json`、`/tmp/pg-snia-parallel-build-cancel.log`；Guest回归目录`/tmp/pg-sina-queries.cslVMo`、测量目录`/tmp/pg-sina-queries.fBBPOM`。FEMU PCIe带宽模型未启用等既有限制仍适用；这是当前仿真环境对照，不代表真实设备或等总内存、等核数测试。
+
+## 阶段3c：Q19、跨表过滤与哈希扩容（2026-10-22）
+
+Q19使用项目已有qgen参数（Brand#42/#43/#33，数量9/19/28），保留三个OR分支中各自重复连接键的原SQL。另用Brand#12/#23/#34与数量1/10/20、公共等值条件在OR之外的写法验证规划不依赖SQL形状。两种查询均在4/64MB预算下与host逐字一致。完整覆盖增加到Q1/Q6/Q12/Q14/Q19，不能把本阶段视为完成全部22条查询。
+
+### 首次测量暴露的估计容量问题
+
+首次完整实现、尚未补build扩容时，三轮冷启动Q19 host为1659.353/1667.276/1729.557ms，均值1685.395ms；CSD为1920.956/1932.439/2597.747ms，均值2150.381ms、中位数1932.439ms，第三轮较高但保留。这一版本完整卸载却较慢。
+
+独立profile（`/tmp/pg-snia-q19-profile.json`）确认part build扫描200000行，容量由过滤后估计行数固定，实际装满后即spill，即使64MB预算仍有余量。结果仅写/读各131072字节，却使build分2批、lineitem完整扫描两遍：probe累计12002430行、449块，内部读取1876811776字节。最终只有127个连接行进入聚合。Setup/Build/probe/source/Cleanup为62.889/47.656/1691.281/0.547/8.821ms，总计1811.194ms。Scan/Filter累计CU CPU为3193.569/1715.905ms，HashJoin.probe含跨表过滤及聚合仅22.184ms；主要代价是重复扫描/解码，不能归因于最终127行的聚合。
+
+据此补充有界扩容：估计决定初始容量，后续装满先尝试增长，达到build预算或真实分配失败后才spill。复制扩容期间的新旧内存也受统一分配器限额约束；桶扩容失败时缩回记录数组新增空间，沿用原容量。没有提高任何内存配置。估计256行、实际70003行的设备差分测试在64MB下断言一批且无build spill，4MB下仍检查完整结果、多批和总峰值界限。
+
+首次日志为`/tmp/pg-snia-q19-variant-and-bench.log`，Guest测量目录`/tmp/pg-sina-queries.QX8jBy`；这组数据用于解释扩容前的问题，不作为最终实现延迟。
+
+### 最终扩容版本的冷启动延迟
+
+全部构建、sanitizer与正确性回归结束后，独立运行`join-bench`。host/CSD交替各3轮，每次停止PG、清Guest页缓存并启动；profile关闭，逐次比较完整输出。设备仍4 CU、64MiB AFDM、64MB查询/物理workmem，原生PG仍使用既有work_mem和并行设置。没有同时运行编译或其他测试。
+
+| 查询/路径 | 三轮 ms | 均值 ms | 中位数 ms |
+| --- | --- | ---: | ---: |
+| Q12/host | 1938.046 / 1917.202 / 2054.650 | 1969.966 | 1938.046 |
+| Q12/csd | 1062.069 / 1082.074 / 1051.453 | 1065.199 | 1062.069 |
+| Q14/host | 1571.375 / 1365.877 / 2319.934 | 1752.395 | 1571.375 |
+| Q14/csd | 574.015 / 616.961 / 623.430 | 604.802 | 616.961 |
+| Q19/host | 1591.329 / 2416.932 / 2256.246 | 2088.169 | 2256.246 |
+| Q19/csd | 1076.218 / 1098.844 / 1029.659 | 1068.240 | 1076.218 |
+
+本轮按均值，Q12约1.85倍、Q14约2.90倍、Q19约1.95倍。Q14/Q19的host波动较大，全部保留；扩容前Q19 host均值为1685.395ms，不能将两个阶段的host变化归为设备优化收益。更直接的依据是下面同一数据量的扫描次数和profile。Q1/Q6已通过完整结果回归，本阶段未重测其三轮延迟。FEMU未启用PCIe带宽模型等既有限制仍适用，本结果也不是等总内存、等核数对照。
+
+最终Q19另行冷启动profile（`/tmp/pg-snia-q19-growth-profile.json`）：一个CSD CustomScan，part build扫描200000行，只有1个驻内存批次，lineitem probe扫描6001215行、物理过滤后128267行，跨表过滤后127行进入聚合；229块，内部读取955187200字节，spill写/读均为0。AFDM58150912字节，设备报告workmem池峰值3848720字节；严格逐查询容量边界仍由独立设备测试检查。
+
+Setup/Build/probe/source/Cleanup分别为77.367/50.175/869.702/0.789/9.546ms，总计1007.579ms。Scan/Filter累计CU CPU分别1678.179/876.803ms，HashJoin.build/load仅0.206/0.011ms，probe含跨表Filter和聚合11.385ms。相较初次profile，少读921624576字节，少220次Scan/Filter，主要收益是避免无必要的第二次lineitem全表扫描。后续仍可优化heap解码和本地过滤，低预算外部聚合的归并读取放大依旧存在。
+
+### 验证与复现
+
+- 24项设备CTest和19项PG算子ASan/UBSan通过。扩容修改后重新通过24项CTest、3项Join ASan/UBSan；测试故意把70003行估为256行，在64MB断言单批无build spill，4MB验证多批、全部重复键组合、NULL与预算峰值，结束时workmem和上下文为0。
+- Guest单表回归55项通过，覆盖Q1/Q6、高基数聚合、排序、IN/NULL/不同小数精度、空数组/NOT IN回退，以及prepared plan、报错/取消/提前关闭后的复用。最终扩容版本完整Join回归45项通过，包括跨表比较/附加等值/OR/NULL、4MB真实聚合spill、完整Q12/Q14、Q19两组参数和两种写法的4/64MB对照，及同backend资源回收。
+- 4MB跨表分组压力用例得到7001组、318524个连接行，build分3批，聚合也有实际spill，按现有规则降低为1槽。较小的归并窗口仍可能产生明显读取放大；本阶段不掩盖这一限制。
+
+主机日志：`/tmp/pg-snia-q19-native.log`、`/tmp/pg-snia-q19-asan.log`、`/tmp/pg-snia-q19-growth-native.log`、`/tmp/pg-snia-q19-growth-asan.log`、`/tmp/pg-snia-q19-final-guest.log`、`/tmp/pg-snia-q19-growth-guest-join.log`、`/tmp/pg-snia-q19-growth-bench.log`。Guest单表目录`/tmp/pg-sina-queries.1nwb9b`，最终Join目录`/tmp/pg-sina-queries.MabHoz`，最终性能目录`/tmp/pg-sina-queries.h4vM3R`。入口为`tests/pg-sina-csd-test.sh query|join|join-bench`。

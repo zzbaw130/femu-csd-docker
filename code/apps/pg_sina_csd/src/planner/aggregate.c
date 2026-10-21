@@ -217,14 +217,18 @@ static int expression(Node *node,Index rti,struct qs_plan *p)
         if(!s->useOr || list_length(s->args)!=2 || !IsA(lsecond(s->args),Const)) return -1;
         Const *array=lsecond_node(Const,s->args); if(array->constisnull) return -1;
         ArrayType *data=DatumGetArrayTypeP(array->constvalue); Oid type=ARR_ELEMTYPE(data);
-        if(type!=TEXTOID && type!=VARCHAROID && type!=BPCHAROID) return -1;
+        if(type!=TEXTOID && type!=VARCHAROID && type!=BPCHAROID && type!=INT2OID && type!=INT4OID && type!=INT8OID && type!=NUMERICOID) return -1;
         int16 length; bool byval; char align; Datum *values; bool *nulls; int count;
         get_typlenbyvalalign(type,&length,&byval,&align); deconstruct_array(data,type,length,byval,align,&values,&nulls,&count);
         if(!count || count>QS_STRINGS) return -1;
         int result=-1;
         for(int i=0;i<count;++i) {
             Const *literal=makeConst(type,-1,s->inputcollid,length,values[i],nulls[i],byval);
-            int next=string_comparison(linitial(s->args),(Node *)literal,get_opcode(s->opno),s->inputcollid,rti,p);
+            OpExpr *comparison=makeNode(OpExpr);
+            comparison->opno=s->opno; comparison->opfuncid=get_opcode(s->opno);
+            comparison->opresulttype=BOOLOID; comparison->inputcollid=s->inputcollid;
+            comparison->args=list_make2(linitial(s->args),literal);
+            int next=expression((Node *)comparison,rti,p);
             if(next<0) return -1;
             result=result<0?next:put(p,(struct qs_expr){.op=Q_OR,.type=Q_BOOLEAN,.left=result,.right=next});
             if(result<0) return -1;
@@ -352,7 +356,7 @@ static bool describe(PlannerInfo *root,Index rti,struct qs_plan *p,int build)
     }
     p->nattrs+=desc->natts; table_close(table,NoLock); return true;
 }
-static bool compile(PlannerInfo *root,Index rti,RelOptInfo *rel,Index build_rti,RelOptInfo *build_rel,OpExpr *join,struct qs_plan *p)
+static bool compile(PlannerInfo *root,Index rti,RelOptInfo *rel,Index build_rti,RelOptInfo *build_rel,OpExpr *join,List *quals,struct qs_plan *p)
 {
     if(!describe(root,rti,p,0) || (build_rti && !describe(root,build_rti,p,1))) return false;
     p->join.predicate=-1;
@@ -378,6 +382,20 @@ static bool compile(PlannerInfo *root,Index rti,RelOptInfo *rel,Index build_rti,
         restrict_string((Node *)r->clause,rti,p);
         if(p->join.predicate<0) p->join.predicate=next;
         else { p->join.predicate=put(p,(struct qs_expr){.op=Q_AND,.type=Q_BOOLEAN,.left=p->join.predicate,.right=next}); if(p->join.predicate<0) return false; }
+    }
+    /* PG pushes single-relation predicates into baserestrictinfo. Keep every
+     * remaining mixed predicate after the hash equality, including OR trees. */
+    if(join) foreach(cell,quals) {
+        Node *node=lfirst(cell); if(node==(Node *)join) continue;
+        Bitmapset *vars=pull_varnos(node); bool mixed=bms_num_members(vars)>1; bms_free(vars);
+        if(!mixed) continue;
+        int next=expression(node,rti,p); if(next<0) return false;
+        if(!p->join.residual) p->join.residual=next+1;
+        else {
+            int combined=put(p,(struct qs_expr){.op=Q_AND,.type=Q_BOOLEAN,.left=p->join.residual-1,.right=next});
+            if(combined<0) return false;
+            p->join.residual=combined+1;
+        }
     }
     /* Columns assigned slots so far are needed by WHERE, including nested
      * arithmetic/OR/NULL tests. Later slots are only used after filtering. */
@@ -479,10 +497,12 @@ static OpExpr *equality_join(List *quals,Index a,Index b)
         int count=bms_num_members(vars); bool mixed=bms_is_member(a,vars) && bms_is_member(b,vars); bms_free(vars);
         if(!count) return NULL; /* Keep constant-gated joins wholly native. */
         if(!mixed) { if(count!=1) return NULL; continue; }
-        if(join || !IsA(node,OpExpr)) return NULL;
-        OpExpr *op=(OpExpr *)node; if(list_length(op->args)!=2) return NULL;
+        if(join || !IsA(node,OpExpr)) continue;
+        OpExpr *op=(OpExpr *)node; if(list_length(op->args)!=2) continue;
         Oid fn=OidIsValid(op->opfuncid)?op->opfuncid:get_opcode(op->opno);
-        if(!builtin(fn,"int2eq") && !builtin(fn,"int4eq") && !builtin(fn,"int8eq")) return NULL;
+        if(!builtin(fn,"int2eq") && !builtin(fn,"int4eq") && !builtin(fn,"int8eq")) continue;
+        Node *left=unlabel(linitial(op->args)),*right=unlabel(lsecond(op->args));
+        if(!IsA(left,Var) || !IsA(right,Var) || ((Var *)left)->varno==((Var *)right)->varno) continue;
         join=op;
     }
     return join;
@@ -520,13 +540,13 @@ void pg_sina_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *i
         if(rel->tuples<build_rel->tuples) { Index swap=rti; rti=build_rti; build_rti=swap; RelOptInfo *other=rel; rel=build_rel; build_rel=other; }
         join=equality_join(quals,rti,build_rti); if(!join) return;
     }
-    struct qs_plan plan={0}; if(!compile(root,rti,rel,build_rti,build_rel,join,&plan)) return;
+    struct qs_plan plan={0}; if(!compile(root,rti,rel,build_rti,build_rel,join,quals,&plan)) return;
     /* Preserve the cheap raw-size choice when it fits. If it would spill,
      * compare filtered projected records on the other side as well. Estimates
      * only choose orientation; bounded batches still guarantee correctness. */
     if(build_rel && build_bytes(&plan,build_rel->rows)>(double)pg_sina_max_memory*1024/2) {
         struct qs_plan other={0};
-        if(compile(root,build_rti,build_rel,rti,rel,join,&other) && build_bytes(&other,rel->rows)<build_bytes(&plan,build_rel->rows)) {
+        if(compile(root,build_rti,build_rel,rti,rel,join,quals,&other) && build_bytes(&other,rel->rows)<build_bytes(&plan,build_rel->rows)) {
             plan=other; Index swap=rti; rti=build_rti; build_rti=swap;
             RelOptInfo *swap_rel=rel; rel=build_rel; build_rel=swap_rel;
         }

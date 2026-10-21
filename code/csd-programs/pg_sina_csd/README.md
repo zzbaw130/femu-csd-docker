@@ -14,7 +14,7 @@ LOAD → Scan → Filter（可选）→ Sort.sink
 Sort.source（多路归并、OFFSET/LIMIT，分批输出）
 
 build表 LOAD → Scan → Filter（可选）→ HashJoin.build
-每个build批次：HashJoin.load；probe表 LOAD → Scan → Filter → HashJoin.probe → Aggregate.sink
+每个build批次：HashJoin.load；probe表 LOAD → Scan → Filter → HashJoin.probe → Filter(join，可选) → Aggregate.sink
 Aggregate.source → 分组归并/排序（按需）或最终数值表达式
 ```
 
@@ -115,3 +115,9 @@ Guest将字符串字面量放在`qs_plan.strings`，每项记录物理属性号�
 等于/不等于与IN使用这些整数编号进行向量比较。0仅表示“不等于本计划中的任何常量”，不能用于任意字符串间比较或不受约束的分组。PG仅在顶层等于/IN过滤能保证每个存活值有正编号时编译字符串原值的投影/分组/排序；OR或CASE内的比较不能单独作此保证。不支持的表达式回退PG，不合并未知字符串。最终设备结果仍是编号，Guest按同一计划恢复Datum；不会把设备指针或未序列化字符串写入spill。
 
 这使用了字典编码/选择向量思路，没有复制DuckDB的完整DictionaryVector。通用字符串、非ASCII常量和其他排序规则仍待实现。`tests/scan.c`覆盖短/长varlena、NULL、空串、未匹配编号及bpchar尾空格；真实Guest的join回归检查text/varchar/bpchar、NULL数组项、顺序和拒绝不安全表达式。完整Q12示例在Guest扩展的`tests/q12.sql`。
+
+
+连接后过滤复用`filter.c`，与`aggregate.c`、`sort.c`一起编译进`pg-sina-join.so`。PG计划的`join.residual`保存剩余跨表条件的表达式索引加一（0表示没有）；这不是SNIA参数或FEMU接口。probe输出列批次后先应用此条件，再把选择向量交给聚合。过滤结束即释放临时workmem，聚合状态继续存活，因此预算仍需预留后续批次过滤空间。NEED_STORE/LOAD重入只恢复已经过滤的批次，不重复过滤或计数；统计和计时包含在probe入口内。
+
+
+Hash Join的行数估计只决定首次分配。build满表后尝试倍增记录和桶数组，仍受原build预算及共享workmem池限制；扩容失败或到达最大容量才生成spill批次。分配器复制期间同时计入新旧数组，因此不会靠瞬时超额分配扩容。桶数组增长失败会缩回新增记录空间并沿用原容量；已有spill批次的行数和token独立记录，不受后续容量变化影响。

@@ -25,7 +25,11 @@ struct qs_vector {
  * every slot. Keep its charged allocation (including allocator metadata) out
  * of the sink budget; both contexts together stay below that slot's share. */
 static inline size_t qs_filter_memory(const struct qs_plan *p)
-{ return p->predicate<0?0:((size_t)(p->predicate+1)*sizeof(struct qs_vector)+4095)/4096*4096+4096; }
+{
+    int last=p->predicate+1;
+    if(p->join.residual>last) last=p->join.residual;
+    return !last?0:((size_t)last*sizeof(struct qs_vector)+4095)/4096*4096+4096;
+}
 static inline size_t qs_sink_memory(const struct qs_plan *p,unsigned workers)
 {
     struct cs_work_stats stats;

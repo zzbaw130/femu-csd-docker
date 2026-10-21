@@ -4,7 +4,7 @@
 
 目标是把 PG 执行计划转换为 SNIA batch，由 Guest 调度 CSD 算子。只读实验使用与原生 PG 相同的全表 visible/frozen heap；实验前准备一次 schema、extent 和 LBA 映射，后续持续使用。文件、schema 或设备变化以及重启后重新准备，不设置守护连接。
 
-当前支持外部行排序/TopN、高基数聚合、两表整数等值 INNER Hash Join及连接后的分组/排序。Q1/Q6/Q12/Q14 由 PG 表达式树生成动态 pipeline，通过 CustomScan 完整卸载；PG 负责规划、权限检查及结果 Datum 转换。其余能力按[开发计划](doc/development.md)逐步补齐，尚未支持全部22条 TPC-H。
+当前支持外部行排序/TopN、高基数聚合、两表整数等值 INNER Hash Join及连接后的分组/排序。Q1/Q6/Q12/Q14/Q19 由 PG 表达式树生成动态 pipeline，通过 CustomScan 完整卸载；PG 负责规划、权限检查及结果 Datum 转换。其余能力按[开发计划](doc/development.md)逐步补齐，尚未支持全部22条 TPC-H。
 
 ## 执行路径与冷启动
 
@@ -40,7 +40,7 @@ TPC-H测量每条语句之前使用Guest的cold-query.sh：停止PG清空shared 
 | src/check.c | Guest 诊断工具，链接 libpq 和 libsnia；提交 LOAD→heap_count，与原生 COUNT 比较 |
 | include/ | Guest 与设备共用的查询计划、列批次、结果及诊断计数布局 |
 | sql/ | 扩展安装 SQL；sina_csd schema 保存准备结果 |
-| tests/ | PG12 页布局、准备测试、SQL 边界用例及 Q1/Q6/Q12/Q14 |
+| tests/ | PG12 页布局、准备测试、SQL 边界用例及 Q1/Q6/Q12/Q14/Q19 |
 | doc/ | 分阶段开发记录 |
 | ../../csd-programs/pg_sina_csd/ | 容器编译、FEMU CU 执行的设备算子 |
 
@@ -63,9 +63,9 @@ bash tests/pg-sina-csd-test.sh check
 bash tests/pg-sina-csd-test.sh sql
 # 每条查询分别冷启动：Q1/Q6、NULL/空输入/排序/回退、prepared plan 切换及取消回收
 bash tests/pg-sina-csd-test.sh query
-# Join重复键、NULL、连接后分组、字符串、小内存spill及完整Q12/Q14
+# Join重复键、NULL、连接后分组、字符串、小内存spill及完整Q12/Q14/Q19
 bash tests/pg-sina-csd-test.sh join
-# Q12/Q14各3轮冷启动，以及独立的profile
+# Q12/Q14/Q19各3轮冷启动，以及独立的profile
 bash tests/pg-sina-csd-test.sh join-bench
 # 开关、逐算子计时、JSON 输出及开启计时后的结果一致性
 bash tests/pg-sina-csd-test.sh profile
@@ -260,7 +260,7 @@ bash tests/pg-sina-csd-test.sh aggregate-bench
 
 ## 两表 Hash Join 与连接后分组
 
-当前支持两个已准备且属于同一namespace的heap表、一个整数等值INNER JOIN，以及连接后的标量或分组SUM/AVG/COUNT、结果排序和LIMIT/OFFSET。重复键产生所有匹配组合，NULL键不匹配。PG先按原始行数选择较小build侧，分别编译所需列和本地过滤；若该侧过滤后投影的估计空间超过build预算，则也编译另一方向，比较两侧过滤后的记录和哈希桶空间。估计只选择方向，实际超限仍走分批spill；没有按查询编号选择算法。多表连接、连接后普通行输出、非等值连接和外连接暂时保留原生计划。
+当前支持两个已准备且属于同一namespace的heap表、一个整数等值INNER JOIN、连接后跨表复合过滤，以及连接后的标量或分组SUM/AVG/COUNT、结果排序和LIMIT/OFFSET。重复键产生所有匹配组合，NULL键不匹配。PG先按原始行数选择较小build侧，分别编译所需列和本地过滤；若该侧过滤后投影的估计空间超过build预算，则也编译另一方向，比较两侧过滤后的记录和哈希桶空间。估计只选择方向，实际超限仍走分批spill；没有按查询编号选择算法。多表连接、连接后普通行输出、没有整数等值键的连接和外连接暂时保留原生计划。
 
 ```text
 Guest PG编排；以下数据算子在FEMU CU执行：
@@ -268,13 +268,13 @@ build表：多个独立槽 LOAD → Scan → Filter（可选）
         完成一块 → 单写入者 HashJoin.build → 该槽领取下一块
 每个build批次：
     HashJoin.load（驻内存时无需I/O；spill批次通过NEED_LOAD载入）
-    probe表 LOAD → Scan → Filter（可选）→ HashJoin.probe → Aggregate.sink
+    probe表 LOAD → Scan → Filter（可选）→ HashJoin.probe → Filter(join，可选) → Aggregate.sink
 Aggregate.source → 分组归并/结果排序（按需）或标量数值表达式 → 结果
 ```
 
 build侧复用最多4个独立执行槽并行LOAD/Scan/Filter；完成一个槽后，PG用该槽的列批次提交一次HashJoin.build，再补入下一块，不等待其余槽。HashJoin.build仍单写入：追加或spill期间，其他槽可扫描/过滤，但不能同时修改共享哈希表。所有build输入消费完毕后才开始probe；错误/取消先排空在途扫描，再释放设备状态。`EXPLAIN`中的`CSD Build Scheduling`说明这个调度方式。没有为单槽加入双缓冲预取。
 
-HashJoin.build只保存投影后的键和载荷，哈希桶和记录位于workmem。查询预算一半给共享build状态，另一半由probe/聚合执行槽分摊，实际设备池仍是硬上限。build状态放不下时以64KiB块返回NEED_STORE，SNIA执行内部AFDM→NVM；重入后把token保存在设备私有批次描述中。PG只读回批次数，不读取哈希表或中间行。所有probe完成后才能载入下一批，避免并发改写共享哈希表。
+HashJoin.build只保存投影后的键和载荷，哈希桶和记录位于workmem。查询预算一半给共享build状态，另一半由probe/聚合执行槽分摊，实际设备池仍是硬上限。估计行数只决定初始容量；满表先在build上下文限额内扩容记录和桶数组，失败或达到最大容量后才以64KiB块返回NEED_STORE，SNIA执行内部AFDM→NVM；重入后把token保存在设备私有批次描述中。PG只读回批次数，不读取哈希表或中间行。所有probe完成后才能载入下一批，避免并发改写共享哈希表。
 
 每批probe使用最多4个独立执行槽领取输入块，HashJoin.probe生成256行的连接列批次，并直接调用编译进同一`pg-sina-join.so`的聚合函数。该调用不提交嵌套NVMe命令、不额外占用CU；聚合状态与`pg-sina-aggregate.so`的source共用布局。多批build时重扫probe表，聚合状态一直保留到最终source。这个有界实现可处理重复键和倾斜，但没有实现DuckDB的radix分区/动态重分区；小预算下重复扫描会增加内部I/O。批次描述仍驻内存，极多批次可能耗尽元数据预算。
 
@@ -291,3 +291,13 @@ Q12按shipmode分组，并根据orderpriority的两个常量计算CASE。PG将SQ
 原始字符串的投影、GROUP BY或ORDER BY仅在PG证明该列受到顶层`= 常量`或`IN (常量...)`过滤时开放，此时每个存活值都有已知编号。藏在OR/CASE中的比较不构成这个证明；字符串间比较、一般范围比较、未受约束字符串输出仍回退PG，避免将不同未知值都当作0。支持C/C.UTF-8下的ASCII text/varchar/bpchar常量，当前每条计划最多32项、每项127字节；bpchar比较去掉尾空格，text/varchar保留尾空格，最终bpchar恢复列的长度。其他排序规则、非ASCII或更长常量保留原生路径。
 
 这借鉴了DuckDB字典编码和选择向量的思路，是针对SQL字面量的分类，不是任意字符串字典或通用字符串引擎。没有新增文件格式、映射表或SNIA接口。`EXPLAIN`显示`CSD String Literals`，完整示例见`tests/q12.sql`。
+
+### Q19与连接后复合过滤
+
+PG从两表INNER JOIN的条件中选择一个直接整数列等值条件作为哈希键，把其余跨表条件编译成已有表达式树。单表条件仍由对应物理Scan/Filter执行。设备probe先按等值键生成最多256行的列批次，再调用编译进同一`pg-sina-join.so`的Filter实现，用selection vector执行跨表比较及AND/OR，只有存活行进入聚合。Filter使用现有向量求值、NULL三值逻辑和短路选择；不是逐行返回Guest判断。
+
+这次私有Filter调用不提交NVMe、不增加CU；计时包含在`HashJoin.probe+Aggregate`内，EXPLAIN显示`Filter(join)`。本地过滤已完成延迟numeric解码，连接后Filter直接读取已物化的列值。聚合请求spill时，保留过滤后的选择向量和probe位置；重入只恢复待提交聚合，不重做过滤或重复统计。Join Rows为跨表过滤后的连接行数。
+
+常量IN除字符串外，支持smallint/int/bigint/numeric数组，编译为现有比较与OR表达式，单数组最多32项，NULL保留SQL语义。不支持的数组形式仍保留原生PG计划。Q19完整验证入口为`tests/pg-sina-csd-test.sh join`，性能入口`join-bench`。`tests/q19.sql`使用项目已有qgen参数及原始OR写法；`tests/q19_variant.sql`使用另一组参数并将公共连接条件提到OR之外；不按SQL文本或Query编号选择执行路径。
+
+连接与聚合仍共享同一查询内存上限。聚合常驻时，单表Filter与连接后Filter的较大临时空间会从每槽预算中预留。带跨表过滤时，小预算下减少执行槽，为每槽保留约2MiB用于表达式与聚合状态；分组Join无跨表过滤时维持约1MiB。没有提高查询预算或物理workmem池上限。

@@ -32,6 +32,7 @@ struct qs_join {
     uint32_t relid, relfilenode, rti;
     unsigned nattrs;
     int build_key, probe_key, predicate;
+    int residual; /* Joined-row predicate index + 1; 0 means no residual. */
     uint64_t rows, work_mem_bytes;
 };
 struct qs_plan {

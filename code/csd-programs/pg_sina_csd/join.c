@@ -7,6 +7,7 @@
 #include <string.h>
 #include <limits.h>
 extern int64_t pg_sina_aggregate_sink_impl(struct femu_csd_args *);
+extern int64_t pg_sina_filter_impl(struct femu_csd_args *);
 struct hash_row { uint32_t next, padding; uint64_t nulls; };
 struct build_batch { uint64_t *tokens; unsigned rows, blocks; };
 /* Workmem guarantees 16-byte alignment. Space heads two cache lines apart so
@@ -17,7 +18,7 @@ struct hash_join {
     unsigned char *data;
     uint32_t *buckets;
     struct build_batch *batches;
-    unsigned ncols, key, stride, capacity, slots, rows;
+    unsigned ncols, key, stride, capacity, max_capacity, slots, rows;
     unsigned count, batch_capacity, input_position, block, loaded;
     int building, storing, loading, resident;
     struct probe_cursor probes[QS_WORKERS]; /* Private workmem, one per input slot. */
@@ -52,6 +53,7 @@ static int init_join(const struct qs_plan *p,struct qs_join_control *control,str
     size_t max_rows=(limit-sizeof(struct hash_join)-QS_SORT_IO_BYTES)/(stride+8);
     unsigned capacity=1;
     while(capacity<=UINT_MAX/4 && (size_t)capacity*2<=max_rows) capacity*=2;
+    unsigned max_capacity=capacity;
     uint64_t desired=p->join.rows>256?p->join.rows:256;
     unsigned wanted=1; while(wanted<desired && wanted<capacity) wanted*=2;
     if(wanted<capacity) capacity=wanted;
@@ -59,11 +61,29 @@ static int init_join(const struct qs_plan *p,struct qs_join_control *control,str
     cs_work_context *context=cs_work_begin_limit(limit); if(!context) return -4;
     struct hash_join *h=cs_work_calloc(context,1,sizeof(*h));
     if(!h) { cs_work_end(context); return -4; }
-    h->context=context; h->ncols=ncols; h->key=key; h->stride=stride; h->capacity=capacity; h->slots=2*capacity;
+    h->context=context; h->ncols=ncols; h->key=key; h->stride=stride; h->capacity=capacity; h->max_capacity=max_capacity; h->slots=2*capacity;
     h->data=cs_work_alloc(context,(size_t)capacity*stride);
     h->buckets=cs_work_alloc(context,(size_t)h->slots*sizeof(*h->buckets));
     if(!h->data || !h->buckets) { cs_work_end(context); return -4; }
     h->building=1; h->loaded=UINT_MAX; control->state=(uintptr_t)h; *out=h; return 0;
+}
+/* Estimates choose the first allocation, never the spill threshold. During
+ * build the bucket contents are unused; both arrays grow within this context.
+ * The allocator charges old+new while copying, so growth can fail before the
+ * final layout fills the limit. Keep the old capacity and spill in that case. */
+static int grow_join(struct hash_join *h)
+{
+    if(h->capacity==h->max_capacity) return 0;
+    unsigned next=h->capacity*2;
+    void *data=cs_work_realloc(h->context,h->data,(size_t)next*h->stride);
+    if(!data) return 0;
+    h->data=data;
+    void *buckets=cs_work_realloc(h->context,h->buckets,(size_t)next*8);
+    if(!buckets) {
+        h->data=cs_work_realloc(h->context,h->data,(size_t)h->capacity*h->stride);
+        return 0;
+    }
+    h->buckets=buckets; h->capacity=next; h->slots=next*2; return 1;
 }
 static int64_t store_block(struct hash_join *h,void *io)
 {
@@ -107,7 +127,7 @@ int64_t pg_sina_join_build(struct femu_csd_args *a)
     if(!csIsReentry(a)) { h->input_position=0; control->rows+=c->rows; }
     if(h->storing) { int64_t status=store_batch(h,control,a); if(status) return status; }
     while(h->input_position<c->selected) {
-        if(h->rows==h->capacity) { int64_t status=store_batch(h,control,a); if(status) return status; }
+        if(h->rows==h->capacity && !grow_join(h)) { int64_t status=store_batch(h,control,a); if(status) return status; }
         unsigned row=qs_selection(c)[h->input_position++]; if(row>=c->rows) return -1;
         if(qs_nulls(c)[(size_t)h->key*((c->capacity+7)/8)+row/8]&(1U<<(row%8))) continue;
         struct hash_row *r=row_at(h,h->rows++); r->next=UINT_MAX; r->nulls=0;
@@ -152,6 +172,18 @@ int64_t pg_sina_join_load(struct femu_csd_args *a)
 }
 static int64_t aggregate_chunk(struct qs_chunk *out,const struct qs_plan *p,struct qs_task *task,struct femu_csd_args *outer,int reentry)
 {
+    if(!reentry) {
+        if(p->join.residual && out->rows) {
+            /* Both physical filters have materialized numeric values already.
+             * This filter operates on joined vectors, never on heap offsets. */
+            struct qs_plan filter=*p; filter.predicate=p->join.residual-1;
+            for(unsigned i=0;i<filter.nattrs;++i) filter.cols[i].deferred=0;
+            void *mr[]={out,&filter}; long long len[]={qs_chunk_bytes(out->capacity,out->ncols),sizeof(filter)};
+            struct femu_csd_args call={.numr=2,.mr_addr=mr,.mr_len=len};
+            int64_t status=pg_sina_filter_impl(&call); if(status) return status;
+        }
+        task->joined+=out->selected;
+    }
     struct qs_task inner=*task; inner.input_bytes=0;
     void *mr[]={out,(void *)p,&inner,p->external_aggregate?outer->mr_addr[5]:NULL};
     long long len[]={qs_chunk_bytes(out->capacity,out->ncols),sizeof(*p),sizeof(inner),p->external_aggregate?outer->mr_len[5]:0};
@@ -211,7 +243,7 @@ int64_t pg_sina_join_probe(struct femu_csd_args *a)
             qs_dscales(out)[(size_t)slot*out->capacity+dest]=col<np?qs_dscales(c)[(size_t)local*c->capacity+row]:row_scales(h,r)[local];
             if(null) qs_nulls(out)[(size_t)slot*((out->capacity+7)/8)+dest/8]|=1U<<(dest%8);
         }
-        qs_selection(out)[dest]=dest; ++out->rows; ++out->selected; ++task->joined;
+        qs_selection(out)[dest]=dest; ++out->rows; ++out->selected;
         if(out->rows==out->capacity) {
             cursor->pending=1; int64_t status=aggregate_chunk(out,p,task,a,0); if(status) return status;
             cursor->pending=0; out->rows=out->selected=0;

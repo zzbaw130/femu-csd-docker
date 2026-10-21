@@ -210,10 +210,10 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
         else { result->status=1; strcpy(result->error,"insufficient FDM"); goto cleanup; }
     }
     uint64_t nchunks=(request->bytes+chunk-1)/chunk;
-    /* The existing grouped state plus expression scratch and spill buffers
-     * needs roughly 1 MiB per slot. Reduce concurrency for a small join budget. */
-    if(joining && request->plan.external_aggregate)
-        while(workers>1 && (uint64_t)pg_sina_max_memory*1024/2/workers<1024*1024) --workers;
+    /* Keep room for grouped state and spill buffers (1 MiB), or the larger
+     * expression scratch retained alongside a residual join filter (2 MiB). */
+    if(joining && (request->plan.external_aggregate || request->plan.join.residual))
+        while(workers>1 && (uint64_t)pg_sina_max_memory*1024/2/workers<(request->plan.join.residual?2:1)*1024*1024) --workers;
     if(nchunks && workers>nchunks) workers=nchunks;
     /* One budget shared by all concurrent slots, including Filter scratch.
      * CSFs also clamp each share to the physical workmem pool capacity. */

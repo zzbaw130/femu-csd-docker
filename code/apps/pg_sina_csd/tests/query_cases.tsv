@@ -36,3 +36,8 @@ high_groups	SELECT g,sum(a),avg(a),count(a),count(*) FROM snia_query_parallel GR
 high_multikey	SELECT g,k,sum(a),avg(a),count(*) FROM snia_query_parallel WHERE g<400 GROUP BY g,k ORDER BY g DESC,k;
 high_hidden_key	SELECT sum(a),count(*) FROM snia_query_parallel GROUP BY g ORDER BY g DESC NULLS FIRST LIMIT 300 OFFSET 10;
 high_small_memory	SELECT g,sum(a),avg(a),count(a),count(*) FROM snia_query_parallel WHERE g<400 GROUP BY g ORDER BY g;
+in_numeric	SELECT count(*),sum(a),avg(a) FROM snia_query_fixture WHERE a IN (-1.25,0.00,1.000,NULL,123.45);
+in_integer	SELECT k,count(*),sum(a) FROM snia_query_parallel WHERE k IN (0,2,6,NULL) GROUP BY k ORDER BY k;
+in_numeric_null	SELECT count(*),sum(a) FROM snia_query_fixture WHERE a IN (99.00,NULL);
+unsupported_in_empty	SELECT count(*) FROM snia_query_fixture WHERE a=ANY('{}'::numeric[]);
+unsupported_not_in	SELECT count(*) FROM snia_query_fixture WHERE a NOT IN (1.00,NULL);

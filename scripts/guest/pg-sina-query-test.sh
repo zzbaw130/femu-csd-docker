@@ -26,6 +26,9 @@ case ${1:-query} in
                 grep -q 'CSD Join: inner integer hash join' "$RESULTS/$name.plan"
                 grep -q 'CSD Build Scheduling: parallel scan/filter; single hash writer' "$RESULTS/$name.plan"
             fi
+            if [[ $name == join_residual_* || $name == join_small_residual_* ]]; then
+                grep -q 'Filter(join)' "$RESULTS/$name.plan"
+            fi
             run_cold host "$sql" "$RESULTS/$name.host"
             csd_sql=$sql
             if [[ $name == join_small_* ]]; then csd_sql="SET pg_sina_csd.max_memory='4MB'; $sql"; fi
@@ -56,7 +59,7 @@ case ${1:-query} in
                 echo 'PASS join spill/load, profiling, 4 MiB query budget and physical pool bound'
             fi
         done < "$PROJECT/tests/join_cases.tsv"
-        for query in q14 q12; do
+        for query in q14 q12 q19 q19_variant; do
             sql=$(cat "$PROJECT/tests/$query.sql")
             psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
                 -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path=csd" \
@@ -71,6 +74,7 @@ case ${1:-query} in
                 echo "PASS full SF=1 $query with ${memory} MiB budget"
             done
         done
+        sql=$(cat "$PROJECT/tests/q12.sql")
         {
             printf '\\set ON_ERROR_STOP off\n'
             printf 'SELECT sum(b.bad) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k;\n'
@@ -293,7 +297,7 @@ case ${1:-query} in
         queries=(q1 q6)
         if [[ $1 == order-bench ]]; then queries=(order_topn order_spill); fi
         if [[ $1 == aggregate-bench ]]; then queries=(high_aggregate); fi
-        if [[ $1 == join-bench ]]; then queries=(q14 q12); fi
+        if [[ $1 == join-bench ]]; then queries=(q14 q12 q19); fi
         for name in "${queries[@]}"; do
             psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
                 -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path=csd" \

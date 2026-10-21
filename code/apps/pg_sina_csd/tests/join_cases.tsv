@@ -6,7 +6,7 @@ join_empty_build	SELECT count(*),sum(p.price),avg(p.price) FROM snia_join_probe 
 join_no_match	SELECT count(*),sum(p.price),avg(p.price) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k WHERE p.k>100000;
 join_empty_filter	SELECT count(*),sum(p.price) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k WHERE b.amount>10000;
 unsupported_outer	SELECT count(*) FROM snia_join_probe p LEFT JOIN snia_join_build b ON p.k=b.k;
-unsupported_extra_condition	SELECT count(*) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k AND p.price>b.amount;
+join_residual_compare	SELECT count(*) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k AND p.price>b.amount;
 join_groups	SELECT p.k,count(*),sum(p.price),avg(p.price),sum(b.amount) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k GROUP BY p.k ORDER BY p.k;
 join_small_groups	SELECT p.k,count(*),sum(p.price),avg(p.price),sum(b.amount) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k GROUP BY p.k ORDER BY sum(p.price) DESC,p.k;
 join_group_empty	SELECT p.k,count(*) FROM snia_join_probe p JOIN snia_join_empty b ON p.k=b.k GROUP BY p.k ORDER BY p.k;
@@ -24,3 +24,9 @@ unsupported_string_unicode_literal	SELECT count(*) FROM snia_join_strings WHERE 
 unsupported_string_join	SELECT count(*) FROM snia_join_build a JOIN snia_join_empty b ON a.flag=b.flag;
 unsupported_like	SELECT sum(CASE WHEN b.flag LIKE 'PR_MO%' THEN p.price ELSE 0 END) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k;
 unsupported_prefixes	SELECT sum(CASE WHEN b.flag LIKE 'PROMO%' THEN p.price ELSE 0 END),sum(CASE WHEN b.flag LIKE 'STAND%' THEN p.price ELSE 0 END) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k;
+join_residual_or	SELECT count(*),sum(p.price),sum(b.amount) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k WHERE (b.amount<7 AND p.price>=400) OR (b.amount>=20 AND p.price<200) OR (b.amount IS NULL AND p.price IS NULL);
+join_small_residual_groups	SELECT p.k,count(*),sum(p.price),avg(b.amount) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k WHERE (b.amount<7 AND p.price>=400) OR (b.amount>=20 AND p.price<200) OR p.k<-3000 GROUP BY p.k ORDER BY p.k;
+join_residual_null	SELECT count(*),sum(p.price) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k WHERE p.price>b.amount OR (p.price IS NULL AND b.amount=0);
+unsupported_residual_string_null	SELECT count(*),sum(p.price) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k WHERE p.price>b.amount OR (p.price IS NULL AND b.flag IS NULL);
+join_residual_equality	SELECT count(*),sum(p.price) FROM snia_join_probe p JOIN snia_join_build b ON p.k=b.k AND p.price=b.amount;
+unsupported_no_equality	SELECT count(*) FROM snia_join_probe p JOIN snia_join_build b ON p.price>b.amount WHERE p.k=1 AND b.k=2;
