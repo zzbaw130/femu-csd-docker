@@ -678,3 +678,14 @@ Q8 的 8表/7join 在64MB单批完成；`sum(CASE...)/sum(...)` 由 final_expres
 | Q8/csd | 846.824 / 859.838 / 901.284 | 869.315 |
 
 CSD 约快2.9倍；2行结果3轮cmp通过。profile Execution 807.220ms、Build Rows=1860055、Build Batches=1、Internal Read 1200168960字节、Spill 0、4 workers。16MB查询预算 CSD=11484.375ms，结果一致；200ms取消后同backend连续两次CSD COUNT均返回6001215。原始日志：Guest `/tmp/q8-bench.log`、`/tmp/q8.host.*.log`、`/tmp/q8.csd.*.log`、`/tmp/q8_16.log`。
+
+## 阶段3k：Q4 EXISTS 半连接（2026-10-22）
+
+Q4 以 orders 为 probe、lineitem_pkey 为链尾索引，每个 order 最多输出一次；`l_commitdate<l_receiptdate` 在 B-tree heap tuple 上先过滤。小结果快速路径在字符串排序前解析字典，修复了 Q4 按字典 ID 排序的问题。
+
+| 查询/路径 | 三轮 ms | 均值 ms |
+| --- | --- | ---: |
+| Q4/host | 2608.291 / 1945.221 / 2094.175 | 2215.896 |
+| Q4/csd | 1312.971 / 1202.337 / 1332.642 | 1282.650 |
+
+CSD 约快1.7倍；5行结果3轮cmp通过。profile Execution 1183.481ms、Internal Read 727531520字节、Index/Heap Pages Loaded 62715、Index Heap Tuples 52544、Spill 0、4 workers。16MB查询预算 CSD=1237.619ms，结果一致；200ms取消后同backend连续两次CSD COUNT均返回6001215。原始日志：Guest `/tmp/q4-bench2.log`、`/tmp/q4.host.*.log`、`/tmp/q4.csd.*.log`、`/tmp/q4_16.log`。

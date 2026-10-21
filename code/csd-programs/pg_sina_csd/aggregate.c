@@ -359,9 +359,8 @@ static int partial_combine(struct external_state *e,const struct qs_row *row)
     }
     return 0;
 }
-static int group_output(struct external_state *e,struct qs_row *row)
+static int resolve_output_strings(struct external_state *e,struct qs_row *row)
 {
-    if(finalize_group(&e->local,&e->local.groups[0],row)) return -5;
     const struct qs_plan *p=&e->local.plan;
     for(unsigned j=0;j<p->nout;++j) {
         int expr=output_expr(p,j); if(expr<0 || p->exprs[expr].type!=Q_STRING) continue;
@@ -372,6 +371,11 @@ static int group_output(struct external_state *e,struct qs_row *row)
         if(length<=QS_STRING_MAX) qs_cell_set_string_sort(cell,bytes,length);
     }
     return 0;
+}
+static int group_output(struct external_state *e,struct qs_row *row)
+{
+    if(finalize_group(&e->local,&e->local.groups[0],row)) return -5;
+    return resolve_output_strings(e,row);
 }
 static void external_metrics(struct external_state *e,struct qs_result *out)
 {
@@ -407,6 +411,7 @@ static int64_t external_source(struct femu_csd_args *a)
             call.numr=2; call.mr_addr=mr; call.mr_len=len;
             int64_t status=pg_sina_aggregate_source(&call); if(status) return status;
             mr[0]=out; mr[1]=&plan; len[0]=sizeof(*out); len[1]=sizeof(plan);
+            for(unsigned r=0;r<out->rows;++r) if(resolve_output_strings(e,&out->data[r])) return -5;
             if(plan.norder) { status=pg_sina_sort_impl(&call); if(status) return status; }
             out->begin=(uint64_t)plan.offset>out->rows?out->rows:(unsigned)plan.offset;
             out->rows-=out->begin;

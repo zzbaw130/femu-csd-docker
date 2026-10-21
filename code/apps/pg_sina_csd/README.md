@@ -4,7 +4,7 @@
 
 目标是把 PG 执行计划转换为 SNIA batch，由 Guest 调度 CSD 算子。只读实验使用与原生 PG 相同的全表 visible/frozen heap；实验前准备一次 schema、extent 和 LBA 映射，后续持续使用。文件、schema 或设备变化以及重启后重新准备，不设置守护连接。
 
-当前支持外部行排序/TopN、高基数聚合、多表整数等值 INNER Hash Join、B-tree 索引连接及连接后的分组/排序。Q1/Q3/Q5/Q6/Q7/Q8/Q9/Q10/Q12/Q14/Q19 由 PG 表达式树生成动态 pipeline，通过 CustomScan 完整卸载；PG 负责规划、权限检查及结果 Datum 转换。其余能力按[开发计划](doc/development.md)逐步补齐，尚未支持全部22条 TPC-H。
+当前支持外部行排序/TopN、高基数聚合、多表整数等值 INNER Hash Join、B-tree 索引连接及连接后的分组/排序。Q1/Q3/Q4/Q5/Q6/Q7/Q8/Q9/Q10/Q12/Q14/Q19 由 PG 表达式树生成动态 pipeline，通过 CustomScan 完整卸载；PG 负责规划、权限检查及结果 Datum 转换。其余能力按[开发计划](doc/development.md)逐步补齐，尚未支持全部22条 TPC-H。
 
 ## 执行路径与冷启动
 
@@ -40,7 +40,7 @@ TPC-H测量每条语句之前使用Guest的cold-query.sh：停止PG清空shared 
 | src/check.c | Guest 诊断工具，链接 libpq 和 libsnia；提交 LOAD→heap_count，与原生 COUNT 比较 |
 | include/ | Guest 与设备共用的查询计划、列批次、结果及诊断计数布局 |
 | sql/ | 扩展安装 SQL；sina_csd schema 保存准备结果 |
-| tests/ | PG12 页布局、准备测试、SQL 边界用例及 Q1/Q3/Q5/Q6/Q7/Q8/Q9/Q10/Q12/Q14/Q19 |
+| tests/ | PG12 页布局、准备测试、SQL 边界用例及 Q1/Q3/Q4/Q5/Q6/Q7/Q8/Q9/Q10/Q12/Q14/Q19 |
 | doc/ | 分阶段开发记录 |
 | ../../csd-programs/pg_sina_csd/ | 容器编译、FEMU CU 执行的设备算子 |
 
@@ -359,3 +359,5 @@ Q9 进一步增加复合连接键 `(l_partkey,l_suppkey)=(ps_partkey,ps_suppkey)
 Q7 验证了同一基表出现两次的自连接（nation n1/n2）：4 行结果与 host 一致；64MB 三轮 host=2662.096ms、CSD=3662.404ms（约1.38倍），16MB CSD=8348.123ms且结果一致。Q7 的 OR 字符串条件通过“等值限制标记+未知值运行时错误”处理，不会把未知字符串静默合并。
 
 Q8 进一步验证 8 表/7 join、nation 两次自连接和 `sum(CASE...)/sum(...)` 聚合比值：2 行结果与 host 一致；64MB 三轮 host=2535.005ms、CSD=869.315ms（CSD约快2.9倍），16MB CSD=11484.375ms且结果一致。Q8 的聚合比值由 `final_expression` 在分组后计算。
+
+Q4 验证 EXISTS 半连接：`orders` 为 probe，`lineitem_pkey` 为链尾索引，每个 order 最多输出一次；`l_commitdate<l_receiptdate` 在 B-tree heap tuple 上先过滤。5 行结果与 host 一致；64MB 三轮 host=2215.896ms、CSD=1282.650ms（CSD约快1.7倍），16MB CSD=1237.619ms且结果一致。小结果快速路径现在会在排序前解析字符串，避免按字典 ID 排序。

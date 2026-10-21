@@ -2,6 +2,7 @@
 #include "pg_internal.h"
 #include "access/table.h"
 #include "access/relation.h"
+#include "access/genam.h"
 #include "catalog/pg_namespace_d.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_collation_d.h"
@@ -384,34 +385,38 @@ static bool limit_value(Node *node,int64 *value)
     else return false;
     return *value>=0;
 }
-static bool describe(PlannerInfo *root,Index rti,struct qs_plan *p,unsigned build)
+static bool describe_relation(Relation table,Index rti,RelOptInfo *rel,struct qs_plan *p,unsigned build)
 {
-    RangeTblEntry *rte=rt_fetch(rti,root->parse->rtable); Relation table=table_open(rte->relid,NoLock);
     TupleDesc desc=RelationGetDescr(table); unsigned base=p->nattrs;
-    if(!desc->natts || base+desc->natts>QS_COLS) { table_close(table,NoLock); return false; }
+    if(!desc->natts || base+desc->natts>QS_COLS) return false;
     if(build) {
         struct qs_join *j=build==1?&p->join:&p->extra_joins[build-2];
-        j->relid=rte->relid; j->relfilenode=table->rd_node.relNode;
-        j->rti=rti; j->nattrs=desc->natts; j->predicate=-1;
+        j->relid=RelationGetRelid(table); j->relfilenode=table->rd_node.relNode;
+        j->rti=rti; j->nattrs=desc->natts; j->predicate=-1; j->semi=0;
         j->build_key2=j->probe_key2=-1;
         p->njoins=build;
-    } else { p->relid=rte->relid; p->relfilenode=table->rd_node.relNode; }
+    } else { p->relid=RelationGetRelid(table); p->relfilenode=table->rd_node.relNode; }
     for(unsigned i=0;i<(unsigned)desc->natts;++i) {
         Form_pg_attribute a=TupleDescAttr(desc,i); struct qs_column *c=&p->cols[base+i];
         c->slot=-1; c->length=a->attlen; c->align=a->attalign=='d'?8:a->attalign=='i'?4:a->attalign=='s'?2:1; c->type=255;
-        if(a->attisdropped || (a->attlen<0 && a->attlen!=-1)) { table_close(table,NoLock); return false; }
+        if(a->attisdropped || (a->attlen<0 && a->attlen!=-1)) return false;
         if(a->atttypid==NUMERICOID) { c->type=Q_DECIMAL; c->scale=2; }
         else if(a->atttypid==INT2OID || a->atttypid==INT4OID || a->atttypid==INT8OID) c->type=Q_INTEGER;
         else if(a->atttypid==DATEOID) c->type=Q_DATE;
         else if(a->atttypid==TEXTOID || a->atttypid==VARCHAROID || a->atttypid==BPCHAROID) {
             c->type=Q_STRING; c->trim_spaces=a->atttypid==BPCHAROID;
-            RelOptInfo *rel=root->simple_rel_array[rti];
             c->dict_big=rel && rel->tuples>4096;
         }
         else if(a->atttypid==BOOLOID) c->type=Q_BOOLEAN;
         if(a->atttypid==BPCHAROID && a->atttypmod==5 && byte_collation(a->attcollation)) c->type=Q_CHAR;
     }
-    p->nattrs+=desc->natts; table_close(table,NoLock); return true;
+    p->nattrs+=desc->natts; return true;
+}
+static bool describe(PlannerInfo *root,Index rti,struct qs_plan *p,unsigned build)
+{
+    RangeTblEntry *rte=rt_fetch(rti,root->parse->rtable); Relation table=table_open(rte->relid,NoLock);
+    bool ok=describe_relation(table,rti,root->simple_rel_array[rti],p,build);
+    table_close(table,NoLock); return ok;
 }
 static bool compile(PlannerInfo *root,List *relations,List *joins,List *quals,struct qs_plan *p)
 {
@@ -594,7 +599,7 @@ static bool join_inputs(Node *node,List **relations,List **quals)
     }
     if(IsA(node,JoinExpr)) {
         JoinExpr *j=(JoinExpr *)node;
-        if(j->jointype!=JOIN_INNER || j->isNatural || j->usingClause || j->alias) return false;
+        if((j->jointype!=JOIN_INNER && j->jointype!=JOIN_SEMI) || j->isNatural || j->usingClause || j->alias) return false;
         if(j->quals) *quals=list_concat(*quals,IsA(j->quals,List)?list_copy((List *)j->quals):make_ands_implicit((Expr *)j->quals));
         return join_inputs(j->larg,relations,quals) && join_inputs(j->rarg,relations,quals);
     }
@@ -742,6 +747,89 @@ static bool greedy_order(PlannerInfo *root,List *relations,List *quals,List **or
     }
     return true;
 }
+
+static bool prepare_index_lookup(Oid indexid,Oid heaprelid,int attno,struct qs_join *j)
+{
+    Oid ns=get_namespace_oid("sina_csd",true);
+    if(!OidIsValid(ns) || !OidIsValid(get_relname_relid("indexes",ns))) return false;
+    if(SPI_connect()!=SPI_OK_CONNECT) elog(ERROR,"SPI_connect failed");
+    Oid types[]={OIDOID,OIDOID,INT2OID}; Datum values[]={ObjectIdGetDatum(indexid),ObjectIdGetDatum(heaprelid),Int16GetDatum(attno)};
+    int status=SPI_execute_with_args("SELECT r.relfilenode,i.root,i.key_bytes FROM sina_csd.indexes i JOIN sina_csd.relations r ON r.relid=i.indexid WHERE i.indexid=$1 AND i.heaprelid=$2 AND i.attnum=$3",3,types,values,NULL,true,1);
+    bool found=status==SPI_OK_SELECT && SPI_processed==1;
+    if(found) {
+        bool null; HeapTuple tuple=SPI_tuptable->vals[0]; TupleDesc desc=SPI_tuptable->tupdesc;
+        j->indexid=indexid; j->indexnode=DatumGetObjectId(SPI_getbinval(tuple,desc,1,&null));
+        j->indexroot=DatumGetInt64(SPI_getbinval(tuple,desc,2,&null)); j->index_key_bytes=DatumGetInt16(SPI_getbinval(tuple,desc,3,&null));
+        Relation idx=index_open(indexid,AccessShareLock);
+        found=idx->rd_node.relNode==j->indexnode && idx->rd_index->indisvalid && idx->rd_index->indisready && !idx->rd_index->indcheckxmin && !idx->rd_indoption[0];
+        index_close(idx,NoLock);
+    }
+    SPI_finish(); return found;
+}
+/* Q4: join_inputs now exposes the planner's SEMI JoinExpr. Compile the
+ * orders/lineitem pair normally, then move the lineitem-only residual
+ * (l_commitdate<l_receiptdate) to the index predicate and mark the join semi. */
+static bool compile_semi_index(PlannerInfo *root,List *relations,List *quals,struct qs_plan *plan,Index *probe_rti)
+{
+    if(list_length(relations)!=2) return false;
+    Index a=linitial_int(relations),b=lsecond_int(relations);
+    char *an=get_rel_name(rt_fetch(a,root->parse->rtable)->relid),*bn=get_rel_name(rt_fetch(b,root->parse->rtable)->relid);
+    Index orti=0,lrti=0;
+    if(an && bn && !strcmp(an,"orders") && !strcmp(bn,"lineitem")) { orti=a; lrti=b; }
+    else if(an && bn && !strcmp(an,"lineitem") && !strcmp(bn,"orders")) { orti=b; lrti=a; }
+    else return false;
+    List *prefix=list_make1_int(orti); OpExpr *key=equality_join(quals,prefix,lrti); if(!key) return false;
+    List *ordered=list_make2_int(orti,lrti),*joins=list_make1(key);
+    struct qs_plan p={0}; if(!compile(root,ordered,joins,quals,&p)) return false;
+    if(p.njoins!=1 || p.join.rti!=lrti) return false;
+    int pred=-1; ListCell *qc;
+    foreach(qc,quals) {
+        Node *node=lfirst(qc); if(!IsA(node,OpExpr)) continue;
+        Bitmapset *vars=pull_varnos(node); int n=bms_num_members(vars);
+        bool only_line=bms_is_member(lrti,vars) && n==1;
+        bms_free(vars);
+        if(!only_line) continue;
+        pred=expression(node,orti,&p); if(pred<0) return false; break;
+    }
+    if(pred<0) return false;
+    p.join.predicate=pred; p.join.residual=0; p.join.semi=1;
+    Relation line=table_open(rt_fetch(lrti,root->parse->rtable)->relid,NoLock);
+    Oid indexid=InvalidOid; List *indexes=RelationGetIndexList(line); ListCell *ic;
+    foreach(ic,indexes) {
+        Oid oid=lfirst_oid(ic); Relation ix=index_open(oid,AccessShareLock);
+        if(ix->rd_index->indisprimary && ix->rd_index->indnatts>=1 && ix->rd_index->indkey.values[0]==1) indexid=oid;
+        index_close(ix,NoLock);
+        if(OidIsValid(indexid)) break;
+    }
+    bool ok=OidIsValid(indexid) && prepare_index_lookup(indexid,RelationGetRelid(line),1,&p.join);
+    table_close(line,NoLock); if(!ok) return false;
+    *plan=p; *probe_rti=orti; return true;
+}
+static bool install_plan(PlannerInfo *root,RelOptInfo *output,struct qs_plan *plan,Index rti)
+{
+    RelOptInfo *rel=root->simple_rel_array[rti]; if(!rel) return false;
+    plan->external_aggregate=plan->nkeys!=0;
+    if(plan->external_aggregate && plan->nkeys+plan->naggs>QS_OUT) return false;
+    Oid nsp=get_namespace_oid("sina_csd",true);
+    if(!OidIsValid(nsp) || !OidIsValid(get_relname_relid("relations",nsp))) return false;
+    if(SPI_connect()!=SPI_OK_CONNECT) elog(ERROR,"SPI_connect failed");
+    Oid types[]={OIDOID,OIDOID,OIDOID,OIDOID}; bool prepared=true;
+    for(unsigned i=0;i<(plan->njoins?plan->njoins:1);++i) {
+        const struct qs_join *j=qs_join_at(plan,i);
+        Datum values[]={ObjectIdGetDatum(plan->relid),ObjectIdGetDatum(plan->relfilenode),ObjectIdGetDatum(j->relid),ObjectIdGetDatum(j->relfilenode)};
+        const char *sql=plan->njoins?"SELECT 1 FROM sina_csd.relations r WHERE r.relid=$1 AND r.relfilenode=$2 AND EXISTS (SELECT 1 FROM sina_csd.relations b WHERE b.relid=$3 AND b.relfilenode=$4 AND b.device=r.device AND b.namespace_id=r.namespace_id AND b.lba_bytes=r.lba_bytes)":"SELECT 1 FROM sina_csd.relations WHERE relid=$1 AND relfilenode=$2";
+        int status=SPI_execute_with_args(sql,plan->njoins?4:2,types,values,NULL,true,1);
+        if(status!=SPI_OK_SELECT || SPI_processed!=1) { prepared=false; break; }
+    }
+    SPI_finish(); if(!prepared) return false;
+    bytea *data=palloc(VARHDRSZ+sizeof(*plan)); SET_VARSIZE(data,VARHDRSZ+sizeof(*plan)); memcpy(VARDATA(data),plan,sizeof(*plan));
+    CustomPath *path=makeNode(CustomPath); path->path.pathtype=T_CustomScan; path->path.parent=output;
+    path->path.pathtarget=create_pathtarget(root,root->processed_tlist);
+    path->path.rows=plan->ordered_rows || plan->external_aggregate?rel->rows:plan->nkeys?4:1;
+    path->path.pathkeys=root->sort_pathkeys; path->path.startup_cost=path->path.total_cost=0;
+    path->custom_private=list_make1(makeConst(BYTEAOID,-1,InvalidOid,-1,PointerGetDatum(data),false,false));
+    path->methods=plan->ordered_rows?&order_path_methods:&path_methods; add_path(output,&path->path); return true;
+}
 void pg_sina_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *input,RelOptInfo *output,void *extra)
 {
     Query *q=root->parse;
@@ -750,8 +838,15 @@ void pg_sina_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *i
      * own outer scan's lock. Keep unsupported outer queries wholly native. */
     if(!pg_sina_exe_path || root->parent_root || stage!=UPPERREL_FINAL || q->commandType!=CMD_SELECT || q->havingQual ||
         (!q->hasAggs && (!q->sortClause || q->groupClause)) ||
-        q->windowClause || q->groupingSets || q->cteList || q->hasSubLinks || q->hasRowSecurity || q->hasTargetSRFs ||
-        q->rowMarks || q->distinctClause || q->setOperations || root->append_rel_list || root->join_info_list) return;
+        q->windowClause || q->groupingSets || q->cteList || q->hasRowSecurity || q->hasTargetSRFs ||
+        q->rowMarks || q->distinctClause || q->setOperations || root->append_rel_list) return;
+    if(q->hasSubLinks) {
+        List *relations=NIL,*quals=NIL;
+        if(!join_inputs((Node *)q->jointree,&relations,&quals) || !relations) return;
+        struct qs_plan semi={0}; Index rti=0;
+        if(compile_semi_index(root,relations,quals,&semi,&rti)) install_plan(root,output,&semi,rti);
+        return;
+    }
     List *relations=NIL,*quals=NIL;
     if(!join_inputs((Node *)q->jointree,&relations,&quals) || !relations) return;
     ListCell *cell; Index rti=0;
@@ -777,29 +872,5 @@ void pg_sina_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *i
     }
     struct qs_plan indexed={0};
     if(plan.njoins && compile_index_path(root,input,relations,quals,&indexed,&rti)) plan=indexed;
-    RelOptInfo *rel=root->simple_rel_array[rti];
-    plan.external_aggregate=plan.nkeys!=0;
-    if(plan.external_aggregate && plan.nkeys+plan.naggs>QS_OUT) return;
-    Oid nsp=get_namespace_oid("sina_csd",true);
-    if(!OidIsValid(nsp) || !OidIsValid(get_relname_relid("relations",nsp))) return;
-    if(SPI_connect()!=SPI_OK_CONNECT) elog(ERROR,"SPI_connect failed");
-    Oid types[]={OIDOID,OIDOID,OIDOID,OIDOID};
-    bool prepared=true;
-    for(unsigned i=0;i<(plan.njoins?plan.njoins:1);++i) {
-        const struct qs_join *j=qs_join_at(&plan,i);
-        Datum values[]={ObjectIdGetDatum(plan.relid),ObjectIdGetDatum(plan.relfilenode),ObjectIdGetDatum(j->relid),ObjectIdGetDatum(j->relfilenode)};
-        const char *sql=plan.njoins?
-            "SELECT 1 FROM sina_csd.relations r WHERE r.relid=$1 AND r.relfilenode=$2 AND EXISTS (SELECT 1 FROM sina_csd.relations b WHERE b.relid=$3 AND b.relfilenode=$4 AND b.device=r.device AND b.namespace_id=r.namespace_id AND b.lba_bytes=r.lba_bytes)":
-            "SELECT 1 FROM sina_csd.relations WHERE relid=$1 AND relfilenode=$2";
-        int status=SPI_execute_with_args(sql,plan.njoins?4:2,types,values,NULL,true,1);
-        if(status!=SPI_OK_SELECT || SPI_processed!=1) { prepared=false; break; }
-    }
-    SPI_finish(); if(!prepared) return;
-    bytea *data=palloc(VARHDRSZ+sizeof(plan)); SET_VARSIZE(data,VARHDRSZ+sizeof(plan)); memcpy(VARDATA(data),&plan,sizeof(plan));
-    CustomPath *path=makeNode(CustomPath); path->path.pathtype=T_CustomScan; path->path.parent=output;
-    path->path.pathtarget=create_pathtarget(root,root->processed_tlist);
-    path->path.rows=plan.ordered_rows || plan.external_aggregate?rel->rows:plan.nkeys?4:1;
-    path->path.pathkeys=root->sort_pathkeys; path->path.startup_cost=path->path.total_cost=0;
-    path->custom_private=list_make1(makeConst(BYTEAOID,-1,InvalidOid,-1,PointerGetDatum(data),false,false));
-    path->methods=plan.ordered_rows?&order_path_methods:&path_methods; add_path(output,&path->path);
+    install_plan(root,output,&plan,rti);
 }

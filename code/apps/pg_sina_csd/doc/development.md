@@ -332,3 +332,11 @@ Q9提交后复核Q5/Q10（连接顺序/预算已变化）：Q5 host均值2275.09
 - CASE 条件 `nation='JORDAN'` 使用静态字典；p_type/r_name 过滤同路径。
 
 验收：Q8 2行结果与host逐字一致（3轮cmp通过）。默认64MB冷启动三轮host=2951.971/2393.437/2259.607ms（均值2535.005），CSD=846.824/859.838/901.284ms（均值869.315），CSD约快2.9倍。Q8 profile：Build Rows=1860055、Build Batches=1、Internal Read 1200168960字节、Spill 0、4 workers、Execution 807.220ms。16MB查询预算CSD=11484.375ms，结果一致。200ms取消后同backend连续两次CSD COUNT均返回6001215。复现入口同上，SQL位于`tests/q8.sql`。
+
+## 阶段3k：Q4 EXISTS 半连接与索引 tail（2026-10-22）
+
+- `join_inputs` 接受规划器生成的 `JOIN_SEMI` JoinExpr；`compile_semi_index` 以 orders 为 probe、lineitem 为 build 描述，保留 `l_orderkey=o_orderkey` 键，并把 lineitem-only 的 `l_commitdate<l_receiptdate` 从混合残差移到索引谓词。
+- `qs_join` 增加 `semi`；index probe 在 B-tree heap tuple 上先执行谓词，每个 probe 行最多输出一次。`lineitem_pkey` 作为链尾索引，不再需要构建6M行哈希。
+- 小结果快速路径此前在 `Aggregate.source` 中先按字典ID排序、后解析字符串，Q4 只有5组会走该路径；现在排序前调用 `resolve_output_strings`，保证字符串 ORDER BY 的字节序。
+
+验收：Q4 5行结果与host逐字一致（3轮cmp通过）。默认64MB冷启动三轮host=2608.291/1945.221/2094.175ms（均值2215.896），CSD=1312.971/1202.337/1332.642ms（均值1282.650），CSD约快1.7倍。Q4 profile：Internal Read 727531520字节、Index/Heap Pages Loaded 62715、Index Heap Tuples 52544、Spill 0、4 workers、Execution 1183.481ms。16MB查询预算CSD=1237.619ms，结果一致。200ms取消后同backend连续两次CSD COUNT均返回6001215。复现入口同上，SQL位于`tests/q4.sql`。

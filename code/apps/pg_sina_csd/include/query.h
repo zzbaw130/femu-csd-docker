@@ -45,6 +45,7 @@ struct qs_join {
     unsigned nattrs;
     int build_key, probe_key, predicate;
     int build_key2, probe_key2; /* Optional second integer equality key. */
+    int semi; /* EXISTS: at most one output per probe row. */
     int residual; /* Joined-row predicate index + 1; 0 means no residual. */
     uint64_t rows, work_mem_bytes;
     uint32_t indexid, indexnode, indexroot;

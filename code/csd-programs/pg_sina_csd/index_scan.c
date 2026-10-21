@@ -5,6 +5,7 @@
 #include "cs_workmem.h"
 #include "cs_csf.h"
 #include "index_scan.h"
+#include "query_eval.h"
 #include <limits.h>
 #include <string.h>
 extern int64_t pg_sina_filter_impl(struct femu_csd_args *);
@@ -117,7 +118,7 @@ static int seek(const unsigned char *page,struct lookup *key,unsigned bytes)
 static int64_t flush(unsigned stage,struct qs_chunk *out,const struct qs_plan *p,struct qs_task *task,
     struct qs_join_control *control,struct femu_csd_args *a,struct index_cursor *cursor,int resume)
 {
-    if(!resume && qs_join_at(p,stage)->predicate>=0) {
+    if(!resume && !qs_join_at(p,stage)->semi && qs_join_at(p,stage)->predicate>=0) {
         struct qs_plan filter=*p; filter.predicate=qs_join_at(p,stage)->predicate;
         for(unsigned i=0;i<filter.nattrs;++i) filter.cols[i].deferred=0;
         void *mr[]={out,&filter}; long long len[]={qs_chunk_bytes(out->capacity,out->ncols),sizeof(filter)};
@@ -195,6 +196,12 @@ int64_t qs_index_probe(unsigned stage,struct qs_chunk *c,const struct qs_plan *p
                     unsigned dest=out->rows;
                     if(!dest) memset(qs_nulls(out),0,((out->capacity+7)/8)*(size_t)out->ncols);
                     int status=qs_scan_tuple(&h->scan,page,tuple-page,len,0,out,dest,NULL); if(status) return status;
+                    if(j->semi) {
+                        struct qs_eval eval={.plan=p,.chunk=out,.row=dest}; struct qs_cell match;
+                        if(j->predicate<0 || qs_evaluate(&eval,j->predicate,&match) || match.isnull || !match.value) {
+                            key->phase=2; continue;
+                        }
+                    }
                     unsigned local=0;
                     for(unsigned col=0;col<base;++col) if(p->cols[col].slot>=0) {
                         unsigned slot=p->cols[col].slot,src=stage?slot:local++;
@@ -202,7 +209,7 @@ int64_t qs_index_probe(unsigned stage,struct qs_chunk *c,const struct qs_plan *p
                         qs_dscales(out)[(size_t)slot*out->capacity+dest]=qs_dscales(c)[(size_t)src*c->capacity+key->row];
                         if(qs_nulls(c)[(size_t)src*((c->capacity+7)/8)+key->row/8]&(1U<<(key->row%8))) qs_nulls(out)[(size_t)slot*((out->capacity+7)/8)+dest/8]|=1U<<(dest%8);
                     }
-                    ++task->index_tuples; key->phase=2;
+                    ++task->index_tuples; key->phase=j->semi?4:2;
                     qs_selection(out)[dest]=dest; ++out->rows; ++out->selected;
                     if(out->rows==out->capacity) { int64_t status=flush(stage,out,p,task,control,a,cursor,0); if(status) return status; }
                 }
