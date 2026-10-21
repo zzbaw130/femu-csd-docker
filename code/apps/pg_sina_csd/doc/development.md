@@ -355,4 +355,4 @@ Q9提交后复核Q5/Q10（连接顺序/预算已变化）：Q5 host均值2275.09
 - 设备计划增加 post-aggregate `having` 表达式；`finalize_group` 在输出前用 Q_AGGREF 求值，不满足的组直接跳过。
 - Q18 专用 planner 移除 SubLink、编译正常三表聚合，并附加 Q_GT(Q_AGGREF,300)。
 - 验证：10k customer/20k orders/60k lineitem 测试表上 host/CSD 结果逐字一致，LIMIT 100 通过。
-- 未完成：SF1 规模三表装载时 guest NVMe I/O 失去响应，尚未做 64MB 三轮、16MB、取消和延迟记录；Q18 暂不能标记完成。
+- 补充：SF1 规模三表装载完成后，host Q18 6M 行数据集可完成（104 行输出）；CSD 在 120s statement_timeout 内未返回且 guest 失去响应，因此 64MB 三轮、16MB、取消和延迟记录仍未完成；Q18 暂不能标记完成。
