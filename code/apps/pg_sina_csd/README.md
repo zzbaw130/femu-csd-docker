@@ -4,7 +4,7 @@
 
 目标是把 PG 执行计划转换为 SNIA batch，由 Guest 调度 CSD 算子。只读实验使用与原生 PG 相同的全表 visible/frozen heap；实验前准备一次 schema、extent 和 LBA 映射，后续持续使用。文件、schema 或设备变化以及重启后重新准备，不设置守护连接。
 
-当前完成阶段1，并接入阶段2的外部行排序/TopN：Q1/Q6 由 PG 表达式树生成动态 pipeline，通过 CustomScan 卸载 Scan、Filter、表达式、SUM/AVG/COUNT、低基数分组、结果排序与 LIMIT/OFFSET。Q1/Q6 的 SQL 数据算子都在 CSD 执行；PG 负责规划、权限检查及结果 Datum 转换。其余能力按[开发计划](doc/development.md)逐步补齐，尚未支持全部22条 TPC-H。
+当前完成阶段2的外部行排序/TopN和高基数聚合：Q1/Q6 由 PG 表达式树生成动态 pipeline，通过 CustomScan 卸载 Scan、Filter、表达式、SUM/AVG/COUNT、可spill分组、结果排序与 LIMIT/OFFSET。Q1/Q6 的 SQL 数据算子都在 CSD 执行；PG 负责规划、权限检查及结果 Datum 转换。其余能力按[开发计划](doc/development.md)逐步补齐，尚未支持全部22条 TPC-H。
 
 ## 执行路径与冷启动
 
@@ -123,8 +123,8 @@ PG 会另行执行 COUNT 校验结果，因此本工具用于正确性验收，�
 Guest PG：解析/规划 → CustomScan → 读取数据库中的静态 extent 映射
 Guest PG：异步提交最多4个 SERIAL batch → 各自 LOAD → Scan → Filter → Aggregate.sink
 Guest PG：接收任意 batch 完成事件 → 为该执行槽补充下一块，直到输入耗尽
-Guest PG：调用 SNIA SERIAL batch → Aggregate.source → Sort → Limit
-Guest PG：接收少量最终结果 → 转换 Datum → 返回客户端
+Guest PG：重复提交 source SERIAL batch → Aggregate.source（合并、按需排序与LIMIT）
+Guest PG：接收分批最终结果 → 转换 Datum → 返回客户端
 ```
 
 箭头中的 Scan/Filter/Aggregate/Sort/Limit 是设备 SO，运行在 FEMU CU；PG backend 仅编排请求，不扫描 heap、不计算聚合、不排序。原始 heap 通过 NVM→AFDM 内部路径读取，不经过 Guest 应用缓冲。列批次保留在 AFDM，哈希表等私有状态放在受限 workmem。借鉴 DuckDB 的所需列投影、selection vector、局部聚合后合并及公共子表达式复用；Filter 的列/常量比较（单条件或复合 AND）使用类型化列循环，支持 AVX2 时一次比较4个 int64。复杂过滤和聚合共用 `query_vector.h`，每批最多256行：列引用直接使用原始列和 selection vector，常量只保存一份值，计算结果才物化为临时列。AND/OR 根据左侧结果将仍需判断的行传给右侧；共享表达式缓存每行已完成的结果，避免重复计算，也不会求值被短路忽略的表达式。AVX2 还用于无 NULL/错误批次的加减、乘法及通用比较；乘法要求两个输入均在 int32 范围内，产生精确 int64 结果，加减检查 int64 溢出。不满足条件时回退精确 int128 标量计算，保留 NULL、小数显示精度和溢出语义，不使用浮点近似。
@@ -166,7 +166,7 @@ Sort.source                            # 等待全部sink完成，归并并按�
 
 这里的 Sort.sink/source 都是 `csd-programs/pg_sina_csd/sort.c` 中的设备 CSF，Guest 不排序。借鉴 DuckDB 的局部排序、阻塞边界及 TopN 堆：`OFFSET+LIMIT` 足够小时，每个sink只保留最优的这些行；否则生成有序段，优先保留在 workmem，预算不足以容纳下一段时通过 NEED_STORE 请求 SNIA 内部 STORE。source 用小根堆归并各执行槽的有序段，通过 NEED_LOAD 读取 spill 数据，完成后通过 NEED_FREE 释放 token。排序输入按实际输出列数紧凑存储；排序目前沿用已支持的 numeric、整数、date、bool、bpchar(1)，不代表已经支持任意字符串。
 
-每次source最多输出256行，PG保留当前查询的 SNIA 设备、batch、结果AFDM和状态句柄，继续提交同一个source batch，直到设备报告结束。256是结果块容量，聚合的256组上限仍需后续阶段解除。OFFSET/LIMIT在设备source处理，不在Guest重复切分。
+每次source最多输出256行，PG保留当前查询的 SNIA 设备、batch、结果AFDM和状态句柄，继续提交同一个source batch，直到设备报告结束。256是结果块容量；GROUP BY也已支持超过256组，见下文。OFFSET/LIMIT在设备source处理，不在Guest重复切分。
 
 原始输入AFDM在当前块的Scan/Filter结束后可作为sink的spill I/O缓冲，列结果仍保留在独立AFDM；没有把排序工作区放到AFDM。输入结束后，仅保留source需要的句柄、I/O和结果缓冲，其他输入槽立即释放。单个有序段至多1MiB，spill I/O块为64KiB；这里的64KiB用于归并时按需读入，多个块属于同一个有序段，不会增加归并段数。读缓冲不足时可释放已有spill副本的读缓冲，保留段头，再按需加载。workmem容量由设备配置决定；每个局部上下文按查询上限和实际执行槽数限额。
 
@@ -224,3 +224,31 @@ SET pg_sina_csd.max_memory = '16MB';
 排序不采用“空闲低于50%”的固定触发线。参考本地DuckDB `src/common/sort/sort.cpp`的预算/线程分摊和外部排序判定：当前实现先保留内存段，准备下一段时检查“已用内存＋新段＋64KiB归并I/O余量＋分配开销”是否超过槽预算，超过则将已排序内存段spill。实际分配失败也会触发spill，以处理共享池竞争或碎片。预算减小时单段容量从1MiB逐步缩小，最低64KiB；归并仍按64KiB加载所需块，并可丢弃已有NVM副本的读缓存。
 
 `EXPLAIN ANALYZE`的`CSD Query Memory Limit`显示执行时配置的查询上限，实际仍受设备池容量限制；`CSD Workmem Peak`来自设备共享分配器，是该池生命周期的历史峰值，不应用它判断某条低预算查询是否超限。独立进程的设备测试会核对实际峰值及清理后的零占用。运行`bash tests/pg-sina-csd-test.sh memory`可冷启动核对4/16/64/128MB预算下Q1、Q6和外部排序结果，以及已PREPARE查询的参数切换。
+
+
+## 高基数 GROUP BY 与 spill
+
+所有支持的GROUP BY均使用自适应路径，不依赖PG对分组数的估计来保证正确性。每个执行槽先在workmem内用小哈希表预聚合；表满时，把部分聚合状态交给已有外部排序算法，生成按分组键排序的run。状态包含分组键、SUM、非NULL计数、显示精度；AVG保留sum/count，最后合并后才做除法，不会平均各批次的平均值。
+
+```text
+LOAD → Scan → Filter → Aggregate.sink         # 各槽局部哈希预聚合
+Aggregate.source                              # 合并相同键的部分状态，分批输出
+  └─ 若SQL有ORDER BY：结果Sort.sink → Sort.source（包括OFFSET/LIMIT）
+```
+
+这些步骤都在设备SO中执行。PG仍从表达式树生成分组键、聚合、排序及LIMIT描述；设备不解析SQL。`pg-sina-aggregate.so`直接复用同一份`sort.c`算法作为私有函数，不发送嵌套NVMe请求、不额外占用CU，也不增加固件/runtime。输入、结果和spill传输使用AFDM，哈希表、部分状态和归并缓存仍放workmem。小分组在所有局部表未flush且合并容量足够时，直接走原小哈希表快路径，不生成run；排序和LIMIT也在source内完成。
+
+每槽预算先扣除过滤临时空间，再为哈希表、表达式和状态块保留固定空间。有ORDER BY时，把余下预算分给部分状态排序和最终结果排序；两者可能同时存活，总额不能分别使用一整份查询上限。没有ORDER BY则将余下预算用于部分状态run。阈值按所需空间确定，不用全局空闲比例。局部表暂时仍是256组，满表仅意味着flush，不再是总分组数上限。中间记录目前要求“分组键数＋聚合数”不超过16，已知超出或不支持的语义在规划时回退PG。
+
+source每次最多返回256行，PG复用现有分批游标。若SQL要求排序，先完整归并聚合，再输出排序结果；否则可按组连续输出。取消、报错、提前关闭时，回收部分状态排序和结果排序的所有私有上下文，再由本查询的SNIA设备回收剩余token。
+
+`EXPLAIN`显示`CSD Aggregation: adaptive partial-state merge`。开启profile时，`Aggregate.sink/source`包含其内部排序的CPU时间及I/O重入；这些不是额外提交的CSF，不能重复计入`Sort.sink/source`。独立行排序仍单独计时。spill读写与run数汇总两轮内部排序。
+
+本实现参考DuckDB的局部哈希预聚合、部分状态合并和算子内存预算；采用现有排序基础设施完成有界归并，没有实现DuckDB完整的radix分区哈希聚合。run描述仍驻留内存，极低预算/极多run仍可能耗尽元数据；受预算约束的多轮归并仍待实现。
+
+```sh
+bash tests/pg-sina-csd-test.sh query
+bash tests/pg-sina-csd-test.sh aggregate-bench
+```
+
+`aggregate-bench`使用`tests/high_aggregate.sql`在SF=1 lineitem上筛选1995年数据，按partkey聚合销售额、平均数量和计数，再按销售额取前100；这是算子验证语句，不是新增已经完成的TPC-H查询编号。Join等能力仍按开发计划推进。

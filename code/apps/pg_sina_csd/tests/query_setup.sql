@@ -17,6 +17,7 @@ SELECT sina_csd.prepare('public.snia_query_empty');
 -- projected by the explicit error/cleanup test, not the normal comparisons.
 CREATE TABLE public.snia_query_parallel AS
 SELECT i%7 AS k, (i%101)::numeric(12,2) AS a,
+       CASE WHEN i%997=0 THEN NULL ELSE i%8191 END AS g,
        CASE WHEN i=1 THEN 1e30::numeric ELSE 0::numeric END AS bad,
        repeat('x',48) AS padding
 FROM generate_series(1,450000) AS g(i);

@@ -110,7 +110,7 @@ SNIA已有计时记录D0=220次、累计1.523479s，E1=663次、累计3.393881s�
 
 | 阶段 | 实现内容 | 优先验收 |
 | --- | --- | --- |
-| 2（进行中） | 行排序/TopN已接入，详见阶段2a；继续实现高基数聚合。workmem优先，NEED_STORE/LOAD/FREE驱动spill与重入，保留sink/source生命周期 | 大数据排序、分组和强制小内存正确性 |
+| 2（完成） | 行排序/TopN与高基数聚合已接入，详见阶段2a/2b。workmem优先，NEED_STORE/LOAD/FREE驱动spill与重入，保留sink/source生命周期 | 大数据排序、分组和强制小内存正确性 |
 | 3 | Hash Join build/probe、投影传递、分区spill，扩展CASE和必要字符串表达式 | Q14，再Q3/Q5/Q10/Q12/Q19 |
 | 4 | 多路Join与分组，子查询去相关，semi/anti join，EXISTS/NOT EXISTS，LIKE/SUBSTRING、派生表与中间聚合结果复用 | Q4/Q7/Q8/Q9/Q11/Q13/Q15/Q16/Q18/Q20/Q21/Q22 |
 | 5 | 补齐剩余表达式与嵌套聚合/标量子查询语义，逐条核查设备覆盖与原生结果 | Q2/Q17及全部22条 |
@@ -173,3 +173,14 @@ EXPLAIN增加CSD Scheduling说明。Guest回归新增450000行多块表，覆盖
 验收：17项设备CTest通过，最终相关12项重复检查通过；新增外部排序测试以4/8/16/64/128MiB workmem处理约96MiB完整行数据，覆盖四sink、spill重入、归并窗口压力、全部输出顺序/NULL/显示精度、TopN/OFFSET、最大int64 OFFSET、提前退出和失败scope已回收token后的清理；12项PG算子ASan/UBSan及最终6项外部排序容量重复检查通过（环境限制关闭LeakSanitizer）。Guest覆盖普通排序、隐藏排序键、空结果、跨256行输出、大结果spill、游标提前关闭与同backend复用，旧Q1/Q6、取消、计时开关也通过。SF=1 TopN和外部排序各3轮冷启动与原生输出精确一致，数字见[性能分析](performance.md)。
 
 阶段2a同时增加`pg_sina_csd.max_memory`（默认64MB，执行时生效），按执行槽分摊并保留过滤临时空间，以设备共享workmem池为硬上限。排序按下一段是否超预算触发spill，容量降低时缩小run；不是全局空闲比例阈值。后续Hash Join和高基数聚合应沿用同一查询预算，并为自身不可spill状态留出空间，不能各自再申请一份完整上限。当前固定256组聚合尚未改成外部聚合，Join尚未接入。
+
+
+## 阶段2b：高基数聚合、状态归并与结果排序（完成）
+
+- 所有支持的GROUP BY具备spill路径，删除估计分组数超过256时的规划回退。实际小分组保留原哈希合并快路径；总分组数不再受局部表256组容量限制，不用估计值作为正确性边界。
+- 参考DuckDB局部哈希预聚合和部分状态合并：局部表满时flush按键有序的中间状态，source归并sum/count/显示精度，最后完成AVG。复用已有sort.c有界run和SNIA NEED_STORE/LOAD/FREE，没有新增设备接口或运行时框架，也没有照搬radix分区实现。
+- GROUP BY sink/source追加I/O AFDM，profile缓冲仍位于最后I/O之前；排序算法编译进aggregate SO内部直接调用，不生成嵌套设备请求。结果需要ORDER BY时在设备内接结果排序，PG只持续提交source和转换Datum。
+- 保留查询预算和物理池硬上限，分别限制局部状态、部分状态run及结果排序，使两个排序阶段同时存活时也不超额。连续run保留整块缓存，检测到交错访问造成缓存反复丢失后才缩小窗口，不把缓存策略当作新的用户配置。
+- 新增超过32768组的设备差分测试，以及Guest多列/NULL分组、隐藏排序键、4MB预算、实际spill、连续结果、报错与游标提前关闭后的复用；SF=1自定义高基数聚合单独冷启动比较host/CSD。详细数据见performance.md。
+
+当前仍不支持Join、HAVING、MIN/MAX、一般字符串或全部22条TPC-H。中间记录键数加聚合数暂限16，run元数据驻留、外部聚合采用排序部分状态而非radix分区；极多run和极低预算仍需后续多轮归并。下一阶段开始Hash Join和所需表达式扩展。

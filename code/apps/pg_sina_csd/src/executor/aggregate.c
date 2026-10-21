@@ -126,10 +126,14 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     SniaState *s=(SniaState *)node; const struct qs_plan *p=&s->request.plan;
     ExplainPropertyText("Execution Path","csd",es);
     ExplainPropertyText("CSD Scheduling","independent serial batches",es);
+    if(p->external_aggregate) ExplainPropertyText("CSD Aggregation","adaptive partial-state merge",es);
     StringInfoData graph; initStringInfo(&graph); appendStringInfoString(&graph,"LOAD -> Scan");
     if(p->predicate>=0) appendStringInfoString(&graph," -> Filter");
     if(p->ordered_rows) appendStringInfoString(&graph," -> Sort.sink; Sort.source (OFFSET/LIMIT)");
-    else {
+    else if(p->external_aggregate) {
+        appendStringInfoString(&graph," -> Aggregate.sink (local hash); Aggregate.source (merge/finalize)");
+        if(p->norder) appendStringInfoString(&graph," -> Sort (small result or external sink/source)");
+    } else {
         appendStringInfoString(&graph," -> Aggregate.sink; Aggregate.source");
         if(p->norder) appendStringInfoString(&graph," -> Sort");
         if(p->limit>=0 || p->offset) appendStringInfoString(&graph," -> Limit");
@@ -148,7 +152,7 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
         ExplainPropertyInteger("CSD Internal Read","bytes",s->result->metrics.input_bytes,es);
         ExplainPropertyInteger("CSD Query Memory Limit","bytes",p->work_mem_bytes*s->result->metrics.workers,es);
         ExplainPropertyInteger("CSD Workmem Peak","bytes",s->result->metrics.work_peak,es);
-        if(p->ordered_rows) {
+        if(p->ordered_rows || p->external_aggregate) {
             ExplainPropertyInteger("CSD Sort Runs",NULL,s->result->metrics.runs,es);
             ExplainPropertyInteger("CSD Spilled Runs",NULL,s->result->metrics.spilled_runs,es);
             ExplainPropertyInteger("CSD Spill Write","bytes",s->result->metrics.spill_write_bytes,es);

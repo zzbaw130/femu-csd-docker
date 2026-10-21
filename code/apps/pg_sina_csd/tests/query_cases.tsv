@@ -29,3 +29,7 @@ order_stream	SELECT k,a FROM snia_query_parallel WHERE k=0 ORDER BY a,k;
 order_spill	SELECT k,a,a*1.00,a*2.00,a*3.00,a*4.00,a*5.00,a*6.00 FROM snia_query_parallel ORDER BY a,k LIMIT 12000 OFFSET 10000;
 unsupported_row_timestamp	SELECT timestamp '1995-01-01',a FROM snia_query_fixture ORDER BY a;
 unsupported_nested_sorts	SELECT count(*) FROM (SELECT a FROM snia_query_parallel ORDER BY a LIMIT 300) x CROSS JOIN (SELECT a FROM snia_query_parallel ORDER BY a LIMIT 300) y;
+high_groups	SELECT g,sum(a),avg(a),count(a),count(*) FROM snia_query_parallel GROUP BY g ORDER BY sum(a) DESC,g NULLS FIRST;
+high_multikey	SELECT g,k,sum(a),avg(a),count(*) FROM snia_query_parallel WHERE g<400 GROUP BY g,k ORDER BY g DESC,k;
+high_hidden_key	SELECT sum(a),count(*) FROM snia_query_parallel GROUP BY g ORDER BY g DESC NULLS FIRST LIMIT 300 OFFSET 10;
+high_small_memory	SELECT g,sum(a),avg(a),count(a),count(*) FROM snia_query_parallel WHERE g<400 GROUP BY g ORDER BY g;

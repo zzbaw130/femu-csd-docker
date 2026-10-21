@@ -28,7 +28,8 @@ struct qs_plan {
     uint32_t relid, relfilenode;
     unsigned nattrs, ncols, nexprs, naggs, nkeys, nout, norder;
     int predicate;
-    unsigned ordered_rows;
+    unsigned ordered_rows; /* 1: SQL row sort; 2: internal full-row input. */
+    unsigned external_aggregate;
     uint64_t work_mem_bytes; /* Per execution slot, set at execution; 0 uses device capacity. */
     int64_t limit, offset;
     struct qs_column cols[QS_COLS];

@@ -32,10 +32,13 @@ case ${1:-query} in
                 grep -Eq 'CSD Deferred Columns: [1-9]' "$RESULTS/$name.plan"
             fi
             run_cold host "$sql" "$RESULTS/$name.host"
-            run_cold csd "$sql" "$RESULTS/$name.csd"
+            csd_sql=$sql
+            if [[ $name == high_small_memory ]]; then csd_sql="SET pg_sina_csd.max_memory='4MB'; $sql"; fi
+            run_cold csd "$csd_sql" "$RESULTS/$name.csd"
             cmp "$RESULTS/$name.host.rows" "$RESULTS/$name.csd.rows"
+            if [[ $name == high_* ]]; then grep -q 'CSD Aggregation: adaptive partial-state merge' "$RESULTS/$name.plan"; fi
             echo "PASS $name: cold host/csd exact results and expected plan"
-            if [[ $name == order_spill ]]; then
+            if [[ $name == order_spill || $name == high_groups ]]; then
                 printf 'SET pg_sina_csd.profile=on;\nEXPLAIN (ANALYZE,COSTS OFF,TIMING OFF,FORMAT JSON)\n%s\n' "$sql" > "$RESULTS/current.sql"
                 sh "$COLD" csd "$RESULTS/current.sql" > "$RESULTS/$name.json"
                 check=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 -c "
@@ -44,13 +47,14 @@ case ${1:-query} in
                         AND (p->>'CSD Spill Write')::bigint>0
                         AND (p->>'CSD Spill Read')::bigint>0
                         AND (p->>'CSD Workmem Peak')::bigint<=67108864
-                        AND (p->'CSD Profile'->'Sort.source'->>'Calls')::bigint>1
+                        AND CASE WHEN '$name'='order_spill' THEN (p->'CSD Profile'->'Sort.source'->>'Calls')::bigint>1
+                            ELSE (p->'CSD Profile'->'Aggregate.source'->>'Calls')::bigint>1 END
                     FROM doc")
                 [[ $check == t ]]
                 echo 'PASS external row sort actually spills, resumes and stays within 64 MiB workmem'
             fi
         done < "$PROJECT/tests/query_cases.tsv"
-        for name in q1 q6; do
+        for name in q1 q6 high_aggregate; do
             sql=$(cat "$PROJECT/tests/$name.sql")
             psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
                 -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path=csd" \
@@ -95,7 +99,7 @@ case ${1:-query} in
         # Scan fails in one slot while other batches may still be in flight.
         # Drain them before the same backend starts the following full scan.
         {
-            printf '\\set ON_ERROR_STOP off\nSELECT sum(bad) FROM snia_query_parallel;\n'
+            printf '\\set ON_ERROR_STOP off\nSELECT sum(bad) FROM snia_query_parallel;\nSELECT g,sum(bad) FROM snia_query_parallel GROUP BY g;\n'
             printf '\\set ON_ERROR_STOP on\nSELECT count(*) FROM snia_query_parallel;\nSELECT count(*) FROM snia_query_parallel;\n'
         } > "$RESULTS/error.sql"
         sh "$COLD" csd "$RESULTS/error.sql" > "$RESULTS/error.log" 2>&1
@@ -110,6 +114,13 @@ case ${1:-query} in
             -c 'SELECT count(*) FROM snia_query_parallel' > "$RESULTS/sort-close.log"
         grep -q '^450000$' "$RESULTS/sort-close.log"
         echo 'PASS closing a partially consumed sort releases workmem and spill before same-backend reuse'
+        psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
+            -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path=csd; BEGIN" \
+            -c 'DECLARE aggregate_cursor CURSOR FOR SELECT g,sum(a),avg(a),count(*) FROM snia_query_parallel GROUP BY g ORDER BY g' \
+            -c 'FETCH 1 FROM aggregate_cursor; CLOSE aggregate_cursor; COMMIT' \
+            -c 'SELECT count(*) FROM snia_query_parallel' > "$RESULTS/aggregate-close.log"
+        grep -q '^450000$' "$RESULTS/aggregate-close.log"
+        echo 'PASS partially consumed external aggregation releases states and spill before same-backend reuse'
         psql -X -q -v ON_ERROR_STOP=1 -d tpch_s1 -c "DELETE FROM sina_csd.relations WHERE relid IN ('snia_query_fixture'::regclass,'snia_query_empty'::regclass,'snia_query_parallel'::regclass); DROP TABLE snia_query_fixture,snia_query_empty,snia_query_parallel"
         ;;
     memory)
@@ -156,7 +167,7 @@ case ${1:-query} in
                    AND abs((p->>'Total Wall')::numeric-(p->>'Setup Wall')::numeric
                        -(p->>'Pipeline 1 Wall')::numeric-(p->>'Pipeline 2 Wall')::numeric
                        -(p->>'Cleanup Wall')::numeric)<0.01
-                   AND CASE WHEN '$name'='q1' THEN (p->'Sort'->>'Calls')::bigint=1
+                   AND CASE WHEN '$name'='q1' THEN NOT (p ? 'Sort')
                             ELSE (p->'Limit'->>'Calls')::bigint=1 END
                 FROM data")
             [[ $check == t ]]
@@ -197,9 +208,10 @@ case ${1:-query} in
         unset SNIA_FEMU_PROFILE
         pg_ctl -D /data/tpch_s1 -l /data/tpch_s1/log -o '-c autovacuum=off' -w restart >/dev/null
         ;;
-    bench|order-bench)
+    bench|order-bench|aggregate-bench)
         queries=(q1 q6)
         if [[ $1 == order-bench ]]; then queries=(order_topn order_spill); fi
+        if [[ $1 == aggregate-bench ]]; then queries=(high_aggregate); fi
         for name in "${queries[@]}"; do
             psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
                 -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path=csd" \
@@ -223,12 +235,12 @@ case ${1:-query} in
             done
         done
         awk 'NR>1 {key=$1" "$2; sum[key]+=$4; n[key]++} END {for(key in n) printf "%s mean=%.6fs\n",key,sum[key]/n[key]/1000}' "$RESULTS/timings.tsv"
-        if [[ $1 == order-bench ]]; then
+        if [[ $1 != bench ]]; then
             for name in "${queries[@]}"; do
                 printf 'SET pg_sina_csd.profile=on;\nEXPLAIN (ANALYZE,COSTS OFF,TIMING OFF,FORMAT JSON)\n%s\n' "$(cat "$PROJECT/tests/$name.sql")" > "$RESULTS/current.sql"
                 sh "$COLD" csd "$RESULTS/current.sql" > "$RESULTS/$name.json"
             done
         fi
         ;;
-    *) echo 'usage: pg-sina-query-test.sh query|memory|profile|analyze|bench|order-bench' >&2; exit 2 ;;
+    *) echo 'usage: pg-sina-query-test.sh query|memory|profile|analyze|bench|order-bench|aggregate-bench' >&2; exit 2 ;;
 esac

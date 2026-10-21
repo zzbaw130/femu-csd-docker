@@ -331,3 +331,48 @@ Guest `/tmp/pg-sina-queries.KjmMQM`，主机日志 `/tmp/pg-snia-memory-order-be
 | order_spill / csd | 1353.913 / 1321.059 / 1328.090 | 1334.354 | 1328.090 |
 
 TopN扫描lineitem后按extendedprice降序、orderkey升序取100行。外部排序筛选1995年发货记录，按四列排序后OFFSET 10000、LIMIT 12000，约117MiB紧凑行数据超过64MiB预算，验证实际spill。独立开启profile的样本保存在同目录两个JSON中，不混入延迟均值。FEMU带宽模型参数未调整，少量样本不代表真实SSD的固定收益。
+
+
+## 阶段2b：高基数聚合与部分状态归并（2026-10-21）
+
+所有支持的GROUP BY改为自适应局部哈希路径，不再依赖PG估计分组数≤256。局部表未flush、所有局部组的数量之和≤256时直接使用小哈希合并快路径；其他情况将部分状态按键归并，再计算最终SUM/AVG/COUNT。需要SQL排序时将最终组送入结果排序。输入和结果排序共享查询预算：固定局部状态扣除后，有ORDER BY的查询将余量分给两种排序，没有ORDER BY则用于部分状态run。这是简单的静态预算安排，没有实现动态借用。
+
+参考本地DuckDB的radix_partitioned_hashtable.cpp（局部预聚合、内存预算和状态合并）及sorted_aggregate_function.cpp/sort.cpp（排序与状态组织）；没有复制DuckDB的完整radix分区实现。aggregate SO直接复用sort.c私有函数，不发送嵌套NVMe、不新增固件功能；profile的Aggregate.sink/source包含其内部排序CPU与I/O重入，不与独立Sort计数重复累计。
+
+### 正确性与内存
+
+21项设备CTest及16项PG算子ASan/UBSan通过；为最终新增全NULL聚合组又重复4项容量sanitizer，全部通过。LeakSanitizer仍因执行环境限制关闭，测试另行断言分配器零占用及token回收。
+
+新的设备差分测试包含100003行、32772组的完整输出，与独立sum/count预期值逐列核对；同一AVG输入在不同槽和run中的条数不同，合并sum/count后再求平均。另有8组小结果、跨块边界、NULL键/全NULL值组、显示精度、排序、LIMIT/OFFSET、空输入、提前终止和失败scope已回收token的清理。下表取完整大结果case；峰值包括同进程先前的小结果等用例：
+
+| 物理池 / 查询预算 MiB | 峰值 bytes | STORE次数 | LOAD次数 |
+| --- | ---: | ---: | ---: |
+| 4 / 4 | 3984224 | 305 | 10529 |
+| 8 / 8 | 7910320 | 248 | 5704 |
+| 64 / 64 | 23264416 | 0 | 0 |
+| 64 / 4 | 3984224 | 305 | 10529 |
+
+小结果case不生成run、不发生STORE/LOAD。缓存策略起初保留64KiB整块；仅在交错run反复提前丢弃缓存后缩小窗口，复制当前窗口到workmem，实际LOAD仍为64KiB。顺序run保持原读法，测试额外约束约96MiB顺序数据在4MiB预算下的LOAD不超过STORE的3倍，避免无条件缩小窗口产生回退。交错场景仍有读取放大，不能替代后续多轮归并。
+
+Guest完整冷启动回归通过：8192组、NULL分组键、多列分组、隐藏排序键、4MB预算、真实spill、全部分批结果，以及设备报错和游标提前关闭后的同backend复用。Q1/Q6和SF=1新增语句全部结果与原生PG一致；profile开关/调用数也通过。日志：`/tmp/pg-snia-high-aggregate-final-query.log`（Guest `/tmp/pg-sina-queries.d9KCUk`）、`/tmp/pg-snia-high-aggregate-final-profile.log`（Guest `/tmp/pg-sina-queries.yQjO4c`）、`/tmp/pg-snia-high-aggregate-final-native.log`、`/tmp/pg-snia-high-aggregate-final-asan.log`和`/tmp/pg-snia-high-aggregate-extra-asan.log`。
+
+### 冷启动性能
+
+所有构建和其他测试结束后单独测量，每次停止PG、清Guest页缓存并重启PG，交替host/CSD各3轮，关闭profile。PG保留既有work_mem=4MB及并行配置；CSD为4 CU、64MiB AFDM及64MiB查询/物理workmem上限，不是等核数、等总内存对照。全部样本保留：
+
+| 查询/路径 | 三轮 ms | 均值 ms | 中位数 ms |
+| --- | --- | ---: | ---: |
+| high_aggregate/host | 3958.478 / 3075.970 / 3066.997 | 3367.148 | 3075.970 |
+| high_aggregate/csd | 2862.612 / 2776.241 / 3210.016 | 2949.623 | 2862.612 |
+| Q1/host | 4380.653 / 4809.148 / 4544.757 | 4578.186 | 4544.757 |
+| Q1/csd | 851.351 / 819.152 / 851.366 | 840.623 | 851.351 |
+| Q6/host | 1496.184 / 1682.299 / 1482.344 | 1553.609 | 1496.184 |
+| Q6/csd | 591.267 / 604.685 / 621.489 | 605.814 | 604.685 |
+
+新增语句是1995年lineitem按partkey汇总revenue、AVG(quantity)、COUNT，再按revenue取前100，是算子验证，不是新增TPC-H查询编号。均值差异受到host首轮3958ms样本影响；中位数约3076→2863ms，收益较小且存在波动。当前完整TPC-H覆盖仍为Q1/Q6，Join、HAVING、MIN/MAX及一般字符串待后续阶段。
+
+原始记录：Guest `/tmp/pg-sina-queries.dEPbad`、`/tmp/pg-sina-queries.ACDp5s`，主机 `/tmp/pg-snia-high-aggregate-{bench,q1q6-bench}.log`。独立profile快照 `/tmp/pg-snia-high-aggregate-profiles.json`，不混入关闭profile的延迟均值。
+
+独立profile的新增语句：扫描6001215行，保留914963行，内部读取921624576字节；118个run、89个spill run，写93323264字节（89MiB）、读204865536字节（195.375MiB），workmem池峰值33843360字节。第一pipeline墙钟1702ms，source阶段1403ms；Scan/Filter/聚合sink/source累计CU CPU分别约899/194/1620/740ms，累计CPU不能直接相加为查询墙钟。sink有1644次、source有4551次调用，包含I/O重入。
+
+当前主要限制是局部表固定256组、部分状态排序与单source归并，以及大量重入/LOAD命令。预留的结果排序预算在TopN场景几乎没有使用，使输入排序仅利用约一半容量；后续可考虑在明确生命周期内借用预算，而不是降低全局空闲百分比阈值。极多run元数据仍可能耗尽内存，多轮归并尚未实现。Q1独立profile保持0个run/0次spill，聚合source一次，说明其继续使用小哈希快路径；新状态结构使workmem峰值约1.50MiB。

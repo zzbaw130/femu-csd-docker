@@ -109,6 +109,8 @@ static void check(function sink,function source,unsigned rows,int64_t limit,int6
     if(limit<0 && (uint64_t)rows*3*sizeof(struct qs_cell)>budget) assert(stored && loaded);
     if(limit<0 && (uint64_t)rows*3*sizeof(struct qs_cell)<budget/2) assert(!stored && !loaded);
     if(limit>=0) assert(!stored && !loaded);
+    /* These monotonic runs should retain full I/O blocks, even at 4 MiB. */
+    if(limit<0 && rows>1000000 && !cancel && stored) assert(loaded<=3*stored);
     if(profile) assert(counters[0].operators[QS_SORT_SOURCE].calls);
     for(unsigned i=1;i<next_token;++i) assert(!blocks[i]);
     for(unsigned i=0;i<4;++i) assert(!group.states[i]);

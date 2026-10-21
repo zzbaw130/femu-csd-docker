@@ -21,7 +21,6 @@
 #include "utils/rel.h"
 #include <errno.h>
 #include <locale.h>
-#include "utils/selfuncs.h"
 static bool builtin(Oid function,const char *name)
 {
     char *actual=get_func_name(function);
@@ -267,8 +266,9 @@ void pg_sina_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *i
     Index rti=((RangeTblRef *)linitial(q->jointree->fromlist))->rtindex;
     RangeTblEntry *rte=rt_fetch(rti,q->rtable); if(rte->rtekind!=RTE_RELATION || rte->tablesample) return;
     RelOptInfo *rel=root->simple_rel_array[rti]; if(!rel) return;
-    if(q->groupClause && estimate_num_groups(root,get_sortgrouplist_exprs(q->groupClause,root->processed_tlist),rel->rows,NULL)>QS_GROUPS) return;
     struct qs_plan plan={0}; if(!compile(root,rti,rel,&plan)) return;
+    plan.external_aggregate=plan.nkeys!=0;
+    if(plan.external_aggregate && plan.nkeys+plan.naggs>QS_OUT) return;
     Oid nsp=get_namespace_oid("sina_csd",true);
     if(!OidIsValid(nsp) || !OidIsValid(get_relname_relid("relations",nsp))) return;
     if(SPI_connect()!=SPI_OK_CONNECT) elog(ERROR,"SPI_connect failed");
@@ -278,7 +278,7 @@ void pg_sina_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *i
     bytea *data=palloc(VARHDRSZ+sizeof(plan)); SET_VARSIZE(data,VARHDRSZ+sizeof(plan)); memcpy(VARDATA(data),&plan,sizeof(plan));
     CustomPath *path=makeNode(CustomPath); path->path.pathtype=T_CustomScan; path->path.parent=output;
     path->path.pathtarget=create_pathtarget(root,root->processed_tlist);
-    path->path.rows=plan.ordered_rows?rel->rows:plan.nkeys?4:1;
+    path->path.rows=plan.ordered_rows || plan.external_aggregate?rel->rows:plan.nkeys?4:1;
     path->path.pathkeys=root->sort_pathkeys; path->path.startup_cost=path->path.total_cost=0;
     path->custom_private=list_make1(makeConst(BYTEAOID,-1,InvalidOid,-1,PointerGetDatum(data),false,false));
     path->methods=plan.ordered_rows?&order_path_methods:&path_methods; add_path(output,&path->path);

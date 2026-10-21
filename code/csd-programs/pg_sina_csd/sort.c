@@ -58,7 +58,7 @@ struct row_run {
     cs_work_context *owner;
     uint64_t blocks[RUN_BLOCKS];
     struct qs_cell head[QS_OUT];
-    unsigned rows, position, loaded;
+    unsigned rows, position, loaded, cache_rows;
     int sorted, spilled;
 };
 struct row_sort {
@@ -73,7 +73,8 @@ struct row_sort {
     struct row_sort *owners[QS_WORKERS];
     unsigned owners_count;
     struct row_run **heap, *pending_run;
-    unsigned heap_count, pending_block, pending;
+    unsigned heap_count, pending_block, pending, cache_evictions;
+    int compact_cache;
     struct qs_metrics metrics;
 };
 enum { ROW_NONE, ROW_STORE, ROW_LOAD, ROW_FREE };
@@ -123,6 +124,28 @@ static int64_t row_store(struct row_sort *s,struct row_run *r,struct femu_csd_ar
     memcpy(io,r->data+(size_t)first*s->row_bytes,(size_t)n*s->row_bytes);
     return csNeedStore(QS_SORT_IO_BYTES);
 }
+/* Sequential runs benefit from full-block caching. Only shrink windows when
+ * repeated premature evictions show that interleaved runs are thrashing. */
+static void compact_cache(struct row_sort *o)
+{
+    unsigned spilled=0;
+    for(unsigned j=0;j<o->count;++j) {
+        struct row_run *r=&o->runs[j];
+        if(!r->spilled) continue;
+        ++spilled;
+        if(r->data) { cs_work_free(o->context,r->data); r->data=NULL; }
+        r->loaded=UINT32_MAX;
+    }
+    struct cs_work_context_stats memory;
+    if(cs_work_get_context_stats(o->context,&memory)) return;
+    size_t bytes=(memory.limit_bytes-memory.used_bytes)/(spilled+1);
+    bytes=bytes>128?bytes-128:0; /* Allocation metadata/alignment headroom. */
+    unsigned rows=bytes/o->row_bytes;
+    if(!rows) rows=1;
+    if(rows>o->block_rows) rows=o->block_rows;
+    for(unsigned j=0;j<o->count;++j) o->runs[j].cache_rows=rows;
+    o->compact_cache=1;
+}
 static int64_t row_evict(struct row_sort *s,cs_work_context *owner,struct femu_csd_args *a)
 {
     /* A spilled run's read buffer is only a cache. Its head is retained in
@@ -132,7 +155,10 @@ static int64_t row_evict(struct row_sort *s,cs_work_context *owner,struct femu_c
         for(unsigned j=0;j<o->count;++j) {
             struct row_run *r=&o->runs[j];
             if(r->owner==owner && r->spilled && r->data) {
-                cs_work_free(owner,r->data); r->data=NULL; r->loaded=UINT32_MAX; return 0;
+                int premature=r->loaded!=UINT32_MAX && r->position<r->loaded+r->cache_rows;
+                cs_work_free(owner,r->data); r->data=NULL; r->loaded=UINT32_MAX;
+                if(premature && !o->compact_cache && ++o->cache_evictions>=2*o->count) compact_cache(o);
+                return 0;
             }
         }
     }
@@ -160,8 +186,10 @@ static int64_t row_resume(struct row_sort *s,struct femu_csd_args *a)
         cs_work_free(r->owner,r->data); r->data=NULL; r->spilled=1; r->loaded=UINT32_MAX;
         ++s->metrics.spilled_runs;
     } else if(s->pending==ROW_LOAD) {
-        memcpy(r->data,a->mr_addr[a->numr-1],QS_SORT_IO_BYTES);
-        r->loaded=s->pending_block; s->metrics.spill_read_bytes+=QS_SORT_IO_BYTES;
+        unsigned first=(r->position%s->block_rows/r->cache_rows)*r->cache_rows;
+        unsigned count=s->block_rows-first; if(count>r->cache_rows) count=r->cache_rows;
+        memcpy(r->data,(unsigned char *)a->mr_addr[a->numr-1]+(size_t)first*s->row_bytes,(size_t)count*s->row_bytes);
+        r->loaded=s->pending_block*s->block_rows+first; s->metrics.spill_read_bytes+=QS_SORT_IO_BYTES;
     } else if(s->pending==ROW_FREE) r->blocks[s->pending_block]=0;
     else return -1;
     s->pending=ROW_NONE; return 0;
@@ -181,7 +209,7 @@ static int row_init(struct qs_task *task,const struct qs_plan *p,struct row_sort
     s->run_rows=(bytes/QS_SORT_IO_BYTES)*s->block_rows;
     s->vectors=cs_work_alloc(context,p->nexprs*sizeof(*s->vectors));
     if(p->nexprs && !s->vectors) { cs_work_end(context); return -4; }
-    for(unsigned i=0;i<p->nout;++i)
+    for(unsigned i=0;i<p->nout && p->ordered_rows!=2;++i)
         if(qs_vector_require(p,p->outputs[i].index,s->needed)) { cs_work_end(context); return -1; }
     if(p->limit>=0 && (uint64_t)p->limit<=UINT64_MAX-(uint64_t)p->offset) {
         s->topn=(uint64_t)p->limit+(uint64_t)p->offset;
@@ -194,19 +222,23 @@ int64_t pg_sina_sort_sink(struct femu_csd_args *a)
 {
     if(!a || a->numr!=4 || a->mr_len[1]<(long long)sizeof(struct qs_plan) ||
         a->mr_len[2]<(long long)sizeof(struct qs_task) || a->mr_len[3]<QS_SORT_IO_BYTES) return -1;
-    struct qs_chunk *c=a->mr_addr[0]; const struct qs_plan *p=a->mr_addr[1]; struct qs_task *task=a->mr_addr[2];
+    struct qs_chunk *c=a->mr_addr[0]; struct qs_result *rows=a->mr_addr[0];
+    const struct qs_plan *p=a->mr_addr[1]; struct qs_task *task=a->mr_addr[2];
+    int row_input=p->ordered_rows==2;
     if(!p->nout || p->nout>QS_OUT || p->nexprs>QS_EXPRS || p->norder>QS_OUT ||
-        a->mr_len[0]<(long long)sizeof(*c) || c->selected>c->rows || c->rows>c->capacity ||
-        qs_chunk_bytes(c->capacity,c->ncols)>(uint64_t)a->mr_len[0]) return -1;
+        (row_input?(a->mr_len[0]<(long long)sizeof(*rows) || rows->rows>QS_RESULT_ROWS):
+         (a->mr_len[0]<(long long)sizeof(*c) || c->selected>c->rows || c->rows>c->capacity ||
+          qs_chunk_bytes(c->capacity,c->ncols)>(uint64_t)a->mr_len[0]))) return -1;
+    unsigned selected=row_input?rows->rows:c->selected;
     struct row_sort *s=(void *)(uintptr_t)task->state;
     if(!s) { int status=row_init(task,p,&s); if(status) return status; }
     if(!csIsReentry(a)) {
-        s->input_position=0; s->metrics.scanned+=c->rows; s->metrics.matched+=c->selected;
+        s->input_position=0; s->metrics.scanned+=row_input?rows->rows:c->rows; s->metrics.matched+=selected;
         s->metrics.input_bytes+=task->input_bytes; ++s->metrics.chunks;
     }
     int64_t status=row_resume(s,a); if(status) return status;
-    while(s->input_position<c->selected) {
-        if(s->bounded && !s->topn) { s->input_position=c->selected; break; }
+    while(s->input_position<selected) {
+        if(s->bounded && !s->topn) { s->input_position=selected; break; }
         struct row_run *r=s->count?&s->runs[s->count-1]:NULL;
         if(!r || (!s->bounded && r->sorted)) {
             if(s->count==s->capacity) {
@@ -227,13 +259,14 @@ int64_t pg_sina_sort_sink(struct femu_csd_args *a)
             if(!data) return row_evict(s,s->context,a);
             r=&s->runs[s->count++]; memset(r,0,sizeof(*r)); r->data=data; r->owner=s->context;
         }
-        unsigned count=c->selected-s->input_position;
+        unsigned count=selected-s->input_position;
         if(count>QS_VECTOR_ROWS) count=QS_VECTOR_ROWS;
         if(!s->bounded && count>s->run_rows-r->rows) count=s->run_rows-r->rows;
-        if(qs_vector_execute(p,c,qs_selection(c),s->input_position,count,s->needed,s->vectors)) return -5;
+        if(!row_input && qs_vector_execute(p,c,qs_selection(c),s->input_position,count,s->needed,s->vectors)) return -5;
         for(unsigned i=0;i<count;++i) {
             struct qs_cell row[QS_OUT];
-            for(unsigned col=0;col<p->nout;++col) {
+            if(row_input) memcpy(row,rows->data[s->input_position+i].cells,s->row_bytes);
+            else for(unsigned col=0;col<p->nout;++col) {
                 unsigned expr=p->outputs[col].index;
                 if(s->vectors[expr].errors[i]) return -5;
                 row[col]=qs_vector_cell(p,s->vectors,expr,i);
@@ -290,6 +323,8 @@ static int row_combine(struct row_sort *s,struct qs_group *group)
             }
             s->metrics.runs+=o->count;
         }
+        for(unsigned i=0;i<s->owners_count;++i)
+            for(unsigned j=0;j<s->owners[i]->count;++j) s->owners[i]->runs[j].cache_rows=s->block_rows;
         s->metrics.workers=group->count; s->combined=1;
     }
     return 0;
@@ -298,15 +333,16 @@ static int64_t merge_head(struct row_sort *s,struct row_run *r,struct femu_csd_a
 {
     if(r->spilled) {
         while(!r->data) {
-            r->data=cs_work_alloc(r->owner,QS_SORT_IO_BYTES);
+            r->data=cs_work_alloc(r->owner,(size_t)r->cache_rows*s->row_bytes);
             if(!r->data) { int64_t status=row_evict(s,r->owner,a); if(status) return status; }
         }
         unsigned block=r->position/s->block_rows;
-        if(r->loaded!=block) {
+        unsigned window=block*s->block_rows+(r->position%s->block_rows/r->cache_rows)*r->cache_rows;
+        if(r->loaded!=window) {
             s->pending_run=r; s->pending_block=block; s->pending=ROW_LOAD;
             return csNeedLoad(r->blocks[block]);
         }
-        memcpy(r->head,r->data+(size_t)(r->position%s->block_rows)*s->row_bytes,s->row_bytes);
+        memcpy(r->head,r->data+(size_t)(r->position-r->loaded)*s->row_bytes,s->row_bytes);
     } else memcpy(r->head,r->data+(size_t)r->position*s->row_bytes,s->row_bytes);
     return 0;
 }

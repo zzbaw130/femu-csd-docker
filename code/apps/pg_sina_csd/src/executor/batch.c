@@ -84,7 +84,7 @@ static void compute_io_request(CsBatchRequest *b,CS_CSF_ID function,CS_MEM_HANDL
         ++b->u.Compute.NumArgs;
     }
 }
-static void drop_sort(CS_CSF_ID source,CS_MEM_HANDLE group,CsBatchRequest *compute)
+static void drop_source(CS_CSF_ID source,CS_MEM_HANDLE group,CsBatchRequest *compute)
 {
     CS_MEM_HANDLE memory[]={group}; compute_request(compute,source,memory,1,NULL);
     csQueueComputeRequest(&compute->u.Compute,NULL,NULL,NULL,NULL,NULL);
@@ -96,8 +96,9 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     uint64_t start=profiling?clock_ns():0,phase=start,cleanup_start=0;
     struct qs_profile stats={0};
     CHECK_FOR_INTERRUPTS();
-    struct pg_sina_stream *saved=request->plan.ordered_rows?calloc(1,sizeof(*saved)):NULL;
-    if(request->plan.ordered_rows && !saved) elog(ERROR,"cannot allocate CSD result stream");
+    bool streaming=request->plan.ordered_rows || request->plan.external_aggregate;
+    struct pg_sina_stream *saved=streaming?calloc(1,sizeof(*saved)):NULL;
+    if(streaming && !saved) elog(ERROR,"cannot allocate CSD result stream");
     *stream=NULL;
     /* Do not longjmp through SNIA C++ frames or its batch threads. Poll PG's
      * pending cancel between event polls, then release resources before PG
@@ -150,7 +151,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     request->plan.work_mem_bytes=(uint64_t)pg_sina_max_memory*1024/workers;
     group.count=workers;
     for(unsigned i=0;i<FUNCTIONS;++i) {
-        if((request->plan.ordered_rows && i>=SORT) ||
+        if((streaming && i>=SORT) ||
             (i==FILTER && request->plan.predicate<0) || (i==SORT && !request->plan.norder) ||
             (i==LIMIT && request->plan.limit<0 && !request->plan.offset)) continue;
         TRY(load_program(device,&programs[i]));
@@ -215,7 +216,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
                     TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_ADD,compute,0,previous,&current)); previous=current;
                 }
                 CS_MEM_HANDLE aggregate[]={vectors[i],plan_mem,tasks[i],input[i]};
-                if(request->plan.ordered_rows) compute_io_request(compute,programs[SINK].function,aggregate,4,counters[i]);
+                if(streaming) compute_io_request(compute,programs[SINK].function,aggregate,4,counters[i]);
                 else compute_request(compute,programs[SINK].function,aggregate,3,counters[i]);
                 TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_ADD,compute,0,previous,&current));
             }
@@ -246,14 +247,14 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     TRY(csAllocBatchRequest(CS_BATCH_SERIAL,3,&batch));
     CS_BATCH_INDEX previous=0,current;
     CS_MEM_HANDLE source[]={group_mem,out_mem,input[0]};
-    if(request->plan.ordered_rows) compute_io_request(compute,programs[SOURCE].function,source,3,counters[0]);
+    if(streaming) compute_io_request(compute,programs[SOURCE].function,source,3,counters[0]);
     else compute_request(compute,programs[SOURCE].function,source,2,counters[0]);
     TRY(csConfigureBatchEntry(batch,CS_BATCH_ADD,compute,0,0,&previous));
-    if(request->plan.norder && !request->plan.ordered_rows) {
+    if(request->plan.norder && !streaming) {
         CS_MEM_HANDLE order[]={out_mem,plan_mem}; compute_request(compute,programs[SORT].function,order,2,counters[0]);
         TRY(csConfigureBatchEntry(batch,CS_BATCH_ADD,compute,0,previous,&current)); previous=current;
     }
-    if(!request->plan.ordered_rows && (request->plan.limit>=0 || request->plan.offset)) {
+    if(!streaming && (request->plan.limit>=0 || request->plan.offset)) {
         CS_MEM_HANDLE limit[]={out_mem,plan_mem}; compute_request(compute,programs[LIMIT].function,limit,2,counters[0]);
         TRY(csConfigureBatchEntry(batch,CS_BATCH_ADD,compute,0,previous,&current));
     }
@@ -308,7 +309,7 @@ cleanup:
             for(unsigned i=0;i<workers;++i) if(tasks[i]) { struct qs_task task={0}; copy(tasks[i],0,&task,sizeof(task),0); group.states[i]=task.state; }
             copy(group_mem,0,&group,sizeof(group),1);
         }
-        if(request->plan.ordered_rows) drop_sort(programs[SOURCE].function,group_mem,compute);
+        if(streaming) drop_source(programs[SOURCE].function,group_mem,compute);
         else {
             CS_MEM_HANDLE memory[]={group_mem}; compute_request(compute,programs[SOURCE].function,memory,1,NULL);
             csQueueComputeRequest(&compute->u.Compute,NULL,NULL,NULL,NULL,NULL);
@@ -341,7 +342,7 @@ void pg_sina_close(struct pg_sina_stream *s)
     unsigned char storage[sizeof(CsBatchRequest)+6*sizeof(CsComputeArg)] __attribute__((aligned(16)));
     CsBatchRequest *compute=(void *)storage;
     if(s->batch) csFreeBatchRequest(s->batch);
-    drop_sort(s->source.function,s->group,compute);
+    drop_source(s->source.function,s->group,compute);
     CsMemFlags flags={.FDMId=1};
     csFreeMem(s->output,&flags); csFreeMem(s->group,&flags); csFreeMem(s->io,&flags);
     if(s->counter) csFreeMem(s->counter,&flags);
