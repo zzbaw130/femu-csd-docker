@@ -340,3 +340,11 @@ Q9提交后复核Q5/Q10（连接顺序/预算已变化）：Q5 host均值2275.09
 - 小结果快速路径此前在 `Aggregate.source` 中先按字典ID排序、后解析字符串，Q4 只有5组会走该路径；现在排序前调用 `resolve_output_strings`，保证字符串 ORDER BY 的字节序。
 
 验收：Q4 5行结果与host逐字一致（3轮cmp通过）。默认64MB冷启动三轮host=2608.291/1945.221/2094.175ms（均值2215.896），CSD=1312.971/1202.337/1332.642ms（均值1282.650），CSD约快1.7倍。Q4 profile：Internal Read 727531520字节、Index/Heap Pages Loaded 62715、Index Heap Tuples 52544、Spill 0、4 workers、Execution 1183.481ms。16MB查询预算CSD=1237.619ms，结果一致。200ms取消后同backend连续两次CSD COUNT均返回6001215。复现入口同上，SQL位于`tests/q4.sql`。
+
+## 阶段3l：Q13 LEFT JOIN 与两级聚合（2026-10-22）
+
+- LEFT JOIN 采用“每 probe 行先输出一条 build 列为 NULL 的垫底行”方案；Q13 的 `count(o_orderkey)` 忽略该 NULL，零订单 customer 自然得到 c_count=0，避免 unmatched 状态机。
+- `Aggregate.source` 增加 nested 模式：第一级 group 完成后不再直接输出，而是按第一级 count 累加 c_count 分布；最终输出 c_count/custdist，并在设备内排序。
+- 小库 q13_test 与 10 万客户/100 万订单场景验证通过后，再接 TPCH 主库。
+
+验收：Q13 41行结果与host逐字一致（3轮cmp通过）。64MB冷启动三轮host=1312.491/1134.331/1150.842ms（均值1199.221），CSD=5631.952/5418.754/5892.680ms（均值5647.795），约4.7倍。16MB查询预算长时间不返回，当前最低验收内存为64MB；性能和16MB小内存仍未达标。Q13 profile未在崩溃前采集。SQL位于`tests/q13.sql`。

@@ -46,6 +46,7 @@ struct qs_join {
     int build_key, probe_key, predicate;
     int build_key2, probe_key2; /* Optional second integer equality key. */
     int semi; /* EXISTS: at most one output per probe row. */
+    int left_pad; /* Emit one NULL-build row per probe row (left join count). */
     int residual; /* Joined-row predicate index + 1; 0 means no residual. */
     uint64_t rows, work_mem_bytes;
     uint32_t indexid, indexnode, indexroot;
@@ -59,6 +60,8 @@ struct qs_plan {
     int predicate;
     unsigned ordered_rows; /* 1: SQL row sort; 2: internal full-row input. */
     unsigned external_aggregate;
+    unsigned nested; /* First-level groups are re-aggregated by nested_key_agg. */
+    int nested_key_agg;
     struct qs_join join; /* First build; its work_mem_bytes is the total build reservation. */
     unsigned njoins;
     struct qs_join extra_joins[QS_JOINS-1];

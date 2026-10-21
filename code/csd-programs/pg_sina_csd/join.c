@@ -13,7 +13,7 @@ struct hash_row { uint32_t next, padding; uint64_t nulls; };
 struct build_batch { uint64_t *tokens; unsigned rows, blocks; };
 /* Workmem guarantees 16-byte alignment. Space heads two cache lines apart so
  * adjacent slots never share the frequently written cursor fields. */
-struct probe_cursor { unsigned position, match, pending; unsigned char padding[116]; };
+struct probe_cursor { unsigned position, match, pending, pad_done; unsigned char padding[112]; };
 struct hash_join {
     cs_work_context *context;
     unsigned char *data;
@@ -246,21 +246,38 @@ static int64_t probe_stage(unsigned stage,struct qs_chunk *c,const struct qs_pla
         if(!cursor->pending) return -1;
         int64_t status=qs_join_consume(stage,out,p,task,control,a,1); if(status) return status;
         cursor->pending=0; out->rows=out->selected=0;
-    } else { cursor->position=cursor->match=cursor->pending=0; out->rows=out->selected=0; }
+    } else { cursor->position=cursor->match=cursor->pending=cursor->pad_done=0; out->rows=out->selected=0; }
     while(cursor->position<c->selected) {
         unsigned row=qs_selection(c)[cursor->position]; if(row>=c->rows) return -1;
-        if(qs_nulls(c)[(size_t)key*((c->capacity+7)/8)+row/8]&(1U<<(row%8))) { ++cursor->position; continue; }
+        if(j->left_pad && !cursor->pad_done) {
+            if(!out->rows) memset(qs_nulls(out),0,((out->capacity+7)/8)*(size_t)out->ncols);
+            unsigned dest=out->rows;
+            for(unsigned col=0;col<np;++col) {
+                unsigned slot=probe_cols[col];
+                qs_values(out)[(size_t)slot*out->capacity+dest]=qs_values(c)[(size_t)(stage?slot:col)*c->capacity+row];
+                qs_dscales(out)[(size_t)slot*out->capacity+dest]=qs_dscales(c)[(size_t)(stage?slot:col)*c->capacity+row];
+                if(qs_nulls(c)[(size_t)(stage?slot:col)*((c->capacity+7)/8)+row/8]&(1U<<(row%8))) qs_nulls(out)[(size_t)slot*((out->capacity+7)/8)+dest/8]|=1U<<(dest%8);
+            }
+            for(unsigned col=0;col<nb;++col) qs_nulls(out)[(size_t)build_cols[col]*((out->capacity+7)/8)+dest/8]|=1U<<(dest%8);
+            qs_selection(out)[dest]=dest; ++out->rows; ++out->selected;
+            cursor->pad_done=1;
+            if(out->rows==out->capacity) {
+                cursor->pending=1; int64_t status=qs_join_consume(stage,out,p,task,control,a,0); if(status) return status;
+                cursor->pending=0; out->rows=out->selected=0;
+            }
+        }
+        if(qs_nulls(c)[(size_t)key*((c->capacity+7)/8)+row/8]&(1U<<(row%8))) { cursor->pad_done=0; ++cursor->position; continue; }
         int64_t value=qs_values(c)[(size_t)key*c->capacity+row],value2=0;
         if(key2!=UINT_MAX) {
-            if(qs_nulls(c)[(size_t)key2*((c->capacity+7)/8)+row/8]&(1U<<(row%8))) { ++cursor->position; continue; }
+            if(qs_nulls(c)[(size_t)key2*((c->capacity+7)/8)+row/8]&(1U<<(row%8))) { cursor->pad_done=0; ++cursor->position; continue; }
             value2=qs_values(c)[(size_t)key2*c->capacity+row];
         }
         unsigned at=cursor->match?cursor->match-1:h->buckets[value_pair(h,value,value2)&(h->slots-1)];
-        if(at==UINT_MAX) { ++cursor->position; continue; }
+        if(at==UINT_MAX) { cursor->pad_done=0; ++cursor->position; continue; }
         struct hash_row *r=row_at(h,at);
         /* Save the next pair before a possibly reentrant aggregate call. */
         cursor->match=r->next==UINT_MAX?0:r->next+1;
-        if(!cursor->match) ++cursor->position;
+        if(!cursor->match) { cursor->pad_done=0; ++cursor->position; }
         if(row_values(r)[h->key]!=value) continue;
         if(h->key2!=UINT_MAX && row_values(r)[h->key2]!=value2) continue;
         if(!out->rows) memset(qs_nulls(out),0,((out->capacity+7)/8)*(size_t)out->ncols);

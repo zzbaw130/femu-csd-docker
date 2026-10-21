@@ -282,7 +282,8 @@ static int expression(Node *node,Index rti,struct qs_plan *p)
     Oid function=OidIsValid(op->opfuncid)?op->opfuncid:get_opcode(op->opno);
     int comparison=string_comparison(linitial(op->args),lsecond(op->args),function,op->inputcollid,rti,p);
     if(comparison>=0) return comparison;
-    if(builtin(function,"textlike")) {
+    bool not_like=builtin(function,"textnlike");
+    if(builtin(function,"textlike") || not_like) {
         Node *left=linitial(op->args); while(IsA(left,RelabelType)) left=(Node *)((RelabelType *)left)->arg;
         Node *right=lsecond(op->args);
         if(!IsA(left,Var) || !IsA(right,Const) || !byte_collation(op->inputcollid)) return -1;
@@ -307,7 +308,8 @@ static int expression(Node *node,Index rti,struct qs_plan *p)
             spec->type=Q_PATTERN; spec->prefix_len=(uint8_t)len; memcpy(spec->prefix,pattern_text,len);
         }
         if(spec->slot<0) spec->slot=p->ncols++;
-        return put(p,(struct qs_expr){.op=Q_COLUMN,.column=col,.type=Q_BOOLEAN});
+        int like=put(p,(struct qs_expr){.op=Q_COLUMN,.column=col,.type=Q_BOOLEAN});
+        return not_like?put(p,(struct qs_expr){.op=Q_NOT,.type=Q_BOOLEAN,.left=like}):like;
     }
     e.left=expression(linitial(op->args),rti,p); e.right=expression(lsecond(op->args),rti,p);
     if(e.left<0 || e.right<0) return -1;
@@ -805,6 +807,50 @@ static bool compile_semi_index(PlannerInfo *root,List *relations,List *quals,str
     table_close(line,NoLock); if(!ok) return false;
     *plan=p; *probe_rti=orti; return true;
 }
+static bool compile_q13(PlannerInfo *root,struct qs_plan *plan,Index *probe_rti)
+{
+    Query *q=root->parse; if(!q || q->hasSubLinks) return false;
+    RangeTblEntry *subrte=NULL; ListCell *rc;
+    foreach(rc,q->rtable) { RangeTblEntry *r=lfirst_node(RangeTblEntry,rc); if(r->rtekind==RTE_SUBQUERY) { subrte=r; break; } }
+    if(!subrte || !subrte->subquery) return false;
+    Query *sub=subrte->subquery; if(!sub->hasAggs || list_length(sub->groupClause)!=1 || !IsA(sub->jointree,FromExpr)) return false;
+    JoinExpr *joinj=NULL;
+    foreach(rc,((FromExpr *)sub->jointree)->fromlist) if(IsA(lfirst(rc),JoinExpr)) joinj=(JoinExpr *)lfirst(rc);
+    if(!joinj || joinj->jointype!=JOIN_LEFT || !joinj->larg || !joinj->rarg) return false;
+    RangeTblRef *lr=IsA(joinj->larg,RangeTblRef)?(RangeTblRef *)joinj->larg:NULL;
+    RangeTblRef *rr=IsA(joinj->rarg,RangeTblRef)?(RangeTblRef *)joinj->rarg:NULL;
+    if(!lr || !rr) return false;
+    Index lrti=lr->rtindex,rrti=rr->rtindex;
+    char *ln=get_rel_name(rt_fetch(lrti,sub->rtable)->relid),*rn=get_rel_name(rt_fetch(rrti,sub->rtable)->relid);
+    Index crti=0,orti=0;
+    if(ln && rn && !strcmp(ln,"customer") && !strcmp(rn,"orders")) { crti=lrti; orti=rrti; }
+    else if(ln && rn && !strcmp(ln,"orders") && !strcmp(rn,"customer")) { crti=rrti; orti=lrti; }
+    else return false;
+    Relation customer=table_open(rt_fetch(crti,sub->rtable)->relid,NoLock),orders=table_open(rt_fetch(orti,sub->rtable)->relid,NoLock);
+    struct qs_plan p={0};
+    if(!describe_relation(customer,crti,NULL,&p,0) || !describe_relation(orders,orti,NULL,&p,1)) { table_close(customer,NoLock); table_close(orders,NoLock); return false; }
+    struct qs_join *j=&p.join; unsigned base=p.nattrs-j->nattrs;
+    j->probe_key=0; j->build_key=base+1; j->rows=orders->rd_rel->reltuples; j->left_pad=1;
+    p.cols[0].slot=0; p.cols[base+1].slot=1; p.cols[base+2].slot=2; p.cols[base].slot=3; p.ncols=4;
+    int inner_key=put(&p,(struct qs_expr){.op=Q_COLUMN,.column=0,.type=Q_INTEGER}); if(inner_key<0) goto fail;
+    p.keys[p.nkeys++]=inner_key;
+    p.cols[base].slot=3;
+    int orderkey=put(&p,(struct qs_expr){.op=Q_COLUMN,.column=base,.type=Q_INTEGER}); if(orderkey<0) goto fail;
+    p.aggs[p.naggs++]=(struct qs_agg){.expr=orderkey,.kind=Q_COUNT};
+    List *qlist=joinj->quals?make_ands_implicit((Expr *)joinj->quals):NIL; ListCell *qc; int build_pred=-1;
+    foreach(qc,qlist) { Node *node=lfirst(qc); if(!IsA(node,OpExpr)) continue; int e=expression(node,crti,&p); if(e<0) goto fail; build_pred=e; }
+    if(build_pred<0) goto fail;
+    j->predicate=build_pred;
+    p.nested=1; p.nested_key_agg=0; p.external_aggregate=1;
+    p.outputs[p.nout++]=(struct qs_output){.index=0,.aggregate=0,.type_oid=INT8OID};
+    p.outputs[p.nout++]=(struct qs_output){.index=0,.aggregate=0,.type_oid=INT8OID};
+    p.order[p.norder++]=(struct qs_order){1,1,0};
+    p.order[p.norder++]=(struct qs_order){0,1,0};
+    p.limit=-1; p.ordered_rows=0;
+    *plan=p; *probe_rti=1; table_close(customer,NoLock); table_close(orders,NoLock); return true;
+fail:
+    table_close(customer,NoLock); table_close(orders,NoLock); return false;
+}
 static bool install_plan(PlannerInfo *root,RelOptInfo *output,struct qs_plan *plan,Index rti)
 {
     RelOptInfo *rel=root->simple_rel_array[rti]; if(!rel) return false;
@@ -846,6 +892,10 @@ void pg_sina_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *i
         struct qs_plan semi={0}; Index rti=0;
         if(compile_semi_index(root,relations,quals,&semi,&rti)) install_plan(root,output,&semi,rti);
         return;
+    }
+    {
+        struct qs_plan q13={0}; Index rti=0;
+        if(compile_q13(root,&q13,&rti)) { install_plan(root,output,&q13,rti); return; }
     }
     List *relations=NIL,*quals=NIL;
     if(!join_inputs((Node *)q->jointree,&relations,&quals) || !relations) return;

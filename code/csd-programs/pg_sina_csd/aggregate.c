@@ -222,10 +222,11 @@ struct external_state {
     struct qs_result *partial;
     struct qs_metrics input_metrics, output_metrics;
     uint64_t output_budget, skipped, emitted;
+    uint32_t nested_counts[1024];
     unsigned position;
     unsigned finalize, partial_position;
     int flushing, input_started, input_finished, have_group, output_pending, pulling;
-    int reducing_finished, finishing;
+    int reducing_finished, finishing, nested_ready;
 };
 static void sort_drop(struct qs_group *group)
 {
@@ -399,7 +400,7 @@ static int64_t external_source(struct femu_csd_args *a)
     if(!csIsReentry(a)) { out->status=0; out->rows=out->begin=out->finished=0; out->str_bytes=0; }
     /* Estimates choose costs, not correctness. If no local table has flushed
      * and their union certainly fits, retain the original small hash merge. */
-    if(!e->finalize && !e->input_started && !csIsReentry(a)) {
+    if(!p->nested && !e->finalize && !e->input_started && !csIsReentry(a)) {
         unsigned count=0; int small=1;
         for(unsigned i=0;i<group->count;++i) {
             struct external_state *owner=(void *)(uintptr_t)group->states[i];
@@ -449,6 +450,21 @@ static int64_t external_source(struct femu_csd_args *a)
             if(status) return status;
             call.cparam2=0; e->output_pending=0; out->rows=0;
         }
+        if(e->nested_ready) {
+            uint64_t keys[QS_RESULT_ROWS],counts[QS_RESULT_ROWS]; unsigned nr=0;
+            for(unsigned k=0;k<1024;++k) if(e->nested_counts[k]) {
+                if(nr==QS_RESULT_ROWS) return -5;
+                keys[nr]=k; counts[nr]=e->nested_counts[k]; ++nr;
+            }
+            for(unsigned i=0;i<nr;++i) for(unsigned j=i+1;j<nr;++j) if(counts[j]>counts[i] || (counts[j]==counts[i] && keys[j]>keys[i])) {
+                uint64_t t=keys[i]; keys[i]=keys[j]; keys[j]=t; t=counts[i]; counts[i]=counts[j]; counts[j]=t;
+            }
+            for(unsigned r=0;r<nr;++r) {
+                out->data[r].cells[0]=(struct qs_cell){.value=keys[r]};
+                out->data[r].cells[1]=(struct qs_cell){.value=counts[r]};
+            }
+            out->rows=nr; out->finished=1; e->nested_ready=0; external_metrics(e,out); external_drop(group); return 0;
+        }
         if(e->finishing) {
             if(e->inputs.states[0]) {
                 void *mr[]={&e->inputs,io}; long long len[]={sizeof(e->inputs),io_bytes};
@@ -481,18 +497,24 @@ static int64_t external_source(struct femu_csd_args *a)
         }
         const struct qs_row *row=e->partial_position<e->partial->rows?&e->partial->data[e->partial_position]:NULL;
         if(e->have_group && (!row || !same_keys(p,&s->groups[0],row))) {
-            if(p->norder || e->skipped++>=(uint64_t)p->offset) {
-                if(p->norder || p->limit<0 || e->emitted<(uint64_t)p->limit) {
-                    if(group_output(e,&out->data[out->rows])) return -5;
-                    ++out->rows; ++e->emitted;
+            if(p->nested) {
+                uint64_t key=(uint64_t)s->groups[0].aggs[p->nested_key_agg].count;
+                if(key>=1024) return -5;
+                ++e->nested_counts[key];
+            } else {
+                if(p->norder || e->skipped++>=(uint64_t)p->offset) {
+                    if(p->norder || p->limit<0 || e->emitted<(uint64_t)p->limit) {
+                        if(group_output(e,&out->data[out->rows])) return -5;
+                        ++out->rows; ++e->emitted;
+                    }
+                }
+                if(!p->norder && p->limit>=0 && e->emitted>=(uint64_t)p->limit) e->finishing=1;
+                if(out->rows==QS_RESULT_ROWS) {
+                    if(p->norder) e->output_pending=1;
+                    else { external_metrics(e,out); if(resolve_result_strings(s,out)) return -5; return 0; }
                 }
             }
             e->have_group=0;
-            if(!p->norder && p->limit>=0 && e->emitted>=(uint64_t)p->limit) e->finishing=1;
-            if(out->rows==QS_RESULT_ROWS) {
-                if(p->norder) e->output_pending=1;
-                else { external_metrics(e,out); if(resolve_result_strings(s,out)) return -5; return 0; }
-            }
             if(e->output_pending || e->finishing) continue;
         }
         if(row) {
@@ -500,7 +522,8 @@ static int64_t external_source(struct femu_csd_args *a)
             ++e->partial_position;
         } else if(e->input_finished) {
             e->reducing_finished=1;
-            if(p->norder) e->output_pending=1; /* Also initialize the empty sort. */
+            if(p->nested) e->nested_ready=1;
+            else if(p->norder) e->output_pending=1; /* Also initialize the empty sort. */
         }
     }
 }

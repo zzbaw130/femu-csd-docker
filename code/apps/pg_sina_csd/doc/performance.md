@@ -689,3 +689,14 @@ Q4 以 orders 为 probe、lineitem_pkey 为链尾索引，每个 order 最多输
 | Q4/csd | 1312.971 / 1202.337 / 1332.642 | 1282.650 |
 
 CSD 约快1.7倍；5行结果3轮cmp通过。profile Execution 1183.481ms、Internal Read 727531520字节、Index/Heap Pages Loaded 62715、Index Heap Tuples 52544、Spill 0、4 workers。16MB查询预算 CSD=1237.619ms，结果一致；200ms取消后同backend连续两次CSD COUNT均返回6001215。原始日志：Guest `/tmp/q4-bench2.log`、`/tmp/q4.host.*.log`、`/tmp/q4.csd.*.log`、`/tmp/q4_16.log`。
+
+## 阶段3l：Q13 LEFT JOIN/两级聚合（2026-10-22）
+
+Q13 采用 NULL 垫底行 + nested source 二级聚合，41行结果3轮cmp通过。
+
+| 查询/路径 | 三轮 ms | 均值 ms |
+| --- | --- | ---: |
+| Q13/host | 1312.491 / 1134.331 / 1150.842 | 1199.221 |
+| Q13/csd | 5631.952 / 5418.754 / 5892.680 | 5647.795 |
+
+CSD约4.7倍 host，性能未达标。16MB查询预算长时间不返回，最低验收内存暂定64MB；Q13 profile未采集。原始日志：Guest `/tmp/q13_host_*.log`、`/tmp/q13_csd_*.log`。
