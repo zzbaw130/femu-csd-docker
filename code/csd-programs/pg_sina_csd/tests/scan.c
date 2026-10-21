@@ -116,6 +116,20 @@ static void prefix_projection(function scan)
     p.cols[1].prefix_len=0; assert(!scan_rows(scan,&p,c,bytes,raw));
     for(unsigned i=1;i<c->rows;++i) assert(qs_values(c)[i]);
     p.cols[1].type=Q_STRING; assert(scan_rows(scan,&p,c,bytes,raw)==-3);
+    p.cols[1].type=Q_DICTIONARY; p.nstrings=3;
+    p.strings[0]=(struct qs_string){.column=1,.length=0};
+    p.strings[1]=(struct qs_string){.column=1,.length=3,.bytes="abc"};
+    p.strings[2]=(struct qs_string){.column=1,.length=2,.bytes="ab"};
+    assert(!scan_rows(scan,&p,c,bytes,raw));
+    assert(qs_nulls(c)[0]&1); assert(qs_values(c)[1]==1);
+    for(unsigned i=2;i<c->rows;++i) assert(qs_values(c)[i]==2);
+    p.strings[1].length=4; memcpy(p.strings[1].bytes,"abc ",4);
+    assert(!scan_rows(scan,&p,c,bytes,raw));
+    for(unsigned i=2;i<c->rows;++i) assert(!qs_values(c)[i]); /* unknown != NULL */
+    p.strings[1].length=2; memcpy(p.strings[1].bytes,"ab",2);
+    raw[QS_PAGE-192+34]=' '; p.cols[1].trim_spaces=1;
+    assert(!scan_rows(scan,&p,c,bytes,raw)); assert(qs_values(c)[2]==2);
+    p.strings[0].length=255; assert(scan_rows(scan,&p,c,bytes,raw)==-3);
     free(c);
 }
 int main(int argc,char **argv)

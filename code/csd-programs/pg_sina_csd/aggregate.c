@@ -243,6 +243,15 @@ static int external_init(const struct qs_plan *p,struct qs_task *task,struct ext
     unsigned workers=task->workers?task->workers:1;
     size_t run_budget=(limit-fixed)/(p->norder?2:1);
     e->output_budget=(limit-fixed-run_budget)*workers;
+    if(p->join.relid && p->norder) {
+        /* PG releases the build hash before source starts. Its old reservation
+         * can hold the final result sort, leaving this slot's full remainder
+         * for partial-state runs and their resident metadata during probe. */
+        struct cs_work_stats stats;
+        if(cs_work_get_stats(&stats)) { cs_work_end(context); return -4; }
+        run_budget=limit-fixed; e->output_budget=p->join.work_mem_bytes;
+        if(!e->output_budget || e->output_budget>stats.capacity_bytes/2) e->output_budget=stats.capacity_bytes/2;
+    }
     e->sort_plan=(struct qs_plan){.nout=p->nkeys+p->naggs,.norder=p->nkeys,
         .ordered_rows=2,.predicate=-1,.limit=-1,.work_mem_bytes=run_budget};
     for(unsigned k=0;k<p->nkeys;++k) e->sort_plan.order[k]=(struct qs_order){.output=k,.nulls_first=1};

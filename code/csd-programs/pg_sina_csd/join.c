@@ -9,6 +9,9 @@
 extern int64_t pg_sina_aggregate_sink_impl(struct femu_csd_args *);
 struct hash_row { uint32_t next, padding; uint64_t nulls; };
 struct build_batch { uint64_t *tokens; unsigned rows, blocks; };
+/* Workmem guarantees 16-byte alignment. Space heads two cache lines apart so
+ * adjacent slots never share the frequently written cursor fields. */
+struct probe_cursor { unsigned position, match, pending; unsigned char padding[116]; };
 struct hash_join {
     cs_work_context *context;
     unsigned char *data;
@@ -17,6 +20,7 @@ struct hash_join {
     unsigned ncols, key, stride, capacity, slots, rows;
     unsigned count, batch_capacity, input_position, block, loaded;
     int building, storing, loading, resident;
+    struct probe_cursor probes[QS_WORKERS]; /* Private workmem, one per input slot. */
 };
 static uint64_t hash_key(uint64_t x)
 {
@@ -146,25 +150,27 @@ int64_t pg_sina_join_load(struct femu_csd_args *a)
     if(h->block<b->blocks) return csNeedLoad(b->tokens[h->block]);
     h->rows=b->rows; index_batch(h); h->loaded=control->current; h->loading=0; return 0;
 }
-static int64_t aggregate_chunk(struct qs_chunk *out,const struct qs_plan *p,struct qs_task *task)
+static int64_t aggregate_chunk(struct qs_chunk *out,const struct qs_plan *p,struct qs_task *task,struct femu_csd_args *outer,int reentry)
 {
     struct qs_task inner=*task; inner.input_bytes=0;
-    void *mr[]={out,(void *)p,&inner}; long long len[]={qs_chunk_bytes(out->capacity,out->ncols),sizeof(*p),sizeof(inner)};
-    struct femu_csd_args call={.numr=3,.mr_addr=mr,.mr_len=len};
+    void *mr[]={out,(void *)p,&inner,p->external_aggregate?outer->mr_addr[5]:NULL};
+    long long len[]={qs_chunk_bytes(out->capacity,out->ncols),sizeof(*p),sizeof(inner),p->external_aggregate?outer->mr_len[5]:0};
+    struct femu_csd_args call={.numr=p->external_aggregate?4:3,.mr_addr=mr,.mr_len=len,.cparam2=reentry?outer->cparam2:0};
     int64_t status=pg_sina_aggregate_sink_impl(&call); task->state=inner.state; return status;
 }
 /* probe columns, combined plan, aggregate task, shared build control,
- * joined column batch. The aggregate is an ordinary private call;
+ * joined column batch, optional spill I/O. The aggregate is a private call;
  * no nested NVMe submission or extra CU is involved. */
 int64_t pg_sina_join_probe(struct femu_csd_args *a)
 {
-    if(!a || a->numr!=5 || a->mr_len[1]<(long long)sizeof(struct qs_plan) ||
+    if(!a || (a->numr!=5 && a->numr!=6) || a->mr_len[1]<(long long)sizeof(struct qs_plan) ||
         a->mr_len[2]<(long long)sizeof(struct qs_task) || a->mr_len[3]<(long long)sizeof(struct qs_join_control)) return -1;
     struct qs_chunk *c=a->mr_addr[0],*out=a->mr_addr[4]; const struct qs_plan *p=a->mr_addr[1];
     struct qs_task *task=a->mr_addr[2]; struct qs_join_control *control=a->mr_addr[3];
     struct hash_join *h=(void *)(uintptr_t)control->state;
     if(p->nattrs>QS_COLS || p->join.nattrs>p->nattrs || p->ncols>QS_COLS ||
-        !h || h->building || h->loaded!=control->current || p->external_aggregate || p->nkeys ||
+        !h || h->building || h->loaded!=control->current || task->slot>=QS_WORKERS ||
+        (p->external_aggregate && (a->numr!=6 || a->mr_len[5]<QS_SORT_IO_BYTES)) ||
         a->mr_len[0]<(long long)sizeof(*c) || c->rows>c->capacity || c->selected>c->rows ||
         qs_chunk_bytes(c->capacity,c->ncols)>(uint64_t)a->mr_len[0] ||
         a->mr_len[4]<(long long)sizeof(*out) || !out->capacity || out->ncols!=p->ncols ||
@@ -175,30 +181,46 @@ int64_t pg_sina_join_probe(struct femu_csd_args *a)
         else build_cols[nb++]=p->cols[i].slot;
     }
     if(np!=c->ncols || nb!=h->ncols || key==UINT_MAX) return -1;
-    out->rows=out->selected=0;
-    if(!task->state) { int64_t status=aggregate_chunk(out,p,task); if(status) return status; }
-    task->scanned+=c->rows; task->matched+=c->selected;
-    for(unsigned i=0;i<c->selected;++i) {
-        unsigned row=qs_selection(c)[i]; if(row>=c->rows) return -1;
-        if(qs_nulls(c)[(size_t)key*((c->capacity+7)/8)+row/8]&(1U<<(row%8))) continue;
+    struct probe_cursor *cursor=&h->probes[task->slot];
+    if(csIsReentry(a)) {
+        if(!cursor->pending) return -1;
+        int64_t status=aggregate_chunk(out,p,task,a,1); if(status) return status;
+        cursor->pending=0; out->rows=out->selected=0;
+    } else {
+        cursor->position=cursor->match=cursor->pending=0; out->rows=out->selected=0;
+        if(!task->state) { int64_t status=aggregate_chunk(out,p,task,a,0); if(status) return status; }
+        task->scanned+=c->rows; task->matched+=c->selected;
+    }
+    while(cursor->position<c->selected) {
+        unsigned row=qs_selection(c)[cursor->position]; if(row>=c->rows) return -1;
+        if(qs_nulls(c)[(size_t)key*((c->capacity+7)/8)+row/8]&(1U<<(row%8))) { ++cursor->position; continue; }
         int64_t value=qs_values(c)[(size_t)key*c->capacity+row];
-        unsigned at=h->buckets[hash_key(value)&(h->slots-1)];
-        for(;at!=UINT_MAX;at=row_at(h,at)->next) {
-            struct hash_row *r=row_at(h,at); if(row_values(r)[h->key]!=value) continue;
-            if(!out->rows) memset(qs_nulls(out),0,((out->capacity+7)/8)*(size_t)out->ncols);
-            unsigned dest=out->rows;
-            for(unsigned col=0;col<np+nb;++col) {
-                unsigned local=col<np?col:col-np,slot=col<np?probe_cols[local]:build_cols[local];
-                int null=col<np?!!(qs_nulls(c)[(size_t)local*((c->capacity+7)/8)+row/8]&(1U<<(row%8))):!!(r->nulls&(UINT64_C(1)<<local));
-                qs_values(out)[(size_t)slot*out->capacity+dest]=col<np?qs_values(c)[(size_t)local*c->capacity+row]:row_values(r)[local];
-                qs_dscales(out)[(size_t)slot*out->capacity+dest]=col<np?qs_dscales(c)[(size_t)local*c->capacity+row]:row_scales(h,r)[local];
-                if(null) qs_nulls(out)[(size_t)slot*((out->capacity+7)/8)+dest/8]|=1U<<(dest%8);
-            }
-            qs_selection(out)[dest]=dest; ++out->rows; ++out->selected; ++task->joined;
-            if(out->rows==out->capacity) { int64_t status=aggregate_chunk(out,p,task); if(status) return status; out->rows=out->selected=0; }
+        unsigned at=cursor->match?cursor->match-1:h->buckets[hash_key(value)&(h->slots-1)];
+        if(at==UINT_MAX) { ++cursor->position; continue; }
+        struct hash_row *r=row_at(h,at);
+        /* Save the next pair before a possibly reentrant aggregate call. */
+        cursor->match=r->next==UINT_MAX?0:r->next+1;
+        if(!cursor->match) ++cursor->position;
+        if(row_values(r)[h->key]!=value) continue;
+        if(!out->rows) memset(qs_nulls(out),0,((out->capacity+7)/8)*(size_t)out->ncols);
+        unsigned dest=out->rows;
+        for(unsigned col=0;col<np+nb;++col) {
+            unsigned local=col<np?col:col-np,slot=col<np?probe_cols[local]:build_cols[local];
+            int null=col<np?!!(qs_nulls(c)[(size_t)local*((c->capacity+7)/8)+row/8]&(1U<<(row%8))):!!(r->nulls&(UINT64_C(1)<<local));
+            qs_values(out)[(size_t)slot*out->capacity+dest]=col<np?qs_values(c)[(size_t)local*c->capacity+row]:row_values(r)[local];
+            qs_dscales(out)[(size_t)slot*out->capacity+dest]=col<np?qs_dscales(c)[(size_t)local*c->capacity+row]:row_scales(h,r)[local];
+            if(null) qs_nulls(out)[(size_t)slot*((out->capacity+7)/8)+dest/8]|=1U<<(dest%8);
+        }
+        qs_selection(out)[dest]=dest; ++out->rows; ++out->selected; ++task->joined;
+        if(out->rows==out->capacity) {
+            cursor->pending=1; int64_t status=aggregate_chunk(out,p,task,a,0); if(status) return status;
+            cursor->pending=0; out->rows=out->selected=0;
         }
     }
-    if(out->rows) return aggregate_chunk(out,p,task);
+    if(out->rows) {
+        cursor->pending=1; int64_t status=aggregate_chunk(out,p,task,a,0); if(status) return status;
+        cursor->pending=0;
+    }
     return 0;
 }
 /* Device close owns token reclamation, including already-rolled-back tokens. */

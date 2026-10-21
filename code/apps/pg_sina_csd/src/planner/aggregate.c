@@ -15,6 +15,7 @@
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "utils/builtins.h"
+#include "utils/array.h"
 #include "utils/date.h"
 #include "utils/lsyscache.h"
 #include "utils/pg_locale.h"
@@ -71,6 +72,78 @@ static int var_column(Var *v,Index rti,const struct qs_plan *p)
         return probe+v->varattno-1;
     return -1;
 }
+static Node *unlabel(Node *node)
+{ while(node && IsA(node,RelabelType)) node=(Node *)((RelabelType *)node)->arg; return node; }
+/* Encode only equality against literals. Unknown non-NULL strings share ID 0;
+ * that ID must never be used for raw string output or string/string equality. */
+static int string_comparison(Node *left,Node *right,Oid function,Oid collation,Index rti,struct qs_plan *p)
+{
+    bool equal=builtin(function,"texteq") || builtin(function,"bpchareq");
+    bool unequal=builtin(function,"textne") || builtin(function,"bpcharne");
+    left=unlabel(left); right=unlabel(right);
+    if(IsA(left,Const) && IsA(right,Var)) { Node *swap=left; left=right; right=swap; }
+    if((!equal && !unequal) || !IsA(left,Var) || !IsA(right,Const) || !byte_collation(collation)) return -1;
+    int col=var_column((Var *)left,rti,p); if(col<0) return -1;
+    struct qs_column *c=&p->cols[col]; Const *literal=(Const *)right;
+    if((c->type!=Q_STRING && c->type!=Q_DICTIONARY) ||
+        (literal->consttype!=TEXTOID && literal->consttype!=VARCHAROID && literal->consttype!=BPCHAROID)) return -1;
+    /* A bpchar-to-text cast changes trailing-space semantics; keep it native. */
+    if(c->trim_spaces!=builtin(function,equal?"bpchareq":"bpcharne")) return -1;
+    unsigned id=0;
+    if(!literal->constisnull) {
+        text *value=DatumGetTextPP(literal->constvalue); size_t len=VARSIZE_ANY_EXHDR(value);
+        const char *bytes=VARDATA_ANY(value);
+        if(c->trim_spaces) while(len && bytes[len-1]==' ') --len;
+        if(len>=sizeof(p->strings[0].bytes) || memchr(bytes,0,len)) return -1;
+        for(size_t i=0;i<len;++i) if((unsigned char)bytes[i]>=128) return -1;
+        for(;id<p->nstrings;++id) if(p->strings[id].column==col && p->strings[id].length==len && !memcmp(p->strings[id].bytes,bytes,len)) break;
+        if(id==p->nstrings) {
+            if(id==QS_STRINGS) return -1;
+            p->strings[id]=(struct qs_string){.column=col,.length=len}; memcpy(p->strings[id].bytes,bytes,len); ++p->nstrings;
+        }
+        ++id;
+    }
+    c->type=Q_DICTIONARY; if(c->slot<0) c->slot=p->ncols++;
+    int a=put(p,(struct qs_expr){.op=Q_COLUMN,.column=col,.type=Q_DICTIONARY});
+    int b=put(p,(struct qs_expr){.op=Q_CONST,.constant=id,.type=Q_DICTIONARY,.isnull=literal->constisnull});
+    return a<0 || b<0?-1:put(p,(struct qs_expr){.op=equal?Q_EQ:Q_NE,.type=Q_BOOLEAN,.left=a,.right=b});
+}
+/* A top-level equality or IN restriction proves that surviving string values
+ * belong to the dictionary. An equality hidden inside OR/CASE does not. */
+static void restrict_string(Node *node,Index rti,struct qs_plan *p)
+{
+    Node *left=NULL,*right=NULL; Oid fn=InvalidOid;
+    if(IsA(node,ScalarArrayOpExpr)) {
+        ScalarArrayOpExpr *a=(ScalarArrayOpExpr *)node; if(!a->useOr || list_length(a->args)!=2) return;
+        fn=get_opcode(a->opno); left=unlabel(linitial(a->args)); right=unlabel(lsecond(a->args));
+    } else if(IsA(node,OpExpr)) {
+        OpExpr *o=(OpExpr *)node; if(list_length(o->args)!=2) return;
+        fn=get_opcode(o->opno); left=unlabel(linitial(o->args)); right=unlabel(lsecond(o->args));
+        if(IsA(left,Const)) { Node *swap=left; left=right; right=swap; }
+    }
+    if(left && IsA(left,Var) && IsA(right,Const) && (builtin(fn,"texteq") || builtin(fn,"bpchareq"))) {
+        int col=var_column((Var *)left,rti,p);
+        if(col>=0 && p->cols[col].type==Q_DICTIONARY) p->cols[col].restricted=1;
+    }
+}
+static int string_order(const void *a,const void *b)
+{
+    const struct qs_string *x=a,*y=b;
+    if(x->column!=y->column) return (int)x->column-y->column;
+    int cmp=memcmp(x->bytes,y->bytes,Min(x->length,y->length));
+    return cmp?cmp:(int)x->length-y->length;
+}
+static void order_strings(struct qs_plan *p)
+{
+    struct qs_string original[QS_STRINGS]; memcpy(original,p->strings,sizeof(original));
+    qsort(p->strings,p->nstrings,sizeof(p->strings[0]),string_order);
+    for(unsigned i=0;i<p->nexprs;++i) {
+        struct qs_expr *e=&p->exprs[i];
+        if(e->op!=Q_CONST || e->type!=Q_DICTIONARY || e->isnull) continue;
+        const struct qs_string *s=&original[e->constant-1];
+        for(unsigned j=0;j<p->nstrings;++j) if(!string_order(s,&p->strings[j])) { e->constant=j+1; break; }
+    }
+}
 static int expression(Node *node,Index rti,struct qs_plan *p)
 {
     while(node && IsA(node,RelabelType)) node=(Node *)((RelabelType *)node)->arg;
@@ -80,7 +153,7 @@ static int expression(Node *node,Index rti,struct qs_plan *p)
         Var *v=(Var *)node;
         int col=var_column(v,rti,p); if(col<0) return -1;
         struct qs_column *c=&p->cols[col];
-        if(v->vartype==TEXTOID || v->vartype==VARCHAROID || c->type==Q_PREFIX) return -1;
+        if(c->type==Q_STRING || c->type==Q_PREFIX || (c->type==Q_DICTIONARY && !c->restricted)) return -1;
         if(c->type==255 || (c->type==Q_CHAR && !byte_collation(v->varcollid))) return -1;
         if(c->slot<0) c->slot=p->ncols++;
         e.op=Q_COLUMN; e.column=col; e.type=c->type; e.scale=e.dscale=c->scale;
@@ -130,6 +203,7 @@ static int expression(Node *node,Index rti,struct qs_plan *p)
             CaseWhen *w=list_nth_node(CaseWhen,c->args,i);
             int condition=expression((Node *)w->expr,rti,p),value=expression((Node *)w->result,rti,p);
             if(condition<0 || value<0 || p->exprs[condition].type!=Q_BOOLEAN) return -1;
+            if(p->exprs[value].type==Q_DICTIONARY || p->exprs[result].type==Q_DICTIONARY) return -1;
             unsigned scale=Max(p->exprs[value].scale,p->exprs[result].scale);
             if(scale>12) return -1;
             e=(struct qs_expr){.op=Q_CASE,.left=condition,.right=value,.otherwise=result,
@@ -138,10 +212,31 @@ static int expression(Node *node,Index rti,struct qs_plan *p)
         }
         return result;
     }
+    if(IsA(node,ScalarArrayOpExpr)) {
+        ScalarArrayOpExpr *s=(ScalarArrayOpExpr *)node;
+        if(!s->useOr || list_length(s->args)!=2 || !IsA(lsecond(s->args),Const)) return -1;
+        Const *array=lsecond_node(Const,s->args); if(array->constisnull) return -1;
+        ArrayType *data=DatumGetArrayTypeP(array->constvalue); Oid type=ARR_ELEMTYPE(data);
+        if(type!=TEXTOID && type!=VARCHAROID && type!=BPCHAROID) return -1;
+        int16 length; bool byval; char align; Datum *values; bool *nulls; int count;
+        get_typlenbyvalalign(type,&length,&byval,&align); deconstruct_array(data,type,length,byval,align,&values,&nulls,&count);
+        if(!count || count>QS_STRINGS) return -1;
+        int result=-1;
+        for(int i=0;i<count;++i) {
+            Const *literal=makeConst(type,-1,s->inputcollid,length,values[i],nulls[i],byval);
+            int next=string_comparison(linitial(s->args),(Node *)literal,get_opcode(s->opno),s->inputcollid,rti,p);
+            if(next<0) return -1;
+            result=result<0?next:put(p,(struct qs_expr){.op=Q_OR,.type=Q_BOOLEAN,.left=result,.right=next});
+            if(result<0) return -1;
+        }
+        return result;
+    }
     if(!IsA(node,OpExpr)) return -1;
     OpExpr *op=(OpExpr *)node;
     if(list_length(op->args)!=2) return -1;
     Oid function=OidIsValid(op->opfuncid)?op->opfuncid:get_opcode(op->opno);
+    int comparison=string_comparison(linitial(op->args),lsecond(op->args),function,op->inputcollid,rti,p);
+    if(comparison>=0) return comparison;
     if(builtin(function,"textlike")) {
         Node *left=linitial(op->args); while(IsA(left,RelabelType)) left=(Node *)((RelabelType *)left)->arg;
         Node *right=lsecond(op->args);
@@ -161,6 +256,7 @@ static int expression(Node *node,Index rti,struct qs_plan *p)
     }
     e.left=expression(linitial(op->args),rti,p); e.right=expression(lsecond(op->args),rti,p);
     if(e.left<0 || e.right<0) return -1;
+    if(p->exprs[e.left].type==Q_DICTIONARY || p->exprs[e.right].type==Q_DICTIONARY) return -1;
     if(builtin(function,"numeric_add")) e.op=Q_ADD;
     else if(builtin(function,"numeric_sub")) e.op=Q_SUB;
     else if(builtin(function,"numeric_mul")) e.op=Q_MUL;
@@ -250,9 +346,9 @@ static bool describe(PlannerInfo *root,Index rti,struct qs_plan *p,int build)
         if(a->atttypid==NUMERICOID) { c->type=Q_DECIMAL; c->scale=2; }
         else if(a->atttypid==INT2OID || a->atttypid==INT4OID || a->atttypid==INT8OID) c->type=Q_INTEGER;
         else if(a->atttypid==DATEOID) c->type=Q_DATE;
-        else if(a->atttypid==TEXTOID || a->atttypid==VARCHAROID) c->type=Q_STRING;
+        else if(a->atttypid==TEXTOID || a->atttypid==VARCHAROID || a->atttypid==BPCHAROID) { c->type=Q_STRING; c->trim_spaces=a->atttypid==BPCHAROID; }
         else if(a->atttypid==BOOLOID) c->type=Q_BOOLEAN;
-        else if(a->atttypid==BPCHAROID && a->atttypmod==5 && byte_collation(a->attcollation)) c->type=Q_CHAR;
+        if(a->atttypid==BPCHAROID && a->atttypmod==5 && byte_collation(a->attcollation)) c->type=Q_CHAR;
     }
     p->nattrs+=desc->natts; table_close(table,NoLock); return true;
 }
@@ -273,11 +369,13 @@ static bool compile(PlannerInfo *root,Index rti,RelOptInfo *rel,Index build_rti,
     ListCell *cell; p->predicate=-1; p->limit=-1;
     foreach(cell,rel->baserestrictinfo) {
         RestrictInfo *r=lfirst_node(RestrictInfo,cell); int next=expression((Node *)r->clause,rti,p); if(next<0) return false;
+        restrict_string((Node *)r->clause,rti,p);
         if(p->predicate<0) p->predicate=next;
         else { p->predicate=put(p,(struct qs_expr){.op=Q_AND,.type=Q_BOOLEAN,.left=p->predicate,.right=next}); if(p->predicate<0) return false; }
     }
     if(build_rel) foreach(cell,build_rel->baserestrictinfo) {
         RestrictInfo *r=lfirst_node(RestrictInfo,cell); int next=expression((Node *)r->clause,rti,p); if(next<0) return false;
+        restrict_string((Node *)r->clause,rti,p);
         if(p->join.predicate<0) p->join.predicate=next;
         else { p->join.predicate=put(p,(struct qs_expr){.op=Q_AND,.type=Q_BOOLEAN,.left=p->join.predicate,.right=next}); if(p->join.predicate<0) return false; }
     }
@@ -295,7 +393,8 @@ static bool compile(PlannerInfo *root,Index rti,RelOptInfo *rel,Index build_rti,
         /* Timestamp constants are accepted as midnight date bounds above,
          * but are not a supported result Datum. Reject at planning time. */
         if(out->type_oid!=NUMERICOID && out->type_oid!=INT2OID && out->type_oid!=INT4OID &&
-            out->type_oid!=INT8OID && out->type_oid!=BOOLOID && out->type_oid!=DATEOID && out->type_oid!=BPCHAROID) return false;
+            out->type_oid!=INT8OID && out->type_oid!=BOOLOID && out->type_oid!=DATEOID && out->type_oid!=BPCHAROID &&
+            out->type_oid!=TEXTOID && out->type_oid!=VARCHAROID) return false;
         if(p->ordered_rows) {
             out->index=expression((Node *)entry->expr,rti,p);
             if(out->index<0) return false;
@@ -322,8 +421,8 @@ static bool compile(PlannerInfo *root,Index rti,RelOptInfo *rel,Index build_rti,
         unsigned index=0; ListCell *t; foreach(t,root->processed_tlist) { if(lfirst(t)==entry) break; ++index; }
         if(index==p->nout) return false;
         Oid function=get_opcode(sort->sortop); bool descending=false,found=false;
-        static const char *less[]={"numeric_lt","int2lt","int4lt","int8lt","date_lt","bpcharlt","boollt"};
-        static const char *greater[]={"numeric_gt","int2gt","int4gt","int8gt","date_gt","bpchargt","boolgt"};
+        static const char *less[]={"numeric_lt","int2lt","int4lt","int8lt","date_lt","bpcharlt","boollt","text_lt"};
+        static const char *greater[]={"numeric_gt","int2gt","int4gt","int8gt","date_gt","bpchargt","boolgt","text_gt"};
         for(unsigned i=0;i<lengthof(less);++i) {
             if(builtin(function,less[i])) found=true;
             if(builtin(function,greater[i])) found=descending=true;
@@ -342,6 +441,7 @@ static bool compile(PlannerInfo *root,Index rti,RelOptInfo *rel,Index build_rti,
     if(build_rel && p->join.predicate>=0 && build_rel->rows<build_rel->tuples/2)
         for(unsigned i=p->nattrs-p->join.nattrs;i<p->nattrs;++i)
             p->cols[i].deferred=p->cols[i].type==Q_DECIMAL && p->cols[i].slot>=0;
+    order_strings(p);
     return limit_value(root->parse->limitCount,&p->limit) && limit_value(root->parse->limitOffset,&p->offset);
 }
 static Plan *plan_path(PlannerInfo *root,RelOptInfo *rel,CustomPath *path,List *tlist,List *clauses,List *plans)
@@ -387,6 +487,16 @@ static OpExpr *equality_join(List *quals,Index a,Index b)
     }
     return join;
 }
+static double build_bytes(const struct qs_plan *p,double rows)
+{
+    unsigned columns=0;
+    for(unsigned i=p->nattrs-p->join.nattrs;i<p->nattrs;++i) columns+=p->cols[i].slot>=0;
+    /* Current hash records: next/NULL header, 8-byte values, display scales,
+     * alignment and two uint32 bucket entries per capacity row. */
+    unsigned row=(16+columns*9+7)&~7U;
+    double capacity=256; while(capacity<rows) capacity*=2;
+    return capacity*(row+8);
+}
 void pg_sina_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *input,RelOptInfo *output,void *extra)
 {
     Query *q=root->parse;
@@ -403,7 +513,7 @@ void pg_sina_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *i
     RangeTblEntry *rte=rt_fetch(rti,q->rtable); if(rte->rtekind!=RTE_RELATION || rte->tablesample) return;
     RelOptInfo *rel=root->simple_rel_array[rti]; if(!rel) return;
     if(list_length(relations)==2) {
-        if(!q->hasAggs || q->groupClause) return; /* Initial join scope: scalar aggregates. */
+        if(!q->hasAggs) return;
         build_rti=lsecond_int(relations); RangeTblEntry *build_rte=rt_fetch(build_rti,q->rtable);
         if(build_rte->rtekind!=RTE_RELATION || build_rte->tablesample) return;
         build_rel=root->simple_rel_array[build_rti]; if(!build_rel) return;
@@ -411,6 +521,16 @@ void pg_sina_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *i
         join=equality_join(quals,rti,build_rti); if(!join) return;
     }
     struct qs_plan plan={0}; if(!compile(root,rti,rel,build_rti,build_rel,join,&plan)) return;
+    /* Preserve the cheap raw-size choice when it fits. If it would spill,
+     * compare filtered projected records on the other side as well. Estimates
+     * only choose orientation; bounded batches still guarantee correctness. */
+    if(build_rel && build_bytes(&plan,build_rel->rows)>(double)pg_sina_max_memory*1024/2) {
+        struct qs_plan other={0};
+        if(compile(root,build_rti,build_rel,rti,rel,join,&other) && build_bytes(&other,rel->rows)<build_bytes(&plan,build_rel->rows)) {
+            plan=other; Index swap=rti; rti=build_rti; build_rti=swap;
+            RelOptInfo *swap_rel=rel; rel=build_rel; build_rel=swap_rel;
+        }
+    }
     plan.external_aggregate=plan.nkeys!=0;
     if(plan.external_aggregate && plan.nkeys+plan.naggs>QS_OUT) return;
     Oid nsp=get_namespace_oid("sina_csd",true);

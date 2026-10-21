@@ -407,3 +407,46 @@ Q14的单次冷启动profile保存在主机`/tmp/pg-snia-q14-profile.json`。只
 执行端墙钟：Setup 68.109ms，Build 58.688ms，probe阶段480.358ms，最终source 0.688ms，Cleanup 6.802ms，总计614.646ms。Scan累计CU CPU 918.827ms，Filter 44.605ms，HashJoin.build/load 14.413/5.671ms，HashJoin.probe+Aggregate 45.475ms。Scan覆盖两表229块，probe相关调用220次。当前主要计算开销仍是heap扫描解码，连接与聚合本身较小；累计CPU不是查询关键路径，不能直接相加解释延迟。
 
 4MB预算的重复键测试使用70003行build、150003行probe，产生1289854个组合。build分3批，probe实际累计扫描450009行，STORE/LOAD各2949120字节；共享池该次峰值2343088字节。数据见`/tmp/pg-snia-join-small-profile.json`。独立设备4MiB池和64MiB池内4MiB预算测试另行严格断言实际峰值不超预算；Guest的池峰值可能包含历史查询，不作为通用的逐查询上限判据。重扫保证当前有界实现的完整语义，后续多表/大build应考虑分区以减少重复内部读取。
+
+## 阶段3b.1：连接后分组与Q12（2026-10-21）
+
+接通Join后的外部分组/结果排序，聚合spill时保存probe位置并重入；支持SQL字符串常量的等于/不等于、IN和受限字符串分组/排序。Q12全部数据算子在一个CSD CustomScan中执行；字符串仅在最终Datum转换时恢复。当前完整TPC-H覆盖为Q1/Q6/Q12/Q14，其他查询仍按计划扩展。
+
+24项设备CTest、19项PG算子ASan/UBSan、完整Guest query/profile以及最终join回归通过。后者包含1289854个重复键组合的高基数组、4MB双重spill、多页结果、游标提前关闭/错误/取消后的设备复用，以及text/varchar/bpchar尾空格、空串、NULL数组项、排序及原生回退。SF=1 Q12分别以16/64MB预算核对，Q14以4/64MB预算核对；所有结果逐字一致。Q12为`MAIL|6202|9324`、`SHIP|6200|9262`，实际bpchar输出保留10字符宽度。
+
+主机日志：`/tmp/pg-snia-q12-workmem-native.log`、`/tmp/pg-snia-q12-workmem-asan.log`、`/tmp/pg-snia-q12-workmem-join-regression.log`、`/tmp/pg-snia-q12-old-regression.log`、`/tmp/pg-snia-q12-profile-regression.log`。最后调整游标间距后，另外3项Join容量CTest及3项对应ASan/UBSan通过，日志为`/tmp/pg-snia-q12-cursors-{native,asan}.log`。Guest最终Join回归目录`/tmp/pg-sina-queries.JLsX9O`，单表及计时回归目录`/tmp/pg-sina-queries.4vCtr4`、`/tmp/pg-sina-queries.8YW3Ab`。
+
+### 最终版本冷启动延迟
+
+所有构建和回归结束后单独测量，保持原生PG并行/work_mem配置；CSD为4 CU、64MiB AFDM、64MB查询/物理workmem上限。每次停止PG、清Guest页缓存并启动，交替host/CSD各3轮，profile关闭，逐次核对完整结果。全部样本如下：
+
+| 查询/路径 | 三轮 ms | 均值 ms | 中位数 ms |
+| --- | --- | ---: | ---: |
+| Q12/host | 2125.019 / 1971.768 / 1970.799 | 2022.529 | 1971.768 |
+| Q12/csd | 3399.552 / 3426.804 / 3466.878 | 3431.078 | 3426.804 |
+| Q14/host | 2258.033 / 1452.882 / 1599.472 | 1770.129 | 1599.472 |
+| Q14/csd | 691.175 / 678.021 / 692.397 | 687.198 | 691.175 |
+| Q1/host | 4428.497 / 4448.977 / 4350.515 | 4409.330 | 4428.497 |
+| Q1/csd | 897.827 / 913.736 / 1035.822 | 949.128 | 913.736 |
+| Q6/host | 1464.201 / 1573.149 / 1432.170 | 1489.840 | 1464.201 |
+| Q6/csd | 667.279 / 656.134 / 951.190 | 758.201 | 667.279 |
+
+Q12当前CSD约为host的1.70倍延迟，未获得加速；Q1/Q6/Q14仍有收益。Q1/Q6第三轮CSD样本明显较高，保留全部样本，Q6中位数为667.279ms；本阶段不是它们的性能优化，其CSD延迟也高于上一阶段部分样本，需后续独立归因，不能用本组测量声称加速进一步上升。FEMU的PCIe带宽模型未启用等限制仍适用，这不是等核数、等总内存或真实CSD芯片对照。
+
+原始性能日志为`/tmp/pg-snia-q12-release-join-bench.log`、`/tmp/pg-snia-q12-release-q1q6-bench.log`，Guest目录`/tmp/pg-sina-queries.gXDnD9`、`/tmp/pg-sina-queries.e3pqF5`；`join-bench`包含Q12/Q14及另行冷启动的profile。
+
+### Q12瓶颈：减少重复读取后，build扫描仍串行
+
+最初仅按原始表行数选择orders做build，三轮CSD为3666.025/3599.402/4193.898ms，均值3819.775ms；host均值2113.861ms。独立profile确认1500000行build分3批，lineitem扫描18003645行，内部读取2978643968字节，spill写/读各60162048字节；Build Wall 921.897ms，probe阶段2816.831ms。Scan/Filter累计CU CPU约3968/3185ms。数据在`/tmp/pg-snia-q12-before-profile.json`及Guest`/tmp/pg-sina-queries.gWoTRq`。
+
+最终补充了内存约束下的方向比较：原build估计超预算时，尝试另一侧，以过滤后行数和实际投影宽度估计记录/哈希桶空间。Q12因而选择过滤后的lineitem建表，而Q14默认预算下仍保留可驻留的part build。估计失准只影响方向和spill量，实际分配依然限额。
+
+最终Q12独立profile（`/tmp/pg-snia-q12-release-profile.json`）：build扫描6001215行，过滤后建表，1个驻内存批次；probe为1500000行orders，产生30988个匹配组合，内部读取1135394816字节，无spill。AFDM51761152字节，workmem池峰值4312880字节。Build Wall=3204.146ms，probe阶段=139.852ms，source=0.596ms，Setup/Cleanup=80.864/7.795ms。Scan累计CU CPU=1779.013ms，Filter=1267.781ms，HashJoin.build=8.099ms，probe+Aggregate=99.742ms。
+
+内部读取减少约62%，均值延迟约下降10%，但绝大部分时间转为串行build扫描/过滤。哈希插入与最终聚合并非主要瓶颈。下一步应让build侧LOAD/Scan/Filter也利用多个执行槽，再集中/合并哈希状态；更大build再考虑分区，不能仅靠交换连接方向保证加速。没有在本阶段引入新的设备调度机制或读算双缓冲。
+
+### 4MB下的归并读取放大
+
+独立设备压力测试扩大到1471273个连接组合、7001个潜在分组。4MiB池及64MiB池内4MiB查询预算均通过，峰值3562368字节，build分3批，STORE 1143次、LOAD 188408次；64MiB预算无spill。实际分配及结束时零残留均断言。恢复游标在build workmem中，每槽独占并隔开缓存行；AFDM只传槽编号、句柄和统计。
+
+Guest的1289854组合测试，在4MB预算下用2槽，build分3批，source汇总487个run、478个spill run；写65601536字节、读12875333632字节，池峰值3551664字节，profile耗时26245.991ms。数据为`/tmp/pg-snia-q12-small-groups-profile.json`。其中build自身写/读约2.8MiB，其余主要是部分状态归并；源数据与状态并非真的有12GiB，而是小读缓存交错访问导致反复LOAD。结果和内存界限通过，不代表这种低内存场景具备良好性能。多轮归并或分区仍是需要解决的性能限制，不能用提高默认内存掩盖。

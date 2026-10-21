@@ -33,7 +33,7 @@ static inline size_t qs_sink_memory(const struct qs_plan *p,unsigned workers)
     size_t limit=stats.capacity_bytes/(workers?workers:1);
     if(p->join.relid) {
         size_t build=p->join.work_mem_bytes;
-        if(build>stats.capacity_bytes/2) build=stats.capacity_bytes/2;
+        if(!build || build>stats.capacity_bytes/2) build=stats.capacity_bytes/2;
         limit=(stats.capacity_bytes-build)/(workers?workers:1);
     }
     if(p->work_mem_bytes && p->work_mem_bytes<limit) limit=p->work_mem_bytes;

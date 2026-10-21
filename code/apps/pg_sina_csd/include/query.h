@@ -15,11 +15,15 @@
 #define QS_PAGE 8192U
 #define QS_CHUNK (4U*1024*1024)
 #define QS_SORT_IO_BYTES (64U*1024)
-enum qs_type { Q_DECIMAL, Q_INTEGER, Q_DATE, Q_CHAR, Q_BOOLEAN, Q_STRING, Q_PREFIX };
+#define QS_STRINGS 32
+enum qs_type { Q_DECIMAL, Q_INTEGER, Q_DATE, Q_CHAR, Q_BOOLEAN, Q_STRING, Q_PREFIX, Q_DICTIONARY };
 enum qs_op { Q_COLUMN, Q_CONST, Q_ADD, Q_SUB, Q_MUL, Q_EQ, Q_NE, Q_LT, Q_LE, Q_GT, Q_GE,
              Q_AND, Q_OR, Q_NOT, Q_IS_NULL, Q_IS_NOT_NULL, Q_CASE, Q_AGGREF, Q_DIV };
 enum qs_agg_kind { Q_SUM, Q_AVG, Q_COUNT, Q_COUNT_STAR };
-struct qs_column { int16_t length, slot; uint8_t align, type, scale, deferred, prefix_len; char prefix[32]; };
+struct qs_column { int16_t length, slot; uint8_t align, type, scale, deferred, prefix_len, trim_spaces, restricted; char prefix[32]; };
+/* SQL literal dictionary: IDs 1..nstrings; 0 means another non-NULL string.
+ * Only a proven equality/IN restriction permits returning/grouping a string. */
+struct qs_string { uint8_t column, length; char bytes[128]; };
 struct qs_expr { int16_t left, right, column, otherwise; uint8_t op, type, scale, dscale, isnull; int64_t constant; };
 struct qs_agg { int16_t expr; uint8_t kind; };
 struct qs_output { int16_t index; uint8_t aggregate; uint32_t type_oid; int32_t typmod; };
@@ -32,7 +36,7 @@ struct qs_join {
 };
 struct qs_plan {
     uint32_t relid, relfilenode;
-    unsigned nattrs, ncols, nexprs, naggs, nkeys, nout, norder;
+    unsigned nattrs, ncols, nexprs, naggs, nkeys, nout, norder, nstrings;
     int predicate;
     unsigned ordered_rows; /* 1: SQL row sort; 2: internal full-row input. */
     unsigned external_aggregate;
@@ -40,6 +44,7 @@ struct qs_plan {
     uint64_t work_mem_bytes; /* Per execution slot, set at execution; 0 uses device capacity. */
     int64_t limit, offset;
     struct qs_column cols[QS_COLS];
+    struct qs_string strings[QS_STRINGS];
     struct qs_expr exprs[QS_EXPRS];
     struct qs_agg aggs[QS_AGGS];
     int keys[QS_KEYS];
@@ -48,7 +53,11 @@ struct qs_plan {
 };
 struct qs_extent { uint64_t logical, lba, bytes; };
 struct qs_request { struct qs_plan plan; char device[128]; uint32_t nsid, lba_bytes, nextents; uint64_t bytes; };
-struct qs_task { uint64_t state; uint32_t input_bytes, workers; uint64_t scanned, matched, joined; };
+struct qs_task {
+    uint64_t state;
+    uint32_t input_bytes, workers, slot; /* slot is a PG-assigned input index. */
+    uint64_t scanned, matched, joined;
+};
 struct qs_join_control {
     uint64_t state, rows, spill_write_bytes, spill_read_bytes;
     uint32_t batches, current;

@@ -25,12 +25,14 @@ static int64_t run(function f,struct femu_csd_args *a)
             memcpy(blocks[token],io,QS_SORT_IO_BYTES); ++stores;
         } else if(action==CS_NEED_LOAD) {
             assert(token && token<next_token && blocks[token]); memcpy(io,blocks[token],QS_SORT_IO_BYTES); ++loads;
+        } else if(action==CS_NEED_FREE) {
+            assert(token && token<next_token && blocks[token]); free(blocks[token]); blocks[token]=NULL;
         } else return value;
         a->cparam2=token;
     }
 }
 static void check(function build,function load,function probe,function close,function source,
-    unsigned build_rows,unsigned probe_rows,int skew,int cancel,int profile)
+    unsigned build_rows,unsigned probe_rows,int skew,int cancel,int profile,int grouped)
 {
     next_token=1; stores=loads=0;
     struct qs_plan p={.nattrs=4,.ncols=4,.nexprs=9,.naggs=4,.nout=5,.predicate=-1,.limit=-1,
@@ -49,6 +51,14 @@ static void check(function build,function load,function probe,function close,fun
     p.aggs[2]=(struct qs_agg){.kind=Q_COUNT_STAR,.expr=-1}; p.aggs[3]=(struct qs_agg){.kind=Q_AVG,.expr=0};
     for(unsigned i=0;i<4;++i) p.outputs[i]=(struct qs_output){.aggregate=1,.index=i};
     p.outputs[4]=(struct qs_output){.aggregate=2,.index=8};
+    unsigned workers=grouped?2:4;
+    if(grouped) {
+        p.external_aggregate=1; p.nkeys=p.norder=1; p.nexprs=10; p.work_mem_bytes=budget/4;
+        p.exprs[9]=(struct qs_expr){.op=Q_COLUMN,.column=0,.type=Q_INTEGER}; p.keys[0]=9;
+        p.outputs[0]=(struct qs_output){.index=0};
+        for(unsigned i=1;i<5;++i) p.outputs[i]=(struct qs_output){.aggregate=1,.index=i-1};
+        p.order[0]=(struct qs_order){.output=0};
+    }
     unsigned all[7001]={0},promo[7001]={0};
     struct qs_join_control control={0}; struct qs_task tasks[4]={{0}}; struct qs_profile counters[4]={0};
     size_t bytes=qs_chunk_bytes(997,2); struct qs_chunk *c=calloc(1,bytes); assert(c);
@@ -70,8 +80,12 @@ static void check(function build,function load,function probe,function close,fun
         struct femu_csd_args a={.numr=profile?5:4,.mr_addr=mr,.mr_len=len,.cparam1=profile}; assert(!run(build,&a));
     }
     __int128 expected_promo=0,expected_total=0; uint64_t expected_rows=0,expected_values=0;
+    uint64_t pairs_by[7001]={0},values_by[7001]={0},total_by[7001]={0},promo_by[7001]={0},case_by[7001]={0};
     for(unsigned at=0;at<probe_rows;++at) if(at%113!=0) {
         unsigned key=skew?3493:at%7001; expected_rows+=all[key];
+        pairs_by[key]+=all[key];
+        case_by[key]+=at%17?all[key]:all[key]-promo[key];
+        if(at%17!=0) { values_by[key]+=all[key]; total_by[key]+=(at%201+1)*all[key]; promo_by[key]+=(at%201+1)*promo[key]; }
         if(at%17!=0) { expected_values+=all[key]; expected_total+=(__int128)(at%201+1)*all[key]; expected_promo+=(__int128)(at%201+1)*promo[key]; }
     }
     struct qs_chunk *joined=calloc(1,qs_chunk_bytes(256,4)); assert(joined); joined->capacity=256; joined->ncols=4;
@@ -92,19 +106,45 @@ static void check(function build,function load,function probe,function close,fun
                 if(at%17==0) qs_nulls(c)[(c->capacity+7)/8+i/8]|=1U<<(i%8);
                 qs_selection(c)[i]=i;
             }
-            unsigned worker=chunk++%4; tasks[worker].workers=4;
-            void *memory[]={c,&p,&tasks[worker],&control,joined,&counters[worker]};
-            long long sizes[]={bytes,sizeof(p),sizeof(tasks[0]),sizeof(control),qs_chunk_bytes(256,4),sizeof(counters[0])};
-            struct femu_csd_args request={.numr=profile?6:5,.mr_addr=memory,.mr_len=sizes,.cparam1=profile}; assert(!run(probe,&request));
+            unsigned worker=chunk++%workers; tasks[worker].workers=workers; tasks[worker].slot=worker;
+            void *memory[]={c,&p,&tasks[worker],&control,joined,grouped?(profile?(void *)&counters[worker]:io):&counters[worker],io};
+            long long sizes[]={bytes,sizeof(p),sizeof(tasks[0]),sizeof(control),qs_chunk_bytes(256,4),grouped?(profile?sizeof(counters[0]):QS_SORT_IO_BYTES):sizeof(counters[0]),QS_SORT_IO_BYTES};
+            struct femu_csd_args request={.numr=grouped?(profile?7:6):(profile?6:5),.mr_addr=memory,.mr_len=sizes,.cparam1=profile}; assert(!run(probe,&request));
         }
     }
     struct qs_group group={0}; uint64_t actual_pairs=0;
     for(unsigned i=0;i<4;++i) if(tasks[i].state) { group.states[group.count++]=tasks[i].state; actual_pairs+=tasks[i].joined; }
+    if(grouped) {
+        void *mr[]={&control}; long long len[]={sizeof(control)};
+        struct femu_csd_args a={.numr=1,.mr_addr=mr,.mr_len=len}; assert(!close(&a) && !control.state);
+    }
     if(!cancel) {
         assert(actual_pairs==expected_rows);
         struct qs_result *out=calloc(1,sizeof(*out)); assert(out);
-        void *mr[]={&group,out}; long long len[]={sizeof(group),sizeof(*out)};
-        struct femu_csd_args a={.numr=2,.mr_addr=mr,.mr_len=len}; assert(!source(&a));
+        void *mr[]={&group,out,io}; long long len[]={sizeof(group),sizeof(*out),QS_SORT_IO_BYTES};
+        struct femu_csd_args a={.numr=grouped?3:2,.mr_addr=mr,.mr_len=len};
+        if(grouped) {
+            unsigned next=0;
+            do {
+                assert(!run(source,&a));
+                for(unsigned row=0;row<out->rows;++row) {
+                    while(next<7001 && !pairs_by[next]) ++next;
+                    assert(next<7001); const struct qs_cell *v=out->data[row].cells;
+                    assert(v[0].value==(int)next-3500 && v[3].value==pairs_by[next]);
+                    assert(v[1].isnull==!case_by[next] && v[2].isnull==!values_by[next] && v[4].isnull==!values_by[next]);
+                    if(case_by[next]) assert(v[1].value==promo_by[next]);
+                    if(values_by[next]) {
+                        assert(v[2].value==total_by[next]);
+                        struct qs_cell avg; assert(!qs_average((struct qs_cell){.value=total_by[next],.scale=2,.dscale=2},values_by[next],&avg));
+                        assert(v[4].value==avg.value && v[4].scale==avg.scale);
+                    }
+                    ++next;
+                }
+            } while(!out->finished);
+            while(next<7001 && !pairs_by[next]) ++next;
+            assert(next==7001);
+        } else {
+        assert(!source(&a));
         assert(out->rows==1 && out->finished && out->data[0].cells[2].value==expected_rows);
         assert(out->data[0].cells[1].isnull==!expected_values);
         if(expected_values) {
@@ -114,7 +154,8 @@ static void check(function build,function load,function probe,function close,fun
                 (struct qs_cell){.value=expected_total,.scale=2,.dscale=2},&ratio));
             assert(out->data[0].cells[4].value==ratio.value && out->data[0].cells[4].scale==ratio.scale);
         } else assert(out->data[0].cells[4].isnull);
-        assert(control.rows==build_rows && (!stores || stores==loads)); free(out);
+        }
+        assert(control.rows==build_rows && (grouped || !stores || stores==loads)); free(out);
     }
     /* Model device-close token reclamation, including a failed batch scope. */
     for(unsigned i=1;i<next_token;++i) { free(blocks[i]); blocks[i]=NULL; }
@@ -137,10 +178,14 @@ int main(int argc,char **argv)
     function build=(function)dlsym(join,"pg_sina_join_build"),load=(function)dlsym(join,"pg_sina_join_load");
     function probe=(function)dlsym(join,"pg_sina_join_probe"),close=(function)dlsym(join,"pg_sina_join_close");
     function source=(function)dlsym(agg,"pg_sina_aggregate_source"); assert(build && load && probe && close && source);
-    check(build,load,probe,close,source,70003,17003,0,0,1);
-    check(build,load,probe,close,source,5001,301,1,0,0);
-    check(build,load,probe,close,source,0,2003,0,0,0);
-    check(build,load,probe,close,source,70003,0,0,0,0);
-    check(build,load,probe,close,source,70003,17003,0,1,0);
+    check(build,load,probe,close,source,70003,17003,0,0,1,0);
+    check(build,load,probe,close,source,5001,301,1,0,0,0);
+    check(build,load,probe,close,source,0,2003,0,0,0,0);
+    check(build,load,probe,close,source,70003,0,0,0,0,0);
+    check(build,load,probe,close,source,70003,17003,0,1,0,0);
+    check(build,load,probe,close,source,70003,150003,0,0,1,1);
+    check(build,load,probe,close,source,5001,301,1,0,0,1);
+    check(build,load,probe,close,source,0,2003,0,0,0,1);
+    check(build,load,probe,close,source,70003,0,0,0,0,1);
     dlclose(agg); dlclose(join); puts("PASS hash join duplicates, negative/NULL keys, spill/replay, CASE, final projection and cleanup"); return 0;
 }

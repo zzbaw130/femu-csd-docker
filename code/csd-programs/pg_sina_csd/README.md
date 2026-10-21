@@ -15,7 +15,7 @@ Sort.source（多路归并、OFFSET/LIMIT，分批输出）
 
 build表 LOAD → Scan → Filter（可选）→ HashJoin.build
 每个build批次：HashJoin.load；probe表 LOAD → Scan → Filter → HashJoin.probe → Aggregate.sink
-Aggregate.source → 最终数值表达式
+Aggregate.source → 分组归并/排序（按需）或最终数值表达式
 ```
 
 第一条流水线按最多4个独立执行槽并行，每槽一个 SERIAL batch；完成的槽立即领取下一块。第二条流水线等待全部输入完成。通常每块4MiB原始heap，同一槽没有下一块预取或双缓冲。
@@ -31,7 +31,7 @@ Aggregate.source → 最终数值表达式
 | limit.c / pg-sina-limit.so | limit：小聚合结果、计划；调整结果范围 |
 | join.c / pg-sina-join.so | pg_sina_join_build：build列批次、完整计划、共享build控制记录、spill I/O AFDM |
 | join.c / pg-sina-join.so | pg_sina_join_load：共享build控制记录、spill I/O AFDM；current由PG指定 |
-| join.c / pg-sina-join.so | pg_sina_join_probe：probe列批次、完整计划、分支聚合任务、共享build控制记录、连接输出列批次 |
+| join.c / pg-sina-join.so | pg_sina_join_probe：probe列批次、完整计划、分支聚合任务、共享build控制记录、连接输出列批次；分组时追加spill I/O AFDM |
 | join.c / pg-sina-join.so | pg_sina_join_close：共享build控制记录；只释放workmem，临时token由本查询deviceClose回收 |
 | heap_count.c / pg-sina-heap-count.so | 诊断：原始页、计数；cparam1为物理列数，cparam2为有效字节 |
 
@@ -43,7 +43,7 @@ Aggregate.source 的单MR调用释放私有状态。Sort.source 的单MR调用�
 
 Scan解析PG12/x86-64/8KiB、全visible/frozen的heap，仅提取所需列。列批次包含int64值、NULL位图、numeric显示精度和selection vector；仍须遍历变长属性边界，不减少heap页读取量。
 
-numeric输入必须有限、至多两位小数，可精确表示为int64百分数；支持整数、date、bool、ASCII bpchar(1)。varchar/text仅支持Scan将指定ASCII前缀匹配提取为布尔列，尚无通用字符串列输出。规划时已知不支持的能力回退PG；运行时数据超出设备表示范围时报错，不伪装成透明回退。
+numeric输入必须有限、至多两位小数，可精确表示为int64百分数；支持整数、date、bool、ASCII bpchar(1)。较长字符串支持ASCII常量等于/不等于、IN和前缀LIKE。只有顶层等于/IN证明值属于计划字典时，才支持该列的投影/分组/排序，尚无任意字符串列输出。规划时已知不支持的能力回退PG；运行时数据超出设备表示范围时报错，不伪装成透明回退。
 
 PG估计过滤后剩余不足一半行时，所需numeric可以延迟解码，包括WHERE使用的列。Scan将原始AFDM中的`{offset, bytes}`暂存在原8字节值槽。简单AND先用SIMD处理已解码列，再按存活行逐个判断其余列，同列相邻上下界共用一次解码；复杂AND/OR只把仍需判断的行传给后续表达式。最终存活行的所有延迟列会在Filter中转换为正常列值，因此下游无需理解原始位置。原始AFDM一直保留到当前槽sink完成。
 
@@ -102,6 +102,16 @@ source保留一个正在合并的组及一块部分状态输入。没有SQL排�
 
 build共用一半查询预算，probe/聚合槽分摊其余预算；设备实际池容量继续限制总分配。build缓冲满时将当前记录按64KiB块NEED_STORE，保存token后复用缓冲。最后一次build后由load完成剩余记录的spill；若全表可驻留则直接建桶，无内部STORE/LOAD。对每个spill批次，load通过NEED_LOAD恢复记录并重建桶，PG随后并行扫描完整probe表；所有probe完成才切换批次，桶在probe期间只读。
 
-probe生成256行连接列批次，调用同一SO内的`aggregate.c`私有sink；仅支持无分组聚合，不产生嵌套spill请求。各槽聚合状态跨build批次保留，最后由普通aggregate source合并并计算最终表达式。该调用不消耗另一个CU，也不向主机返回中间行。profile的`HashJoin.probe+Aggregate`包含两者时间；build/load支持I/O重入，计数AFDM按约定放在最后I/O缓冲之前。
+probe生成256行连接列批次，调用同一SO内的`aggregate.c`私有sink，支持标量及可spill分组。各槽聚合状态跨build批次保留，最后由普通aggregate source合并、排序或计算最终表达式。该调用不消耗另一个CU，也不向主机返回中间行。profile的`HashJoin.probe+Aggregate`包含两者时间；分组probe和build/load支持I/O重入，计数AFDM按约定放在最后I/O缓冲之前。
+
+分组spill时，build的workmem状态为各执行槽保留probe选择行位置、重复键链的下一项和待提交状态；qs_task只输入PG分配的slot编号并输出句柄/统计，连接输出AFDM保持不变。重入先将相同的ACK和I/O缓冲传给聚合sink，完成后再继续probe。生成新批次时清除上一次ACK，避免误确认下一次spill。原始heap在Scan/Filter后不再使用，可作为聚合I/O缓冲。所有probe结束后PG显式调用join.close，释放build工作区；分组source的最终结果排序可以使用原build预算，局部部分状态排序则使用各槽固定状态之外的余量。该复用只发生于已明确结束的build生命周期，仍受同一个池和查询上限限制。
 
 参考DuckDB的build/probe阻塞边界、键/载荷投影和分批列输出；本阶段没有照搬其radix分区。内存不足时重扫probe，可能明显增加内部I/O；极多build批次也可能耗尽驻内存的token元数据，尚不保证任意规模输入。`tests/join.c`以独立按键统计核对重复键、负键、NULL、倾斜、空输入、分批spill和异常清理，分别验证4/64MiB池及64MiB池内4MiB查询预算。
+
+## SQL常量字符串字典
+
+Guest将字符串字面量放在`qs_plan.strings`，每项记录物理属性号、长度和字节；当前最多32项、每项127字节。字典在生成物理侧扫描计划之前按属性号及ASCII字节序排列，随后仅重映射属性号，保留编号。Scan对匹配值输出索引加一，其他非NULL值输出0，NULL仍用独立位图。bpchar去尾空格，text/varchar保留尾空格；空串也有自己的正编号。
+
+等于/不等于与IN使用这些整数编号进行向量比较。0仅表示“不等于本计划中的任何常量”，不能用于任意字符串间比较或不受约束的分组。PG仅在顶层等于/IN过滤能保证每个存活值有正编号时编译字符串原值的投影/分组/排序；OR或CASE内的比较不能单独作此保证。不支持的表达式回退PG，不合并未知字符串。最终设备结果仍是编号，Guest按同一计划恢复Datum；不会把设备指针或未序列化字符串写入spill。
+
+这使用了字典编码/选择向量思路，没有复制DuckDB的完整DictionaryVector。通用字符串、非ASCII常量和其他排序规则仍待实现。`tests/scan.c`覆盖短/长varlena、NULL、空串、未匹配编号及bpchar尾空格；真实Guest的join回归检查text/varchar/bpchar、NULL数组项、顺序和拒绝不安全表达式。完整Q12示例在Guest扩展的`tests/q12.sql`。

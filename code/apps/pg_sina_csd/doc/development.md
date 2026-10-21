@@ -112,7 +112,8 @@ SNIA已有计时记录D0=220次、累计1.523479s，E1=663次、累计3.393881s�
 | --- | --- | --- |
 | 2（完成） | 行排序/TopN与高基数聚合已接入，详见阶段2a/2b。workmem优先，NEED_STORE/LOAD/FREE驱动spill与重入，保留sink/source生命周期 | 大数据排序、分组和强制小内存正确性 |
 | 3a（完成） | 两表整数INNER Hash Join、投影、build分批spill及probe重扫，搜索CASE、前缀LIKE与聚合后数值运算 | Q14 |
-| 3b | 多表Join、Join后分组与字符串投影、分区spill以减少probe重复读取 | Q3/Q5/Q10/Q12/Q19 |
+| 3b.1（完成） | Join后分组、聚合spill重入、SQL常量字符串字典与受限投影/排序 | Q12 |
+| 3b.2 | build侧扫描并行、多表Join、一般字符串投影、连接后复合谓词、分区spill以减少probe重复读取 | Q3/Q5/Q10/Q19 |
 | 4 | 多路Join与分组，子查询去相关，semi/anti join，EXISTS/NOT EXISTS，LIKE/SUBSTRING、派生表与中间聚合结果复用 | Q4/Q7/Q8/Q9/Q11/Q13/Q15/Q16/Q18/Q20/Q21/Q22 |
 | 5 | 补齐剩余表达式与嵌套聚合/标量子查询语义，逐条核查设备覆盖与原生结果 | Q2/Q17及全部22条 |
 | 6 | `auto`：基于可支持性、估计行数、投影宽度、传输/计算/内存与spill成本选择host/csd；支持混合子计划 | 全部22条，比较host/csd/auto与实际计划 |
@@ -197,6 +198,27 @@ EXPLAIN增加CSD Scheduling说明。Guest回归新增450000行多块表，覆盖
 
 验收：24项设备CTest通过，19项PG算子ASan/UBSan通过。独立Join测试按键统计预期值，核对负键、重复键、NULL、倾斜、空build/probe、3批spill、计时和异常清理；4/64MiB池与64MiB池内4MiB查询预算均核对零残留及实际内存峰值。Guest的`join`入口核对两侧过滤、重复组合、空输入、无匹配、4MiB强制spill、原生回退、build/probe错误及取消后的同backend设备复用。SF=1 Q14在4/64MiB预算下均为一个CSD CustomScan，最终结果逐字一致：`16.3807786263955401`。
 
-当前完整TPC-H覆盖为Q1/Q6/Q14；其余查询尚不能完整卸载。Join初期只支持两个heap表、一个同类型整数等值INNER条件和标量SUM/AVG/COUNT；连接后GROUP BY/行输出、多表、外/semi/anti Join、一般字符串及子查询按后续阶段推进。LIKE仅限C/C.UTF-8下ASCII前缀、末尾一个`%`，同列多个前缀或其他通配符回退PG。numeric仍受现有输入和int128表示范围限制，运行时越界报错。
+阶段3a验收时完整TPC-H覆盖为Q1/Q6/Q14。该阶段Join只支持两个heap表、一个同类型整数等值INNER条件和标量SUM/AVG/COUNT；后续分组能力见阶段3b.1。LIKE仅限C/C.UTF-8下ASCII前缀、末尾一个`%`，同列多个前缀或其他通配符回退PG。numeric仍受现有输入和int128表示范围限制，运行时越界报错。
 
 完整单表query/profile回归也通过，包括新CASE/聚合后运算以及原有高基数聚合、排序、prepared plan、取消/错误和提前关闭。全部检查结束后冷启动交替各3轮：Q14 host=2066.527ms、CSD=636.031ms；Q1为4543.746/861.610ms，Q6为1432.663/584.542ms。Q14 host首轮波动较大，中位数1834.704/648.166ms；完整样本、内存/spill和独立算子计时见[性能分析](performance.md)。
+
+## 阶段3b.1：连接后分组、受限字符串与完整 Q12
+
+- 连接后的GROUP BY复用已有外部聚合，不新增一种聚合器。probe每生成256行列批次，就调用同SO内的聚合sink；聚合返回NEED_STORE/LOAD时，probe把原状态返回SNIA，保留输入行位置、重复键链下一项和待提交列批次。重入先完成该批聚合，再生成新行；新批次清除旧ACK，统计只在首次处理时累加。
+- 每个分组probe增加最后一个I/O AFDM，复用已不再使用的heap输入，计时AFDM仍放在它之前。普通标量probe保留原MR顺序。恢复游标保存在build的workmem中，每槽独占；AFDM任务只输入槽编号并输出句柄/统计，不保存私有恢复工作区。聚合source继续分批返回256行结果，PG保留独立build/probe统计，在每次source刷新聚合统计后合并，避免后续页丢失Join行数和build spill字节。
+- 所有probe结束后立即释放build哈希表。连接后分组的局部部分状态run使用各槽固定状态之外的余量，最终结果排序使用原build预算。4MB查询预算下减少为2槽，为每槽保留约1MiB固定状态、表达式与spill缓冲。此调整针对实际压力测试：先前将每槽余量再对半保留给尚未开始的结果排序，导致run描述在4MB下分配失败；扩大到150003行probe的独立设备测试可复现，复用已结束生命周期的预算后通过。仍不保证任意多run的元数据都能驻留。
+- SQL字符串常量在PG计划内构成小字典，按属性及字节顺序排列。Scan产生整数编号，未知非NULL为0、NULL仍独立；后续沿用8字节列槽、向量比较、CASE和整数分组/排序，不扩大全部数值列。字典随计划保留，spill只保存编号，PG恢复最终字符串Datum。bpchar比较去尾空格并在输出恢复列长度，text/varchar保留尾空格。
+- 只有顶层等于/IN能证明列的存活值属于字典，才允许原字符串投影/分组/排序。OR/CASE内的比较不能单独作此证明；未约束列、字符串间比较、范围谓词和一般字符串CASE保留原生路径，防止合并未知值。当前限C/C.UTF-8下ASCII、32项/计划、127字节/项；同列前缀LIKE与字典比较组合未开放。这是SQL常量分类，不是通用字符串字典。
+- 参考本地DuckDB `common/types/vector.cpp` 的字典/选择向量组织，以及Hash Join的build/probe阻塞边界和局部聚合组织；针对现有内存和SNIA接口复用机制，没有引入SQL专用runtime、设备格式、辅助进程或SNIA新API。
+
+Q12通过PG表达式树生成两侧Scan/Filter、Hash Join和分组流水线。orders的priority常量比较和lineitem的shipmode IN均使用字典；日期列间比较、CASE、两组SUM和ORDER BY都在设备执行，Guest只恢复最终bpchar Datum。
+
+首轮Q12性能诊断发现按原始表大小选择orders build会分3批，lineitem被重扫3次。补充简单的方向选择：当前build投影估计超预算时，尝试另一方向，按过滤后行数、实际投影列数及当前记录/哈希桶布局估计空间，选择较小者。当前方向已能驻留时保留原选择，避免无条件将大表Scan改为串行build。估计不决定正确性，实际超限仍能spill；EXPLAIN新增Build Relation。已PREPARE的方向可能保留旧预算的选择，执行时仍按当前上限限额。
+
+设备验收：24项CTest和19项ASan/UBSan通过，关闭现有环境不支持的LeakSanitizer。新增/扩大的用例覆盖1471273个重复键连接组合、7001个潜在分组、多build批次与聚合spill同时出现、跨256行输出、加权AVG、CASE/NULL、空输入及计时；4/64MiB池和64MiB池内4MiB查询预算均核对完整结果及零残留。Scan测试补充字典的空串、NULL、未知值、短/长varlena、bpchar尾空格及无效长度。
+
+当前完整TPC-H覆盖扩展到Q1/Q6/Q12/Q14。多表Join、一般字符串、连接后的普通行输出、连接后跨表复合谓词、外/semi/anti Join、HAVING和子查询仍按后续阶段推进，不能将本阶段视为完成全部TPC-H。
+
+Guest完整Join/字符串回归通过，包括4MB高基数分组、source多次输出、早关游标/错误/取消后同backend复用；Q12在16/64MB、Q14在4/64MB下与host逐字一致。原有query/profile回归也通过。最终冷启动各3轮：Q12 host=2022.529ms、CSD=3431.078ms，当前没有加速；Q1为4409.330/949.128ms，Q6为1489.840/758.201ms，Q14为1770.129/687.198ms。Q1/Q6第三轮CSD偏高，完整样本及中位数一并保留。
+
+Q12方向调整将内部读取从约2.98GB降至1.14GB、CSD均值从3819.775ms降至3431.078ms，但build侧Scan/Filter仍为单槽，独立profile的Build Wall约3204ms，成为主要瓶颈。4MB高基数场景另有明显归并读取放大，需要多轮归并/分区。详细样本和资源统计见[性能分析](performance.md)；不将完整卸载等同于已经获得加速。

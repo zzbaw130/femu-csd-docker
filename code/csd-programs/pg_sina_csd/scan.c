@@ -10,7 +10,7 @@ int64_t pg_sina_scan(struct femu_csd_args *a)
     if(!a || a->numr!=4 || a->mr_len[1]<(long long)sizeof(struct qs_plan) || a->mr_len[3]<(long long)sizeof(struct qs_task)) return -1;
     const struct qs_plan *p=a->mr_addr[1]; struct qs_chunk *c=a->mr_addr[2];
     unsigned bytes=((struct qs_task *)a->mr_addr[3])->input_bytes;
-    if(p->nattrs>QS_COLS || p->ncols>p->nattrs || a->mr_len[2]<(long long)sizeof(*c) ||
+    if(p->nattrs>QS_COLS || p->ncols>p->nattrs || p->nstrings>QS_STRINGS || a->mr_len[2]<(long long)sizeof(*c) ||
         c->ncols!=p->ncols || qs_chunk_bytes(c->capacity,c->ncols)>(uint64_t)a->mr_len[2] ||
         bytes%QS_PAGE || bytes>(uint64_t)a->mr_len[0]) return -1;
     c->rows=c->selected=0; memset(qs_nulls(c),0,((c->capacity+7)/8)*(size_t)c->ncols);
@@ -54,6 +54,15 @@ int64_t pg_sina_scan(struct femu_csd_args *a)
                         memcpy(&value,&ref,sizeof(ref));
                     }
                     else if(spec->type==Q_STRING) return -3;
+                    else if(spec->type==Q_DICTIONARY) {
+                        unsigned length=size-header;
+                        if(spec->trim_spaces) while(length && v[length-1]==' ') --length;
+                        for(unsigned s=0;s<p->nstrings;++s) {
+                            const struct qs_string *text=&p->strings[s];
+                            if(text->length>=sizeof(text->bytes)) return -3;
+                            if(text->column==col && text->length==length && !memcmp(v,text->bytes,length)) { value=s+1; break; }
+                        }
+                    }
                     else if(spec->type==Q_PREFIX) { if(spec->prefix_len>sizeof(spec->prefix)) return -3; value=size-header>=spec->prefix_len && !memcmp(v,spec->prefix,spec->prefix_len); }
                     else if(spec->type==Q_DECIMAL) { if(qs_numeric_cents(v,size-header,&value,&dscale)) return -3; }
                     else if(spec->type==Q_CHAR) { if(size-header!=1 || *v>=128) return -3; value=*v; }

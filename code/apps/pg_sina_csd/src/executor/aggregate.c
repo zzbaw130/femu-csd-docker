@@ -2,6 +2,7 @@
 #include "executor/executor.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
+#include "utils/lsyscache.h"
 typedef struct {
     CustomScanState css;
     struct qs_request request;
@@ -70,7 +71,19 @@ static TupleTableSlot *execute(CustomScanState *node)
         if(value.isnull) continue;
         switch(s->request.plan.outputs[i].type_oid) {
         case 1700:slot->tts_values[i]=decimal(value);break;
-        case 1042: { char text[2]={(char)value.value,0}; slot->tts_values[i]=DirectFunctionCall3(bpcharin,CStringGetDatum(text),ObjectIdGetDatum(InvalidOid),Int32GetDatum(5));break; }
+        case 25:case 1043:case 1042: {
+            const struct qs_plan *p=&s->request.plan; const struct qs_output *o=&p->outputs[i];
+            int expr=p->ordered_rows?o->index:p->keys[o->index];
+            char single[2]={(char)value.value,0}; const char *text=single;
+            if(p->exprs[expr].type==Q_DICTIONARY) {
+                if(value.value<1 || value.value>p->nstrings) elog(ERROR,"unknown CSD string result");
+                text=p->strings[(unsigned)value.value-1].bytes;
+            }
+            slot->tts_values[i]=o->type_oid==1042?
+                DirectFunctionCall3(bpcharin,CStringGetDatum(text),ObjectIdGetDatum(InvalidOid),Int32GetDatum(o->typmod)):
+                CStringGetTextDatum(text);
+            break;
+        }
         case 16:slot->tts_values[i]=BoolGetDatum(value.value!=0);break;
         case 21:slot->tts_values[i]=Int16GetDatum((int16)value.value);break;
         case 23:case 1082:slot->tts_values[i]=Int32GetDatum((int32)value.value);break;
@@ -131,13 +144,18 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     StringInfoData graph; initStringInfo(&graph);
     if(p->join.relid) {
         ExplainPropertyText("CSD Join","inner integer hash join; build-batch replay",es);
+        ExplainPropertyText("CSD Build Relation",get_rel_name(p->join.relid),es);
         appendStringInfoString(&graph,"Build: LOAD -> Scan");
         if(p->join.predicate>=0) appendStringInfoString(&graph," -> Filter");
         appendStringInfoString(&graph," -> HashJoin.build; each batch: HashJoin.load; Probe: ");
     }
     appendStringInfoString(&graph,"LOAD -> Scan");
     if(p->predicate>=0) appendStringInfoString(&graph," -> Filter");
-    if(p->join.relid) appendStringInfoString(&graph," -> HashJoin.probe -> Aggregate.sink; Aggregate.source -> Projection");
+    if(p->join.relid) {
+        appendStringInfoString(&graph," -> HashJoin.probe -> Aggregate.sink; Aggregate.source");
+        if(p->external_aggregate && p->norder) appendStringInfoString(&graph," -> Sort");
+        appendStringInfoString(&graph," -> Projection");
+    }
     else if(p->ordered_rows) appendStringInfoString(&graph," -> Sort.sink; Sort.source (OFFSET/LIMIT)");
     else if(p->external_aggregate) {
         appendStringInfoString(&graph," -> Aggregate.sink (local hash); Aggregate.source (merge/finalize)");
@@ -151,6 +169,7 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     unsigned deferred=0;
     for(unsigned i=0;i<p->nattrs;++i) deferred+=p->cols[i].deferred!=0;
     ExplainPropertyInteger("CSD Deferred Columns",NULL,deferred,es);
+    if(p->nstrings) ExplainPropertyInteger("CSD String Literals",NULL,p->nstrings,es);
     if(s->executed) {
         if(s->profiling) explain_profile(&s->result->profile,es);
         ExplainPropertyInteger("CSD AFDM","bytes",s->result->metrics.fdm_bytes,es);
