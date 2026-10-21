@@ -316,3 +316,11 @@ Guest完整Join回归54项、单表及旧查询55项通过。Q3在16/64MB下与h
 限制：Q9仍有6次lineitem重扫，64MB下2.21倍host；16MB不可用。问题来自orders 1.5M与partsupp 800k无法同时单批驻留，下一步需要分区Hash Join或probe物化，不能把当前结果当作性能完成。复现入口`tests/pg-sina-csd-test.sh join|join-bench`，SQL位于`tests/q9.sql`。
 
 Q9提交后复核Q5/Q10（连接顺序/预算已变化）：Q5 host均值2275.099ms、CSD均值1212.940ms，约1.88倍；Q10 host均值2287.015ms、CSD均值1531.757ms，约1.49倍；各3轮结果cmp通过。16MB查询预算Q5=11102.431ms、Q10=5062.922ms，结果一致；旧Q5/Q10的64MB/16MB记录以本次复核为准。
+
+## 阶段3i：重复 RTE 自连接与完整 Q7（2026-10-22）
+
+- Q7 的 `nation n1`/`nation n2` 是同一基表的两个 RangeTblEntry。规划端按 RTI 绑定列区间，`greedy_order` 允许同一 relid 的两个实例分别进入连接链；Q7 生成 supplier、nation n1、orders、customer、nation n2 五级 build链。
+- OR 中的字符串等值（n1/n2 名称）在 `string_comparison` 中标记为等值受限；若运行时出现字典外字符串，输出ID0会在结果转换时报错，不会静默合并。Q7 只输出 KENYA/JORDAN 两值，静态字典覆盖。
+- 字符串 `ORDER BY` 使用短字符串 inline 字节序；Q7 的 `supp_nation,cust_nation,l_year` 排序在设备完成。
+
+验收：Q7 4行结果与host逐字一致（3轮cmp通过）。默认64MB冷启动三轮host=3251.633/2329.948/2404.706ms（均值2662.096），CSD=3676.067/3691.620/3619.526ms（均值3662.404），约1.38倍。Q7 profile：Build Batches=4、Internal Read 3931471872字节、Spill Write 66191360/Read 126287872字节、4 workers、Execution 3590.978ms。16MB查询预算CSD=8348.123ms，结果一致。200ms取消后同backend连续两次CSD COUNT均返回6001215。复现入口`tests/pg-sina-csd-test.sh join|join-bench`，SQL位于`tests/q7.sql`。

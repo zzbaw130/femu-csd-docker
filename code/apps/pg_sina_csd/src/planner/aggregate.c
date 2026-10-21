@@ -110,6 +110,10 @@ static int string_comparison(Node *left,Node *right,Oid function,Oid collation,I
         ++id;
     }
     c->type=Q_DICTIONARY; if(c->slot<0) c->slot=p->ncols++;
+    /* Mark equality-restricted columns even inside OR. The device still emits
+     * ID 0 for any survivor outside the literal set and errors on output, so
+     * this never silently truncates or merges an unknown string. */
+    if(equal) c->restricted=1;
     int a=put(p,(struct qs_expr){.op=Q_COLUMN,.column=col,.type=Q_DICTIONARY});
     int b=put(p,(struct qs_expr){.op=Q_CONST,.constant=id,.type=Q_DICTIONARY,.isnull=literal->constisnull});
     return a<0 || b<0?-1:put(p,(struct qs_expr){.op=equal?Q_EQ:Q_NE,.type=Q_BOOLEAN,.left=a,.right=b});
