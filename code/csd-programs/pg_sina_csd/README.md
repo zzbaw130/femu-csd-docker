@@ -25,7 +25,7 @@ Guest 从 PG 选定的树中标记可并行的扫描/投影/Hash 或 Index Probe
 ## 节点与内存
 
 - Scan/Projection：只解码父节点真正需要的列；投影、过滤、CASE、NULL 三值逻辑、短路、数值运算、LIKE、substring 和 year 在设备执行。仅用于 LIKE 的长字符串直接在扫描时判断，不先将所有文本放入字典。
-- Hash Join：按 PG 的左右输入 build/probe，支持 INNER/LEFT/SEMI/ANTI 和多键等值/剩余条件。超出配额时保留已经消费的投影行，交给外部 Merge Join，不回头重扫原始 Heap。
+- Hash Join：按 PG 的左右输入 build/probe，支持 INNER/LEFT/SEMI/ANTI 和多键等值/剩余条件。Hash 表使用查询预算扣除两份排序配额后的上限，不再受单个排序节点的小配额限制；实际分配仍受查询根 context 约束。超出配额时保留已经消费的投影行，交给外部 Merge Join，不回头重扫原始 Heap。
 - Merge Join：分别排序输入，按键归并；重复键组可 spill，保留 NULL、重复和外连接语义。
 - Index Join：复用 `index_scan.c` 的 PG12 整数 B-tree 下探与 Heap Tuple 解码，可在连接树多个位置出现。最多批量 64 个外侧键；要求保留顺序时一次一个键。缺页只通过控制记录交给 Guest 批量提交内部 LOAD。SEMI/ANTI 在消费端确认条件满足后停止查找该键；索引自连接复用当前扫描块中的 Heap 页，超出该块再读取，不建立跨查询缓存。
 - Aggregate：支持任意组合的 SUM/AVG/COUNT/MIN/MAX、分组和 HAVING；按组有序输入流式计算，否则先外部排序。COUNT DISTINCT 支持一组共享的 DISTINCT 输入列，排序后跳过重复/NULL。

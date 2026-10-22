@@ -350,9 +350,15 @@ static int64_t hash_build(struct execution *s,unsigned id)
     unsigned rn=s->plan->nodes[n->right].expr.nout;
     if(o->hash_fallback) return 0;
     size_t stride=rn*sizeof(struct qs_cell)+3*sizeof(uint32_t);
+    /* Hash build is not a sort run: allow it to use the query budget while
+     * retaining two sort quotas for a Merge fallback. The parent allocator
+     * still enforces actual usage across all active nodes and workers. */
+    struct cs_work_context_stats memory;
+    if(cs_work_get_context_stats(s->context,&memory)) return -4;
+    size_t hash_limit=memory.limit_bytes-2*s->sort_limit;
     if(!o->hash_capacity) {
         uint64_t estimate=s->plan->nodes[n->right].estimated_rows;
-        unsigned max=1; while((size_t)max*2*stride<=s->sort_limit && max<UINT_MAX/4) max*=2;
+        unsigned max=1; while((size_t)max*2*stride<=hash_limit && max<UINT_MAX/4) max*=2;
         unsigned capacity=128; while(capacity<estimate && capacity<max) capacity*=2;
         if(capacity>max) capacity=max;
         o->hash_data=cs_work_alloc(s->context,capacity*stride);
@@ -362,7 +368,7 @@ static int64_t hash_build(struct execution *s,unsigned id)
     while(!o->hash_phase) {
         if(o->hash_rows==o->hash_capacity) {
             size_t bytes=(size_t)o->hash_capacity*2*stride;
-            void *data=bytes<=s->sort_limit?cs_work_realloc(s->context,o->hash_data,bytes):NULL;
+            void *data=bytes<=hash_limit?cs_work_realloc(s->context,o->hash_data,bytes):NULL;
             if(!data) {
                 /* Preserve already-built projected rows. The fallback sorts
                  * this prefix plus the remaining child stream, never rereads
