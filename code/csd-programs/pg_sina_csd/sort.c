@@ -57,7 +57,7 @@ struct row_run {
     cs_work_context *owner;
     uint64_t *blocks;
     unsigned nblocks;
-    struct qs_cell head[QS_OUT];
+    struct qs_cell *head;
     unsigned rows, position, loaded, cache_rows;
     int sorted, spilled;
 };
@@ -129,7 +129,7 @@ static uint64_t integer_sort_key(const unsigned char *row,unsigned column,int de
 /* Normalize a single integer/date key and skip constant bytes, as DuckDB's
  * sort keys do. Scratch is charged to the run owner; use the existing sorter
  * when the key is nullable, wide, composite or scratch does not fit. */
-static int run_radix_sort(struct row_sort *s,struct row_run *r)
+static int run_integer_radix_sort(struct row_sort *s,struct row_run *r)
 {
     if(s->plan.norder!=1 || r->rows<2) return 0;
     const struct qs_order *order=&s->plan.order[0]; unsigned column=order->output;
@@ -156,6 +156,57 @@ static int run_radix_sort(struct row_sort *s,struct row_run *r)
             memcpy(to+(size_t)positions[bucket]++*s->row_bytes,row,s->row_bytes);
         }
         unsigned char *swap=from; from=to; to=swap;
+    }
+    if(from!=r->data) memcpy(r->data,from,bytes);
+    cs_work_free(r->owner,scratch); return 1;
+}
+static unsigned __int128 numeric_sort_key(const unsigned char *row,unsigned column,int descending)
+{
+    unsigned __int128 key=(unsigned __int128)((const struct qs_cell *)row)[column].value^((unsigned __int128)1<<127);
+    return descending?~key:key;
+}
+/* Normalize integer/date and uniform-scale numeric keys, as DuckDB's
+ * sort keys do. Scratch is charged to the run owner; use the existing sorter
+ * when a key is nullable, has mixed scales or scratch does not fit. */
+static int run_radix_sort(struct row_sort *s,struct row_run *r)
+{
+    /* Preserve the cheaper 64-bit path for the common single integer key. */
+    if(s->plan.norder==1 && s->plan.outputs[s->plan.order[0].output].type_oid!=1700)
+        return run_integer_radix_sort(s,r);
+    if(!s->plan.norder || r->rows<2) return 0;
+    unsigned __int128 vary[QS_OUT]={0},changed=0;
+    for(unsigned k=0;k<s->plan.norder;++k) {
+        const struct qs_order *order=&s->plan.order[k]; unsigned column=order->output;
+        unsigned oid=s->plan.outputs[column].type_oid;
+        if(oid!=20 && oid!=21 && oid!=23 && oid!=1082 && oid!=1700) return 0;
+        unsigned scale=run_row(s,r,0)[column].scale;
+        unsigned __int128 first=numeric_sort_key(r->data,column,order->descending);
+        for(unsigned i=0;i<r->rows;++i) {
+            const struct qs_cell *v=&run_row(s,r,i)[column];
+            if(v->isnull || v->scale!=scale || v->dscale==UINT8_MAX) return 0;
+            vary[k]|=first^numeric_sort_key(r->data+(size_t)i*s->row_bytes,column,order->descending);
+        }
+        changed|=vary[k];
+    }
+    if(!changed) return 1;
+    size_t bytes=(size_t)r->rows*s->row_bytes;
+    unsigned char *scratch=cs_work_alloc(r->owner,bytes); if(!scratch) return 0;
+    unsigned char *from=r->data,*to=scratch;
+    /* Stable passes from the last key preserve lexicographic ordering. */
+    for(unsigned k=s->plan.norder;k;--k) {
+      const struct qs_order *order=&s->plan.order[k-1]; unsigned column=order->output;
+      for(unsigned shift=0;shift<128;shift+=8) if((vary[k-1]>>shift)&255) {
+        unsigned positions[256]={0};
+        for(unsigned i=0;i<r->rows;++i) ++positions[(numeric_sort_key(from+(size_t)i*s->row_bytes,column,order->descending)>>shift)&255];
+        unsigned start=0;
+        for(unsigned i=0;i<256;++i) { unsigned count=positions[i]; positions[i]=start; start+=count; }
+        for(unsigned i=0;i<r->rows;++i) {
+            const unsigned char *row=from+(size_t)i*s->row_bytes;
+            unsigned bucket=(numeric_sort_key(row,column,order->descending)>>shift)&255;
+            memcpy(to+(size_t)positions[bucket]++*s->row_bytes,row,s->row_bytes);
+        }
+        unsigned char *swap=from; from=to; to=swap;
+      }
     }
     if(from!=r->data) memcpy(r->data,from,bytes);
     cs_work_free(r->owner,scratch); return 1;
@@ -328,11 +379,15 @@ int64_t pg_sina_sort_sink(struct femu_csd_args *a)
             if(memory.limit_bytes-memory.used_bytes<(size_t)n*s->row_bytes+QS_SORT_IO_BYTES+4096)
                 return row_evict(s,s->context,a);
             unsigned blocks=(n+s->block_rows-1)/s->block_rows;
-            uint64_t *tokens=cs_work_calloc(s->context,blocks,sizeof(*tokens));
+            size_t token_bytes=(blocks*sizeof(uint64_t)+_Alignof(struct qs_cell)-1)&~(size_t)(_Alignof(struct qs_cell)-1);
+            /* Keep the merge head next to its token array, sized to the
+             * projected row rather than sixteen cells for every run. */
+            uint64_t *tokens=cs_work_calloc(s->context,1,token_bytes+s->row_bytes);
             if(!tokens) return row_evict(s,s->context,a);
             void *data=cs_work_alloc(s->context,(size_t)n*s->row_bytes);
             if(!data) { cs_work_free(s->context,tokens); return row_evict(s,s->context,a); }
             r=&s->runs[s->count++]; memset(r,0,sizeof(*r)); r->data=data; r->owner=s->context; r->blocks=tokens; r->nblocks=blocks;
+            r->head=(void *)((char *)tokens+token_bytes);
         }
         unsigned count=selected-s->input_position;
         if(count>QS_VECTOR_ROWS) count=QS_VECTOR_ROWS;
@@ -483,12 +538,14 @@ static int64_t consolidate(struct row_sort *s,struct femu_csd_args *a)
             if(rows>UINT32_MAX) return -4;
             struct row_run *r=&s->compact_run;
             r->rows=rows; r->nblocks=(rows+s->block_rows-1)/s->block_rows; r->owner=o->context;
-            r->blocks=cs_work_calloc(o->context,r->nblocks,sizeof(*r->blocks));
+            size_t token_bytes=(r->nblocks*sizeof(uint64_t)+_Alignof(struct qs_cell)-1)&~(size_t)(_Alignof(struct qs_cell)-1);
+            r->blocks=cs_work_calloc(o->context,1,token_bytes+s->row_bytes);
             if(!r->blocks) {
                 int64_t status=row_evict(s,o->context,a); if(status) return status;
                 continue;
             }
             r->spilled=r->sorted=1; r->loaded=UINT32_MAX; r->cache_rows=s->block_rows;
+            r->head=(void *)((char *)r->blocks+token_bytes);
             s->heap_count=0; s->root_pending=0; s->compact_block=s->compact_rows=0;
             for(unsigned i=s->compact_begin;i<s->compact_end;++i) {
                 struct row_run *input=&o->runs[i];

@@ -34,7 +34,7 @@ Guest 从 PG 选定的树中标记可并行的扫描/投影/Hash 或 Index Probe
 
 所有动态算法状态从 `libcs-workmem` 分配。通用查询先建立受 `max_memory` 限制的根 context；排序、索引子 context 同时计入根配额和全局池。Hash 表、run、归并游标不能放入 AFDM 来绕开工作内存上限。
 
-`sort.c` 每个 run 最大约 1 MiB，spill 块为 64 KiB。内存优先保留 run，下一段超过预算才 STORE；归并 fan-in 受缓存预算限制，必要时分轮合并并释放旧 token。需要读缓存时优先 spill 驻留 run，避免驻留数据挤占缓存、每输出几行便重新读取整个块。单个非 NULL int64 范围整数/date 键优先用 radix sort，并跳过常量字节；scratch 计入 run 所有者的配额，放不下时保留原有排序，不额外制造 spill。多键、NULL、字符串和宽 numeric 继续走原有精确比较。字符串比较使用字典；短最终字符串排序标记为 `UINT8_MAX`，不能与合法的 numeric 显示精度重叠。
+`sort.c` 每个 run 最大约 1 MiB，spill 块为 64 KiB。内存优先保留 run，下一段超过预算才 STORE；归并 fan-in 受缓存预算限制，必要时分轮合并并释放旧 token。需要读缓存时优先 spill 驻留 run，避免驻留数据挤占缓存、每输出几行便重新读取整个块。每个 run 的归并头按实际投影列宽分配，与 token 一起计入 workmem，避免小预算被固定 16 列的描述占满。非 NULL 整数/date 和 run 内相同 scale 的 numeric 键使用精确 int128 radix sort，支持多列升降序并跳过常量字节；scratch 计入 run 所有者的配额，放不下时保留原有排序，不额外制造 spill。NULL、字符串和混合 scale 继续走原有精确比较。字符串比较使用字典；短最终字符串排序标记为 `UINT8_MAX`，不能与合法的 numeric 显示精度重叠。
 
 正常完成或提前 Limit 后释放私有 context；取消/错误时 Guest 再提交 close，随后关闭当前 SNIA 会话，释放仍存活的临时 token。没有后台代理或独立设备执行进程。
 

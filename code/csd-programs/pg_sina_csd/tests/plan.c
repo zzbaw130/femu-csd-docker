@@ -24,7 +24,7 @@ static unsigned char *heap(unsigned rows,unsigned side,size_t *size)
         for(unsigned i=0;i<count;++i) {
             unsigned row=p*100+i,off=QS_PAGE-(i+1)*40; unsigned char *t=page+off;
             w32(page+24+i*4,off|(1U<<15)|(40U<<17)); w16(t+18,2); w16(t+20,0xb01); t[22]=24; t[23]=side==2 || row%17?3:2;
-            if(side==2) { w32(t+24,row); w32(t+28,(int32_t)((uint64_t)row*1009%100003)-50000); }
+            if(side==2) { w32(t+24,row); w32(t+28,(int32_t)((uint64_t)row*1009%997)-498); }
             else if(row%17) { w32(t+24,row%(side?7:11)); w32(t+28,side?row%13+1:row%19+1); }
             else w32(t+24,side?row%13+1:row%19+1);
         }
@@ -265,12 +265,12 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
 #undef control
 static int descending(const void *a,const void *b)
 { return (*(const int32_t *)a<*(const int32_t *)b)-(*(const int32_t *)a>*(const int32_t *)b); }
-static void nested_sort(function run)
+static void nested_sort(function run,unsigned type)
 {
     unsigned rows=50003; size_t raw_bytes;
     unsigned char *raw=heap(rows,2,&raw_bytes);
     int32_t *expected=malloc(rows*sizeof(*expected)); assert(expected);
-    for(unsigned i=0;i<rows;++i) expected[i]=(int32_t)((uint64_t)i*1009%100003)-50000;
+    for(unsigned i=0;i<rows;++i) expected[i]=(int32_t)((uint64_t)i*1009%997)-498;
     qsort(expected,rows,sizeof(*expected),descending);
     struct qp_plan *p=calloc(1,sizeof(*p)); assert(p); p->count=4; p->scan_bytes=QP_SCAN_BYTES;
     scan(&p->nodes[3]); p->nodes[3].bytes=raw_bytes;
@@ -288,6 +288,9 @@ static void nested_sort(function run)
         n->expr.limit=-1;
     }
     p->nodes[0].expr.work_mem_bytes=4U*1024*1024;
+    p->nodes[0].expr.norder=2;
+    p->nodes[0].expr.order[1]=(struct qs_order){.output=0};
+    p->nodes[0].expr.outputs[1].type_oid=type;
     struct qp_node *leaf=&p->nodes[3]; leaf->input_offset=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
     leaf->vector_offset=leaf->input_offset+QP_SCAN_BYTES;
     size_t bytes=leaf->vector_offset+qs_chunk_bytes(QP_SCAN_BYTES/24,2);
@@ -297,7 +300,7 @@ static void nested_sort(function run)
     struct qp_control control={0}; struct qs_result *out=calloc(1,sizeof(*out)); assert(out);
     void *mr[]={p,&control,out,arena,io}; long long len[]={sizeof(*p),sizeof(control),sizeof(*out),bytes,QS_SORT_IO_BYTES};
     struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=len};
-    void **tokens=NULL; unsigned ntokens=0,seen=0;
+    void **tokens=NULL; unsigned ntokens=0,seen=0,last_id=0;
     while(!out->finished) {
         int64_t status=run(&args); assert(status>=0);
         uint64_t op=(uint64_t)status>>60,id=(uint64_t)status&CS_IO_VALUE_MASK;
@@ -312,7 +315,9 @@ static void nested_sort(function run)
             if(seen>=rows || out->data[r].cells[1].value!=expected[seen]) {
                 fprintf(stderr,"nested sort row=%u got=%lld expected=%d\n",seen,(long long)out->data[r].cells[1].value,seen<rows?expected[seen]:0); abort();
             }
-            ++seen;
+            unsigned id=(unsigned)out->data[r].cells[0].value;
+            if(seen && expected[seen]==expected[seen-1]) assert(id>last_id);
+            last_id=id; ++seen;
         }
         if(control.bytes && !control.ready) { memcpy(arena+leaf->input_offset,raw+control.offset,control.bytes); control.ready=1; }
     }
@@ -362,6 +367,7 @@ int main(int argc,char **argv)
     test(run,QP_LEFT,20000,23,4,0,TEST_SERIAL);
     test(run,QP_LEFT,73,20000,8,1,TEST_SERIAL);
     test(run,QP_INNER,73,60000,8,1,TEST_BUILD_FALLBACK);
-    nested_sort(run); parallel_dictionary();
+    test(run,QP_INNER,73,60000,4,1,TEST_BUILD_FALLBACK);
+    nested_sort(run,23); nested_sort(run,1700); parallel_dictionary();
     puts("PASS native Plan joins, NULL/duplicate keys, MIN/MAX/AVG, spill and cleanup");
 }
