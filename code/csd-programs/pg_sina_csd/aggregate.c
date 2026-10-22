@@ -149,17 +149,16 @@ static int output_expr(const struct qs_plan *p,unsigned j)
 }
 /* Resolve dictionary IDs only when a final result block leaves the source;
  * group keys and partial states stay fixed-size IDs through sorting/spill. */
-static int resolve_result_strings(const struct state *s,struct qs_result *out)
+static int resolve_result_strings(const struct qs_plan *p,struct qs_dict *dict,struct qs_result *out)
 {
-    const struct qs_plan *p=&s->plan;
     out->str_bytes=0;
     for(unsigned r=0;r<out->rows;++r) for(unsigned j=0;j<p->nout;++j) {
         int expr=output_expr(p,j); if(expr<0 || p->exprs[expr].type!=Q_STRING) continue;
         struct qs_cell *cell=&out->data[r].cells[j];
         if(cell->isnull || cell->dscale!=2) continue;
-        if(!s->dict) return -1;
+        if(!dict) return -1;
         const char *bytes=NULL; unsigned length=0;
-        if(qs_dict_get(s->dict,(unsigned)cell->value,&bytes,&length)) return -1;
+        if(qs_dict_get(dict,(unsigned)cell->value,&bytes,&length)) return -1;
         if(length<=QS_STRING_MAX) qs_cell_set_string(cell,bytes,length);
         else {
             if(out->str_bytes+length>QS_RESULT_STRING_BYTES || length>255) return -1;
@@ -365,15 +364,14 @@ static int partial_combine(struct external_state *e,const struct qs_row *row)
     }
     return 0;
 }
-static int resolve_output_strings(struct external_state *e,struct qs_row *row)
+static int resolve_output_strings(const struct qs_plan *p,struct qs_dict *dict,struct qs_row *row)
 {
-    const struct qs_plan *p=&e->local.plan;
     for(unsigned j=0;j<p->nout;++j) {
         int expr=output_expr(p,j); if(expr<0 || p->exprs[expr].type!=Q_STRING) continue;
         struct qs_cell *cell=&row->cells[j];
         if(cell->isnull || cell->dscale!=2) continue;
         const char *bytes=NULL; unsigned length=0;
-        if(!e->local.dict || qs_dict_get(e->local.dict,(unsigned)cell->value,&bytes,&length)) return -5;
+        if(!dict || qs_dict_get(dict,(unsigned)cell->value,&bytes,&length)) return -5;
         if(length<=QS_STRING_MAX) qs_cell_set_string_sort(cell,bytes,length);
     }
     return 0;
@@ -383,7 +381,7 @@ static int group_output(struct external_state *e,struct qs_row *row)
     int status=finalize_group(&e->local,&e->local.groups[0],row);
     if(status<0) return -5;
     if(status>0) return 1;
-    return resolve_output_strings(e,row);
+    return resolve_output_strings(&e->local.plan,e->local.dict,row);
 }
 static void external_metrics(struct external_state *e,struct qs_result *out)
 {
@@ -415,16 +413,17 @@ static int64_t external_source(struct femu_csd_args *a)
         }
         if(small && count<=QS_GROUPS) {
             struct qs_plan plan=*p;
+            struct qs_dict *dict=s->dict;
             void *mr[]={group,out}; long long len[]={sizeof(*group),sizeof(*out)};
             call.numr=2; call.mr_addr=mr; call.mr_len=len;
             int64_t status=pg_sina_aggregate_source(&call); if(status) return status;
             mr[0]=out; mr[1]=&plan; len[0]=sizeof(*out); len[1]=sizeof(plan);
-            for(unsigned r=0;r<out->rows;++r) if(resolve_output_strings(e,&out->data[r])) return -5;
+            for(unsigned r=0;r<out->rows;++r) if(resolve_output_strings(&plan,dict,&out->data[r])) return -5;
             if(plan.norder) { status=pg_sina_sort_impl(&call); if(status) return status; }
             out->begin=(uint64_t)plan.offset>out->rows?out->rows:(unsigned)plan.offset;
             out->rows-=out->begin;
             if(plan.limit>=0 && (uint64_t)plan.limit<out->rows) out->rows=plan.limit;
-            if(resolve_result_strings(s,out)) return -5;
+            if(resolve_result_strings(&plan,dict,out)) return -5;
             return 0;
         }
     }
@@ -480,7 +479,7 @@ static int64_t external_source(struct femu_csd_args *a)
                 call.cparam2=0;
             }
             out->finished=1; external_metrics(e,out);
-            if(resolve_result_strings(s,out)) return -5;
+            if(resolve_result_strings(p,s->dict,out)) return -5;
             external_drop(group);
             return 0;
         }
@@ -490,7 +489,7 @@ static int64_t external_source(struct femu_csd_args *a)
             call.numr=3; call.mr_addr=mr; call.mr_len=len;
             int64_t status=pg_sina_sort_source_impl(&call); if(status) return status;
             e->output_metrics=out->metrics; external_metrics(e,out);
-            if(resolve_result_strings(s,out)) return -5;
+            if(resolve_result_strings(p,s->dict,out)) return -5;
             if(out->finished) external_drop(group);
             return 0;
         }
@@ -519,7 +518,12 @@ static int64_t external_source(struct femu_csd_args *a)
                 if(!p->norder && p->limit>=0 && e->emitted>=(uint64_t)p->limit) e->finishing=1;
                 if(out->rows==QS_RESULT_ROWS) {
                     if(p->norder) e->output_pending=1;
-                    else { external_metrics(e,out); if(resolve_result_strings(s,out)) return -5; return 0; }
+                    else {
+                        /* The group has been emitted even when the result
+                         * page is full. Do not emit it again on the next pull. */
+                        e->have_group=0;
+                        external_metrics(e,out); if(resolve_result_strings(p,s->dict,out)) return -5; return 0;
+                    }
                 }
             }
             e->have_group=0;

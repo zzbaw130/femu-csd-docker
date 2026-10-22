@@ -19,6 +19,7 @@ union block {
 };
 struct context_record {
     uintptr_t token;
+    uintptr_t parent;
     size_t limit, used, requested, peak, allocations;
 };
 /* Exactly one instance in the shared library's data segment. All CU threads use it. */
@@ -77,6 +78,27 @@ static struct context_record *context_locked(cs_work_context *handle)
     errno = EINVAL;
     return NULL;
 }
+static int may_charge(struct context_record *ctx,size_t bytes)
+{
+    for(;;) {
+        if(bytes>ctx->limit-ctx->used) return 0;
+        if(!ctx->parent) return 1;
+        ctx=context_locked((void *)ctx->parent);
+        if(!ctx) return 0;
+    }
+}
+static void account(struct context_record *ctx,size_t old_used,size_t new_used,
+    size_t old_requested,size_t new_requested,size_t old_allocations,size_t new_allocations)
+{
+    for(;;) {
+        ctx->used=ctx->used-old_used+new_used;
+        ctx->requested=ctx->requested-old_requested+new_requested;
+        ctx->allocations=ctx->allocations-old_allocations+new_allocations;
+        if(ctx->used>ctx->peak) ctx->peak=ctx->used;
+        if(!ctx->parent) break;
+        ctx=context_locked((void *)ctx->parent);
+    }
+}
 static block *find_locked(struct context_record *ctx, void *ptr)
 {
     for (block *b = pool.arena; b; b = b->h.next)
@@ -117,9 +139,7 @@ static void release_locked(struct context_record *ctx, block *b)
     pool.used -= b->h.span;
     pool.requested -= b->h.requested;
     pool.allocations--;
-    ctx->used -= b->h.span;
-    ctx->requested -= b->h.requested;
-    ctx->allocations--;
+    account(ctx,b->h.span,0,b->h.requested,0,1,0);
     b->h.owner = b->h.requested = 0;
     merge_next_locked(b);
     if (b->h.prev && !b->h.prev->h.owner)
@@ -140,7 +160,7 @@ static void *allocate_locked(struct context_record *ctx, size_t bytes)
         if (b->h.owner || b->h.span < need)
             continue;
         size_t charge = b->h.span - need >= sizeof(block) + ALIGN ? need : b->h.span;
-        if (charge > ctx->limit - ctx->used)
+        if (!may_charge(ctx,charge))
             continue;
         split_locked(b, need);
         b->h.owner = ctx->token;
@@ -148,9 +168,7 @@ static void *allocate_locked(struct context_record *ctx, size_t bytes)
         pool.used += b->h.span;
         pool.requested += bytes;
         pool.allocations++;
-        ctx->used += b->h.span;
-        ctx->requested += bytes;
-        ctx->allocations++;
+        account(ctx,0,b->h.span,0,bytes,0,1);
         if (pool.used > pool.peak)
             pool.peak = pool.used;
         if (ctx->used > ctx->peak)
@@ -167,12 +185,15 @@ int cs_work_init(size_t bytes)
     pthread_mutex_unlock(&pool.mutex);
     return result;
 }
-cs_work_context *cs_work_begin_limit(size_t limit)
+static cs_work_context *begin_context(cs_work_context *parent,size_t limit)
 {
     pthread_mutex_lock(&pool.mutex);
     cs_work_context *handle = NULL;
     if (initialize_locked(0))
         goto out;
+    struct context_record *owner=parent?context_locked(parent):NULL;
+    if(parent && !owner) goto out;
+    if(owner && (!limit || limit>owner->limit)) limit=owner->limit;
     if (limit > pool.capacity || pool.next_token == UINTPTR_MAX) {
         errno = limit > pool.capacity ? EINVAL : EOVERFLOW;
         goto out;
@@ -182,7 +203,8 @@ cs_work_context *cs_work_begin_limit(size_t limit)
         if (!pool.records[i].token) {
             struct context_record *ctx = &pool.records[i];
             *ctx = (struct context_record){.token = pool.next_token++,
-                                          .limit = limit ? limit : pool.capacity};
+                                          .limit = limit ? limit : pool.capacity,
+                                          .parent=owner?owner->token:0};
             pool.contexts++;
             handle = (void *)ctx->token;
             break;
@@ -191,6 +213,10 @@ out:
     pthread_mutex_unlock(&pool.mutex);
     return handle;
 }
+cs_work_context *cs_work_begin_limit(size_t limit)
+{ return begin_context(NULL,limit); }
+cs_work_context *cs_work_begin_child(cs_work_context *parent,size_t limit)
+{ if(!parent) { errno=EINVAL; return NULL; } return begin_context(parent,limit); }
 cs_work_context *cs_work_begin(void)
 {
     return cs_work_begin_limit(0);
@@ -248,13 +274,11 @@ void *cs_work_realloc(cs_work_context *handle, void *ptr, size_t bytes)
         if (b->h.span != original)
             merge_next_locked(b->h.next);
         pool.used -= original - b->h.span;
-        ctx->used -= original - b->h.span;
+        account(ctx,original,b->h.span,old,bytes,0,0);
         if (bytes >= old) {
             pool.requested += bytes - old;
-            ctx->requested += bytes - old;
         } else {
             pool.requested -= old - bytes;
-            ctx->requested -= old - bytes;
         }
         b->h.requested = bytes;
         p = ptr;
@@ -275,6 +299,10 @@ int cs_work_end(cs_work_context *handle)
     pthread_mutex_lock(&pool.mutex);
     struct context_record *ctx = context_locked(handle);
     int result = ctx ? 0 : -1;
+    if(ctx) for(size_t i=0;i<CONTEXTS;++i) if(pool.records[i].parent==ctx->token) {
+        pthread_mutex_unlock(&pool.mutex);
+        return fail(EBUSY);
+    }
     if (ctx) {
         /* release coalesces neighbors, so restart traversal after each owned block. */
         for (block *b = pool.arena; b;) {

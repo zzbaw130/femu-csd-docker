@@ -26,8 +26,14 @@ case ${1:-build} in
     index)
         guest "bash /home/femu/scripts/pg-sina-index-test.sh"
         ;;
+    plan)
+        guest 'sh /home/femu/scripts/pg-sina-plan-test.sh'
+        ;;
+    plan-bench)
+        guest 'sh /home/femu/scripts/pg-sina-plan-bench.sh'
+        ;;
     query|join|memory|profile|analyze|bench|order-bench|aggregate-bench|join-bench)
         guest "bash /home/femu/scripts/pg-sina-query-test.sh $1"
         ;;
-    *) echo '用法：pg-sina-csd-test.sh [build|prepare|check|sql|query|join|index|memory|profile|analyze|bench|order-bench|aggregate-bench|join-bench]' >&2; exit 2 ;;
+    *) echo '用法：pg-sina-csd-test.sh [build|prepare|check|sql|query|join|index|plan|plan-bench|memory|profile|analyze|bench|order-bench|aggregate-bench|join-bench]' >&2; exit 2 ;;
 esac

@@ -17,7 +17,7 @@ struct index_cursor {
     struct lookup keys[INDEX_KEYS];
     unsigned position, count, hand, waiting, pending;
 };
-struct index_join { cs_work_context *context; struct qs_plan scan; struct index_cursor cursors[QS_WORKERS]; };
+struct index_join { cs_work_context *context; struct qs_plan scan; struct index_cursor cursors[QS_WORKERS]; struct qs_dict *dictionary; };
 static uint16_t u16(const unsigned char *p) { uint16_t x; memcpy(&x,p,2); return x; }
 static uint32_t u32(const unsigned char *p) { uint32_t x; memcpy(&x,p,4); return x; }
 int qs_index_init(const struct qs_plan *p,struct qs_join_control *control)
@@ -25,7 +25,8 @@ int qs_index_init(const struct qs_plan *p,struct qs_join_control *control)
     struct cs_work_stats stats; if(cs_work_get_stats(&stats)) return -4;
     size_t limit=p->join.work_mem_bytes,physical=stats.capacity_bytes;
     if(!limit || limit>physical) limit=physical;
-    cs_work_context *ctx=cs_work_begin_limit(limit); if(!ctx) return -4;
+    cs_work_context *ctx=p->work_mem_parent?cs_work_begin_child((void *)(uintptr_t)p->work_mem_parent,limit):cs_work_begin_limit(limit);
+    if(!ctx) return -4;
     struct index_join *h=cs_work_calloc(ctx,1,sizeof(*h));
     if(!h) { cs_work_end(ctx); return -4; }
     h->context=ctx; h->scan=*p;
@@ -45,6 +46,8 @@ void qs_index_close(struct qs_join_control *control)
     struct index_join *h=(void *)(uintptr_t)control->state;
     if(h) { cs_work_context *ctx=h->context; control->state=0; cs_work_end(ctx); }
 }
+void qs_index_dictionary(struct qs_join_control *control,struct qs_dict *dictionary)
+{ ((struct index_join *)(uintptr_t)control->state)->dictionary=dictionary; }
 static const unsigned char *page_at(struct index_cursor *c,struct qs_task *task,void *io,unsigned block,unsigned heap)
 {
     for(unsigned i=0;i<QS_INDEX_CACHE;++i) if(c->tags[i].state && c->tags[i].block==block && c->tags[i].heap==heap)
@@ -195,7 +198,7 @@ int64_t qs_index_probe(unsigned stage,struct qs_chunk *c,const struct qs_plan *p
                     if(!tuple || len<23) return -2;
                     unsigned dest=out->rows;
                     if(!dest) memset(qs_nulls(out),0,((out->capacity+7)/8)*(size_t)out->ncols);
-                    int status=qs_scan_tuple(&h->scan,page,tuple-page,len,0,out,dest,NULL); if(status) return status;
+                    int status=qs_scan_tuple(&h->scan,page,tuple-page,len,0,out,dest,h->dictionary); if(status) return status;
                     if(j->semi) {
                         struct qs_eval eval={.plan=p,.chunk=out,.row=dest}; struct qs_cell match;
                         if(j->predicate<0 || qs_evaluate(&eval,j->predicate,&match) || match.isnull || !match.value) {

@@ -69,6 +69,17 @@ int main(void)
     assert(!cs_work_realloc(a, q, 0));
     assert(!cs_work_end(a));
     assert(!cs_work_end(b));
+    a=cs_work_begin_limit(16*1024);
+    cs_work_context *c1=cs_work_begin_child(a,12*1024),*c2=cs_work_begin_child(a,12*1024);
+    assert(a && c1 && c2);
+    void *p1=cs_work_alloc(c1,8*1024),*p2=cs_work_alloc(c2,6*1024);
+    assert(p1 && p2 && !cs_work_alloc(c2,4*1024));
+    assert(!cs_work_get_context_stats(a,&local) && local.requested_bytes==14*1024 && local.allocations==2);
+    assert(cs_work_end(a)==-1 && errno==EBUSY);
+    assert(cs_work_realloc(c1,p1,1024)==p1);
+    assert(!cs_work_get_context_stats(a,&local) && local.requested_bytes==7*1024);
+    assert(!cs_work_alloc(c1,12*1024));
+    assert(!cs_work_end(c1) && !cs_work_end(c2) && !cs_work_end(a));
     pthread_t threads[8];
     for (unsigned i = 0; i < 8; i++)
         assert(!pthread_create(&threads[i], NULL, stress, NULL));

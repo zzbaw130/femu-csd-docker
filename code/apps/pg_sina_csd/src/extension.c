@@ -9,19 +9,24 @@ PG_MODULE_MAGIC;
 int pg_sina_exe_path = 0;
 bool pg_sina_profile = false;
 int pg_sina_max_memory = 64*1024; /* KiB, independent of AFDM capacity. */
+bool pg_sina_compiling_plan = false;
 static create_upper_paths_hook_type previous_upper_hook;
 static planner_hook_type previous_planner_hook;
 static PlannedStmt *hooked_planner(Query *parse,int cursorOptions,ParamListInfo boundParams)
 {
-    Query *query=copyObject(parse);
-    if(pg_sina_exe_path==1) pg_sina_rewrite_query(query);
-    if(previous_planner_hook) return previous_planner_hook(query,cursorOptions,boundParams);
-    return standard_planner(query,cursorOptions,boundParams);
+    Query *query=parse;
+    if(pg_sina_exe_path==1) {
+        Query *candidate=copyObject(parse);
+        if(pg_sina_rewrite_query(candidate)) query=candidate;
+    }
+    PlannedStmt *plan=previous_planner_hook?previous_planner_hook(query,cursorOptions,boundParams):standard_planner(query,cursorOptions,boundParams);
+    plan->planTree=pg_sina_native_plan(plan->planTree);
+    return plan;
 }
 static void upper_hook(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *input,RelOptInfo *output,void *extra)
 {
     if(previous_upper_hook) previous_upper_hook(root,stage,input,output,extra);
-    pg_sina_upper_paths(root,stage,input,output,extra);
+    if(!pg_sina_compiling_plan) pg_sina_upper_paths(root,stage,input,output,extra);
 }
 static void assign_path(int value,void *extra)
 {
@@ -41,6 +46,7 @@ void _PG_init(void)
         &pg_sina_max_memory, 64*1024, 4*1024, MAX_KILOBYTES, PGC_USERSET, GUC_UNIT_KB, NULL, NULL, NULL);
     RegisterCustomScanMethods(&pg_sina_scan_methods);
     RegisterCustomScanMethods(&pg_sina_order_methods);
+    RegisterCustomScanMethods(&pg_sina_plan_methods);
     previous_upper_hook=create_upper_paths_hook; create_upper_paths_hook=upper_hook;
     previous_planner_hook=planner_hook; planner_hook=hooked_planner;
 }

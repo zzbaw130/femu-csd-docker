@@ -20,6 +20,7 @@ cs_work_end(ctx);
 - 一次 mmap 建立有限 arena，块头和对齐计入配额；互斥锁保护分配链及全部 CU 的总计数。
 - 一次完整任务创建 context，可跨多次 CSF 入口保留；cs_work_end 批量释放。context 是不可解引用的 opaque token，最多256个。
 - cs_work_begin_limit 可限制单 context，但不为它预留独占内存。
+- cs_work_begin_child(parent, limit) 创建查询内的子 context；每次分配同时计入自身、父级和全局池的限额，供多个排序或索引节点共享一个查询预算。先结束子 context；仍有子级时结束父级返回 EBUSY。
 - alloc/calloc/realloc 无空间返回 NULL/ENOMEM；错误句柄或归属返回 EINVAL，context 数量耗尽返回 ENOSPC。
 - 地址按 max_align_t 对齐；realloc 扩容同时计入旧块和新块，失败保留旧块；free 合并相邻空闲块。
 - cs_work_get_stats / cs_work_get_context_stats 查询容量、占用、峰值与最大连续空闲块。free_bytes 含空闲块头，不等于可申请的单块大小。

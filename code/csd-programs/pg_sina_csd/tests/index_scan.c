@@ -59,7 +59,7 @@ static void large_pages(void)
 }
 static void check(function build,function probe,function close,function source,int filtered,int cancel)
 {
-    struct qs_plan p={.nattrs=3,.ncols=3,.nexprs=3,.naggs=2,.nout=2,.limit=-1,.predicate=-1,.work_mem_bytes=1024*1024,
+    struct qs_plan p={.having=-1,.nattrs=3,.ncols=3,.nexprs=3,.naggs=2,.nout=2,.limit=-1,.predicate=-1,.work_mem_bytes=1024*1024,
         .join={.relid=1,.nattrs=2,.build_key=1,.probe_key=0,.predicate=-1,.work_mem_bytes=1024*1024,.indexid=2,.indexroot=empty_index==1?0:1,.index_key_bytes=key_bytes}};
     for(unsigned i=0;i<3;++i) p.cols[i]=(struct qs_column){.slot=i,.length=4,.align=4,.type=Q_INTEGER};
     p.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER,.column=2};

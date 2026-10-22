@@ -20,6 +20,9 @@ int cs_work_init(size_t capacity_bytes);
 cs_work_context *cs_work_begin(void);
 /* 0 means the whole shared pool; a limit never reserves memory exclusively. */
 cs_work_context *cs_work_begin_limit(size_t limit_bytes);
+/* A child charges both its own limit and the parent's query-wide limit.
+ * End children before their parent; ending a parent with children is EBUSY. */
+cs_work_context *cs_work_begin_child(cs_work_context *parent,size_t limit_bytes);
 void *cs_work_alloc(cs_work_context *ctx, size_t bytes);
 void *cs_work_calloc(cs_work_context *ctx, size_t count, size_t bytes);
 void *cs_work_realloc(cs_work_context *ctx, void *ptr, size_t bytes);

@@ -25,8 +25,8 @@ static inline int qs_pgdate_year(int32_t days)
 }
 static inline int qs_compare(struct qs_cell a, struct qs_cell b, int *result)
 {
-    if(a.dscale==3 || b.dscale==3) {
-        if(a.dscale!=3 || b.dscale!=3) return -1;
+    if(a.dscale==UINT8_MAX || b.dscale==UINT8_MAX) {
+        if(a.dscale!=UINT8_MAX || b.dscale!=UINT8_MAX) return -1;
         unsigned al=a.scale,bl=b.scale,n=al<bl?al:bl;
         int cmp=memcmp(&a.value,&b.value,n);
         if(!cmp) cmp=(al>bl)-(al<bl);
@@ -55,7 +55,7 @@ static inline int qs_compare(struct qs_cell a, struct qs_cell b, int *result)
 }
 
 static inline int qs_divide(struct qs_cell,struct qs_cell,struct qs_cell *);
-struct qs_eval { const struct qs_plan *plan; struct qs_chunk *chunk; unsigned row; uint8_t valid[QS_EXPRS]; struct qs_cell cells[QS_EXPRS]; const struct qs_cell *aggregates; };
+struct qs_eval { const struct qs_plan *plan; struct qs_chunk *chunk; unsigned row; uint8_t valid[QS_EXPRS]; struct qs_cell cells[QS_EXPRS]; const struct qs_cell *aggregates; const struct qs_cell *tuple; };
 static inline int qs_evaluate(struct qs_eval *e, int index, struct qs_cell *out)
 {
     if(index<0 || (unsigned)index>=e->plan->nexprs) return -1;
@@ -68,6 +68,7 @@ static inline int qs_evaluate(struct qs_eval *e, int index, struct qs_cell *out)
         v=e->aggregates[x->column];
     }
     else if(x->op==Q_COLUMN) {
+        if(e->tuple) { v=e->tuple[x->column]; e->valid[index]=1; e->cells[index]=v; *out=v; return 0; }
         int slot=e->plan->cols[x->column].slot;
         if(slot<0 || (unsigned)slot>=e->chunk->ncols) return -1;
         v.value=qs_values(e->chunk)[(size_t)slot*e->chunk->capacity+e->row];

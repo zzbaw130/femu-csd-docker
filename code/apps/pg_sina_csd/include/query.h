@@ -31,7 +31,7 @@
 enum qs_type { Q_DECIMAL, Q_INTEGER, Q_DATE, Q_CHAR, Q_BOOLEAN, Q_STRING, Q_PREFIX, Q_PATTERN, Q_DICTIONARY };
 enum qs_op { Q_COLUMN, Q_CONST, Q_ADD, Q_SUB, Q_MUL, Q_EQ, Q_NE, Q_LT, Q_LE, Q_GT, Q_GE,
              Q_AND, Q_OR, Q_NOT, Q_IS_NULL, Q_IS_NOT_NULL, Q_CASE, Q_YEAR, Q_AGGREF, Q_DIV };
-enum qs_agg_kind { Q_SUM, Q_AVG, Q_COUNT, Q_COUNT_STAR };
+enum qs_agg_kind { Q_SUM, Q_AVG, Q_COUNT, Q_COUNT_STAR, Q_MIN, Q_MAX };
 struct qs_column { int16_t length, slot; uint8_t align, type, scale, deferred, prefix_len, trim_spaces, restricted, dict_big; char prefix[32]; };
 /* SQL literal dictionary: IDs 1..nstrings; 0 means another non-NULL string.
  * Only a proven equality/IN restriction permits returning/grouping a string. */
@@ -67,6 +67,7 @@ struct qs_plan {
     unsigned njoins;
     struct qs_join extra_joins[QS_JOINS-1];
     uint64_t work_mem_bytes; /* Per execution slot, set at execution; 0 uses device capacity. */
+    uint64_t work_mem_parent; /* Device-only allocator context; host plans leave this zero. */
     int64_t limit, offset;
     struct qs_column cols[QS_COLS];
     struct qs_string strings[QS_STRINGS];
@@ -132,7 +133,7 @@ static inline void qs_cell_set_string_ref(struct qs_cell *cell,uint32_t offset,u
 }
 static inline void qs_cell_set_string_sort(struct qs_cell *cell,const char *bytes,unsigned length)
 {
-    cell->value=0; cell->scale=(uint8_t)length; cell->dscale=3; cell->isnull=0;
+    cell->value=0; cell->scale=(uint8_t)length; cell->dscale=UINT8_MAX; cell->isnull=0;
     if(length) memcpy(&cell->value,bytes,length);
 }
 static inline unsigned qs_cell_string(const struct qs_cell *cell)

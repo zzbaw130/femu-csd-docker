@@ -35,7 +35,7 @@ static void check(function build,function load,function probe,function close,fun
     unsigned build_rows,unsigned probe_rows,int skew,int cancel,int profile,int grouped,int residual)
 {
     next_token=1; stores=loads=0;
-    struct qs_plan p={.nattrs=4,.ncols=4,.nexprs=9,.naggs=4,.nout=5,.predicate=-1,.limit=-1,
+    struct qs_plan p={.having=-1,.nattrs=4,.ncols=4,.nexprs=9,.naggs=4,.nout=5,.predicate=-1,.limit=-1,
         .work_mem_bytes=budget/8,.join={.relid=1,.nattrs=2,.build_key=2,.probe_key=0,.rows=estimated_rows?estimated_rows:build_rows,.work_mem_bytes=budget/2}};
     for(unsigned i=0;i<4;++i) p.cols[i]=(struct qs_column){.slot=i,.type=i==1?Q_DECIMAL:i==3?Q_BOOLEAN:Q_INTEGER,.scale=i==1?2:0};
     p.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.column=1,.type=Q_DECIMAL,.scale=2};
@@ -51,9 +51,10 @@ static void check(function build,function load,function probe,function close,fun
     p.aggs[2]=(struct qs_agg){.kind=Q_COUNT_STAR,.expr=-1}; p.aggs[3]=(struct qs_agg){.kind=Q_AVG,.expr=0};
     for(unsigned i=0;i<4;++i) p.outputs[i]=(struct qs_output){.aggregate=1,.index=i};
     p.outputs[4]=(struct qs_output){.aggregate=2,.index=8};
-    unsigned workers=grouped?2:4;
+    unsigned workers=grouped?(budget<=4*1024*1024?1:2):4;
+    p.work_mem_bytes=budget/2/workers;
     if(grouped) {
-        p.external_aggregate=1; p.nkeys=p.norder=1; p.nexprs=10; p.work_mem_bytes=budget/4;
+        p.external_aggregate=1; p.nkeys=p.norder=1; p.nexprs=10;
         p.exprs[9]=(struct qs_expr){.op=Q_COLUMN,.column=0,.type=Q_INTEGER}; p.keys[0]=9;
         p.outputs[0]=(struct qs_output){.index=0};
         for(unsigned i=1;i<5;++i) p.outputs[i]=(struct qs_output){.aggregate=1,.index=i-1};
@@ -186,7 +187,7 @@ static void check(function build,function load,function probe,function close,fun
 static void check_chain(function build,function load,function probe,function close,function source,int grouped,int empty)
 {
     next_token=1; stores=loads=0;
-    struct qs_plan p={.nattrs=5,.ncols=5,.nexprs=7,.naggs=3,.nout=3,.predicate=-1,.limit=-1,.njoins=2,
+    struct qs_plan p={.having=-1,.nattrs=5,.ncols=5,.nexprs=7,.naggs=3,.nout=3,.predicate=-1,.limit=-1,.njoins=2,
         .work_mem_bytes=budget/2,.join={.relid=1,.nattrs=2,.probe_key=0,.build_key=1,.rows=35003,.work_mem_bytes=budget/2,.residual=7}};
     p.extra_joins[0]=(struct qs_join){.relid=2,.nattrs=2,.probe_key=2,.build_key=3,.rows=25003};
     for(unsigned i=0;i<5;++i) p.cols[i]=(struct qs_column){.slot=i,.type=Q_INTEGER};

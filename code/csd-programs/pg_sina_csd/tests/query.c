@@ -26,7 +26,7 @@ int main(int argc,char **argv)
     if(profiling) assert(!strcmp(argv[6],"--profile"));
     function scan=load(argv[1],"pg_sina_scan"),filter=load(argv[2],"pg_sina_filter"),sink=load(argv[3],"pg_sina_aggregate_sink");
     function source=load(argv[3],"pg_sina_aggregate_source"),sort=load(argv[4],"pg_sina_sort"),limit=load(argv[5],"pg_sina_limit");
-    struct qs_plan p={.nattrs=2,.ncols=2,.nexprs=4,.nkeys=1,.naggs=4,.nout=5,.norder=1,.predicate=3,.limit=1,.offset=1};
+    struct qs_plan p={.having=-1,.nattrs=2,.ncols=2,.nexprs=4,.nkeys=1,.naggs=4,.nout=5,.norder=1,.predicate=3,.limit=1,.offset=1};
     p.cols[0]=(struct qs_column){.slot=0,.type=Q_INTEGER};p.cols[1]=(struct qs_column){.slot=1,.type=Q_DECIMAL,.scale=2};
     p.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER,.column=0};
     p.exprs[1]=(struct qs_expr){.op=Q_COLUMN,.type=Q_DECIMAL,.column=1,.scale=2,.dscale=2};

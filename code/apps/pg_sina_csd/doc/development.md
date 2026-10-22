@@ -369,3 +369,20 @@ Q9提交后复核Q5/Q10（连接顺序/预算已变化）：Q5 host均值2275.09
 - 该阶段只完成 PG planner 前的重写，设备尚未实现 grouped derived table 的 materialize/build 算子，因此 Q17 设备路径仍不能完整 offload；不能把 Q17 加入已支持列表。
 
 重写等价性验证：同一 Q17 的手写 grouped join 与 CSD planner 重写后的查询结果一致（348406.054285714286），说明当前 rewrite 不改变结果。
+
+## 2026-10-23：基于 PG 原生 Plan 的设备执行
+
+本节取代前面阶段中关于贪心 Join 顺序、链尾单个 Index Join、Q13/Q18 专用编排和“仅去关联但不能卸载”的当前状态描述；前文保留为开发历史。当前接口和限制以 README 为准。
+
+- `src/planner/plan.c` 接管 `UPPERREL_FINAL` 已选中的原生 Path，在 `PlanCustomPath` 收到 PG 生成的 Plan、尚未执行 setrefs 时转换。保留左右输入和连接树，不从表集合重新挑选连接顺序。转换失败的规划包装在 setrefs 后去除，原生 InitPlan 和参数依赖保留。
+- 参考本地 DuckDB 的 unused-column pruning，从父输出、过滤、连接键和排序/分组键向下推导投影需求，同步重映射位置引用。不能直接照搬 PG Scan 暴露全物理 Tuple 的 targetlist，否则会无意义地解码大字符串，甚至耗尽设备字典。
+- `src/planner/rewrite.c` 只在可证明的严格 WHERE 场景，将 NULL-on-empty 标量聚合改成按整数关联键分组的派生表；支持多个关联键和多次改写。COUNT 空输入、OR 和不覆盖的形态不强行去关联。Query 按副本尝试并原子采用，避免失败后留下半改写。
+- Guest 的 `src/executor/plan.c` 用一个直接 SNIA 会话执行 `pg-sina-plan.so`；按已有 extent 提交 Heap/索引内部 LOAD，只转换最终结果。私有中间行、连接组、聚合状态、CTE 和标量参数均留在设备。没有新增进程、代理、IPC 或 FEMU SQL runtime。
+- 设备 `plan.c` 组合 Scan、Projection、Hash/Merge/Index Join、Aggregate、Sort/Limit、CTE 和 InitPlan。连接覆盖 INNER/LEFT/SEMI/ANTI；聚合增加 MIN/MAX、COUNT DISTINCT、HAVING 和分组结果作为上层输入。多个位置的参数化 Index Join 复用 PG12 B-tree 实现；复合索引的额外条件在设备判断。
+- Hash 超限时保存已消费的投影行，再对该前缀和剩余输入归并，不按 build 批次重新读大表。排序使用有界 fan-in 的多轮归并；归并缓存不足时优先 spill 驻留 run，修复读放大。workmem 新增父子 context 记账，子排序和索引共同受查询总额度约束。
+- 修复旧聚合结果满页时重复输出边界组，以及小结果合并释放 context 后再读取字符串状态的问题。短字符串排序标记由合法 numeric 精度 3 改为 UINT8_MAX，避免 Q3/Q10 收入排序错误。
+- 通用树默认 1 MiB 扫描块，列批次通过现有 decoder 生成；树内中间值保留 int128。当前通用路径为单 CU、按行组合，Q1/Q6 等单表列向量快路径仍保留最多四槽调度。不能把新功能覆盖当成已经继承全部向量化、并行和性能优化。
+
+验证入口：`tests/pg-sina-csd-test.sh plan`、`plan-bench`；后者逐条检查 CSD CustomScan，再冷启动核对原始 SQL 的结果。Q17/Q20 的原生 host 120 秒超时时，使用独立参考 SQL 作为正确性 oracle，保留超时而不替换原生 host 延迟。设备 CTest 覆盖 NULL/重复键/连接类型、精度、Hash 超限、乱序多 run、嵌套排序聚合、4–128 MiB 排序预算和回收；原生树及排序另用 ASan/UBSan 检查。
+
+最终验证：26 项设备 CTest、1 项本地 PG 页布局 CTest、22 项 Guest 原生计划回归及取消后同 backend 复用全部通过。Q1–Q22 均实际以 CSD CustomScan 执行并核对完整结果；Q17/Q20 的独立参考核对与原始 host 超时分别记录。原生树/外部排序 ASan+UBSan 通过（当前环境关闭 LeakSanitizer），最终计数变更后又复验原生树。Guest 结果目录分别为 `/tmp/pg-sina-plans.It2DI2`、`/tmp/pg-sina-plan-bench.8WwC10`。性能退化及剩余工作已明确记录在 performance.md，未宣称 Join 顺序调整已经带来整体加速。

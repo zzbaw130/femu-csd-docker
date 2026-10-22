@@ -36,7 +36,7 @@ static void begin(CustomScanState *node,EState *estate,int flags)
     s->cleanup.func=release; s->cleanup.arg=s;
     MemoryContextRegisterResetCallback(estate->es_query_cxt,&s->cleanup);
 }
-static Datum decimal(struct qs_cell value)
+Datum pg_sina_decimal(struct qs_cell value)
 {
     char digits[48],text[96]; unsigned n=0,pos=0;
     unsigned __int128 magnitude=value.value<0?0-(unsigned __int128)value.value:(unsigned __int128)value.value;
@@ -70,7 +70,7 @@ static TupleTableSlot *execute(CustomScanState *node)
         struct qs_cell value=row->cells[i]; slot->tts_isnull[i]=value.isnull;
         if(value.isnull) continue;
         switch(s->request.plan.outputs[i].type_oid) {
-        case 1700:slot->tts_values[i]=decimal(value);break;
+        case 1700:slot->tts_values[i]=pg_sina_decimal(value);break;
         case 25:case 1043:case 1042: {
             const struct qs_plan *p=&s->request.plan; const struct qs_output *o=&p->outputs[i];
             int expr=p->ordered_rows?o->index:p->keys[o->index];

@@ -7,7 +7,7 @@
 #include <stdlib.h>
 static void expressions(void)
 {
-    struct qs_plan p={.nattrs=3,.ncols=3,.nexprs=27};
+    struct qs_plan p={.having=-1,.nattrs=3,.ncols=3,.nexprs=27};
     p.cols[0]=(struct qs_column){.slot=0,.type=Q_INTEGER};
     p.cols[1]=(struct qs_column){.slot=1,.type=Q_DECIMAL,.scale=2};
     p.cols[2]=(struct qs_column){.slot=2,.type=Q_BOOLEAN};
@@ -77,7 +77,7 @@ static void expressions(void)
 }
 static void arithmetic(void)
 {
-    struct qs_plan p={.nattrs=2,.ncols=2,.nexprs=3};
+    struct qs_plan p={.having=-1,.nattrs=2,.ncols=2,.nexprs=3};
     for(unsigned i=0;i<2;++i) {
         p.cols[i]=(struct qs_column){.slot=i,.type=Q_DECIMAL,.scale=2};
         p.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.column=i,.type=Q_DECIMAL,.scale=2};
@@ -116,7 +116,7 @@ static void arithmetic(void)
 typedef int64_t (*function)(struct femu_csd_args *);
 static void case_and_division(void)
 {
-    struct qs_plan p={.nattrs=2,.ncols=2,.nexprs=9};
+    struct qs_plan p={.having=-1,.nattrs=2,.ncols=2,.nexprs=9};
     p.cols[0]=(struct qs_column){.slot=0,.type=Q_BOOLEAN};
     p.cols[1]=(struct qs_column){.slot=1,.type=Q_DECIMAL,.scale=2};
     p.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.column=0,.type=Q_BOOLEAN};
@@ -163,7 +163,7 @@ static void aggregates(const char *path)
 {
     void *library=dlopen(path,RTLD_NOW|RTLD_LOCAL); assert(library);
     function sink=(function)dlsym(library,"pg_sina_aggregate_sink"),source=(function)dlsym(library,"pg_sina_aggregate_source"); assert(sink && source);
-    struct qs_plan p={.nattrs=1,.ncols=1,.nexprs=1,.naggs=5,.nout=5,.predicate=-1,.limit=-1};
+    struct qs_plan p={.having=-1,.nattrs=1,.ncols=1,.nexprs=1,.naggs=5,.nout=5,.predicate=-1,.limit=-1};
     p.cols[0]=(struct qs_column){.slot=0,.type=Q_DECIMAL,.scale=2};
     p.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.column=0,.type=Q_DECIMAL,.scale=2};
     p.aggs[0]=(struct qs_agg){.kind=Q_COUNT,.expr=0};

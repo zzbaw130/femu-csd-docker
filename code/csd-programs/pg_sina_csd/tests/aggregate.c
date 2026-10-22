@@ -51,7 +51,7 @@ static void check(function sink,function source,unsigned rows,unsigned groups,in
 {
     next_token=1; stored=loaded=0;
     struct oracle *oracle=calloc(groups+1,sizeof(*oracle)); assert(oracle);
-    struct qs_plan p={.nattrs=2,.ncols=2,.nexprs=2,.naggs=4,.nkeys=1,.nout=5,
+    struct qs_plan p={.having=-1,.nattrs=2,.ncols=2,.nexprs=2,.naggs=4,.nkeys=1,.nout=5,
         .predicate=-1,.external_aggregate=1,.work_mem_bytes=budget/4,.limit=limit,.offset=offset};
     p.keys[0]=0;
     for(unsigned i=0;i<2;++i) {
@@ -118,7 +118,13 @@ static void check(function sink,function source,unsigned rows,unsigned groups,in
             for(unsigned j=0;j<5;++j) {
                 struct qs_cell x=out->data[out->begin+i].cells[j],y=want->cells[j];
                 assert(x.isnull==y.isnull);
-                if(!x.isnull) assert(x.value==y.value && x.scale==y.scale && x.dscale==y.dscale);
+                if(!x.isnull) {
+                    if(x.value!=y.value || x.scale!=y.scale || x.dscale!=y.dscale)
+                        fprintf(stderr,"key=%lld column=%u got=%lld/%u/%u expected=%lld/%u/%u\n",
+                            (long long)out->data[out->begin+i].cells[0].value,j,
+                            (long long)x.value,x.scale,x.dscale,(long long)y.value,y.scale,y.dscale);
+                    assert(x.value==y.value && x.scale==y.scale && x.dscale==y.dscale);
+                }
             }
         }
         if(cancel && !out->finished) {

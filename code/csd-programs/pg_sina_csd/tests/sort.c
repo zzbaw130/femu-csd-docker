@@ -45,7 +45,7 @@ static void check(function sink,function source,unsigned rows,int64_t limit,int6
     unsigned *expected=malloc(rows*sizeof(*expected)); assert(expected);
     for(unsigned i=0;i<rows;++i) expected[i]=i;
     qsort(expected,rows,sizeof(*expected),host_order);
-    struct qs_plan p={.nattrs=3,.ncols=3,.nexprs=3,.nout=3,.norder=2,.ordered_rows=1,.work_mem_bytes=budget/4,.predicate=-1,.limit=limit,.offset=offset};
+    struct qs_plan p={.having=-1,.nattrs=3,.ncols=3,.nexprs=3,.nout=3,.norder=2,.ordered_rows=1,.work_mem_bytes=budget/4,.predicate=-1,.limit=limit,.offset=offset};
     for(unsigned i=0;i<3;++i) {
         p.cols[i]=(struct qs_column){.slot=i,.type=i==1?Q_DECIMAL:Q_INTEGER,.scale=i==1?2:0};
         p.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.column=i,.type=p.cols[i].type,.scale=p.cols[i].scale};
@@ -61,9 +61,10 @@ static void check(function sink,function source,unsigned rows,int64_t limit,int6
         unsigned n=rows-first; if(n>1001) n=1001;
         memset(qs_nulls(c),0,((c->capacity+7)/8)*3); c->rows=c->selected=n;
         for(unsigned i=0;i<n;++i) {
-            unsigned key=rows-1-first-i; qs_values(c)[i]=key;
+            unsigned key=(uint64_t)(rows-1-first-i)*1009%rows; qs_values(c)[i]=key;
             qs_values(c)[c->capacity+i]=(int64_t)key*123; qs_values(c)[2*c->capacity+i]=-(int64_t)key;
             qs_dscales(c)[c->capacity+i]=key%3;
+            qs_dscales(c)[2*c->capacity+i]=key%5;
             if(key%11==0) qs_nulls(c)[i/8]|=1U<<(i%8);
             qs_selection(c)[i]=i;
         }
@@ -89,6 +90,7 @@ static void check(function sink,function source,unsigned rows,int64_t limit,int6
             if(!cells[0].isnull) assert(cells[0].value==key);
             assert(cells[1].value==(int64_t)key*123 && cells[1].scale==2 && cells[1].dscale==key%3);
             assert(cells[2].value==-(int64_t)key);
+            assert(cells[2].dscale==key%5);
         }
         if(cancel && !out->finished) {
             void *drop[]={&group,io}; long long size[]={sizeof(group),QS_SORT_IO_BYTES};

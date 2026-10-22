@@ -9,7 +9,7 @@ static void compare(filter_function filter,struct qs_plan *p,struct qs_chunk *c,
 {
     uint32_t expected[3003]; unsigned n=0;
     for(unsigned row=0;row<c->rows;++row) {
-        struct qs_eval e; e.plan=p; e.chunk=c; e.row=row; memset(e.valid,0,p->nexprs);
+        struct qs_eval e={0}; e.plan=p; e.chunk=c; e.row=row; memset(e.valid,0,p->nexprs);
         struct qs_cell value; assert(!qs_evaluate(&e,p->predicate,&value));
         if(!value.isnull && value.value) expected[n++]=row;
     }
