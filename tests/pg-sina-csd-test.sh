@@ -16,24 +16,8 @@ case ${1:-build} in
     check)
         guest 'set -e; for table in region nation supplier customer part partsupp orders lineitem; do sudo /home/femu/opt/pg_sina_csd/build/pg-sina-csd-check "dbname=tpch_s1 user=femu" "public.$table"; done'
         ;;
-    sql)
-        docker compose -f "$ROOT/docker-compose.yml" exec -T femu-csd \
-            env SSH_PORT="${SSH_PORT:-8080}" ./run-guest-ssh.sh '/home/femu/opt/postgres/release/bin/psql -X -v ON_ERROR_STOP=1 -d tpch_s1' \
-            < "$ROOT/code/apps/pg_sina_csd/tests/prepare.sql"
-        guest "sudo /home/femu/opt/pg_sina_csd/build/pg-sina-csd-check 'dbname=tpch_s1 user=femu' public.pg_sina_fixture 3 && sudo /home/femu/opt/pg_sina_csd/build/pg-sina-csd-check 'dbname=tpch_s1 user=femu' public.pg_sina_empty 3"
-        guest "/home/femu/opt/postgres/release/bin/psql -X -v ON_ERROR_STOP=1 -d tpch_s1 -c \"DELETE FROM sina_csd.relations WHERE relid IN ('public.pg_sina_fixture'::regclass,'public.pg_sina_empty'::regclass); DROP TABLE public.pg_sina_fixture,public.pg_sina_empty\""
+    tpch)
+        guest 'sh /home/femu/tests/tpch-test.sh'
         ;;
-    index)
-        guest "bash /home/femu/scripts/pg-sina-index-test.sh"
-        ;;
-    plan)
-        guest 'sh /home/femu/scripts/pg-sina-plan-test.sh'
-        ;;
-    plan-bench)
-        guest 'sh /home/femu/scripts/pg-sina-plan-bench.sh'
-        ;;
-    query|join|memory|profile|analyze|bench|order-bench|aggregate-bench|join-bench)
-        guest "bash /home/femu/scripts/pg-sina-query-test.sh $1"
-        ;;
-    *) echo '用法：pg-sina-csd-test.sh [build|prepare|check|sql|query|join|index|plan|plan-bench|memory|profile|analyze|bench|order-bench|aggregate-bench|join-bench]' >&2; exit 2 ;;
+    *) echo '用法：pg-sina-csd-test.sh [build|prepare|check|tpch]' >&2; exit 2 ;;
 esac

@@ -1,5 +1,7 @@
 # 开发阶段与验证记录
 
+> 以下旧阶段记录曾使用扩展目录的自建 SQL，其测试入口和 SQL 副本现已删除；不属于当前验收。当前只认 `tests/guest/queries/`，新规则和结果见文末。
+
 分支 pg_sina_csd_dev，基线 sina-femu-csd（f5a7df9dd）。每个可验收阶段单独提交。旧 pg_csd_dev 仅作实现参考，不移植其 Python 代理、AFDM 工作区或 FEMU SQL runtime。
 
 ## 阶段0：PG扩展、静态映射与共享heap通路（完成）
@@ -386,3 +388,11 @@ Q9提交后复核Q5/Q10（连接顺序/预算已变化）：Q5 host均值2275.09
 验证入口：`tests/pg-sina-csd-test.sh plan`、`plan-bench`；后者逐条检查 CSD CustomScan，再冷启动核对原始 SQL 的结果。Q17/Q20 的原生 host 120 秒超时时，使用独立参考 SQL 作为正确性 oracle，保留超时而不替换原生 host 延迟。设备 CTest 覆盖 NULL/重复键/连接类型、精度、Hash 超限、乱序多 run、嵌套排序聚合、4–128 MiB 排序预算和回收；原生树及排序另用 ASan/UBSan 检查。
 
 最终验证：26 项设备 CTest、1 项本地 PG 页布局 CTest、22 项 Guest 原生计划回归及取消后同 backend 复用全部通过。Q1–Q22 均实际以 CSD CustomScan 执行并核对完整结果；Q17/Q20 的独立参考核对与原始 host 超时分别记录。原生树/外部排序 ASan+UBSan 通过（当前环境关闭 LeakSanitizer），最终计数变更后又复验原生树。Guest 结果目录分别为 `/tmp/pg-sina-plans.It2DI2`、`/tmp/pg-sina-plan-bench.8WwC10`。性能退化及剩余工作已明确记录在 performance.md，未宣称 Join 顺序调整已经带来整体加速。
+
+## 2026-10-23：收敛唯一 TPC-H 验收入口
+
+- 删除 `tests/guest/queries` 中17条非标准 LIMIT 1及对应explain的限制，共34个文件；Q2/Q3/Q10/Q18/Q21原样保留。参数、子查询及Q15的视图创建/删除流程不替换。
+- 删除扩展测试目录的SQL/TSV fixture、自建TPC-H及reference副本，保留heap_layout.c；删除四个旧Guest测试脚本、timed.sql及其临时bench/统计脚本。CSD/SNIA/workmem的C/C++单元测试保留。
+- 唯一入口为 `tests/guest/tpch-test.sh`；主机 `tests/pg-sina-csd-test.sh tpch` 直接调用它。旧命令入口删除，活动README依赖同步更新。
+- AGENTS.md明确唯一SQL来源及性能门槛：只有实际内存不足导致必须频繁spill的较高延迟可以接受，实现不完整/不够优化造成的退化不合格。
+- 当前扩展使用统一22条SQL重测：完整结果及实际卸载全部通过，无超时或参考SQL；Q1/Q6较快，20条更慢，按新规则性能未达标，脚本返回1。较慢项另行采集内存/spill/CPU，不能以结果一致或发生spill直接宣布合格。详见performance.md最后一节和 `results/tpch.sCmJHo/`。

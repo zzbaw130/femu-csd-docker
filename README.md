@@ -48,7 +48,7 @@ cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,f
 # 开启测试
 ./tests/passthru-test.sh build <nvme dev> <options>
 
-# 基于postgrs的tpch测试，需要build.sh的时候指定了-p
+# PostgreSQL host/CSD 冷启动对照，只使用 tests/guest/queries 的 22 条 SQL
 ./tests/test-guest.sh tpch-test.sh
 
 # ssh到guest内部
@@ -78,7 +78,7 @@ cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,f
 │   ├── test-guest.sh                # 在 guest 里执行 tests/guest/<name>
 │   ├── passthru-test.sh             # CSD passthru smoke test
 │   └── guest/
-│       ├── tpch-test.sh             # TPC-H 22 条（guest 内 psql）
+│       ├── tpch-test.sh             # 唯一 TPC-H 验收：host/CSD 冷启动对照
 │       └── queries/                 # 1..22 的 <n>.sql 与 <n>.explain.sql
 ├── code/
 │   ├── FEMU/                        # FEMU 源码（改这里，容器里编译）

@@ -76,20 +76,25 @@ spill 使用现有 SNIA batch 的 NEED_STORE/NEED_LOAD/NEED_FREE 重入协议，
 
 计划时不支持的类型/表达式回退 PG；运行时越界、工作内存不足或数据超出设备表示范围会明确报错，不伪装成已经完成的查询。当前覆盖的是仓库 TPC-H 查询及回归用例，不是完整 PostgreSQL SQL 语法。
 
-## 测试和性能解释
+## 唯一验收入口
+
+TPC-H 验收只读取仓库 `tests/guest/queries/1.sql` 至 `22.sql` 及对应 `.explain.sql`。Guest 挂载路径为 `/home/femu/tests/queries`。扩展目录不再保存另一套 TPC-H、参考改写 SQL、临时 timed.sql 或 SQL fixture。开发中的小 SQL 仅放在临时目录定位问题，不作为验收依据；设备 C/C++ 单元测试和 `tests/heap_layout.c` 保留。
 
 ```sh
-bash tests/pg-sina-csd-test.sh prepare
-bash tests/pg-sina-csd-test.sh check   # 内部读取与 PG COUNT 对照
-bash tests/pg-sina-csd-test.sh plan    # 原生 Plan、子查询和 NULL 等回归
-# Guest：逐条冷启动核对并计时，省略编号时为全部 22 条
-sh /home/femu/scripts/pg-sina-plan-bench.sh 7 9 13
+# 仓库主机：八表映射已准备时，不必每次重新 prepare
+bash tests/pg-sina-csd-test.sh tpch
+# Guest：默认全部 22 条，也可以只测指定编号
+sh /home/femu/tests/tpch-test.sh 7 9 13
 ```
 
-每条 host/CSD 查询都由 `scripts/guest/cold-query.sh` 停止 PG、sync、清除 Guest page cache 并重启 PG；不重启 FEMU，以免丢失 RAM-backed NVM。主机与设备性能测试不能并发运行。
+只保留标准规定的 Q2=100、Q3=10、Q10=20、Q18=100、Q21=100 行上限，其余查询不额外添加 LIMIT。查询参数、子查询写法和 Q15 的 CREATE VIEW/SELECT/DROP VIEW 均保持该目录原样。host 与 CSD 接收同一个文件，超时或错误直接记录为失败，不用手写参考 SQL 替代。
 
-通用树 EXPLAIN 显示来自 PG 的连接树、扫描行数、内部读取和 spill 字节数；开启 profile 后增加整个 CSF 的 CPU/墙钟/调用次数。该累计 CPU 不等于查询延迟，通用树计时也不是逐节点独占 CPU。单表快路径仍提供已有的逐算子计时。
+每次测量前 `scripts/guest/cold-query.sh` 停止 PG、sync、清除 Guest page cache 并重启 PG；不重启 FEMU，以免丢失 RAM-backed NVM。profile 默认关闭。Q15 的计时是原始脚本中各 SQL 耗时之和，包含创建/删除视图，host/CSD 规则相同。
 
-Q17、Q20 的原始 host 相关子查询可能超过脚本的 120 秒上限。此时只用 `tests/reference/` 中独立写出的等价 PG 查询核对结果，CSV 的 `host_ms` 留空、`host_timed_out=1`，参考查询耗时单列为 `reference_ms`。CSD 始终接收原始 SQL，不能将参考 SQL 的耗时当成原始 host 延迟。
+结果保存到 Guest `/home/femu/results/tpch.*`，对应主机 `results/tpch.*`：`timings.csv` 分别记录完整结果是否一致、是否实际卸载和性能状态。较慢的 CSD 查询会另行冷启动，读取相同查询的 explain 文件，仅增加 ANALYZE/计时选项采集设备 CPU、内读、工作内存和 spill；该诊断耗时不混入关闭 profile 的性能比较。
 
-原生 Join 顺序避免了旧实现按多个 build 组合重扫大表，但不保证单 CU 通用树比 PG 更快；归并、行式中间值及设备请求次数仍需分别分析。具体实测和历史记录见 [开发记录](doc/development.md) 与 [性能记录](doc/performance.md)。设备入口与参数见 [设备算子说明](../../csd-programs/pg_sina_csd/README.md)。
+**结果一致不代表性能验收合格。** 只有实际设备工作内存不足且必须频繁 spill 造成的延迟增加可以接受。单 CU/向量化不足、重复扫描或复制、碎片化页请求、保守节点配额等实现问题造成的退化均不合格。脚本将较慢样本标记为 `needs_analysis` 并返回非零；必须结合实际占用和计时判断，不能看到 spill 就自动认定内存不足。单次测量不用于宣称稳定加速比。
+
+通用树 EXPLAIN 显示来自 PG 的连接树、顺序扫描行数、索引 Heap Tuple 数、完整内部读取、工作内存峰值及 spill 字节；开启 profile 后增加整个 CSF 的 CPU/墙钟/调用次数。单表快路径仍提供已有的逐算子计时。
+
+设备入口见 [设备算子说明](../../csd-programs/pg_sina_csd/README.md)。新验收结果见 [性能记录](doc/performance.md)，旧记录仅为历史，不作为当前验收依据。

@@ -32,7 +32,6 @@ where
 			revenue0
 	)
 order by
-	s_suppkey
-LIMIT 1;
+	s_suppkey;
 
 drop view revenue0;

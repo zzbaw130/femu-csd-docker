@@ -63,3 +63,5 @@ ctest --test-dir code/csd-programs/build --output-on-failure
 ```
 
 设备测试使用真实布局的模拟 PG 页与独立行循环校验 Join、NULL、重复键、外连接、精度、乱序多 run 归并、小内存 spill 和回收。它不模拟 NVMe 时间。实际 Guest 冷启动比较和使用限制见 [PG 扩展说明](../../apps/pg_sina_csd/README.md)。
+
+TPC-H 验收只使用仓库 `tests/guest/queries/` 的 SQL，由 `tests/guest/tpch-test.sh` 执行；这里的 C/C++ 单元测试只校验算子行为，不替代 SQL 正确性和性能验收。

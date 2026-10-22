@@ -40,5 +40,4 @@ group by
 order by
 	supp_nation,
 	cust_nation,
-	l_year
-LIMIT 1;
+	l_year;

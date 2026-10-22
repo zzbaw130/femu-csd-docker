@@ -13,5 +13,4 @@ where
 	and agg_partkey = l_partkey
 	and p_brand = 'Brand#54'
 	and p_container = 'JUMBO BAG'
-	and l_quantity < avg_quantity
-LIMIT 1;
+	and l_quantity < avg_quantity;

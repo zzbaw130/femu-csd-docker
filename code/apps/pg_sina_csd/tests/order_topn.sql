@@ -1,4 +1,0 @@
-SELECT l_orderkey,l_extendedprice
-FROM lineitem
-ORDER BY l_extendedprice DESC,l_orderkey
-LIMIT 100;

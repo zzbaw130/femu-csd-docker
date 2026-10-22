@@ -44,5 +44,4 @@ where
 	and s_nationkey = n_nationkey
 	and n_name = 'JORDAN'
 order by
-	s_name
-LIMIT 1;
+	s_name;
