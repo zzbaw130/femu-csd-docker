@@ -12,10 +12,21 @@
 #include <time.h>
 #include <unistd.h>
 
+struct plan_slot {
+    struct qp_control control;
+    CS_BATCH_HANDLE batch, resume;
+    CS_BATCH_INDEX previous;
+    CS_EVT_HANDLE event;
+    CS_REQ_HANDLE pending;
+    bool ready, done;
+};
 typedef struct {
     CustomScanState css;
     struct qp_plan *plan;
-    struct qp_control control;
+    struct plan_slot slots[QS_WORKERS+1];
+    unsigned workers, epoch;
+    bool parallel;
+    uint64_t load_ns, load_calls;
     struct qs_request files[QP_NODES];
     struct qs_extent *extents[QP_NODES];
     struct qs_request indexes[QP_NODES];
@@ -23,9 +34,6 @@ typedef struct {
     struct qs_result *result;
     CS_DEV_HANDLE device;
     CS_MEM_HANDLE memory[5];
-    CS_BATCH_HANDLE batch;
-    CS_EVT_HANDLE event;
-    CS_REQ_HANDLE pending;
     CS_CSF_ID function;
     int lock_fd;
     unsigned row;
@@ -59,20 +67,21 @@ static void close_state(void *arg)
 {
     PlanStateCsd *s=arg;
     HOLD_INTERRUPTS();
-    if(s->pending) {
-        csAbortRequest(s->pending);
-        while(csPollEvent(s->event,NULL,NULL)==CS_NOT_DONE) pg_usleep(50L);
-        s->pending=NULL;
+    for(unsigned w=0;w<=s->workers;++w) if(s->slots[w].pending) {
+        csAbortRequest(s->slots[w].pending);
+        while(csPollEvent(s->slots[w].event,NULL,NULL)==CS_NOT_DONE) pg_usleep(50L);
+        s->slots[w].pending=NULL;
     }
-    if(s->device && s->batch && s->memory[1] && s->active) {
+    if(s->device && s->slots[0].batch && s->memory[1] && s->active) {
         unsigned close=1;
-        /* A failed CSF may already have allocated state. Preserve its device
-         * handle even when the failed call never copied control back to PG. */
         if(transfer(s->memory[1],offsetof(struct qp_control,close),&close,sizeof(close),true)==CS_SUCCESS)
-            csQueueBatchRequest(s->batch,NULL,NULL,NULL,NULL,NULL);
+            csQueueBatchRequest(s->slots[0].batch,NULL,NULL,NULL,NULL,NULL);
     }
-    if(s->batch) { csFreeBatchRequest(s->batch); s->batch=NULL; }
-    if(s->event) { csDeleteEvent(s->event); s->event=NULL; }
+    for(unsigned w=0;w<=s->workers;++w) {
+        if(s->slots[w].batch) { csFreeBatchRequest(s->slots[w].batch); s->slots[w].batch=NULL; }
+        if(s->slots[w].resume) { csFreeBatchRequest(s->slots[w].resume); s->slots[w].resume=NULL; }
+        if(s->slots[w].event) { csDeleteEvent(s->slots[w].event); s->slots[w].event=NULL; }
+    }
     CsMemFlags flags={.FDMId=1};
     for(unsigned i=0;i<5;++i) if(s->memory[i]) { csFreeMem(s->memory[i],&flags); s->memory[i]=NULL; }
     if(s->active) {
@@ -98,6 +107,41 @@ static void begin(CustomScanState *node,EState *estate,int flags)
     s->cleanup.func=close_state; s->cleanup.arg=s;
     MemoryContextRegisterResetCallback(estate->es_query_cxt,&s->cleanup);
 }
+/* Compute offsets without allocating, so a larger I/O block can be tried
+ * before reducing CU concurrency. Small relations need only their own bytes. */
+static size_t layout_buffers(PlanStateCsd *s,unsigned entries,unsigned data,const bool *indexed)
+{
+    size_t arena=(qs_dict_bytes(entries,data)+4095)&~(size_t)4095;
+    for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_SCAN && !indexed[i]) {
+        struct qp_node *n=&s->plan->nodes[i]; unsigned bytes=qp_scan_buffer_bytes(s->plan,n);
+        n->input_offset=arena; arena+=bytes; n->vector_offset=arena;
+        arena+=(qs_chunk_bytes(bytes/24,n->expr.ncols)+4095)&~(size_t)4095;
+    }
+    for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_INDEX_JOIN) {
+        struct qp_node *n=&s->plan->nodes[i]; n->input_offset=arena;
+        arena+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE; n->vector_offset=arena;
+        arena+=4096+((qs_chunk_bytes(256,s->plan->nodes[n->right].expr.ncols+2)+4095)&~(size_t)4095);
+    }
+    size_t stride=0;
+    if(s->workers>1) for(unsigned root=0;root<s->plan->count;++root) if(s->plan->nodes[root].parallel) {
+        size_t end=arena;
+        for(int id=root;id>=0;id=s->plan->nodes[id].left) {
+            struct qp_node *n=&s->plan->nodes[id];
+            if(n->kind==QP_SCAN) {
+                unsigned bytes=qp_scan_buffer_bytes(s->plan,n);
+                n->parallel_input=end; end+=bytes; n->parallel_vector=end;
+                end+=(qs_chunk_bytes(bytes/24,n->expr.ncols)+4095)&~(size_t)4095; break;
+            }
+            if(n->kind==QP_INDEX_JOIN) {
+                n->parallel_input=end; end+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE; n->parallel_vector=end;
+                end+=4096+((qs_chunk_bytes(256,s->plan->nodes[n->right].expr.ncols+2)+4095)&~(size_t)4095);
+            }
+        }
+        stride=Max(stride,end-arena);
+    }
+    s->plan->parallel_stride=stride; s->plan->workers=s->workers?s->workers:1;
+    return arena+(s->workers?s->workers-1:0)*stride;
+}
 static void start(PlanStateCsd *s)
 {
     const char *device=NULL; bool big=false;
@@ -117,7 +161,7 @@ static void start(PlanStateCsd *s)
             if(n->expr.cols[col].slot>=0 && n->expr.cols[col].type==Q_STRING && r->bytes>QS_DICT_SMALL_DATA) big=true;
     }
     if(!device) elog(ERROR,"CSD PG Plan has no prepared relation");
-    s->profiling=pg_sina_profile; s->start_ns=clock_ns();
+    s->profiling=pg_sina_profile; s->start_ns=clock_ns(); s->load_ns=s->load_calls=0;
     s->plan->nodes[s->plan->root].expr.work_mem_bytes=(uint64_t)pg_sina_max_memory*1024;
     s->lock_fd=open(device,O_RDONLY|O_CLOEXEC);
     if(s->lock_fd<0) elog(ERROR,"cannot open CSD namespace");
@@ -127,40 +171,62 @@ static void start(PlanStateCsd *s)
     }
     checked(csOpenCSx(device,NULL,&s->device),"open");
     unsigned entries=big?QS_DICT_BIG_ENTRIES:QS_DICT_SMALL_ENTRIES,data=big?QS_DICT_BIG_DATA:QS_DICT_SMALL_DATA;
-    size_t arena=(qs_dict_bytes(entries,data)+4095)&~(size_t)4095;
-    for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_SCAN) {
-        struct qp_node *n=&s->plan->nodes[i]; n->input_offset=arena; arena+=QP_SCAN_BYTES;
-        n->vector_offset=arena; arena+=(qs_chunk_bytes(QP_SCAN_BYTES/24,n->expr.ncols)+4095)&~(size_t)4095;
+    bool indexed[QP_NODES]={0};
+    for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_INDEX_JOIN) indexed[s->plan->nodes[i].right]=true;
+    qp_parallel_boundaries(s->plan,s->plan->root);
+    for(unsigned i=0;i<s->plan->ninit;++i) qp_parallel_boundaries(s->plan,s->plan->init_nodes[i]);
+    bool parallel=false;
+    for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].parallel) parallel=true;
+    s->plan->workers=1; s->workers=0;
+    uint64_t capacity=0; int length=0;
+    if(csQueryDeviceProperties(s->device,CS_CSE_TYPE,&length,NULL)==CS_LENGTH_RETURNED) {
+        CsProperties *properties=palloc(length);
+        checked(csQueryDeviceProperties(s->device,CS_CSE_TYPE,&length,properties),"query CU count");
+        if(parallel) s->workers=Min(QS_WORKERS,properties->CSEDetails[0].CSE[0].NumCRs);
+        pfree(properties);
     }
-    for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_INDEX_JOIN) {
-        struct qp_node *n=&s->plan->nodes[i]; n->input_offset=arena;
-        arena+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE;
-        n->vector_offset=arena;
-        unsigned cols=s->plan->nodes[n->right].expr.ncols+2;
-        arena+=4096+((qs_chunk_bytes(256,cols)+4095)&~(size_t)4095);
+    length=0;
+    if(csQueryDeviceProperties(s->device,CS_FDM_TYPE,&length,NULL)==CS_LENGTH_RETURNED) {
+        CsProperties *properties=palloc(length);
+        checked(csQueryDeviceProperties(s->device,CS_FDM_TYPE,&length,properties),"query FDM capacity");
+        capacity=properties->FDMDetails[0].FDM[0].FDMSize; pfree(properties);
+    }
+    if(s->workers<=1) s->workers=0;
+    s->plan->scan_bytes=QS_CHUNK;
+    size_t arena;
+    for(;;) {
+        arena=layout_buffers(s,entries,data,indexed);
+        size_t needed=arena+sizeof(*s->plan)+(s->workers+1)*(sizeof(struct qp_control)+sizeof(*s->result)+QS_SORT_IO_BYTES)+65536;
+        if(capacity && needed>capacity) {
+            if(s->plan->scan_bytes>QP_SCAN_BYTES) { s->plan->scan_bytes/=2; continue; }
+            if(s->workers>1) { if(--s->workers==1) s->workers=0; continue; }
+        }
+        break;
     }
     CsMemFlags flags={.FDMId=1};
-    size_t sizes[]={sizeof(*s->plan),sizeof(s->control),sizeof(*s->result),arena,QS_SORT_IO_BYTES};
+    size_t sizes[]={sizeof(*s->plan),(s->workers+1)*sizeof(struct qp_control),(s->workers+1)*sizeof(*s->result),arena,(s->workers+1)*QS_SORT_IO_BYTES};
     for(unsigned i=0;i<5;++i) checked(csAllocMem(s->device,sizes[i],&flags,&s->memory[i],NULL),"allocate AFDM");
     checked(transfer(s->memory[0],0,s->plan,sizeof(*s->plan),true),"copy plan");
-    checked(transfer(s->memory[1],0,&s->control,sizeof(s->control),true),"initialize control");
+    checked(transfer(s->memory[1],0,&s->slots[0].control,sizeof(s->slots[0].control),true),"initialize control");
     struct qs_dict dictionary={.entries=entries,.capacity=entries,.data=data};
     checked(transfer(s->memory[3],0,&dictionary,sizeof(dictionary),true),"initialize strings");
     char zeros[4096]={0};
     size_t offset=sizeof(dictionary)+(size_t)entries*sizeof(struct qs_dict_entry);
     for(size_t i=0;i<(size_t)entries*4;i+=sizeof(zeros))
         checked(transfer(s->memory[3],offset+i,zeros,Min(sizeof(zeros),(size_t)entries*4-i),true),"clear string buckets");
-    for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_SCAN) {
+    for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_SCAN && !indexed[i]) {
         struct qp_node *n=&s->plan->nodes[i];
-        struct qs_chunk header={.capacity=QP_SCAN_BYTES/24,.ncols=n->expr.ncols};
+        struct qs_chunk header={.capacity=qp_scan_buffer_bytes(s->plan,n)/24,.ncols=n->expr.ncols};
         checked(transfer(s->memory[3],n->vector_offset,&header,sizeof(header),true),"initialize scan");
     }
+    for(unsigned w=0;w<s->workers;++w)
+        checked(transfer(s->memory[1],(w+1)*sizeof(struct qp_control),&s->slots[w+1].control,sizeof(struct qp_control),true),"initialize worker control");
     char descriptor[]="pg-sina-plan.so\0pg_sina_plan";
     CsCSFDownloadInfo download={.Type=CS_CSF_VENDOR_SPECIFIC,.SubType=CS_SUBTYPE_VENDOR_SPECIFIC,.CSEEId=1,.Index=510};
     strcpy(download.common.UniqueName,"pg-sina-plan"); download.common.DataBuffer=descriptor; download.common.Length=sizeof(descriptor);
     u32 id; checked(csCSFDownload(s->device,&download,&id),"download"); s->loaded=true;
     CsConfigInfo config={.Type=CS_CSF_ACTIVATE,.u.CSFActivateInfo={.CSFId=510,.EEIId=1,.State=CS_ACTIVE_STATE}};
-    CsConfigData result; int length=sizeof(result); checked(csConfig(s->device,&length,&config,&result),"activate"); s->active=true;
+    CsConfigData result; length=sizeof(result); checked(csConfig(s->device,&length,&config,&result),"activate"); s->active=true;
     length=0; int count=0; CS_STATUS status=csGetCSFId(s->device,"pg-sina-plan",0,&length,&count,NULL);
     if(status!=CS_LENGTH_RETURNED) checked(status,"lookup function length");
     CSFIdInfo *functions=palloc(length); checked(csGetCSFId(s->device,"pg-sina-plan",0,&length,&count,functions),"lookup function");
@@ -168,87 +234,157 @@ static void start(PlanStateCsd *s)
     size_t size=sizeof(CsBatchRequest)+6*sizeof(CsComputeArg); CsBatchRequest *request=palloc0(size);
     request->ReqType=CS_QUEUE_COMPUTE; request->u.Compute.CSFId=s->function; request->u.Compute.NumArgs=6;
     for(unsigned i=0;i<5;++i) csHelperSetComputeArg(&request->u.Compute.Args[i],CS_AFDM_TYPE,s->memory[i],0UL);
-    csHelperSetComputeArg(&request->u.Compute.Args[5],CS_64BIT_VALUE_TYPE,(u64)s->profiling);
-    checked(csAllocBatchRequest(CS_BATCH_SERIAL,1,&s->batch),"allocate batch");
-    CS_BATCH_INDEX index; checked(csConfigureBatchEntry(s->batch,CS_BATCH_ADD,request,0,0,&index),"configure batch"); pfree(request);
-    checked(csCreateEvent(&s->event),"create event"); s->started=true;
+    for(unsigned w=0;w<=s->workers;++w) {
+        csHelperSetComputeArg(&request->u.Compute.Args[5],CS_64BIT_VALUE_TYPE,(u64)(s->profiling|(w<<1)));
+        checked(csAllocBatchRequest(CS_BATCH_SERIAL,1,&s->slots[w].batch),"allocate batch");
+        CS_BATCH_INDEX index; checked(csConfigureBatchEntry(s->slots[w].batch,CS_BATCH_ADD,request,0,0,&index),"configure batch");
+        checked(csCreateEvent(&s->slots[w].event),"create event");
+    }
+    pfree(request); s->started=true;
 }
-static void load_pages(PlanStateCsd *s)
+static void append_ranges(CsBlockIo *io,const struct qs_request *file,const struct qs_extent *extents,uint64_t at,uint64_t end)
 {
-    unsigned node=s->control.node;
+    for(unsigned e=0;e<file->nextents && at<end;++e) {
+        if(extents[e].logical+extents[e].bytes<=at) continue;
+        if(extents[e].logical>at) elog(ERROR,"CSD unmapped heap/index page");
+        uint64_t n=Min(end,extents[e].logical+extents[e].bytes)-at;
+        CSBlockRange range={file->nsid,extents[e].lba+(at-extents[e].logical)/file->lba_bytes,n/file->lba_bytes};
+        CSBlockRange *last=io->NumRanges?&io->Range[io->NumRanges-1]:NULL;
+        if(last && last->NamespaceId==range.NamespaceId && last->StartLba+last->NumBlocks==range.StartLba) last->NumBlocks+=range.NumBlocks;
+        else io->Range[io->NumRanges++]=range;
+        at+=n;
+    }
+    if(at!=end) elog(ERROR,"CSD incomplete extent mapping");
+}
+static void configure_load(PlanStateCsd *s,unsigned worker,CsStorageRequest *load)
+{
+    struct plan_slot *slot=&s->slots[worker];
+    if(!slot->resume) { checked(csQueueStorageRequest(load,NULL,NULL,NULL,NULL,NULL),"internal LOAD"); return; }
+    size_t bytes=sizeof(CsBatchRequest)+load->u.BlockIo.NumRanges*sizeof(CSBlockRange);
+    CsBatchRequest *request=palloc0(bytes); request->ReqType=CS_STORAGE_IO;
+    memcpy(&request->u.StorageIo,load,sizeof(*load)+load->u.BlockIo.NumRanges*sizeof(CSBlockRange));
+    CS_BATCH_INDEX current;
+    checked(csConfigureBatchEntry(slot->resume,CS_BATCH_ADD,request,0,slot->previous,&current),"configure LOAD");
+    slot->previous=current; pfree(request);
+}
+static void load_pages(PlanStateCsd *s,unsigned worker)
+{
+    struct qp_control *c=&s->slots[worker].control;
+    unsigned node=c->node; uint64_t started=clock_ns();
     if(node>=s->plan->count) elog(ERROR,"invalid CSD page request");
-    if(s->control.index_nreads) {
-        if(s->control.index_nreads>QS_INDEX_READS || s->plan->nodes[node].kind!=QP_INDEX_JOIN) elog(ERROR,"invalid CSD index request");
-        unsigned leaf=s->plan->nodes[node].right;
-        for(unsigned j=0;j<s->control.index_nreads;++j) {
-            const struct qs_index_read *read=&s->control.index_reads[j];
-            struct qs_request *file=read->heap?&s->files[leaf]:&s->indexes[leaf];
-            struct qs_extent *extents=read->heap?s->extents[leaf]:s->index_extents[leaf];
-            uint64_t at=(uint64_t)read->block*QS_PAGE,end=at+QS_PAGE;
-            if(read->heap>1 || read->slot>=QS_INDEX_CACHE || end>file->bytes) elog(ERROR,"invalid CSD index page");
-            CsStorageRequest *load=palloc0(sizeof(*load)+(file->nextents+1)*sizeof(CSBlockRange));
+    const struct qp_node *n=&s->plan->nodes[node];
+    size_t input=worker>1?n->parallel_input+(worker-2)*s->plan->parallel_stride:n->input_offset;
+    if(c->index_nreads) {
+        if(c->index_nreads>QS_INDEX_READS || n->kind!=QP_INDEX_JOIN) elog(ERROR,"invalid CSD index request");
+        unsigned leaf=n->right,max_extents=Max(s->files[leaf].nextents,s->indexes[leaf].nextents);
+        for(unsigned j=0;j<c->index_nreads;) {
+            unsigned first=j++; const struct qs_index_read *read=&c->index_reads[first];
+            while(j<c->index_nreads && c->index_reads[j].slot==read->slot+j-first) ++j;
+            CsStorageRequest *load=palloc0(sizeof(*load)+((j-first)*(max_extents+1))*sizeof(CSBlockRange));
             load->Mode=CS_STORAGE_BLOCK_IO; load->DevHandle=s->device;
             CsBlockIo *io=&load->u.BlockIo; io->Type=CS_STORAGE_LOAD_TYPE;
-            io->DevMem=(CsDevAFDM){s->memory[3],s->plan->nodes[node].input_offset+QS_SORT_IO_BYTES+(size_t)read->slot*QS_PAGE};
-            for(unsigned e=0;e<file->nextents && at<end;++e) {
-                if(extents[e].logical+extents[e].bytes<=at) continue;
-                uint64_t n=Min(end,extents[e].logical+extents[e].bytes)-at;
-                io->Range[io->NumRanges++]=(CSBlockRange){file->nsid,extents[e].lba+(at-extents[e].logical)/file->lba_bytes,n/file->lba_bytes}; at+=n;
+            io->DevMem=(CsDevAFDM){s->memory[3],input+QS_SORT_IO_BYTES+(size_t)read->slot*QS_PAGE};
+            for(unsigned k=first;k<j;++k) {
+                read=&c->index_reads[k]; struct qs_request *file=read->heap?&s->files[leaf]:&s->indexes[leaf];
+                struct qs_extent *extents=read->heap?s->extents[leaf]:s->index_extents[leaf];
+                uint64_t at=(uint64_t)read->block*QS_PAGE,end=at+QS_PAGE;
+                if(read->heap>1 || read->slot>=QS_INDEX_CACHE || end>file->bytes) elog(ERROR,"invalid CSD index page");
+                append_ranges(io,file,extents,at,end);
             }
-            checked(csQueueStorageRequest(load,NULL,NULL,NULL,NULL,NULL),"index/heap LOAD"); pfree(load);
+            configure_load(s,worker,load); ++s->load_calls; pfree(load);
         }
-        s->control.ready=1;
-        checked(transfer(s->memory[1],0,&s->control,sizeof(s->control),true),"resume index");
-        return;
+    } else {
+        if(c->offset>s->files[node].bytes || c->bytes>s->files[node].bytes-c->offset) elog(ERROR,"invalid CSD page request");
+        struct qs_request *file=&s->files[node];
+        CsStorageRequest *load=palloc0(sizeof(*load)+(file->nextents+1)*sizeof(CSBlockRange));
+        load->Mode=CS_STORAGE_BLOCK_IO; load->DevHandle=s->device;
+        CsBlockIo *io=&load->u.BlockIo; io->Type=CS_STORAGE_LOAD_TYPE; io->DevMem=(CsDevAFDM){s->memory[3],input};
+        append_ranges(io,file,s->extents[node],c->offset,c->offset+c->bytes);
+        configure_load(s,worker,load); ++s->load_calls; pfree(load);
     }
-    if(node>=s->plan->count || s->control.offset>s->files[node].bytes ||
-       s->control.bytes>s->files[node].bytes-s->control.offset) elog(ERROR,"invalid CSD page request");
-    struct qs_request *r=&s->files[node]; uint64_t at=s->control.offset,end=at+s->control.bytes;
-    size_t bytes=sizeof(CsStorageRequest)+(r->nextents+1)*sizeof(CSBlockRange);
-    CsStorageRequest *load=palloc0(bytes);
-    load->Mode=CS_STORAGE_BLOCK_IO; load->DevHandle=s->device;
-    CsBlockIo *io=&load->u.BlockIo; io->Type=CS_STORAGE_LOAD_TYPE;
-    io->DevMem=(CsDevAFDM){s->memory[3],s->plan->nodes[node].input_offset};
-    for(unsigned i=0;i<r->nextents && at<end;++i) {
-        const struct qs_extent *e=&s->extents[node][i];
-        if(e->logical+e->bytes<=at) continue;
-        uint64_t n=Min(e->logical+e->bytes,end)-at;
-        io->Range[io->NumRanges++]=(CSBlockRange){r->nsid,e->lba+(at-e->logical)/r->lba_bytes,n/r->lba_bytes}; at+=n;
+    c->ready=1; s->load_ns+=clock_ns()-started;
+}
+static void submit(PlanStateCsd *s,unsigned worker)
+{
+    struct plan_slot *slot=&s->slots[worker];
+    if((slot->control.bytes || slot->control.index_nreads) && !slot->control.ready) {
+        unsigned groups=1;
+        for(unsigned j=1;j<slot->control.index_nreads;++j)
+            groups+=slot->control.index_reads[j].slot!=slot->control.index_reads[j-1].slot+1;
+        if(groups<64) checked(csAllocBatchRequest(CS_BATCH_SERIAL,groups+1,&slot->resume),"allocate LOAD batch");
+        slot->previous=0; load_pages(s,worker);
+        checked(transfer(s->memory[1],worker*sizeof(struct qp_control)+offsetof(struct qp_control,ready),&slot->control.ready,sizeof(slot->control.ready),true),"resume LOAD");
+        if(slot->resume) {
+            CsBatchRequest *request=palloc0(sizeof(*request)+6*sizeof(CsComputeArg));
+            request->ReqType=CS_QUEUE_COMPUTE; request->u.Compute.CSFId=s->function; request->u.Compute.NumArgs=6;
+            for(unsigned i=0;i<5;++i) csHelperSetComputeArg(&request->u.Compute.Args[i],CS_AFDM_TYPE,s->memory[i],0UL);
+            csHelperSetComputeArg(&request->u.Compute.Args[5],CS_64BIT_VALUE_TYPE,(u64)(s->profiling|(worker<<1)));
+            CS_BATCH_INDEX current;
+            checked(csConfigureBatchEntry(slot->resume,CS_BATCH_ADD,request,0,slot->previous,&current),"configure resumed compute"); pfree(request);
+        }
     }
-    checked(csQueueStorageRequest(load,NULL,NULL,NULL,NULL,NULL),"internal LOAD"); pfree(load);
-    s->control.ready=1;
-    checked(transfer(s->memory[1],0,&s->control,sizeof(s->control),true),"resume scan");
+    if(!worker && slot->control.available)
+        checked(transfer(s->memory[1],offsetof(struct qp_control,available),&slot->control.available,sizeof(slot->control.available),true),"provide worker rows");
+    CS_STATUS status=csQueueBatchRequest(slot->resume?slot->resume:slot->batch,NULL,NULL,slot->event,&slot->pending,NULL);
+    if(status!=CS_QUEUED) checked(status,"queue tree");
 }
 static void fetch(PlanStateCsd *s)
 {
+    /* Result buffers remain in AFDM: the final pipeline consumes worker rows
+     * on a CU. PG only polls completions and assigns the next ready CSF. */
     for(;;) {
-        CHECK_FOR_INTERRUPTS();
-        if((s->control.bytes || s->control.index_nreads) && !s->control.ready) load_pages(s);
-        HOLD_INTERRUPTS();
-        CS_STATUS status=csQueueBatchRequest(s->batch,NULL,NULL,s->event,&s->pending,NULL);
-        if(status==CS_QUEUED) {
-            do {
-                status=csPollEvent(s->event,NULL,NULL);
-                if(status==CS_NOT_DONE && !(QueryCancelPending || ProcDiePending)) pg_usleep(50L);
-                else if(status==CS_NOT_DONE) csAbortRequest(s->pending);
-            } while(status==CS_NOT_DONE);
+        CHECK_FOR_INTERRUPTS(); bool progress=false;
+        for(unsigned w=0;w<=s->workers;++w) {
+            struct plan_slot *slot=&s->slots[w];
+            if(!slot->pending) continue;
+            HOLD_INTERRUPTS(); CS_STATUS status=csPollEvent(slot->event,NULL,NULL);
+            if(status==CS_NOT_DONE) { RESUME_INTERRUPTS(); continue; }
+            slot->pending=NULL;
+            CS_STATUS copied=transfer(s->memory[1],w*sizeof(struct qp_control),&slot->control,sizeof(slot->control),false);
+            if(status==CS_SUCCESS) status=copied;
+            struct qs_result header;
+            if(!w) {
+                memset(&header,0,offsetof(struct qs_result,data));
+                if(status==CS_SUCCESS && (slot->control.output_rows || slot->control.finished))
+                    status=transfer(s->memory[2],0,&header,offsetof(struct qs_result,data),false);
+            }
+            RESUME_INTERRUPTS(); CHECK_FOR_INTERRUPTS();
+            if(status!=CS_SUCCESS && slot->control.error)
+                ereport(ERROR,(errmsg("CSD PG Plan node %u failed: device=%d, status=%d",slot->control.error_node,slot->control.error,status)));
+            checked(status,"execute tree"); progress=true;
+            if(slot->resume) { checked(csFreeBatchRequest(slot->resume),"release LOAD batch"); slot->resume=NULL; }
+            if(w) { slot->ready=slot->control.output_rows || slot->control.finished; slot->done=slot->control.finished; continue; }
+            memcpy(s->result,&header,offsetof(struct qs_result,data));
+            for(unsigned i=1;i<=s->workers;++i) if(slot->control.drained&(1U<<(i-1))) s->slots[i].ready=false;
+            s->parallel=slot->control.parallel;
+            if(slot->control.epoch!=s->epoch) {
+                s->epoch=slot->control.epoch;
+                for(unsigned i=1;i<=s->workers;++i) s->slots[i].ready=s->slots[i].done=false;
+                for(unsigned i=1;i<=s->workers;++i)
+                    checked(transfer(s->memory[1],i*sizeof(struct qp_control),&s->slots[i].control,sizeof(struct qp_control),false),"read worker state");
+            }
+            if(s->result->rows>QS_RESULT_ROWS) elog(ERROR,"invalid CSD result page");
+            if(s->result->rows) {
+                checked(transfer(s->memory[2],offsetof(struct qs_result,data),s->result->data,s->result->rows*sizeof(struct qs_row),false),"read result");
+                checked(transfer(s->memory[2],offsetof(struct qs_result,str_bytes),&s->result->str_bytes,
+                    sizeof(s->result->str_bytes)+sizeof(s->result->str_data),false),"read result strings");
+            }
+            if(s->result->rows || s->result->finished) { s->row=0; return; }
         }
-        s->pending=NULL;
-        CS_STATUS control_status=transfer(s->memory[1],0,&s->control,sizeof(s->control),false);
-        if(status==CS_SUCCESS) status=control_status;
-        if(status==CS_SUCCESS) status=transfer(s->memory[2],0,s->result,offsetof(struct qs_result,data),false);
-        RESUME_INTERRUPTS(); CHECK_FOR_INTERRUPTS();
-        if(status!=CS_SUCCESS && s->control.error)
-            ereport(ERROR,(errmsg("CSD PG Plan node %u failed: device=%d, status=%d",s->control.error_node,s->control.error,status)));
-        checked(status,"execute tree");
-        if(s->result->rows>QS_RESULT_ROWS) elog(ERROR,"invalid CSD result page");
-        if(s->result->rows) {
-            checked(transfer(s->memory[2],offsetof(struct qs_result,data),s->result->data,s->result->rows*sizeof(struct qs_row),false),"read result");
-            checked(transfer(s->memory[2],offsetof(struct qs_result,str_bytes),&s->result->str_bytes,
-                sizeof(s->result->str_bytes)+sizeof(s->result->str_data),false),"read result strings");
+        if(s->parallel) for(unsigned w=1;w<=s->workers;++w) {
+            struct plan_slot *slot=&s->slots[w];
+            if(!slot->pending && !slot->ready && !slot->done) { HOLD_INTERRUPTS(); submit(s,w); RESUME_INTERRUPTS(); progress=true; }
         }
-        if(s->result->rows || s->result->finished) { s->row=0; return; }
-        if(!s->control.bytes && !s->control.index_nreads) elog(ERROR,"CSD tree made no progress");
+        struct plan_slot *main=&s->slots[0];
+        if(!main->pending) {
+            unsigned ready=0;
+            for(unsigned w=1;w<=s->workers;++w) if(s->slots[w].ready) ready|=1U<<(w-1);
+            if(!s->parallel || ready || !main->control.parallel) {
+                main->control.available=ready;
+                HOLD_INTERRUPTS(); submit(s,0); RESUME_INTERRUPTS(); progress=true;
+            }
+        }
+        if(!progress) pg_usleep(50L);
     }
 }
 extern Datum pg_sina_decimal(struct qs_cell);
@@ -293,7 +429,7 @@ static void end(CustomScanState *node) { close_state(node); }
 static void rescan(CustomScanState *node)
 {
     PlanStateCsd *s=(void *)node; close_state(s);
-    memset(&s->control,0,sizeof(s->control)); memset(s->result,0,sizeof(*s->result)); s->started=false; s->row=0;
+    memset(s->slots,0,sizeof(s->slots)); s->parallel=false; s->epoch=0; memset(s->result,0,sizeof(*s->result)); s->started=false; s->row=0;
 }
 static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
 {
@@ -324,7 +460,9 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
         ExplainPropertyInteger("CSD Index/Heap Page Loads",NULL,s->result->metrics.index_pages,es);
         ExplainPropertyInteger("CSD Indexed Heap Tuples",NULL,s->result->metrics.index_tuples,es);
         ExplainPropertyInteger("CSD Workmem Peak","bytes",s->result->metrics.work_peak,es);
-        ExplainPropertyInteger("CSD Workers",NULL,1,es);
+        ExplainPropertyInteger("CSD Workers",NULL,s->result->metrics.workers,es);
+        ExplainPropertyInteger("CSD Parallel Pipelines",NULL,s->slots[0].control.epoch,es);
+        ExplainPropertyInteger("CSD Scan Block","bytes",s->plan->scan_bytes,es);
         ExplainPropertyInteger("CSD Spill Read","bytes",s->result->metrics.spill_read_bytes,es);
         ExplainPropertyInteger("CSD Spill Write","bytes",s->result->metrics.spill_write_bytes,es);
         ExplainPropertyInteger("CSD Runs",NULL,s->result->metrics.runs,es);
@@ -334,6 +472,12 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
             ExplainPropertyFloat("CSD CSF Wall","ms",t->wall_ns/1e6,3,es);
             ExplainPropertyFloat("CSD CSF CPU","ms",t->cpu_ns/1e6,3,es);
             ExplainPropertyInteger("CSD CSF Calls",NULL,t->calls,es);
+            ExplainPropertyInteger("CSD Active CUs Peak",NULL,s->slots[0].control.peak_cus,es);
+            static const unsigned ops[]={QS_SCAN,QS_FILTER,QS_SORT_SINK,QS_SORT_SOURCE};
+            static const char *labels[]={"CSD Scan Decode CPU","CSD Vector Filter CPU","CSD Sort Sink CPU","CSD Sort Source CPU"};
+            for(unsigned i=0;i<4;++i) ExplainPropertyFloat(labels[i],"ms",s->result->profile.operators[ops[i]].cpu_ns/1e6,3,es);
+            ExplainPropertyFloat("CSD LOAD Preparation","ms",s->load_ns/1e6,3,es);
+            ExplainPropertyInteger("CSD Host LOAD Requests",NULL,s->load_calls,es);
         }
     }
 }

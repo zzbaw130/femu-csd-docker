@@ -121,11 +121,52 @@ static void row_sift(struct row_sort *s,struct row_run *r,unsigned size,unsigned
         row_swap(s,r,root,child); root=child;
     }
 }
+static uint64_t integer_sort_key(const unsigned char *row,unsigned column,int descending)
+{
+    uint64_t key=(uint64_t)(int64_t)((const struct qs_cell *)row)[column].value^(UINT64_C(1)<<63);
+    return descending?~key:key;
+}
+/* Normalize a single integer/date key and skip constant bytes, as DuckDB's
+ * sort keys do. Scratch is charged to the run owner; use the existing sorter
+ * when the key is nullable, wide, composite or scratch does not fit. */
+static int run_radix_sort(struct row_sort *s,struct row_run *r)
+{
+    if(s->plan.norder!=1 || r->rows<2) return 0;
+    const struct qs_order *order=&s->plan.order[0]; unsigned column=order->output;
+    unsigned oid=s->plan.outputs[column].type_oid;
+    if(oid!=20 && oid!=21 && oid!=23 && oid!=1082) return 0;
+    uint64_t first=integer_sort_key(r->data,column,order->descending),vary=0;
+    for(unsigned i=0;i<r->rows;++i) {
+        const struct qs_cell *v=&run_row(s,r,i)[column];
+        if(v->isnull || v->scale || v->dscale==UINT8_MAX || v->value<INT64_MIN || v->value>INT64_MAX) return 0;
+        vary|=first^integer_sort_key(r->data+(size_t)i*s->row_bytes,column,order->descending);
+    }
+    if(!vary) return 1;
+    size_t bytes=(size_t)r->rows*s->row_bytes;
+    unsigned char *scratch=cs_work_alloc(r->owner,bytes); if(!scratch) return 0;
+    unsigned char *from=r->data,*to=scratch;
+    for(unsigned shift=0;shift<64;shift+=8) if((vary>>shift)&255) {
+        unsigned positions[256]={0};
+        for(unsigned i=0;i<r->rows;++i) ++positions[(integer_sort_key(from+(size_t)i*s->row_bytes,column,order->descending)>>shift)&255];
+        unsigned start=0;
+        for(unsigned i=0;i<256;++i) { unsigned count=positions[i]; positions[i]=start; start+=count; }
+        for(unsigned i=0;i<r->rows;++i) {
+            const unsigned char *row=from+(size_t)i*s->row_bytes;
+            unsigned bucket=(integer_sort_key(row,column,order->descending)>>shift)&255;
+            memcpy(to+(size_t)positions[bucket]++*s->row_bytes,row,s->row_bytes);
+        }
+        unsigned char *swap=from; from=to; to=swap;
+    }
+    if(from!=r->data) memcpy(r->data,from,bytes);
+    cs_work_free(r->owner,scratch); return 1;
+}
 static void run_sort(struct row_sort *s,struct row_run *r)
 {
     if(r->sorted) return;
-    for(unsigned i=r->rows/2;i;i--) row_sift(s,r,r->rows,i-1);
-    for(unsigned n=r->rows;n>1;--n) { row_swap(s,r,0,n-1); row_sift(s,r,n-1,0); }
+    if(!run_radix_sort(s,r)) {
+        for(unsigned i=r->rows/2;i;i--) row_sift(s,r,r->rows,i-1);
+        for(unsigned n=r->rows;n>1;--n) { row_swap(s,r,0,n-1); row_sift(s,r,n-1,0); }
+    }
     r->sorted=1;
     if(r->rows) memcpy(r->head,r->data,s->row_bytes);
 }

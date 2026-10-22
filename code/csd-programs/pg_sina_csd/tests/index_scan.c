@@ -10,7 +10,8 @@
 #include <string.h>
 typedef int64_t (*function)(struct femu_csd_args *);
 static unsigned key_bytes=4;
-static int empty_index,large_index;
+static int empty_index,large_index,retained_window;
+static void (*heap_window)(struct qs_join_control *,unsigned,const void *,uint32_t,uint32_t);
 static unsigned char index_pages[4][QS_PAGE],heap[256][QS_PAGE];
 static void w16(void *p,uint16_t v) { memcpy(p,&v,2); }
 static void w32(void *p,uint32_t v) { memcpy(p,&v,4); }
@@ -83,6 +84,7 @@ static void check(function build,function probe,function close,function source,i
     struct qs_task task={.workers=1};
     void *mr[]={c,&p,&control,io}; long long len[]={qs_chunk_bytes(513,1),sizeof(p),sizeof(control),io_bytes};
     struct femu_csd_args a={.numr=4,.mr_addr=mr,.mr_len=len}; assert(!build(&a)); assert(control.indexed);
+    if(retained_window) heap_window(&control,0,heap[retained_window==2?1:0],retained_window==2?1:0,retained_window==2?1:large_index?256:2);
     void *args[]={c,&p,&task,&control,out,io}; long long sizes[]={len[0],sizeof(p),sizeof(task),sizeof(control),qs_chunk_bytes(256,3),io_bytes};
     a=(struct femu_csd_args){.numr=6,.mr_addr=args,.mr_len=sizes};
     unsigned resumes=0; int failed=0;
@@ -92,6 +94,7 @@ static void check(function build,function probe,function close,function source,i
         if(cancel==1) break;
         for(unsigned i=0;i<task.index_nreads;++i) {
             const struct qs_index_read *r=&task.index_reads[i];
+            if(retained_window) assert(!r->heap || (retained_window==2 && r->block==0));
             assert(r->slot<QS_INDEX_CACHE && r->block<(r->heap?(large_index?256:2):4));
             unsigned char *dest=(void *)((char *)io+QS_SORT_IO_BYTES+(size_t)r->slot*QS_PAGE);
             memcpy(dest,r->heap?heap[r->block]:index_pages[r->block],QS_PAGE);
@@ -115,8 +118,13 @@ int main(int argc,char **argv)
     assert(argc==3); assert(!cs_work_init(4*1024*1024));
     void *join=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL),*agg=dlopen(argv[2],RTLD_NOW|RTLD_LOCAL); assert(join && agg);
     function build=(function)dlsym(join,"pg_sina_join_build"),probe=(function)dlsym(join,"pg_sina_join_probe"),close=(function)dlsym(join,"pg_sina_join_close"),source=(function)dlsym(agg,"pg_sina_aggregate_source"); assert(build && probe && close && source);
+    heap_window=(void (*)(struct qs_join_control *,unsigned,const void *,uint32_t,uint32_t))dlsym(join,"qs_index_heap_window"); assert(heap_window);
     for(key_bytes=2;key_bytes<=8;key_bytes*=2) {
-        pages(); check(build,probe,close,source,0,0); check(build,probe,close,source,1,0); check(build,probe,close,source,0,1); check(build,probe,close,source,0,2);
+        pages();
+        for(retained_window=1;retained_window<=2;++retained_window) {
+            check(build,probe,close,source,0,0); check(build,probe,close,source,1,0);
+        }
+        retained_window=0; check(build,probe,close,source,0,0); check(build,probe,close,source,1,0); check(build,probe,close,source,0,1); check(build,probe,close,source,0,2);
         unsigned char tuple[32]; memcpy(tuple,heap[0]+QS_PAGE-32,32); w16(tuple+18,0x8002);
         add(heap[0],tuple,32); w32(heap[0]+24,5|(2U<<15));
         check(build,probe,close,source,0,0); /* HOT root -> heap-only tuple */

@@ -14,13 +14,16 @@ struct qp_node {
     int kind, left, right, join_type, join_qual;
     unsigned nkeys, distinct, distinct_aggs;
     unsigned sorted_input;
-    unsigned hash;
+    unsigned hash, parallel;
     int left_keys[QS_KEYS], right_keys[QS_KEYS];
     uint64_t bytes, input_offset, vector_offset;
+    uint64_t parallel_input, parallel_vector;
     double estimated_rows;
 };
 struct qp_plan {
     unsigned count, root, nparams, ninit;
+    unsigned workers, scan_bytes;
+    uint64_t parallel_stride;
     int param_nodes[QP_PARAMS],cte_nodes[QP_PARAMS],init_nodes[QP_PARAMS],init_params[QP_PARAMS];
     struct qp_node nodes[QP_NODES];
 };
@@ -30,6 +33,41 @@ struct qp_control {
     unsigned node, bytes, ready, finished, close, index_nreads;
     int error;
     unsigned error_node;
+    unsigned parallel, epoch, available, drained;
+    /* Completion metadata avoids a second AFDM read for internal row batches. */
+    unsigned output_rows, peak_cus;
     struct qs_index_read index_reads[QS_INDEX_READS];
 };
+static inline unsigned qp_scan_buffer_bytes(const struct qp_plan *p,const struct qp_node *n)
+{
+    unsigned bytes=n->bytes<p->scan_bytes?n->bytes:p->scan_bytes;
+    return bytes?bytes:QS_PAGE;
+}
+/* A parallel probe pipeline ends before an order-dependent/blocking operator.
+ * Hash build children retain the exact PG-selected tree and are built once. */
+static inline int qp_probe_scan(const struct qp_plan *p,int id)
+{
+    if(id<0) return -1;
+    const struct qp_node *n=&p->nodes[id];
+    if(n->kind==QP_SCAN) return id;
+    if(n->kind==QP_PROJECT || n->kind==QP_INDEX_JOIN || (n->kind==QP_JOIN && n->hash))
+        return qp_probe_scan(p,n->left);
+    return -1;
+}
+/* Mark every independent scan/probe pipeline, including InitPlan scans.
+ * Each phase reuses the same worker buffers after the previous phase drains. */
+static inline void qp_parallel_boundaries(struct qp_plan *p,int id)
+{
+    if(id<0) return;
+    struct qp_node *n=&p->nodes[id]; int candidate=-1;
+    if(n->kind==QP_SORT || (n->kind==QP_AGGREGATE && (!n->nkeys || !n->sorted_input))) candidate=n->left;
+    int scan=qp_probe_scan(p,candidate);
+    if(scan>=0 && p->nodes[scan].bytes>=4*QP_SCAN_BYTES) p->nodes[candidate].parallel=1;
+    qp_parallel_boundaries(p,n->left);
+    if(n->kind==QP_JOIN && n->hash) {
+        scan=qp_probe_scan(p,n->right);
+        if(scan>=0 && p->nodes[scan].bytes>=4*QP_SCAN_BYTES) p->nodes[n->right].parallel=1;
+        qp_parallel_boundaries(p,n->right);
+    }
+}
 #endif

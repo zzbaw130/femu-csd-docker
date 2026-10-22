@@ -45,7 +45,7 @@ struct qs_join {
     unsigned nattrs;
     int build_key, probe_key, predicate;
     int build_key2, probe_key2; /* Optional second integer equality key. */
-    int semi; /* EXISTS: at most one output per probe row. */
+    int semi; /* 1: evaluate EXISTS here; -1: the native-Plan consumer confirms a match. */
     int left_pad; /* Emit one NULL-build row per probe row (left join count). */
     int residual; /* Joined-row predicate index + 1; 0 means no residual. */
     uint64_t rows, work_mem_bytes;
@@ -166,14 +166,15 @@ static inline uint32_t qs_dict_hash(const char *bytes,unsigned length)
     for(unsigned i=0;i<length;++i) { hash^=(unsigned char)bytes[i]; hash*=16777619U; }
     return hash;
 }
-/* Caller holds the insert lock for lookup/insert. */
+/* Published entries never move. Existing strings can be found without the
+ * insertion lock, including when several CUs decode the same enum columns. */
 static inline int qs_dict_find(struct qs_dict *dict,const char *bytes,unsigned length)
 {
     struct qs_dict_entry *entries=qs_dict_entries(dict);
     uint32_t *buckets=qs_dict_buckets(dict),mask=dict->capacity-1;
     uint32_t at=qs_dict_hash(bytes,length)&mask;
     for(unsigned probes=0;probes<dict->capacity;++probes) {
-        uint32_t id=buckets[at];
+        uint32_t id=__atomic_load_n(&buckets[at],__ATOMIC_ACQUIRE);
         if(!id) return 0;
         struct qs_dict_entry *e=&entries[id-1];
         if(e->length==length && (!length || !memcmp(qs_dict_data(dict)+e->offset,bytes,length))) return (int)id;
@@ -183,9 +184,10 @@ static inline int qs_dict_find(struct qs_dict *dict,const char *bytes,unsigned l
 }
 static inline int qs_dict_insert(struct qs_dict *dict,const char *bytes,unsigned length)
 {
-    while(__sync_lock_test_and_set(&dict->lock,1U)) { }
-    if(dict->count>=dict->entries) { __sync_lock_release(&dict->lock); return -1; }
     int id=qs_dict_find(dict,bytes,length);
+    if(id) return id;
+    while(__sync_lock_test_and_set(&dict->lock,1U)) { }
+    id=qs_dict_find(dict,bytes,length);
     if(!id) {
         unsigned count=dict->count,used=dict->bytes;
         if(count>=dict->entries || used+length>dict->data || length>65535U) id=-1;
@@ -196,8 +198,8 @@ static inline int qs_dict_insert(struct qs_dict *dict,const char *bytes,unsigned
             uint32_t *buckets=qs_dict_buckets(dict),mask=dict->capacity-1;
             uint32_t at=qs_dict_hash(bytes,length)&mask;
             while(buckets[at]) at=(at+1)&mask;
-            buckets[at]=count+1;
             __atomic_store_n(&dict->count,count+1,__ATOMIC_RELEASE);
+            __atomic_store_n(&buckets[at],count+1,__ATOMIC_RELEASE);
             id=(int)count+1;
         }
     }
@@ -206,7 +208,7 @@ static inline int qs_dict_insert(struct qs_dict *dict,const char *bytes,unsigned
 }
 static inline int qs_dict_get(const struct qs_dict *dict,unsigned id,const char **bytes,unsigned *length)
 {
-    if(!dict || !id || id>dict->count || id>dict->entries) return -1;
+    if(!dict || !id || id>__atomic_load_n(&dict->count,__ATOMIC_ACQUIRE) || id>dict->entries) return -1;
     const struct qs_dict_entry *e=&((const struct qs_dict_entry *)(dict+1))[id-1];
     const char *base=(const char *)(((const struct qs_dict_entry *)(dict+1))+dict->entries)+
         (size_t)dict->capacity*sizeof(uint32_t);

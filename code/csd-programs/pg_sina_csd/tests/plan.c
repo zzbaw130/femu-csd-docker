@@ -8,7 +8,9 @@
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <pthread.h>
 typedef int64_t (*function)(struct femu_csd_args *);
+enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN };
 static void w16(void *p,uint16_t x) { memcpy(p,&x,2); }
 static void w32(void *p,uint32_t x) { memcpy(p,&x,4); }
 static unsigned char *heap(unsigned rows,unsigned side,size_t *size)
@@ -22,7 +24,7 @@ static unsigned char *heap(unsigned rows,unsigned side,size_t *size)
         for(unsigned i=0;i<count;++i) {
             unsigned row=p*100+i,off=QS_PAGE-(i+1)*40; unsigned char *t=page+off;
             w32(page+24+i*4,off|(1U<<15)|(40U<<17)); w16(t+18,2); w16(t+20,0xb01); t[22]=24; t[23]=side==2 || row%17?3:2;
-            if(side==2) { w32(t+24,row); w32(t+28,(uint64_t)row*1009%100003); }
+            if(side==2) { w32(t+24,row); w32(t+28,(int32_t)((uint64_t)row*1009%100003)-50000); }
             else if(row%17) { w32(t+24,row%(side?7:11)); w32(t+28,side?row%13+1:row%19+1); }
             else w32(t+24,side?row%13+1:row%19+1);
         }
@@ -54,9 +56,40 @@ static void scan(struct qp_node *n)
         n->expr.outputs[i]=(struct qs_output){.index=i,.type_oid=23};
     }
 }
-static void test(function run,unsigned join,unsigned rows,unsigned right_rows,unsigned memory,int hash)
+struct probe_test {
+    function run;
+    struct femu_csd_args args;
+    struct qp_plan *plan;
+    struct qp_control *control;
+    struct qs_result *out;
+    unsigned char *arena,*raw,*heap,*index;
+    unsigned worker;
+};
+static void *probe_worker(void *arg)
 {
-    struct qp_plan *plan=calloc(1,sizeof(*plan)); assert(plan); plan->count=4;
+    struct probe_test *t=arg;
+    for(;;) {
+        struct qp_control *c=t->control;
+        if((c->index_nreads || c->bytes) && !c->ready) {
+            const struct qp_node *n=&t->plan->nodes[c->node];
+            size_t offset=t->worker>1?n->parallel_input+(t->worker-2)*t->plan->parallel_stride:n->input_offset;
+            if(c->index_nreads) {
+                for(unsigned i=0;i<c->index_nreads;++i) {
+                    const struct qs_index_read *r=&c->index_reads[i];
+                    memcpy(t->arena+offset+QS_SORT_IO_BYTES+(size_t)r->slot*QS_PAGE,
+                        (r->heap?t->heap:t->index)+(size_t)r->block*QS_PAGE,QS_PAGE);
+                }
+            } else memcpy(t->arena+offset,((c->node==3 || c->node==6)?t->heap:t->raw)+c->offset,c->bytes);
+            c->ready=1;
+        }
+        int64_t status=t->run(&t->args); assert(!status);
+        if(t->out->rows || t->out->finished) return NULL;
+        assert(c->index_nreads || c->bytes);
+    }
+}
+static void test(function run,unsigned join,unsigned rows,unsigned right_rows,unsigned memory,int hash,int parallel)
+{
+    struct qp_plan *plan=calloc(1,sizeof(*plan)); assert(plan); plan->count=4; plan->scan_bytes=parallel==TEST_LARGE_SCAN?QS_CHUNK:QP_SCAN_BYTES;
     scan(&plan->nodes[2]); scan(&plan->nodes[3]);
     struct qp_node *j=&plan->nodes[1]; j->kind=QP_JOIN; j->left=2; j->right=3; j->join_type=join; j->join_qual=-1;
     j->hash=hash==1;
@@ -82,22 +115,70 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         a->expr.exprs[3+i]=(struct qs_expr){.op=Q_AGGREF,.column=i,.type=i==4?Q_DECIMAL:Q_INTEGER};
         a->expr.outputs[i+1]=(struct qs_output){.index=3+i,.type_oid=i==4?1700:20};
     }
+    if(parallel==TEST_COUNT_ROWS) {
+        /* COUNT(*) needs row cardinality but no payload from the probe pipeline. */
+        j->expr.nout=0; a->nkeys=a->expr.nkeys=a->expr.nattrs=0;
+        a->expr.naggs=a->expr.nout=1; a->expr.aggs[0]=(struct qs_agg){.kind=Q_COUNT_STAR};
+        a->expr.outputs[0]=(struct qs_output){.index=3,.type_oid=20};
+    }
+    if(parallel==TEST_BUILD_FALLBACK) {
+        /* The small inner build needs a parallel grouped input; the large
+         * outer build falls back while its own scan still has buffered rows. */
+        plan->count=7; j->left=4;
+        plan->nodes[4]=*j; plan->nodes[4].left=2; plan->nodes[4].right=5;
+        plan->nodes[4].expr.nout=2;
+        plan->nodes[5]=*a; plan->nodes[5].left=6; plan->nodes[5].nkeys=plan->nodes[5].expr.nkeys=1;
+        plan->nodes[5].expr.nattrs=2; plan->nodes[5].expr.naggs=1; plan->nodes[5].expr.nout=2;
+        plan->nodes[5].expr.aggs[0].expr=1;
+        plan->nodes[5].expr.outputs[1]=(struct qs_output){.index=3,.type_oid=20};
+        plan->nodes[6]=plan->nodes[3];
+    }
     size_t sizes[2]; unsigned char *raw[2]={heap(rows,0,&sizes[0]),heap(right_rows,1,&sizes[1])};
     size_t bytes=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
     for(unsigned i=2;i<4;++i) {
-        plan->nodes[i].bytes=sizes[i-2]; plan->nodes[i].input_offset=bytes; bytes+=QP_SCAN_BYTES;
-        plan->nodes[i].vector_offset=bytes; bytes+=(qs_chunk_bytes(QP_SCAN_BYTES/24,2)+4095)&~(size_t)4095;
+        plan->nodes[i].bytes=sizes[i-2]; plan->nodes[i].input_offset=bytes; bytes+=plan->scan_bytes;
+        plan->nodes[i].vector_offset=bytes; bytes+=(qs_chunk_bytes(plan->scan_bytes/24,2)+4095)&~(size_t)4095;
+    }
+    if(parallel==TEST_BUILD_FALLBACK) {
+        plan->nodes[6].bytes=plan->nodes[3].bytes;
+        plan->nodes[6].input_offset=plan->nodes[3].input_offset;
+        plan->nodes[6].vector_offset=plan->nodes[3].vector_offset;
     }
     if(hash==2) {
         j->input_offset=bytes; bytes+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE;
         j->vector_offset=bytes; bytes+=4096+((qs_chunk_bytes(256,4)+4095)&~(size_t)4095);
     }
+    size_t parallel_bytes=bytes;
+    if(parallel) {
+        plan->workers=4; plan->nodes[1].parallel=1;
+        plan->nodes[2].parallel_input=parallel_bytes; parallel_bytes+=plan->scan_bytes;
+        plan->nodes[2].parallel_vector=parallel_bytes; parallel_bytes+=(qs_chunk_bytes(plan->scan_bytes/24,2)+4095)&~(size_t)4095;
+        if(hash==2) {
+            j->parallel_input=parallel_bytes; parallel_bytes+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE;
+            j->parallel_vector=parallel_bytes; parallel_bytes+=4096+((qs_chunk_bytes(256,4)+4095)&~(size_t)4095);
+        }
+        if(parallel==TEST_BUILD_PHASE || parallel==TEST_BUILD_FALLBACK) {
+            plan->nodes[3].parallel=1;
+            plan->nodes[3].parallel_input=plan->nodes[2].parallel_input;
+            plan->nodes[3].parallel_vector=plan->nodes[2].parallel_vector;
+        }
+        if(parallel==TEST_BUILD_FALLBACK) {
+            plan->nodes[6].parallel=1;
+            plan->nodes[6].parallel_input=plan->nodes[2].parallel_input;
+            plan->nodes[6].parallel_vector=plan->nodes[2].parallel_vector;
+        }
+        plan->parallel_stride=parallel_bytes-bytes; bytes+=4*plan->parallel_stride;
+    }
     unsigned char *index=hash==2?index_page(right_rows):NULL;
-    unsigned char *arena=calloc(1,bytes),*io=calloc(1,QS_SORT_IO_BYTES); assert(arena && io);
+    unsigned char *arena=calloc(1,bytes),*io=calloc(5,QS_SORT_IO_BYTES); assert(arena && io);
     struct qs_dict *dict=(void *)arena; *dict=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
-    for(unsigned i=2;i<4;++i) *(struct qs_chunk *)(arena+plan->nodes[i].vector_offset)=(struct qs_chunk){.capacity=QP_SCAN_BYTES/24,.ncols=2};
-    struct qp_control control={0}; struct qs_result *out=calloc(1,sizeof(*out)); assert(out);
-    void *mr[]={plan,&control,out,arena,io}; long long len[]={sizeof(*plan),sizeof(control),sizeof(*out),bytes,QS_SORT_IO_BYTES};
+    for(unsigned i=2;i<4;++i) *(struct qs_chunk *)(arena+plan->nodes[i].vector_offset)=(struct qs_chunk){.capacity=plan->scan_bytes/24,.ncols=2};
+    struct qp_control controls[5]={{0}};
+#define control controls[0]
+    struct qs_result *out=calloc(5,sizeof(*out)); assert(out);
+    for(unsigned w=0;w<plan->workers;++w)
+        *(struct qs_chunk *)(arena+plan->nodes[2].parallel_vector+w*plan->parallel_stride)=(struct qs_chunk){.capacity=plan->scan_bytes/24,.ncols=2};
+    void *mr[]={plan,&control,out,arena,io}; long long len[]={sizeof(*plan),sizeof(controls),5*sizeof(*out),bytes,5*QS_SORT_IO_BYTES};
     struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=len};
     void **tokens=NULL; size_t ntokens=0; unsigned got=0; unsigned char seen[12]={0};
     uint64_t counts[12]={0},sums[12]={0},mins[12]={0},maxs[12]={0};
@@ -116,9 +197,25 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             ++counts[key]; sums[key]+=v; if(!mins[key] || mins[key]>v) mins[key]=v; if(maxs[key]<v) maxs[key]=v;
         }
     }
+    unsigned available=0,done=0,epoch=0;
     for(unsigned iteration=0;!out->finished;++iteration) {
-        assert(iteration<1000000);
+        if(control.parallel && !csIsReentry(&args)) {
+            pthread_t threads[4]; struct probe_test tasks[4]; unsigned started=0;
+            for(unsigned w=0;w<plan->workers;++w) if(!((available|done)&(1U<<w))) {
+                tasks[w]=(struct probe_test){run,args,plan,&controls[w+1],&out[w+1],arena,raw[0],raw[1],index,w+1};
+                tasks[w].args.cparam1=(w+1)<<1;
+                assert(!pthread_create(&threads[w],NULL,probe_worker,&tasks[w])); started|=1U<<w;
+            }
+            for(unsigned w=0;w<plan->workers;++w) if(started&(1U<<w)) {
+                assert(!pthread_join(threads[w],NULL)); available|=1U<<w;
+                if(out[w+1].finished) done|=1U<<w;
+            }
+            control.available=available;
+        }
+        if(iteration==1000000) { fprintf(stderr,"STUCK join=%u hash=%d parallel=%d epoch=%u avail=%u done=%u active=%u rows=%u node=%u reads=%u bytes=%u\n",join,hash,parallel,control.epoch,available,done,control.parallel,out->rows,control.node,control.index_nreads,control.bytes); abort(); }
+        unsigned consumed=csIsReentry(&args)?control.drained:0,previous_epoch=control.epoch;
         int64_t status=run(&args);
+        if(control.epoch==previous_epoch) assert((control.drained&consumed)==consumed);
         if(status<0) { fprintf(stderr,"native plan status=%lld join=%u row=%u state=%llu\n",(long long)status,join,rows,(unsigned long long)control.state); abort(); }
         uint64_t op=(uint64_t)status>>60,id=(uint64_t)status&CS_IO_VALUE_MASK;
         if(op) {
@@ -127,8 +224,13 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             else { assert(op==3 && id && id<=ntokens && tokens[id-1]); free(tokens[id-1]); tokens[id-1]=NULL; args.cparam2=id; }
             continue;
         }
-        args.cparam2=0;
+        args.cparam2=0; available&=~control.drained;
+        if(control.epoch!=epoch) { epoch=control.epoch; available=done=0; }
         for(unsigned r=0;r<out->rows;++r) {
+            if(parallel==TEST_COUNT_ROWS) {
+                uint64_t expected=0; for(unsigned i=0;i<12;++i) expected+=counts[i];
+                assert(out->data[r].cells[0].value==expected); ++got; continue;
+            }
             struct qs_cell *v=out->data[r].cells; unsigned key=v[0].isnull?11:(unsigned)v[0].value;
             assert(key<12 && seen[key]); seen[key]=0; ++got;
             if(v[1].isnull!=!counts[key] || v[2].value!=counts[key])
@@ -150,26 +252,27 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             }
             control.ready=1;
         } else if(control.bytes && !control.ready) {
-            assert(control.node>=2 && control.node<4);
+            assert((control.node>=2 && control.node<4) || control.node==6);
             struct qp_node *n=&plan->nodes[control.node];
-            memcpy(arena+n->input_offset,raw[control.node-2]+control.offset,control.bytes); control.ready=1;
+            memcpy(arena+n->input_offset,raw[control.node==2?0:1]+control.offset,control.bytes); control.ready=1;
         }
     }
-    assert(got); for(unsigned i=0;i<12;++i) assert(!seen[i]);
+    assert(got); if(parallel!=TEST_COUNT_ROWS) for(unsigned i=0;i<12;++i) assert(!seen[i]);
     for(size_t i=0;i<ntokens;++i) free(tokens[i]);
     free(tokens); free(raw[0]); free(raw[1]); free(index); free(plan); free(arena); free(io); free(out);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
 }
+#undef control
 static int descending(const void *a,const void *b)
-{ return (*(const unsigned *)a<*(const unsigned *)b)-(*(const unsigned *)a>*(const unsigned *)b); }
+{ return (*(const int32_t *)a<*(const int32_t *)b)-(*(const int32_t *)a>*(const int32_t *)b); }
 static void nested_sort(function run)
 {
     unsigned rows=50003; size_t raw_bytes;
     unsigned char *raw=heap(rows,2,&raw_bytes);
-    unsigned *expected=malloc(rows*sizeof(*expected)); assert(expected);
-    for(unsigned i=0;i<rows;++i) expected[i]=(uint64_t)i*1009%100003;
+    int32_t *expected=malloc(rows*sizeof(*expected)); assert(expected);
+    for(unsigned i=0;i<rows;++i) expected[i]=(int32_t)((uint64_t)i*1009%100003)-50000;
     qsort(expected,rows,sizeof(*expected),descending);
-    struct qp_plan *p=calloc(1,sizeof(*p)); assert(p); p->count=4;
+    struct qp_plan *p=calloc(1,sizeof(*p)); assert(p); p->count=4; p->scan_bytes=QP_SCAN_BYTES;
     scan(&p->nodes[3]); p->nodes[3].bytes=raw_bytes;
     struct qp_node *a=&p->nodes[1]; a->kind=QP_AGGREGATE; a->left=2; a->right=-1; a->sorted_input=1;
     a->nkeys=a->expr.nkeys=1; a->expr.predicate=-1; a->expr.nout=a->expr.nexprs=2;
@@ -207,7 +310,7 @@ static void nested_sort(function run)
         args.cparam2=0;
         for(unsigned r=0;r<out->rows;++r) {
             if(seen>=rows || out->data[r].cells[1].value!=expected[seen]) {
-                fprintf(stderr,"nested sort row=%u got=%lld expected=%u\n",seen,(long long)out->data[r].cells[1].value,seen<rows?expected[seen]:0); abort();
+                fprintf(stderr,"nested sort row=%u got=%lld expected=%d\n",seen,(long long)out->data[r].cells[1].value,seen<rows?expected[seen]:0); abort();
             }
             ++seen;
         }
@@ -218,14 +321,47 @@ static void nested_sort(function run)
     free(tokens); free(raw); free(expected); free(p); free(arena); free(io); free(out);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
 }
+struct dictionary_test { struct qs_dict *dictionary; unsigned worker; };
+static void *dictionary_worker(void *arg)
+{
+    struct dictionary_test *t=arg;
+    for(unsigned i=0;i<5000;++i) {
+        char text[64]; const char *value; unsigned length;
+        unsigned n=snprintf(text,sizeof(text),"shared-%u",i%997);
+        int id=qs_dict_insert(t->dictionary,text,n); assert(id>0);
+        assert(!qs_dict_get(t->dictionary,id,&value,&length) && length==n && !memcmp(value,text,n));
+        n=snprintf(text,sizeof(text),"unique-%u-%u",t->worker,i);
+        id=qs_dict_insert(t->dictionary,text,n); assert(id>0);
+        assert(!qs_dict_get(t->dictionary,id,&value,&length) && length==n && !memcmp(value,text,n));
+    }
+    return NULL;
+}
+static void parallel_dictionary(void)
+{
+    struct qs_dict *d=calloc(1,qs_dict_bytes(32768,1024*1024)); assert(d);
+    *d=(struct qs_dict){.entries=32768,.capacity=32768,.data=1024*1024};
+    pthread_t threads[4]; struct dictionary_test tasks[4];
+    for(unsigned w=0;w<4;++w) { tasks[w]=(struct dictionary_test){d,w}; assert(!pthread_create(&threads[w],NULL,dictionary_worker,&tasks[w])); }
+    for(unsigned w=0;w<4;++w) assert(!pthread_join(threads[w],NULL));
+    assert(d->count==20997); free(d);
+}
 int main(int argc,char **argv)
 {
     assert(argc==2); void *library=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(library);
     function run=(function)dlsym(library,"pg_sina_plan"); assert(run); assert(!cs_work_init(64*1024*1024));
     for(int hash=0;hash<3;++hash)
-        for(unsigned join=QP_INNER;join<=QP_ANTI;++join) test(run,join,517,23,64,hash);
-    test(run,QP_LEFT,20000,23,4,0);
-    test(run,QP_LEFT,73,20000,8,1);
-    nested_sort(run);
+        for(unsigned join=QP_INNER;join<=QP_ANTI;++join) test(run,join,517,23,64,hash,TEST_SERIAL);
+    for(unsigned join=QP_INNER;join<=QP_ANTI;++join) {
+        test(run,join,5170,23,64,1,TEST_PARALLEL);
+        test(run,join,5170,23,64,1,TEST_BUILD_PHASE);
+        test(run,join,5170,23,64,2,TEST_PARALLEL);
+    }
+    test(run,QP_INNER,120000,23,8,1,TEST_PARALLEL);
+    test(run,QP_INNER,120000,23,8,1,TEST_LARGE_SCAN);
+    test(run,QP_INNER,5170,23,64,1,TEST_COUNT_ROWS);
+    test(run,QP_LEFT,20000,23,4,0,TEST_SERIAL);
+    test(run,QP_LEFT,73,20000,8,1,TEST_SERIAL);
+    test(run,QP_INNER,73,60000,8,1,TEST_BUILD_FALLBACK);
+    nested_sort(run); parallel_dictionary();
     puts("PASS native Plan joins, NULL/duplicate keys, MIN/MAX/AVG, spill and cleanup");
 }

@@ -396,3 +396,19 @@ Q9提交后复核Q5/Q10（连接顺序/预算已变化）：Q5 host均值2275.09
 - 唯一入口为 `tests/guest/tpch-test.sh`；主机 `tests/pg-sina-csd-test.sh tpch` 直接调用它。旧命令入口删除，活动README依赖同步更新。
 - AGENTS.md明确唯一SQL来源及性能门槛：只有实际内存不足导致必须频繁spill的较高延迟可以接受，实现不完整/不够优化造成的退化不合格。
 - 当前扩展使用统一22条SQL重测：完整结果及实际卸载全部通过，无超时或参考SQL；Q1/Q6较快，20条更慢，按新规则性能未达标，脚本返回1。较慢项另行采集内存/spill/CPU，不能以结果一致或发生spill直接宣布合格。详见performance.md最后一节和 `results/tpch.sCmJHo/`。
+
+## 2026-10-23：通用 Plan 多 CU 与无 spill 慢查询优化
+
+本节更新前述“通用树单 CU”的状态，保持 PG 选定的连接树、标准 SQL、设备/PG 资源配置及冷启动规则不变。
+
+- Guest `src/executor/plan.c` 标记 Scan/Projection/Hash Probe/Index Probe 流水线，以现有 SNIA event/batch 推进至多四槽。设备 `plan.c` 动态领取块，Hash build 共享一次；阻塞节点消费紧密投影的内部批次，PG 不接收中间行。不同阶段复用缓冲，扫描块按 FDM 容量选 4/2/1 MiB，小表按实际大小分配。
+- 复用原 Filter 的 SIMD/selection/复杂条件短路与延迟 numeric，直接列投影省去解释器；已有字典值无锁查找、新增值仍加锁。动态状态和 Filter scratch 均计入同一查询根 workmem，放不下时回退原算法，不绕过总内存限制。
+- 索引页合并批量异步 LOAD→继续计算；SEMI/ANTI 匹配后停止查找。自连接借用当前保留的扫描块，块外仍使用原索引缓存。单整数/date run 新增有预算约束的 radix sort，其他类型保持原精确比较。
+- 修复 spill 重入丢失已消费缓冲标记、嵌套 Hash fallback 复用未消费完 AFDM 两个并发正确性问题；更深的 build 依赖优先完成。没有增加 FEMU/SNIA 协议、SQL runtime、配置开关或辅助进程。
+- 现有 profile 开关增加 Scan/Filter/Sort 调用边界计时、实际同时计算的 CU 峰值和 LOAD 请求准备统计；不逐行读时钟，累计分项不与总时间重复相加。
+
+验证：26 项设备 CTest、1 项 PG heap CTest 通过；原生 Plan 的 ASan+UBSan 通过（关闭 LeakSanitizer）。原生 Plan 测试覆盖四任务并发、Hash/Index 的 INNER/LEFT/SEMI/ANTI、多阶段 build、零列 COUNT(*)、并行后 spill、嵌套 fallback、4 MiB 输入块、负整数排序、并发字典插入以及 context 完整回收。spill 缓冲消费标记及嵌套 fallback 的新用例可使旧实现失败，修复后通过。
+
+真实 Guest：唯一入口 `tpch-test.sh` 完整 22 条结果一致并实际卸载；对 Q3/Q11/Q15/Q21 又各做两轮冷启动，所有结果一致。11 条无 spill 查询的独立 profile 都观察到 CU 并发峰值 4；没有改变 64 MiB 总 workmem。取消测试用原始 Q12 在 250ms 超时，再在同一个 backend 完成原始 Q12、Q7，完整结果与 host 一致。日志在 `results/tpch.qf481C/`、`tpch.8RuIV4/`、`tpch.PFtKzS/`。
+
+性能：完整轮 13 条未更慢、9 条仍未达标。Q3/Q11/Q21 的重复测量接近持平，个别样本略慢，不能宣称稳定加速；Q15 三轮中位数 host 2.263s / CSD 1.494s。其余 9 条的 spill 尚不能归因于物理 64 MiB 内存耗尽，节点配额和算法成本仍需继续优化。具体数据及口径见 performance.md 最后一节，结果正确和性能验收分别报告。

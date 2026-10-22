@@ -16,6 +16,8 @@ struct index_cursor {
     struct page_tag tags[QS_INDEX_CACHE];
     struct lookup keys[INDEX_KEYS];
     unsigned position, count, hand, waiting, pending;
+    const unsigned char *heap_window;
+    uint32_t heap_first,heap_pages;
 };
 struct index_join { cs_work_context *context; struct qs_plan scan; struct index_cursor cursors[QS_WORKERS]; struct qs_dict *dictionary; };
 static uint16_t u16(const unsigned char *p) { uint16_t x; memcpy(&x,p,2); return x; }
@@ -41,6 +43,17 @@ void qs_index_reset(struct qs_join_control *control,unsigned slot)
     struct index_join *h=(void *)(uintptr_t)control->state;
     memset(h->cursors[slot].tags,0,sizeof(h->cursors[slot].tags));
 }
+void qs_index_skip(struct qs_join_control *control,unsigned slot,uint64_t rows)
+{
+    struct index_join *h=(void *)(uintptr_t)control->state;
+    struct index_cursor *c=&h->cursors[slot];
+    for(unsigned i=0;i<c->count;++i) if(rows&(UINT64_C(1)<<c->keys[i].row)) c->keys[i].phase=4;
+}
+void qs_index_heap_window(struct qs_join_control *control,unsigned slot,const void *data,uint32_t first,uint32_t pages)
+{
+    struct index_join *h=(void *)(uintptr_t)control->state; struct index_cursor *c=&h->cursors[slot];
+    c->heap_window=data; c->heap_first=first; c->heap_pages=pages;
+}
 void qs_index_close(struct qs_join_control *control)
 {
     struct index_join *h=(void *)(uintptr_t)control->state;
@@ -50,6 +63,8 @@ void qs_index_dictionary(struct qs_join_control *control,struct qs_dict *diction
 { ((struct index_join *)(uintptr_t)control->state)->dictionary=dictionary; }
 static const unsigned char *page_at(struct index_cursor *c,struct qs_task *task,void *io,unsigned block,unsigned heap)
 {
+    if(heap && block>=c->heap_first && block-c->heap_first<c->heap_pages)
+        return c->heap_window+(size_t)(block-c->heap_first)*QS_PAGE;
     for(unsigned i=0;i<QS_INDEX_CACHE;++i) if(c->tags[i].state && c->tags[i].block==block && c->tags[i].heap==heap)
         return c->tags[i].state==1?(unsigned char *)io+QS_SORT_IO_BYTES+(size_t)i*QS_PAGE:NULL;
     if(task->index_nreads==QS_INDEX_READS) return NULL;
@@ -199,7 +214,7 @@ int64_t qs_index_probe(unsigned stage,struct qs_chunk *c,const struct qs_plan *p
                     unsigned dest=out->rows;
                     if(!dest) memset(qs_nulls(out),0,((out->capacity+7)/8)*(size_t)out->ncols);
                     int status=qs_scan_tuple(&h->scan,page,tuple-page,len,0,out,dest,h->dictionary); if(status) return status;
-                    if(j->semi) {
+                    if(j->semi>0) {
                         struct qs_eval eval={.plan=p,.chunk=out,.row=dest}; struct qs_cell match;
                         if(j->predicate<0 || qs_evaluate(&eval,j->predicate,&match) || match.isnull || !match.value) {
                             key->phase=2; continue;
@@ -212,9 +227,9 @@ int64_t qs_index_probe(unsigned stage,struct qs_chunk *c,const struct qs_plan *p
                         qs_dscales(out)[(size_t)slot*out->capacity+dest]=qs_dscales(c)[(size_t)src*c->capacity+key->row];
                         if(qs_nulls(c)[(size_t)src*((c->capacity+7)/8)+key->row/8]&(1U<<(key->row%8))) qs_nulls(out)[(size_t)slot*((out->capacity+7)/8)+dest/8]|=1U<<(dest%8);
                     }
-                    ++task->index_tuples; key->phase=j->semi?4:2;
+                    ++task->index_tuples; key->phase=j->semi>0?4:2;
                     qs_selection(out)[dest]=dest; ++out->rows; ++out->selected;
-                    if(out->rows==out->capacity) { int64_t status=flush(stage,out,p,task,control,a,cursor,0); if(status) return status; }
+                    if(j->semi<0 || out->rows==out->capacity) { int64_t status=flush(stage,out,p,task,control,a,cursor,0); if(status) return status; }
                 }
             }
             done+=key->phase==4;

@@ -8,31 +8,33 @@
 
 入口 `pg_sina_plan` 按顺序接收五个 AFDM：
 
-1. 只读设备计划。
-2. 控制记录：私有状态句柄、下次需要读取的文件节点/偏移/页号、就绪/结束/关闭标记。
-3. 分批最终结果 `qs_result`。
+1. 节点计划与执行器分配的缓冲偏移。
+2. 控制记录数组：整树任务及各流水线任务的私有状态句柄、所需页地址、完成/结束/关闭标记。
+3. 结果缓冲数组：首项是最终 `qs_result`，其余是设备内部交接批次；内部行紧密存储所需列，不传回 PG。
 4. 原始页输入、扫描列批次和共享字符串字典的交接区域。
-5. 64 KiB spill I/O 缓冲。
+5. 每个执行槽各 64 KiB 的 spill I/O 缓冲。
 
-`cparam1` 表示是否开启计时；`cparam2` 由 SNIA 用于 spill 重入。参数顺序由双方代码约定，不需要参数解码框架。
+本项目约定：`cparam1` 的最低位表示计时开关，其余位为执行槽编号；0 推进整树，1–4 执行当前并行流水线。执行槽不是固定的物理 CU 绑定，每次普通 E1 请求占用一个可用 CU。`cparam2` 仍仅由 SNIA 用于 spill 重入。参数顺序由双方代码约定，不改变 SNIA/FEMU 接口，也没有参数解码框架。
 
-设备 Scan 需要数据页时写控制记录并正常返回；Guest 仅把这些地址转换为 `csQueueStorageRequest(NVM_TO_AFDM)` 再继续调用。默认扫描块 1 MiB，索引按需读取 8 KiB 页。原始数据不经过 Guest PG 缓冲。设备执行中发现 spill 需要时直接返回 `csNeedStore/Load/Free` 完成值，由已有 SNIA batch 调度器处理并重入，PG 不接收或解释中间行。
+设备 Scan 需要数据页时写控制记录并正常返回；Guest 仅把这些地址转换为 `csQueueStorageRequest(NVM_TO_AFDM)` 再继续调用。扫描块由 Guest 根据 FDM 容量在 4/2/1 MiB 中选择，索引按需读取 8 KiB 页。原始数据不经过 Guest PG 缓冲。设备执行中发现 spill 需要时直接返回 `csNeedStore/Load/Free` 完成值，由已有 SNIA batch 调度器处理并重入，PG 不接收或解释中间行。
 
-通用树当前使用一个 CU，按行拉取组合节点，Scan 输出仍是列批次。中间行用精确 `qs_cell` 的 int128 值、精度和 NULL 传递，不先缩窄聚合结果为 int64。该路径尚未全部向量化或自动分配多个 CU；Q1/Q6 等单表聚合仍走下文已有的多槽列向量快路径。
+Guest 从 PG 选定的树中标记可并行的扫描/投影/Hash 或 Index Probe 段，包含初始化和 Hash Build 输入。设备先完成共享 Hash 表，再建立各 CU 独立的游标；任务从原子游标动态领取输入块。阻塞节点消费投影后的行批次，不重复构建 Hash 表。Guest 通过已有事件和批次请求推进每个完成的槽，不需要设备调度 runtime 或代理。
+
+不同流水线依次复用 AFDM；各任务的动态状态通过子 context 计入同一个查询预算。整树节点仍按行拉取组合，中间值保持精确 `qs_cell` 的 int128、精度和 NULL；Scan/Filter 则复用已有列向量和 SIMD 路径。Q1/Q6 继续使用下文的单表快路径。
 
 ## 节点与内存
 
 - Scan/Projection：只解码父节点真正需要的列；投影、过滤、CASE、NULL 三值逻辑、短路、数值运算、LIKE、substring 和 year 在设备执行。仅用于 LIKE 的长字符串直接在扫描时判断，不先将所有文本放入字典。
 - Hash Join：按 PG 的左右输入 build/probe，支持 INNER/LEFT/SEMI/ANTI 和多键等值/剩余条件。超出配额时保留已经消费的投影行，交给外部 Merge Join，不回头重扫原始 Heap。
 - Merge Join：分别排序输入，按键归并；重复键组可 spill，保留 NULL、重复和外连接语义。
-- Index Join：复用 `index_scan.c` 的 PG12 整数 B-tree 下探与 Heap Tuple 解码，可在连接树多个位置出现。最多批量 64 个外侧键；要求保留顺序时一次一个键。缺页只通过控制记录交给 Guest 提交内部 LOAD。
+- Index Join：复用 `index_scan.c` 的 PG12 整数 B-tree 下探与 Heap Tuple 解码，可在连接树多个位置出现。最多批量 64 个外侧键；要求保留顺序时一次一个键。缺页只通过控制记录交给 Guest 批量提交内部 LOAD。SEMI/ANTI 在消费端确认条件满足后停止查找该键；索引自连接复用当前扫描块中的 Heap 页，超出该块再读取，不建立跨查询缓存。
 - Aggregate：支持任意组合的 SUM/AVG/COUNT/MIN/MAX、分组和 HAVING；按组有序输入流式计算，否则先外部排序。COUNT DISTINCT 支持一组共享的 DISTINCT 输入列，排序后跳过重复/NULL。
 - Sort/Limit：复用 `sort.c` 的有界工作内存 run 和分批归并，完整处理输入、OFFSET/LIMIT、提前结束与回收。
 - CTE/InitPlan：共享 CTE 在设备计算一次并暂存，读者各自持有游标；标量初始化结果保存在设备参数数组。整数 IN/NOT IN 集合保留 NULL 和空集合语义。
 
 所有动态算法状态从 `libcs-workmem` 分配。通用查询先建立受 `max_memory` 限制的根 context；排序、索引子 context 同时计入根配额和全局池。Hash 表、run、归并游标不能放入 AFDM 来绕开工作内存上限。
 
-`sort.c` 每个 run 最大约 1 MiB，spill 块为 64 KiB。内存优先保留 run，下一段超过预算才 STORE；归并 fan-in 受缓存预算限制，必要时分轮合并并释放旧 token。需要读缓存时优先 spill 驻留 run，避免驻留数据挤占缓存、每输出几行便重新读取整个块。字符串比较使用字典；短最终字符串排序标记为 `UINT8_MAX`，不能与合法的 numeric 显示精度重叠。
+`sort.c` 每个 run 最大约 1 MiB，spill 块为 64 KiB。内存优先保留 run，下一段超过预算才 STORE；归并 fan-in 受缓存预算限制，必要时分轮合并并释放旧 token。需要读缓存时优先 spill 驻留 run，避免驻留数据挤占缓存、每输出几行便重新读取整个块。单个非 NULL int64 范围整数/date 键优先用 radix sort，并跳过常量字节；scratch 计入 run 所有者的配额，放不下时保留原有排序，不额外制造 spill。多键、NULL、字符串和宽 numeric 继续走原有精确比较。字符串比较使用字典；短最终字符串排序标记为 `UINT8_MAX`，不能与合法的 numeric 显示精度重叠。
 
 正常完成或提前 Limit 后释放私有 context；取消/错误时 Guest 再提交 close，随后关闭当前 SNIA 会话，释放仍存活的临时 token。没有后台代理或独立设备执行进程。
 
@@ -52,7 +54,7 @@
 
 单表快路径最多四个独立 SERIAL batch，完成的执行槽立即领取下一块，不等待固定四分支轮次。Scan 按需输出 int64 列、NULL 位图、显示精度和 selection；numeric 可延迟到筛选后解码。`query_vector.h` 每批 256 行，复用列引用/常量和公共表达式，只为仍存活的行计算复杂条件。AVX2 支持比较、无溢出的加减和 int32×int32→int64；其他情况用精确 int128。没有浮点近似。
 
-动态 Hash/聚合状态属于 workmem，FDM 仅作输入输出。单表入口 `profile.c` 包装计时，默认关闭；需要计时的 AFDM 放在 spill I/O 之前。通用树计时在 `pg_sina_plan` 入口累计整个 CSF，不把树内递归时间相加冒充独占 CPU。
+动态 Hash/聚合状态属于 workmem，FDM 仅作输入输出。单表入口 `profile.c` 包装计时，默认关闭；需要计时的 AFDM 放在 spill I/O 之前。通用树在 `pg_sina_plan` 入口累计整个 CSF，同时在 Scan/Filter/Sort 的调用边界计时；各 worker 结束后合并计数。还记录实际同时运行的 CU 峰值。算子分项包含在 CSF 总时间中，不能与总时间相加，也不对逐行递归反复计时。
 
 ## 构建和验证
 

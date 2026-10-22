@@ -42,7 +42,7 @@ if(BUILD_TESTING)
     target_include_directories(pg-sina-plan-test PRIVATE "${CSD_FEMU_INCLUDE}" "${CMAKE_CURRENT_SOURCE_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
     target_compile_options(pg-sina-plan-test PRIVATE -UNDEBUG)
-    target_link_libraries(pg-sina-plan-test PRIVATE cs-workmem ${CMAKE_DL_LIBS})
+    target_link_libraries(pg-sina-plan-test PRIVATE cs-workmem ${CMAKE_DL_LIBS} Threads::Threads)
     add_dependencies(pg-sina-plan-test pg-sina-plan)
     add_test(NAME pgSinaNativePlan COMMAND pg-sina-plan-test $<TARGET_FILE:pg-sina-plan>)
 endif()
