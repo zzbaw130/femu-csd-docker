@@ -367,3 +367,5 @@ Q9提交后复核Q5/Q10（连接顺序/预算已变化）：Q5 host均值2275.09
 - Q17 在 `exe_path=csd` 下的 EXPLAIN 已从 `Join Filter: (... SubPlan 1)` 变为：
   `Hash Join` + 右侧 `Finalize GroupAggregate Group Key: lineitem_1.l_partkey`，不再有 SubPlan。
 - 该阶段只完成 PG planner 前的重写，设备尚未实现 grouped derived table 的 materialize/build 算子，因此 Q17 设备路径仍不能完整 offload；不能把 Q17 加入已支持列表。
+
+重写等价性验证：同一 Q17 的手写 grouped join 与 CSD planner 重写后的查询结果一致（348406.054285714286），说明当前 rewrite 不改变结果。

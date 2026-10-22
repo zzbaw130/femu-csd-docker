@@ -707,4 +707,4 @@ Q18 使用 IN→HAVING 消解，小规模三表 host/CSD 结果逐字一致。SF
 
 ## 阶段3n（基础设施）：Q17 子查询 decorrelation
 
-Q17 在 CSD planner 前改写为 grouped aggregate + join，EXPLAIN 已无 SubPlan，显示 `Hash Join` + `Finalize GroupAggregate (Group Key: l_partkey)`。设备端尚未实现 grouped subquery 的 build/materialize，因此没有 Q17 CSD 延迟记录，Q17 未标记完成。
+Q17 在 CSD planner 前改写为 grouped aggregate + join，EXPLAIN 已无 SubPlan，显示 `Hash Join` + `Finalize GroupAggregate (Group Key: l_partkey)`。设备端尚未实现 grouped subquery 的 build/materialize，因此没有 Q17 CSD 延迟记录，Q17 未标记完成。手写 grouped join 与重写后的查询结果一致（348406.054285714286）。
