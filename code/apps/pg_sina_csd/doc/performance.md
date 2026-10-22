@@ -704,3 +704,7 @@ CSD约4.7倍 host，性能未达标。同规模合成表（150k customer/1.5M or
 ## 阶段3m（部分）：Q18 HAVING（2026-10-22）
 
 Q18 使用 IN→HAVING 消解，小规模三表 host/CSD 结果逐字一致。SF1 规模 host Q18 可完成（104 行）；单轮 host 6M=14905.102ms、CSD=15088.137ms，100行 cmp 通过；3轮冷启动再次导致 guest 失去响应；16MB 单轮超过60s无返回，最低验收内存64MB，未标记完成。
+
+## 阶段3n（基础设施）：Q17 子查询 decorrelation
+
+Q17 在 CSD planner 前改写为 grouped aggregate + join，EXPLAIN 已无 SubPlan，显示 `Hash Join` + `Finalize GroupAggregate (Group Key: l_partkey)`。设备端尚未实现 grouped subquery 的 build/materialize，因此没有 Q17 CSD 延迟记录，Q17 未标记完成。

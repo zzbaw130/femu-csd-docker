@@ -356,3 +356,14 @@ Q9提交后复核Q5/Q10（连接顺序/预算已变化）：Q5 host均值2275.09
 - Q18 专用 planner 移除 SubLink、编译正常三表聚合，并附加 Q_GT(Q_AGGREF,300)。
 - 验证：10k customer/20k orders/60k lineitem 测试表上 host/CSD 结果逐字一致，LIMIT 100 通过。
 - 补充：SF1 规模三表装载完成后，host Q18 6M 行数据集可完成（104 行输出）；后续单轮实测：host 6M Q18 14905.102ms、CSD 15088.137ms，100行结果 cmp 通过。3轮冷启动脚本再次导致 guest 失去响应；16MB 单轮超过60s无返回，最低验收内存为64MB；Q18 暂不能标记完成。
+
+## 阶段3n（基础设施）：planner 前子查询 decorrelation（2026-10-22）
+
+- 新增 `planner_hook` 包装：CSD 模式下先复制 Query，在 `standard_planner` 之前运行 `pg_sina_rewrite_query()`。
+- 首个形态：WHERE 中等值相关、单聚合的 `EXPR_SUBLINK`（Q17/Q22 类）。
+  - 原 SubLink 子查询改写成 `GROUP BY correlation_key` 的 derived table；
+  - 外层 WHERE 中的 SubLink 替换为该 derived table 的值列；
+  - 增加外层 correlation key 与 derived key 的等值 join qual。
+- Q17 在 `exe_path=csd` 下的 EXPLAIN 已从 `Join Filter: (... SubPlan 1)` 变为：
+  `Hash Join` + 右侧 `Finalize GroupAggregate Group Key: lineitem_1.l_partkey`，不再有 SubPlan。
+- 该阶段只完成 PG planner 前的重写，设备尚未实现 grouped derived table 的 materialize/build 算子，因此 Q17 设备路径仍不能完整 offload；不能把 Q17 加入已支持列表。

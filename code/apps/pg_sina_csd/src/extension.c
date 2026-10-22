@@ -10,6 +10,14 @@ int pg_sina_exe_path = 0;
 bool pg_sina_profile = false;
 int pg_sina_max_memory = 64*1024; /* KiB, independent of AFDM capacity. */
 static create_upper_paths_hook_type previous_upper_hook;
+static planner_hook_type previous_planner_hook;
+static PlannedStmt *hooked_planner(Query *parse,int cursorOptions,ParamListInfo boundParams)
+{
+    Query *query=copyObject(parse);
+    if(pg_sina_exe_path==1) pg_sina_rewrite_query(query);
+    if(previous_planner_hook) return previous_planner_hook(query,cursorOptions,boundParams);
+    return standard_planner(query,cursorOptions,boundParams);
+}
 static void upper_hook(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *input,RelOptInfo *output,void *extra)
 {
     if(previous_upper_hook) previous_upper_hook(root,stage,input,output,extra);
@@ -34,6 +42,7 @@ void _PG_init(void)
     RegisterCustomScanMethods(&pg_sina_scan_methods);
     RegisterCustomScanMethods(&pg_sina_order_methods);
     previous_upper_hook=create_upper_paths_hook; create_upper_paths_hook=upper_hook;
+    previous_planner_hook=planner_hook; planner_hook=hooked_planner;
 }
 PG_FUNCTION_INFO_V1(pg_sina_csd_version);
 Datum pg_sina_csd_version(PG_FUNCTION_ARGS)
