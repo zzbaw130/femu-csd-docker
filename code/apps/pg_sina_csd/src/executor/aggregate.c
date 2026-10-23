@@ -151,6 +151,9 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
 {
     SniaState *s=(SniaState *)node; const struct qs_plan *p=&s->request.plan;
     ExplainPropertyText("Execution Path","csd",es);
+    ExplainPropertyInteger("CSD Device CUs",NULL,pg_sina_resources.cus,es);
+    ExplainPropertyInteger("CSD Device Workmem","bytes",pg_sina_resources.workmem_bytes,es);
+    ExplainPropertyInteger("CSD Query Memory Limit","bytes",pg_sina_query_memory(),es);
     ExplainPropertyText("CSD Scan Relation",get_rel_name(p->relid),es);
     ExplainPropertyText("CSD Scheduling","independent serial batches",es);
     if(p->external_aggregate) ExplainPropertyText("CSD Aggregation","adaptive partial-state merge",es);
@@ -212,7 +215,6 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
         ExplainPropertyInteger("CSD Heap Rows",NULL,s->result->metrics.scanned,es);
         ExplainPropertyInteger("CSD Matched Rows",NULL,s->result->metrics.matched,es);
         ExplainPropertyInteger("CSD Internal Read","bytes",s->result->metrics.input_bytes,es);
-        ExplainPropertyInteger("CSD Query Memory Limit","bytes",p->work_mem_bytes*s->result->metrics.workers+p->join.work_mem_bytes,es);
         ExplainPropertyInteger("CSD Workmem Peak","bytes",s->result->metrics.work_peak,es);
         if(p->join.relid) {
             ExplainPropertyInteger("CSD Build Rows",NULL,s->result->metrics.build_rows,es);

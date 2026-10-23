@@ -7,6 +7,18 @@
 extern int pg_sina_exe_path;
 extern bool pg_sina_profile;
 extern int pg_sina_max_memory;
+/* Per-backend device capacities, populated before finalizing an offloaded plan.
+ * Workmem is private compute memory; fdm_bytes is only the I/O buffer pool. */
+extern struct pg_sina_resources {
+    unsigned cus;
+    uint64_t fdm_bytes,workmem_bytes;
+} pg_sina_resources;
+void pg_sina_read_resources(const char *device);
+static inline uint64_t pg_sina_query_memory(void)
+{
+    uint64_t physical=pg_sina_resources.workmem_bytes;
+    return pg_sina_max_memory?Min(physical,(uint64_t)pg_sina_max_memory*1024):physical;
+}
 extern bool pg_sina_compiling_plan;
 extern const CustomScanMethods pg_sina_scan_methods;
 extern const CustomScanMethods pg_sina_order_methods;

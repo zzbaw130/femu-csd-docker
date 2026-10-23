@@ -8,7 +8,7 @@
 PG_MODULE_MAGIC;
 int pg_sina_exe_path = 0;
 bool pg_sina_profile = false;
-int pg_sina_max_memory = 64*1024; /* KiB, independent of AFDM capacity. */
+int pg_sina_max_memory = 0; /* KiB; 0 uses the device workmem capacity. */
 bool pg_sina_compiling_plan = false;
 static create_upper_paths_hook_type previous_upper_hook;
 static planner_hook_type previous_planner_hook;
@@ -32,6 +32,17 @@ static void assign_path(int value,void *extra)
 {
     if(value!=pg_sina_exe_path) ResetPlanCache();
 }
+static void assign_memory(int value,void *extra)
+{
+    if(value!=pg_sina_max_memory) ResetPlanCache();
+}
+static bool check_memory(int *value,void **extra,GucSource source)
+{
+    if(*value && *value<4*1024) {
+        GUC_check_errdetail("Use 0 for automatic device capacity, or at least 4 MB."); return false;
+    }
+    return true;
+}
 static const struct config_enum_entry execution_paths[] = {
     {"host", 0, false}, {"csd", 1, false}, {NULL, 0, false}
 };
@@ -43,7 +54,7 @@ void _PG_init(void)
     DefineCustomBoolVariable("pg_sina_csd.profile", "Collect device operator timings for EXPLAIN ANALYZE", NULL,
         &pg_sina_profile, false, PGC_USERSET, 0, NULL, NULL, NULL);
     DefineCustomIntVariable("pg_sina_csd.max_memory", "Maximum device work memory per query", NULL,
-        &pg_sina_max_memory, 64*1024, 4*1024, MAX_KILOBYTES, PGC_USERSET, GUC_UNIT_KB, NULL, NULL, NULL);
+        &pg_sina_max_memory, 0, 0, MAX_KILOBYTES, PGC_USERSET, GUC_UNIT_KB, check_memory, assign_memory, NULL);
     RegisterCustomScanMethods(&pg_sina_scan_methods);
     RegisterCustomScanMethods(&pg_sina_order_methods);
     RegisterCustomScanMethods(&pg_sina_plan_methods);

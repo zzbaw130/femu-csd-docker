@@ -6,6 +6,8 @@
 
 `plan.c` 编译成 `pg-sina-plan.so`。Guest 以 PG 已选中的连接树为基础，进行分组键过滤下推、计数预聚合等局部改写，转换为 `apps/pg_sina_csd/include/plan.h` 中的节点数组。该格式只属于本应用，FEMU 和 SNIA 没有为 SQL 增加协议。
 
+同一 SO 还提供 `pg_sina_workmem_capacity`：无 AFDM、无标量参数，正常返回共享 `libcs-workmem` 的总容量（字节），由 SNIA 通过 64 位 CompValue 交给 Guest。该调用不创建查询 context，也不分配查询工作内存。CU 数和 FDM 容量仍由 Guest 通过 SNIA 资源查询取得。
+
 入口 `pg_sina_plan` 按顺序接收五个 AFDM：
 
 1. 节点计划与执行器分配的缓冲偏移。

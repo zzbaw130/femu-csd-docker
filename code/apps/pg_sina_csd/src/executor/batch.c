@@ -59,6 +59,45 @@ static CsProperties *properties(CS_DEV_HANDLE device,CS_RESOURCE_TYPE type)
     CsProperties *p=malloc(length); if(!p) return NULL;
     if(csQueryDeviceProperties(device,type,&length,p)!=CS_SUCCESS) { free(p); return NULL; } return p;
 }
+struct pg_sina_resources pg_sina_resources;
+void pg_sina_read_resources(const char *path)
+{
+    static char cached_device[128];
+    if(pg_sina_resources.workmem_bytes && !strcmp(cached_device,path)) return;
+    int fd=open(path,O_RDONLY|O_CLOEXEC);
+    if(fd<0) elog(ERROR,"cannot open CSD resource query namespace: %m");
+    while(flock(fd,LOCK_EX|LOCK_NB)) {
+        if((errno!=EWOULDBLOCK && errno!=EINTR) || QueryCancelPending || ProcDiePending) {
+            close(fd); CHECK_FOR_INTERRUPTS(); elog(ERROR,"cannot lock CSD resource query namespace");
+        }
+        pg_usleep(1000L);
+    }
+    CS_DEV_HANDLE device=NULL;
+    struct program probe={.file="pg-sina-plan.so",.symbol="pg_sina_workmem_capacity",.index=511};
+    CsProperties *cus=NULL,*fdm=NULL; u64 bytes=0;
+    struct pg_sina_resources found={0};
+    HOLD_INTERRUPTS();
+    CS_STATUS status=csOpenCSx(path,NULL,&device);
+    if(status==CS_SUCCESS) {
+        cus=properties(device,CS_CSE_TYPE); fdm=properties(device,CS_FDM_TYPE);
+        if(!cus || !fdm) status=CS_DEVICE_ERROR;
+    }
+    if(status==CS_SUCCESS) status=load_program(device,&probe);
+    if(status==CS_SUCCESS) {
+        CsComputeRequest request={.CSFId=probe.function,.NumArgs=0};
+        status=csQueueComputeRequest(&request,NULL,NULL,NULL,NULL,&bytes);
+        if(status==CS_SUCCESS) {
+            found=(struct pg_sina_resources){.cus=cus->CSEDetails[0].CSE[0].NumCRs,
+                .fdm_bytes=fdm->FDMDetails[0].FDM[0].FDMSize,.workmem_bytes=bytes};
+            if(!found.cus || !found.fdm_bytes || !bytes || bytes>INT64_MAX) status=CS_DEVICE_ERROR;
+        }
+    }
+    if(device) { unload_program(device,&probe); csCloseCSx(device); }
+    free(cus); free(fdm); close(fd);
+    RESUME_INTERRUPTS(); CHECK_FOR_INTERRUPTS();
+    if(status!=CS_SUCCESS) elog(ERROR,"CSD resource query failed: status=%d",status);
+    pg_sina_resources=found; strlcpy(cached_device,path,sizeof(cached_device));
+}
 static void compute_request(CsBatchRequest *b,CS_CSF_ID function,CS_MEM_HANDLE *memories,unsigned count,CS_MEM_HANDLE counters)
 {
     memset(b,0,sizeof(*b)+8*sizeof(CsComputeArg)); b->ReqType=CS_QUEUE_COMPUTE;
@@ -170,6 +209,7 @@ static void join_metrics(struct qs_metrics *out,const struct qs_metrics *join)
     result->status=status; snprintf(result->error,sizeof(result->error),"%s: status=%d",#call,status); goto cleanup; } } while(0)
 void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct qs_result *result,bool profiling,struct pg_sina_stream **stream)
 {
+    pg_sina_read_resources(request->device);
     uint64_t start=profiling?clock_ns():0,phase=start,cleanup_start=0;
     struct qs_profile stats={0};
     CHECK_FOR_INTERRUPTS();
@@ -211,7 +251,6 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     struct qs_metrics join_totals={0};
     unsigned build_chunks=0;
     CS_MEM_HANDLE input[QS_WORKERS]={0},vectors[QS_WORKERS]={0},tasks[QS_WORKERS]={0},counters[QS_WORKERS]={0};
-    CsProperties *caps=NULL,*fdm=NULL;
     CsBatchRequest *load=NULL,*compute=NULL;
     struct qs_group group={0}; int group_ready=0,lock_fd=-1;
     unsigned workers=0,chunk=QS_CHUNK;
@@ -247,12 +286,10 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
         pg_usleep(100000L);
     }
     TRY(csOpenCSx(request->device,NULL,&device));
-    caps=properties(device,CS_CSE_TYPE); fdm=properties(device,CS_FDM_TYPE);
-    if(!caps || !fdm) { result->status=1; strcpy(result->error,"resource query failed"); goto cleanup; }
-    workers=caps->CSEDetails[0].CSE[0].NumCRs;
+    workers=pg_sina_resources.cus;
     if(workers>QS_WORKERS) workers=QS_WORKERS;
     if(!workers) goto cleanup;
-    uint64_t capacity=fdm->FDMDetails[0].FDM[0].FDMSize;
+    uint64_t capacity=pg_sina_resources.fdm_bytes;
     unsigned dict_entries=request->plan.dict_big?QS_DICT_BIG_ENTRIES:QS_DICT_SMALL_ENTRIES;
     unsigned dict_data=request->plan.dict_big?QS_DICT_BIG_DATA:QS_DICT_SMALL_DATA;
     size_t dict_size=request->plan.runtime_dict?qs_dict_bytes(dict_entries,dict_data):0;
@@ -273,11 +310,11 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     /* Keep room for grouped state and spill buffers (1 MiB), or the larger
      * expression scratch retained alongside a residual join filter (2 MiB). */
     if(joining && (request->plan.external_aggregate || request->plan.join.residual))
-        while(workers>1 && (uint64_t)pg_sina_max_memory*1024/2/workers<(request->plan.join.residual?2:1)*1024*1024) --workers;
+        while(workers>1 && pg_sina_query_memory()/2/workers<(request->plan.join.residual?2:1)*1024*1024) --workers;
     if(nchunks && workers>nchunks) workers=nchunks;
     /* One budget shared by all concurrent slots, including Filter scratch.
      * CSFs also clamp each share to the physical workmem pool capacity. */
-    uint64_t query_budget=(uint64_t)pg_sina_max_memory*1024;
+    uint64_t query_budget=pg_sina_query_memory();
     uint64_t build_budget=joining?query_budget/2:0;
     if(joining) {
         uint64_t estimated=0;
@@ -731,7 +768,7 @@ cleanup:
     for(unsigned i=0;i<FUNCTIONS;++i) unload_program(device,&programs[i]);
     if(device && !*stream)csCloseCSx(device);
     if(lock_fd>=0)close(lock_fd);
-    free(caps);free(fdm);free(load);free(compute);
+    free(load);free(compute);
     free(saved);
     if(profiling) {
         uint64_t now=clock_ns(); stats.cleanup_ns=now-cleanup_start; stats.total_ns=now-start;

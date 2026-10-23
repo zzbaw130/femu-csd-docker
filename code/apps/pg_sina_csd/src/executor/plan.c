@@ -166,9 +166,10 @@ static void start(PlanStateCsd *s)
             if(n->expr.cols[col].slot>=0 && n->expr.cols[col].type==Q_STRING && r->bytes>QS_DICT_SMALL_DATA) big=true;
     }
     if(!device) elog(ERROR,"CSD PG Plan has no prepared relation");
+    pg_sina_read_resources(device);
     s->profiling=pg_sina_profile; s->start_ns=clock_ns(); s->load_ns=s->load_calls=0;
     memset(s->plan->pipelines,0,sizeof(s->plan->pipelines));
-    s->plan->nodes[s->plan->root].expr.work_mem_bytes=(uint64_t)pg_sina_max_memory*1024;
+    s->plan->nodes[s->plan->root].expr.work_mem_bytes=pg_sina_query_memory();
     s->lock_fd=open(device,O_RDONLY|O_CLOEXEC);
     if(s->lock_fd<0) elog(ERROR,"cannot open CSD namespace");
     while(flock(s->lock_fd,LOCK_EX|LOCK_NB)) {
@@ -184,20 +185,9 @@ static void start(PlanStateCsd *s)
     bool parallel=false;
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].parallel) parallel=true;
     s->plan->workers=1; s->workers=0;
-    uint64_t capacity=0; int length=0;
-    if(csQueryDeviceProperties(s->device,CS_CSE_TYPE,&length,NULL)==CS_LENGTH_RETURNED) {
-        CsProperties *properties=palloc(length);
-        checked(csQueryDeviceProperties(s->device,CS_CSE_TYPE,&length,properties),"query CU count");
-        s->device_cus=properties->CSEDetails[0].CSE[0].NumCRs;
-        if(parallel) s->workers=Min(QS_WORKERS,properties->CSEDetails[0].CSE[0].NumCRs);
-        pfree(properties);
-    }
-    length=0;
-    if(csQueryDeviceProperties(s->device,CS_FDM_TYPE,&length,NULL)==CS_LENGTH_RETURNED) {
-        CsProperties *properties=palloc(length);
-        checked(csQueryDeviceProperties(s->device,CS_FDM_TYPE,&length,properties),"query FDM capacity");
-        capacity=properties->FDMDetails[0].FDM[0].FDMSize; pfree(properties);
-    }
+    s->device_cus=pg_sina_resources.cus;
+    if(parallel) s->workers=Min(QS_WORKERS,s->device_cus);
+    uint64_t capacity=pg_sina_resources.fdm_bytes;
     if(s->workers<=1) s->workers=0;
     s->plan->scan_bytes=QS_CHUNK;
     size_t arena;
@@ -235,7 +225,7 @@ static void start(PlanStateCsd *s)
     strcpy(download.common.UniqueName,"pg-sina-plan"); download.common.DataBuffer=descriptor; download.common.Length=sizeof(descriptor);
     u32 id; checked(csCSFDownload(s->device,&download,&id),"download"); s->loaded=true;
     CsConfigInfo config={.Type=CS_CSF_ACTIVATE,.u.CSFActivateInfo={.CSFId=510,.EEIId=1,.State=CS_ACTIVE_STATE}};
-    CsConfigData result; length=sizeof(result); checked(csConfig(s->device,&length,&config,&result),"activate"); s->active=true;
+    CsConfigData result; int length=sizeof(result); checked(csConfig(s->device,&length,&config,&result),"activate"); s->active=true;
     length=0; int count=0; CS_STATUS status=csGetCSFId(s->device,"pg-sina-plan",0,&length,&count,NULL);
     if(status!=CS_LENGTH_RETURNED) checked(status,"lookup function length");
     CSFIdInfo *functions=palloc(length); checked(csGetCSFId(s->device,"pg-sina-plan",0,&length,&count,functions),"lookup function");
@@ -455,6 +445,9 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
 {
     PlanStateCsd *s=(void *)node;
     ExplainPropertyText("Execution Path","csd",es);
+    ExplainPropertyInteger("CSD Device CUs",NULL,pg_sina_resources.cus,es);
+    ExplainPropertyInteger("CSD Device Workmem","bytes",pg_sina_resources.workmem_bytes,es);
+    ExplainPropertyInteger("CSD Query Memory Limit","bytes",s->plan->nodes[s->plan->root].expr.work_mem_bytes,es);
     ExplainPropertyText("CSD Plan Source","PostgreSQL selected Plan; original join tree",es);
     ExplainPropertyText("CSD Intermediate Data","device workmem and internal spill; 128-bit values",es);
     static const char *names[]={"Scan","Projection","Merge Join","Aggregate","Sort","Limit","Index Join","CTE Scan","CTE materialization","IN hash set"};

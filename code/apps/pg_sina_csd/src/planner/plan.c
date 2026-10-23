@@ -1067,17 +1067,20 @@ Plan *pg_sina_rewrite_plan(PlannerInfo *root,Plan *native)
     Oid ns=get_namespace_oid("sina_csd",true);
     if(!OidIsValid(ns) || !OidIsValid(get_relname_relid("relations",ns))) { pfree(tree); return native; }
     if(SPI_connect()!=SPI_OK_CONNECT) elog(ERROR,"SPI_connect failed");
-    bool prepared=true;
+    bool prepared=true; char device[128]={0};
     for(unsigned i=0;i<tree->count && prepared;++i) if(tree->nodes[i].kind==QP_SCAN) {
         Oid types[]={OIDOID,OIDOID};
         Datum values[]={ObjectIdGetDatum(tree->nodes[i].expr.relid),ObjectIdGetDatum(tree->nodes[i].expr.relfilenode)};
-        int status=SPI_execute_with_args("SELECT 1 FROM sina_csd.relations WHERE relid=$1 AND relfilenode=$2",2,types,values,NULL,true,1);
+        int status=SPI_execute_with_args("SELECT device FROM sina_csd.relations WHERE relid=$1 AND relfilenode=$2",2,types,values,NULL,true,1);
         prepared=status==SPI_OK_SELECT && SPI_processed==1;
+        if(prepared && !device[0]) strlcpy(device,SPI_getvalue(SPI_tuptable->vals[0],SPI_tuptable->tupdesc,1),sizeof(device));
     }
     SPI_finish();
     if(!prepared) { pfree(tree); return native; }
     root->init_plans=NIL; /* Scalar and CTE initializers now run on the device. */
     tree->root=result;
+    pg_sina_read_resources(device);
+    tree->nodes[result].expr.work_mem_bytes=pg_sina_query_memory();
     bytea *bytes=palloc(VARHDRSZ+sizeof(*tree)); SET_VARSIZE(bytes,VARHDRSZ+sizeof(*tree)); memcpy(VARDATA(bytes),tree,sizeof(*tree)); pfree(tree);
     CustomScan *scan=makeNode(CustomScan);
     scan->scan.plan=*native; NodeSetTag(scan,T_CustomScan);

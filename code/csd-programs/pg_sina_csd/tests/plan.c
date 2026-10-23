@@ -611,7 +611,17 @@ static void merge_input_parallelism(void)
 int main(int argc,char **argv)
 {
     merge_input_parallelism();
-    assert(argc==2); void *library=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(library);
+    assert(argc==2 || argc==3); void *library=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(library);
+    function capacity=(function)dlsym(library,"pg_sina_workmem_capacity"); assert(capacity);
+    if(argc==3) {
+        struct femu_csd_args args={0}; struct cs_work_stats stats;
+        uint64_t expected=strtoull(argv[2],NULL,10)*1024*1024;
+        assert(capacity(&args)==(int64_t)expected);
+        assert(!cs_work_get_stats(&stats) && stats.capacity_bytes==expected && !stats.used_bytes && !stats.active_contexts);
+        args.numr=1; assert(capacity(&args)<0);
+        printf("PASS device resource query: %llu MiB, no query allocations\n",(unsigned long long)(expected/1024/1024));
+        return 0;
+    }
     function run=(function)dlsym(library,"pg_sina_plan"); assert(run); assert(!cs_work_init(64*1024*1024));
     for(int hash=0;hash<3;++hash)
         for(unsigned join=QP_INNER;join<=QP_ANTI;++join) test(run,join,517,23,64,hash,TEST_SERIAL);

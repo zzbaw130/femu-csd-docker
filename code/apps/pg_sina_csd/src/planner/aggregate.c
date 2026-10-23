@@ -606,9 +606,12 @@ Plan *pg_sina_fast_plan(PlannerInfo *root,Plan *native)
     if(!OidIsValid(ns) || !OidIsValid(get_relname_relid("relations",ns))) return NULL;
     if(SPI_connect()!=SPI_OK_CONNECT) elog(ERROR,"SPI_connect failed");
     Oid types[]={OIDOID,OIDOID}; Datum values[]={ObjectIdGetDatum(plan.relid),ObjectIdGetDatum(plan.relfilenode)};
-    int status=SPI_execute_with_args("SELECT 1 FROM sina_csd.relations WHERE relid=$1 AND relfilenode=$2",2,types,values,NULL,true,1);
+    int status=SPI_execute_with_args("SELECT device FROM sina_csd.relations WHERE relid=$1 AND relfilenode=$2",2,types,values,NULL,true,1);
     bool prepared=status==SPI_OK_SELECT && SPI_processed==1;
+    char device[128]={0};
+    if(prepared) strlcpy(device,SPI_getvalue(SPI_tuptable->vals[0],SPI_tuptable->tupdesc,1),sizeof(device));
     SPI_finish(); if(!prepared) return NULL;
+    pg_sina_read_resources(device); plan.work_mem_bytes=pg_sina_query_memory();
     bytea *bytes=palloc(VARHDRSZ+sizeof(plan)); SET_VARSIZE(bytes,VARHDRSZ+sizeof(plan)); memcpy(VARDATA(bytes),&plan,sizeof(plan));
     CustomScan *scan=makeNode(CustomScan); scan->scan.plan=*native; NodeSetTag(scan,T_CustomScan);
     scan->scan.plan.lefttree=scan->scan.plan.righttree=NULL; scan->scan.plan.qual=NIL;

@@ -1735,6 +1735,14 @@ static void close_execution(struct execution *s)
     close_workers(s);
     cs_work_context *context=s->context; s->control->state=0; cs_work_end(context);
 }
+/* Resource discovery uses a normal zero-argument CSF and its 64-bit completion
+ * value. SNIA CSE properties report CUs, but do not describe this allocator. */
+int64_t pg_sina_workmem_capacity(struct femu_csd_args *a)
+{
+    struct cs_work_stats stats;
+    if(!a || a->numr || cs_work_get_stats(&stats) || stats.capacity_bytes>INT64_MAX) return -1;
+    return stats.capacity_bytes;
+}
 /* plan, lifecycle/page requests, result, input/dictionary arena, spill I/O.
  * A successful call either returns result rows or asks PG to LOAD pages.
  * NEED_STORE/LOAD is handled entirely by the existing SNIA batch scheduler. */

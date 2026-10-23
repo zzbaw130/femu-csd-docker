@@ -1082,3 +1082,14 @@ Q22 的 orders 构建输入流水线平均仅 1.05 CU、CPU 利用率 26.4%，�
 4 MiB 标准 Q13/Q16 的完整结果也与 host 一致：根峰值分别为 3.62/3.79 MiB，spill 读写各 616.69/74.19 MiB；Q13 使用 4 CU，Q16 因预算保留串行路径。这仅验证低预算正确性和上限，未作为低内存性能合格的证明。相关 Q9/Q20 定向回归位于 `results/tpch.5zhAxo/`，host/CSD 分别为 4015.164/2797.661 ms、4723.289/2025.058 ms，结果一致并实际卸载；没有重新运行完整 22 条。
 
 原生 Plan 测试及 ASan/UBSan 通过，新增覆盖并发重复键构建、跨多轮扩容、热点键 COUNT、多键字符串/NULL、精确 SUM/AVG、全局 DISTINCT、4 MiB spill 及 context/token 回收。环境不支持 LeakSanitizer，回收继续由分配器断言检查。计时只在批次与已有执行边界采集，不逐行读时钟。
+
+
+## 设备资源自动发现（2026-10-24）
+
+扩展在 backend 首次规划设备查询时读取 CU、FDM 和设备分配器的 workmem 总容量，保存为公共内部资源记录。`max_memory=0` 为默认自动模式，查询预算等于设备 workmem；非零值取用户上限与物理容量的较小值，全部 CU/节点共用此预算。查询上限改变时废弃缓存计划。容量查询通过现有 SNIA 的零参数 CSF 完成值返回，不修改 FEMU/SNIA 接口。仍保留已有最多四个 SQL 执行槽的限制。
+
+当前 Guest 自动发现 4 CU、64 MiB workmem。`results/device-resources.GvEQLr/` 核对单表快路径 Q6 和通用树 Q13 的普通 EXPLAIN：自动值为 64 MiB，显式 4 MiB 时为 4 MiB，显式 128 MiB 时仍为 64 MiB。两条标准 SQL 在 4 MiB 下完整结果均与 host 相同。同一会话的 PREPARE/EXPLAIN 也确认自动→4 MiB→128 MiB→自动时预算依次为 64/4/64/64 MiB，非零 1 MiB 设置仍被拒绝；临时 SQL 已删除。未重启 FEMU 或修改实验数据。
+
+默认自动模式的定向冷启动验收位于 `results/tpch.R12PiY/`：Q6 host/CSD 为 2572.930/768.324 ms，Q13 为 1436.065/774.988 ms，完整结果一致、实际卸载且本轮 CSD 较快。只验证相关两条查询，没有运行全量 TPC-H。
+
+原生 Plan 回归及 4/16/64/128 MiB 容量查询 CTest 全部通过；容量查询还经 ASan/UBSan 检查，确认无查询 context 或工作内存分配。不同物理容量的验证来自独立进程加载同一个设备 SO 和分配器并读取对应环境配置，真实 Guest 本轮保持 4 CU/64 MiB，未声称完成其他 CU 配置的实机测量。

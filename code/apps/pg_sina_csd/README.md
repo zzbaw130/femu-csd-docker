@@ -64,15 +64,20 @@ EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT count(*) FROM lineitem;
 需要顺序的、已准备映射的 PG12 整数前导键 B-tree 支持正向叶页遍历，按索引顺序回表并直接交给有序聚合，不再补 Heap 排序。索引页做有界预读；PG 相关性统计大于 0.9 时，Heap 也做有界正向预读。游标受 workmem 约束，页留在原 AFDM 缓存中。其他独立扫描仍可能降为 Heap；反向有序扫描仍补排序。Index Only Scan 当前仅支持所需列完全由已映射索引的整数前导键覆盖的形态，直接读取索引键，不回表；其他形态回退原路径。仍没有 Bitmap Scan、通用索引范围游标、部分/表达式索引或 PG13+ posting list 支持。
 
 ```sql
-SET pg_sina_csd.max_memory='64MB'; -- 查询设备工作内存上限，最低 4MB
+SET pg_sina_csd.max_memory=0;      -- 默认值，自动使用设备 workmem 总容量
+-- SET pg_sina_csd.max_memory='16MB'; -- 可选：进一步缩小查询预算，非零值最低 4MB
 SET pg_sina_csd.profile=on;       -- 开发时开启，默认 off
 ```
+
+扩展在每个 PG backend 首次规划已映射设备的 CSD 查询时，读取并保存该设备的 CU 数、FDM 容量及 workmem 总容量，供规划和两条执行路径共用。同一 backend 后续查询复用这些容量；设备重新配置后建立新 PG 连接即可重新发现，不需要修改扩展源码。CU/FDM 通过 `csQueryDeviceProperties` 获取；当前 SNIA 资源结构没有本项目分配器的 workmem 字段，因此调用 `pg-sina-plan.so` 中零参数的 `pg_sina_workmem_capacity`，通过 64 位 CompValue 返回 `cs_work_get_stats().capacity_bytes`。这是一条普通设备计算请求，不创建辅助进程，也不读取 Guest 的内存配置。
+
+自动模式下，CSD 查询总内存预算等于设备 workmem；显式设置非零 `max_memory` 时取两者较小值。例如设备为 32 MiB，即使设置 64 MiB，查询也只能使用 32 MiB。EXPLAIN 显示 `CSD Device CUs`、`CSD Device Workmem` 和 `CSD Query Memory Limit`，普通 EXPLAIN 即可核对。查询的所有并行 CU 和阻塞节点共享该总预算。实际执行槽数还受 FDM、内存及数据量约束；本次保留已有最多 4 个 SQL 执行槽的限制，读取到更多 CU 不会自动突破此上限。
 
 工作内存来自共享 `libcs-workmem`，查询根 context 和子排序/索引 context 同时记账，总量不超过查询设置和物理池容量。不是为每个节点各给一个完整的 `max_memory`。FDM 只放页输入、列批次、字符串交接和最终输出；Hash 表、run 描述和游标来自 workmem。排序优先保留内存 run，分配下一段将超过配额时请求 spill，而非等待某个固定的空闲百分比。
 
 spill 使用现有 SNIA batch 的 NEED_STORE/NEED_LOAD/NEED_FREE 重入协议，经设备内部 AFDM↔NVM 短路径存取临时 token。多路归并按缓存预算分轮合并；输入缓存不足时先 spill 驻留 run，为读缓存留出空间。查询正常完成、提前 Limit、取消和错误都要回收工作内存，关闭本查询 SNIA 会话时回收剩余临时 token。
 
-设备程序索引 510 供通用树使用，旧快路径使用 501–509；当前查询持有 namespace 文件锁，尚未支持多个 PG backend 同时卸载。SNIA 不能强制中断正在执行的 CSF，取消要等待当前请求完成再回收。
+设备程序索引 510 供通用树使用，旧快路径使用 501–509，511 仅在首次发现资源时短暂加载容量查询函数并随即卸载；当前查询持有 namespace 文件锁，尚未支持多个 PG backend 同时卸载。SNIA 不能强制中断正在执行的 CSF，取消要等待当前请求完成再回收。
 
 ## 精度和回退范围
 
