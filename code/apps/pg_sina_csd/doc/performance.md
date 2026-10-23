@@ -948,7 +948,7 @@ Q3/Q21 仍有大量索引页请求，Q11 的短查询受固定准备/请求开�
 
 具体瓶颈：
 
-- **Q9：大侧 Hash 构建及超限后的 Merge。** 按 PG 字段类型压缩 Hash 行、推迟阻塞子节点父表的分配并允许 workmem 原地扩容后，单向 spill 从约 677 MiB 降到 414 MiB。当前峰值 60.04 MiB，转归并仍引入大量排序，排序占累计 CSF CPU 约 48%。缺少分区 Hash Join，不能因此认定所有延迟均由物理内存不足造成。应优先让超限 Hash 分区处理，避免全量改用比较/归并路径。
+- **Q9：嵌套 Hash 表同时驻留，orders 连接回退为串行 Merge。** 已在下文逐节点确认：子表占 42 MiB，父表增长时超出根预算；随后对两侧和 GROUP BY 输入共做三次外部排序。缺少分区 Hash Join、多键 Hash Aggregate、并行构建及局部聚合，不能将其全部归为不可避免的容量退化。
 - **Q13：已消除不必要的 Merge 和聚合前排序。** 单整数键 COUNT 可以直接消费 LEFT JOIN 输出，正确跳过补出的 NULL；外层 PG HashAggregate 也保留 Hash 算法。整数 Hash 字段仅保存值和 NULL，不保存恒为零的 scale/dscale。原生 Parallel SeqScan 的 618687 行是单 worker 估计，设备扫描却消费整张表；现使用 PG 基表的全表过滤后估计，避免先建小表、随后扩容时因新旧块同时驻留而回退。标准查询完整结果一致，累计 CSF CPU 1.75s，spill 读写为 0，根峰值 61.58 MiB。剩余较慢样本主要应继续检查构建/聚合组合及请求交接，不能归因于 spill。
 - **Q17：32/64 MiB 下均已消除 spill。** 有界 Hash Aggregate 保留精确 SUM/count，取消分组前的大排序。Hash 表按字段类型存储整数、numeric 保留完整 128 位；阻塞子节点的父表按实际输出增长，避免提前挤占聚合预算；workmem 可利用相邻空闲块原地扩容，仍遵守父/子配额。32 MiB 的独立 profile 根峰值为 25.28 MiB，spill 读写为 0，树墙钟约 3.82s；完整结果与 host 一致。此前的低内存退化属于行存储及预留问题，本次已消除该瓶颈。
 - **Q18：已补正向有序索引扫描。** 原生 PG 的内层 GroupAggregate 直接读取 `lineitem_pkey`；设备现在同样沿叶链批量回表、按索引顺序流式聚合，去除 Heap 后补的 Sort。复用原来的页缓存和 LOAD 请求；最多预读 16 个索引页，只有 PG 相关性统计大于 0.9 时才最多预读 32 个 Heap 页。游标/TID 列表使用 workmem，AFDM 页缓存大小不增加，单个最近页命中直接返回。当前独立 profile 有 5962 次 CSF、7036 个 Host LOAD 请求，累计 CSF CPU 4.49s，spill 为 0。其他外层阻塞阶段仍沿用原实现。
@@ -964,3 +964,34 @@ Q13 已补整数前导键覆盖的 Index Only Scan，标准 SQL 完整结果一�
 Hash 存储/扩容定向验证：原生 Plan 覆盖四 CU、int32 负值、超过 int32 的 bigint、128 位 numeric 与精度、LEFT JOIN 的 NULL 补齐和 4 MiB 嵌套 Merge 回退；普通及 ASan/UBSan 通过。workmem 新增原地扩容及父配额、超限保留原块、SIZE_MAX 溢出测试；分配、共享预算与 C++ 头文件兼容测试通过。未运行完整 TPC-H。
 
 连接后聚合定向验证：原生 Plan 与 ASan/UBSan 通过，新增四 CU 的 INNER/LEFT JOIN 后 COUNT(列)，覆盖未匹配行和 NULL 分组；标准 Q13 验证两级 Hash Aggregate、结果及实际卸载。Q9/Q17 同时使用标准 SQL 冷启动回归，完整结果一致。
+
+## Q9：对照原生 PG 与 DuckDB 的节点级排查
+
+只执行 `tests/guest/queries/9.explain.sql` 的原始查询正文，分别冷启动 PG、清除 Guest page cache；仅增加 EXPLAIN ANALYZE/BUFFERS 等诊断选项。数据在 `results/q9-diagnosis/`。原生 PG 实际执行约 3.66s，CSD 诊断约 12.28s；这是开启诊断的独立样本，不替代前面的关闭计时验收。临时节点日志计数已移除，设备算子已重新编译恢复。Guest 未安装 DuckDB/pg_duckdb，因此 DuckDB 部分为本仓库源码对照，没有可比的 DuckDB 实测延迟。
+
+两边均按同一连接顺序执行全表扫描，PG 实际 shared read 为 160369 个 8 KiB 页，恰好等于 CSD 的 1313742848 字节内部读取。PG 没有利用索引避免扫描 lineitem；索引缺失不能解释本次差距。
+
+**已确认的回退位置是 node 3：orders 与 node 5 中间结果的连接。** 构建侧累计 131072 行时，父 Hash 表为 12.25 MiB，欲增至 24.5 MiB；与此同时 node 6 的子 Hash 表仍有 323844 行，容量 524288，占 42 MiB，supplier 小表还占约 0.34 MiB。根 context 已用 56.76 MiB，剩余仅约 7.24 MiB，最大空闲块约 6.95 MiB。即使这次能原地增长，新增 12.25 MiB 也放不下。此处不是单个节点配额过小：申请 24.5 MiB 低于当时约 54.15 MiB 的 Hash 上限。
+
+这证明当前同时驻留方式确有容量压力，但不能证明完整查询必须采用当前的慢路径。`hash_build` 会把父表转换为排序前缀，`parallel_next` 随即关闭受影响流水线的并行，`hash_next` 改走 Merge。其他较低层扫描/Probe 仍有四 CU，不能把峰值四 CU 理解为全查询四 CU 并行。
+
+节点日志明确分离出三份排序成本：
+
+| 用途 | 输入行数 | 列数 | spill 读/写各 MiB | sink+source CPU 秒 |
+| --- | ---: | ---: | ---: | ---: |
+| node 3 左侧：orders | 1500000 | 2 | 179.56 | 2.74 |
+| node 3 右侧：连接中间结果 | 323844 | 6 | 117.38 | 0.90 |
+| node 1：GROUP BY 前排序 | 323844 | 6 | 117.38 | 1.00 |
+| 合计 | — | — | 414.31 | 4.63 |
+
+PG 的两个大连接使用 Parallel Hash 的 16/8 个 batch，保持 Hash 算法，不把 orders 改为全量排序。全部临时 I/O 为读 122.55 MiB、写 124.13 MiB，明显低于 CSD 的各 414.31 MiB。PG 的两个 worker 加 leader 各自排序、部分聚合；每路聚合输出 175 行，Gather Merge 只收 525 行，最后输出 175 行。`work_mem=4MB` 是每节点/worker 的预算，不能与 CSD 查询全局 64 MiB 等同；本次未测 PG 查询总内存峰值。
+
+CSD 的排序仍按每列 32 字节的 `qs_cell` 保存：六列为 192 字节/行，323844 行仅原始行区就约 59.30 MiB。约 4.92 MiB 的排序配额与多轮归并进一步放大读写。Q9 的 nation 字符串键不能走现有整数/numeric radix 快路。聚合优化当前还要求单整数键、无上层顺序需求和简单聚合参数，Q9 的 nation/year 双键、amount 算术表达式及 ORDER BY 全部不满足，因此没有得到与 Q17 相同的 Hash 聚合收益。
+
+DuckDB 对照的是已有实现能力，不据此声称其 Q9 一定采用某个具体计划：
+
+- `physical_hash_join.cpp` 的 Sink 以 DataChunk 执行键表达式、引用所需 payload 列并构建局部表；Finalize 可以并行处理。当前 CSD 的协调端构建和 `next_row`/`hash_load`/`memcpy` 组合仍主要按行执行。
+- 同文件的外部路径及 `join_hashtable.cpp` 的 `PrepareExternalFinalize`、`ProbeAndSpill` 按 radix 分区选择驻留数据，将暂不能 Probe 的输入落盘，后续继续 Hash；不是超限后整体改为 Merge。
+- `physical_hash_aggregate.cpp` 与 `radix_partitioned_hashtable.cpp` 使用列批次和线程局部聚合，预算不足时调整内存预留或分区。可借鉴为先维护少量 nation/year 聚合状态，最后只对聚合结果排序；实际内存和收益仍需实现后验证。
+
+优化优先级：先实现有界分区 Hash Join，避免 orders 的全量排序并保留分区内并行；其次支持多键/表达式的局部 Hash Aggregate，将最终排序从 323844 行缩至 175 行；再减少中间行宽、连续表倍增的峰值和逐行复制。当前扫描解码约 1.73s 累计 CPU，三份排序约 4.63s，后者约占总 CSF CPU 9.43s 的 49%；继续只优化 Scan SIMD 或增加 CU 数不能消除已确认的算法退化。CPU 为跨 CU 累计，不能与查询墙钟直接相减计算 I/O。
