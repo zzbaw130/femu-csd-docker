@@ -416,6 +416,93 @@ static void nested_sort(function run,unsigned type,unsigned hash,unsigned kind)
     free(tokens); free(raw); free(expected); free(want); free(counts); free(p); free(arena); free(io); free(out);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
 }
+/* Two keys (text + nullable integer), expression SUM/AVG, adaptive growth
+ * and partial-state spill. The oracle groups independently by array indices. */
+struct expected_multi { unsigned a,b,rows,count; int64_t sum; };
+static int multi_order(const void *ap,const void *bp)
+{
+    const struct expected_multi *a=ap,*b=bp;
+    if(a->a!=b->a) return (a->a>b->a)-(a->a<b->a);
+    if(a->b==17 || b->b==17) return (a->b==17)-(b->b==17);
+    return (a->b<b->b)-(a->b>b->b);
+}
+static void multiple_groups(function run,unsigned memory,unsigned kind)
+{
+    unsigned rows=50003,total=1022*18,groups=0; size_t raw_bytes;
+    unsigned char *raw=heap(rows,2,&raw_bytes);
+    struct expected_multi *expected=calloc(total,sizeof(*expected)); assert(expected);
+    struct qp_plan *p=calloc(1,sizeof(*p)); assert(p); p->count=3; p->scan_bytes=QP_SCAN_BYTES;
+    struct qp_node *leaf=&p->nodes[2]; scan(leaf); leaf->bytes=raw_bytes;
+    leaf->expr.exprs[0].type=Q_STRING; leaf->expr.outputs[0].type_oid=25;
+    leaf->input_offset=(qs_dict_bytes(2048,65536)+4095)&~(size_t)4095;
+    leaf->vector_offset=leaf->input_offset+QP_SCAN_BYTES;
+    size_t bytes=leaf->vector_offset+qs_chunk_bytes(QP_SCAN_BYTES/24,2);
+    unsigned char *arena=calloc(1,bytes),*io=calloc(1,QS_SORT_IO_BYTES); assert(arena && io);
+    struct qs_dict *dict=(void *)arena; *dict=(struct qs_dict){.entries=2048,.capacity=2048,.data=65536};
+    int ids[1021];
+    for(unsigned i=0;i<1021;++i) { char text[8]; int n=snprintf(text,sizeof(text),"k%04u",i); ids[i]=qs_dict_insert(dict,text,n); assert(ids[i]>=0); }
+    for(unsigned i=0;i<rows;++i) {
+        unsigned a=i%17?i%1021:1021,b=i%19?(i/1021)%17:17;
+        struct expected_multi *w=&expected[a*18+b]; w->a=a; w->b=b; ++w->rows;
+        if(b!=17) { w->sum+=((int)b-8)*125; ++w->count; }
+        unsigned char *t=raw+(i/100)*QS_PAGE+QS_PAGE-(i%100+1)*40;
+        t[23]=(a!=1021?1:0)|(b!=17?2:0); unsigned off=24;
+        if(a!=1021) { w32(t+off,ids[a]); off+=4; }
+        if(b!=17) w32(t+off,(int)b-8);
+    }
+    for(unsigned i=0;i<total;++i) if(expected[i].rows) expected[groups++]=expected[i];
+    qsort(expected,groups,sizeof(*expected),multi_order);
+    struct qp_node *a=&p->nodes[1]; a->kind=QP_AGGREGATE; a->left=2; a->right=-1; a->hash=1; a->estimated_rows=60000;
+    a->nkeys=a->expr.nkeys=2; a->left_keys[0]=a->expr.keys[0]=0; a->left_keys[1]=a->expr.keys[1]=1;
+    a->expr.predicate=-1; a->expr.nattrs=2; a->expr.nexprs=5; a->expr.nout=3; a->expr.naggs=1;
+    a->expr.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.column=0,.type=Q_STRING};
+    a->expr.exprs[1]=(struct qs_expr){.op=Q_COLUMN,.column=1,.type=Q_INTEGER};
+    a->expr.exprs[2]=(struct qs_expr){.op=Q_AGGREF,.column=0,.type=Q_DECIMAL};
+    a->expr.exprs[3]=(struct qs_expr){.op=Q_CONST,.type=Q_DECIMAL,.constant=125,.scale=2,.dscale=2};
+    a->expr.exprs[4]=(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=1,.right=3,.scale=2,.dscale=2};
+    a->expr.aggs[0]=(struct qs_agg){.kind=kind,.expr=4};
+    a->expr.outputs[0]=(struct qs_output){.index=0,.type_oid=25};
+    a->expr.outputs[1]=(struct qs_output){.index=1,.type_oid=23};
+    a->expr.outputs[2]=(struct qs_output){.index=2,.type_oid=1700};
+    struct qp_node *sort=&p->nodes[0]; sort->kind=QP_SORT; sort->left=1; sort->right=-1;
+    sort->expr=a->expr; sort->expr.nexprs=3; sort->expr.nattrs=3; sort->expr.naggs=0;
+    sort->expr.work_mem_bytes=(uint64_t)memory*1024*1024; sort->expr.limit=-1;
+    for(unsigned i=0;i<3;++i) { sort->expr.exprs[i].op=Q_COLUMN; sort->expr.exprs[i].column=i; }
+    sort->expr.norder=2; sort->expr.order[0]=(struct qs_order){.output=0}; sort->expr.order[1]=(struct qs_order){.output=1,.descending=1};
+    *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=QP_SCAN_BYTES/24,.ncols=2};
+    struct qp_control control={0}; struct qs_result *out=calloc(1,sizeof(*out)); assert(out);
+    void *mr[]={p,&control,out,arena,io}; long long len[]={sizeof(*p),sizeof(control),sizeof(*out),bytes,QS_SORT_IO_BYTES};
+    struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=len};
+    void **tokens=NULL; unsigned ntokens=0,seen=0;
+    while(!out->finished) {
+        int64_t status=run(&args); assert(status>=0);
+        uint64_t op=(uint64_t)status>>60,id=(uint64_t)status&CS_IO_VALUE_MASK;
+        if(op) {
+            if(op==1) { tokens=realloc(tokens,(ntokens+1)*sizeof(*tokens)); assert(tokens); tokens[ntokens]=malloc(id); assert(tokens[ntokens]); memcpy(tokens[ntokens],io,id); args.cparam2=++ntokens; }
+            else if(op==2) { assert(id && id<=ntokens && tokens[id-1]); memcpy(io,tokens[id-1],QS_SORT_IO_BYTES); args.cparam2=id; }
+            else { assert(op==3 && id && id<=ntokens && tokens[id-1]); free(tokens[id-1]); tokens[id-1]=NULL; args.cparam2=id; }
+            continue;
+        }
+        args.cparam2=0;
+        for(unsigned r=0;r<out->rows;++r) {
+            assert(seen<groups); const struct expected_multi *w=&expected[seen++]; struct qs_cell *v=out->data[r].cells;
+            assert(v[0].isnull==(w->a==1021) && v[1].isnull==(w->b==17));
+            if(w->a!=1021) { char text[8]; int n=snprintf(text,sizeof(text),"k%04u",w->a); assert(qs_cell_string(&v[0])==(unsigned)n && !memcmp(qs_cell_string_bytes(&v[0]),text,n)); }
+            if(w->b!=17) assert(v[1].value==(int)w->b-8);
+            assert(v[2].isnull==!w->count);
+            if(w->count) {
+                struct qs_cell sum={.value=w->sum,.scale=2,.dscale=2}; int cmp;
+                if(kind==Q_AVG) assert(!qs_average(sum,w->count,&sum));
+                assert(!qs_compare(v[2],sum,&cmp) && !cmp);
+            }
+        }
+        if(control.bytes && !control.ready) { memcpy(arena+leaf->input_offset,raw+control.offset,control.bytes); control.ready=1; }
+    }
+    assert(seen==groups && (memory==4?ntokens>0:ntokens==0));
+    for(unsigned i=0;i<ntokens;++i) assert(!tokens[i]);
+    free(tokens); free(raw); free(expected); free(p); free(arena); free(io); free(out);
+    struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
+}
 struct dictionary_test { struct qs_dict *dictionary; unsigned worker; };
 static void *dictionary_worker(void *arg)
 {
@@ -468,5 +555,6 @@ int main(int argc,char **argv)
     nested_sort(run,23,0,Q_SUM); nested_sort(run,1700,0,Q_SUM);
     nested_sort(run,1700,1,Q_SUM); nested_sort(run,1700,1,Q_AVG); nested_sort(run,1700,2,Q_AVG);
     nested_sort(run,20,1,Q_COUNT); nested_sort(run,20,1,Q_COUNT_STAR); nested_sort(run,1700,3,Q_AVG); parallel_dictionary();
+    multiple_groups(run,4,Q_SUM); multiple_groups(run,64,Q_SUM); multiple_groups(run,4,Q_AVG);
     puts("PASS native Plan joins, NULL/duplicate keys, MIN/MAX/AVG, spill and cleanup");
 }

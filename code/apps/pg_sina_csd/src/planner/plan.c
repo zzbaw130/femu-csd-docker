@@ -559,15 +559,18 @@ static Node *heap_index_var(Node *node,List *tlist)
 }
 /* A full index path may supply ordering without a Sort node. Reading its
  * immutable heap is valid only if we explicitly retain that ordering. */
-static bool group_output(const struct qs_plan *p,int index,int key)
+static bool group_output(const struct qs_plan *p,int index,const struct qp_node *n)
 {
     if(index<0 || (unsigned)index>=p->nexprs) return false;
     const struct qs_expr *x=&p->exprs[index];
     if(x->op==Q_CONST) return true;
-    if(x->op==Q_COLUMN) return x->column==key;
+    if(x->op==Q_COLUMN) {
+        for(unsigned k=0;k<n->nkeys;++k) if(x->column==n->left_keys[k]) return true;
+        return false;
+    }
     if(x->op==Q_AGGREF) return x->column==0;
     return (x->op==Q_ADD || x->op==Q_SUB || x->op==Q_MUL || x->op==Q_DIV) &&
-        group_output(p,x->left,key) && group_output(p,x->right,key);
+        group_output(p,x->left,n) && group_output(p,x->right,n);
 }
 static int ordered_heap_scan(struct binding *b,struct qp_plan *tree,unsigned id,Oid indexid,ScanDirection direction,bool ordered,bool index_only)
 {
@@ -796,19 +799,17 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
         if(l->limitCount) { if(!IsA(l->limitCount,Const)) return -1; Const *v=(Const *)l->limitCount; if(!v->constisnull) p->limit=DatumGetInt64(v->constvalue); }
         if(l->limitOffset) { if(!IsA(l->limitOffset,Const)) return -1; Const *v=(Const *)l->limitOffset; if(!v->constisnull) p->offset=DatumGetInt64(v->constvalue); }
     }
-    /* Keep PG HashAggregate, or remove a grouping-only Sort when no parent
-     * needs its order. The same bounded states consume projected/join rows. */
-    if(n->kind==QP_AGGREGATE && !ordered && n->nkeys==1 && p->naggs==1 && !n->distinct && !n->distinct_aggs &&
+    /* Keep PG HashAggregate or replace grouping-only sorting with bounded
+     * states. Required output order is reapplied above the aggregate. */
+    if(n->kind==QP_AGGREGATE && n->nkeys && p->naggs==1 && !n->distinct && !n->distinct_aggs &&
        p->predicate<0 && p->having<0 && n->left>=0 && (tree->nodes[n->left].kind==QP_SORT ||
-        (IsA(native,Agg) && ((Agg *)native)->aggstrategy==AGG_HASHED))) {
+        (!ordered && IsA(native,Agg) && ((Agg *)native)->aggstrategy==AGG_HASHED))) {
         bool remove_sort=tree->nodes[n->left].kind==QP_SORT;
-        int input=remove_sort?tree->nodes[n->left].left:n->left,key=n->left_keys[0];
+        int sort_id=n->left,input=remove_sort?tree->nodes[sort_id].left:n->left;
         unsigned kind=p->aggs[0].kind;
         bool supported=input>=0 && (!remove_sort || tree->nodes[input].kind==QP_JOIN ||
             (tree->nodes[input].kind==QP_SCAN && !tree->nodes[input].ordered_index)) &&
-            p->exprs[p->keys[0]].type==Q_INTEGER &&
-            (kind==Q_COUNT_STAR || ((kind==Q_SUM || kind==Q_AVG || kind==Q_COUNT) && p->aggs[0].expr>=0 &&
-             p->exprs[p->aggs[0].expr].op==Q_COLUMN));
+            (kind==Q_COUNT_STAR || ((kind==Q_SUM || kind==Q_AVG || kind==Q_COUNT) && p->aggs[0].expr>=0));
         const struct qs_plan *sorted=&tree->nodes[n->left].expr;
         if(remove_sort && input>=0) {
             if(sorted->nout!=tree->nodes[input].expr.nout) supported=false;
@@ -818,9 +819,40 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
             }
         }
         for(unsigned i=0;i<p->nout;++i) {
-            if(!group_output(p,p->outputs[i].index,key)) supported=false;
+            if(!group_output(p,p->outputs[i].index,n)) supported=false;
         }
-        if(supported) { n->left=input; n->sorted_input=0; n->hash=1; }
+        /* A sorted GroupAggregate can also supply SQL ORDER BY. Preserve
+         * that order by moving its Sort above the aggregate, using output
+         * column positions. The two existing nodes suffice. */
+        struct qs_order orders[QS_KEYS]; unsigned count=sorted->norder;
+        if(ordered) {
+            if(!remove_sort || count>QS_KEYS) supported=false;
+            for(unsigned k=0;supported && k<count;++k) {
+                int output=-1;
+                for(unsigned i=0;i<p->nout;++i) {
+                    const struct qs_expr *x=&p->exprs[p->outputs[i].index];
+                    if(x->op==Q_COLUMN && x->column==sorted->order[k].output) { output=i; break; }
+                }
+                if(output<0) supported=false;
+                else { orders[k]=sorted->order[k]; orders[k].output=output; }
+            }
+        }
+        if(supported) {
+            n->left=input; n->sorted_input=0; n->hash=1;
+            if(ordered) {
+                tree->nodes[sort_id]=*n;
+                const struct qp_node *aggregate=&tree->nodes[sort_id];
+                *n=(struct qp_node){.kind=QP_SORT,.left=sort_id,.right=-1,.join_qual=-1,.estimated_rows=aggregate->estimated_rows};
+                n->expr.predicate=n->expr.having=-1; n->expr.limit=-1;
+                n->expr.nout=n->expr.nexprs=n->expr.nattrs=n->expr.ncols=aggregate->expr.nout;
+                for(unsigned i=0;i<n->expr.nout;++i) {
+                    const struct qs_expr *x=&aggregate->expr.exprs[aggregate->expr.outputs[i].index];
+                    n->expr.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.column=i,.type=x->type,.scale=x->scale,.dscale=x->dscale};
+                    n->expr.outputs[i]=aggregate->expr.outputs[i]; n->expr.outputs[i].index=i;
+                }
+                n->expr.norder=count; memcpy(n->expr.order,orders,count*sizeof(*orders));
+            }
+        }
     }
     if(n->kind==QP_SCAN && IsA(native,IndexScan)) {
         int extra=conditions(&b,((IndexScan *)native)->indexqualorig); if(extra==-2) return -1;

@@ -997,3 +997,5 @@ DuckDB 对照的是已有实现能力，不据此声称其 Q9 一定采用某个
 优化优先级：先实现有界分区 Hash Join，避免 orders 的全量排序并保留分区内并行；其次支持多键/表达式的局部 Hash Aggregate，将最终排序从 323844 行缩至 175 行；再减少中间行宽、连续表倍增的峰值和逐行复制。当前扫描解码约 1.73s 累计 CPU，三份排序约 4.63s，后者约占总 CSF CPU 9.43s 的 49%；继续只优化 Scan SIMD 或增加 CU 数不能消除已确认的算法退化。CPU 为跨 CU 累计，不能与查询墙钟直接相减计算 I/O。
 
 分区 Hash Join 定向验证：原生 Plan 及 ASan/UBSan 通过；新增 4 MiB 下强制分区的四 CU、重复键、NULL 和所有键集中于一个分区的用例，核对 COUNT、无排序 run、spill 及 context 回收。模拟重入使用每 CU 独立 I/O 范围；真实 PG 也为每 CU 传递独立 spill AFDM，遵守 FEMU 计算参数零偏移限制，AFDM 总容量不增加。
+
+多键 Hash Aggregate 阶段：标准 Q9 已变为 Hash Aggregate 后仅排序 175 行，完整结果一致。两轮关闭计时样本分别为 host/CSD 3.877/3.587s 与 2.967/3.865s，尚未稳定达标；独立 profile 在 `results/tpch.6VD8bU/9.profile.log`，spill 单向 40.69 MiB、根峰值 56.77 MiB、Sort sink/source CPU 各低于 0.001s。定向原生 Plan 及 ASan/UBSan 通过，新增 text+整数双键、各键独立 NULL、负数、表达式 SUM/AVG、表扩容、4 MiB 多轮部分状态归并和 64 MiB 无 spill。Q13/Q17/Q18 完整结果回归通过；Q13 仍存在较慢样本。
