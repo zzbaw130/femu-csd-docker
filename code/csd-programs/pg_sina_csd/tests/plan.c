@@ -74,7 +74,8 @@ static void *probe_worker(void *arg)
     memcpy(ranges,t->args.mr_addr,sizeof(ranges)); memcpy(lengths,t->args.mr_len,sizeof(lengths));
     ranges[4]=(unsigned char *)ranges[4]+t->worker*QS_SORT_IO_BYTES; lengths[4]=QS_SORT_IO_BYTES;
     t->args.mr_addr=ranges; t->args.mr_len=lengths;
-    for(;;) {
+    for(unsigned iteration=0;;++iteration) {
+        assert(iteration<1000000);
         struct qp_control *c=t->control;
         if((c->index_nreads || c->bytes) && !c->ready) {
             const struct qp_node *n=&t->plan->nodes[c->node];
@@ -97,7 +98,7 @@ static void *probe_worker(void *arg)
         }
         t->args.cparam2=0;
         if(t->out->rows || t->out->finished) return NULL;
-        assert(c->index_nreads || c->bytes);
+        /* A direct sink can consume a batch without emitting rows or I/O. */
     }
 }
 static void test(function run,unsigned join,unsigned rows,unsigned right_rows,unsigned memory,int hash,int parallel)
@@ -217,7 +218,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         *(struct qs_chunk *)(arena+plan->nodes[2].parallel_vector+w*plan->parallel_stride)=(struct qs_chunk){.capacity=plan->scan_bytes/24,.ncols=2};
     void *mr[]={plan,&control,out,arena,io}; long long len[]={sizeof(*plan),sizeof(controls),5*sizeof(*out),bytes,5*QS_SORT_IO_BYTES};
     struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=len};
-    args.cparam1=parallel==TEST_PARALLEL || parallel==TEST_PARTITION || parallel==TEST_PARTITION_SKEW;
+    args.cparam1=parallel==TEST_PARALLEL || parallel==TEST_BUILD_PHASE || parallel==TEST_HASH_GROUP || parallel==TEST_PARTITION || parallel==TEST_PARTITION_SKEW;
     void **tokens=NULL; size_t ntokens=0; unsigned got=0; unsigned char seen[12]={0};
     uint64_t counts[12]={0},sums[12]={0},mins[12]={0},maxs[12]={0};
     for(unsigned l=0;l<rows;++l) {
@@ -306,6 +307,8 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             if(p->rounds) assert(p->wall_ns && p->worker_ns && p->coordinator_ns);
         }
         assert(rounds==control.epoch);
+        if(parallel==TEST_BUILD_PHASE) assert(plan->pipelines[3].sink_rows);
+        if(parallel==TEST_HASH_GROUP) assert(plan->pipelines[1].sink_rows);
         uint64_t children=0;
         for(unsigned op=0;op<QS_OPERATORS;++op) if(op!=QS_JOIN_PROBE) children+=out->profile.operators[op].cpu_ns;
         assert(out->profile.operators[QS_JOIN_PROBE].cpu_ns>=children);
@@ -443,7 +446,7 @@ static int multi_order(const void *ap,const void *bp)
     if(a->b==17 || b->b==17) return (a->b==17)-(b->b==17);
     return (a->b<b->b)-(a->b>b->b);
 }
-static void multiple_groups(function run,unsigned memory,unsigned kind,int integer_keys)
+static void multiple_groups(function run,unsigned memory,unsigned kind,int integer_keys,unsigned workers)
 {
     unsigned rows=50003,total=1022*18,groups=0; size_t raw_bytes;
     unsigned char *raw=heap(rows,2,&raw_bytes);
@@ -499,12 +502,38 @@ static void multiple_groups(function run,unsigned memory,unsigned kind,int integ
     sort->expr.work_mem_bytes=(uint64_t)memory*1024*1024; sort->expr.limit=-1;
     for(unsigned i=0;i<3;++i) { sort->expr.exprs[i].op=Q_COLUMN; sort->expr.exprs[i].column=i; }
     sort->expr.norder=2; sort->expr.order[0]=(struct qs_order){.output=0}; sort->expr.order[1]=(struct qs_order){.output=1,.descending=1};
+    p->workers=workers;
+    if(workers) {
+        size_t old=bytes,base=(bytes+4095)&~(size_t)4095;
+        bytes=base;
+        leaf->parallel_input=bytes; bytes+=QP_SCAN_BYTES;
+        leaf->parallel_vector=bytes; bytes+=(qs_chunk_bytes(QP_SCAN_BYTES/24,2)+4095)&~(size_t)4095;
+        p->parallel_stride=bytes-base; bytes=base+workers*p->parallel_stride;
+        arena=realloc(arena,bytes); assert(arena); memset(arena+old,0,bytes-old);
+        io=realloc(io,(workers+1)*QS_SORT_IO_BYTES); assert(io);
+        leaf->parallel=1;
+    }
     *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=QP_SCAN_BYTES/24,.ncols=2};
-    struct qp_control control={0}; struct qs_result *out=calloc(1,sizeof(*out)); assert(out);
-    void *mr[]={p,&control,out,arena,io}; long long len[]={sizeof(*p),sizeof(control),sizeof(*out),bytes,QS_SORT_IO_BYTES};
-    struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=len};
+    struct qp_control controls[5]={{0}}; struct qs_result *out=calloc(5,sizeof(*out)); assert(out);
+#define control controls[0]
+    void *mr[]={p,&control,out,arena,io}; long long len[]={sizeof(*p),sizeof(controls),5*sizeof(*out),bytes,(workers+1)*QS_SORT_IO_BYTES};
+    struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=len,.cparam1=workers?1:0};
+    unsigned available=0,done=0,epoch=0;
     void **tokens=NULL; unsigned ntokens=0,seen=0;
     while(!out->finished) {
+        if(control.parallel && !csIsReentry(&args)) {
+            pthread_t threads[4]; struct probe_test tasks[4]; unsigned started=0;
+            for(unsigned w=0;w<p->workers;++w) if(!((available|done)&(1U<<w))) {
+                tasks[w]=(struct probe_test){run,args,p,&controls[w+1],&out[w+1],arena,raw,raw,NULL,w+1,tokens,ntokens};
+                tasks[w].args.cparam1=((w+1)<<1)|1;
+                assert(!pthread_create(&threads[w],NULL,probe_worker,&tasks[w])); started|=1U<<w;
+            }
+            for(unsigned w=0;w<p->workers;++w) if(started&(1U<<w)) {
+                assert(!pthread_join(threads[w],NULL)); available|=1U<<w;
+                if(out[w+1].finished) done|=1U<<w;
+            }
+            control.available=available;
+        }
         int64_t status=run(&args); assert(status>=0);
         uint64_t op=(uint64_t)status>>60,id=(uint64_t)status&CS_IO_VALUE_MASK;
         if(op) {
@@ -513,7 +542,8 @@ static void multiple_groups(function run,unsigned memory,unsigned kind,int integ
             else { assert(op==3 && id && id<=ntokens && tokens[id-1]); free(tokens[id-1]); tokens[id-1]=NULL; args.cparam2=id; }
             continue;
         }
-        args.cparam2=0;
+        args.cparam2=0; available&=~control.drained;
+        if(control.epoch!=epoch) { epoch=control.epoch; available=done=0; }
         for(unsigned r=0;r<out->rows;++r) {
             assert(seen<groups); const struct expected_multi *w=&expected[seen++]; struct qs_cell *v=out->data[r].cells;
             assert(v[0].isnull==(w->a==1021) && v[1].isnull==(w->b==17));
@@ -530,11 +560,16 @@ static void multiple_groups(function run,unsigned memory,unsigned kind,int integ
         }
         if(control.bytes && !control.ready) { memcpy(arena+leaf->input_offset,raw+control.offset,control.bytes); control.ready=1; }
     }
+    if(workers && memory==64) {
+        assert(p->pipelines[2].sink_rows && p->pipelines[2].sink_ns);
+        assert(p->pipelines[2].sink_ns<=p->pipelines[2].worker_ns);
+    }
     assert(seen==groups && (memory==4?ntokens>0:ntokens==0));
     for(unsigned i=0;i<ntokens;++i) assert(!tokens[i]);
     free(tokens); free(raw); free(expected); free(p); free(arena); free(io); free(out);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
 }
+#undef control
 struct dictionary_test { struct qs_dict *dictionary; unsigned worker; };
 static void *dictionary_worker(void *arg)
 {
@@ -585,6 +620,9 @@ int main(int argc,char **argv)
         test(run,join,5170,23,64,1,TEST_BUILD_PHASE);
         test(run,join,5170,23,64,2,TEST_PARALLEL);
     }
+    /* Concurrent duplicate-key builds, including multiple growth barriers. */
+    test(run,QP_INNER,31,50003,64,1,TEST_BUILD_PHASE);
+    test(run,QP_ANTI,31,50003,4,1,TEST_BUILD_PHASE);
     test(run,QP_INNER,120000,23,8,1,TEST_PARALLEL);
     test(run,QP_INNER,120000,23,8,1,TEST_LARGE_SCAN);
     test(run,QP_INNER,5170,23,64,1,TEST_COUNT_ROWS);
@@ -605,8 +643,11 @@ int main(int argc,char **argv)
     nested_sort(run,23,0,Q_SUM); nested_sort(run,1700,0,Q_SUM);
     nested_sort(run,1700,1,Q_SUM); nested_sort(run,1700,1,Q_AVG); nested_sort(run,1700,2,Q_AVG);
     nested_sort(run,20,1,Q_COUNT); nested_sort(run,20,1,Q_COUNT_STAR); nested_sort(run,1700,3,Q_AVG); parallel_dictionary();
-    multiple_groups(run,4,Q_SUM,0); multiple_groups(run,64,Q_SUM,0); multiple_groups(run,4,Q_AVG,0);
-    multiple_groups(run,4,Q_SUM,1); multiple_groups(run,64,Q_SUM,1); multiple_groups(run,4,Q_AVG,1);
-    multiple_groups(run,4,Q_COUNT,0); multiple_groups(run,64,Q_COUNT,0);
+    multiple_groups(run,4,Q_SUM,0,0); multiple_groups(run,64,Q_SUM,0,0); multiple_groups(run,4,Q_AVG,0,0);
+    multiple_groups(run,4,Q_SUM,1,0); multiple_groups(run,64,Q_SUM,1,0); multiple_groups(run,4,Q_AVG,1,0);
+    multiple_groups(run,4,Q_COUNT,0,0); multiple_groups(run,64,Q_COUNT,0,0);
+    multiple_groups(run,64,Q_SUM,0,4); multiple_groups(run,64,Q_AVG,1,4);
+    multiple_groups(run,64,Q_COUNT,0,4); multiple_groups(run,4,Q_SUM,1,4);
+    multiple_groups(run,4,Q_AVG,0,4); multiple_groups(run,4,Q_COUNT,1,4);
     puts("PASS native Plan joins, NULL/duplicate keys, MIN/MAX/AVG, spill and cleanup");
 }

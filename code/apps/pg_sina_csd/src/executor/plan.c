@@ -386,7 +386,7 @@ static void fetch(PlanStateCsd *s)
                     sizeof(s->plan->pipelines),false),"read pipeline profile");
             if(s->result->rows || s->result->finished) { s->row=0; return; }
         }
-        if(s->parallel) for(unsigned w=1;w<=s->workers;++w) {
+        if(s->parallel && !(s->slots[0].control.parallel==2 && s->slots[0].pending)) for(unsigned w=1;w<=s->workers;++w) {
             struct plan_slot *slot=&s->slots[w];
             if(!slot->pending && !slot->ready && !slot->done) { HOLD_INTERRUPTS(); submit(s,w); RESUME_INTERRUPTS(); progress=true; }
         }
@@ -394,7 +394,12 @@ static void fetch(PlanStateCsd *s)
         if(!main->pending) {
             unsigned ready=0;
             for(unsigned w=1;w<=s->workers;++w) if(s->slots[w].ready) ready|=1U<<(w-1);
-            if(!s->parallel || ready || !main->control.parallel) {
+            /* Direct build/aggregate sinks share a bounded table. Its owner
+             * may resize or spill only after every CU in the wave is idle. */
+            bool idle=true;
+            if(main->control.parallel==2)
+                for(unsigned w=1;w<=s->workers;++w) if(s->slots[w].pending) idle=false;
+            if(idle && (!s->parallel || ready || !main->control.parallel)) {
                 main->control.available=ready;
                 HOLD_INTERRUPTS(); submit(s,0); RESUME_INTERRUPTS(); progress=true;
             }
@@ -506,9 +511,9 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
                 if(!p->rounds) continue;
                 double average=(double)(p->coordinator_ns+p->worker_ns)/p->wall_ns;
                 char label[64],value[256]; snprintf(label,sizeof(label),"CSD Pipeline %u",i);
-                snprintf(value,sizeof(value),"rounds=%llu wall=%.3f ms coordinator=%.3f ms workers=%.3f ms avg_cus=%.2f cpu_util=%.1f%%",
+                snprintf(value,sizeof(value),"rounds=%llu wall=%.3f ms coordinator=%.3f ms workers=%.3f ms avg_cus=%.2f cpu_util=%.1f%% sink=%.3f ms sink_rows=%llu",
                     (unsigned long long)p->rounds,p->wall_ns/1e6,p->coordinator_ns/1e6,p->worker_ns/1e6,
-                    average,100*average/Max(1,s->device_cus));
+                    average,100*average/Max(1,s->device_cus),p->sink_ns/1e6,(unsigned long long)p->sink_rows);
                 ExplainPropertyText(label,value,es);
             }
             ExplainPropertyFloat("CSD LOAD Preparation","ms",s->load_ns/1e6,3,es);

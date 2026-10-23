@@ -22,7 +22,11 @@ struct qp_node {
 };
 /* Optional per-pipeline measurements; only the coordinator writes these.
  * CPU sums include all CSF slices, wall includes LOAD and scheduling waits. */
-struct qp_pipeline_profile { uint64_t wall_ns, coordinator_ns, worker_ns, rounds; };
+struct qp_pipeline_profile {
+    uint64_t wall_ns, coordinator_ns, worker_ns, rounds;
+    /* Shared Hash/aggregate sink work is a subset of worker_ns. */
+    uint64_t sink_ns,sink_rows;
+};
 struct qp_plan {
     unsigned count, root, nparams, ninit;
     unsigned workers, scan_bytes;
@@ -37,6 +41,7 @@ struct qp_control {
     unsigned node, bytes, ready, finished, close, index_nreads;
     int error;
     unsigned error_node;
+    /* parallel=2 adds a CU wave barrier before a shared sink can resize/spill. */
     unsigned parallel, epoch, available, drained;
     /* Completion metadata avoids a second AFDM read for internal row batches. */
     unsigned output_rows, peak_cus;
