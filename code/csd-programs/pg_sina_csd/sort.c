@@ -631,7 +631,8 @@ static int64_t row_finish(struct row_sort *s,struct qs_group *group,struct qs_re
 int64_t pg_sina_sort_source(struct femu_csd_args *a)
 {
     if(!a || (a->numr!=1 && a->numr!=2 && a->numr!=3) || a->mr_len[0]<(long long)sizeof(struct qs_group) ||
-        (a->numr!=1 && a->mr_len[a->numr-1]<QS_SORT_IO_BYTES)) return -1;
+        (a->numr!=1 && a->mr_len[a->numr-1]<QS_SORT_IO_BYTES) ||
+        (a->numr==3 && a->mr_len[1]<(long long)sizeof(struct qs_result))) return -1;
     struct qs_group *group=a->mr_addr[0];
     if(!group->count || group->count>QS_WORKERS) return -1;
     /* PG closes this query's SNIA device immediately afterwards. That releases
@@ -644,11 +645,16 @@ int64_t pg_sina_sort_source(struct femu_csd_args *a)
         }
         return 0;
     }
-    if(a->numr==2 && !csIsReentry(a)) {
+    if(!csIsReentry(a)) {
+        /* Dynamic scan assignment can leave CU slots without a run. Merge
+         * only initialized owners, also on the ordinary output path. */
         unsigned count=0;
         for(unsigned i=0;i<group->count;++i) if(group->states[i]) group->states[count++]=group->states[i];
         for(unsigned i=count;i<group->count;++i) group->states[i]=0;
-        if(!count) return 0;
+        if(!count) {
+            if(a->numr==3) { struct qs_result *out=a->mr_addr[1]; out->rows=out->begin=0; out->finished=1; }
+            return 0;
+        }
         group->count=count;
     }
     struct row_sort *s=(void *)(uintptr_t)group->states[0];

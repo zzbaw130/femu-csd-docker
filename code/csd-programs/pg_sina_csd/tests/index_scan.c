@@ -13,6 +13,7 @@ static unsigned key_bytes=4;
 static int empty_index,large_index,retained_window,pair_keys;
 static void (*heap_window)(struct qs_join_control *,unsigned,const void *,uint32_t,uint32_t);
 static unsigned char index_pages[4][QS_PAGE],heap[256][QS_PAGE];
+static unsigned test_slot;
 static void w16(void *p,uint16_t v) { memcpy(p,&v,2); }
 static void w32(void *p,uint32_t v) { memcpy(p,&v,4); }
 static void init_page(unsigned char *p,unsigned special)
@@ -83,10 +84,10 @@ static void check(function build,function probe,function close,function source,i
         else if(!empty_index) for(unsigned j=0;j<(large_index?256:8);++j) if((large_index?(int)j:j<2?-2:j<6?7:9)==key && (!filtered || j+10>=13)) { ++expected_count; expected_sum+=j+10; }
     }
     out->capacity=256; out->ncols=3;
-    struct qs_task task={.workers=1};
+    struct qs_task task={.workers=test_slot+1,.slot=test_slot};
     void *mr[]={c,&p,&control,io}; long long len[]={qs_chunk_bytes(513,1),sizeof(p),sizeof(control),io_bytes};
     struct femu_csd_args a={.numr=4,.mr_addr=mr,.mr_len=len}; assert(!build(&a)); assert(control.indexed);
-    if(retained_window) heap_window(&control,0,heap[retained_window==2?1:0],retained_window==2?1:0,retained_window==2?1:large_index?256:2);
+    if(retained_window) heap_window(&control,test_slot,heap[retained_window==2?1:0],retained_window==2?1:0,retained_window==2?1:large_index?256:2);
     void *args[]={c,&p,&task,&control,out,io}; long long sizes[]={len[0],sizeof(p),sizeof(task),sizeof(control),qs_chunk_bytes(256,3),io_bytes};
     a=(struct femu_csd_args){.numr=6,.mr_addr=args,.mr_len=sizes};
     unsigned resumes=0; int failed=0;
@@ -161,7 +162,7 @@ static void ordered_scan(void *library,unsigned rows,int empty,int flags)
 }
 int main(int argc,char **argv)
 {
-    assert(argc==3); assert(!cs_work_init(4*1024*1024));
+    assert(argc==3 || argc==4); assert(!cs_work_init((argc==4?256U:4U)*1024*1024));
     void *join=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL),*agg=dlopen(argv[2],RTLD_NOW|RTLD_LOCAL); assert(join && agg);
     function build=(function)dlsym(join,"pg_sina_join_build"),probe=(function)dlsym(join,"pg_sina_join_probe"),close=(function)dlsym(join,"pg_sina_join_close"),source=(function)dlsym(agg,"pg_sina_aggregate_source"); assert(build && probe && close && source);
     heap_window=(void (*)(struct qs_join_control *,unsigned,const void *,uint32_t,uint32_t))dlsym(join,"qs_index_heap_window"); assert(heap_window);
@@ -194,6 +195,8 @@ int main(int argc,char **argv)
     check(build,probe,close,source,0,0);
     empty_index=0; large_index=1; large_pages();
     check(build,probe,close,source,0,0); check(build,probe,close,source,1,0);
+    if(argc==4) { test_slot=strtoul(argv[3],NULL,10); assert(test_slot<QS_WORKERS);
+        check(build,probe,close,source,0,0); check(build,probe,close,source,1,0); }
     puts("PASS PG12 index prefix lookup, duplicate leaf boundaries, NULL, filter and continuation cleanup");
     dlclose(agg); dlclose(join); return 0;
 }

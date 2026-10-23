@@ -16,7 +16,7 @@
 4. 原始页输入、扫描列批次和共享字符串字典的交接区域。
 5. 每个执行槽各 64 KiB 的 spill I/O 缓冲。
 
-本项目约定：`cparam1` 的最低位表示计时开关，其余位为执行槽编号；0 推进整树，1–4 执行当前并行流水线。执行槽不是固定的物理 CU 绑定，每次普通 E1 请求占用一个可用 CU。`cparam2` 仍仅由 SNIA 用于 spill 重入。参数顺序由双方代码约定，不改变 SNIA/FEMU 接口，也没有参数解码框架。
+本项目约定：`cparam1` 的最低位表示计时开关，其余位为执行槽编号；0 推进整树，1–64 执行当前并行流水线。可用和已消费槽的位图为 64 位，最高槽使用第 63 位；64 槽的完整掩码为 UINT64_MAX。执行槽不是固定的物理 CU 绑定，每次普通 E1 请求占用一个可用 CU。`cparam2` 仍仅由 SNIA 用于 spill 重入。参数顺序由双方代码约定，不改变 SNIA/FEMU 接口，也没有参数解码框架。
 
 设备 Scan 需要数据页时写控制记录并正常返回；Guest 仅把这些地址转换为 `csQueueStorageRequest(NVM_TO_AFDM)` 再继续调用。扫描块由 Guest 根据 FDM 容量在 4/2/1 MiB 中选择，索引按需读取 8 KiB 页。原始数据不经过 Guest PG 缓冲。设备执行中发现 spill 需要时直接返回 `csNeedStore/Load/Free` 完成值，由已有 SNIA batch 调度器处理并重入，PG 不接收或解释中间行。
 
@@ -29,11 +29,11 @@ Guest 从 PG 选定的树中标记可并行的扫描/投影/Hash 或 Index Probe
 - Scan/Projection：只解码父节点真正需要的列；投影、过滤、CASE、NULL 三值逻辑、短路、数值运算、LIKE、substring 和 year 在设备执行。仅用于 LIKE 的长字符串直接在扫描时判断，不先将所有文本放入字典。
 - Hash Join：按 PG 的左右输入 build/probe，支持 INNER/LEFT/SEMI/ANTI 和多键等值/剩余条件。表内按 PG 类型保存整数/date 的 4/8 字节值，numeric 保留完整 128 位，避免每列承担 32 字节的对齐填充。并行构建输入的 CU 按批预留行区并原子链接桶头，省去协调端逐行接收与再次构建桶链。表满时将未消费行保留在原 AFDM，协调端在本轮 CU 都暂停后扩容；阻塞子节点的父表仍从小容量开始，随实际输出增长。INNER 表扩容失败时，将已消费的前缀和后续输入按键分为四个分区，使用现有 SNIA spill 请求保存紧凑行；两侧 Heap 均只扫描一次。构建侧结束后重新检查实际空闲内存：若全部分区能驻留，按实际行数分配行区、单独为桶取二次幂容量，直接多 CU 扫描 Probe 侧，避免将它预先落盘；否则逐分区构建共享 Hash 表，各 CU 动态领取 Probe 块，偏斜分区超限时分批构建并重复读取该分区的 Probe 临时数据，不改用全表排序。其他不能采用此路径的形态保留原 Merge 回退。所有分配仍受查询根 context 和物理池约束。
 - Merge Join：分别排序输入，按键归并；重复键组可 spill，保留 NULL、重复和外连接语义。
-- Index Join：复用 `index_scan.c` 的 PG12 整数 B-tree 下探与 Heap Tuple 解码，可在连接树多个位置出现。最多批量 64 个外侧键；要求保留顺序时一次一个键。缺页只通过控制记录交给 Guest 批量提交内部 LOAD。SEMI/ANTI 在消费端确认条件满足后停止查找该键；索引自连接复用当前扫描块中的 Heap 页，超出该块再读取，不建立跨查询缓存。
+- Index Join：复用 `index_scan.c` 的 PG12 整数 B-tree 下探与 Heap Tuple 解码，可在连接树多个位置出现。最多批量 64 个外侧键；要求保留顺序时一次一个键。缺页只通过控制记录交给 Guest 批量提交内部 LOAD。SEMI/ANTI 在消费端确认条件满足后停止查找该键；索引自连接复用当前扫描块中的 Heap 页，超出该块再读取，不建立跨查询缓存。索引游标按实际使用的槽延迟分配，单 CU 扫描只保留自身游标；共享索引上下文的额度按槽数增加。
 - 有序 Index Scan：同一文件沿 PG12 B-tree 正向叶链收集 TID，批量回表，按索引顺序生成列批次。保持单游标供流式 GroupAggregate 消费；不把有序输入任意拆给多个 CU。沿叶链预读至多 16 页，Heap 在 PG 提供的正相关性大于 0.9 时预读至多 32 页，均受文件边界和原页缓存限制；无统计或相关性低时按需读取。额外 TID 列表仅为该游标分配，等值连接不承担这份开销。
 - Index Only Scan：冻结镜像中支持前两个整数索引列，直接输出键和 NULL 位图，不请求 Heap 页。需要索引顺序时沿叶链读取；无需顺序时各 CU 动态领取互不重叠的物理页范围，只处理叶页，跳过内部页和已删除页。每个 CU 使用私有游标、页缓存和列批次；不支持的覆盖列仍走回表或原回退路径。
 - Aggregate：扫描或等值连接输出上的单个 SUM/COUNT/AVG 可用有界 Hash 表聚合，支持多键（包括字符串、numeric、NULL）及聚合参数的算术表达式；LEFT JOIN 补出的 NULL 不计入 COUNT(列)，COUNT(*) 则计入行数。保留精确 SUM/count，AVG 在最终输出时才相除。整数和字符串字典 ID 按 64 位保存，NULL 使用位图；numeric 键保留完整精度。直接扫描和并行的纯键去重可按估计组数预留；其他多键表仍从 128 槽开始增长，避免错误估计挤占子节点的预算。并行输入的 CU 直接更新同一张表，短暂锁定当前桶保护键初始化及精确 sum/count；不复制完整局部表，也不把各 CU 的 DISTINCT 计数相加。满表的原始行保留在 AFDM，当前 CU 都暂停后协调端扩容或 spill。聚合同时预留将启动的 worker 状态及 spill 空间；实际无法容纳时该段串行执行。需要 ORDER BY 时在聚合后排序；预算不足时归并部分状态，不重读明细。COUNT DISTINCT 的精确键投影先按“分组键＋参数”做 Hash 去重，再 COUNT 非 NULL 参数；不覆盖的形态保留排序去重。任意组合的 SUM/AVG/COUNT/MIN/MAX、分组和 HAVING 仍可走原有流式或外部排序聚合。
-- Sort/Limit：复用 `sort.c` 的有界工作内存 run 和分批归并，完整处理输入、OFFSET/LIMIT、提前结束与回收。
+- Sort/Limit：source 跳过没有生成 run 的空闲槽，全空输入正常返回空结果；复用 `sort.c` 的有界工作内存 run 和分批归并，完整处理输入、OFFSET/LIMIT、提前结束与回收。
 - CTE/InitPlan：共享 CTE 在设备计算一次并暂存，读者各自持有游标；标量初始化结果保存在设备参数数组。整数 IN/NOT IN 集合保留 NULL 和空集合语义。
 
 所有动态算法状态从 `libcs-workmem` 分配。通用查询先建立受 `max_memory` 限制的根 context；排序、索引子 context 同时计入根配额和全局池。Hash 表、run、归并游标不能放入 AFDM 来绕开工作内存上限。
@@ -56,7 +56,7 @@ Guest 从 PG 选定的树中标记可并行的扫描/投影/Hash 或 Index Probe
 | join.c / pg-sina-join.so | 原有独立连接链入口；PG 通用计划已由 plan.c 执行，不再用它选择连接顺序 |
 | heap_count.c / pg-sina-heap-count.so | 诊断：原始页、计数；cparam1 为物理列数，cparam2 为有效字节 |
 
-单表快路径最多四个独立 SERIAL batch，完成的执行槽立即领取下一块，不等待固定四分支轮次。Scan 按需输出 int64 列、NULL 位图、显示精度和 selection；numeric 可延迟到筛选后解码。`query_vector.h` 每批 256 行，复用列引用/常量和公共表达式，只为仍存活的行计算复杂条件。AVX2 支持比较、无溢出的加减和 int32×int32→int64；其他情况用精确 int128。没有浮点近似。
+单表快路径按设备 CU 数、FDM、workmem 和输入块数选择最多 64 个独立 SERIAL batch，完成的执行槽立即领取下一块，不等待固定四分支轮次。Scan 按需输出 int64 列、NULL 位图、显示精度和 selection；numeric 可延迟到筛选后解码。`query_vector.h` 每批 256 行，复用列引用/常量和公共表达式，只为仍存活的行计算复杂条件。AVX2 支持比较、无溢出的加减和 int32×int32→int64；其他情况用精确 int128。没有浮点近似。
 
 动态 Hash/聚合状态属于 workmem，FDM 仅作输入输出。单表入口 `profile.c` 包装计时，默认关闭；需要计时的 AFDM 放在 spill I/O 之前。通用树在 `pg_sina_plan` 入口累计整个 CSF，同时在 Scan/Filter/Sort 的调用边界计时；各 worker 结束后合并计数。还记录实际同时运行的 CU 峰值。算子分项包含在 CSF 总时间中，不能与总时间相加，也不对逐行递归反复计时。
 

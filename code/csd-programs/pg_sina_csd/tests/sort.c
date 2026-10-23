@@ -11,13 +11,16 @@
 #include <string.h>
 typedef int64_t (*function)(struct femu_csd_args *);
 static void *blocks[8192];
-static unsigned next_token=1,stored,loaded;
+static unsigned next_token=1,stored,loaded,workers=4;
 static size_t capacity=8U*1024*1024,budget=8U*1024*1024;
 static int64_t run(function f,struct femu_csd_args *args)
 {
     args->cparam2=0;
     for(;;) {
-        int64_t value=f(args); assert(value>=0);
+        int64_t value=f(args);
+        if(value<0) { struct cs_work_stats stats; assert(!cs_work_get_stats(&stats));
+            fprintf(stderr,"sort status=%lld args=%d workers=%u used=%zu peak=%zu tokens=%u\n",(long long)value,args->numr,workers,stats.used_bytes,stats.peak_used_bytes,next_token); }
+        assert(value>=0);
         uint64_t action=(uint64_t)value&~CS_IO_VALUE_MASK,token=(uint64_t)value&CS_IO_VALUE_MASK;
         void *io=args->mr_addr[args->numr-1];
         if(action==CS_NEED_STORE) {
@@ -42,10 +45,10 @@ static int host_order(const void *left,const void *right)
 static void check(function sink,function source,unsigned rows,int64_t limit,int64_t offset,int cancel,int profile)
 {
     next_token=1; stored=loaded=0;
-    unsigned *expected=malloc(rows*sizeof(*expected)); assert(expected);
+    unsigned *expected=malloc((rows?rows:1)*sizeof(*expected)); assert(expected);
     for(unsigned i=0;i<rows;++i) expected[i]=i;
     qsort(expected,rows,sizeof(*expected),host_order);
-    struct qs_plan p={.having=-1,.nattrs=3,.ncols=3,.nexprs=3,.nout=3,.norder=2,.ordered_rows=1,.work_mem_bytes=budget/4,.predicate=-1,.limit=limit,.offset=offset};
+    struct qs_plan p={.having=-1,.nattrs=3,.ncols=3,.nexprs=3,.nout=3,.norder=2,.ordered_rows=1,.work_mem_bytes=budget/workers,.predicate=-1,.limit=limit,.offset=offset};
     for(unsigned i=0;i<3;++i) {
         p.cols[i]=(struct qs_column){.slot=i,.type=i==1?Q_DECIMAL:Q_INTEGER,.scale=i==1?2:0};
         p.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.column=i,.type=p.cols[i].type,.scale=p.cols[i].scale};
@@ -55,7 +58,7 @@ static void check(function sink,function source,unsigned rows,int64_t limit,int6
     size_t bytes=qs_chunk_bytes(1001,3); struct qs_chunk *c=calloc(1,bytes); assert(c);
     c->capacity=1001; c->ncols=3;
     void *io=calloc(1,QS_SORT_IO_BYTES); assert(io);
-    struct qs_task tasks[4]={{0}}; struct qs_profile counters[4]={0};
+    struct qs_task tasks[QS_WORKERS]={{0}}; struct qs_profile counters[QS_WORKERS]={0};
     unsigned chunk=0;
     for(unsigned first=0;first<rows;first+=1001) {
         unsigned n=rows-first; if(n>1001) n=1001;
@@ -68,14 +71,14 @@ static void check(function sink,function source,unsigned rows,int64_t limit,int6
             if(key%11==0) qs_nulls(c)[i/8]|=1U<<(i%8);
             qs_selection(c)[i]=i;
         }
-        unsigned worker=chunk++%4; tasks[worker].workers=4; tasks[worker].input_bytes=n*24;
+        unsigned worker=chunk++%workers; tasks[worker].workers=workers; tasks[worker].input_bytes=n*24;
         void *mr[]={c,&p,&tasks[worker],profile?(void *)&counters[worker]:io,io};
         long long len[]={bytes,sizeof(p),sizeof(tasks[0]),profile?sizeof(counters[0]):QS_SORT_IO_BYTES,QS_SORT_IO_BYTES};
         struct femu_csd_args a={.numr=profile?5:4,.mr_addr=mr,.mr_len=len,.cparam1=profile};
         assert(!run(sink,&a));
     }
-    struct qs_group group={.count=4};
-    for(unsigned i=0;i<4;++i) group.states[i]=tasks[i].state;
+    struct qs_group group={.count=workers};
+    for(unsigned i=0;i<workers;++i) group.states[i]=tasks[i].state;
     struct qs_result *out=calloc(1,sizeof(*out)); assert(out);
     void *mr[]={&group,out,profile?(void *)&counters[0]:io,io};
     long long len[]={sizeof(group),sizeof(*out),profile?sizeof(counters[0]):QS_SORT_IO_BYTES,QS_SORT_IO_BYTES};
@@ -115,7 +118,7 @@ static void check(function sink,function source,unsigned rows,int64_t limit,int6
     if(limit<0 && rows>1000000 && !cancel && stored) assert(loaded<=3*stored);
     if(profile) assert(counters[0].operators[QS_SORT_SOURCE].calls);
     for(unsigned i=1;i<next_token;++i) assert(!blocks[i]);
-    for(unsigned i=0;i<4;++i) assert(!group.states[i]);
+    for(unsigned i=0;i<workers;++i) assert(!group.states[i]);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats));
     assert(!stats.used_bytes && !stats.active_contexts && stats.peak_used_bytes<=budget && stats.peak_used_bytes<=capacity);
     printf("rows=%u pool=%zu budget=%zu peak=%zu store=%u load=%u\n",rows,capacity,budget,stats.peak_used_bytes,stored,loaded);
@@ -123,13 +126,16 @@ static void check(function sink,function source,unsigned rows,int64_t limit,int6
 }
 int main(int argc,char **argv)
 {
-    assert(argc>=2 && argc<=4);
+    assert(argc>=2 && argc<=5);
     if(argc>=3) capacity=(size_t)strtoul(argv[2],NULL,10)*1024*1024;
-    budget=argc==4?(size_t)strtoul(argv[3],NULL,10)*1024*1024:capacity;
+    budget=argc>=4?(size_t)strtoul(argv[3],NULL,10)*1024*1024:capacity;
+    if(argc==5) workers=strtoul(argv[4],NULL,10);
+    assert(workers && workers<=QS_WORKERS);
     if(budget>capacity) budget=capacity;
     assert(capacity && budget && !cs_work_init(capacity));
     void *so=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(so);
     function sink=(function)dlsym(so,"pg_sina_sort_sink"),source=(function)dlsym(so,"pg_sina_sort_source"); assert(sink && source);
+    check(sink,source,0,-1,0,0,0);
     check(sink,source,5003,-1,0,0,0);
     check(sink,source,262147,-1,0,0,1);
     check(sink,source,262147,17,5,0,1);
@@ -138,6 +144,6 @@ int main(int argc,char **argv)
     check(sink,source,1048583,-1,0,0,0); /* Merge read buffers exceed workmem. */
     check(sink,source,5003,INT64_MAX,INT64_MAX,0,0);
     dlclose(so);
-    puts("PASS external row sort, four sinks, memory pressure/reentry, NULL/precision, chunked output, TopN/OFFSET and abort cleanup");
+    puts("PASS external row sort, multiple sinks, memory pressure/reentry, NULL/precision, chunked output, TopN/OFFSET and abort cleanup");
     return 0;
 }

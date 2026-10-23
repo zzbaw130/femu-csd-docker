@@ -22,7 +22,7 @@ struct hash_join {
     unsigned ncols, key, key2, stride, capacity, max_capacity, slots, rows;
     unsigned count, batch_capacity, input_position, block, loaded;
     int building, storing, loading, resident;
-    struct probe_cursor probes[QS_WORKERS]; /* Private workmem, one per input slot. */
+    struct probe_cursor *probes[QS_WORKERS]; /* Allocate only active slots. */
 };
 static uint64_t hash_key(uint64_t x)
 {
@@ -241,7 +241,8 @@ static int64_t probe_stage(unsigned stage,struct qs_chunk *c,const struct qs_pla
         else build_cols[nb++]=p->cols[i].slot;
     }
     if((!stage && np!=c->ncols) || nb!=h->ncols || key==UINT_MAX) return -1;
-    struct probe_cursor *cursor=&h->probes[task->slot];
+    if(!h->probes[task->slot]) h->probes[task->slot]=cs_work_calloc(h->context,1,sizeof(struct probe_cursor));
+    struct probe_cursor *cursor=h->probes[task->slot]; if(!cursor) return -4;
     if(reentry) {
         if(!cursor->pending) return -1;
         int64_t status=qs_join_consume(stage,out,p,task,control,a,1); if(status) return status;

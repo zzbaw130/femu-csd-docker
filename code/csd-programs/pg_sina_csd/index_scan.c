@@ -23,7 +23,16 @@ struct index_cursor {
     int scan_started,scan_done;
     unsigned scan_end;
 };
-struct index_join { cs_work_context *context; struct qs_plan scan; struct index_cursor cursors[QS_WORKERS]; struct qs_dict *dictionary; };
+_Static_assert(sizeof(struct index_cursor)<=4096,"index cursor must fit its per-CU budget");
+struct index_join { cs_work_context *context; struct qs_plan scan; struct index_cursor *cursors[QS_WORKERS]; struct qs_dict *dictionary; };
+/* Each CU owns one slot. Allocate its cursor on first use, rather than
+ * charging all possible CUs to a single-CU scan's workmem context. */
+static struct index_cursor *index_cursor(struct index_join *h,unsigned slot)
+{
+    if(slot>=QS_WORKERS) return NULL;
+    if(!h->cursors[slot]) h->cursors[slot]=cs_work_calloc(h->context,1,sizeof(*h->cursors[slot]));
+    return h->cursors[slot];
+}
 static uint16_t u16(const unsigned char *p) { uint16_t x; memcpy(&x,p,2); return x; }
 static uint32_t u32(const unsigned char *p) { uint32_t x; memcpy(&x,p,4); return x; }
 int qs_index_init(const struct qs_plan *p,struct qs_join_control *control)
@@ -36,6 +45,7 @@ int qs_index_init(const struct qs_plan *p,struct qs_join_control *control)
     struct index_join *h=cs_work_calloc(ctx,1,sizeof(*h));
     if(!h) { cs_work_end(ctx); return -4; }
     h->context=ctx; h->scan=*p;
+    if(!index_cursor(h,0)) { cs_work_end(ctx); return -4; }
     unsigned base=p->nattrs-p->join.nattrs; h->scan.nattrs=p->join.nattrs;
     for(unsigned i=0;i<h->scan.nattrs;++i) { h->scan.cols[i]=p->cols[base+i]; h->scan.cols[i].deferred=0; }
     for(unsigned i=0;i<p->nstrings;++i) h->scan.strings[i].column=p->strings[i].column>=base?p->strings[i].column-base:255;
@@ -45,17 +55,19 @@ int qs_index_init(const struct qs_plan *p,struct qs_join_control *control)
 void qs_index_reset(struct qs_join_control *control,unsigned slot)
 {
     struct index_join *h=(void *)(uintptr_t)control->state;
-    memset(h->cursors[slot].tags,0,sizeof(h->cursors[slot].tags));
+    if(h->cursors[slot]) memset(h->cursors[slot]->tags,0,sizeof(h->cursors[slot]->tags));
 }
 void qs_index_skip(struct qs_join_control *control,unsigned slot,uint64_t rows)
 {
     struct index_join *h=(void *)(uintptr_t)control->state;
-    struct index_cursor *c=&h->cursors[slot];
+    struct index_cursor *c=index_cursor(h,slot);
+    if(!c) return;
     for(unsigned i=0;i<c->count;++i) if(rows&(UINT64_C(1)<<c->keys[i].row)) c->keys[i].phase=4;
 }
 void qs_index_heap_window(struct qs_join_control *control,unsigned slot,const void *data,uint32_t first,uint32_t pages)
 {
-    struct index_join *h=(void *)(uintptr_t)control->state; struct index_cursor *c=&h->cursors[slot];
+    struct index_join *h=(void *)(uintptr_t)control->state; struct index_cursor *c=index_cursor(h,slot);
+    if(!c) return;
     c->heap_window=data; c->heap_first=first; c->heap_pages=pages;
 }
 void qs_index_close(struct qs_join_control *control)
@@ -143,7 +155,7 @@ static int seek(const unsigned char *page,struct lookup *key,unsigned bytes)
 void qs_index_scan_range(struct qs_join_control *control,unsigned first,unsigned end)
 {
     struct index_join *h=(void *)(uintptr_t)control->state;
-    struct index_cursor *c=&h->cursors[0];
+    struct index_cursor *c=h->cursors[0];
     c->scan=(struct lookup){.block=first}; c->scan_end=end;
     c->scan_started=1; c->scan_done=first>=end;
 }
@@ -151,7 +163,7 @@ int64_t qs_index_scan(struct qs_chunk *out,struct qs_task *task,struct qs_join_c
     unsigned heap_pages,unsigned index_pages,int flags)
 {
     struct index_join *h=(void *)(uintptr_t)control->state;
-    struct index_cursor *c=&h->cursors[0];
+    struct index_cursor *c=h->cursors[0];
     if(c->waiting) {
         for(unsigned i=0;i<QS_INDEX_CACHE;++i) if(c->tags[i].state==2) c->tags[i].state=1;
         c->waiting=0; task->index_pending=task->index_nreads=0;
@@ -286,7 +298,7 @@ int64_t qs_index_probe(unsigned stage,struct qs_chunk *c,const struct qs_plan *p
     struct qs_join_control *control,struct femu_csd_args *a,int resume)
 {
     const struct qs_join *j=qs_join_at(p,stage); struct index_join *h=(void *)(uintptr_t)control[stage].state;
-    struct index_cursor *cursor=&h->cursors[task->slot];
+    struct index_cursor *cursor=index_cursor(h,task->slot); if(!cursor) return -4;
     struct qs_chunk *out=(void *)((unsigned char *)a->mr_addr[4]+stage*qs_join_chunk_stride(p));
     if(a->numr!=6 || a->mr_len[5]<QS_SORT_IO_BYTES+(long long)QS_INDEX_CACHE*QS_PAGE) return -1;
     if(cursor->waiting) {

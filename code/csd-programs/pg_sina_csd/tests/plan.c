@@ -11,6 +11,7 @@
 #include <pthread.h>
 typedef int64_t (*function)(struct femu_csd_args *);
 enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL };
+static unsigned test_workers=4;
 static void w16(void *p,uint16_t x) { memcpy(p,&x,2); }
 static void w32(void *p,uint32_t x) { memcpy(p,&x,4); }
 static unsigned char *heap(unsigned rows,unsigned side,size_t *size)
@@ -103,7 +104,7 @@ static void *probe_worker(void *arg)
 }
 static void test(function run,unsigned join,unsigned rows,unsigned right_rows,unsigned memory,int hash,int parallel)
 {
-    struct qp_plan *plan=calloc(1,sizeof(*plan)); assert(plan); plan->count=4; plan->scan_bytes=parallel==TEST_LARGE_SCAN?QS_CHUNK:QP_SCAN_BYTES;
+    struct qp_plan *plan=calloc(1,sizeof(*plan)); assert(plan); plan->count=4; plan->scan_bytes=parallel==TEST_LARGE_SCAN?QS_CHUNK:test_workers>4?QS_PAGE:QP_SCAN_BYTES;
     scan(&plan->nodes[2]); scan(&plan->nodes[3]);
     __int128 factor=parallel==TEST_WIDE_HASH?((__int128)1<<64):parallel==TEST_SIGNED_HASH?-1:parallel==TEST_BIGINT_HASH?INT64_C(1)<<32:1;
     if(parallel==TEST_WIDE_HASH) {
@@ -188,7 +189,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     }
     size_t parallel_bytes=bytes;
     if(parallel && parallel!=TEST_PARTITION_SERIAL) {
-        plan->workers=4; plan->nodes[1].parallel=1;
+        plan->workers=test_workers; plan->nodes[1].parallel=1;
         plan->nodes[2].parallel_input=parallel_bytes; parallel_bytes+=plan->scan_bytes;
         plan->nodes[2].parallel_vector=parallel_bytes; parallel_bytes+=(qs_chunk_bytes(plan->scan_bytes/24,2)+4095)&~(size_t)4095;
         if(hash==2) {
@@ -205,18 +206,18 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             plan->nodes[6].parallel_input=plan->nodes[2].parallel_input;
             plan->nodes[6].parallel_vector=plan->nodes[2].parallel_vector;
         }
-        plan->parallel_stride=parallel_bytes-bytes; bytes+=4*plan->parallel_stride;
+        plan->parallel_stride=parallel_bytes-bytes; bytes+=test_workers*plan->parallel_stride;
     }
     unsigned char *index=hash==2?index_page(right_rows):NULL;
-    unsigned char *arena=calloc(1,bytes),*io=calloc(5,QS_SORT_IO_BYTES); assert(arena && io);
+    unsigned char *arena=calloc(1,bytes),*io=calloc(plan->workers+1,QS_SORT_IO_BYTES); assert(arena && io);
     struct qs_dict *dict=(void *)arena; *dict=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
     for(unsigned i=2;i<4;++i) *(struct qs_chunk *)(arena+plan->nodes[i].vector_offset)=(struct qs_chunk){.capacity=plan->scan_bytes/24,.ncols=2};
-    struct qp_control controls[5]={{0}};
+    struct qp_control *controls=calloc(plan->workers+1,sizeof(*controls)); assert(controls);
 #define control controls[0]
-    struct qs_result *out=calloc(5,sizeof(*out)); assert(out);
+    struct qs_result *out=calloc(plan->workers+1,sizeof(*out)); assert(out);
     for(unsigned w=0;w<plan->workers;++w)
         *(struct qs_chunk *)(arena+plan->nodes[2].parallel_vector+w*plan->parallel_stride)=(struct qs_chunk){.capacity=plan->scan_bytes/24,.ncols=2};
-    void *mr[]={plan,&control,out,arena,io}; long long len[]={sizeof(*plan),sizeof(controls),5*sizeof(*out),bytes,5*QS_SORT_IO_BYTES};
+    void *mr[]={plan,&control,out,arena,io}; long long len[]={sizeof(*plan),(plan->workers+1)*sizeof(*controls),(plan->workers+1)*sizeof(*out),bytes,(plan->workers+1)*QS_SORT_IO_BYTES};
     struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=len};
     args.cparam1=parallel==TEST_PARALLEL || parallel==TEST_BUILD_PHASE || parallel==TEST_HASH_GROUP || parallel==TEST_PARTITION || parallel==TEST_PARTITION_SKEW;
     void **tokens=NULL; size_t ntokens=0; unsigned got=0; unsigned char seen[12]={0};
@@ -236,23 +237,23 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             ++counts[key]; sums[key]+=v; if(!mins[key] || mins[key]>v) mins[key]=v; if(maxs[key]<v) maxs[key]=v;
         }
     }
-    unsigned available=0,done=0,epoch=0;
+    uint64_t available=0,done=0; unsigned epoch=0;
     for(unsigned iteration=0;!out->finished;++iteration) {
         if(control.parallel && !csIsReentry(&args)) {
-            pthread_t threads[4]; struct probe_test tasks[4]; unsigned started=0;
-            for(unsigned w=0;w<plan->workers;++w) if(!((available|done)&(1U<<w))) {
+            pthread_t threads[QS_WORKERS]; struct probe_test tasks[QS_WORKERS]; uint64_t started=0;
+            for(unsigned w=0;w<plan->workers;++w) if(!((available|done)&(UINT64_C(1)<<w))) {
                 tasks[w]=(struct probe_test){run,args,plan,&controls[w+1],&out[w+1],arena,raw[0],raw[1],index,w+1,tokens,ntokens};
                 tasks[w].args.cparam1=((w+1)<<1)|(args.cparam1&1);
-                assert(!pthread_create(&threads[w],NULL,probe_worker,&tasks[w])); started|=1U<<w;
+                assert(!pthread_create(&threads[w],NULL,probe_worker,&tasks[w])); started|=UINT64_C(1)<<w;
             }
-            for(unsigned w=0;w<plan->workers;++w) if(started&(1U<<w)) {
-                assert(!pthread_join(threads[w],NULL)); available|=1U<<w;
-                if(out[w+1].finished) done|=1U<<w;
+            for(unsigned w=0;w<plan->workers;++w) if(started&(UINT64_C(1)<<w)) {
+                assert(!pthread_join(threads[w],NULL)); available|=UINT64_C(1)<<w;
+                if(out[w+1].finished) done|=UINT64_C(1)<<w;
             }
             control.available=available;
         }
-        if(iteration==1000000) { fprintf(stderr,"STUCK join=%u hash=%d parallel=%d epoch=%u avail=%u done=%u active=%u rows=%u node=%u reads=%u bytes=%u\n",join,hash,parallel,control.epoch,available,done,control.parallel,out->rows,control.node,control.index_nreads,control.bytes); abort(); }
-        unsigned consumed=csIsReentry(&args)?control.drained:0,previous_epoch=control.epoch;
+        if(iteration==1000000) { fprintf(stderr,"STUCK join=%u hash=%d parallel=%d epoch=%u avail=%llu done=%llu active=%u rows=%u node=%u reads=%u bytes=%u\n",join,hash,parallel,control.epoch,(unsigned long long)available,(unsigned long long)done,control.parallel,out->rows,control.node,control.index_nreads,control.bytes); abort(); }
+        uint64_t consumed=csIsReentry(&args)?control.drained:0; unsigned previous_epoch=control.epoch;
         int64_t status=run(&args);
         if(control.epoch==previous_epoch) assert((control.drained&consumed)==consumed);
         if(status<0) { fprintf(stderr,"native plan status=%lld join=%u row=%u state=%llu\n",(long long)status,join,rows,(unsigned long long)control.state); abort(); }
@@ -299,6 +300,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             memcpy(arena+n->input_offset,raw[control.node==2?0:1]+control.offset,control.bytes); control.ready=1;
         }
     }
+    if(test_workers>4 && parallel) assert(out->metrics.workers==test_workers && control.epoch);
     assert(got); if(parallel!=TEST_COUNT_ROWS && parallel<TEST_PARTITION) for(unsigned i=0;i<12;++i) assert(!seen[i]);
     if(args.cparam1&1) {
         uint64_t rounds=0;
@@ -319,7 +321,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         else assert(memory==8?control.epoch==1:control.epoch>1);
     }
     for(size_t i=0;i<ntokens;++i) free(tokens[i]);
-    free(tokens); free(raw[0]); free(raw[1]); free(index); free(plan); free(arena); free(io); free(out);
+    free(controls); free(tokens); free(raw[0]); free(raw[1]); free(index); free(plan); free(arena); free(io); free(out);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
 }
 #undef control
@@ -448,15 +450,16 @@ static int multi_order(const void *ap,const void *bp)
 }
 static void multiple_groups(function run,unsigned memory,unsigned kind,int integer_keys,unsigned workers)
 {
+    unsigned scan_bytes=workers>4?QS_PAGE:QP_SCAN_BYTES;
     unsigned rows=50003,total=1022*18,groups=0; size_t raw_bytes;
     unsigned char *raw=heap(rows,2,&raw_bytes);
     struct expected_multi *expected=calloc(total,sizeof(*expected)); assert(expected);
-    struct qp_plan *p=calloc(1,sizeof(*p)); assert(p); p->count=3; p->scan_bytes=QP_SCAN_BYTES;
+    struct qp_plan *p=calloc(1,sizeof(*p)); assert(p); p->count=3; p->scan_bytes=scan_bytes;
     struct qp_node *leaf=&p->nodes[2]; scan(leaf); leaf->bytes=raw_bytes;
     leaf->expr.exprs[0].type=Q_STRING; leaf->expr.outputs[0].type_oid=25;
     leaf->input_offset=(qs_dict_bytes(2048,65536)+4095)&~(size_t)4095;
-    leaf->vector_offset=leaf->input_offset+QP_SCAN_BYTES;
-    size_t bytes=leaf->vector_offset+qs_chunk_bytes(QP_SCAN_BYTES/24,2);
+    leaf->vector_offset=leaf->input_offset+scan_bytes;
+    size_t bytes=leaf->vector_offset+qs_chunk_bytes(scan_bytes/24,2);
     unsigned char *arena=calloc(1,bytes),*io=calloc(1,QS_SORT_IO_BYTES); assert(arena && io);
     struct qs_dict *dict=(void *)arena; *dict=(struct qs_dict){.entries=2048,.capacity=2048,.data=65536};
     int ids[1021];
@@ -506,31 +509,32 @@ static void multiple_groups(function run,unsigned memory,unsigned kind,int integ
     if(workers) {
         size_t old=bytes,base=(bytes+4095)&~(size_t)4095;
         bytes=base;
-        leaf->parallel_input=bytes; bytes+=QP_SCAN_BYTES;
-        leaf->parallel_vector=bytes; bytes+=(qs_chunk_bytes(QP_SCAN_BYTES/24,2)+4095)&~(size_t)4095;
+        leaf->parallel_input=bytes; bytes+=scan_bytes;
+        leaf->parallel_vector=bytes; bytes+=(qs_chunk_bytes(scan_bytes/24,2)+4095)&~(size_t)4095;
         p->parallel_stride=bytes-base; bytes=base+workers*p->parallel_stride;
         arena=realloc(arena,bytes); assert(arena); memset(arena+old,0,bytes-old);
         io=realloc(io,(workers+1)*QS_SORT_IO_BYTES); assert(io);
         leaf->parallel=1;
     }
-    *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=QP_SCAN_BYTES/24,.ncols=2};
-    struct qp_control controls[5]={{0}}; struct qs_result *out=calloc(5,sizeof(*out)); assert(out);
+    *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=scan_bytes/24,.ncols=2};
+    struct qp_control *controls=calloc(workers+1,sizeof(*controls));
+    struct qs_result *out=calloc(workers+1,sizeof(*out)); assert(controls && out);
 #define control controls[0]
-    void *mr[]={p,&control,out,arena,io}; long long len[]={sizeof(*p),sizeof(controls),5*sizeof(*out),bytes,(workers+1)*QS_SORT_IO_BYTES};
+    void *mr[]={p,&control,out,arena,io}; long long len[]={sizeof(*p),(workers+1)*sizeof(*controls),(workers+1)*sizeof(*out),bytes,(workers+1)*QS_SORT_IO_BYTES};
     struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=len,.cparam1=workers?1:0};
-    unsigned available=0,done=0,epoch=0;
+    uint64_t available=0,done=0; unsigned epoch=0;
     void **tokens=NULL; unsigned ntokens=0,seen=0;
     while(!out->finished) {
         if(control.parallel && !csIsReentry(&args)) {
-            pthread_t threads[4]; struct probe_test tasks[4]; unsigned started=0;
-            for(unsigned w=0;w<p->workers;++w) if(!((available|done)&(1U<<w))) {
+            pthread_t threads[QS_WORKERS]; struct probe_test tasks[QS_WORKERS]; uint64_t started=0;
+            for(unsigned w=0;w<p->workers;++w) if(!((available|done)&(UINT64_C(1)<<w))) {
                 tasks[w]=(struct probe_test){run,args,p,&controls[w+1],&out[w+1],arena,raw,raw,NULL,w+1,tokens,ntokens};
                 tasks[w].args.cparam1=((w+1)<<1)|1;
-                assert(!pthread_create(&threads[w],NULL,probe_worker,&tasks[w])); started|=1U<<w;
+                assert(!pthread_create(&threads[w],NULL,probe_worker,&tasks[w])); started|=UINT64_C(1)<<w;
             }
-            for(unsigned w=0;w<p->workers;++w) if(started&(1U<<w)) {
-                assert(!pthread_join(threads[w],NULL)); available|=1U<<w;
-                if(out[w+1].finished) done|=1U<<w;
+            for(unsigned w=0;w<p->workers;++w) if(started&(UINT64_C(1)<<w)) {
+                assert(!pthread_join(threads[w],NULL)); available|=UINT64_C(1)<<w;
+                if(out[w+1].finished) done|=UINT64_C(1)<<w;
             }
             control.available=available;
         }
@@ -560,13 +564,14 @@ static void multiple_groups(function run,unsigned memory,unsigned kind,int integ
         }
         if(control.bytes && !control.ready) { memcpy(arena+leaf->input_offset,raw+control.offset,control.bytes); control.ready=1; }
     }
-    if(workers && memory==64) {
+    if(workers && memory>=64) {
+        assert(out->metrics.workers==workers);
         assert(p->pipelines[2].sink_rows && p->pipelines[2].sink_ns);
         assert(p->pipelines[2].sink_ns<=p->pipelines[2].worker_ns);
     }
     assert(seen==groups && (memory==4?ntokens>0:ntokens==0));
     for(unsigned i=0;i<ntokens;++i) assert(!tokens[i]);
-    free(tokens); free(raw); free(expected); free(p); free(arena); free(io); free(out);
+    free(controls); free(tokens); free(raw); free(expected); free(p); free(arena); free(io); free(out);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
 }
 #undef control
@@ -611,7 +616,8 @@ static void merge_input_parallelism(void)
 int main(int argc,char **argv)
 {
     merge_input_parallelism();
-    assert(argc==2 || argc==3); void *library=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(library);
+    assert(qp_worker_mask(0)==0 && qp_worker_mask(32)==UINT32_MAX && qp_worker_mask(64)==UINT64_MAX);
+    assert(argc==2 || argc==3 || argc==4); void *library=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(library);
     function capacity=(function)dlsym(library,"pg_sina_workmem_capacity"); assert(capacity);
     if(argc==3) {
         struct femu_csd_args args={0}; struct cs_work_stats stats;
@@ -622,7 +628,21 @@ int main(int argc,char **argv)
         printf("PASS device resource query: %llu MiB, no query allocations\n",(unsigned long long)(expected/1024/1024));
         return 0;
     }
-    function run=(function)dlsym(library,"pg_sina_plan"); assert(run); assert(!cs_work_init(64*1024*1024));
+    function run=(function)dlsym(library,"pg_sina_plan"); assert(run);
+    if(argc==4) {
+        assert(!strcmp(argv[2],"--workers")); test_workers=strtoul(argv[3],NULL,10);
+        assert(test_workers && test_workers<=QS_WORKERS && !cs_work_init(256*1024*1024));
+        for(unsigned join=QP_INNER;join<=QP_ANTI;++join)
+            test(run,join,20003,23,256,1,TEST_BUILD_PHASE);
+        test(run,QP_INNER,31,50003,256,1,TEST_BUILD_PHASE);
+        test(run,QP_LEFT,20003,23,256,1,TEST_HASH_GROUP);
+        multiple_groups(run,256,Q_SUM,0,test_workers);
+        multiple_groups(run,256,Q_AVG,1,test_workers);
+        multiple_groups(run,256,Q_COUNT,0,test_workers);
+        printf("PASS %u CU slots: parallel build/probe, exact SUM/AVG, global DISTINCT, cleanup\n",test_workers);
+        return 0;
+    }
+    assert(!cs_work_init(64*1024*1024));
     for(int hash=0;hash<3;++hash)
         for(unsigned join=QP_INNER;join<=QP_ANTI;++join) test(run,join,517,23,64,hash,TEST_SERIAL);
     for(unsigned join=QP_INNER;join<=QP_ANTI;++join) {

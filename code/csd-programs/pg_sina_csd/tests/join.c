@@ -8,7 +8,7 @@
 #include <stdlib.h>
 typedef int64_t (*function)(struct femu_csd_args *);
 static void *blocks[8192];
-static unsigned next_token,stores,loads,estimated_rows;
+static unsigned next_token,stores,loads,estimated_rows,worker_override;
 static size_t capacity,budget;
 static int64_t run(function f,struct femu_csd_args *a)
 {
@@ -51,7 +51,7 @@ static void check(function build,function load,function probe,function close,fun
     p.aggs[2]=(struct qs_agg){.kind=Q_COUNT_STAR,.expr=-1}; p.aggs[3]=(struct qs_agg){.kind=Q_AVG,.expr=0};
     for(unsigned i=0;i<4;++i) p.outputs[i]=(struct qs_output){.aggregate=1,.index=i};
     p.outputs[4]=(struct qs_output){.aggregate=2,.index=8};
-    unsigned workers=grouped?(budget<=4*1024*1024?1:2):4;
+    unsigned workers=worker_override?worker_override:grouped?(budget<=4*1024*1024?1:2):4;
     p.work_mem_bytes=budget/2/workers;
     if(grouped) {
         p.external_aggregate=1; p.nkeys=p.norder=1; p.nexprs=10;
@@ -72,7 +72,7 @@ static void check(function build,function load,function probe,function close,fun
         p.cols[1].deferred=1; /* Joined values have already been materialized. */
     }
     unsigned all[7001]={0},promo[7001]={0};
-    struct qs_join_control control={0}; struct qs_task tasks[4]={{0}}; struct qs_profile counters[4]={0};
+    struct qs_join_control control={0}; struct qs_task tasks[QS_WORKERS]={{0}}; struct qs_profile counters[QS_WORKERS]={0};
     size_t bytes=qs_chunk_bytes(997,2); struct qs_chunk *c=calloc(1,bytes); assert(c);
     c->capacity=997; c->ncols=2;
     void *io=calloc(1,QS_SORT_IO_BYTES); assert(io);
@@ -128,7 +128,7 @@ static void check(function build,function load,function probe,function close,fun
         }
     }
     struct qs_group group={0}; uint64_t actual_pairs=0;
-    for(unsigned i=0;i<4;++i) if(tasks[i].state) { group.states[group.count++]=tasks[i].state; actual_pairs+=tasks[i].joined; }
+    for(unsigned i=0;i<workers;++i) if(tasks[i].state) { group.states[group.count++]=tasks[i].state; actual_pairs+=tasks[i].joined; }
     if(grouped) {
         void *mr[]={&control}; long long len[]={sizeof(control)};
         struct femu_csd_args a={.numr=1,.mr_addr=mr,.mr_len=len}; assert(!close(&a) && !control.state);
@@ -306,8 +306,9 @@ static void check_chain(function build,function load,function probe,function clo
 }
 int main(int argc,char **argv)
 {
-    assert(argc==4 || argc==5); capacity=(size_t)strtoul(argv[3],NULL,10)*1024*1024;
-    budget=argc==5?(size_t)strtoul(argv[4],NULL,10)*1024*1024:capacity;
+    assert(argc==4 || argc==5 || argc==6); capacity=(size_t)strtoul(argv[3],NULL,10)*1024*1024;
+    budget=argc>=5?(size_t)strtoul(argv[4],NULL,10)*1024*1024:capacity;
+    if(argc==6) { worker_override=strtoul(argv[5],NULL,10); assert(worker_override && worker_override<=QS_WORKERS); }
     if(budget>capacity) budget=capacity;
     assert(!cs_work_init(capacity));
     void *join=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL),*agg=dlopen(argv[2],RTLD_NOW|RTLD_LOCAL);
@@ -316,6 +317,12 @@ int main(int argc,char **argv)
     function build=(function)dlsym(join,"pg_sina_join_build"),load=(function)dlsym(join,"pg_sina_join_load");
     function probe=(function)dlsym(join,"pg_sina_join_probe"),close=(function)dlsym(join,"pg_sina_join_close");
     function source=(function)dlsym(agg,"pg_sina_aggregate_source"); assert(build && load && probe && close && source);
+    if(worker_override) {
+        check(build,load,probe,close,source,70003,150003,0,0,1,0,0);
+        check(build,load,probe,close,source,70003,150003,0,0,1,1,1);
+        check(build,load,probe,close,source,70003,150003,0,0,1,0,1);
+        dlclose(agg); dlclose(join); puts("PASS multi-CU probe cursors and final aggregate merge"); return 0;
+    }
     check(build,load,probe,close,source,70003,17003,0,0,1,0,0);
     check(build,load,probe,close,source,5001,301,1,0,0,0,0);
     check(build,load,probe,close,source,0,2003,0,0,0,0,0);

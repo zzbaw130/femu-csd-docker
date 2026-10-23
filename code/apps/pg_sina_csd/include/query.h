@@ -13,7 +13,7 @@
 #define QS_OUT 16
 #define QS_GROUPS 256
 #define QS_RESULT_ROWS 256
-#define QS_WORKERS 4
+#define QS_WORKERS 64 /* FEMU supports 1..64 CUs; active slots follow device resources. */
 #define QS_PAGE 8192U
 #define QS_CHUNK (4U*1024*1024)
 #define QS_SORT_IO_BYTES (64U*1024)
@@ -26,7 +26,9 @@
 #define QS_RESULT_STRING_BYTES (64U*1024U)
 #define QS_INDEX_READS 64
 #define QS_INDEX_CACHE 128
-#define QS_INDEX_WORK_BYTES (128U*1024) /* Cursor/tag state; page input stays in AFDM. */
+#define QS_INDEX_WORK_BYTES (128U*1024) /* Base cursor/tag state; pages stay in AFDM. */
+static inline size_t qs_index_work_bytes(unsigned workers)
+{ return QS_INDEX_WORK_BYTES+(size_t)(workers?workers-1:0)*4096; }
 #define QS_INDEX_WAIT 1 /* Private join continuation; never a SNIA status. */
 enum qs_type { Q_DECIMAL, Q_INTEGER, Q_DATE, Q_CHAR, Q_BOOLEAN, Q_STRING, Q_PREFIX, Q_PATTERN, Q_DICTIONARY };
 enum qs_op { Q_COLUMN, Q_CONST, Q_ADD, Q_SUB, Q_MUL, Q_EQ, Q_NE, Q_LT, Q_LE, Q_GT, Q_GE,

@@ -357,7 +357,7 @@ static void fetch(PlanStateCsd *s)
             if(slot->resume) { checked(csFreeBatchRequest(slot->resume),"release LOAD batch"); slot->resume=NULL; }
             if(w) { slot->ready=slot->control.output_rows || slot->control.finished; slot->done=slot->control.finished; continue; }
             memcpy(s->result,&header,offsetof(struct qs_result,data));
-            for(unsigned i=1;i<=s->workers;++i) if(slot->control.drained&(1U<<(i-1))) s->slots[i].ready=false;
+            for(unsigned i=1;i<=s->workers;++i) if(slot->control.drained&(UINT64_C(1)<<(i-1))) s->slots[i].ready=false;
             s->parallel=slot->control.parallel;
             if(slot->control.epoch!=s->epoch) {
                 s->epoch=slot->control.epoch;
@@ -382,8 +382,8 @@ static void fetch(PlanStateCsd *s)
         }
         struct plan_slot *main=&s->slots[0];
         if(!main->pending) {
-            unsigned ready=0;
-            for(unsigned w=1;w<=s->workers;++w) if(s->slots[w].ready) ready|=1U<<(w-1);
+            uint64_t ready=0;
+            for(unsigned w=1;w<=s->workers;++w) if(s->slots[w].ready) ready|=UINT64_C(1)<<(w-1);
             /* Direct build/aggregate sinks share a bounded table. Its owner
              * may resize or spill only after every CU in the wave is idle. */
             bool idle=true;

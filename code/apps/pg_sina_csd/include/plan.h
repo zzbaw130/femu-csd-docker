@@ -42,11 +42,14 @@ struct qp_control {
     int error;
     unsigned error_node;
     /* parallel=2 adds a CU wave barrier before a shared sink can resize/spill. */
-    unsigned parallel, epoch, available, drained;
+    unsigned parallel, epoch;
+    uint64_t available, drained;
     /* Completion metadata avoids a second AFDM read for internal row batches. */
     unsigned output_rows, peak_cus;
     struct qs_index_read index_reads[QS_INDEX_READS];
 };
+static inline uint64_t qp_worker_mask(unsigned workers)
+{ return workers==64?UINT64_MAX:(UINT64_C(1)<<workers)-1; }
 static inline unsigned qp_scan_buffer_bytes(const struct qp_plan *p,const struct qp_node *n)
 {
     unsigned bytes=n->bytes<p->scan_bytes?n->bytes:p->scan_bytes;

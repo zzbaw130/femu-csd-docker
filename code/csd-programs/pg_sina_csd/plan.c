@@ -135,7 +135,8 @@ struct execution {
     bool profiling;
     struct femu_csd_args *args;
     unsigned initializer,initializer_phase;
-    unsigned worker, parallel_done, parallel_position[QS_WORKERS];
+    unsigned worker, parallel_position[QS_WORKERS];
+    uint64_t parallel_done;
     int parallel_started;
     unsigned parallel_node, root, used_workers;
     /* One-based parent receiving rows directly from parallel workers. */
@@ -1668,17 +1669,17 @@ restart:
         s->parallel_started=1; s->used_workers=p->workers;
         if(s->profiling) { s->pipeline_start=now_ns(CLOCK_MONOTONIC); s->pipeline_tick=now_ns(CLOCK_THREAD_CPUTIME_ID); }
     }
-    for(unsigned w=0;w<p->workers;++w) if(s->control->available&(1U<<w)) {
+    for(unsigned w=0;w<p->workers;++w) if(s->control->available&(UINT64_C(1)<<w)) {
         struct qs_result *out=&s->outputs[w+1];
         if(s->parallel_position[w]<out->rows) {
             unsigned cols=p->nodes[root].expr.nout;
             memcpy(row,(struct qs_cell *)out->data+(size_t)s->parallel_position[w]++*cols,cols*sizeof(*row));
             return 2;
         }
-        if(out->finished) s->parallel_done|=1U<<w;
-        s->parallel_position[w]=0; s->control->available&=~(1U<<w); s->control->drained|=1U<<w;
+        if(out->finished) s->parallel_done|=UINT64_C(1)<<w;
+        s->parallel_position[w]=0; s->control->available&=~(UINT64_C(1)<<w); s->control->drained|=UINT64_C(1)<<w;
     }
-    if(s->parallel_done==((1U<<p->workers)-1)) {
+    if(s->parallel_done==qp_worker_mask(p->workers)) {
         struct qp_pipeline_profile *phase=&p->pipelines[root];
         if(s->profiling) {
             phase->wall_ns+=now_ns(CLOCK_MONOTONIC)-s->pipeline_start;
@@ -1752,7 +1753,7 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
         a->mr_len[1]<(long long)sizeof(struct qp_control) || a->mr_len[2]<(long long)sizeof(struct qs_result) ||
         a->mr_len[4]<QS_SORT_IO_BYTES) return -1;
     struct qp_plan *plan=a->mr_addr[0]; unsigned worker=(uint64_t)a->cparam1>>1;
-    if(worker>plan->workers || a->mr_len[1]<(long long)((worker+1)*sizeof(struct qp_control)) ||
+    if(plan->workers>QS_WORKERS || worker>plan->workers || a->mr_len[1]<(long long)((worker+1)*sizeof(struct qp_control)) ||
        a->mr_len[2]<(long long)((worker+1)*sizeof(struct qs_result))) return -1;
     struct qp_control *control=(struct qp_control *)a->mr_addr[1]+worker;
     struct qs_result *out=(struct qs_result *)a->mr_addr[2]+worker;

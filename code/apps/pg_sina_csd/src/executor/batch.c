@@ -399,7 +399,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
             if(qs_join_at(&request->plan,i)->indexid) { ++indexed_stages; continue; }
             weights[i]=stage_build_bytes(&request->plan,i); weight_sum+=weights[i];
         }
-        uint64_t index_budget=indexed_stages?QS_INDEX_WORK_BYTES*indexed_stages:0;
+        uint64_t index_budget=indexed_stages?qs_index_work_bytes(workers)*indexed_stages:0;
         uint64_t hash_budget=build_budget>index_budget?build_budget-index_budget:0;
         uint64_t limits[QS_JOINS]={0};
         bool tuned=false;
@@ -419,7 +419,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
             struct qs_request *build=&builds[stage];
             struct qs_plan view=request->plan; view.join=*qs_join_at(&request->plan,stage); view.njoins=njoins;
             base+=view.join.nattrs; view.nattrs=base; view.join.residual=0;
-            if(view.join.indexid) view.join.work_mem_bytes=QS_INDEX_WORK_BYTES;
+            if(view.join.indexid) view.join.work_mem_bytes=qs_index_work_bytes(workers);
             else if(tuned) view.join.work_mem_bytes=limits[stage];
             else if(weight_sum) {
                 uint64_t share=hash_budget*weights[stage]/weight_sum;

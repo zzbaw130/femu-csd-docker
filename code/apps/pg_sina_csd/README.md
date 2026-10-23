@@ -23,7 +23,7 @@ CSD：按计划读取 Heap/索引 → 连接/聚合/排序 → 分批最终结�
 Guest PG：最终结果 → Datum → 客户端
 ```
 
-通用树按 PG 选定的连接树划分可并行的 Scan→Filter→Join Probe 流水线，包含 InitPlan 和 Hash Build 输入中的流水线。Guest 根据设备 CU 数和 FDM 容量分配至多四个执行槽，通过普通 SNIA 请求提交；各设备任务从共享游标动态领取数据块，完成的槽立即继续推进，不等待固定四分支轮次。并行构建输入由各 CU 按批预留紧凑行空间、原子更新桶链，Hash 表只构建一次并共享。支持的 Hash 聚合/去重也由各 CU 直接更新同一张有界表，只锁当前桶；AVG 保留精确 sum/count，DISTINCT 在全局按完整键去重。表满时保留未消费的 AFDM 行，等当前 CU 任务均停止使用该表后，由协调端扩容或沿现有路径 spill；不会为四个 CU 复制四份完整表。Sort 和不支持该方式的聚合保留原阻塞边界；不同流水线依次复用缓冲。扫描块根据 FDM 容量在 4/2/1 MiB 中选择，优先保留 CU 并行度；小表只分配其实际文件大小的缓冲。工作内存仍受同一个查询根 context 限制。
+通用树按 PG 选定的连接树划分可并行的 Scan→Filter→Join Probe 流水线，包含 InitPlan 和 Hash Build 输入中的流水线。Guest 根据设备 CU 数和 FDM 容量分配至多 64 个执行槽，通过普通 SNIA 请求提交；各设备任务从共享游标动态领取数据块，完成的槽立即继续推进，不等待固定四分支轮次。并行构建输入由各 CU 按批预留紧凑行空间、原子更新桶链，Hash 表只构建一次并共享。支持的 Hash 聚合/去重也由各 CU 直接更新同一张有界表，只锁当前桶；AVG 保留精确 sum/count，DISTINCT 在全局按完整键去重。表满时保留未消费的 AFDM 行，等当前 CU 任务均停止使用该表后，由协调端扩容或沿现有路径 spill；不会按 CU 数复制完整表。Sort 和不支持该方式的聚合保留原阻塞边界；不同流水线依次复用缓冲。扫描块根据 FDM 容量在 4/2/1 MiB 中选择，优先保留 CU 并行度；小表只分配其实际文件大小的缓冲。工作内存仍受同一个查询根 context 限制。
 
 扫描输出列批次，复用已有 Filter 的 selection、SIMD 和复杂条件短路；价格等 numeric 列仅为存活行解码。内部批次只存当前流水线需要的列，字符串已有值的查找不再争抢插入锁。索引自连接可以复用同一个执行槽仍保留的原始扫描块，块外页按需 LOAD。树内中间值仍为精确 int128，连接/投影/聚合的组合仍有按行处理部分；不表示所有节点已完全向量化。Q1/Q6 继续使用已有的单表列向量快路径。
 
@@ -71,7 +71,9 @@ SET pg_sina_csd.profile=on;       -- 开发时开启，默认 off
 
 扩展在每个 PG backend 首次规划已映射设备的 CSD 查询时，读取并保存该设备的 CU 数、FDM 容量及 workmem 总容量，供规划和两条执行路径共用。同一 backend 后续查询复用这些容量；设备重新配置后建立新 PG 连接即可重新发现，不需要修改扩展源码。CU/FDM 通过 `csQueryDeviceProperties` 获取；当前 SNIA 资源结构没有本项目分配器的 workmem 字段，因此调用 `pg-sina-plan.so` 中零参数的 `pg_sina_workmem_capacity`，通过 64 位 CompValue 返回 `cs_work_get_stats().capacity_bytes`。这是一条普通设备计算请求，不创建辅助进程，也不读取 Guest 的内存配置。
 
-自动模式下，CSD 查询总内存预算等于设备 workmem；显式设置非零 `max_memory` 时取两者较小值。例如设备为 32 MiB，即使设置 64 MiB，查询也只能使用 32 MiB。EXPLAIN 显示 `CSD Device CUs`、`CSD Device Workmem` 和 `CSD Query Memory Limit`，普通 EXPLAIN 即可核对。查询的所有并行 CU 和阻塞节点共享该总预算。实际执行槽数还受 FDM、内存及数据量约束；本次保留已有最多 4 个 SQL 执行槽的限制，读取到更多 CU 不会自动突破此上限。
+自动模式下，CSD 查询总内存预算等于设备 workmem；显式设置非零 `max_memory` 时取两者较小值。例如设备为 32 MiB，即使设置 64 MiB，查询也只能使用 32 MiB。EXPLAIN 显示 `CSD Device CUs`、`CSD Device Workmem` 和 `CSD Query Memory Limit`，普通 EXPLAIN 即可核对。查询的所有并行 CU 和阻塞节点共享该总预算。实际执行槽数还受 FDM、内存及数据量约束；支持 1–64 个 SQL 执行槽，与当前 FEMU 允许的 CU 范围一致，使用 `min(设备 CU 数, 64)` 作为初始候选，按实际缓冲和算子需要减少。完成标记采用 64 位位图，64 槽完整掩码单独处理，避免移位溢出。设备 CU 和 workmem 增加后，新连接自动重新编排，不需要修改扩展源码。
+
+Hash Probe 和索引游标仅为实际用到的槽分配，避免扩大槽容量后每个节点都预留 64 份游标；共享索引状态的预算按槽数增加。Sort source 归并时会跳过未生成 run 的空闲槽。
 
 工作内存来自共享 `libcs-workmem`，查询根 context 和子排序/索引 context 同时记账，总量不超过查询设置和物理池容量。不是为每个节点各给一个完整的 `max_memory`。FDM 只放页输入、列批次、字符串交接和最终输出；Hash 表、run 描述和游标来自 workmem。排序优先保留内存 run，分配下一段将超过配额时请求 spill，而非等待某个固定的空闲百分比。
 
