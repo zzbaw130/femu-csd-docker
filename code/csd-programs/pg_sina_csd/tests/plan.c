@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <pthread.h>
 typedef int64_t (*function)(struct femu_csd_args *);
-enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP };
+enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_PARTITION,TEST_PARTITION_SKEW };
 static void w16(void *p,uint16_t x) { memcpy(p,&x,2); }
 static void w32(void *p,uint32_t x) { memcpy(p,&x,4); }
 static unsigned char *heap(unsigned rows,unsigned side,size_t *size)
@@ -64,10 +64,16 @@ struct probe_test {
     struct qs_result *out;
     unsigned char *arena,*raw,*heap,*index;
     unsigned worker;
+    void **tokens;
+    size_t ntokens;
 };
 static void *probe_worker(void *arg)
 {
     struct probe_test *t=arg;
+    void *ranges[5]; long long lengths[5];
+    memcpy(ranges,t->args.mr_addr,sizeof(ranges)); memcpy(lengths,t->args.mr_len,sizeof(lengths));
+    ranges[4]=(unsigned char *)ranges[4]+t->worker*QS_SORT_IO_BYTES; lengths[4]=QS_SORT_IO_BYTES;
+    t->args.mr_addr=ranges; t->args.mr_len=lengths;
     for(;;) {
         struct qp_control *c=t->control;
         if((c->index_nreads || c->bytes) && !c->ready) {
@@ -82,7 +88,14 @@ static void *probe_worker(void *arg)
             } else memcpy(t->arena+offset,((c->node==3 || c->node==6)?t->heap:t->raw)+c->offset,c->bytes);
             c->ready=1;
         }
-        int64_t status=t->run(&t->args); assert(!status);
+        int64_t status=t->run(&t->args); assert(status>=0);
+        if(status) {
+            uint64_t op=(uint64_t)status>>60,id=(uint64_t)status&CS_IO_VALUE_MASK;
+            assert(op==2 && id && id<=t->ntokens && t->tokens[id-1]);
+            memcpy(t->args.mr_addr[4],t->tokens[id-1],QS_SORT_IO_BYTES);
+            t->args.cparam2=id; continue;
+        }
+        t->args.cparam2=0;
         if(t->out->rows || t->out->finished) return NULL;
         assert(c->index_nreads || c->bytes);
     }
@@ -131,7 +144,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         a->expr.exprs[3+i]=(struct qs_expr){.op=Q_AGGREF,.column=i,.type=i==4?Q_DECIMAL:Q_INTEGER};
         a->expr.outputs[i+1]=(struct qs_output){.index=3+i,.type_oid=i==4?1700:20};
     }
-    if(parallel==TEST_COUNT_ROWS) {
+    if(parallel==TEST_COUNT_ROWS || parallel>=TEST_PARTITION) {
         /* COUNT(*) needs row cardinality but no payload from the probe pipeline. */
         j->expr.nout=0; a->nkeys=a->expr.nkeys=a->expr.nattrs=0;
         a->expr.naggs=a->expr.nout=1; a->expr.aggs[0]=(struct qs_agg){.kind=Q_COUNT_STAR};
@@ -155,6 +168,9 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         plan->nodes[6]=plan->nodes[3];
     }
     size_t sizes[2]; unsigned char *raw[2]={heap(rows,0,&sizes[0]),heap(right_rows,1,&sizes[1])};
+    if(parallel==TEST_PARTITION_SKEW)
+        for(unsigned side=0;side<2;++side) for(unsigned i=0;i<(side?right_rows:rows);++i)
+            if(i%17) w32(raw[side]+(i/100)*QS_PAGE+QS_PAGE-(i%100+1)*40+24,1);
     size_t bytes=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
     for(unsigned i=2;i<4;++i) {
         plan->nodes[i].bytes=sizes[i-2]; plan->nodes[i].input_offset=bytes; bytes+=plan->scan_bytes;
@@ -204,8 +220,8 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     void **tokens=NULL; size_t ntokens=0; unsigned got=0; unsigned char seen[12]={0};
     uint64_t counts[12]={0},sums[12]={0},mins[12]={0},maxs[12]={0};
     for(unsigned l=0;l<rows;++l) {
-        unsigned key=l%11; int matched=0;
-        for(unsigned r=0;r<right_rows;++r) if(l%17 && r%17 && key==r%7) {
+        unsigned key=parallel==TEST_PARTITION_SKEW?1:l%11; int matched=0;
+        for(unsigned r=0;r<right_rows;++r) if(l%17 && r%17 && key==(parallel==TEST_PARTITION_SKEW?1:r%7)) {
             unsigned v=join==QP_SEMI?l%19+1:r%13+1; matched=1;
             if(join==QP_ANTI) continue;
             ++counts[key]; sums[key]+=v; if(!mins[key] || mins[key]>v) mins[key]=v; if(maxs[key]<v) maxs[key]=v;
@@ -223,7 +239,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         if(control.parallel && !csIsReentry(&args)) {
             pthread_t threads[4]; struct probe_test tasks[4]; unsigned started=0;
             for(unsigned w=0;w<plan->workers;++w) if(!((available|done)&(1U<<w))) {
-                tasks[w]=(struct probe_test){run,args,plan,&controls[w+1],&out[w+1],arena,raw[0],raw[1],index,w+1};
+                tasks[w]=(struct probe_test){run,args,plan,&controls[w+1],&out[w+1],arena,raw[0],raw[1],index,w+1,tokens,ntokens};
                 tasks[w].args.cparam1=(w+1)<<1;
                 assert(!pthread_create(&threads[w],NULL,probe_worker,&tasks[w])); started|=1U<<w;
             }
@@ -248,7 +264,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         args.cparam2=0; available&=~control.drained;
         if(control.epoch!=epoch) { epoch=control.epoch; available=done=0; }
         for(unsigned r=0;r<out->rows;++r) {
-            if(parallel==TEST_COUNT_ROWS) {
+            if(parallel==TEST_COUNT_ROWS || parallel>=TEST_PARTITION) {
                 uint64_t expected=0; for(unsigned i=0;i<12;++i) expected+=counts[i];
                 assert(out->data[r].cells[0].value==expected); ++got; continue;
             }
@@ -281,7 +297,8 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             memcpy(arena+n->input_offset,raw[control.node==2?0:1]+control.offset,control.bytes); control.ready=1;
         }
     }
-    assert(got); if(parallel!=TEST_COUNT_ROWS) for(unsigned i=0;i<12;++i) assert(!seen[i]);
+    assert(got); if(parallel!=TEST_COUNT_ROWS && parallel<TEST_PARTITION) for(unsigned i=0;i<12;++i) assert(!seen[i]);
+    if(parallel>=TEST_PARTITION) assert(ntokens && !out->metrics.runs && out->metrics.workers==4);
     for(size_t i=0;i<ntokens;++i) free(tokens[i]);
     free(tokens); free(raw[0]); free(raw[1]); free(index); free(plan); free(arena); free(io); free(out);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
@@ -442,6 +459,8 @@ int main(int argc,char **argv)
     test(run,QP_LEFT,23,23,64,1,TEST_BIGINT_HASH);
     test(run,QP_LEFT,5170,23,4,1,TEST_HASH_GROUP);
     test(run,QP_INNER,5170,23,64,1,TEST_HASH_GROUP);
+    test(run,QP_INNER,31,150000,4,1,TEST_PARTITION);
+    test(run,QP_INNER,31,150000,4,1,TEST_PARTITION_SKEW);
     test(run,QP_LEFT,20000,23,4,0,TEST_SERIAL);
     test(run,QP_LEFT,73,20000,8,1,TEST_SERIAL);
     test(run,QP_INNER,73,60000,8,1,TEST_BUILD_FALLBACK);

@@ -25,7 +25,7 @@ Guest 从 PG 选定的树中标记可并行的扫描/投影/Hash 或 Index Probe
 ## 节点与内存
 
 - Scan/Projection：只解码父节点真正需要的列；投影、过滤、CASE、NULL 三值逻辑、短路、数值运算、LIKE、substring 和 year 在设备执行。仅用于 LIKE 的长字符串直接在扫描时判断，不先将所有文本放入字典。
-- Hash Join：按 PG 的左右输入 build/probe，支持 INNER/LEFT/SEMI/ANTI 和多键等值/剩余条件。表内按 PG 类型保存整数/date 的 4/8 字节值，numeric 保留完整 128 位，均保留精度与 NULL 信息，避免每列承担 32 字节的对齐填充。阻塞子节点的父表从小容量开始，随实际输出增长，避免提前挤占子节点的内存。Hash 表使用查询预算扣除两份排序配额后的上限，实际分配仍受查询根 context 约束。超出配额时缩小并保留已经消费的投影行，交给外部 Merge Join，不回头重扫原始 Heap。
+- Hash Join：按 PG 的左右输入 build/probe，支持 INNER/LEFT/SEMI/ANTI 和多键等值/剩余条件。表内按 PG 类型保存整数/date 的 4/8 字节值，numeric 保留完整 128 位，避免每列承担 32 字节的对齐填充。阻塞子节点的父表从小容量开始，随实际输出增长。INNER 表扩容失败时，将已消费的前缀和后续输入按键分为四个分区，使用现有 SNIA spill 请求保存紧凑行；两侧 Heap 均只扫描一次。逐分区构建共享 Hash 表，各 CU 动态领取 Probe 块，偏斜分区超限时分批构建并重复读取该分区的 Probe 临时数据，不改用全表排序。其他不能采用此路径的形态保留原 Merge 回退。所有分配仍受查询根 context 和物理池约束。
 - Merge Join：分别排序输入，按键归并；重复键组可 spill，保留 NULL、重复和外连接语义。
 - Index Join：复用 `index_scan.c` 的 PG12 整数 B-tree 下探与 Heap Tuple 解码，可在连接树多个位置出现。最多批量 64 个外侧键；要求保留顺序时一次一个键。缺页只通过控制记录交给 Guest 批量提交内部 LOAD。SEMI/ANTI 在消费端确认条件满足后停止查找该键；索引自连接复用当前扫描块中的 Heap 页，超出该块再读取，不建立跨查询缓存。
 - 有序 Index Scan：同一文件沿 PG12 B-tree 正向叶链收集 TID，批量回表，按索引顺序生成列批次。保持单游标供流式 GroupAggregate 消费；不把有序输入任意拆给多个 CU。沿叶链预读至多 16 页，Heap 在 PG 提供的正相关性大于 0.9 时预读至多 32 页，均受文件边界和原页缓存限制；无统计或相关性低时按需读取。额外 TID 列表仅为该游标分配，等值连接不承担这份开销。

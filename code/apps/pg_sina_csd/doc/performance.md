@@ -948,7 +948,7 @@ Q3/Q21 仍有大量索引页请求，Q11 的短查询受固定准备/请求开�
 
 具体瓶颈：
 
-- **Q9：嵌套 Hash 表同时驻留，orders 连接回退为串行 Merge。** 已在下文逐节点确认：子表占 42 MiB，父表增长时超出根预算；随后对两侧和 GROUP BY 输入共做三次外部排序。缺少分区 Hash Join、多键 Hash Aggregate、并行构建及局部聚合，不能将其全部归为不可避免的容量退化。
+- **Q9：已增加分区 Hash Join，仍需去除聚合前的大排序。** 分区保存紧凑行，保留分区内四 CU Probe，orders 两侧不再排序。标准 Q9 完整结果一致，本阶段 host 4.111s、CSD 5.226s，单向 spill 158.06 MiB、根峰值 56.76 MiB、CSF CPU 5.93s，数据在 `results/tpch.LOYNZe/`。现有 62 个 run 均来自聚合前排序，下一阶段处理；当前性能仍未达标。
 - **Q13：已消除不必要的 Merge 和聚合前排序。** 单整数键 COUNT 可以直接消费 LEFT JOIN 输出，正确跳过补出的 NULL；外层 PG HashAggregate 也保留 Hash 算法。整数 Hash 字段仅保存值和 NULL，不保存恒为零的 scale/dscale。原生 Parallel SeqScan 的 618687 行是单 worker 估计，设备扫描却消费整张表；现使用 PG 基表的全表过滤后估计，避免先建小表、随后扩容时因新旧块同时驻留而回退。标准查询完整结果一致，累计 CSF CPU 1.75s，spill 读写为 0，根峰值 61.58 MiB。剩余较慢样本主要应继续检查构建/聚合组合及请求交接，不能归因于 spill。
 - **Q17：32/64 MiB 下均已消除 spill。** 有界 Hash Aggregate 保留精确 SUM/count，取消分组前的大排序。Hash 表按字段类型存储整数、numeric 保留完整 128 位；阻塞子节点的父表按实际输出增长，避免提前挤占聚合预算；workmem 可利用相邻空闲块原地扩容，仍遵守父/子配额。32 MiB 的独立 profile 根峰值为 25.28 MiB，spill 读写为 0，树墙钟约 3.82s；完整结果与 host 一致。此前的低内存退化属于行存储及预留问题，本次已消除该瓶颈。
 - **Q18：已补正向有序索引扫描。** 原生 PG 的内层 GroupAggregate 直接读取 `lineitem_pkey`；设备现在同样沿叶链批量回表、按索引顺序流式聚合，去除 Heap 后补的 Sort。复用原来的页缓存和 LOAD 请求；最多预读 16 个索引页，只有 PG 相关性统计大于 0.9 时才最多预读 32 个 Heap 页。游标/TID 列表使用 workmem，AFDM 页缓存大小不增加，单个最近页命中直接返回。当前独立 profile 有 5962 次 CSF、7036 个 Host LOAD 请求，累计 CSF CPU 4.49s，spill 为 0。其他外层阻塞阶段仍沿用原实现。
@@ -995,3 +995,5 @@ DuckDB 对照的是已有实现能力，不据此声称其 Q9 一定采用某个
 - `physical_hash_aggregate.cpp` 与 `radix_partitioned_hashtable.cpp` 使用列批次和线程局部聚合，预算不足时调整内存预留或分区。可借鉴为先维护少量 nation/year 聚合状态，最后只对聚合结果排序；实际内存和收益仍需实现后验证。
 
 优化优先级：先实现有界分区 Hash Join，避免 orders 的全量排序并保留分区内并行；其次支持多键/表达式的局部 Hash Aggregate，将最终排序从 323844 行缩至 175 行；再减少中间行宽、连续表倍增的峰值和逐行复制。当前扫描解码约 1.73s 累计 CPU，三份排序约 4.63s，后者约占总 CSF CPU 9.43s 的 49%；继续只优化 Scan SIMD 或增加 CU 数不能消除已确认的算法退化。CPU 为跨 CU 累计，不能与查询墙钟直接相减计算 I/O。
+
+分区 Hash Join 定向验证：原生 Plan 及 ASan/UBSan 通过；新增 4 MiB 下强制分区的四 CU、重复键、NULL 和所有键集中于一个分区的用例，核对 COUNT、无排序 run、spill 及 context 回收。模拟重入使用每 CU 独立 I/O 范围；真实 PG 也为每 CU 传递独立 spill AFDM，遵守 FEMU 计算参数零偏移限制，AFDM 总容量不增加。

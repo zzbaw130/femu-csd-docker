@@ -34,6 +34,7 @@ typedef struct {
     struct qs_result *result;
     CS_DEV_HANDLE device;
     CS_MEM_HANDLE memory[5];
+    CS_MEM_HANDLE worker_io[QS_WORKERS];
     CS_CSF_ID function;
     int lock_fd;
     unsigned row;
@@ -84,6 +85,9 @@ static void close_state(void *arg)
     }
     CsMemFlags flags={.FDMId=1};
     for(unsigned i=0;i<5;++i) if(s->memory[i]) { csFreeMem(s->memory[i],&flags); s->memory[i]=NULL; }
+    for(unsigned w=0;w<s->workers;++w) if(s->worker_io[w]) {
+        csFreeMem(s->worker_io[w],&flags); s->worker_io[w]=NULL;
+    }
     if(s->active) {
         CsConfigInfo c={.Type=CS_CSF_ACTIVATE,.u.CSFActivateInfo={.CSFId=510,.EEIId=1,.State=CS_INACTIVE_STATE}};
         CsConfigData data; int size=sizeof(data); csConfig(s->device,&size,&c,&data); s->active=false;
@@ -205,8 +209,10 @@ static void start(PlanStateCsd *s)
         break;
     }
     CsMemFlags flags={.FDMId=1};
-    size_t sizes[]={sizeof(*s->plan),(s->workers+1)*sizeof(struct qp_control),(s->workers+1)*sizeof(*s->result),arena,(s->workers+1)*QS_SORT_IO_BYTES};
+    size_t sizes[]={sizeof(*s->plan),(s->workers+1)*sizeof(struct qp_control),(s->workers+1)*sizeof(*s->result),arena,QS_SORT_IO_BYTES};
     for(unsigned i=0;i<5;++i) checked(csAllocMem(s->device,sizes[i],&flags,&s->memory[i],NULL),"allocate AFDM");
+    for(unsigned w=0;w<s->workers;++w)
+        checked(csAllocMem(s->device,QS_SORT_IO_BYTES,&flags,&s->worker_io[w],NULL),"allocate worker spill AFDM");
     checked(transfer(s->memory[0],0,s->plan,sizeof(*s->plan),true),"copy plan");
     checked(transfer(s->memory[1],0,&s->slots[0].control,sizeof(s->slots[0].control),true),"initialize control");
     struct qs_dict dictionary={.entries=entries,.capacity=entries,.data=data};
@@ -236,6 +242,8 @@ static void start(PlanStateCsd *s)
     request->ReqType=CS_QUEUE_COMPUTE; request->u.Compute.CSFId=s->function; request->u.Compute.NumArgs=6;
     for(unsigned i=0;i<5;++i) csHelperSetComputeArg(&request->u.Compute.Args[i],CS_AFDM_TYPE,s->memory[i],0UL);
     for(unsigned w=0;w<=s->workers;++w) {
+        /* FEMU compute ranges start at zero; each CU needs its own spill AFDM. */
+        csHelperSetComputeArg(&request->u.Compute.Args[4],CS_AFDM_TYPE,w?s->worker_io[w-1]:s->memory[4],0UL);
         csHelperSetComputeArg(&request->u.Compute.Args[5],CS_64BIT_VALUE_TYPE,(u64)(s->profiling|(w<<1)));
         checked(csAllocBatchRequest(CS_BATCH_SERIAL,1,&s->slots[w].batch),"allocate batch");
         CS_BATCH_INDEX index; checked(csConfigureBatchEntry(s->slots[w].batch,CS_BATCH_ADD,request,0,0,&index),"configure batch");
@@ -319,6 +327,7 @@ static void submit(PlanStateCsd *s,unsigned worker)
             CsBatchRequest *request=palloc0(sizeof(*request)+6*sizeof(CsComputeArg));
             request->ReqType=CS_QUEUE_COMPUTE; request->u.Compute.CSFId=s->function; request->u.Compute.NumArgs=6;
             for(unsigned i=0;i<5;++i) csHelperSetComputeArg(&request->u.Compute.Args[i],CS_AFDM_TYPE,s->memory[i],0UL);
+            csHelperSetComputeArg(&request->u.Compute.Args[4],CS_AFDM_TYPE,worker?s->worker_io[worker-1]:s->memory[4],0UL);
             csHelperSetComputeArg(&request->u.Compute.Args[5],CS_64BIT_VALUE_TYPE,(u64)(s->profiling|(worker<<1)));
             CS_BATCH_INDEX current;
             checked(csConfigureBatchEntry(slot->resume,CS_BATCH_ADD,request,0,slot->previous,&current),"configure resumed compute"); pfree(request);

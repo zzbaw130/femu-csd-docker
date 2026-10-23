@@ -71,6 +71,15 @@ struct spool {
     unsigned blocks, capacity, used, loaded;
     uint64_t rows;
 };
+#define HASH_PARTITIONS 4
+/* Bounded radix partitions use the existing SNIA spill protocol. A skewed
+ * partition is probed in build batches, without sorting or rereading Heap. */
+struct external_hash {
+    struct spool build[HASH_PARTITIONS],probe[HASH_PARTITIONS];
+    unsigned char *prefix;
+    uint64_t prefix_rows,prefix_at,build_at,probe_at;
+    unsigned phase,partition;
+};
 struct accumulator { struct qs_cell sum,extreme,last; uint64_t count; int has_last; };
 struct compact_group { struct qs_cell sum; int64_t key; uint64_t count; unsigned occupied; };
 struct set_key { int64_t value; unsigned occupied; };
@@ -96,6 +105,7 @@ struct operator_state {
     unsigned char *hash_data;
     unsigned hash_rows,hash_capacity,hash_match,hash_phase;
     int hash_matched,hash_fallback,hash_shared;
+    struct external_hash *external;
     struct compact_group *groups;
     unsigned group_capacity,group_count,group_flush,group_phase;
     struct set_key *set;
@@ -128,6 +138,9 @@ struct execution {
     atomic_uint active_cus, peak_cus;
     struct execution *owner, *workers[QS_WORKERS];
     struct qs_result *outputs;
+    int partition_join,source_node;
+    struct spool source;
+    uint64_t source_at,source_end;
 };
 static uint64_t now_ns(clockid_t clock)
 { struct timespec t; clock_gettime(clock,&t); return (uint64_t)t.tv_sec*1000000000ULL+t.tv_nsec; }
@@ -152,6 +165,9 @@ static inline int64_t next_row(struct execution *s,unsigned id,struct qs_cell *r
     return status;
 }
 static int64_t join_next(struct execution *,unsigned,struct qs_cell *);
+static int64_t external_build(struct execution *,unsigned);
+static int64_t external_probe(struct execution *,unsigned,struct qs_cell *);
+static void external_advance(struct execution *,unsigned);
 static int key_compare(struct execution *,const struct qp_node *,const struct qs_cell *,const struct qs_cell *);
 static int keys_null(const struct qp_node *,const struct qs_cell *);
 static uint64_t mix_hash(uint64_t);
@@ -389,6 +405,7 @@ static int64_t hash_build(struct execution *s,unsigned id)
     const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
     const struct qs_plan *right=&s->plan->nodes[n->right].expr;
     unsigned row_bytes=hash_row_bytes(right);
+    if(o->external) return external_build(s,id);
     if(o->hash_fallback) return 0;
     size_t stride=row_bytes+3*sizeof(uint32_t);
     /* Hash build is not a sort run: allow it to use the query budget while
@@ -418,7 +435,15 @@ static int64_t hash_build(struct execution *s,unsigned id)
                  * or decodes the original heap for another build batch. */
                 size_t used=(size_t)o->hash_rows*row_bytes;
                 void *prefix=cs_work_realloc(s->context,o->hash_data,used);
-                o->right_sort.prefix=prefix?prefix:o->hash_data; o->right_sort.prefix_rows=o->hash_rows;
+                unsigned char *retained=prefix?prefix:o->hash_data;
+                if(n->join_type==QP_INNER)
+                    o->external=cs_work_calloc(s->context,1,sizeof(*o->external));
+                if(o->external) {
+                    o->external->prefix=retained; o->external->prefix_rows=o->hash_rows;
+                    o->hash_data=NULL; o->hash_capacity=o->hash_rows=0; o->hash_fallback=2;
+                    return external_build(s,id);
+                }
+                o->right_sort.prefix=retained; o->right_sort.prefix_rows=o->hash_rows;
                 o->hash_data=NULL; o->hash_fallback=1; return 0;
             }
             o->hash_data=data; o->hash_capacity*=2;
@@ -443,13 +468,16 @@ static int64_t hash_next(struct execution *s,unsigned id,struct qs_cell *row)
     unsigned rn=s->plan->nodes[n->right].expr.nout,ln=s->plan->nodes[n->left].expr.nout;
     const struct qs_plan *right_plan=&s->plan->nodes[n->right].expr;
     unsigned row_bytes=hash_row_bytes(right_plan);
-    if(!o->hash_phase && !o->hash_fallback) { int64_t status=hash_build(s,id); if(status) return status; }
-    if(o->hash_fallback) return join_next(s,id,row);
+restart:
+    if(!o->hash_phase && o->hash_fallback!=1) { int64_t status=hash_build(s,id); if(status) return status; }
+    if(o->finished) return 0;
+    if(o->hash_fallback==1) return join_next(s,id,row);
     uint32_t *next=(void *)(o->hash_data+(size_t)o->hash_capacity*row_bytes),*buckets=next+o->hash_capacity;
     for(;;) {
         if(!o->have_left) {
-            int64_t status=next_row(s,n->left,o->left);
+            int64_t status=o->external?external_probe(s,id,o->left):next_row(s,n->left,o->left);
             if(status!=2) {
+                if(!status && o->external) { external_advance(s,id); goto restart; }
                 if(!status) { if(!o->hash_shared) cs_work_free(s->context,o->hash_data); o->hash_data=NULL; o->finished=1; }
                 return status;
             }
@@ -482,9 +510,9 @@ static int64_t hash_next(struct execution *s,unsigned id,struct qs_cell *row)
         }
     }
 }
-static int64_t spool_append(struct execution *s,struct spool *p,const struct qs_cell *row,unsigned cols)
+static int64_t spool_append_bytes(struct execution *s,struct spool *p,const void *row,unsigned row_bytes)
 {
-    unsigned row_bytes=cols*sizeof(*row),block_rows=QS_SORT_IO_BYTES/row_bytes;
+    unsigned block_rows=QS_SORT_IO_BYTES/row_bytes;
     if(!p->tail) {
         p->tail=cs_work_alloc(s->context,QS_SORT_IO_BYTES); p->loaded=UINT_MAX;
         if(!p->tail) return -4;
@@ -500,9 +528,9 @@ static int64_t spool_append(struct execution *s,struct spool *p,const struct qs_
     }
     memcpy(p->tail+(size_t)p->used*row_bytes,row,row_bytes); ++p->used; ++p->rows; return 0;
 }
-static int64_t spool_row(struct execution *s,struct spool *p,uint64_t index,unsigned cols,struct qs_cell *row)
+static int64_t spool_row_bytes(struct execution *s,struct spool *p,uint64_t index,unsigned row_bytes,void *row)
 {
-    unsigned row_bytes=cols*sizeof(*row),block_rows=QS_SORT_IO_BYTES/row_bytes,block=index/block_rows;
+    unsigned block_rows=QS_SORT_IO_BYTES/row_bytes,block=index/block_rows;
     if(index>=p->rows) return -1;
     unsigned char *data=p->tail;
     if(block<p->blocks) {
@@ -514,6 +542,100 @@ static int64_t spool_row(struct execution *s,struct spool *p,uint64_t index,unsi
         data=p->cache;
     }
     memcpy(row,data+(index%block_rows)*row_bytes,row_bytes); return 0;
+}
+static int64_t spool_append(struct execution *s,struct spool *p,const struct qs_cell *row,unsigned cols)
+{ return spool_append_bytes(s,p,row,cols*sizeof(*row)); }
+static int64_t spool_row(struct execution *s,struct spool *p,uint64_t index,unsigned cols,struct qs_cell *row)
+{ return spool_row_bytes(s,p,index,cols*sizeof(*row),row); }
+static void external_advance(struct execution *s,unsigned id)
+{
+    struct operator_state *o=&s->nodes[id];
+    if(o->hash_data) cs_work_free(s->context,o->hash_data);
+    o->hash_data=NULL; o->hash_rows=o->hash_capacity=o->hash_phase=o->hash_match=0;
+    o->have_left=0; o->external->probe_at=0; o->external->phase=2;
+}
+static int64_t external_probe(struct execution *s,unsigned id,struct qs_cell *row)
+{
+    const struct qp_node *n=&s->plan->nodes[id]; struct external_hash *e=s->nodes[id].external;
+    const struct qs_plan *p=&s->plan->nodes[n->left].expr;
+    struct spool *input=&e->probe[e->partition];
+    if(e->probe_at==input->rows) return 0;
+    unsigned char packed[QS_OUT*19];
+    int64_t status=spool_row_bytes(s,input,e->probe_at,hash_row_bytes(p),packed); if(status) return status;
+    hash_load(row,packed,p); ++e->probe_at; return 2;
+}
+static int64_t external_build(struct execution *s,unsigned id)
+{
+    const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
+    struct external_hash *e=o->external;
+    const struct qs_plan *right=&s->plan->nodes[n->right].expr,*left=&s->plan->nodes[n->left].expr;
+    unsigned rb=hash_row_bytes(right),lb=hash_row_bytes(left);
+    unsigned char packed[QS_OUT*19];
+    while(e->phase<2) {
+        int build=e->phase==0;
+        if(!o->have_right) {
+            int64_t status;
+            if(build && e->prefix_at<e->prefix_rows) {
+                hash_load(o->right,e->prefix+(size_t)e->prefix_at++*rb,right); status=2;
+            } else {
+                if(e->prefix) { cs_work_free(s->context,e->prefix); e->prefix=NULL; }
+                status=next_row(s,build?n->right:n->left,o->right);
+            }
+            if(status==QP_WAIT || status<0 || status>2) return status;
+            if(!status) { ++e->phase; continue; }
+            o->have_right=1;
+        }
+        /* INNER join NULL keys cannot match, on either side. */
+        int null=0;
+        for(unsigned k=0;k<n->nkeys;++k) null|=o->right[build?n->right_keys[k]:n->left_keys[k]].isnull;
+        if(!null) {
+            unsigned part=(row_hash(n,o->right,build)>>32)&(HASH_PARTITIONS-1);
+            hash_store(packed,o->right,build?right:left);
+            int64_t status=spool_append_bytes(s,build?&e->build[part]:&e->probe[part],packed,build?rb:lb);
+            if(status) return status;
+        }
+        o->have_right=0;
+    }
+    while(e->phase==2) {
+        if(e->partition==HASH_PARTITIONS) { e->phase=4; o->finished=1; return 0; }
+        struct spool *build=&e->build[e->partition],*probe=&e->probe[e->partition];
+        if(e->build_at==build->rows || !probe->rows) {
+            if(build->cache) { cs_work_free(s->context,build->cache); build->cache=NULL; }
+            if(build->tail) { cs_work_free(s->context,build->tail); build->tail=NULL; }
+            if(probe->cache) { cs_work_free(s->context,probe->cache); probe->cache=NULL; }
+            if(probe->tail) { cs_work_free(s->context,probe->tail); probe->tail=NULL; }
+            ++e->partition; e->build_at=e->probe_at=0; continue;
+        }
+        if(!o->hash_data) {
+            struct cs_work_context_stats m;
+            if(cs_work_get_context_stats(s->context,&m)) return -4;
+            size_t reserve=2*QS_SORT_IO_BYTES;
+            if(s->plan->workers>1) reserve+=s->plan->workers*(sizeof(*s)+s->plan->count*sizeof(*s->nodes)+QS_SORT_IO_BYTES+256);
+            size_t available=m.limit_bytes-m.used_bytes;
+            available=available>reserve?available-reserve:available/2;
+            unsigned capacity=128;
+            while(capacity<build->rows-e->build_at && (size_t)capacity*2*(rb+12)<=available && capacity<UINT_MAX/4) capacity*=2;
+            while(!(o->hash_data=cs_work_alloc(s->context,(size_t)capacity*(rb+12)))) {
+                if(capacity==128) return -4;
+                capacity/=2;
+            }
+            o->hash_capacity=capacity;
+        }
+        while(o->hash_rows<o->hash_capacity && e->build_at<build->rows) {
+            int64_t status=spool_row_bytes(s,build,e->build_at,rb,o->hash_data+(size_t)o->hash_rows*rb);
+            if(status) return status;
+            ++e->build_at; ++o->hash_rows;
+        }
+        uint32_t *next=(void *)(o->hash_data+(size_t)o->hash_capacity*rb),*buckets=next+o->hash_capacity;
+        memset(buckets,0xff,(size_t)o->hash_capacity*2*sizeof(*buckets));
+        for(unsigned i=0;i<o->hash_rows;++i) {
+            hash_load(o->right,o->hash_data+(size_t)i*rb,right);
+            unsigned bucket=row_hash(n,o->right,1)&(2*o->hash_capacity-1);
+            next[i]=buckets[bucket]; buckets[bucket]=i;
+        }
+        e->phase=3; o->hash_phase=1;
+    }
+    return 0;
 }
 static int64_t materialized_row(struct execution *s,unsigned id,uint64_t position,struct qs_cell *row)
 {
@@ -1106,6 +1228,18 @@ static int64_t next_row_impl(struct execution *s,unsigned id,struct qs_cell *row
 {
     if(id>=s->plan->count) return -1;
     struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
+    if(s->worker && (int)id==s->source_node) {
+        unsigned bytes=hash_row_bytes(&n->expr),block_rows=QS_SORT_IO_BYTES/bytes;
+        if(s->source_at==s->source_end) {
+            s->source_at=atomic_fetch_add(&s->owner->next_offset,block_rows);
+            if(s->source_at>=s->source.rows) return 0;
+            s->source_end=s->source_at+block_rows;
+            if(s->source_end>s->source.rows) s->source_end=s->source.rows;
+        }
+        unsigned char packed[QS_OUT*19];
+        int64_t status=spool_row_bytes(s,&s->source,s->source_at,bytes,packed); if(status) return status;
+        hash_load(row,packed,&n->expr); ++s->source_at; return 2;
+    }
     if(o->finished) return 0;
     if(!s->worker && s->plan->workers>1 && n->parallel) return parallel_next(s,id,row);
     if(n->kind==QP_SCAN) return scan_next(s,id,row);
@@ -1148,6 +1282,7 @@ static void close_workers(struct execution *s)
 static int64_t parallel_next(struct execution *s,unsigned root,struct qs_cell *row)
 {
     struct qp_plan *p=s->plan;
+restart:
     if(!s->parallel_started || s->parallel_node!=root) {
         int builds[QP_NODES]; unsigned count=0;
         for(int id=root;id>=0 && p->nodes[id].kind!=QP_SCAN;id=p->nodes[id].left)
@@ -1158,11 +1293,22 @@ static int64_t parallel_next(struct execution *s,unsigned root,struct qs_cell *r
         for(unsigned i=count;i;--i) {
             unsigned id=builds[i-1];
             int64_t status=hash_build(s,id); if(status) return status;
-            if(s->nodes[id].hash_fallback) {
+            if(s->nodes[id].external && s->nodes[id].finished) {
+                for(unsigned j=0;j<count;++j) {
+                    struct operator_state *o=&s->nodes[builds[j]];
+                    if(o->hash_data) cs_work_free(s->context,o->hash_data);
+                    o->hash_data=NULL;
+                }
+                s->control->parallel=0; s->nodes[root].finished=1; return 0;
+            }
+            if(s->nodes[id].hash_fallback==1) {
                 p->nodes[root].parallel=0;
                 return next_row(s,root,row);
             }
         }
+        s->partition_join=-1;
+        for(unsigned i=0;i<count;++i)
+            if(s->nodes[builds[i]].external) { s->partition_join=builds[i]; break; }
         for(unsigned w=0;w<p->workers;++w) {
             struct cs_work_context_stats stats;
             if(cs_work_get_context_stats(s->context,&stats)) return -4;
@@ -1176,8 +1322,14 @@ static int64_t parallel_next(struct execution *s,unsigned root,struct qs_cell *r
             }
             e->context=context; e->plan=p; e->owner=s; e->worker=w+1; e->root=root;
             e->control=s->control+w+1; e->dictionary=s->dictionary; e->arena=s->arena;
-            e->io=(char *)s->io+(w+1)*QS_SORT_IO_BYTES; e->io_bytes=QS_SORT_IO_BYTES;
+            e->io_bytes=QS_SORT_IO_BYTES;
             e->sort_limit=s->sort_limit; e->profiling=s->profiling; e->initializer=p->ninit;
+            e->source_node=-1;
+            if(s->partition_join>=0) {
+                const struct external_hash *h=s->nodes[s->partition_join].external;
+                e->source_node=p->nodes[s->partition_join].left;
+                e->source=h->probe[h->partition]; e->source.cache=NULL; e->source.loaded=UINT_MAX;
+            }
             memcpy(e->params,s->params,sizeof(e->params));
             for(unsigned i=0;i<p->count;++i) {
                 const struct operator_state *built=&s->nodes[i]; struct operator_state *local=&e->nodes[i];
@@ -1216,16 +1368,23 @@ static int64_t parallel_next(struct execution *s,unsigned root,struct qs_cell *r
             s->metrics.scanned+=v->metrics.scanned; s->metrics.matched+=v->metrics.matched;
             s->metrics.input_bytes+=v->metrics.input_bytes-v->metrics.index_pages*QS_PAGE;
             s->metrics.index_pages+=v->metrics.index_pages; s->metrics.index_tuples+=v->metrics.index_tuples;
+            s->metrics.spill_read_bytes+=v->metrics.spill_read_bytes;
+            s->metrics.spill_write_bytes+=v->metrics.spill_write_bytes;
             for(unsigned op=0;op<QS_OPERATORS;++op) {
                 struct qs_timing *t=&s->profile.operators[op]; const struct qs_timing *x=&v->profile.operators[op];
                 t->calls+=x->calls; t->wall_ns+=x->wall_ns; t->cpu_ns+=x->cpu_ns;
             }
         }
         close_workers(s);
+        s->parallel_started=0; s->control->parallel=0;
+        if(s->partition_join>=0) {
+            external_advance(s,s->partition_join); s->partition_join=-1;
+            goto restart;
+        }
         for(int id=root;id>=0 && p->nodes[id].kind!=QP_SCAN;id=p->nodes[id].left) if(p->nodes[id].kind==QP_JOIN) {
             cs_work_free(s->context,s->nodes[id].hash_data); s->nodes[id].hash_data=NULL;
         }
-        s->parallel_started=0; s->control->parallel=0; s->nodes[root].finished=1; return 0;
+        s->nodes[root].finished=1; return 0;
     }
     s->control->parallel=1; return QP_WAIT;
 }
@@ -1274,6 +1433,7 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
         cs_work_context *context=cs_work_begin_limit(budget); if(!context) return -4;
         s=cs_work_calloc(context,1,sizeof(*s)); if(!s) { cs_work_end(context); return -4; }
         s->context=context; s->plan=plan; s->control=control; s->dictionary=a->mr_addr[3];
+        s->partition_join=s->source_node=-1;
         s->arena=a->mr_addr[3]; s->io=a->mr_addr[4]; s->io_bytes=a->mr_len[4];
         s->nodes=cs_work_calloc(context,plan->count,sizeof(*s->nodes));
         if(!s->nodes) { cs_work_end(context); return -4; }
@@ -1282,6 +1442,8 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
         s->profiling=a->cparam1&1; s->outputs=a->mr_addr[2]; control->state=(uintptr_t)s;
     }
     s->args=a;
+    /* The last AFDM is private to this CU, also for SNIA NEED_LOAD/STORE. */
+    s->io=a->mr_addr[4]; s->io_bytes=a->mr_len[4];
     /* SNIA may invoke us repeatedly inside one batch submission for spill.
      * PG only observes completion once, so retain all consumed-buffer bits. */
     if(!csIsReentry(a)) control->drained=0;
