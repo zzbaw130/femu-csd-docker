@@ -559,26 +559,39 @@ static Node *heap_index_var(Node *node,List *tlist)
 }
 /* A full index path may supply ordering without a Sort node. Reading its
  * immutable heap is valid only if we explicitly retain that ordering. */
-static int ordered_heap_scan(struct binding *b,struct qp_plan *tree,unsigned id,Oid indexid,ScanDirection direction,bool ordered)
+static int ordered_heap_scan(struct binding *b,struct qp_plan *tree,unsigned id,Oid indexid,ScanDirection direction,bool ordered,bool index_only)
 {
-    if(direction==NoMovementScanDirection || !ordered) return id;
+    if(direction==NoMovementScanDirection || (!ordered && !index_only)) return id;
     if(tree->count==QP_NODES) return -1;
     Relation index=relation_open(indexid,NoLock);
     if(direction==ForwardScanDirection &&
        index_metadata(indexid,b->node->expr.relid,index->rd_index->indkey.values[0],&b->node->expr.join)) {
         b->node->ordered_index=1;
+        int key=index->rd_index->indkey.values[0]-1;
+        bool covered=index_only && key>=0 && key<(int)b->node->expr.nattrs;
+        for(unsigned i=0;i<b->node->expr.nattrs;++i)
+            if(b->node->expr.cols[i].slot>=0 && (int)i!=key) covered=false;
+        if(covered) {
+            b->node->ordered_index|=4;
+            b->node->expr.join.build_key=key+1;
+        }
+        if(!ordered && !covered) {
+            b->node->ordered_index=0; memset(&b->node->expr.join,0,sizeof(b->node->expr.join));
+            relation_close(index,NoLock); return id;
+        }
         HeapTuple stats=SearchSysCache3(STATRELATTINH,ObjectIdGetDatum(b->node->expr.relid),
             Int16GetDatum(index->rd_index->indkey.values[0]),BoolGetDatum(false));
         if(HeapTupleIsValid(stats)) {
             AttStatsSlot slot;
             if(get_attstatsslot(&slot,stats,STATISTIC_KIND_CORRELATION,InvalidOid,ATTSTATSSLOT_NUMBERS)) {
-                if(slot.nnumbers==1 && slot.numbers[0]>0.9) b->node->ordered_index|=2;
+                if(!covered && slot.nnumbers==1 && slot.numbers[0]>0.9) b->node->ordered_index|=2;
                 free_attstatsslot(&slot);
             }
             ReleaseSysCache(stats);
         }
         relation_close(index,NoLock); return id;
     }
+    if(!ordered) { relation_close(index,NoLock); return id; }
     if(index->rd_rel->relam!=BTREE_AM_OID || RelationGetIndexPredicate(index) || RelationGetIndexExpressions(index) ||
        index->rd_index->indnkeyatts>QS_OUT) { relation_close(index,NoLock); return -1; }
     unsigned out=tree->count++,original=b->node->expr.nout;
@@ -772,14 +785,14 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
     if(n->kind==QP_SCAN && IsA(native,IndexScan)) {
         int extra=conditions(&b,((IndexScan *)native)->indexqualorig); if(extra==-2) return -1;
         if(extra>=0) p->predicate=p->predicate<0?extra:add_expr(p,(struct qs_expr){.op=Q_AND,.type=Q_BOOLEAN,.left=p->predicate,.right=extra});
-        return ordered_heap_scan(&b,tree,id,((IndexScan *)native)->indexid,((IndexScan *)native)->indexorderdir,ordered);
+        return ordered_heap_scan(&b,tree,id,((IndexScan *)native)->indexid,((IndexScan *)native)->indexorderdir,ordered,false);
     }
     if(n->kind==QP_SCAN && IsA(native,IndexOnlyScan)) {
         IndexOnlyScan *index=(IndexOnlyScan *)native;
         List *quals=(List *)heap_index_var((Node *)index->recheckqual,index->indextlist);
         int extra=conditions(&b,quals); if(extra==-2) return -1;
         if(extra>=0) p->predicate=p->predicate<0?extra:add_expr(p,(struct qs_expr){.op=Q_AND,.type=Q_BOOLEAN,.left=p->predicate,.right=extra});
-        return ordered_heap_scan(&b,tree,id,index->indexid,index->indexorderdir,ordered);
+        return ordered_heap_scan(&b,tree,id,index->indexid,index->indexorderdir,ordered,true);
     }
     return id;
 }

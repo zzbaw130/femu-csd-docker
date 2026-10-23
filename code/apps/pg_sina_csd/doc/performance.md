@@ -955,4 +955,6 @@ Q3/Q21 仍有大量索引页请求，Q11 的短查询受固定准备/请求开�
 
 本次针对性验证：7 项原生 Plan/外部排序测试（包括 4/16/64/128 MiB 与查询总预算）通过；原生 Plan ASan+UBSan 通过。新增覆盖 4 MiB 嵌套回退、多键重复值和正负整数/numeric 排序，完整回收 context；未添加新 SQL 测试集。
 
-有序扫描专项验证：原生 Plan 和 B-tree 测试、PG heap 测试及对应 ASan/UBSan 通过。新增空索引、跨叶页、17 行小批次输出、普通/预读模式的完整顺序与数量核对；真实 Q18 两轮完整结果一致并实际卸载。反向扫描仍用原排序回退，尚未实现真正的 Index Only Scan。
+有序扫描专项验证：原生 Plan 和 B-tree 测试、PG heap 测试及对应 ASan/UBSan 通过。新增空索引、跨叶页、17 行小批次输出、普通/预读模式的完整顺序与数量核对；真实 Q18 两轮完整结果一致并实际卸载。反向扫描仍用原排序回退。
+
+Q13 已补整数前导键覆盖的 Index Only Scan，结果在 `results/tpch.5lOWAG/`。标准 SQL 完整结果一致、实际 Scan(customer, index only)，内部读取减少约 25 MiB；冷启动 host 1.198s、CSD 11.310s，spill 单向约 353 MiB，性能仍不合格。定向 Plan/B-tree 及 ASan/UBSan 通过，覆盖 NULL、2/4/8 字节整数和跨页输出，测试确认覆盖扫描不请求 Heap。主要剩余成本仍为 Hash 转 Merge 和聚合前排序。

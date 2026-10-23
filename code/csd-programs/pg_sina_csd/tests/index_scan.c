@@ -113,24 +113,26 @@ static void check(function build,function probe,function close,function source,i
     free(result); free(c); free(out); free(io);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
 }
-static void ordered_scan(void *library,unsigned rows,int empty,int read_ahead)
+static void ordered_scan(void *library,unsigned rows,int empty,int flags)
 {
     int (*init)(const struct qs_plan *,struct qs_join_control *)=dlsym(library,"qs_index_init");
     int64_t (*scan)(struct qs_chunk *,struct qs_task *,struct qs_join_control *,void *,unsigned,unsigned,int)=dlsym(library,"qs_index_scan");
     void (*close)(struct qs_join_control *)=dlsym(library,"qs_index_close");
     assert(init && scan && close);
-    struct qs_plan p={.nattrs=2,.ncols=2,.join={.nattrs=2,.indexroot=empty?0:1,.work_mem_bytes=QS_INDEX_WORK_BYTES}};
+    struct qs_plan p={.nattrs=2,.ncols=2,.join={.nattrs=2,.build_key=1,.index_key_bytes=key_bytes,.indexroot=empty?0:1,.work_mem_bytes=QS_INDEX_WORK_BYTES}};
     for(unsigned i=0;i<2;++i) p.cols[i]=(struct qs_column){.slot=i,.length=4,.align=4,.type=Q_INTEGER};
+    if(flags&4) { p.cols[1].slot=-1; p.ncols=1; }
     struct qs_join_control control={0}; struct qs_task task={0}; assert(!init(&p,&control));
-    struct qs_chunk *out=calloc(1,qs_chunk_bytes(17,2)); assert(out); out->capacity=17; out->ncols=2;
+    struct qs_chunk *out=calloc(1,qs_chunk_bytes(17,2)); assert(out); out->capacity=17; out->ncols=p.ncols;
     char *io=calloc(1,QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE); assert(io);
     unsigned seen=0;
     for(unsigned iteration=0;;++iteration) {
         assert(iteration<10000);
-        int64_t status=scan(out,&task,&control,io,rows==8?2:256,4,read_ahead);
+        int64_t status=scan(out,&task,&control,io,rows==8?2:256,4,flags);
         if(status==QS_INDEX_WAIT) {
             for(unsigned i=0;i<task.index_nreads;++i) {
                 struct qs_index_read *r=&task.index_reads[i];
+                if(flags&4) assert(!r->heap);
                 memcpy(io+QS_SORT_IO_BYTES+(size_t)r->slot*QS_PAGE,r->heap?heap[r->block]:index_pages[r->block],QS_PAGE);
             }
             continue;
@@ -138,7 +140,9 @@ static void ordered_scan(void *library,unsigned rows,int empty,int read_ahead)
         assert(!status);
         if(!out->rows) break;
         for(unsigned i=0;i<out->rows;++i) {
-            assert(qs_values(out)[out->capacity+i]==10+seen);
+            if((flags&4) && rows==9 && seen==8) assert(qs_nulls(out)[i/8]&(1U<<(i%8)));
+            else if(flags&4) assert(qs_values(out)[i]==(rows<=9?(seen<2?-2:seen<6?7:9):(int)seen));
+            else assert(qs_values(out)[out->capacity+i]==10+seen);
             ++seen;
         }
         out->rows=out->selected=0;
@@ -151,10 +155,12 @@ int main(int argc,char **argv)
     void *join=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL),*agg=dlopen(argv[2],RTLD_NOW|RTLD_LOCAL); assert(join && agg);
     function build=(function)dlsym(join,"pg_sina_join_build"),probe=(function)dlsym(join,"pg_sina_join_probe"),close=(function)dlsym(join,"pg_sina_join_close"),source=(function)dlsym(agg,"pg_sina_aggregate_source"); assert(build && probe && close && source);
     heap_window=(void (*)(struct qs_join_control *,unsigned,const void *,uint32_t,uint32_t))dlsym(join,"qs_index_heap_window"); assert(heap_window);
-    key_bytes=4; pages(); ordered_scan(join,8,0,0); ordered_scan(join,8,1,1);
-    large_pages(); ordered_scan(join,256,0,0); ordered_scan(join,256,0,1);
+    key_bytes=4; pages(); ordered_scan(join,8,0,0); ordered_scan(join,8,1,2); ordered_scan(join,8,0,4);
+    unsigned char null_key[16]={0}; w16(null_key+6,0x8000|16); add(index_pages[3],null_key,16);
+    ordered_scan(join,9,0,4);
+    large_pages(); ordered_scan(join,256,0,0); ordered_scan(join,256,0,2); ordered_scan(join,256,0,4);
     for(key_bytes=2;key_bytes<=8;key_bytes*=2) {
-        pages();
+        pages(); ordered_scan(join,8,0,4);
         for(retained_window=1;retained_window<=2;++retained_window) {
             check(build,probe,close,source,0,0); check(build,probe,close,source,1,0);
         }

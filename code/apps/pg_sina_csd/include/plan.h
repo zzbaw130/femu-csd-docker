@@ -13,7 +13,7 @@ struct qp_node {
     struct qs_plan expr;
     int kind, left, right, join_type, join_qual;
     unsigned nkeys, distinct, distinct_aggs;
-    unsigned sorted_input, ordered_index; /* bit 0: forward index; bit 1: correlated heap read-ahead */
+    unsigned sorted_input, ordered_index; /* bit 0: forward index; bit 1: correlated heap read-ahead; bit 2: covered leading key */
     unsigned hash, parallel;
     int left_keys[QS_KEYS], right_keys[QS_KEYS];
     uint64_t bytes, index_bytes, input_offset, vector_offset;

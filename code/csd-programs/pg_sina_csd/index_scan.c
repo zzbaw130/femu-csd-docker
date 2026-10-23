@@ -140,7 +140,7 @@ static int seek(const unsigned char *page,struct lookup *key,unsigned bytes)
     return 0;
 }
 int64_t qs_index_scan(struct qs_chunk *out,struct qs_task *task,struct qs_join_control *control,void *io,
-    unsigned heap_pages,unsigned index_pages,int read_ahead)
+    unsigned heap_pages,unsigned index_pages,int flags)
 {
     struct index_join *h=(void *)(uintptr_t)control->state;
     struct index_cursor *c=&h->cursors[0];
@@ -149,8 +149,10 @@ int64_t qs_index_scan(struct qs_chunk *out,struct qs_task *task,struct qs_join_c
         c->waiting=0; task->index_pending=task->index_nreads=0;
     }
     if(!c->scan_started) {
-        c->scan_tids=cs_work_alloc(h->context,QS_RESULT_ROWS*sizeof(*c->scan_tids));
-        if(!c->scan_tids) return -4;
+        if(!(flags&4)) {
+            c->scan_tids=cs_work_alloc(h->context,QS_RESULT_ROWS*sizeof(*c->scan_tids));
+            if(!c->scan_tids) return -4;
+        }
         c->scan_started=1; c->scan.block=h->scan.join.indexroot;
         c->scan.phase=1; c->scan_done=!c->scan.block;
     }
@@ -183,6 +185,29 @@ int64_t qs_index_scan(struct qs_chunk *out,struct qs_task *task,struct qs_join_c
             unsigned item=c->scan.item++,len=0;
             if(((u32(page+24+(item-1)*4)>>15)&3)==3) continue;
             const unsigned char *t=item_at(page,item,&len); if(!t || len<8) return -2;
+            if(flags&4) {
+                unsigned attr=h->scan.join.build_key-1,bytes=h->scan.join.index_key_bytes;
+                if(attr>=h->scan.nattrs || (bytes!=2 && bytes!=4 && bytes!=8)) return -2;
+                unsigned info=u16(t+6),off=info&0x8000?16:8;
+                if((info&8191)!=len || ((info&0x8000) && len<16)) return -2;
+                int null=(info&0x8000) && !(t[8]&1),slot=h->scan.cols[attr].slot;
+                if(!out->rows) memset(qs_nulls(out),0,((out->capacity+7)/8)*(size_t)out->ncols);
+                if(slot>=0) {
+                    int64_t value=0;
+                    if(!null) {
+                        if(len<off+bytes) return -2;
+                        if(bytes==2) value=(int16_t)u16(t+off);
+                        else if(bytes==4) value=(int32_t)u32(t+off);
+                        else memcpy(&value,t+off,8);
+                    }
+                    qs_values(out)[(size_t)slot*out->capacity+out->rows]=value;
+                    qs_dscales(out)[(size_t)slot*out->capacity+out->rows]=0;
+                    if(null) qs_nulls(out)[(size_t)slot*((out->capacity+7)/8)+out->rows/8]|=1U<<(out->rows%8);
+                }
+                qs_selection(out)[out->rows]=out->rows; ++out->rows; ++out->selected;
+                if(out->rows==out->capacity) return 0;
+                continue;
+            }
             c->scan_tids[c->count++]=((uint64_t)(((uint32_t)u16(t)<<16)|u16(t+2))<<16)|u16(t+4);
         }
         /* Decode in TID-list order; collect missing pages at the first miss. */
@@ -192,7 +217,7 @@ int64_t qs_index_scan(struct qs_chunk *out,struct qs_task *task,struct qs_join_c
             const unsigned char *page=page_at(c,task,io,tid>>16,1);
             if(!page) {
                 unsigned block=tid>>16;
-                if(read_ahead) for(unsigned i=1;i<32 && i<heap_pages-block;++i) page_at(c,task,io,block+i,1);
+                if(flags&2) for(unsigned i=1;i<32 && i<heap_pages-block;++i) page_at(c,task,io,block+i,1);
                 goto wait;
             }
             if(page_items(page,0)<0) return -2;

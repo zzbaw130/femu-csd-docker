@@ -661,7 +661,7 @@ static int64_t scan_next(struct execution *s,unsigned id,struct qs_cell *row)
                 s->control->ready=s->control->index_nreads=0;
             } else chunk->rows=chunk->selected=0;
             int64_t status=qs_index_scan(chunk,&o->index_task,&o->index_control,s->arena+n->input_offset,
-                n->bytes/QS_PAGE,n->index_bytes/QS_PAGE,n->ordered_index&2);
+                n->bytes/QS_PAGE,n->index_bytes/QS_PAGE,n->ordered_index);
             if(status==QS_INDEX_WAIT) {
                 s->control->node=id; s->control->index_nreads=o->index_task.index_nreads;
                 memcpy(s->control->index_reads,o->index_task.index_reads,sizeof(s->control->index_reads));

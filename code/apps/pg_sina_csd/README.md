@@ -55,9 +55,9 @@ EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT count(*) FROM lineitem;
 
 ## 访问路径和内存
 
-设备可在连接树任意位置使用参数化整数前导键 B-tree 等值查找，支持复合索引的前导键，剩余条件仍在设备判断。一次最多收集 64 个外侧键；需要保留外侧顺序时按单键推进。缺页时只将页号写入控制 AFDM，PG 根据 extent 合并连续目的缓冲和相邻 LBA，通过 SERIAL batch 提交内部 NVM→AFDM LOAD→继续计算；不同执行槽可以独立推进。SEMI/ANTI 在确认匹配后立即停止该键的查找。索引页和 Heap Tuple 仍在设备解析；没有实现真正的 Index Only Scan。
+设备可在连接树任意位置使用参数化整数前导键 B-tree 等值查找，支持复合索引的前导键，剩余条件仍在设备判断。一次最多收集 64 个外侧键；需要保留外侧顺序时按单键推进。缺页时只将页号写入控制 AFDM，PG 根据 extent 合并连续目的缓冲和相邻 LBA，通过 SERIAL batch 提交内部 NVM→AFDM LOAD→继续计算；不同执行槽可以独立推进。SEMI/ANTI 在确认匹配后立即停止该键的查找。索引页和 Heap Tuple 仍在设备解析。
 
-需要顺序的、已准备映射的 PG12 整数前导键 B-tree 支持正向叶页遍历，按索引顺序回表并直接交给有序聚合，不再补 Heap 排序。索引页做有界预读；PG 相关性统计大于 0.9 时，Heap 也做有界正向预读。游标受 workmem 约束，页留在原 AFDM 缓存中。其他独立扫描仍可能降为 Heap；反向有序扫描仍补排序。目前没有真正的 Index Only Scan、Bitmap Scan、通用索引范围游标、部分/表达式索引或 PG13+ posting list 支持。
+需要顺序的、已准备映射的 PG12 整数前导键 B-tree 支持正向叶页遍历，按索引顺序回表并直接交给有序聚合，不再补 Heap 排序。索引页做有界预读；PG 相关性统计大于 0.9 时，Heap 也做有界正向预读。游标受 workmem 约束，页留在原 AFDM 缓存中。其他独立扫描仍可能降为 Heap；反向有序扫描仍补排序。Index Only Scan 当前仅支持所需列完全由已映射索引的整数前导键覆盖的形态，直接读取索引键，不回表；其他形态回退原路径。仍没有 Bitmap Scan、通用索引范围游标、部分/表达式索引或 PG13+ posting list 支持。
 
 ```sql
 SET pg_sina_csd.max_memory='64MB'; -- 查询设备工作内存上限，最低 4MB
