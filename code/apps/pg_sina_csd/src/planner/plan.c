@@ -7,6 +7,7 @@
 #include "catalog/pg_namespace_d.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_collation_d.h"
+#include "catalog/pg_statistic.h"
 #include "executor/spi.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -20,6 +21,7 @@
 #include "utils/rel.h"
 #include "utils/pg_locale.h"
 #include "utils/date.h"
+#include "utils/syscache.h"
 #include <errno.h>
 #include <locale.h>
 
@@ -562,6 +564,21 @@ static int ordered_heap_scan(struct binding *b,struct qp_plan *tree,unsigned id,
     if(direction==NoMovementScanDirection || !ordered) return id;
     if(tree->count==QP_NODES) return -1;
     Relation index=relation_open(indexid,NoLock);
+    if(direction==ForwardScanDirection &&
+       index_metadata(indexid,b->node->expr.relid,index->rd_index->indkey.values[0],&b->node->expr.join)) {
+        b->node->ordered_index=1;
+        HeapTuple stats=SearchSysCache3(STATRELATTINH,ObjectIdGetDatum(b->node->expr.relid),
+            Int16GetDatum(index->rd_index->indkey.values[0]),BoolGetDatum(false));
+        if(HeapTupleIsValid(stats)) {
+            AttStatsSlot slot;
+            if(get_attstatsslot(&slot,stats,STATISTIC_KIND_CORRELATION,InvalidOid,ATTSTATSSLOT_NUMBERS)) {
+                if(slot.nnumbers==1 && slot.numbers[0]>0.9) b->node->ordered_index|=2;
+                free_attstatsslot(&slot);
+            }
+            ReleaseSysCache(stats);
+        }
+        relation_close(index,NoLock); return id;
+    }
     if(index->rd_rel->relam!=BTREE_AM_OID || RelationGetIndexPredicate(index) || RelationGetIndexExpressions(index) ||
        index->rd_index->indnkeyatts>QS_OUT) { relation_close(index,NoLock); return -1; }
     unsigned out=tree->count++,original=b->node->expr.nout;
@@ -724,7 +741,7 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
             if(p->exprs[key].op!=Q_COLUMN) return -1;
             n->left_keys[n->nkeys++]=p->exprs[key].column;
         }
-        if(tree->nodes[n->left].kind!=QP_SORT) n->sorted_input=0;
+        if(tree->nodes[n->left].kind!=QP_SORT && !tree->nodes[n->left].ordered_index) n->sorted_input=0;
     }
     ListCell *c;
     foreach(c,native->targetlist) {

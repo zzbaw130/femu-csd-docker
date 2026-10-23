@@ -13,10 +13,10 @@ struct qp_node {
     struct qs_plan expr;
     int kind, left, right, join_type, join_qual;
     unsigned nkeys, distinct, distinct_aggs;
-    unsigned sorted_input;
+    unsigned sorted_input, ordered_index; /* bit 0: forward index; bit 1: correlated heap read-ahead */
     unsigned hash, parallel;
     int left_keys[QS_KEYS], right_keys[QS_KEYS];
-    uint64_t bytes, input_offset, vector_offset;
+    uint64_t bytes, index_bytes, input_offset, vector_offset;
     uint64_t parallel_input, parallel_vector;
     double estimated_rows;
 };
@@ -49,7 +49,7 @@ static inline int qp_probe_scan(const struct qp_plan *p,int id)
 {
     if(id<0) return -1;
     const struct qp_node *n=&p->nodes[id];
-    if(n->kind==QP_SCAN) return id;
+    if(n->kind==QP_SCAN) return n->ordered_index?-1:id;
     if(n->kind==QP_PROJECT || n->kind==QP_INDEX_JOIN || (n->kind==QP_JOIN && n->hash))
         return qp_probe_scan(p,n->left);
     return -1;

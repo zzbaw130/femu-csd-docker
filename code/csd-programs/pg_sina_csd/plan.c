@@ -635,8 +635,15 @@ static int64_t scan_next(struct execution *s,unsigned id,struct qs_cell *row)
 {
     const struct qp_node *n=&s->plan->nodes[id]; const struct qs_plan *p=&n->expr; struct operator_state *o=&s->nodes[id];
     struct qs_chunk *chunk=(void *)(s->arena+vector_offset(s,n));
+    if(n->ordered_index && !o->index_control.state) {
+        o->index_plan=cs_work_alloc(s->context,sizeof(*p)); if(!o->index_plan) return -4;
+        *o->index_plan=*p; o->index_plan->work_mem_parent=(uintptr_t)s->context;
+        o->index_plan->join.nattrs=p->nattrs; o->index_plan->join.work_mem_bytes=QS_INDEX_WORK_BYTES;
+        int status=qs_index_init(o->index_plan,&o->index_control); if(status) return status;
+        qs_index_dictionary(&o->index_control,s->dictionary);
+    }
     for(;;) {
-        if(o->scan_position<chunk->selected) {
+        if(!o->index_task.index_pending && o->scan_position<chunk->selected) {
             unsigned at=qs_selection(chunk)[o->scan_position++]; struct qs_cell values[QS_COLS];
             for(unsigned i=0;i<p->nattrs;++i) if(p->cols[i].slot>=0) {
                 unsigned slot=p->cols[i].slot;
@@ -646,6 +653,23 @@ static int64_t scan_next(struct execution *s,unsigned id,struct qs_cell *row)
             }
             int count=project_filtered(s,n,values,NULL,row,o->scan_filter!=NULL); if(count<0) return count;
             if(count) { ++s->metrics.matched; return 2; }
+            continue;
+        }
+        if(n->ordered_index) {
+            if(o->index_task.index_pending) {
+                if(!s->control->ready) return QP_WAIT;
+                s->control->ready=s->control->index_nreads=0;
+            } else chunk->rows=chunk->selected=0;
+            int64_t status=qs_index_scan(chunk,&o->index_task,&o->index_control,s->arena+n->input_offset,
+                n->bytes/QS_PAGE,n->index_bytes/QS_PAGE,n->ordered_index&2);
+            if(status==QS_INDEX_WAIT) {
+                s->control->node=id; s->control->index_nreads=o->index_task.index_nreads;
+                memcpy(s->control->index_reads,o->index_task.index_reads,sizeof(s->control->index_reads));
+                return QP_WAIT;
+            }
+            if(status) return status;
+            o->scan_position=0; s->metrics.scanned+=chunk->rows;
+            if(!chunk->rows) return 0;
             continue;
         }
         if(s->control->ready && s->control->node==id && !s->control->index_nreads) {
@@ -1141,7 +1165,7 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
     }
     control->output_rows=out->rows;
     out->metrics=s->metrics; out->metrics.workers=s->used_workers?s->used_workers:1; out->profile=s->profile;
-    for(unsigned i=0;i<plan->count;++i) if(plan->nodes[i].kind==QP_INDEX_JOIN) {
+    for(unsigned i=0;i<plan->count;++i) if(plan->nodes[i].kind==QP_INDEX_JOIN || plan->nodes[i].ordered_index) {
         out->metrics.index_pages+=s->nodes[i].index_task.index_pages;
         out->metrics.index_tuples+=s->nodes[i].index_task.index_tuples;
     }

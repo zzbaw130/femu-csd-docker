@@ -113,9 +113,9 @@ static size_t layout_buffers(PlanStateCsd *s,unsigned entries,unsigned data,cons
 {
     size_t arena=(qs_dict_bytes(entries,data)+4095)&~(size_t)4095;
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_SCAN && !indexed[i]) {
-        struct qp_node *n=&s->plan->nodes[i]; unsigned bytes=qp_scan_buffer_bytes(s->plan,n);
+        struct qp_node *n=&s->plan->nodes[i]; unsigned bytes=n->ordered_index?QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE:qp_scan_buffer_bytes(s->plan,n);
         n->input_offset=arena; arena+=bytes; n->vector_offset=arena;
-        arena+=(qs_chunk_bytes(bytes/24,n->expr.ncols)+4095)&~(size_t)4095;
+        arena+=(qs_chunk_bytes(n->ordered_index?256:bytes/24,n->expr.ncols)+4095)&~(size_t)4095;
     }
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_INDEX_JOIN) {
         struct qp_node *n=&s->plan->nodes[i]; n->input_offset=arena;
@@ -156,6 +156,7 @@ static void start(PlanStateCsd *s)
             s->indexes[i].plan.relid=n->expr.join.indexid;
             s->indexes[i].plan.relfilenode=n->expr.join.indexnode;
             s->index_extents[i]=pg_sina_mapping(&s->indexes[i]);
+            n->index_bytes=s->indexes[i].bytes;
         }
         for(unsigned col=0;col<n->expr.nattrs;++col)
             if(n->expr.cols[col].slot>=0 && n->expr.cols[col].type==Q_STRING && r->bytes>QS_DICT_SMALL_DATA) big=true;
@@ -216,7 +217,7 @@ static void start(PlanStateCsd *s)
         checked(transfer(s->memory[3],offset+i,zeros,Min(sizeof(zeros),(size_t)entries*4-i),true),"clear string buckets");
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_SCAN && !indexed[i]) {
         struct qp_node *n=&s->plan->nodes[i];
-        struct qs_chunk header={.capacity=qp_scan_buffer_bytes(s->plan,n)/24,.ncols=n->expr.ncols};
+        struct qs_chunk header={.capacity=n->ordered_index?256:qp_scan_buffer_bytes(s->plan,n)/24,.ncols=n->expr.ncols};
         checked(transfer(s->memory[3],n->vector_offset,&header,sizeof(header),true),"initialize scan");
     }
     for(unsigned w=0;w<s->workers;++w)
@@ -275,8 +276,8 @@ static void load_pages(PlanStateCsd *s,unsigned worker)
     const struct qp_node *n=&s->plan->nodes[node];
     size_t input=worker>1?n->parallel_input+(worker-2)*s->plan->parallel_stride:n->input_offset;
     if(c->index_nreads) {
-        if(c->index_nreads>QS_INDEX_READS || n->kind!=QP_INDEX_JOIN) elog(ERROR,"invalid CSD index request");
-        unsigned leaf=n->right,max_extents=Max(s->files[leaf].nextents,s->indexes[leaf].nextents);
+        if(c->index_nreads>QS_INDEX_READS || (n->kind!=QP_INDEX_JOIN && !n->ordered_index)) elog(ERROR,"invalid CSD index request");
+        unsigned leaf=n->ordered_index?node:(unsigned)n->right,max_extents=Max(s->files[leaf].nextents,s->indexes[leaf].nextents);
         for(unsigned j=0;j<c->index_nreads;) {
             unsigned first=j++; const struct qs_index_read *read=&c->index_reads[first];
             while(j<c->index_nreads && c->index_reads[j].slot==read->slot+j-first) ++j;
@@ -443,7 +444,7 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
         const struct qp_node *n=&s->plan->nodes[i];
         if(i) appendStringInfoString(&tree,"; ");
         appendStringInfo(&tree,"%u:%s",i,n->kind==QP_JOIN && n->hash?"Hash Join":names[n->kind]);
-        if(n->kind==QP_SCAN) appendStringInfo(&tree,"(%s)",get_rel_name(n->expr.relid));
+        if(n->kind==QP_SCAN) appendStringInfo(&tree,"(%s%s)",get_rel_name(n->expr.relid),n->ordered_index?(n->ordered_index&2?", index ordered, heap read-ahead":", index ordered"):"");
         if(n->kind==QP_SORT) {
             appendStringInfoString(&tree,"[");
             for(unsigned k=0;k<n->expr.norder;++k)

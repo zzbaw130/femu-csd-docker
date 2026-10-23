@@ -113,12 +113,46 @@ static void check(function build,function probe,function close,function source,i
     free(result); free(c); free(out); free(io);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
 }
+static void ordered_scan(void *library,unsigned rows,int empty,int read_ahead)
+{
+    int (*init)(const struct qs_plan *,struct qs_join_control *)=dlsym(library,"qs_index_init");
+    int64_t (*scan)(struct qs_chunk *,struct qs_task *,struct qs_join_control *,void *,unsigned,unsigned,int)=dlsym(library,"qs_index_scan");
+    void (*close)(struct qs_join_control *)=dlsym(library,"qs_index_close");
+    assert(init && scan && close);
+    struct qs_plan p={.nattrs=2,.ncols=2,.join={.nattrs=2,.indexroot=empty?0:1,.work_mem_bytes=QS_INDEX_WORK_BYTES}};
+    for(unsigned i=0;i<2;++i) p.cols[i]=(struct qs_column){.slot=i,.length=4,.align=4,.type=Q_INTEGER};
+    struct qs_join_control control={0}; struct qs_task task={0}; assert(!init(&p,&control));
+    struct qs_chunk *out=calloc(1,qs_chunk_bytes(17,2)); assert(out); out->capacity=17; out->ncols=2;
+    char *io=calloc(1,QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE); assert(io);
+    unsigned seen=0;
+    for(unsigned iteration=0;;++iteration) {
+        assert(iteration<10000);
+        int64_t status=scan(out,&task,&control,io,rows==8?2:256,4,read_ahead);
+        if(status==QS_INDEX_WAIT) {
+            for(unsigned i=0;i<task.index_nreads;++i) {
+                struct qs_index_read *r=&task.index_reads[i];
+                memcpy(io+QS_SORT_IO_BYTES+(size_t)r->slot*QS_PAGE,r->heap?heap[r->block]:index_pages[r->block],QS_PAGE);
+            }
+            continue;
+        }
+        assert(!status);
+        if(!out->rows) break;
+        for(unsigned i=0;i<out->rows;++i) {
+            assert(qs_values(out)[out->capacity+i]==10+seen);
+            ++seen;
+        }
+        out->rows=out->selected=0;
+    }
+    assert(seen==(empty?0:rows)); close(&control); free(out); free(io);
+}
 int main(int argc,char **argv)
 {
     assert(argc==3); assert(!cs_work_init(4*1024*1024));
     void *join=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL),*agg=dlopen(argv[2],RTLD_NOW|RTLD_LOCAL); assert(join && agg);
     function build=(function)dlsym(join,"pg_sina_join_build"),probe=(function)dlsym(join,"pg_sina_join_probe"),close=(function)dlsym(join,"pg_sina_join_close"),source=(function)dlsym(agg,"pg_sina_aggregate_source"); assert(build && probe && close && source);
     heap_window=(void (*)(struct qs_join_control *,unsigned,const void *,uint32_t,uint32_t))dlsym(join,"qs_index_heap_window"); assert(heap_window);
+    key_bytes=4; pages(); ordered_scan(join,8,0,0); ordered_scan(join,8,1,1);
+    large_pages(); ordered_scan(join,256,0,0); ordered_scan(join,256,0,1);
     for(key_bytes=2;key_bytes<=8;key_bytes*=2) {
         pages();
         for(retained_window=1;retained_window<=2;++retained_window) {

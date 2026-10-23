@@ -15,9 +15,12 @@ struct lookup { unsigned row, block, item, heap_block, heap_item, phase; int64_t
 struct index_cursor {
     struct page_tag tags[QS_INDEX_CACHE];
     struct lookup keys[INDEX_KEYS];
-    unsigned position, count, hand, waiting, pending;
+    unsigned position, count, hand, waiting, pending, last_slot;
     const unsigned char *heap_window;
     uint32_t heap_first,heap_pages;
+    struct lookup scan;
+    uint64_t *scan_tids;
+    int scan_started,scan_done;
 };
 struct index_join { cs_work_context *context; struct qs_plan scan; struct index_cursor cursors[QS_WORKERS]; struct qs_dict *dictionary; };
 static uint16_t u16(const unsigned char *p) { uint16_t x; memcpy(&x,p,2); return x; }
@@ -65,8 +68,11 @@ static const unsigned char *page_at(struct index_cursor *c,struct qs_task *task,
 {
     if(heap && block>=c->heap_first && block-c->heap_first<c->heap_pages)
         return c->heap_window+(size_t)(block-c->heap_first)*QS_PAGE;
+    const struct page_tag *last=&c->tags[c->last_slot];
+    if(last->state && last->block==block && last->heap==heap)
+        return last->state==1?(unsigned char *)io+QS_SORT_IO_BYTES+(size_t)c->last_slot*QS_PAGE:NULL;
     for(unsigned i=0;i<QS_INDEX_CACHE;++i) if(c->tags[i].state && c->tags[i].block==block && c->tags[i].heap==heap)
-        return c->tags[i].state==1?(unsigned char *)io+QS_SORT_IO_BYTES+(size_t)i*QS_PAGE:NULL;
+        { c->last_slot=i; return c->tags[i].state==1?(unsigned char *)io+QS_SORT_IO_BYTES+(size_t)i*QS_PAGE:NULL; }
     if(task->index_nreads==QS_INDEX_READS) return NULL;
     for(unsigned n=0;n<QS_INDEX_CACHE;++n) {
         unsigned slot=c->hand++%QS_INDEX_CACHE;
@@ -132,6 +138,90 @@ static int seek(const unsigned char *page,struct lookup *key,unsigned bytes)
         key->block=next;
     }
     return 0;
+}
+int64_t qs_index_scan(struct qs_chunk *out,struct qs_task *task,struct qs_join_control *control,void *io,
+    unsigned heap_pages,unsigned index_pages,int read_ahead)
+{
+    struct index_join *h=(void *)(uintptr_t)control->state;
+    struct index_cursor *c=&h->cursors[0];
+    if(c->waiting) {
+        for(unsigned i=0;i<QS_INDEX_CACHE;++i) if(c->tags[i].state==2) c->tags[i].state=1;
+        c->waiting=0; task->index_pending=task->index_nreads=0;
+    }
+    if(!c->scan_started) {
+        c->scan_tids=cs_work_alloc(h->context,QS_RESULT_ROWS*sizeof(*c->scan_tids));
+        if(!c->scan_tids) return -4;
+        c->scan_started=1; c->scan.block=h->scan.join.indexroot;
+        c->scan.phase=1; c->scan_done=!c->scan.block;
+    }
+    for(;;) {
+        while(!c->scan_done && c->count<QS_RESULT_ROWS) {
+            if(!c->scan.block || c->scan.block>=index_pages) return -2;
+            const unsigned char *page=page_at(c,task,io,c->scan.block,0);
+            if(!page) {
+                if(c->scan.phase!=1) for(unsigned i=1;i<16 && i<index_pages-c->scan.block;++i)
+                    page_at(c,task,io,c->scan.block+i,0);
+                goto wait;
+            }
+            int count=page_items(page,1); if(count<0) return -2;
+            unsigned first=u32(page+QS_PAGE-12)?2:1;
+            if(c->scan.phase!=2) {
+                if(!(u16(page+QS_PAGE-4)&1)) {
+                    unsigned len=0; const unsigned char *t=item_at(page,first,&len);
+                    if(!t || len<8) return -2;
+                    unsigned next=((uint32_t)u16(t)<<16)|u16(t+2);
+                    if(!next || next==c->scan.block) return -2;
+                    c->scan.block=next; continue;
+                }
+                c->scan.item=first; c->scan.phase=2;
+            }
+            if(c->scan.item>(unsigned)count) {
+                c->scan.block=u32(page+QS_PAGE-12); c->scan.phase=0;
+                if(!c->scan.block) c->scan_done=1;
+                continue;
+            }
+            unsigned item=c->scan.item++,len=0;
+            if(((u32(page+24+(item-1)*4)>>15)&3)==3) continue;
+            const unsigned char *t=item_at(page,item,&len); if(!t || len<8) return -2;
+            c->scan_tids[c->count++]=((uint64_t)(((uint32_t)u16(t)<<16)|u16(t+2))<<16)|u16(t+4);
+        }
+        /* Decode in TID-list order; collect missing pages at the first miss. */
+        while(c->position<c->count) {
+            uint64_t tid=c->scan_tids[c->position];
+            if((tid>>16)>=heap_pages) return -2;
+            const unsigned char *page=page_at(c,task,io,tid>>16,1);
+            if(!page) {
+                unsigned block=tid>>16;
+                if(read_ahead) for(unsigned i=1;i<32 && i<heap_pages-block;++i) page_at(c,task,io,block+i,1);
+                goto wait;
+            }
+            if(page_items(page,0)<0) return -2;
+            unsigned item=tid&65535,steps=0;
+            for(;;) {
+                if(!item || item>(unsigned)(u16(page+12)-24)/4 || ++steps>QS_PAGE/4) return -2;
+                uint32_t lp=u32(page+24+(item-1)*4); unsigned flags=(lp>>15)&3;
+                if(flags==2) { item=lp&32767; continue; }
+                if(flags!=1) return -2;
+                break;
+            }
+            unsigned len=0; const unsigned char *t=item_at(page,item,&len);
+            if(!t || len<23) return -2;
+            if(!out->rows) memset(qs_nulls(out),0,((out->capacity+7)/8)*(size_t)out->ncols);
+            int status=qs_scan_tuple(&h->scan,page,t-page,len,0,out,out->rows,h->dictionary);
+            if(status) return status;
+            qs_selection(out)[out->rows]=out->rows; ++out->rows; ++out->selected;
+            ++task->index_tuples; ++c->position;
+            if(out->rows==out->capacity) return 0;
+        }
+        c->count=c->position=0;
+        if(c->scan_done) return 0;
+    }
+wait:
+    for(unsigned i=c->position;i<c->count && task->index_nreads<QS_INDEX_READS;++i)
+        page_at(c,task,io,c->scan_tids[i]>>16,1);
+    if(!task->index_nreads) return -2;
+    c->waiting=task->index_pending=1; task->index_pages+=task->index_nreads;
+    return QS_INDEX_WAIT;
 }
 static int64_t flush(unsigned stage,struct qs_chunk *out,const struct qs_plan *p,struct qs_task *task,
     struct qs_join_control *control,struct femu_csd_args *a,struct index_cursor *cursor,int resume)
