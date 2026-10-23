@@ -19,6 +19,7 @@ struct plan_slot {
     CS_EVT_HANDLE event;
     CS_REQ_HANDLE pending;
     bool ready, done;
+    uint64_t queued_ns;
 };
 typedef struct {
     CustomScanState css;
@@ -27,6 +28,10 @@ typedef struct {
     unsigned workers, epoch, device_cus;
     bool parallel;
     uint64_t load_ns, load_calls;
+    /* Host-thread wall times: queue/load preparation are subsets of submit;
+     * pending time is summed across concurrent requests, not query latency. */
+    uint64_t poll_ns, completion_copy_ns, submit_ns, queue_ns, control_write_ns, idle_ns, pending_ns;
+    uint64_t submits, polls, completions;
     struct qs_request files[QP_NODES];
     struct qs_extent *extents[QP_NODES];
     struct qs_request indexes[QP_NODES];
@@ -168,6 +173,8 @@ static void start(PlanStateCsd *s)
     if(!device) elog(ERROR,"CSD PG Plan has no prepared relation");
     pg_sina_read_resources(device);
     s->profiling=pg_sina_profile; s->start_ns=clock_ns(); s->load_ns=s->load_calls=0;
+    s->poll_ns=s->completion_copy_ns=s->submit_ns=s->queue_ns=s->control_write_ns=0;
+    s->idle_ns=s->pending_ns=s->submits=s->polls=s->completions=0;
     memset(s->plan->pipelines,0,sizeof(s->plan->pipelines));
     s->plan->nodes[s->plan->root].expr.work_mem_bytes=pg_sina_query_memory();
     s->lock_fd=open(device,O_RDONLY|O_CLOEXEC);
@@ -307,6 +314,7 @@ static void load_pages(PlanStateCsd *s,unsigned worker)
 }
 static void submit(PlanStateCsd *s,unsigned worker)
 {
+    uint64_t started=s->profiling?clock_ns():0;
     struct plan_slot *slot=&s->slots[worker];
     if((slot->control.bytes || slot->control.index_nreads) && !slot->control.ready) {
         unsigned groups=1;
@@ -314,7 +322,9 @@ static void submit(PlanStateCsd *s,unsigned worker)
             groups+=slot->control.index_reads[j].slot!=slot->control.index_reads[j-1].slot+1;
         if(groups<64) checked(csAllocBatchRequest(CS_BATCH_SERIAL,groups+1,&slot->resume),"allocate LOAD batch");
         slot->previous=0; load_pages(s,worker);
+        uint64_t written=s->profiling?clock_ns():0;
         checked(transfer(s->memory[1],worker*sizeof(struct qp_control)+offsetof(struct qp_control,ready),&slot->control.ready,sizeof(slot->control.ready),true),"resume LOAD");
+        if(s->profiling) s->control_write_ns+=clock_ns()-written;
         if(slot->resume) {
             CsBatchRequest *request=palloc0(sizeof(*request)+6*sizeof(CsComputeArg));
             request->ReqType=CS_QUEUE_COMPUTE; request->u.Compute.CSFId=s->function; request->u.Compute.NumArgs=6;
@@ -325,9 +335,17 @@ static void submit(PlanStateCsd *s,unsigned worker)
             checked(csConfigureBatchEntry(slot->resume,CS_BATCH_ADD,request,0,slot->previous,&current),"configure resumed compute"); pfree(request);
         }
     }
-    if(!worker && slot->control.available)
+    if(!worker && slot->control.available) {
+        uint64_t written=s->profiling?clock_ns():0;
         checked(transfer(s->memory[1],offsetof(struct qp_control,available),&slot->control.available,sizeof(slot->control.available),true),"provide worker rows");
+        if(s->profiling) s->control_write_ns+=clock_ns()-written;
+    }
+    if(s->profiling) slot->queued_ns=clock_ns();
     CS_STATUS status=csQueueBatchRequest(slot->resume?slot->resume:slot->batch,NULL,NULL,slot->event,&slot->pending,NULL);
+    if(s->profiling) {
+        uint64_t now=clock_ns();
+        s->queue_ns+=now-slot->queued_ns; s->submit_ns+=now-started; ++s->submits;
+    }
     if(status!=CS_QUEUED) checked(status,"queue tree");
 }
 static void fetch(PlanStateCsd *s)
@@ -339,8 +357,12 @@ static void fetch(PlanStateCsd *s)
         for(unsigned w=0;w<=s->workers;++w) {
             struct plan_slot *slot=&s->slots[w];
             if(!slot->pending) continue;
+            uint64_t polled=s->profiling?clock_ns():0;
             HOLD_INTERRUPTS(); CS_STATUS status=csPollEvent(slot->event,NULL,NULL);
+            uint64_t completed=s->profiling?clock_ns():0;
+            if(s->profiling) { s->poll_ns+=completed-polled; ++s->polls; }
             if(status==CS_NOT_DONE) { RESUME_INTERRUPTS(); continue; }
+            if(s->profiling) { s->pending_ns+=completed-slot->queued_ns; ++s->completions; }
             slot->pending=NULL;
             CS_STATUS copied=transfer(s->memory[1],w*sizeof(struct qp_control),&slot->control,sizeof(slot->control),false);
             if(status==CS_SUCCESS) status=copied;
@@ -350,6 +372,7 @@ static void fetch(PlanStateCsd *s)
                 if(status==CS_SUCCESS && (slot->control.output_rows || slot->control.finished))
                     status=transfer(s->memory[2],0,&header,offsetof(struct qs_result,data),false);
             }
+            if(s->profiling) s->completion_copy_ns+=clock_ns()-completed;
             RESUME_INTERRUPTS(); CHECK_FOR_INTERRUPTS();
             if(status!=CS_SUCCESS && slot->control.error)
                 ereport(ERROR,(errmsg("CSD PG Plan node %u failed: device=%d, status=%d",slot->control.error_node,slot->control.error,status)));
@@ -394,7 +417,11 @@ static void fetch(PlanStateCsd *s)
                 HOLD_INTERRUPTS(); submit(s,0); RESUME_INTERRUPTS(); progress=true;
             }
         }
-        if(!progress) pg_usleep(50L);
+        if(!progress) {
+            uint64_t idle=s->profiling?clock_ns():0;
+            pg_usleep(50L);
+            if(s->profiling) s->idle_ns+=clock_ns()-idle;
+        }
     }
 }
 extern Datum pg_sina_decimal(struct qs_cell);
@@ -511,6 +538,16 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
             }
             ExplainPropertyFloat("CSD LOAD Preparation","ms",s->load_ns/1e6,3,es);
             ExplainPropertyInteger("CSD Host LOAD Requests",NULL,s->load_calls,es);
+            ExplainPropertyFloat("CSD Host Poll","ms",s->poll_ns/1e6,3,es);
+            ExplainPropertyFloat("CSD Host Completion Copy","ms",s->completion_copy_ns/1e6,3,es);
+            ExplainPropertyFloat("CSD Host Submit","ms",s->submit_ns/1e6,3,es);
+            ExplainPropertyFloat("CSD Host Queue (within Submit)","ms",s->queue_ns/1e6,3,es);
+            ExplainPropertyFloat("CSD Host Control Write (within Submit)","ms",s->control_write_ns/1e6,3,es);
+            ExplainPropertyFloat("CSD Host Idle Sleep","ms",s->idle_ns/1e6,3,es);
+            ExplainPropertyFloat("CSD Pending Requests Sum","ms",s->pending_ns/1e6,3,es);
+            ExplainPropertyInteger("CSD Host Submissions",NULL,s->submits,es);
+            ExplainPropertyInteger("CSD Host Polls",NULL,s->polls,es);
+            ExplainPropertyInteger("CSD Host Completions",NULL,s->completions,es);
         }
     }
 }

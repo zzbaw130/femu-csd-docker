@@ -110,4 +110,6 @@ sh /home/femu/tests/tpch-test.sh 7 9 13
 
 通用树 EXPLAIN 显示来自 PG 的连接树、实际 worker 数、并行流水线次数、顺序扫描行数、索引 Heap Tuple 数、内部读取、工作内存峰值及 spill 字节。开启 profile 后增加整个 CSF 的累计 CPU/墙钟/调用次数、实际同时执行的 CU 峰值，以及扫描解码、向量过滤和 Sort sink/source 的 CPU 时间。CPU 是各 CU 的累计值，可能大于查询墙钟；扫描/过滤/排序已包含在 CSF 总 CPU 中，不能再次相加。`CSD LOAD Preparation` 仅为 PG 构造请求的时间，异步 LOAD 的等待不计入该字段。单表快路径保留已有的逐算子计时。
 
+通用树的 profile 同时记录 PG 调度线程的墙钟：`CSD Host Completion Copy` 是每次请求完成后同步读取 AFDM 控制记录及结果头的时间，`CSD Host Submit` 是准备和提交后续请求的时间。其中 `Queue`、`Control Write` 及已有的 `LOAD Preparation` 均包含在 Submit 中，不能再次相加。`Poll` 是检查事件的时间，`Idle Sleep` 是没有可推进任务时的休眠时间。`Pending Requests Sum` 从请求提交计到 PG 观察完成，跨并发请求求和，包含设备执行、I/O 和主机调度等待，不是查询延迟或纯 I/O 时间；Submissions/Completions 用于核对完成次数。关闭 profile 时不采集这些计时。
+
 设备入口见 [设备算子说明](../../csd-programs/pg_sina_csd/README.md)。新验收结果见 [性能记录](doc/performance.md)，旧记录仅为历史，不作为当前验收依据。
