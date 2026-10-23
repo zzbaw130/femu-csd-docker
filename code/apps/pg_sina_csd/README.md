@@ -6,7 +6,7 @@
 
 `pg_sina_csd.exe_path=host` 使用原生 PG。设置为 `csd` 后，扩展先进行保证语义的相关子查询去关联，再让 PG 正常选择计划，最后将它选中的物理 Plan 转换为设备执行树。连接的左右输入和树形结构来自 PG，不再使用扩展原来的贪心连接排序，也没有针对 Q13、Q18 的专用计划。
 
-转换会删除下游不需要的物理扫描输出列，并同步调整 Sort、Aggregate 的列位置。PG 的部分/最终聚合合并为设备端的一次聚合；Gather 不再启动 Guest worker。参数化 B-tree Nested Loop 在原位置转换为设备 Index Join；其他等值连接使用 Hash Join 或 Merge Join。Hash build 超过设备配额时，保留已经消费的输入并改用外部归并，不重新扫描 Heap。
+转换会删除下游不需要的物理扫描输出列，并同步调整 Sort、Aggregate 的列位置。PG 的部分/最终聚合合并为设备端的一次聚合；不要求结果顺序的单整数键 SUM/COUNT/AVG 扫描聚合可改为有界 Hash Aggregate，超限时归并 SUM/count 部分状态。Gather 不再启动 Guest worker。参数化 B-tree Nested Loop 在原位置转换为设备 Index Join；其他等值连接使用 Hash Join 或 Merge Join。Hash build 超过设备配额时，保留已经消费的输入并改用外部归并，不重新扫描 Heap。
 
 支持的节点包括投影/过滤、INNER/LEFT/SEMI/ANTI 等值连接、SUM/AVG/COUNT/MIN/MAX、COUNT DISTINCT、HAVING、Sort、Limit/Offset、派生表、共享 CTE、标量 InitPlan 和整数 IN/NOT IN 集合。相关标量聚合目前仅将严格 WHERE 条件中的 SUM/AVG/MIN/MAX 按整数等值关联键去关联；COUNT 的空输入、OR 等不安全形态保留 PG 执行。不能转换的计划整体回退原生 PG。`auto` 尚未实现，不接受该配置值。
 

@@ -559,6 +559,16 @@ static Node *heap_index_var(Node *node,List *tlist)
 }
 /* A full index path may supply ordering without a Sort node. Reading its
  * immutable heap is valid only if we explicitly retain that ordering. */
+static bool group_output(const struct qs_plan *p,int index,int key)
+{
+    if(index<0 || (unsigned)index>=p->nexprs) return false;
+    const struct qs_expr *x=&p->exprs[index];
+    if(x->op==Q_CONST) return true;
+    if(x->op==Q_COLUMN) return x->column==key;
+    if(x->op==Q_AGGREF) return x->column==0;
+    return (x->op==Q_ADD || x->op==Q_SUB || x->op==Q_MUL || x->op==Q_DIV) &&
+        group_output(p,x->left,key) && group_output(p,x->right,key);
+}
 static int ordered_heap_scan(struct binding *b,struct qp_plan *tree,unsigned id,Oid indexid,ScanDirection direction,bool ordered,bool index_only)
 {
     if(direction==NoMovementScanDirection || (!ordered && !index_only)) return id;
@@ -781,6 +791,29 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
         Limit *l=(Limit *)native;
         if(l->limitCount) { if(!IsA(l->limitCount,Const)) return -1; Const *v=(Const *)l->limitCount; if(!v->constisnull) p->limit=DatumGetInt64(v->constvalue); }
         if(l->limitOffset) { if(!IsA(l->limitOffset,Const)) return -1; Const *v=(Const *)l->limitOffset; if(!v->constisnull) p->offset=DatumGetInt64(v->constvalue); }
+    }
+    /* Replace a grouping-only Sort over a scan when no parent needs its order.
+     * Keep joins and ordered/index-backed aggregation unchanged. */
+    if(n->kind==QP_AGGREGATE && !ordered && n->nkeys==1 && p->naggs==1 && !n->distinct && !n->distinct_aggs &&
+       p->predicate<0 && p->having<0 && n->left>=0 && tree->nodes[n->left].kind==QP_SORT) {
+        int scan=tree->nodes[n->left].left,key=n->left_keys[0];
+        unsigned kind=p->aggs[0].kind;
+        bool supported=scan>=0 && tree->nodes[scan].kind==QP_SCAN && !tree->nodes[scan].ordered_index &&
+            p->exprs[p->keys[0]].type==Q_INTEGER &&
+            (kind==Q_COUNT_STAR || ((kind==Q_SUM || kind==Q_AVG || kind==Q_COUNT) && p->aggs[0].expr>=0 &&
+             p->exprs[p->aggs[0].expr].op==Q_COLUMN));
+        const struct qs_plan *sorted=&tree->nodes[n->left].expr;
+        if(scan>=0) {
+            if(sorted->nout!=tree->nodes[scan].expr.nout) supported=false;
+            for(unsigned i=0;i<sorted->nout;++i) {
+                const struct qs_expr *x=&sorted->exprs[sorted->outputs[i].index];
+                if(x->op!=Q_COLUMN || x->column!=(int)i) supported=false;
+            }
+        }
+        for(unsigned i=0;i<p->nout;++i) {
+            if(!group_output(p,p->outputs[i].index,key)) supported=false;
+        }
+        if(supported) { n->left=scan; n->sorted_input=0; n->hash=1; }
     }
     if(n->kind==QP_SCAN && IsA(native,IndexScan)) {
         int extra=conditions(&b,((IndexScan *)native)->indexqualorig); if(extra==-2) return -1;

@@ -35,6 +35,7 @@ struct spool {
     uint64_t rows;
 };
 struct accumulator { struct qs_cell sum,extreme,last; uint64_t count; int has_last; };
+struct compact_group { struct qs_cell sum; int64_t key; uint64_t count; unsigned occupied; };
 struct set_key { int64_t value; unsigned occupied; };
 struct operator_state {
     struct sorted_rows left_sort,right_sort;
@@ -58,6 +59,8 @@ struct operator_state {
     struct qs_cell *hash_data;
     unsigned hash_rows,hash_capacity,hash_match,hash_phase;
     int hash_matched,hash_fallback,hash_shared;
+    struct compact_group *groups;
+    unsigned group_capacity,group_count,group_flush,group_phase;
     struct set_key *set;
     unsigned set_capacity,set_count;
     int set_null,set_ready;
@@ -745,9 +748,139 @@ static int accumulate(struct execution *s,const struct qp_node *n,struct operato
     }
     return 0;
 }
+static int64_t aggregate_next(struct execution *,unsigned,struct qs_cell *);
+static int group_add(struct compact_group *g,struct qs_cell v,uint64_t count,unsigned kind)
+{
+    if(count && (kind==Q_SUM || kind==Q_AVG)) {
+        if(!g->count) g->sum=v;
+        else {
+            unsigned scale=v.scale>g->sum.scale?v.scale:g->sum.scale; __int128 left,right;
+            if(qs_scale(g->sum.value,scale-g->sum.scale,&left) || qs_scale(v.value,scale-v.scale,&right) ||
+               __builtin_add_overflow(left,right,&g->sum.value)) return -5;
+            g->sum.scale=scale; if(v.dscale>g->sum.dscale) g->sum.dscale=v.dscale;
+        }
+    }
+    return __builtin_add_overflow(g->count,count,&g->count)?-5:0;
+}
+static int group_result(struct execution *s,const struct qp_node *n,struct compact_group *g,struct qs_cell *row)
+{
+    struct qs_cell input[QS_COLS],value={.isnull=!g->count};
+    for(unsigned i=0;i<QS_COLS;++i) input[i]=(struct qs_cell){.isnull=1};
+    input[n->left_keys[0]]=(struct qs_cell){.value=g->key,.isnull=g->occupied==2};
+    unsigned kind=n->expr.aggs[0].kind;
+    if(kind==Q_COUNT || kind==Q_COUNT_STAR) value=(struct qs_cell){.value=g->count};
+    else if(g->count) {
+        value=g->sum;
+        if(kind==Q_AVG && qs_average(value,g->count,&value)) return -5;
+    }
+    int status=project(s,n,input,&value,row);
+    return status<0?status:status?2:0;
+}
+/* A single integer grouping key and SUM/COUNT/AVG need only a key, exact sum
+ * and count per group. Spill partial states, not the original heap rows. */
+static int64_t hash_aggregate_next(struct execution *s,unsigned id,struct qs_cell *row)
+{
+    struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
+    struct sorted_rows *sort=&o->left_sort; unsigned kind=n->expr.aggs[0].kind;
+    if(!o->group_capacity) {
+        struct cs_work_context_stats memory;
+        if(cs_work_get_context_stats(s->context,&memory)) return -4;
+        size_t available=(memory.limit_bytes-memory.used_bytes)/2;
+        unsigned capacity=128;
+        while(capacity< n->estimated_rows*8/7 && (size_t)capacity*2*sizeof(*o->groups)<=available && capacity<UINT_MAX/2)
+            capacity*=2;
+        for(;;) {
+            o->groups=cs_work_calloc(s->context,capacity,sizeof(*o->groups));
+            if(o->groups || capacity==128) break;
+            capacity/=2;
+        }
+        if(!o->groups) { n->hash=0; return aggregate_next(s,id,row); }
+        o->group_capacity=capacity;
+    }
+    for(;;) {
+        if(o->group_phase==0) {
+            if(!o->have_left) {
+                int64_t status=next_row(s,n->left,o->left);
+                if(status==QP_WAIT || status<0 || status>2) return status;
+                o->have_left=status==2;
+                if(!status) { o->input_done=1; o->group_phase=1; continue; }
+            }
+            struct qs_cell key=o->left[n->left_keys[0]];
+            if(!key.isnull && (key.scale || key.value<INT64_MIN || key.value>INT64_MAX)) return -5;
+            unsigned occupied=key.isnull?2:1,mask=o->group_capacity-1;
+            unsigned at=mix_hash(key.isnull?0:(uint64_t)key.value)&mask;
+            while(o->groups[at].occupied && (o->groups[at].occupied!=occupied || (!key.isnull && o->groups[at].key!=(int64_t)key.value))) at=(at+1)&mask;
+            struct compact_group *g=&o->groups[at];
+            if(!g->occupied) {
+                if(o->group_count>=o->group_capacity*7/8) { o->group_phase=1; continue; }
+                g->occupied=occupied; g->key=key.isnull?0:key.value; g->sum.isnull=1; ++o->group_count;
+            }
+            struct qs_cell value={.value=1};
+            if(kind!=Q_COUNT_STAR) value=o->left[n->expr.exprs[n->expr.aggs[0].expr].column];
+            int status=group_add(g,value,!value.isnull,kind); if(status) return status;
+            o->have_left=0; continue;
+        }
+        if(o->group_phase==1) {
+            if(o->input_done && !o->hash_fallback) { o->group_phase=3; continue; }
+            o->hash_fallback=1;
+            struct qs_plan partial={.nout=3};
+            partial.outputs[0].type_oid=20; partial.outputs[1].type_oid=1700; partial.outputs[2].type_oid=20;
+            int key=0; int64_t status=sort_init(s,sort,&partial,1,&key,NULL); if(status) return status;
+            if(sort->input_pending) {
+                status=sort_call(s,sort,0); if(status) return status;
+                sort->input_pending=0; sort->input->rows=0;
+            }
+            while(o->group_flush<o->group_capacity && sort->input->rows<QS_RESULT_ROWS) {
+                struct compact_group *g=&o->groups[o->group_flush++]; if(!g->occupied) continue;
+                struct qs_cell *out=sort->input->data[sort->input->rows++].cells;
+                out[0]=(struct qs_cell){.value=g->key,.isnull=g->occupied==2};
+                out[1]=g->sum; out[2]=(struct qs_cell){.value=g->count};
+            }
+            if(sort->input->rows) { sort->input_pending=1; continue; }
+            if(o->input_done) {
+                cs_work_free(s->context,o->groups); o->groups=NULL;
+                sort->complete=1; sort->group.count=1; sort->group.states[0]=sort->task.state;
+                cs_work_free(s->context,sort->input); sort->input=NULL;
+                o->group_phase=2;
+            } else {
+                memset(o->groups,0,(size_t)o->group_capacity*sizeof(*o->groups));
+                o->group_count=o->group_flush=0; o->group_phase=0;
+            }
+            continue;
+        }
+        if(o->group_phase==3) {
+            while(o->group_flush<o->group_capacity) {
+                struct compact_group *g=&o->groups[o->group_flush++]; if(!g->occupied) continue;
+                return group_result(s,n,g,row);
+            }
+            cs_work_free(s->context,o->groups); o->groups=NULL; o->finished=1; return 0;
+        }
+        /* Merge partial SUM/count pairs; AVG is divided only for final output. */
+        if(!o->have_right && !o->group_ready) {
+            if((s->pending_sort==sort || sort->position==sort->output->rows) && !sort->drained) {
+                int64_t status=sort_call(s,sort,1); if(status) return status;
+                sort->position=0; sort->drained=sort->output->finished;
+            }
+            if(sort->position<sort->output->rows) {
+                memcpy(o->right,sort->output->data[sort->position++].cells,3*sizeof(*o->right)); o->have_right=1;
+            } else o->group_ready=1;
+        }
+        if(!o->phase) {
+            if(!o->have_right) { cs_work_free(s->context,sort->output); sort->output=NULL; o->finished=1; return 0; }
+            o->keys[0]=o->right[0]; memset(&o->accum[0],0,sizeof(o->accum[0])); o->accum[0].sum.isnull=1; o->phase=1;
+        }
+        struct compact_group g={.key=o->keys[0].value,.occupied=o->keys[0].isnull?2:1,.sum=o->accum[0].sum,.count=o->accum[0].count};
+        if(o->have_right && o->right[0].isnull==o->keys[0].isnull && (o->keys[0].isnull || o->right[0].value==o->keys[0].value)) {
+            int status=group_add(&g,o->right[1],o->right[2].value,kind); if(status) return status;
+            o->accum[0].sum=g.sum; o->accum[0].count=g.count; o->have_right=0; continue;
+        }
+        o->phase=0; return group_result(s,n,&g,row);
+    }
+}
 static int64_t aggregate_next(struct execution *s,unsigned id,struct qs_cell *row)
 {
     const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
+    if(n->hash) return hash_aggregate_next(s,id,row);
     for(;;) {
         if(!o->have_left && !o->input_done) {
             int64_t status;

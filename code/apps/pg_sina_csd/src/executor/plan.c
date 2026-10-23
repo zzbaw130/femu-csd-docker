@@ -440,10 +440,19 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     ExplainPropertyText("CSD Intermediate Data","device workmem and internal spill; 128-bit values",es);
     static const char *names[]={"Scan","Projection","Merge Join","Aggregate","Sort","Limit","Index Join","CTE Scan","CTE materialization","IN hash set"};
     StringInfoData tree; initStringInfo(&tree);
+    bool used[QP_NODES]={0}; used[s->plan->root]=true;
+    for(unsigned i=0;i<s->plan->ninit;++i) used[s->plan->init_nodes[i]]=true;
+    for(unsigned pass=0;pass<s->plan->count;++pass)
+        for(unsigned i=0;i<s->plan->count;++i) if(used[i]) {
+            const struct qp_node *n=&s->plan->nodes[i];
+            if(n->left>=0) used[n->left]=true;
+            if(n->right>=0) used[n->right]=true;
+        }
     for(unsigned i=0;i<s->plan->count;++i) {
+        if(!used[i]) continue;
         const struct qp_node *n=&s->plan->nodes[i];
         if(i) appendStringInfoString(&tree,"; ");
-        appendStringInfo(&tree,"%u:%s",i,n->kind==QP_JOIN && n->hash?"Hash Join":names[n->kind]);
+        appendStringInfo(&tree,"%u:%s",i,n->hash && n->kind==QP_AGGREGATE?"Hash Aggregate":n->kind==QP_JOIN && n->hash?"Hash Join":names[n->kind]);
         if(n->kind==QP_SCAN) appendStringInfo(&tree,"(%s%s)",get_rel_name(n->expr.relid),n->ordered_index?(n->ordered_index&4?", index only":n->ordered_index&2?", index ordered, heap read-ahead":", index ordered"):"");
         if(n->kind==QP_SORT) {
             appendStringInfoString(&tree,"[");

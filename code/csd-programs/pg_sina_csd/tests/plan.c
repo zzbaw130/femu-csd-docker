@@ -265,13 +265,46 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
 #undef control
 static int descending(const void *a,const void *b)
 { return (*(const int32_t *)a<*(const int32_t *)b)-(*(const int32_t *)a>*(const int32_t *)b); }
-static void nested_sort(function run,unsigned type)
+struct expected_group { struct qs_cell value; unsigned key; };
+static int group_order(const void *a,const void *b)
 {
-    unsigned rows=50003; size_t raw_bytes;
+    const struct expected_group *x=a,*y=b; int cmp;
+    if(x->value.isnull || y->value.isnull) return x->value.isnull!=y->value.isnull?(x->value.isnull?1:-1):(x->key>y->key)-(x->key<y->key);
+    assert(!qs_compare(x->value,y->value,&cmp));
+    return cmp?-cmp:(x->key>y->key)-(x->key<y->key);
+}
+static void nested_sort(function run,unsigned type,unsigned hash,unsigned kind)
+{
+    unsigned rows=hash==3?0:50003; size_t raw_bytes;
     unsigned char *raw=heap(rows,2,&raw_bytes);
-    int32_t *expected=malloc(rows*sizeof(*expected)); assert(expected);
+    int32_t *expected=malloc((rows?rows:1)*sizeof(*expected)); assert(expected);
     for(unsigned i=0;i<rows;++i) expected[i]=(int32_t)((uint64_t)i*1009%997)-498;
     qsort(expected,rows,sizeof(*expected),descending);
+    unsigned groups=hash?(rows?20004:0):rows;
+    struct expected_group *want=calloc(groups?groups:1,sizeof(*want)); unsigned *counts=calloc(groups?groups:1,sizeof(*counts)); assert(want && counts);
+    if(hash) {
+        for(unsigned i=0;i<rows;++i) {
+            unsigned key=i%20003,at=i%17?key:20003;
+            unsigned char *t=raw+(i/100)*QS_PAGE+QS_PAGE-(i%100+1)*40;
+            int key_null=i%17==0,value_null=i%19==0 || key==7;
+            int value=(int32_t)((uint64_t)i*1009%997)-498;
+            t[23]=(key_null?0:1)|(value_null?0:2);
+            unsigned off=24;
+            if(!key_null) { w32(t+off,key); off+=4; }
+            if(!value_null) w32(t+off,value);
+            want[at].key=key_null?UINT32_MAX:key;
+            if(!value_null || kind==Q_COUNT_STAR) { want[at].value.value+=value; ++counts[at]; }
+        }
+        for(unsigned i=0;i<groups;++i) {
+            if(kind==Q_AVG && counts[i]) {
+                assert(!qs_average(want[i].value,counts[i],&want[i].value));
+                want[i].value.value*=2; ++want[i].value.scale; ++want[i].value.dscale;
+            }
+            if(kind==Q_COUNT || kind==Q_COUNT_STAR) want[i].value=(struct qs_cell){.value=counts[i]};
+            else if(!counts[i]) want[i].value.isnull=1;
+        }
+        qsort(want,groups,sizeof(*want),group_order);
+    }
     struct qp_plan *p=calloc(1,sizeof(*p)); assert(p); p->count=4; p->scan_bytes=QP_SCAN_BYTES;
     scan(&p->nodes[3]); p->nodes[3].bytes=raw_bytes;
     struct qp_node *a=&p->nodes[1]; a->kind=QP_AGGREGATE; a->left=2; a->right=-1; a->sorted_input=1;
@@ -287,7 +320,14 @@ static void nested_sort(function run,unsigned type)
         n->expr.order[0]=(struct qs_order){.output=i?0:1,.descending=!i};
         n->expr.limit=-1;
     }
-    p->nodes[0].expr.work_mem_bytes=4U*1024*1024;
+    if(hash) { a->hash=1; a->sorted_input=0; a->left=3; a->estimated_rows=groups; a->expr.aggs[0].kind=kind; }
+    if(hash && kind==Q_AVG) {
+        a->expr.nexprs=5;
+        a->expr.exprs[3]=(struct qs_expr){.op=Q_CONST,.type=Q_DECIMAL,.constant=2,.scale=1,.dscale=1};
+        a->expr.exprs[4]=(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=1,.right=3};
+        a->expr.outputs[1].index=4;
+    }
+    p->nodes[0].expr.work_mem_bytes=(hash==2?64U:4U)*1024*1024;
     p->nodes[0].expr.norder=2;
     p->nodes[0].expr.order[1]=(struct qs_order){.output=0};
     p->nodes[0].expr.outputs[1].type_oid=type;
@@ -312,6 +352,13 @@ static void nested_sort(function run,unsigned type)
         }
         args.cparam2=0;
         for(unsigned r=0;r<out->rows;++r) {
+            if(hash) {
+                assert(seen<groups); int cmp;
+                assert(out->data[r].cells[1].isnull==want[seen].value.isnull);
+                if(!want[seen].value.isnull) assert(!qs_compare(out->data[r].cells[1],want[seen].value,&cmp) && !cmp);
+                if(want[seen].key==UINT32_MAX) assert(out->data[r].cells[0].isnull);
+                else assert(!out->data[r].cells[0].isnull && out->data[r].cells[0].value==want[seen].key); ++seen; continue;
+            }
             if(seen>=rows || out->data[r].cells[1].value!=expected[seen]) {
                 fprintf(stderr,"nested sort row=%u got=%lld expected=%d\n",seen,(long long)out->data[r].cells[1].value,seen<rows?expected[seen]:0); abort();
             }
@@ -321,9 +368,11 @@ static void nested_sort(function run,unsigned type)
         }
         if(control.bytes && !control.ready) { memcpy(arena+leaf->input_offset,raw+control.offset,control.bytes); control.ready=1; }
     }
-    assert(seen==rows);
+    assert(seen==groups);
+    if(hash==1) assert(ntokens);
+    if(hash==2) assert(!ntokens);
     for(unsigned i=0;i<ntokens;++i) { assert(!tokens[i]); }
-    free(tokens); free(raw); free(expected); free(p); free(arena); free(io); free(out);
+    free(tokens); free(raw); free(expected); free(want); free(counts); free(p); free(arena); free(io); free(out);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
 }
 struct dictionary_test { struct qs_dict *dictionary; unsigned worker; };
@@ -368,6 +417,8 @@ int main(int argc,char **argv)
     test(run,QP_LEFT,73,20000,8,1,TEST_SERIAL);
     test(run,QP_INNER,73,60000,8,1,TEST_BUILD_FALLBACK);
     test(run,QP_INNER,73,60000,4,1,TEST_BUILD_FALLBACK);
-    nested_sort(run,23); nested_sort(run,1700); parallel_dictionary();
+    nested_sort(run,23,0,Q_SUM); nested_sort(run,1700,0,Q_SUM);
+    nested_sort(run,1700,1,Q_SUM); nested_sort(run,1700,1,Q_AVG); nested_sort(run,1700,2,Q_AVG);
+    nested_sort(run,20,1,Q_COUNT); nested_sort(run,20,1,Q_COUNT_STAR); nested_sort(run,1700,3,Q_AVG); parallel_dictionary();
     puts("PASS native Plan joins, NULL/duplicate keys, MIN/MAX/AVG, spill and cleanup");
 }
