@@ -78,7 +78,7 @@ struct external_hash {
     struct spool build[HASH_PARTITIONS],probe[HASH_PARTITIONS];
     unsigned char *prefix;
     uint64_t prefix_rows,prefix_at,build_at,probe_at;
-    unsigned phase,partition;
+    unsigned phase,partition,direct;
 };
 struct accumulator { struct qs_cell sum,extreme,last; uint64_t count; int has_last; };
 struct compact_group { struct qs_cell sum; int64_t key; uint64_t count; unsigned occupied; };
@@ -103,7 +103,7 @@ struct operator_state {
     unsigned index_position;
     int index_resume, index_flush;
     unsigned char *hash_data;
-    unsigned hash_rows,hash_capacity,hash_match,hash_phase;
+    unsigned hash_rows,hash_capacity,hash_match,hash_phase,hash_buckets;
     int hash_matched,hash_fallback,hash_shared;
     struct external_hash *external;
     struct compact_group *groups;
@@ -452,10 +452,11 @@ static int64_t hash_build(struct execution *s,unsigned id)
         if(status==QP_WAIT || status<0 || status>2) return status;
         if(status==2) { hash_store(o->hash_data+(size_t)o->hash_rows*row_bytes,o->right,right); ++o->hash_rows; ++s->metrics.build_rows; continue; }
         uint32_t *next=(void *)(o->hash_data+(size_t)o->hash_capacity*row_bytes),*buckets=next+o->hash_capacity;
-        memset(buckets,0xff,(size_t)o->hash_capacity*2*sizeof(*buckets));
+        o->hash_buckets=2*o->hash_capacity;
+        memset(buckets,0xff,(size_t)o->hash_buckets*sizeof(*buckets));
         for(unsigned i=0;i<o->hash_rows;++i) {
             hash_load(o->right,o->hash_data+(size_t)i*row_bytes,right);
-            unsigned bucket=row_hash(n,o->right,1)&(2*o->hash_capacity-1);
+            unsigned bucket=row_hash(n,o->right,1)&(o->hash_buckets-1);
             next[i]=buckets[bucket]; buckets[bucket]=i;
         }
         o->hash_phase=1;
@@ -482,7 +483,7 @@ restart:
                 return status;
             }
             o->have_left=1; o->hash_matched=0;
-            unsigned at=keys_null(n,o->left)?UINT_MAX:buckets[row_hash(n,o->left,0)&(2*o->hash_capacity-1)];
+            unsigned at=keys_null(n,o->left)?UINT_MAX:buckets[row_hash(n,o->left,0)&(o->hash_buckets-1)];
             o->hash_match=at==UINT_MAX?0:at+1;
         }
         while(o->hash_match) {
@@ -552,12 +553,14 @@ static void external_advance(struct execution *s,unsigned id)
     struct operator_state *o=&s->nodes[id];
     if(o->hash_data) cs_work_free(s->context,o->hash_data);
     o->hash_data=NULL; o->hash_rows=o->hash_capacity=o->hash_phase=o->hash_match=0;
-    o->have_left=0; o->external->probe_at=0; o->external->phase=2;
+    o->have_left=0; o->external->probe_at=0; o->external->phase=o->external->direct?4:2;
+    if(o->external->direct) o->finished=1;
 }
 static int64_t external_probe(struct execution *s,unsigned id,struct qs_cell *row)
 {
     const struct qp_node *n=&s->plan->nodes[id]; struct external_hash *e=s->nodes[id].external;
     const struct qs_plan *p=&s->plan->nodes[n->left].expr;
+    if(e->direct) return next_row(s,n->left,row);
     struct spool *input=&e->probe[e->partition];
     if(e->probe_at==input->rows) return 0;
     unsigned char packed[QS_OUT*19];
@@ -568,6 +571,7 @@ static int64_t external_build(struct execution *s,unsigned id)
 {
     const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
     struct external_hash *e=o->external;
+    if(e->phase>=3) return 0;
     const struct qs_plan *right=&s->plan->nodes[n->right].expr,*left=&s->plan->nodes[n->left].expr;
     unsigned rb=hash_row_bytes(right),lb=hash_row_bytes(left);
     unsigned char packed[QS_OUT*19];
@@ -582,7 +586,33 @@ static int64_t external_build(struct execution *s,unsigned id)
                 status=next_row(s,build?n->right:n->left,o->right);
             }
             if(status==QP_WAIT || status<0 || status>2) return status;
-            if(!status) { ++e->phase; continue; }
+            if(!status) {
+                ++e->phase;
+                if(build) {
+                    /* The blocking child has now released its table. If all
+                     * partitions fit, load them and Probe the original
+                     * input in parallel without partitioning it first. Only
+                     * the bucket count needs a power-of-two capacity. */
+                    uint64_t rows=0;
+                    for(unsigned i=0;i<HASH_PARTITIONS;++i) rows+=e->build[i].rows;
+                    if(!rows) { e->phase=4; o->finished=1; return 0; }
+                    if(rows<=UINT_MAX/4) {
+                        unsigned capacity=(rows+127)&~127U,buckets=256;
+                        while(buckets<capacity*2) buckets*=2;
+                        size_t bytes=(size_t)capacity*(rb+4)+(size_t)buckets*4;
+                        struct cs_work_context_stats m;
+                        if(cs_work_get_context_stats(s->context,&m)) return -4;
+                        size_t reserve=2*QS_SORT_IO_BYTES;
+                        if(s->plan->workers>1) reserve+=s->plan->workers*(sizeof(*s)+s->plan->count*sizeof(*s->nodes)+QS_SORT_IO_BYTES+256);
+                        size_t available=m.limit_bytes-m.used_bytes;
+                        if(available>reserve && bytes<=available-reserve &&
+                           (o->hash_data=cs_work_alloc(s->context,bytes))) {
+                            o->hash_capacity=capacity; o->hash_buckets=buckets; e->direct=1; e->phase=2;
+                        }
+                    }
+                }
+                continue;
+            }
             o->have_right=1;
         }
         /* INNER join NULL keys cannot match, on either side. */
@@ -597,9 +627,12 @@ static int64_t external_build(struct execution *s,unsigned id)
         o->have_right=0;
     }
     while(e->phase==2) {
-        if(e->partition==HASH_PARTITIONS) { e->phase=4; o->finished=1; return 0; }
+        if(e->partition==HASH_PARTITIONS) {
+            if(e->direct) break;
+            e->phase=4; o->finished=1; return 0;
+        }
         struct spool *build=&e->build[e->partition],*probe=&e->probe[e->partition];
-        if(e->build_at==build->rows || !probe->rows) {
+        if(e->build_at==build->rows || (!e->direct && !probe->rows)) {
             if(build->cache) { cs_work_free(s->context,build->cache); build->cache=NULL; }
             if(build->tail) { cs_work_free(s->context,build->tail); build->tail=NULL; }
             if(probe->cache) { cs_work_free(s->context,probe->cache); probe->cache=NULL; }
@@ -626,15 +659,16 @@ static int64_t external_build(struct execution *s,unsigned id)
             if(status) return status;
             ++e->build_at; ++o->hash_rows;
         }
-        uint32_t *next=(void *)(o->hash_data+(size_t)o->hash_capacity*rb),*buckets=next+o->hash_capacity;
-        memset(buckets,0xff,(size_t)o->hash_capacity*2*sizeof(*buckets));
-        for(unsigned i=0;i<o->hash_rows;++i) {
-            hash_load(o->right,o->hash_data+(size_t)i*rb,right);
-            unsigned bucket=row_hash(n,o->right,1)&(2*o->hash_capacity-1);
-            next[i]=buckets[bucket]; buckets[bucket]=i;
-        }
-        e->phase=3; o->hash_phase=1;
+        if(!e->direct) { o->hash_buckets=2*o->hash_capacity; break; }
     }
+    uint32_t *next=(void *)(o->hash_data+(size_t)o->hash_capacity*rb),*buckets=next+o->hash_capacity;
+    memset(buckets,0xff,(size_t)o->hash_buckets*sizeof(*buckets));
+    for(unsigned i=0;i<o->hash_rows;++i) {
+        hash_load(o->right,o->hash_data+(size_t)i*rb,right);
+        unsigned bucket=row_hash(n,o->right,1)&(o->hash_buckets-1);
+        next[i]=buckets[bucket]; buckets[bucket]=i;
+    }
+    e->phase=3; o->hash_phase=1;
     return 0;
 }
 static int64_t materialized_row(struct execution *s,unsigned id,uint64_t position,struct qs_cell *row)
@@ -1380,7 +1414,7 @@ restart:
         }
         s->partition_join=-1;
         for(unsigned i=0;i<count;++i)
-            if(s->nodes[builds[i]].external) { s->partition_join=builds[i]; break; }
+            if(s->nodes[builds[i]].external && !s->nodes[builds[i]].external->direct) { s->partition_join=builds[i]; break; }
         for(unsigned w=0;w<p->workers;++w) {
             struct cs_work_context_stats stats;
             if(cs_work_get_context_stats(s->context,&stats)) return -4;
@@ -1408,6 +1442,7 @@ restart:
                 if(built->hash_phase) {
                     local->hash_data=built->hash_data; local->hash_rows=built->hash_rows;
                     local->hash_capacity=built->hash_capacity; local->hash_phase=1; local->hash_shared=1;
+                    local->hash_buckets=built->hash_buckets;
                 }
                 if(built->set_ready) {
                     local->set=built->set; local->set_capacity=built->set_capacity;

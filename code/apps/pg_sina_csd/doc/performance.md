@@ -931,7 +931,7 @@ Q3/Q21 仍有大量索引页请求，Q11 的短查询受固定准备/请求开�
 
 ## Q9/Q13/Q17/Q18 专项诊断与低内存修复
 
-以下为专项状态。只使用原始 SQL，分别冷启动 host/CSD；64 MiB 查询上限、64 MiB 物理池、4 CU 不变。Q9/Q13/Q17 最新数据在 `results/tpch.UJUJOo/`，包含 Q17 的 32 MiB 定向验证；Q13 重复测量在 `results/tpch.7pbNx8/`；Q18 已由下述有序扫描实现更新，数据在 `results/tpch.3OY5UA/`、`results/tpch.fXQKVr/`。没有运行完整 TPC-H，也未在测量时并行构建或运行单元测试。
+以下为专项状态。只使用原始 SQL，分别冷启动 host/CSD；64 MiB 查询上限、64 MiB 物理池、4 CU 不变。Q9 最新数据在 `results/tpch.yLbH1i/`、`results/tpch.tE13IC/`，包含 Q9 的 32 MiB 定向验证；表中 Q13/Q17 数据仍来自 `results/tpch.UJUJOo/`，Q13 重复测量在 `results/tpch.7pbNx8/`；Q18 已由下述有序扫描实现更新，数据在 `results/tpch.3OY5UA/`、`results/tpch.fXQKVr/`。没有运行完整 TPC-H，也未在测量时并行构建或运行单元测试。
 
 本次修复排序 run 描述的固定开销：原归并头一律保存 16 个单元，现在按实际投影列宽与 token 一起分配，保持对齐及 workmem 记账。4 MiB 嵌套 Hash→Merge 回退用例原本失败时，根 context 实际仅用约 1.69 MiB，单个排序约 500 KiB 的配额却被描述挤满；修复后完整结果及 context 回收通过。这是元数据实现问题，不能解释成物理内存耗尽。
 
@@ -939,16 +939,16 @@ Q3/Q21 仍有大量索引页请求，Q11 的短查询受固定准备/请求开�
 
 | 查询 | host 秒 | CSD 秒 | 根内存峰值 MiB | spill 读/写各 MiB | CSF CPU 秒 | Sort sink/source CPU 秒 |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Q9 | 4.220 | 11.779 | 60.04 | 414.31 | 9.57 | 3.55 / 1.02 |
+| Q9 | 3.881 | 2.810 | 56.77 | 26.44 | 4.90 | <0.001 / <0.001 |
 | Q13 | 1.184 | 1.336 | 61.58 | 0 | 1.75 | <0.001 / <0.001 |
 | Q17 | 4.576 | 3.620 | 25.28 | 0 | 4.91 | 0 / 0 |
 | Q18 | 8.848 | 7.360 | 36.58 | 0 | 4.49 | <0.001 / <0.001 |
 
-延迟为关闭 profile 的单次样本；内存、spill 和 CPU 来自另外独立冷启动的 `*.profile.log`，CPU 跨 CU 累计，排序分项包含在总 CPU 中。四条完整结果及实际卸载均通过；Q9 性能仍不合格。Q13 两轮 host 为 1.184/1.355s、CSD 为 1.336/1.337s，spill 为零但仍有较慢样本，尚未稳定达标；不能以物理内存不足解释该差距。Q17 本轮 CSD 较快，32/64 MiB 均无 spill，单轮结果不保证固定加速比。Q18 两轮关闭计时的 host 为 8.848/8.873s、CSD 为 7.360/7.258s，独立 profile 的 spill 读写均为 0。只报告这两轮结果，不据此保证固定加速比。
+延迟为关闭 profile 的单次样本；内存、spill 和 CPU 来自另外独立冷启动的 `*.profile.log`，CPU 跨 CU 累计，排序分项包含在总 CPU 中。四条完整结果及实际卸载均通过；Q9 本次两轮较快，具体限制和回归结果见后文。Q13 两轮 host 为 1.184/1.355s、CSD 为 1.336/1.337s，spill 为零但仍有较慢样本，尚未稳定达标；不能以物理内存不足解释该差距。Q17 本轮 CSD 较快，32/64 MiB 均无 spill，单轮结果不保证固定加速比。Q18 两轮关闭计时的 host 为 8.848/8.873s、CSD 为 7.360/7.258s，独立 profile 的 spill 读写均为 0。只报告这两轮结果，不据此保证固定加速比。
 
 具体瓶颈：
 
-- **Q9：已增加分区 Hash Join，仍需去除聚合前的大排序。** 分区保存紧凑行，保留分区内四 CU Probe，orders 两侧不再排序。标准 Q9 完整结果一致，本阶段 host 4.111s、CSD 5.226s，单向 spill 158.06 MiB、根峰值 56.76 MiB、CSF CPU 5.93s，数据在 `results/tpch.LOYNZe/`。现有 62 个 run 均来自聚合前排序，下一阶段处理；当前性能仍未达标。
+- **Q9：已消除两侧排序、聚合前排序及 Probe 预分区。** 采用分区 Hash Join 和多键/表达式 Hash Aggregate，ORDER BY 移至聚合之后，仅排序 175 行。构建侧结束后按实际空闲内存选择驻留分区；本次可容纳所有构建分区，因此 orders 直接由四 CU 扫描、Probe。两轮关闭 profile 的完整结果均一致，host/CSD 分别为 3.881/2.810s、3.417/2.536s，spill 单向 26.44 MiB，根峰值 56.77 MiB；不保证固定加速比。
 - **Q13：已消除不必要的 Merge 和聚合前排序。** 单整数键 COUNT 可以直接消费 LEFT JOIN 输出，正确跳过补出的 NULL；外层 PG HashAggregate 也保留 Hash 算法。整数 Hash 字段仅保存值和 NULL，不保存恒为零的 scale/dscale。原生 Parallel SeqScan 的 618687 行是单 worker 估计，设备扫描却消费整张表；现使用 PG 基表的全表过滤后估计，避免先建小表、随后扩容时因新旧块同时驻留而回退。标准查询完整结果一致，累计 CSF CPU 1.75s，spill 读写为 0，根峰值 61.58 MiB。剩余较慢样本主要应继续检查构建/聚合组合及请求交接，不能归因于 spill。
 - **Q17：32/64 MiB 下均已消除 spill。** 有界 Hash Aggregate 保留精确 SUM/count，取消分组前的大排序。Hash 表按字段类型存储整数、numeric 保留完整 128 位；阻塞子节点的父表按实际输出增长，避免提前挤占聚合预算；workmem 可利用相邻空闲块原地扩容，仍遵守父/子配额。32 MiB 的独立 profile 根峰值为 25.28 MiB，spill 读写为 0，树墙钟约 3.82s；完整结果与 host 一致。此前的低内存退化属于行存储及预留问题，本次已消除该瓶颈。
 - **Q18：已补正向有序索引扫描。** 原生 PG 的内层 GroupAggregate 直接读取 `lineitem_pkey`；设备现在同样沿叶链批量回表、按索引顺序流式聚合，去除 Heap 后补的 Sort。复用原来的页缓存和 LOAD 请求；最多预读 16 个索引页，只有 PG 相关性统计大于 0.9 时才最多预读 32 个 Heap 页。游标/TID 列表使用 workmem，AFDM 页缓存大小不增加，单个最近页命中直接返回。当前独立 profile 有 5962 次 CSF、7036 个 Host LOAD 请求，累计 CSF CPU 4.49s，spill 为 0。其他外层阻塞阶段仍沿用原实现。
@@ -965,37 +965,33 @@ Hash 存储/扩容定向验证：原生 Plan 覆盖四 CU、int32 负值、超�
 
 连接后聚合定向验证：原生 Plan 与 ASan/UBSan 通过，新增四 CU 的 INNER/LEFT JOIN 后 COUNT(列)，覆盖未匹配行和 NULL 分组；标准 Q13 验证两级 Hash Aggregate、结果及实际卸载。Q9/Q17 同时使用标准 SQL 冷启动回归，完整结果一致。
 
-## Q9：对照原生 PG 与 DuckDB 的节点级排查
+## Q9：分区 Hash Join 与多键 Hash Aggregate
 
-只执行 `tests/guest/queries/9.explain.sql` 的原始查询正文，分别冷启动 PG、清除 Guest page cache；仅增加 EXPLAIN ANALYZE/BUFFERS 等诊断选项。数据在 `results/q9-diagnosis/`。原生 PG 实际执行约 3.66s，CSD 诊断约 12.28s；这是开启诊断的独立样本，不替代前面的关闭计时验收。临时节点日志计数已移除，设备算子已重新编译恢复。Guest 未安装 DuckDB/pg_duckdb，因此 DuckDB 部分为本仓库源码对照，没有可比的 DuckDB 实测延迟。
+只使用 `tests/guest/queries/9.sql` 和对应 explain，host/CSD 每次分别重启 PG、清除 Guest page cache。64 MiB 查询上限、64 MiB 物理池、64 MiB FDM、四 CU 不变。两轮关闭 profile 的完整结果均一致并实际卸载：
 
-两边均按同一连接顺序执行全表扫描，PG 实际 shared read 为 160369 个 8 KiB 页，恰好等于 CSD 的 1313742848 字节内部读取。PG 没有利用索引避免扫描 lineitem；索引缺失不能解释本次差距。
+| 样本 | host 秒 | CSD 秒 | 结果目录 |
+| --- | ---: | ---: | --- |
+| 1 | 3.881 | 2.810 | `results/tpch.yLbH1i/` |
+| 2 | 3.417 | 2.536 | `results/tpch.tE13IC/` |
 
-**已确认的回退位置是 node 3：orders 与 node 5 中间结果的连接。** 构建侧累计 131072 行时，父 Hash 表为 12.25 MiB，欲增至 24.5 MiB；与此同时 node 6 的子 Hash 表仍有 323844 行，容量 524288，占 42 MiB，supplier 小表还占约 0.34 MiB。根 context 已用 56.76 MiB，剩余仅约 7.24 MiB，最大空闲块约 6.95 MiB。即使这次能原地增长，新增 12.25 MiB 也放不下。此处不是单个节点配额过小：申请 24.5 MiB 低于当时约 54.15 MiB 的 Hash 上限。
+独立 profile 位于第一轮目录：根 workmem 峰值 56.77 MiB，spill 读写各 26.44 MiB，累计 CSF CPU 4.90s，四 CU 峰值，四段并行流水线；Sort sink/source CPU 均低于 0.001s，仅一个最终排序 run。profile 用于诊断内存和 CPU，不代替上述关闭计时的延迟样本；累计 CPU 不与墙钟直接相减。
 
-这证明当前同时驻留方式确有容量压力，但不能证明完整查询必须采用当前的慢路径。`hash_build` 会把父表转换为排序前缀，`parallel_next` 随即关闭受影响流水线的并行，`hash_next` 改走 Merge。其他较低层扫描/Probe 仍有四 CU，不能把峰值四 CU 理解为全查询四 CU 并行。
+实际执行保持 PG 选择的连接树：
 
-节点日志明确分离出三份排序成本：
+```text
+PG 选定的连接树（按需分区 Hash Join）
+    → Hash Aggregate(nation, year, SUM(amount))
+    → Sort(nation ASC, year DESC)，175 行
+```
 
-| 用途 | 输入行数 | 列数 | spill 读/写各 MiB | sink+source CPU 秒 |
-| --- | ---: | ---: | ---: | ---: |
-| node 3 左侧：orders | 1500000 | 2 | 179.56 | 2.74 |
-| node 3 右侧：连接中间结果 | 323844 | 6 | 117.38 | 0.90 |
-| node 1：GROUP BY 前排序 | 323844 | 6 | 117.38 | 1.00 |
-| 合计 | — | — | 414.31 | 4.63 |
+原先的退化来自嵌套构建：子 Hash 表仍占 42 MiB 时，父表要从 12.25 MiB 增到 24.5 MiB，根预算无法容纳；原实现整体转 Merge 并关闭该段并行。现在保留已消费的投影行，以紧凑格式按键分四区，经现有 NEED_STORE/LOAD 落盘，不重扫两侧 Heap。子节点结束并释放工作内存后重新检查预算；若所有构建分区可驻留，按实际行数分配行区、桶数组单独取二次幂容量。Q9 该表约 31.81 MiB，因此能直接多 CU 扫描 orders 并 Probe，不再对 orders 预分区落盘。容纳不下时仍逐分区并行 Probe，极端偏斜时分批构建并只重读该分区的 Probe 临时数据。
 
-PG 的两个大连接使用 Parallel Hash 的 16/8 个 batch，保持 Hash 算法，不把 orders 改为全量排序。全部临时 I/O 为读 122.55 MiB、写 124.13 MiB，明显低于 CSD 的各 414.31 MiB。PG 的两个 worker 加 leader 各自排序、部分聚合；每路聚合输出 175 行，Gather Merge 只收 525 行，最后输出 175 行。`work_mem=4MB` 是每节点/worker 的预算，不能与 CSD 查询全局 64 MiB 等同；本次未测 PG 查询总内存峰值。
+多键聚合保留精确 SUM/count、各键 NULL 和 numeric 精度，支持 amount 的算术表达式。多键表从小容量按实际分组数增长，Q9 不按 PG 的 60150 组估计预留大表。聚合原先依赖输入排序提供 ORDER BY，现在复用原来的两个节点，将排序移到聚合后并重新映射输出列位置，保留升降序和 NULL 顺序。仅保留 175 个分组状态，无聚合 spill。单整数键的紧凑实现仍保留。
 
-CSD 的排序仍按每列 32 字节的 `qs_cell` 保存：六列为 192 字节/行，323844 行仅原始行区就约 59.30 MiB。约 4.92 MiB 的排序配额与多轮归并进一步放大读写。Q9 的 nation 字符串键不能走现有整数/numeric radix 快路。聚合优化当前还要求单整数键、无上层顺序需求和简单聚合参数，Q9 的 nation/year 双键、amount 算术表达式及 ORDER BY 全部不满足，因此没有得到与 Q17 相同的 Hash 聚合收益。
+32 MiB 查询预算的标准 Q9 完整结果同样与 host 一致，关闭计时耗时约 3.34s；独立 profile 的根峰值为 31.60 MiB，spill 读写各 62.81 MiB，四 CU、七段流水线。该样本验证更小预算下嵌套分区仍可执行，不用增加物理池。它没有与独立同轮 host 比较，不作为加速验收。
 
-DuckDB 对照的是已有实现能力，不据此声称其 Q9 一定采用某个具体计划：
+对照原生 PG 的诊断仍保存在 `results/q9-diagnosis/`：两边读取的基础表页量相同，为 160369 个 8 KiB 页。PG 使用多 batch Parallel Hash 和 worker 部分聚合。DuckDB 的 `physical_hash_join.cpp`、`join_hashtable.cpp` 提供外部分区、重新选择驻留分区及并行 Probe 的参考；`physical_hash_aggregate.cpp`、`radix_partitioned_hashtable.cpp` 提供多键状态、部分 SUM/count 和内存约束的参考。Guest 未安装 DuckDB/pg_duckdb，本次没有 DuckDB 实测延迟。
 
-- `physical_hash_join.cpp` 的 Sink 以 DataChunk 执行键表达式、引用所需 payload 列并构建局部表；Finalize 可以并行处理。当前 CSD 的协调端构建和 `next_row`/`hash_load`/`memcpy` 组合仍主要按行执行。
-- 同文件的外部路径及 `join_hashtable.cpp` 的 `PrepareExternalFinalize`、`ProbeAndSpill` 按 radix 分区选择驻留数据，将暂不能 Probe 的输入落盘，后续继续 Hash；不是超限后整体改为 Merge。
-- `physical_hash_aggregate.cpp` 与 `radix_partitioned_hashtable.cpp` 使用列批次和线程局部聚合，预算不足时调整内存预留或分区。可借鉴为先维护少量 nation/year 聚合状态，最后只对聚合结果排序；实际内存和收益仍需实现后验证。
+定向验证包括原生 Plan 与 ASan/UBSan：4 MiB 分区、重复键、NULL、极端偏斜、四 CU；8 MiB 下暂存后全部驻留及非二次幂行容量；串行/并行两条路径；text+整数双键、负数、表达式 SUM/AVG、表扩容、4 MiB 多轮部分状态归并和 64 MiB 无 spill；context/token 回收。每个 CU 使用独立的 64 KiB spill AFDM，遵守 FEMU 计算参数零偏移限制，AFDM 总容量不增加。
 
-优化优先级：先实现有界分区 Hash Join，避免 orders 的全量排序并保留分区内并行；其次支持多键/表达式的局部 Hash Aggregate，将最终排序从 323844 行缩至 175 行；再减少中间行宽、连续表倍增的峰值和逐行复制。当前扫描解码约 1.73s 累计 CPU，三份排序约 4.63s，后者约占总 CSF CPU 9.43s 的 49%；继续只优化 Scan SIMD 或增加 CU 数不能消除已确认的算法退化。CPU 为跨 CU 累计，不能与查询墙钟直接相减计算 I/O。
-
-分区 Hash Join 定向验证：原生 Plan 及 ASan/UBSan 通过；新增 4 MiB 下强制分区的四 CU、重复键、NULL 和所有键集中于一个分区的用例，核对 COUNT、无排序 run、spill 及 context 回收。模拟重入使用每 CU 独立 I/O 范围；真实 PG 也为每 CU 传递独立 spill AFDM，遵守 FEMU 计算参数零偏移限制，AFDM 总容量不增加。
-
-多键 Hash Aggregate 阶段：标准 Q9 已变为 Hash Aggregate 后仅排序 175 行，完整结果一致。两轮关闭计时样本分别为 host/CSD 3.877/3.587s 与 2.967/3.865s，尚未稳定达标；独立 profile 在 `results/tpch.6VD8bU/9.profile.log`，spill 单向 40.69 MiB、根峰值 56.77 MiB、Sort sink/source CPU 各低于 0.001s。定向原生 Plan 及 ASan/UBSan 通过，新增 text+整数双键、各键独立 NULL、负数、表达式 SUM/AVG、表扩容、4 MiB 多轮部分状态归并和 64 MiB 无 spill。Q13/Q17/Q18 完整结果回归通过；Q13 仍存在较慢样本。
+只回归标准 Q9/Q13/Q17/Q18，没有运行完整 TPC-H。四条完整结果均一致；Q17/Q18 本轮较快，Q13 的 1.36s 仍高于 host 1.17s、spill 为零，继续列为性能未达标。现阶段分区路径用于 INNER 扩容失败，其他形态保留原 Merge 回退；Hash 构建及聚合协调端仍有按行处理，尚未宣称所有节点都已完全向量化或并行化。

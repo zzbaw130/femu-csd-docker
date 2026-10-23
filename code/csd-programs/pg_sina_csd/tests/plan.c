@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <pthread.h>
 typedef int64_t (*function)(struct femu_csd_args *);
-enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_PARTITION,TEST_PARTITION_SKEW };
+enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL };
 static void w16(void *p,uint16_t x) { memcpy(p,&x,2); }
 static void w32(void *p,uint32_t x) { memcpy(p,&x,4); }
 static unsigned char *heap(unsigned rows,unsigned side,size_t *size)
@@ -186,7 +186,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         j->vector_offset=bytes; bytes+=4096+((qs_chunk_bytes(256,4)+4095)&~(size_t)4095);
     }
     size_t parallel_bytes=bytes;
-    if(parallel) {
+    if(parallel && parallel!=TEST_PARTITION_SERIAL) {
         plan->workers=4; plan->nodes[1].parallel=1;
         plan->nodes[2].parallel_input=parallel_bytes; parallel_bytes+=plan->scan_bytes;
         plan->nodes[2].parallel_vector=parallel_bytes; parallel_bytes+=(qs_chunk_bytes(plan->scan_bytes/24,2)+4095)&~(size_t)4095;
@@ -298,7 +298,11 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         }
     }
     assert(got); if(parallel!=TEST_COUNT_ROWS && parallel<TEST_PARTITION) for(unsigned i=0;i<12;++i) assert(!seen[i]);
-    if(parallel>=TEST_PARTITION) assert(ntokens && !out->metrics.runs && out->metrics.workers==4);
+    if(parallel>=TEST_PARTITION) {
+        assert(ntokens && !out->metrics.runs && out->metrics.workers==(parallel==TEST_PARTITION_SERIAL?1:4));
+        if(parallel==TEST_PARTITION_SERIAL) assert(!control.epoch);
+        else assert(memory==8?control.epoch==1:control.epoch>1);
+    }
     for(size_t i=0;i<ntokens;++i) free(tokens[i]);
     free(tokens); free(raw[0]); free(raw[1]); free(index); free(plan); free(arena); free(io); free(out);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
@@ -547,6 +551,9 @@ int main(int argc,char **argv)
     test(run,QP_LEFT,5170,23,4,1,TEST_HASH_GROUP);
     test(run,QP_INNER,5170,23,64,1,TEST_HASH_GROUP);
     test(run,QP_INNER,31,150000,4,1,TEST_PARTITION);
+    test(run,QP_INNER,31,150000,8,1,TEST_PARTITION);
+    test(run,QP_INNER,31,150000,4,1,TEST_PARTITION_SERIAL);
+    test(run,QP_INNER,31,150000,8,1,TEST_PARTITION_SERIAL);
     test(run,QP_INNER,31,150000,4,1,TEST_PARTITION_SKEW);
     test(run,QP_LEFT,20000,23,4,0,TEST_SERIAL);
     test(run,QP_LEFT,73,20000,8,1,TEST_SERIAL);
