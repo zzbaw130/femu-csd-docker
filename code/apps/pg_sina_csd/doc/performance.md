@@ -1273,7 +1273,7 @@ lineitem 流水线三轮平均忙碌 CU 为 1.90/1.93/1.95，仍远低于已分�
 
 PG 改用 SNIA 标准 callback 收取状态和 CompValue，回调只发布普通结果和时间戳，PG 线程通过 release/acquire 完成标志继续调度。取消和清理等待所有在途回调结束，不从回调调用 PG API。原先通过 event 获取完成值的方式与 callback 都是标准 API，此处不修改 SNIA 公共接口。
 
-FEMU 插件沿用 `SNIA_FEMU_PROFILE`，增加同一 SNIA 线程上最后一次成功 D0 返回到 E1 ioctl 提交的间隔。首次诊断 `callback.profile.log/transport.log`：912 对 LOAD→E1 的间隔合计 10.168 ms，平均 11.1 us；callback 发布到 PG 观察完成平均 96.3 us。PG 可以及时安排任务，主要等待仍发生在 D0/E1 ioctl 内部。此测量没有把 Guest 与 FEMU 宿主的绝对时钟相减，也没有把 E1 提交当作 CU 实际开始执行。
+FEMU 插件沿用 `SNIA_FEMU_PROFILE`，增加同一 SNIA 线程上最后一次成功 D0 返回到 E1 ioctl 提交的间隔。首次诊断 `callback.profile.log/transport.log`：912 对 LOAD→E1 的间隔合计 10.168 ms，平均 11.1 us；callback 发布到 PG 观察完成平均 96.3 us。这两个间隔分别是适配器内部交接与 PG 完成观察，不能证明前一 batch 完成后 PG 能及时提交下一块；该间隔见后续自动续交诊断。此测量没有把 Guest 与 FEMU 宿主的绝对时钟相减，也没有把 E1 提交当作 CU 实际开始执行。
 
 ### 本轮修改
 
@@ -1315,3 +1315,46 @@ FEMU 插件沿用 `SNIA_FEMU_PROFILE`，增加同一 SNIA 线程上最后一次�
 D0/E1 跨请求累计等待中位数仍约 1.576/2.531 s，E1 包含设备 CSF 累计墙钟约 1.531 s。请求内剩余时间包含排队、虚拟化、模拟延迟和完成通知；当前计时没有进一步将其全部分开。PG 休眠表示没有可推进的完成项，不能据此判定 CU 全部空闲，也不能把剩余等待直接归因于 NAND 或 workmem 不足。
 
 原生 Plan、8/16/64 worker、共享聚合、索引、低内存 spill 定向 CTest 通过；ASan/UBSan 的原生 Plan 和 8 worker 通过，LeakSanitizer 按现有环境限制关闭。SNIA batch/callback 与 AFDM/event 生命周期测试通过。另在同一 PG 会话中执行标准 Q14，180 ms 超时发生在已有 32 次 LOAD 后；随后立即重跑同一 SQL，完整结果与 host 一致，验证取消时回调排空及状态回收。该超时测试不计入性能样本。
+
+## Q14：callback 自动续交输入块（2026-10-24）
+
+PG 扩展为普通 Heap 扫描准备设备句柄和只读 extent 映射。各 worker 完成 `LOAD→计算` batch 后，如果 CompValue 表明输入块已耗尽、没有未消费输出且 worker 未结束，SNIA callback 从原子扫描游标领取下一块，重配当前 batch 并再次异步提交，不经过 PG 完成观察循环。参考 DuckDB `RowGroupCollection::NextParallelScan` 的共享扫描进度和独立局部扫描状态，保留每槽一个输入缓冲，不增加预读、线程池或设备接口。
+
+回调仅调用 libc 与 SNIA。槽锁保护重配、当前请求句柄及取消；PG 先禁止续交，再等待全部回调结束，之后才释放 batch、AFDM 和查询状态。SNIA 在发布 callback 前释放已完成请求的并发名额，避免 64 个请求同时完成时，回调无法补交下一块。新增测试使 64 个 callback 同时停在回调内，再全部重配并续交同一 batch，验证满并发时可继续执行。
+
+没有无条件删除共享 Sink 的等待。核对调度循环后，原实现本就允许无输出的 worker 继续领取输入，协调任务介入共享表时才要求在途 worker 排空。本次正常 Q14 的该项等待为零；删除保护条件不能解释或解决本轮瓶颈，还会使扩容与并发写表冲突。低内存测试验证这些保护仍然必要。
+
+### 同配置冷启动对比
+
+保持 8 CU、256 MiB workmem、64 MiB FDM。只使用标准 `14.sql`，每次 host/CSD 测量前重启 PG、清 Guest page cache；关闭 profile。基线为 `f32003e66` 的 PG 扩展，设备算子不变，两侧使用同一 SNIA 库。最终三组交替部署的日志在 `results/q14-requeue/{before4,final2,final3,before5,before6,final4}.bench.log`。
+
+| 组 | 旧 CSD ms | 新 CSD ms | 新版同轮 host ms |
+| --- | ---: | ---: | ---: |
+| 1 | 560.101 | 533.105 | 1463.786 |
+| 2（先新后旧） | 729.076 | 552.428 | 1577.890 |
+| 3 | 557.692 | 547.687 | 1544.460 |
+| 中位数 | **560.101** | **547.687** | — |
+
+全部完整结果一致、实际卸载，且新版均快于同轮 host。中位数下降约 **2.2%**，旧版存在 729 ms 波动样本；不能据此宣称 callback 带来了大幅或稳定线性扩展。
+
+### 完成到下一次提交，以及剩余等待
+
+独立开启 profile 的最终 `final2.profile.log`：457 个扫描 LOAD 中，439 次后续请求由 callback 自动续交；PG 提交/观察共 103 次，旧 `before.profile.log` 为 543 次。自动续交平均 **92.353 us**、最大 536.112 us，包含范围映射与 batch 重配。24 次经 PG 重新安排扫描块的平均间隔为 5168.710 us，其中包含输出消费与阶段协调，不能把这部分全当成可删除的提交延迟。共享 Sink 输出等待为 0 次、0 ms。
+
+| 阶段 | profile 墙钟 ms |
+| --- | ---: |
+| 设备执行准备 | 246.910 |
+| lineitem 扫描、过滤、Hash Build 输入 | 432.228 |
+| part 扫描、Probe、聚合消费 | 91.400 |
+| 清理 | 4.361 |
+| 阶段切换及其余时间 | 19.082 |
+| Tree Wall | **793.981** |
+
+这是另一条开启 profile 的查询，不能与关闭 profile 的 548 ms 中位数混算。lineitem 阶段平均忙碌 CU 为 2.83，峰值 8，仍不是持续用满 8 CU；workmem 峰值 8401312 bytes、spill 为零。自动续交消除了普通块依赖 PG 观察完成的过程，但同槽仍先 LOAD 后计算，本次未消除请求内部 I/O/计算等待或实现读算重叠。
+
+### 定向回归
+
+- 标准 Q3：host 3265.106 / CSD 2008.914 ms；标准 Q13：1140.747 / 388.658 ms。完整结果一致、实际卸载；只用于此次索引/输出消费及共享聚合路径回归，没有运行完整 22 条基准。
+- 标准 Q14 仅设置 `max_memory='4MB'` 的压力测试：完整结果与 host 一致；独立 profile 的 workmem 峰值 4023152 bytes，spill 读写各 7864320 bytes，共享 Sink 等待 32 次、49.908 ms，自动续交 187 次。验证内存不足时仍能回到协调任务完成扩容/外排处理。
+- 同一 PG 会话先用 400 ms 超时执行标准 Q14，再取消超时重跑：首次已提交 121 次 LOAD 后超时，第二次完整结果与 host 一致。结束后恢复普通 PG 环境。
+- SNIA batch/callback 调度及 AFDM/event 生命周期定向测试全部通过，包含新增的 64 路 callback 重配、续交测试。

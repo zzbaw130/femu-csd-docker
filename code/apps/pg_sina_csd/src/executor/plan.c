@@ -12,12 +12,15 @@
 #include <time.h>
 #include <unistd.h>
 #include <stdatomic.h>
+#include <pthread.h>
+#include <stdlib.h>
 
+typedef struct PlanStateCsd PlanStateCsd;
 struct plan_slot {
     struct qp_control control;
     CS_BATCH_HANDLE batch, resume;
-    CS_BATCH_INDEX previous;
-    CS_REQ_HANDLE pending;
+    CS_BATCH_INDEX previous,scan_load;
+    CS_REQ_HANDLE pending; /* PG-owned marker for the whole callback chain. */
     atomic_bool completed;
     CS_STATUS completion_status;
     u64 completion_value;
@@ -27,21 +30,31 @@ struct plan_slot {
     unsigned scan_node;
     bool need_input;
     uint64_t queued_ns;
+    PlanStateCsd *owner;
+    unsigned worker;
+    pthread_mutex_t mutex;
+    bool mutex_ready;
+    CS_REQ_HANDLE inflight;
+    uint64_t auto_submits,auto_gap_ns,auto_gap_max_ns,auto_pending_ns;
+    uint64_t scan_loads;
+    uint64_t host_gap_ns,host_gap_max_ns,host_requeues;
 };
-typedef struct {
+struct PlanStateCsd {
     CustomScanState css;
     struct qp_plan *plan;
     struct plan_slot slots[QS_WORKERS+1];
     unsigned workers, epoch, device_cus;
-    uint64_t next_scan_offset;
+    atomic_uint_fast64_t next_scan_offset;
+    atomic_bool stopping;
     bool parallel;
     uint64_t load_ns, load_calls;
     /* Host-thread wall times: queue/load preparation are subsets of submit;
      * pending time is summed across concurrent requests, not query latency. */
     uint64_t poll_ns, completion_copy_ns, submit_ns, queue_ns, control_write_ns, idle_ns, pending_ns;
     uint64_t submits, polls, completions;
-    uint64_t scheduled_loads, completion_reads, control_writes;
+    uint64_t completion_reads, control_writes;
     uint64_t notice_ns, notice_max_ns;
+    uint64_t barrier_started,barrier_ns,barriers;
     uint64_t setup_ns, cleanup_ns;
     uint64_t fdm_bytes;
     struct qs_request files[QP_NODES];
@@ -58,17 +71,38 @@ typedef struct {
     bool started, explain_only, loaded, active, profiling;
     uint64_t start_ns;
     MemoryContextCallback cleanup;
-} PlanStateCsd;
+};
 static const CustomExecMethods methods;
 static uint64_t clock_ns(void)
 { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000ULL+t.tv_nsec; }
-/* SNIA calls this on its request thread. Publish only plain result fields;
- * PostgreSQL APIs and memory contexts are used exclusively by the PG thread. */
+static CS_STATUS queue_scan(struct plan_slot *slot);
+/* A drained input with no output can reuse its buffers immediately. This
+ * callback uses only libc, immutable mappings and SNIA, never PostgreSQL APIs.
+ * Shared-table growth/spill still runs on the coordinator after workers stop. */
 static void completed(void *context,CS_STATUS status,u64 value)
 {
     struct plan_slot *slot=context;
-    slot->callback_ns=slot->profiling?clock_ns():0;
+    uint64_t arrived=slot->profiling?clock_ns():0;
+    pthread_mutex_lock(&slot->mutex);
+    if(status==CS_SUCCESS && value==QP_INPUT_DRAINED && slot->scan_node &&
+       !atomic_load_explicit(&slot->owner->stopping,memory_order_acquire)) {
+        uint64_t previous=slot->queued_ns;
+        CS_STATUS next=queue_scan(slot);
+        if(next==CS_QUEUED) {
+            if(slot->profiling) {
+                uint64_t gap=slot->queued_ns-arrived;
+                ++slot->auto_submits; slot->auto_gap_ns+=gap;
+                slot->auto_gap_max_ns=Max(slot->auto_gap_max_ns,gap);
+                slot->auto_pending_ns+=arrived-previous;
+            }
+            pthread_mutex_unlock(&slot->mutex);
+            return;
+        }
+        status=next;
+    }
+    slot->callback_ns=arrived;
     slot->completion_status=status; slot->completion_value=value;
+    pthread_mutex_unlock(&slot->mutex);
     atomic_store_explicit(&slot->completed,true,memory_order_release);
 }
 static CS_STATUS transfer(CS_MEM_HANDLE memory,size_t offset,void *data,size_t bytes,bool write)
@@ -95,8 +129,11 @@ static void close_state(void *arg)
     PlanStateCsd *s=arg;
     uint64_t started=s->profiling?clock_ns():0;
     HOLD_INTERRUPTS();
+    atomic_store_explicit(&s->stopping,true,memory_order_release);
     for(unsigned w=0;w<=s->workers;++w) if(s->slots[w].pending) {
-        if(!atomic_load_explicit(&s->slots[w].completed,memory_order_acquire)) csAbortRequest(s->slots[w].pending);
+        pthread_mutex_lock(&s->slots[w].mutex);
+        if(!atomic_load_explicit(&s->slots[w].completed,memory_order_acquire)) csAbortRequest(s->slots[w].inflight);
+        pthread_mutex_unlock(&s->slots[w].mutex);
         while(!atomic_load_explicit(&s->slots[w].completed,memory_order_acquire)) pg_usleep(50L);
         s->slots[w].pending=NULL;
     }
@@ -108,6 +145,7 @@ static void close_state(void *arg)
     for(unsigned w=0;w<=s->workers;++w) {
         if(s->slots[w].batch) { csFreeBatchRequest(s->slots[w].batch); s->slots[w].batch=NULL; }
         if(s->slots[w].resume) { csFreeBatchRequest(s->slots[w].resume); s->slots[w].resume=NULL; }
+        if(s->slots[w].mutex_ready) { pthread_mutex_destroy(&s->slots[w].mutex); s->slots[w].mutex_ready=false; }
     }
     CsMemFlags flags={.FDMId=1};
     for(unsigned i=0;i<5;++i) if(s->memory[i]) { csFreeMem(s->memory[i],&flags); s->memory[i]=NULL; }
@@ -135,6 +173,7 @@ static void begin(CustomScanState *node,EState *estate,int flags)
     s->plan=palloc(sizeof(*s->plan)); memcpy(s->plan,VARDATA_ANY(bytes),sizeof(*s->plan));
     s->result=(void *)TYPEALIGN(16,(uintptr_t)palloc0(sizeof(*s->result)+15));
     s->explain_only=flags&EXEC_FLAG_EXPLAIN_ONLY;
+    atomic_init(&s->stopping,false); atomic_init(&s->next_scan_offset,0);
     s->cleanup.func=close_state; s->cleanup.arg=s;
     MemoryContextRegisterResetCallback(estate->es_query_cxt,&s->cleanup);
 }
@@ -195,10 +234,12 @@ static void start(PlanStateCsd *s)
     if(!device) elog(ERROR,"CSD PG Plan has no prepared relation");
     pg_sina_read_resources(device);
     s->profiling=pg_sina_profile; s->start_ns=clock_ns(); s->load_ns=s->load_calls=0;
+    atomic_store(&s->stopping,false);
     s->poll_ns=s->completion_copy_ns=s->submit_ns=s->queue_ns=s->control_write_ns=0;
     s->idle_ns=s->pending_ns=s->submits=s->polls=s->completions=0;
-    s->scheduled_loads=s->completion_reads=s->control_writes=0;
+    s->completion_reads=s->control_writes=0;
     s->notice_ns=s->notice_max_ns=0;
+    s->barrier_started=s->barrier_ns=s->barriers=0;
     s->setup_ns=s->cleanup_ns=0;
     memset(s->plan->pipelines,0,sizeof(s->plan->pipelines));
     s->plan->nodes[s->plan->root].expr.work_mem_bytes=pg_sina_query_memory();
@@ -268,6 +309,9 @@ static void start(PlanStateCsd *s)
     request->ReqType=CS_QUEUE_COMPUTE; request->u.Compute.CSFId=s->function; request->u.Compute.NumArgs=6;
     for(unsigned i=0;i<5;++i) csHelperSetComputeArg(&request->u.Compute.Args[i],CS_AFDM_TYPE,s->memory[i],0UL);
     for(unsigned w=0;w<=s->workers;++w) {
+        struct plan_slot *slot=&s->slots[w];
+        if(pthread_mutex_init(&slot->mutex,NULL)) elog(ERROR,"cannot initialize CSD submission lock");
+        slot->mutex_ready=true; slot->owner=s; slot->worker=w;
         /* FEMU compute ranges start at zero; each CU needs its own spill AFDM. */
         csHelperSetComputeArg(&request->u.Compute.Args[4],CS_AFDM_TYPE,w?s->worker_io[w-1]:s->memory[4],0UL);
         csHelperSetComputeArg(&request->u.Compute.Args[5],CS_64BIT_VALUE_TYPE,(u64)(s->profiling|(w<<1)));
@@ -278,11 +322,11 @@ static void start(PlanStateCsd *s)
     pfree(request); s->started=true;
     if(s->profiling) s->setup_ns=clock_ns()-s->start_ns;
 }
-static void append_ranges(CsBlockIo *io,const struct qs_request *file,const struct qs_extent *extents,uint64_t at,uint64_t end)
+static CS_STATUS append_ranges(CsBlockIo *io,const struct qs_request *file,const struct qs_extent *extents,uint64_t at,uint64_t end)
 {
     for(unsigned e=0;e<file->nextents && at<end;++e) {
         if(extents[e].logical+extents[e].bytes<=at) continue;
-        if(extents[e].logical>at) elog(ERROR,"CSD unmapped heap/index page");
+        if(extents[e].logical>at) return CS_INVALID_ARG;
         uint64_t n=Min(end,extents[e].logical+extents[e].bytes)-at;
         CSBlockRange range={file->nsid,extents[e].lba+(at-extents[e].logical)/file->lba_bytes,n/file->lba_bytes};
         CSBlockRange *last=io->NumRanges?&io->Range[io->NumRanges-1]:NULL;
@@ -290,7 +334,61 @@ static void append_ranges(CsBlockIo *io,const struct qs_request *file,const stru
         else io->Range[io->NumRanges++]=range;
         at+=n;
     }
-    if(at!=end) elog(ERROR,"CSD incomplete extent mapping");
+    return at==end?CS_SUCCESS:CS_INVALID_ARG;
+}
+/* The caller holds slot->mutex. Every block has its own request snapshot;
+ * mappings and device handles remain alive until all callbacks are drained. */
+static CS_STATUS queue_scan(struct plan_slot *slot)
+{
+    PlanStateCsd *s=slot->owner;
+    unsigned node=slot->scan_node-1,worker=slot->worker;
+    const struct qp_node *n=&s->plan->nodes[node];
+    const struct qs_request *file=&s->files[node];
+    uint64_t offset=atomic_fetch_add_explicit(&s->next_scan_offset,s->plan->scan_bytes,memory_order_relaxed);
+    if(offset>n->bytes) offset=n->bytes;
+    uint64_t bytes=Min((uint64_t)s->plan->scan_bytes,n->bytes-offset);
+    size_t size=sizeof(CsBatchRequest)+(file->nextents+1)*sizeof(CSBlockRange);
+    CsBatchRequest *load=calloc(1,size);
+    CsBatchRequest *compute=calloc(1,sizeof(*compute)+6*sizeof(CsComputeArg));
+    CS_STATUS status=CS_OUT_OF_RESOURCES;
+    if(!load || !compute) goto done;
+    bool reuse=bytes && slot->resume;
+    if(slot->resume && !reuse) {
+        status=csFreeBatchRequest(slot->resume); if(status!=CS_SUCCESS) goto done;
+        slot->resume=NULL;
+    }
+    if(!reuse) {
+        status=csAllocBatchRequest(CS_BATCH_SERIAL,bytes?2:1,&slot->resume);
+        if(status!=CS_SUCCESS) goto done;
+    }
+    CS_BATCH_INDEX previous=0,current;
+    if(bytes) {
+        size_t input=worker>1?n->parallel_input+(worker-2)*s->plan->parallel_stride:n->input_offset;
+        load->ReqType=CS_STORAGE_IO;
+        load->u.StorageIo=(CsStorageRequest){.Mode=CS_STORAGE_BLOCK_IO,.DevHandle=s->device,
+            .u.BlockIo={.Type=CS_STORAGE_LOAD_TYPE,.DevMem={s->memory[3],input}}};
+        status=append_ranges(&load->u.StorageIo.u.BlockIo,file,s->extents[node],offset,offset+bytes);
+        if(status!=CS_SUCCESS) goto done;
+        status=csConfigureBatchEntry(slot->resume,reuse?CS_BATCH_RECONFIG:CS_BATCH_ADD,load,
+            reuse?slot->scan_load:0,0,reuse?NULL:&slot->scan_load);
+        if(status!=CS_SUCCESS) goto done;
+        previous=slot->scan_load;
+    }
+    compute->ReqType=CS_QUEUE_COMPUTE; compute->u.Compute.CSFId=s->function; compute->u.Compute.NumArgs=6;
+    for(unsigned i=0;i<5;++i) csHelperSetComputeArg(&compute->u.Compute.Args[i],CS_AFDM_TYPE,s->memory[i],0UL);
+    csHelperSetComputeArg(&compute->u.Compute.Args[4],CS_AFDM_TYPE,s->worker_io[worker-1],0UL);
+    uint64_t parameter=s->profiling|(worker<<1)|QP_SCAN_INPUT|((offset/QS_PAGE)<<QP_SCAN_PAGE_SHIFT);
+    csHelperSetComputeArg(&compute->u.Compute.Args[5],CS_64BIT_VALUE_TYPE,(u64)parameter);
+    status=csConfigureBatchEntry(slot->resume,reuse?CS_BATCH_RECONFIG:CS_BATCH_ADD,compute,
+        reuse?slot->previous:0,reuse?0:previous,reuse?NULL:&current);
+    if(status!=CS_SUCCESS) goto done;
+    if(!reuse) slot->previous=current;
+    slot->control.bytes=slot->control.index_nreads=0; slot->need_input=false;
+    if(s->profiling) slot->queued_ns=clock_ns();
+    status=csQueueBatchRequest(slot->resume,slot,completed,NULL,&slot->inflight,NULL);
+    if(status==CS_QUEUED && bytes) ++slot->scan_loads;
+done:
+    free(compute); free(load); return status;
 }
 static void configure_load(PlanStateCsd *s,unsigned worker,CsStorageRequest *load)
 {
@@ -325,7 +423,7 @@ static void load_pages(PlanStateCsd *s,unsigned worker)
                 struct qs_extent *extents=read->heap?s->extents[leaf]:s->index_extents[leaf];
                 uint64_t at=(uint64_t)read->block*QS_PAGE,end=at+QS_PAGE;
                 if(read->heap>1 || read->slot>=QS_INDEX_CACHE || end>file->bytes) elog(ERROR,"invalid CSD index page");
-                append_ranges(io,file,extents,at,end);
+                checked(append_ranges(io,file,extents,at,end),"map index pages");
             }
             configure_load(s,worker,load); ++s->load_calls; pfree(load);
         }
@@ -335,7 +433,7 @@ static void load_pages(PlanStateCsd *s,unsigned worker)
         CsStorageRequest *load=palloc0(sizeof(*load)+(file->nextents+1)*sizeof(CSBlockRange));
         load->Mode=CS_STORAGE_BLOCK_IO; load->DevHandle=s->device;
         CsBlockIo *io=&load->u.BlockIo; io->Type=CS_STORAGE_LOAD_TYPE; io->DevMem=(CsDevAFDM){s->memory[3],input};
-        append_ranges(io,file,s->extents[node],c->offset,c->offset+c->bytes);
+        checked(append_ranges(io,file,s->extents[node],c->offset,c->offset+c->bytes),"map heap pages");
         configure_load(s,worker,load); ++s->load_calls; pfree(load);
     }
     c->ready=1; s->load_ns+=clock_ns()-started;
@@ -347,15 +445,21 @@ static void submit(PlanStateCsd *s,unsigned worker)
     uint64_t parameter=s->profiling|(worker<<1);
     bool assigned=slot->scan_node && slot->need_input;
     if(assigned) {
-        const struct qp_node *n=&s->plan->nodes[slot->scan_node-1];
-        uint64_t offset=Min(s->next_scan_offset,n->bytes);
-        slot->control.node=slot->scan_node-1; slot->control.offset=offset;
-        slot->control.bytes=Min((uint64_t)s->plan->scan_bytes,n->bytes-offset);
-        slot->control.ready=slot->control.index_nreads=0;
-        if(offset<n->bytes) { s->next_scan_offset+=slot->control.bytes; ++s->scheduled_loads; }
-        Assert(offset%QS_PAGE==0 && offset/QS_PAGE<=(UINT64_MAX>>QP_SCAN_PAGE_SHIFT));
-        parameter|=QP_SCAN_INPUT | ((offset/QS_PAGE)<<QP_SCAN_PAGE_SHIFT);
-        slot->need_input=false;
+        atomic_store_explicit(&slot->completed,false,memory_order_relaxed);
+        pthread_mutex_lock(&slot->mutex);
+        CS_STATUS status=queue_scan(slot);
+        slot->pending=status==CS_QUEUED?slot->inflight:NULL;
+        if(s->profiling) {
+            if(status==CS_QUEUED && slot->callback_ns) {
+                uint64_t gap=slot->queued_ns-slot->callback_ns;
+                slot->host_gap_ns+=gap; slot->host_gap_max_ns=Max(slot->host_gap_max_ns,gap); ++slot->host_requeues;
+            }
+            slot->callback_ns=0;
+            s->queue_ns+=clock_ns()-slot->queued_ns; s->submit_ns+=clock_ns()-started; ++s->submits;
+        }
+        pthread_mutex_unlock(&slot->mutex);
+        if(status!=CS_QUEUED) checked(status,"queue scan block");
+        return;
     }
     if((slot->control.bytes || slot->control.index_nreads) && !slot->control.ready) {
         unsigned groups=1;
@@ -363,15 +467,9 @@ static void submit(PlanStateCsd *s,unsigned worker)
             groups+=slot->control.index_reads[j].slot!=slot->control.index_reads[j-1].slot+1;
         if(groups<64) checked(csAllocBatchRequest(CS_BATCH_SERIAL,groups+1,&slot->resume),"allocate LOAD batch");
         slot->previous=0; load_pages(s,worker);
-        if(!assigned) {
-            uint64_t written=s->profiling?clock_ns():0;
-            checked(transfer(s->memory[1],worker*sizeof(struct qp_control)+offsetof(struct qp_control,ready),&slot->control.ready,sizeof(slot->control.ready),true),"resume LOAD");
-            if(s->profiling) { s->control_write_ns+=clock_ns()-written; ++s->control_writes; }
-        }
-    } else if(assigned) {
-        /* No LOAD at EOF, but each live worker must finish its own state. */
-        checked(csAllocBatchRequest(CS_BATCH_SERIAL,1,&slot->resume),"allocate scan EOF batch");
-        slot->previous=0;
+        uint64_t written=s->profiling?clock_ns():0;
+        checked(transfer(s->memory[1],worker*sizeof(struct qp_control)+offsetof(struct qp_control,ready),&slot->control.ready,sizeof(slot->control.ready),true),"resume LOAD");
+        if(s->profiling) { s->control_write_ns+=clock_ns()-written; ++s->control_writes; }
     }
     if(slot->resume) {
         CsBatchRequest *request=palloc0(sizeof(*request)+6*sizeof(CsComputeArg));
@@ -389,11 +487,14 @@ static void submit(PlanStateCsd *s,unsigned worker)
     }
     if(s->profiling) slot->queued_ns=clock_ns();
     atomic_store_explicit(&slot->completed,false,memory_order_relaxed);
-    CS_STATUS status=csQueueBatchRequest(slot->resume?slot->resume:slot->batch,slot,completed,NULL,&slot->pending,NULL);
+    pthread_mutex_lock(&slot->mutex);
+    CS_STATUS status=csQueueBatchRequest(slot->resume?slot->resume:slot->batch,slot,completed,NULL,&slot->inflight,NULL);
+    slot->pending=status==CS_QUEUED?slot->inflight:NULL;
     if(s->profiling) {
         uint64_t now=clock_ns();
         s->queue_ns+=now-slot->queued_ns; s->submit_ns+=now-started; ++s->submits;
     }
+    pthread_mutex_unlock(&slot->mutex);
     if(status!=CS_QUEUED) checked(status,"queue tree");
 }
 static void fetch(PlanStateCsd *s)
@@ -446,7 +547,7 @@ static void fetch(PlanStateCsd *s)
             s->parallel=slot->control.parallel;
             if(slot->control.epoch!=s->epoch) {
                 s->epoch=slot->control.epoch;
-                s->next_scan_offset=0;
+                atomic_store(&s->next_scan_offset,0);
                 for(unsigned i=1;i<=s->workers;++i) {
                     struct plan_slot *worker=&s->slots[i];
                     worker->ready=worker->done=false;
@@ -480,6 +581,13 @@ static void fetch(PlanStateCsd *s)
             bool idle=true;
             if(main->control.parallel==2)
                 for(unsigned w=1;w<=s->workers;++w) if(s->slots[w].pending) idle=false;
+            if(s->profiling && main->control.parallel==2) {
+                bool output=false;
+                for(unsigned w=1;w<=s->workers;++w)
+                    if(s->slots[w].ready && s->slots[w].control.output_rows) output=true;
+                if(!idle && output && !s->barrier_started) { s->barrier_started=clock_ns(); ++s->barriers; }
+                if(idle && s->barrier_started) { s->barrier_ns+=clock_ns()-s->barrier_started; s->barrier_started=0; }
+            }
             if(idle && (!s->parallel || ready || !main->control.parallel)) {
                 main->control.available=ready;
                 HOLD_INTERRUPTS(); submit(s,0); RESUME_INTERRUPTS(); progress=true;
@@ -616,11 +724,29 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
             ExplainPropertyFloat("CSD Host Queue (within Submit)","ms",s->queue_ns/1e6,3,es);
             ExplainPropertyFloat("CSD Host Control Write (within Submit)","ms",s->control_write_ns/1e6,3,es);
             ExplainPropertyFloat("CSD Host Idle Sleep","ms",s->idle_ns/1e6,3,es);
-            ExplainPropertyFloat("CSD Pending Requests Sum","ms",s->pending_ns/1e6,3,es);
             ExplainPropertyInteger("CSD Host Submissions",NULL,s->submits,es);
             ExplainPropertyInteger("CSD Host Polls",NULL,s->polls,es);
             ExplainPropertyInteger("CSD Host Completions",NULL,s->completions,es);
-            ExplainPropertyInteger("CSD Host Assigned LOADs",NULL,s->scheduled_loads,es);
+            uint64_t automatic=0,gap=0,maximum=0,pending=0,loads=0,host_gap=0,host_max=0,requeues=0;
+            for(unsigned w=1;w<=s->workers;++w) {
+                struct plan_slot *slot=&s->slots[w];
+                if(slot->mutex_ready) pthread_mutex_lock(&slot->mutex);
+                automatic+=slot->auto_submits; gap+=slot->auto_gap_ns; maximum=Max(maximum,slot->auto_gap_max_ns);
+                pending+=slot->auto_pending_ns; loads+=slot->scan_loads;
+                host_gap+=slot->host_gap_ns; host_max=Max(host_max,slot->host_gap_max_ns); requeues+=slot->host_requeues;
+                if(slot->mutex_ready) pthread_mutex_unlock(&slot->mutex);
+            }
+            ExplainPropertyFloat("CSD Pending Requests Sum","ms",(s->pending_ns+pending)/1e6,3,es);
+            ExplainPropertyInteger("CSD Host Assigned LOADs",NULL,loads,es);
+            ExplainPropertyInteger("CSD Callback Submissions",NULL,automatic,es);
+            ExplainPropertyFloat("CSD Callback Requeue Average","us",automatic?gap/1e3/automatic:0,3,es);
+            ExplainPropertyFloat("CSD Callback Requeue Maximum","us",maximum/1e3,3,es);
+            ExplainPropertyFloat("CSD Callback Completed Requests Sum","ms",pending/1e6,3,es);
+            ExplainPropertyInteger("CSD PG Scan Requeues",NULL,requeues,es);
+            ExplainPropertyFloat("CSD PG Scan Requeue Average","us",requeues?host_gap/1e3/requeues:0,3,es);
+            ExplainPropertyFloat("CSD PG Scan Requeue Maximum","us",host_max/1e3,3,es);
+            ExplainPropertyInteger("CSD Shared Sink Waits",NULL,s->barriers,es);
+            ExplainPropertyFloat("CSD Shared Sink Wait","ms",s->barrier_ns/1e6,3,es);
             ExplainPropertyInteger("CSD Host Completion Reads",NULL,s->completion_reads,es);
             ExplainPropertyInteger("CSD Host Control Writes",NULL,s->control_writes,es);
             ExplainPropertyFloat("CSD Completion Notice Sum","ms",s->notice_ns/1e6,3,es);

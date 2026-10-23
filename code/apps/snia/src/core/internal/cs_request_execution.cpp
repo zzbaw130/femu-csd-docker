@@ -37,6 +37,9 @@ void runRequest(const std::shared_ptr<Request> &request)
     {
         std::lock_guard<std::mutex> lock(handlesMutex);
         handles.erase(request->id);
+        // Execution and its resource snapshots have ended. A completion
+        // callback may submit the replacement even at the 64-request limit.
+        --activeRequests;
         if (request->event) {
             request->completion.front() = {request->context, value, status};
             request->event->completions.splice(request->event->completions.end(), request->completion);
@@ -46,8 +49,6 @@ void runRequest(const std::shared_ptr<Request> &request)
     }
     if (request->callback)
         apiCall([&] { request->callback(request->context, status, value); return CS_SUCCESS; });
-    std::lock_guard<std::mutex> lock(handlesMutex);
-    --activeRequests;
 }
 } // namespace
 

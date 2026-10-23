@@ -18,7 +18,7 @@
 
 Heap 的 I/O 块与列向量容量分别计算：一个已加载块可包含多个至多 2048 行的向量，按整页填入并逐批交给下游，消费完后才释放该输入块。无需为整块数据的最坏行数预留列向量；`CSD AFDM` 显示本次申请的总字节数，`CSD Scan Vector Capacity` 显示 Heap 向量的行数上限，索引批次仍保持原容量。字符串字典桶按现有 64 KiB 传输大小初始化，减少准备阶段的小命令。
 
-异步 batch 使用 SNIA 标准 callback 返回状态和 CompValue。回调只向槽发布结果和可选时间戳，PG 主线程观察完成后继续调度；回调不使用 PG API。取消、重扫和释放查询状态前等待在途回调结束，避免后台请求访问已释放的槽。
+异步 batch 使用 SNIA 标准 callback 返回状态和 CompValue。对提前安排的 Heap 输入，若当前块已耗尽、没有未消费输出且 worker 尚未结束，回调直接领取下一块，重新配置该槽的 `LOAD→计算` batch 并异步续交。输入缓冲仍每槽一份，不增加预读或双缓冲。有输出、需要共享表维护、索引页请求及阶段结束时仍返回 PG 调度。回调仅使用普通内存分配、已有 extent 映射及 SNIA，不调用 PG API；PG 取消时先禁止续交，再等待所有在途回调结束后释放状态。
 
 开启 `pg_sina_csd.profile=on` 后，通用执行树的 EXPLAIN ANALYZE 还输出 `CSD Pipeline <节点号>`：每个并行输入流水线的轮次、墙钟、协调端 CPU、worker 累计 CPU、平均计算 CU 数和 CPU 利用率。墙钟包含该流水线输入及消费期间的内部 LOAD/调度等待；平均 CU 数为两端 CPU 之和除以墙钟，利用率再除以设备 CU 数，不能把峰值 4 当作全程满载。Hash 构建/Hash 聚合协调端 CPU 单独记录，扣除已计时的子扫描、排序和嵌套阻塞计算，仍包含协调端接收输入行的处理成本。计时在 CSF、阻塞调用及流水线边界进行，普通输入行不逐条读时钟；关闭 profile 时不采集，完成后只额外读取一次阶段记录。`sink` 是该流水线 worker 写入共享 Hash/聚合表的累计 CPU，已经包含在 `workers` 中；`sink_rows` 是直接在 worker 消费、无需交回协调端逐行处理的行数。
 
@@ -116,10 +116,12 @@ sh /home/femu/tests/tpch-test.sh 7 9 13
 
 通用树 EXPLAIN 显示来自 PG 的连接树、实际 worker 数、并行流水线次数、顺序扫描行数、索引 Heap Tuple 数、内部读取、工作内存峰值及 spill 字节。开启 profile 后增加整个 CSF 的累计 CPU/墙钟/调用次数、实际同时执行的 CU 峰值，以及扫描解码、向量过滤和 Sort sink/source 的 CPU 时间。CPU 是各 CU 的累计值，可能大于查询墙钟；扫描/过滤/排序已包含在 CSF 总 CPU 中，不能再次相加。`CSD LOAD Preparation` 仅为 PG 构造请求的时间，异步 LOAD 的等待不计入该字段。单表快路径保留已有的逐算子计时。
 
-通用树的 profile 同时记录 PG 调度线程的墙钟：`CSD Host Completion Copy` 是每次请求完成后同步读取 AFDM 控制记录及结果头的时间，`CSD Host Submit` 是准备和提交后续请求的时间。其中 `Queue`、`Control Write` 及已有的 `LOAD Preparation` 均包含在 Submit 中，不能再次相加。`Poll` 是检查事件的时间，`Idle Sleep` 是没有可推进任务时的休眠时间。`Pending Requests Sum` 从请求提交计到 PG 观察完成，跨并发请求求和，包含设备执行、I/O 和主机调度等待，不是查询延迟或纯 I/O 时间；Submissions/Completions 用于核对完成次数。关闭 profile 时不采集这些计时。
+通用树的 profile 同时记录 PG 调度线程的墙钟：`CSD Host Completion Copy` 是请求完成后同步读取 AFDM 控制记录及结果头的时间，`CSD Host Submit` 是 PG 主线程准备和提交请求的时间，不包含 callback 续交。其中 `Queue`、`Control Write` 及已有的 `LOAD Preparation` 均包含在 Submit 中，不能再次相加。`Poll` 是检查完成标志的时间，`Idle Sleep` 是没有可推进任务时的休眠时间。`Pending Requests Sum` 累计各请求提交到 callback 的时间，最终返回 PG 的请求还包含完成观察等待；跨并发请求求和，不是查询延迟或纯 I/O 时间。Host Submissions/Completions 只计 PG 提交和观察的次数，Callback Submissions 另计自动续交次数。关闭 profile 时不采集这些计时。
 
 `CSD Host Assigned LOADs` 记录提前分配的顺序输入块数；开启 profile 时，`Completion Reads` 和 `Control Writes` 分别记录调度期间实际进行的控制记录读写次数，不包含初始化、结束清理和最终字符串结果复制。
 
 `CSD Setup Wall` 与 `Cleanup Wall` 分别记录设备执行前的准备和结束清理，已包含在 Tree Wall 中；准备不包含 SQL 规划、映射读取和首次资源发现。`Completion Notice` 记录 callback 发布完成到 PG 观察到的间隔，Average/Maximum 单位为微秒，Sum 是跨请求累计值，不能当成查询关键路径或设备空闲时间。
+
+`CSD Callback Requeue Average/Maximum` 是 callback 收到完成到提交下一块的间隔，包含请求重配；`CSD PG Scan Requeue Average/Maximum` 是返回 PG 的扫描请求完成到 PG 再提交下一块的间隔，可能包含等待下游消费输出或阶段协调，不能全算调度开销。`CSD Callback Completed Requests Sum` 是自动续交之前各请求从提交到完成的累计时间，已包含在 Pending Requests Sum 中。`CSD Shared Sink Waits/Wait` 仅记录共享 Sink 有未消费输出时等待其他 worker 排空的次数和时间，不包含最终 EOF 等待或协调任务自身执行。
 
 设备入口见 [设备算子说明](../../csd-programs/pg_sina_csd/README.md)。新验收结果见 [性能记录](doc/performance.md)，旧记录仅为历史，不作为当前验收依据。

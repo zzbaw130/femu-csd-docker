@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <dlfcn.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -77,6 +78,52 @@ static void callback(void *ctx, CS_STATUS status, u64 value)
     CHECK(status == CS_SUCCESS);
     CHECK(value == 4);
     atomic_store(&callback_done, 1);
+}
+static atomic_uint requeue_entered;
+static atomic_bool requeue_release;
+struct callback_batch {
+    CS_BATCH_HANDLE batch;
+    CsBatchRequest entry;
+    CS_BATCH_INDEX index;
+    atomic_bool done;
+    unsigned resumed;
+    int result;
+};
+static void requeue_batch(void *context, CS_STATUS status, u64 value)
+{
+    struct callback_batch *b = context;
+    CHECK(status == CS_SUCCESS && value == sizeof(b->result) && b->result == 9);
+    if (!b->resumed) {
+        b->resumed = 1;
+        atomic_fetch_add(&requeue_entered, 1);
+        while (!atomic_load(&requeue_release)) usleep(100);
+        OK(csConfigureBatchEntry(b->batch, CS_BATCH_RECONFIG, &b->entry, b->index, 0, NULL));
+        CHECK(csQueueBatchRequest(b->batch, b, requeue_batch, NULL, NULL, NULL) == CS_QUEUED);
+        return;
+    }
+    atomic_store(&b->done, true);
+}
+static void test_batch_callback_requeue(CS_MEM_HANDLE memory)
+{
+    /* All 64 callbacks are still running when they submit replacements. */
+    struct callback_batch slots[64] = {0};
+    for (unsigned i = 0; i < 64; ++i) {
+        atomic_init(&slots[i].done, false);
+        OK(csAllocBatchRequest(CS_BATCH_SERIAL, 1, &slots[i].batch));
+        slots[i].entry = (CsBatchRequest){.ReqType = CS_COPY_AFDM,
+            .u.CopyMem = {.Type = CS_COPY_FROM_DEVICE, .DevMem = {memory, 0},
+                .u.HostVAddress = &slots[i].result, .Bytes = sizeof(slots[i].result)}};
+        OK(csConfigureBatchEntry(slots[i].batch, CS_BATCH_ADD, &slots[i].entry, 0, 0, &slots[i].index));
+        CHECK(csQueueBatchRequest(slots[i].batch, &slots[i], requeue_batch, NULL, NULL, NULL) == CS_QUEUED);
+    }
+    for (unsigned i = 0; i < 5000 && atomic_load(&requeue_entered) != 64; ++i) usleep(1000);
+    CHECK(atomic_load(&requeue_entered) == 64);
+    atomic_store(&requeue_release, true);
+    for (unsigned i = 0; i < 64; ++i) {
+        for (unsigned j = 0; j < 5000 && !atomic_load(&slots[i].done); ++j) usleep(1000);
+        CHECK(atomic_load(&slots[i].done));
+        OK(csFreeBatchRequest(slots[i].batch));
+    }
 }
 int main(void)
 {
@@ -169,6 +216,7 @@ int main(void)
     CHECK(csQueueCopyMemRequest(&write, (void *)123, callback, NULL, NULL, NULL) == CS_QUEUED);
     for (int i = 0; i < 3000 && !atomic_load(&callback_done); ++i) usleep(1000);
     CHECK(atomic_load(&callback_done));
+    test_batch_callback_requeue(a);
     CS_EVT_HANDLE event;
     OK(csCreateEvent(&event));
     CHECK(csQueueCopyMemRequest(&write, NULL, NULL, event, NULL, NULL) == CS_QUEUED);
