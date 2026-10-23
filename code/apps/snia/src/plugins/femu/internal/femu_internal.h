@@ -22,6 +22,7 @@ struct cs_device {
     /* Optional diagnostic counters; internal to this plugin, not SNIA API. */
     bool profile;
     struct { uint64_t calls, wall_ns; } io_timing[5];
+    uint64_t load_to_compute_calls, load_to_compute_ns;
 };
 struct cs_memory { struct cs_device *dev; uint32_t id; uint64_t bytes; };
 struct cs_task { const CsBatchRequest *req; struct cs_device *dev; unsigned scalar_slots; uint64_t reentry; };

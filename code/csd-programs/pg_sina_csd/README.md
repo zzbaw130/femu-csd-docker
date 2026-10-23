@@ -22,6 +22,8 @@
 
 索引、临时分区及串行 Scan 仍在需要数据页时写控制记录并正常返回，Guest 把地址转换为 `csQueueStorageRequest(NVM_TO_AFDM)` 再继续调用。扫描块由 Guest 根据 FDM 容量在 4/2/1 MiB 中选择，索引按需读取 8 KiB 页。原始数据不经过 Guest PG 缓冲。设备执行中发现 spill 需要时直接返回 `csNeedStore/Load/Free` 完成值，由已有 SNIA batch 调度器处理并重入，PG 不接收或解释中间行。
 
+Heap 每次 LOAD 的块可包含多个列批次。通用树将列向量限制为至多 2048 行，扫描前用页内 line pointer 数保守选择能放入向量的完整页，再复用原 Scan/Filter ABI。页指针包含无效项时仍保守计数，单页始终容纳得下；实际页与 Tuple 校验继续由 Scan 完成。已加载字节数和解码进度保存在各扫描节点的 workmem 状态中，控制记录可同时供 Index Join 请求缺页；筛选后需要延迟解码的列始终引用当前这批页。该块的所有向量和输出消费完成后才接受下一块，没有新增读取或跨查询缓存。
+
 Guest 从 PG 选定的树中标记可并行的扫描/投影/Hash 或 Index Probe 段，包含初始化和 Hash Build 输入。设备先完成共享 Hash 表，再建立各 CU 独立的游标；Heap 输入由 PG 动态分配，索引及临时分区任务继续从设备原子游标领取。阻塞节点消费投影后的行批次，不重复构建 Hash 表。Guest 通过已有事件和批次请求推进每个完成的槽，不需要设备调度 runtime 或代理。
 
 不同流水线依次复用 AFDM；各任务的动态状态通过子 context 计入同一个查询预算。整树节点仍按行拉取组合，中间值保持精确 `qs_cell` 的 int128、精度和 NULL；Scan/Filter 则复用已有列向量和 SIMD 路径。Q1/Q6 继续使用下文的单表快路径。

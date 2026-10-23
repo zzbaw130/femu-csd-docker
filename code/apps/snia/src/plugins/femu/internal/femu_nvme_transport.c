@@ -11,21 +11,25 @@
 #include <time.h>
 static const unsigned profile_opcodes[] = {0xe1, 0xd0, 0xd1, 9, 0xf2};
 static const char *profile_names[] = {"E1", "D0", "D1", "TRIM", "F2"};
+/* A serial LOAD->CSF batch runs both requests on the same SNIA thread. */
+static _Thread_local struct cs_device *load_device;
+static _Thread_local uint64_t load_returned;
 static uint64_t profile_clock(void)
 {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (uint64_t)now.tv_sec * 1000000000 + now.tv_nsec;
 }
-static void profile_record(struct cs_device *d, bool admin, unsigned opcode, uint64_t start)
+static uint64_t profile_record(struct cs_device *d, bool admin, unsigned opcode, uint64_t start)
 {
-    if (!d->profile || admin) return;
-    uint64_t elapsed = profile_clock() - start;
+    if (!d->profile || admin) return 0;
+    uint64_t end = profile_clock(), elapsed = end - start;
     for (unsigned i = 0; i < 5; ++i) if (profile_opcodes[i] == opcode) {
         __atomic_fetch_add(&d->io_timing[i].calls, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&d->io_timing[i].wall_ns, elapsed, __ATOMIC_RELAXED);
         break;
     }
+    return end;
 }
 int cs_transport_open(struct cs_device *d, const char *name)
 {
@@ -80,9 +84,13 @@ int cs_transport_open(struct cs_device *d, const char *name)
 }
 void cs_transport_close(struct cs_device *d)
 {
+    if (load_device == d) { load_device = NULL; load_returned = 0; }
     if (d->profile) for (unsigned i = 0; i < 5; ++i)
         fprintf(stderr, "PROFILE CSD %s calls=%llu wall_s=%.9f\n", profile_names[i],
                 (unsigned long long)d->io_timing[i].calls, d->io_timing[i].wall_ns / 1e9);
+    if (d->profile)
+        fprintf(stderr, "PROFILE CSD LOAD_to_E1 calls=%llu wall_s=%.9f\n",
+                (unsigned long long)d->load_to_compute_calls, d->load_to_compute_ns / 1e9);
     if (d->fd >= 0)
         close(d->fd);
     if (d->admin >= 0)
@@ -115,7 +123,10 @@ CS_STATUS cs_io(struct cs_device *d, bool admin, struct nvme_passthru_cmd *cmd)
     int result = ioctl(admin ? d->admin : d->fd,
                        admin ? NVME_IOCTL_ADMIN_CMD : NVME_IOCTL_IO_CMD, cmd);
     int saved_errno = errno;
-    profile_record(d, admin, cmd->opcode, start);
+    uint64_t end = profile_record(d, admin, cmd->opcode, start);
+    if (end && cmd->opcode == 0xd0 && !result) {
+        load_device = d; load_returned = end;
+    }
     errno = saved_errno;
     return io_status(result);
 }
@@ -123,6 +134,11 @@ CS_STATUS cs_io64(struct cs_device *d, bool admin, struct nvme_passthru_cmd64 *c
 {
     cmd->timeout_ms = 600000;
     uint64_t start = d->profile ? profile_clock() : 0;
+    if (start && !admin && cmd->opcode == 0xe1 && load_device == d && load_returned) {
+        __atomic_fetch_add(&d->load_to_compute_calls, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&d->load_to_compute_ns, start-load_returned, __ATOMIC_RELAXED);
+        load_device = NULL; load_returned = 0;
+    }
     int result = ioctl(admin ? d->admin : d->fd,
                        admin ? NVME_IOCTL_ADMIN64_CMD : NVME_IOCTL_IO64_CMD, cmd);
     int saved_errno = errno;

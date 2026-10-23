@@ -106,7 +106,11 @@ static void *probe_worker(void *arg)
             } else memcpy(t->arena+offset,((c->node==3 || c->node==6)?t->heap:t->raw)+c->offset,c->bytes);
             c->ready=1;
         }
-        int64_t status=t->run(&t->args); assert(status>=0);
+        int64_t status=t->run(&t->args);
+        if(status<0) fprintf(stderr,"worker %u status=%lld node=%u kind=%d ready=%u bytes=%u offset=%llu\n",
+            t->worker,(long long)status,c->error_node,t->plan->nodes[c->error_node].kind,
+            c->ready,c->bytes,(unsigned long long)c->offset);
+        assert(status>=0);
         if((uint64_t)status>>60) {
             uint64_t op=(uint64_t)status>>60,id=(uint64_t)status&CS_IO_VALUE_MASK;
             assert(op==2 && id && id<=t->ntokens && t->tokens[id-1]);
@@ -233,7 +237,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     unsigned char *index=hash==2?index_page(right_rows):NULL;
     unsigned char *arena=calloc(1,bytes),*io=calloc(plan->workers+1,QS_SORT_IO_BYTES); assert(arena && io);
     struct qs_dict *dict=(void *)arena; *dict=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
-    for(unsigned i=2;i<4;++i) *(struct qs_chunk *)(arena+plan->nodes[i].vector_offset)=(struct qs_chunk){.capacity=plan->scan_bytes/24,.ncols=2};
+    for(unsigned i=2;i<4;++i) *(struct qs_chunk *)(arena+plan->nodes[i].vector_offset)=(struct qs_chunk){.capacity=qp_scan_capacity(plan,&plan->nodes[i]),.ncols=2};
     struct qp_control *controls=calloc(plan->workers+1,sizeof(*controls)); assert(controls);
 #define control controls[0]
     struct qs_result *out=calloc(plan->workers+1,sizeof(*out)); assert(out);
@@ -548,7 +552,7 @@ static void multiple_groups(function run,unsigned memory,unsigned kind,int integ
         io=realloc(io,(workers+1)*QS_SORT_IO_BYTES); assert(io);
         leaf->parallel=1;
     }
-    *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=scan_bytes/24,.ncols=2};
+    *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=qp_scan_capacity(p,leaf),.ncols=2};
     struct qp_control *controls=calloc(workers+1,sizeof(*controls));
     struct qs_result *out=calloc(workers+1,sizeof(*out)); assert(controls && out);
 #define control controls[0]

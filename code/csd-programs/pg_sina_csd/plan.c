@@ -89,7 +89,7 @@ struct operator_state {
     struct accumulator accum[QS_AGGS];
     struct spool group;
     uint64_t position, skipped, emitted;
-    unsigned scan_position;
+    unsigned scan_position, scan_input, scan_bytes;
     struct qs_plan *scan_filter;
     int scan_filter_checked;
     int phase, have_left, have_right, input_done, group_ready, matched, finished;
@@ -962,10 +962,29 @@ static int64_t scan_next(struct execution *s,unsigned id,struct qs_cell *row)
             continue;
         }
         if(s->control->ready && s->control->node==id && !s->control->index_nreads) {
-            struct qs_task task={.input_bytes=s->control->bytes};
+            /* The retained heap input must not own the shared page-request
+             * record: an Index Join may use that record between vectors. */
+            o->scan_bytes=s->control->bytes;
+            s->control->ready=s->control->bytes=0;
+        }
+        if(o->scan_bytes) {
+            /* Keep the I/O block and fill vectors with complete heap pages.
+             * Line-pointer counts conservatively include unused entries;
+             * one page always fits the minimum capacity (QS_PAGE/24). */
+            if(chunk->capacity<QS_PAGE/24 || o->scan_input>=o->scan_bytes) return -1;
+            unsigned bytes=0,rows=0,remaining=o->scan_bytes-o->scan_input;
+            if(remaining%QS_PAGE) return -1;
+            const unsigned char *input=s->arena+input_offset(s,n)+o->scan_input;
+            while(bytes<remaining) {
+                uint16_t lower; memcpy(&lower,input+bytes+12,sizeof(lower));
+                unsigned items=lower>=24?(lower-24)/4:0;
+                if(bytes && rows+items>chunk->capacity) break;
+                bytes+=QS_PAGE; rows+=items;
+            }
+            struct qs_task task={.input_bytes=bytes};
             int64_t status=scan_filter_init(s,p,o); if(status) return status;
-            void *mr[]={s->arena+input_offset(s,n),o->scan_filter?o->scan_filter:(void *)p,chunk,&task,s->dictionary};
-            long long len[]={qp_scan_buffer_bytes(s->plan,n),sizeof(*p),qs_chunk_bytes(chunk->capacity,chunk->ncols),sizeof(task),0};
+            void *mr[]={s->arena+input_offset(s,n)+o->scan_input,o->scan_filter?o->scan_filter:(void *)p,chunk,&task,s->dictionary};
+            long long len[]={bytes,sizeof(*p),qs_chunk_bytes(chunk->capacity,chunk->ncols),sizeof(task),0};
             struct femu_csd_args a={.numr=5,.mr_addr=mr,.mr_len=len};
             status=timed_call(s,pg_sina_scan_impl,&a,QS_SCAN); if(status) return status;
             s->metrics.scanned+=chunk->rows; s->metrics.input_bytes+=task.input_bytes; ++s->metrics.chunks;
@@ -982,7 +1001,9 @@ static int64_t scan_next(struct execution *s,unsigned id,struct qs_cell *row)
                 }
                 if(status) return status;
             }
-            o->scan_position=0; o->position+=task.input_bytes; s->control->ready=0; s->control->bytes=0; continue;
+            o->scan_position=0; o->position+=task.input_bytes; o->scan_input+=task.input_bytes;
+            if(o->scan_input==o->scan_bytes) o->scan_input=o->scan_bytes=0;
+            continue;
         }
         if(s->host_scan && id==(unsigned)qp_probe_scan(s->plan,s->root)) {
             s->scan_drained=true;
@@ -1665,7 +1686,7 @@ restart:
             }
             *e->control=(struct qp_control){.state=(uintptr_t)e}; s->workers[w]=e;
             *(struct qs_chunk *)(s->arena+vector_offset(e,leaf))=
-                (struct qs_chunk){.capacity=leaf->ordered_index?256:qp_scan_buffer_bytes(p,leaf)/24,.ncols=leaf->expr.ncols};
+                (struct qs_chunk){.capacity=leaf->ordered_index?256:qp_scan_capacity(p,leaf),.ncols=leaf->expr.ncols};
         }
         s->parallel_node=root; s->parallel_done=0;
         memset(s->parallel_position,0,sizeof(s->parallel_position)); atomic_store(&s->next_offset,0);
@@ -1795,7 +1816,7 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
         uint64_t offset=page*QS_PAGE;
         if(offset>n->bytes || (s->host_scan && !s->scan_drained)) return -1;
         s->host_scan=true; s->scan_drained=false;
-        o->position=offset; o->scan_position=0;
+        o->position=offset; o->scan_position=o->scan_input=o->scan_bytes=0;
         struct qs_chunk *chunk=(void *)(s->arena+vector_offset(s,n)); chunk->rows=chunk->selected=0;
         control->node=id; control->offset=offset;
         control->bytes=n->bytes-offset<plan->scan_bytes?n->bytes-offset:plan->scan_bytes;

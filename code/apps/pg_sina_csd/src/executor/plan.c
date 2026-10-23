@@ -11,13 +11,18 @@
 #include <sys/file.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdatomic.h>
 
 struct plan_slot {
     struct qp_control control;
     CS_BATCH_HANDLE batch, resume;
     CS_BATCH_INDEX previous;
-    CS_EVT_HANDLE event;
     CS_REQ_HANDLE pending;
+    atomic_bool completed;
+    CS_STATUS completion_status;
+    u64 completion_value;
+    bool profiling;
+    uint64_t callback_ns;
     bool ready, done;
     unsigned scan_node;
     bool need_input;
@@ -36,6 +41,9 @@ typedef struct {
     uint64_t poll_ns, completion_copy_ns, submit_ns, queue_ns, control_write_ns, idle_ns, pending_ns;
     uint64_t submits, polls, completions;
     uint64_t scheduled_loads, completion_reads, control_writes;
+    uint64_t notice_ns, notice_max_ns;
+    uint64_t setup_ns, cleanup_ns;
+    uint64_t fdm_bytes;
     struct qs_request files[QP_NODES];
     struct qs_extent *extents[QP_NODES];
     struct qs_request indexes[QP_NODES];
@@ -54,6 +62,15 @@ typedef struct {
 static const CustomExecMethods methods;
 static uint64_t clock_ns(void)
 { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000ULL+t.tv_nsec; }
+/* SNIA calls this on its request thread. Publish only plain result fields;
+ * PostgreSQL APIs and memory contexts are used exclusively by the PG thread. */
+static void completed(void *context,CS_STATUS status,u64 value)
+{
+    struct plan_slot *slot=context;
+    slot->callback_ns=slot->profiling?clock_ns():0;
+    slot->completion_status=status; slot->completion_value=value;
+    atomic_store_explicit(&slot->completed,true,memory_order_release);
+}
 static CS_STATUS transfer(CS_MEM_HANDLE memory,size_t offset,void *data,size_t bytes,bool write)
 {
     for(size_t done=0;done<bytes;) {
@@ -76,10 +93,11 @@ static Node *create(CustomScan *scan)
 static void close_state(void *arg)
 {
     PlanStateCsd *s=arg;
+    uint64_t started=s->profiling?clock_ns():0;
     HOLD_INTERRUPTS();
     for(unsigned w=0;w<=s->workers;++w) if(s->slots[w].pending) {
-        csAbortRequest(s->slots[w].pending);
-        while(csPollEvent(s->slots[w].event,NULL,NULL)==CS_NOT_DONE) pg_usleep(50L);
+        if(!atomic_load_explicit(&s->slots[w].completed,memory_order_acquire)) csAbortRequest(s->slots[w].pending);
+        while(!atomic_load_explicit(&s->slots[w].completed,memory_order_acquire)) pg_usleep(50L);
         s->slots[w].pending=NULL;
     }
     if(s->device && s->slots[0].batch && s->memory[1] && s->active) {
@@ -90,7 +108,6 @@ static void close_state(void *arg)
     for(unsigned w=0;w<=s->workers;++w) {
         if(s->slots[w].batch) { csFreeBatchRequest(s->slots[w].batch); s->slots[w].batch=NULL; }
         if(s->slots[w].resume) { csFreeBatchRequest(s->slots[w].resume); s->slots[w].resume=NULL; }
-        if(s->slots[w].event) { csDeleteEvent(s->slots[w].event); s->slots[w].event=NULL; }
     }
     CsMemFlags flags={.FDMId=1};
     for(unsigned i=0;i<5;++i) if(s->memory[i]) { csFreeMem(s->memory[i],&flags); s->memory[i]=NULL; }
@@ -107,6 +124,7 @@ static void close_state(void *arg)
     }
     if(s->device) { csCloseCSx(s->device); s->device=NULL; }
     if(s->lock_fd>=0) { close(s->lock_fd); s->lock_fd=-1; }
+    if(s->profiling) s->cleanup_ns+=clock_ns()-started;
     RESUME_INTERRUPTS();
 }
 static void begin(CustomScanState *node,EState *estate,int flags)
@@ -128,7 +146,7 @@ static size_t layout_buffers(PlanStateCsd *s,unsigned entries,unsigned data,cons
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_SCAN && !indexed[i]) {
         struct qp_node *n=&s->plan->nodes[i]; unsigned bytes=n->ordered_index?QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE:qp_scan_buffer_bytes(s->plan,n);
         n->input_offset=arena; arena+=bytes; n->vector_offset=arena;
-        arena+=(qs_chunk_bytes(n->ordered_index?256:bytes/24,n->expr.ncols)+4095)&~(size_t)4095;
+        arena+=(qs_chunk_bytes(n->ordered_index?256:qp_scan_capacity(s->plan,n),n->expr.ncols)+4095)&~(size_t)4095;
     }
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_INDEX_JOIN) {
         struct qp_node *n=&s->plan->nodes[i]; n->input_offset=arena;
@@ -143,7 +161,7 @@ static size_t layout_buffers(PlanStateCsd *s,unsigned entries,unsigned data,cons
             if(n->kind==QP_SCAN) {
                 unsigned bytes=n->ordered_index?QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE:qp_scan_buffer_bytes(s->plan,n);
                 n->parallel_input=end; end+=bytes; n->parallel_vector=end;
-                end+=(qs_chunk_bytes(n->ordered_index?256:bytes/24,n->expr.ncols)+4095)&~(size_t)4095; break;
+                end+=(qs_chunk_bytes(n->ordered_index?256:qp_scan_capacity(s->plan,n),n->expr.ncols)+4095)&~(size_t)4095; break;
             }
             if(n->kind==QP_INDEX_JOIN) {
                 n->parallel_input=end; end+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE; n->parallel_vector=end;
@@ -180,6 +198,8 @@ static void start(PlanStateCsd *s)
     s->poll_ns=s->completion_copy_ns=s->submit_ns=s->queue_ns=s->control_write_ns=0;
     s->idle_ns=s->pending_ns=s->submits=s->polls=s->completions=0;
     s->scheduled_loads=s->completion_reads=s->control_writes=0;
+    s->notice_ns=s->notice_max_ns=0;
+    s->setup_ns=s->cleanup_ns=0;
     memset(s->plan->pipelines,0,sizeof(s->plan->pipelines));
     s->plan->nodes[s->plan->root].expr.work_mem_bytes=pg_sina_query_memory();
     s->lock_fd=open(device,O_RDONLY|O_CLOEXEC);
@@ -214,6 +234,8 @@ static void start(PlanStateCsd *s)
     }
     CsMemFlags flags={.FDMId=1};
     size_t sizes[]={sizeof(*s->plan),(s->workers+1)*sizeof(struct qp_control),(s->workers+1)*sizeof(*s->result),arena,QS_SORT_IO_BYTES};
+    s->fdm_bytes=s->workers*QS_SORT_IO_BYTES;
+    for(unsigned i=0;i<5;++i) s->fdm_bytes+=sizes[i];
     for(unsigned i=0;i<5;++i) checked(csAllocMem(s->device,sizes[i],&flags,&s->memory[i],NULL),"allocate AFDM");
     for(unsigned w=0;w<s->workers;++w)
         checked(csAllocMem(s->device,QS_SORT_IO_BYTES,&flags,&s->worker_io[w],NULL),"allocate worker spill AFDM");
@@ -221,13 +243,13 @@ static void start(PlanStateCsd *s)
     checked(transfer(s->memory[1],0,&s->slots[0].control,sizeof(s->slots[0].control),true),"initialize control");
     struct qs_dict dictionary={.entries=entries,.capacity=entries,.data=data};
     checked(transfer(s->memory[3],0,&dictionary,sizeof(dictionary),true),"initialize strings");
-    char zeros[4096]={0};
+    char zeros[QS_SORT_IO_BYTES]={0};
     size_t offset=sizeof(dictionary)+(size_t)entries*sizeof(struct qs_dict_entry);
     for(size_t i=0;i<(size_t)entries*4;i+=sizeof(zeros))
         checked(transfer(s->memory[3],offset+i,zeros,Min(sizeof(zeros),(size_t)entries*4-i),true),"clear string buckets");
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_SCAN && !indexed[i]) {
         struct qp_node *n=&s->plan->nodes[i];
-        struct qs_chunk header={.capacity=n->ordered_index?256:qp_scan_buffer_bytes(s->plan,n)/24,.ncols=n->expr.ncols};
+        struct qs_chunk header={.capacity=n->ordered_index?256:qp_scan_capacity(s->plan,n),.ncols=n->expr.ncols};
         checked(transfer(s->memory[3],n->vector_offset,&header,sizeof(header),true),"initialize scan");
     }
     for(unsigned w=0;w<s->workers;++w)
@@ -251,9 +273,10 @@ static void start(PlanStateCsd *s)
         csHelperSetComputeArg(&request->u.Compute.Args[5],CS_64BIT_VALUE_TYPE,(u64)(s->profiling|(w<<1)));
         checked(csAllocBatchRequest(CS_BATCH_SERIAL,1,&s->slots[w].batch),"allocate batch");
         CS_BATCH_INDEX index; checked(csConfigureBatchEntry(s->slots[w].batch,CS_BATCH_ADD,request,0,0,&index),"configure batch");
-        checked(csCreateEvent(&s->slots[w].event),"create event");
+        atomic_init(&s->slots[w].completed,false); s->slots[w].profiling=s->profiling;
     }
     pfree(request); s->started=true;
+    if(s->profiling) s->setup_ns=clock_ns()-s->start_ns;
 }
 static void append_ranges(CsBlockIo *io,const struct qs_request *file,const struct qs_extent *extents,uint64_t at,uint64_t end)
 {
@@ -365,7 +388,8 @@ static void submit(PlanStateCsd *s,unsigned worker)
         if(s->profiling) { s->control_write_ns+=clock_ns()-written; ++s->control_writes; }
     }
     if(s->profiling) slot->queued_ns=clock_ns();
-    CS_STATUS status=csQueueBatchRequest(slot->resume?slot->resume:slot->batch,NULL,NULL,slot->event,&slot->pending,NULL);
+    atomic_store_explicit(&slot->completed,false,memory_order_relaxed);
+    CS_STATUS status=csQueueBatchRequest(slot->resume?slot->resume:slot->batch,slot,completed,NULL,&slot->pending,NULL);
     if(s->profiling) {
         uint64_t now=clock_ns();
         s->queue_ns+=now-slot->queued_ns; s->submit_ns+=now-started; ++s->submits;
@@ -382,12 +406,18 @@ static void fetch(PlanStateCsd *s)
             struct plan_slot *slot=&s->slots[w];
             if(!slot->pending) continue;
             uint64_t polled=s->profiling?clock_ns():0;
-            u64 value=0;
-            HOLD_INTERRUPTS(); CS_STATUS status=csPollEvent(slot->event,NULL,&value);
-            uint64_t completed=s->profiling?clock_ns():0;
-            if(s->profiling) { s->poll_ns+=completed-polled; ++s->polls; }
+            HOLD_INTERRUPTS();
+            bool done=atomic_load_explicit(&slot->completed,memory_order_acquire);
+            CS_STATUS status=done?slot->completion_status:CS_NOT_DONE;
+            u64 value=done?slot->completion_value:0;
+            uint64_t observed=s->profiling?clock_ns():0;
+            if(s->profiling) { s->poll_ns+=observed-polled; ++s->polls; }
             if(status==CS_NOT_DONE) { RESUME_INTERRUPTS(); continue; }
-            if(s->profiling) { s->pending_ns+=completed-slot->queued_ns; ++s->completions; }
+            if(s->profiling) {
+                uint64_t notice=observed-slot->callback_ns;
+                s->notice_ns+=notice; s->notice_max_ns=Max(s->notice_max_ns,notice);
+                s->pending_ns+=observed-slot->queued_ns; ++s->completions;
+            }
             slot->pending=NULL;
             if(w && slot->scan_node && status==CS_SUCCESS) {
                 slot->control.output_rows=(value&QP_OUTPUT_READY)!=0;
@@ -404,7 +434,7 @@ static void fetch(PlanStateCsd *s)
                 if(status==CS_SUCCESS && (slot->control.output_rows || slot->control.finished))
                     status=transfer(s->memory[2],0,&header,offsetof(struct qs_result,data),false);
             }
-            if(s->profiling) s->completion_copy_ns+=clock_ns()-completed;
+            if(s->profiling) s->completion_copy_ns+=clock_ns()-observed;
             RESUME_INTERRUPTS(); CHECK_FOR_INTERRUPTS();
             if(status!=CS_SUCCESS && slot->control.error)
                 ereport(ERROR,(errmsg("CSD PG Plan node %u failed: device=%d, status=%d",slot->control.error_node,slot->control.error,status)));
@@ -550,12 +580,16 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
         ExplainPropertyInteger("CSD Workers",NULL,s->result->metrics.workers,es);
         ExplainPropertyInteger("CSD Parallel Pipelines",NULL,s->slots[0].control.epoch,es);
         ExplainPropertyInteger("CSD Scan Block","bytes",s->plan->scan_bytes,es);
+        ExplainPropertyInteger("CSD Scan Vector Capacity","rows",QP_VECTOR_ROWS,es);
+        ExplainPropertyInteger("CSD AFDM","bytes",s->fdm_bytes,es);
         ExplainPropertyInteger("CSD Spill Read","bytes",s->result->metrics.spill_read_bytes,es);
         ExplainPropertyInteger("CSD Spill Write","bytes",s->result->metrics.spill_write_bytes,es);
         ExplainPropertyInteger("CSD Runs",NULL,s->result->metrics.runs,es);
         if(s->profiling) {
             const struct qs_timing *t=&s->result->profile.operators[QS_JOIN_PROBE];
             ExplainPropertyFloat("CSD Tree Wall","ms",(clock_ns()-s->start_ns)/1e6,3,es);
+            ExplainPropertyFloat("CSD Setup Wall","ms",s->setup_ns/1e6,3,es);
+            ExplainPropertyFloat("CSD Cleanup Wall","ms",s->cleanup_ns/1e6,3,es);
             ExplainPropertyFloat("CSD CSF Wall","ms",t->wall_ns/1e6,3,es);
             ExplainPropertyFloat("CSD CSF CPU","ms",t->cpu_ns/1e6,3,es);
             ExplainPropertyInteger("CSD CSF Calls",NULL,t->calls,es);
@@ -589,6 +623,9 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
             ExplainPropertyInteger("CSD Host Assigned LOADs",NULL,s->scheduled_loads,es);
             ExplainPropertyInteger("CSD Host Completion Reads",NULL,s->completion_reads,es);
             ExplainPropertyInteger("CSD Host Control Writes",NULL,s->control_writes,es);
+            ExplainPropertyFloat("CSD Completion Notice Sum","ms",s->notice_ns/1e6,3,es);
+            ExplainPropertyFloat("CSD Completion Notice Average","us",s->completions?s->notice_ns/1e3/s->completions:0,3,es);
+            ExplainPropertyFloat("CSD Completion Notice Maximum","us",s->notice_max_ns/1e3,3,es);
         }
     }
 }

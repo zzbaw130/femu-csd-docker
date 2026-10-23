@@ -6,6 +6,7 @@
 #define QP_NODES 96
 #define QP_PARAMS 128
 #define QP_SCAN_BYTES (1024U*1024)
+#define QP_VECTOR_ROWS 2048U
 /* cparam1: profile bit 0, CU slot bits 1..7. A scheduled heap input uses
  * bit 8 and its page number in bits 9..63; cparam2 stays reserved for spill. */
 #define QP_SCAN_INPUT (UINT64_C(1)<<8)
@@ -64,6 +65,12 @@ static inline unsigned qp_scan_buffer_bytes(const struct qp_plan *p,const struct
 {
     unsigned bytes=n->bytes<p->scan_bytes?n->bytes:p->scan_bytes;
     return bytes?bytes:QS_PAGE;
+}
+/* I/O blocks may contain many vectors; reserve only one vector per worker. */
+static inline unsigned qp_scan_capacity(const struct qp_plan *p,const struct qp_node *n)
+{
+    unsigned rows=qp_scan_buffer_bytes(p,n)/24;
+    return rows<QP_VECTOR_ROWS?rows:QP_VECTOR_ROWS;
 }
 /* A parallel probe pipeline ends before an order-dependent/blocking operator.
  * Hash build children retain the exact PG-selected tree and are built once. */
