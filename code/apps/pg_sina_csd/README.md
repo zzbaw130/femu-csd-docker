@@ -14,6 +14,8 @@
 
 这里的“设备执行树”只是 `include/plan.h` 定义的本应用参数，由 `pg-sina-plan.so` 解释；FEMU 和 SNIA 不解释 SQL，也没有新增设备 runtime。
 
+开启 `pg_sina_csd.profile=on` 后，通用执行树的 EXPLAIN ANALYZE 还输出 `CSD Pipeline <节点号>`：每个并行输入流水线的轮次、墙钟、协调端 CPU、worker 累计 CPU、平均计算 CU 数和 CPU 利用率。墙钟包含该流水线输入及消费期间的内部 LOAD/调度等待；平均 CU 数为两端 CPU 之和除以墙钟，利用率再除以设备 CU 数，不能把峰值 4 当作全程满载。Hash 构建/Hash 聚合协调端 CPU 单独记录，扣除已计时的子扫描、排序和嵌套阻塞计算，仍包含协调端接收输入行的处理成本。计时在 CSF、阻塞调用及流水线边界进行，普通输入行不逐条读时钟；关闭 profile 时不采集，完成后只额外读取一次阶段记录。
+
 ```text
 Guest PG：SQL → 安全去关联 → PG 选择 Plan → 转换 → CustomScan
 Guest PG：读取预先准备的 extent，直接调用 libsnia

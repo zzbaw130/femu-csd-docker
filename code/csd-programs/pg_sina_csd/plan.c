@@ -128,6 +128,7 @@ struct execution {
     int pending_store;
     struct qs_metrics metrics;
     struct qs_profile profile;
+    uint64_t local_profile_cpu, pipeline_start, pipeline_tick;
     bool profiling;
     struct femu_csd_args *args;
     unsigned initializer,initializer_phase;
@@ -154,8 +155,25 @@ static int64_t timed_call(struct execution *s,int64_t (*call)(struct femu_csd_ar
     if(!s->profiling) return call(a);
     uint64_t wall=now_ns(CLOCK_MONOTONIC),cpu=now_ns(CLOCK_THREAD_CPUTIME_ID);
     int64_t status=call(a); struct qs_timing *t=&s->profile.operators[op];
-    ++t->calls; t->wall_ns+=now_ns(CLOCK_MONOTONIC)-wall; t->cpu_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-cpu;
+    uint64_t elapsed=now_ns(CLOCK_THREAD_CPUTIME_ID)-cpu;
+    ++t->calls; t->wall_ns+=now_ns(CLOCK_MONOTONIC)-wall; t->cpu_ns+=elapsed;
+    s->local_profile_cpu+=elapsed;
     return status;
+}
+/* Blocking-call boundaries, never per input tuple. Child Scan/Sort and nested
+ * blocking CPU is subtracted; merged worker counters are not thread-local CPU. */
+struct blocking_timer { uint64_t wall,cpu,children; };
+static struct blocking_timer blocking_begin(struct execution *s)
+{
+    return (struct blocking_timer){now_ns(CLOCK_MONOTONIC),now_ns(CLOCK_THREAD_CPUTIME_ID),s->local_profile_cpu};
+}
+static void blocking_end(struct execution *s,unsigned op,struct blocking_timer begin)
+{
+    uint64_t elapsed=now_ns(CLOCK_THREAD_CPUTIME_ID)-begin.cpu,children=s->local_profile_cpu-begin.children;
+    uint64_t own=elapsed>children?elapsed-children:0;
+    struct qs_timing *t=&s->profile.operators[op]; ++t->calls;
+    t->cpu_ns+=own; t->wall_ns+=now_ns(CLOCK_MONOTONIC)-begin.wall;
+    s->local_profile_cpu+=own;
 }
 static int64_t next_row_impl(struct execution *,unsigned,struct qs_cell *);
 static inline int64_t next_row(struct execution *s,unsigned id,struct qs_cell *row)
@@ -400,7 +418,7 @@ static uint64_t row_hash(const struct qp_node *n,const struct qs_cell *row,int r
     }
     return hash;
 }
-static int64_t hash_build(struct execution *s,unsigned id)
+static int64_t hash_build_impl(struct execution *s,unsigned id)
 {
     const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
     const struct qs_plan *right=&s->plan->nodes[n->right].expr;
@@ -462,6 +480,12 @@ static int64_t hash_build(struct execution *s,unsigned id)
         o->hash_phase=1;
     }
     return 0;
+}
+static int64_t hash_build(struct execution *s,unsigned id)
+{
+    if(!s->profiling || s->nodes[id].hash_phase) return hash_build_impl(s,id);
+    struct blocking_timer timer=blocking_begin(s);
+    int64_t status=hash_build_impl(s,id); blocking_end(s,QS_JOIN_BUILD,timer); return status;
 }
 static int64_t hash_next(struct execution *s,unsigned id,struct qs_cell *row)
 {
@@ -1034,7 +1058,7 @@ static size_t group_reserve(const struct execution *s,const struct qp_node *n)
     }
     return reserve;
 }
-static int64_t hash_aggregate_next(struct execution *s,unsigned id,struct qs_cell *row)
+static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct qs_cell *row)
 {
     struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
     struct sorted_rows *sort=&o->left_sort; unsigned kind=n->expr.aggs[0].kind;
@@ -1202,6 +1226,14 @@ static int64_t hash_aggregate_next(struct execution *s,unsigned id,struct qs_cel
         }
         o->phase=0; return group_result(s,n,&g,o->keys,row);
     }
+}
+static int64_t hash_aggregate_next(struct execution *s,unsigned id,struct qs_cell *row)
+{
+    /* Pure in-memory output is one call per group: leave it untimed. */
+    if(!s->profiling || s->nodes[id].group_phase==3) return hash_aggregate_next_impl(s,id,row);
+    unsigned op=s->nodes[id].group_phase==2?QS_AGG_SOURCE:QS_AGG_SINK;
+    struct blocking_timer timer=blocking_begin(s);
+    int64_t status=hash_aggregate_next_impl(s,id,row); blocking_end(s,op,timer); return status;
 }
 static int64_t aggregate_next(struct execution *s,unsigned id,struct qs_cell *row)
 {
@@ -1523,6 +1555,7 @@ restart:
         memset(s->parallel_position,0,sizeof(s->parallel_position)); atomic_store(&s->next_offset,0);
         s->control->parallel=1; ++s->control->epoch; s->control->available=s->control->drained=0;
         s->parallel_started=1; s->used_workers=p->workers;
+        if(s->profiling) { s->pipeline_start=now_ns(CLOCK_MONOTONIC); s->pipeline_tick=now_ns(CLOCK_THREAD_CPUTIME_ID); }
     }
     for(unsigned w=0;w<p->workers;++w) if(s->control->available&(1U<<w)) {
         struct qs_result *out=&s->outputs[w+1];
@@ -1535,8 +1568,14 @@ restart:
         s->parallel_position[w]=0; s->control->available&=~(1U<<w); s->control->drained|=1U<<w;
     }
     if(s->parallel_done==((1U<<p->workers)-1)) {
+        struct qp_pipeline_profile *phase=&p->pipelines[root];
+        if(s->profiling) {
+            phase->wall_ns+=now_ns(CLOCK_MONOTONIC)-s->pipeline_start;
+            phase->coordinator_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-s->pipeline_tick; ++phase->rounds;
+        }
         for(unsigned w=0;w<p->workers;++w) {
             const struct qs_result *v=&s->outputs[w+1];
+            if(s->profiling) phase->worker_ns+=v->profile.operators[QS_JOIN_PROBE].cpu_ns;
             s->metrics.scanned+=v->metrics.scanned; s->metrics.matched+=v->metrics.matched;
             s->metrics.input_bytes+=v->metrics.input_bytes-v->metrics.index_pages*QS_PAGE;
             s->metrics.index_pages+=v->metrics.index_pages; s->metrics.index_tuples+=v->metrics.index_tuples;
@@ -1628,6 +1667,7 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
     }
     if(!csIsReentry(a)) { out->rows=out->begin=out->finished=out->str_bytes=0; out->status=0; }
     uint64_t start=s->profiling?now_ns(CLOCK_MONOTONIC):0,cpu=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
+    if(s->profiling && !worker) s->pipeline_tick=cpu;
     struct execution *owner=worker?s->owner:s;
     if(s->profiling) {
         unsigned active=atomic_fetch_add(&owner->active_cus,1)+1,peak=atomic_load(&owner->peak_cus);
@@ -1673,6 +1713,8 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
     }
     if(s->profiling) {
         struct qs_timing *t=&s->profile.operators[QS_JOIN_PROBE];
+        if(!worker && s->parallel_started)
+            plan->pipelines[s->parallel_node].coordinator_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-s->pipeline_tick;
         ++t->calls; t->wall_ns+=now_ns(CLOCK_MONOTONIC)-start; t->cpu_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-cpu;
         atomic_fetch_sub(&owner->active_cus,1); control->peak_cus=atomic_load(&owner->peak_cus);
     }

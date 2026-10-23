@@ -217,6 +217,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         *(struct qs_chunk *)(arena+plan->nodes[2].parallel_vector+w*plan->parallel_stride)=(struct qs_chunk){.capacity=plan->scan_bytes/24,.ncols=2};
     void *mr[]={plan,&control,out,arena,io}; long long len[]={sizeof(*plan),sizeof(controls),5*sizeof(*out),bytes,5*QS_SORT_IO_BYTES};
     struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=len};
+    args.cparam1=parallel==TEST_PARALLEL || parallel==TEST_PARTITION || parallel==TEST_PARTITION_SKEW;
     void **tokens=NULL; size_t ntokens=0; unsigned got=0; unsigned char seen[12]={0};
     uint64_t counts[12]={0},sums[12]={0},mins[12]={0},maxs[12]={0};
     for(unsigned l=0;l<rows;++l) {
@@ -240,7 +241,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             pthread_t threads[4]; struct probe_test tasks[4]; unsigned started=0;
             for(unsigned w=0;w<plan->workers;++w) if(!((available|done)&(1U<<w))) {
                 tasks[w]=(struct probe_test){run,args,plan,&controls[w+1],&out[w+1],arena,raw[0],raw[1],index,w+1,tokens,ntokens};
-                tasks[w].args.cparam1=(w+1)<<1;
+                tasks[w].args.cparam1=((w+1)<<1)|(args.cparam1&1);
                 assert(!pthread_create(&threads[w],NULL,probe_worker,&tasks[w])); started|=1U<<w;
             }
             for(unsigned w=0;w<plan->workers;++w) if(started&(1U<<w)) {
@@ -298,6 +299,17 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         }
     }
     assert(got); if(parallel!=TEST_COUNT_ROWS && parallel<TEST_PARTITION) for(unsigned i=0;i<12;++i) assert(!seen[i]);
+    if(args.cparam1&1) {
+        uint64_t rounds=0;
+        for(unsigned i=0;i<plan->count;++i) {
+            const struct qp_pipeline_profile *p=&plan->pipelines[i]; rounds+=p->rounds;
+            if(p->rounds) assert(p->wall_ns && p->worker_ns && p->coordinator_ns);
+        }
+        assert(rounds==control.epoch);
+        uint64_t children=0;
+        for(unsigned op=0;op<QS_OPERATORS;++op) if(op!=QS_JOIN_PROBE) children+=out->profile.operators[op].cpu_ns;
+        assert(out->profile.operators[QS_JOIN_PROBE].cpu_ns>=children);
+    } else for(unsigned i=0;i<plan->count;++i) assert(!plan->pipelines[i].rounds);
     if(parallel>=TEST_PARTITION) {
         assert(ntokens && !out->metrics.runs && out->metrics.workers==(parallel==TEST_PARTITION_SERIAL?1:4));
         if(parallel==TEST_PARTITION_SERIAL) assert(!control.epoch);

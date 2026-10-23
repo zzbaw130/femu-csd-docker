@@ -20,12 +20,16 @@ struct qp_node {
     uint64_t parallel_input, parallel_vector;
     double estimated_rows;
 };
+/* Optional per-pipeline measurements; only the coordinator writes these.
+ * CPU sums include all CSF slices, wall includes LOAD and scheduling waits. */
+struct qp_pipeline_profile { uint64_t wall_ns, coordinator_ns, worker_ns, rounds; };
 struct qp_plan {
     unsigned count, root, nparams, ninit;
     unsigned workers, scan_bytes;
     uint64_t parallel_stride;
     int param_nodes[QP_PARAMS],cte_nodes[QP_PARAMS],init_nodes[QP_PARAMS],init_params[QP_PARAMS];
     struct qp_node nodes[QP_NODES];
+    struct qp_pipeline_profile pipelines[QP_NODES];
 };
 /* Only page addresses and lifecycle state cross to PG during execution. */
 struct qp_control {

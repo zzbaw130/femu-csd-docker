@@ -24,7 +24,7 @@ typedef struct {
     CustomScanState css;
     struct qp_plan *plan;
     struct plan_slot slots[QS_WORKERS+1];
-    unsigned workers, epoch;
+    unsigned workers, epoch, device_cus;
     bool parallel;
     uint64_t load_ns, load_calls;
     struct qs_request files[QP_NODES];
@@ -167,6 +167,7 @@ static void start(PlanStateCsd *s)
     }
     if(!device) elog(ERROR,"CSD PG Plan has no prepared relation");
     s->profiling=pg_sina_profile; s->start_ns=clock_ns(); s->load_ns=s->load_calls=0;
+    memset(s->plan->pipelines,0,sizeof(s->plan->pipelines));
     s->plan->nodes[s->plan->root].expr.work_mem_bytes=(uint64_t)pg_sina_max_memory*1024;
     s->lock_fd=open(device,O_RDONLY|O_CLOEXEC);
     if(s->lock_fd<0) elog(ERROR,"cannot open CSD namespace");
@@ -187,6 +188,7 @@ static void start(PlanStateCsd *s)
     if(csQueryDeviceProperties(s->device,CS_CSE_TYPE,&length,NULL)==CS_LENGTH_RETURNED) {
         CsProperties *properties=palloc(length);
         checked(csQueryDeviceProperties(s->device,CS_CSE_TYPE,&length,properties),"query CU count");
+        s->device_cus=properties->CSEDetails[0].CSE[0].NumCRs;
         if(parallel) s->workers=Min(QS_WORKERS,properties->CSEDetails[0].CSE[0].NumCRs);
         pfree(properties);
     }
@@ -379,6 +381,9 @@ static void fetch(PlanStateCsd *s)
                 checked(transfer(s->memory[2],offsetof(struct qs_result,str_bytes),&s->result->str_bytes,
                     sizeof(s->result->str_bytes)+sizeof(s->result->str_data),false),"read result strings");
             }
+            if(s->result->finished && s->profiling)
+                checked(transfer(s->memory[0],offsetof(struct qp_plan,pipelines),s->plan->pipelines,
+                    sizeof(s->plan->pipelines),false),"read pipeline profile");
             if(s->result->rows || s->result->finished) { s->row=0; return; }
         }
         if(s->parallel) for(unsigned w=1;w<=s->workers;++w) {
@@ -492,9 +497,20 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
             ExplainPropertyFloat("CSD CSF CPU","ms",t->cpu_ns/1e6,3,es);
             ExplainPropertyInteger("CSD CSF Calls",NULL,t->calls,es);
             ExplainPropertyInteger("CSD Active CUs Peak",NULL,s->slots[0].control.peak_cus,es);
-            static const unsigned ops[]={QS_SCAN,QS_FILTER,QS_SORT_SINK,QS_SORT_SOURCE};
-            static const char *labels[]={"CSD Scan Decode CPU","CSD Vector Filter CPU","CSD Sort Sink CPU","CSD Sort Source CPU"};
-            for(unsigned i=0;i<4;++i) ExplainPropertyFloat(labels[i],"ms",s->result->profile.operators[ops[i]].cpu_ns/1e6,3,es);
+            static const unsigned ops[]={QS_SCAN,QS_FILTER,QS_SORT_SINK,QS_SORT_SOURCE,QS_JOIN_BUILD,QS_AGG_SINK,QS_AGG_SOURCE};
+            static const char *labels[]={"CSD Scan Decode CPU","CSD Vector Filter CPU","CSD Sort Sink CPU","CSD Sort Source CPU",
+                "CSD Hash Build Coordinator CPU","CSD Hash Aggregate Coordinator CPU","CSD Aggregate Merge Coordinator CPU"};
+            for(unsigned i=0;i<lengthof(ops);++i) ExplainPropertyFloat(labels[i],"ms",s->result->profile.operators[ops[i]].cpu_ns/1e6,3,es);
+            for(unsigned i=0;i<s->plan->count;++i) {
+                const struct qp_pipeline_profile *p=&s->plan->pipelines[i];
+                if(!p->rounds) continue;
+                double average=(double)(p->coordinator_ns+p->worker_ns)/p->wall_ns;
+                char label[64],value[256]; snprintf(label,sizeof(label),"CSD Pipeline %u",i);
+                snprintf(value,sizeof(value),"rounds=%llu wall=%.3f ms coordinator=%.3f ms workers=%.3f ms avg_cus=%.2f cpu_util=%.1f%%",
+                    (unsigned long long)p->rounds,p->wall_ns/1e6,p->coordinator_ns/1e6,p->worker_ns/1e6,
+                    average,100*average/Max(1,s->device_cus));
+                ExplainPropertyText(label,value,es);
+            }
             ExplainPropertyFloat("CSD LOAD Preparation","ms",s->load_ns/1e6,3,es);
             ExplainPropertyInteger("CSD Host LOAD Requests",NULL,s->load_calls,es);
         }
