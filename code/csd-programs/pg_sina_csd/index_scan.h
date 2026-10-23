@@ -5,6 +5,8 @@ struct femu_csd_args;
 int qs_index_init(const struct qs_plan *,struct qs_join_control *);
 /* Forward leaf walk, returning heap columns in index order. */
 int64_t qs_index_scan(struct qs_chunk *,struct qs_task *,struct qs_join_control *,void *,unsigned,unsigned,int);
+/* Unordered covering scan: process each physical leaf in [first,end) once. */
+void qs_index_scan_range(struct qs_join_control *,unsigned first,unsigned end);
 void qs_index_reset(struct qs_join_control *,unsigned);
 /* Stop keys whose source-row bits were accepted by a semi/anti consumer. */
 void qs_index_skip(struct qs_join_control *,unsigned,uint64_t);

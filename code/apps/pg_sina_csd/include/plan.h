@@ -13,7 +13,7 @@ struct qp_node {
     struct qs_plan expr;
     int kind, left, right, join_type, join_qual;
     unsigned nkeys, distinct, distinct_aggs;
-    unsigned sorted_input, ordered_index; /* bit 0: forward index; bit 1: correlated heap read-ahead; bit 2: covered leading key */
+    unsigned sorted_input, ordered_index; /* bits: forward, heap read-ahead, covered keys, unordered leaf ranges */
     unsigned hash, parallel;
     int left_keys[QS_KEYS], right_keys[QS_KEYS];
     uint64_t bytes, index_bytes, input_offset, vector_offset;
@@ -49,7 +49,7 @@ static inline int qp_probe_scan(const struct qp_plan *p,int id)
 {
     if(id<0) return -1;
     const struct qp_node *n=&p->nodes[id];
-    if(n->kind==QP_SCAN) return n->ordered_index?-1:id;
+    if(n->kind==QP_SCAN) return n->ordered_index && !(n->ordered_index&8)?-1:id;
     if(n->kind==QP_PROJECT || n->kind==QP_INDEX_JOIN || (n->kind==QP_JOIN && n->hash))
         return qp_probe_scan(p,n->left);
     return -1;
@@ -67,7 +67,9 @@ static inline void qp_parallel_boundaries(struct qp_plan *p,int id)
     if(n->kind==QP_JOIN && n->hash) {
         scan=qp_probe_scan(p,n->right);
         if(scan>=0 && p->nodes[scan].bytes>=4*QP_SCAN_BYTES) p->nodes[n->right].parallel=1;
-        qp_parallel_boundaries(p,n->right);
     }
+    /* Merge inputs have independent blocking pipelines too. An index lookup
+     * is driven by its left input and must not become a full parallel scan. */
+    if(n->kind==QP_JOIN) qp_parallel_boundaries(p,n->right);
 }
 #endif

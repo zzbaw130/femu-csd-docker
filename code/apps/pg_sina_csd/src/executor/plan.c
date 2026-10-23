@@ -132,9 +132,9 @@ static size_t layout_buffers(PlanStateCsd *s,unsigned entries,unsigned data,cons
         for(int id=root;id>=0;id=s->plan->nodes[id].left) {
             struct qp_node *n=&s->plan->nodes[id];
             if(n->kind==QP_SCAN) {
-                unsigned bytes=qp_scan_buffer_bytes(s->plan,n);
+                unsigned bytes=n->ordered_index?QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE:qp_scan_buffer_bytes(s->plan,n);
                 n->parallel_input=end; end+=bytes; n->parallel_vector=end;
-                end+=(qs_chunk_bytes(bytes/24,n->expr.ncols)+4095)&~(size_t)4095; break;
+                end+=(qs_chunk_bytes(n->ordered_index?256:bytes/24,n->expr.ncols)+4095)&~(size_t)4095; break;
             }
             if(n->kind==QP_INDEX_JOIN) {
                 n->parallel_input=end; end+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE; n->parallel_vector=end;

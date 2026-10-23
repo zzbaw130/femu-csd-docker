@@ -21,6 +21,7 @@ struct index_cursor {
     struct lookup scan;
     uint64_t *scan_tids;
     int scan_started,scan_done;
+    unsigned scan_end;
 };
 struct index_join { cs_work_context *context; struct qs_plan scan; struct index_cursor cursors[QS_WORKERS]; struct qs_dict *dictionary; };
 static uint16_t u16(const unsigned char *p) { uint16_t x; memcpy(&x,p,2); return x; }
@@ -139,6 +140,13 @@ static int seek(const unsigned char *page,struct lookup *key,unsigned bytes)
     }
     return 0;
 }
+void qs_index_scan_range(struct qs_join_control *control,unsigned first,unsigned end)
+{
+    struct index_join *h=(void *)(uintptr_t)control->state;
+    struct index_cursor *c=&h->cursors[0];
+    c->scan=(struct lookup){.block=first}; c->scan_end=end;
+    c->scan_started=1; c->scan_done=first>=end;
+}
 int64_t qs_index_scan(struct qs_chunk *out,struct qs_task *task,struct qs_join_control *control,void *io,
     unsigned heap_pages,unsigned index_pages,int flags)
 {
@@ -165,7 +173,13 @@ int64_t qs_index_scan(struct qs_chunk *out,struct qs_task *task,struct qs_join_c
                     page_at(c,task,io,c->scan.block+i,0);
                 goto wait;
             }
+            if(c->scan_end && (u16(page+QS_PAGE-4)&(4|16))) {
+                c->scan_done=++c->scan.block>=c->scan_end; c->scan.phase=0; continue;
+            }
             int count=page_items(page,1); if(count<0) return -2;
+            if(c->scan_end && !(u16(page+QS_PAGE-4)&1)) {
+                c->scan_done=++c->scan.block>=c->scan_end; c->scan.phase=0; continue;
+            }
             unsigned first=u32(page+QS_PAGE-12)?2:1;
             if(c->scan.phase!=2) {
                 if(!(u16(page+QS_PAGE-4)&1)) {
@@ -178,31 +192,37 @@ int64_t qs_index_scan(struct qs_chunk *out,struct qs_task *task,struct qs_join_c
                 c->scan.item=first; c->scan.phase=2;
             }
             if(c->scan.item>(unsigned)count) {
-                c->scan.block=u32(page+QS_PAGE-12); c->scan.phase=0;
-                if(!c->scan.block) c->scan_done=1;
+                c->scan.block=c->scan_end?c->scan.block+1:u32(page+QS_PAGE-12); c->scan.phase=0;
+                if(!c->scan.block || (c->scan_end && c->scan.block>=c->scan_end)) c->scan_done=1;
                 continue;
             }
             unsigned item=c->scan.item++,len=0;
             if(((u32(page+24+(item-1)*4)>>15)&3)==3) continue;
             const unsigned char *t=item_at(page,item,&len); if(!t || len<8) return -2;
             if(flags&4) {
-                unsigned attr=h->scan.join.build_key-1,bytes=h->scan.join.index_key_bytes;
-                if(attr>=h->scan.nattrs || (bytes!=2 && bytes!=4 && bytes!=8)) return -2;
                 unsigned info=u16(t+6),off=info&0x8000?16:8;
                 if((info&8191)!=len || ((info&0x8000) && len<16)) return -2;
-                int null=(info&0x8000) && !(t[8]&1),slot=h->scan.cols[attr].slot;
                 if(!out->rows) memset(qs_nulls(out),0,((out->capacity+7)/8)*(size_t)out->ncols);
-                if(slot>=0) {
-                    int64_t value=0;
-                    if(!null) {
-                        if(len<off+bytes) return -2;
-                        if(bytes==2) value=(int16_t)u16(t+off);
-                        else if(bytes==4) value=(int32_t)u32(t+off);
-                        else memcpy(&value,t+off,8);
+                for(unsigned k=0;k<(h->scan.join.build_key2?2U:1U);++k) {
+                    unsigned attr=(k?h->scan.join.build_key2:h->scan.join.build_key)-1;
+                    if(attr>=h->scan.nattrs) return -2;
+                    unsigned bytes=k?(unsigned)h->scan.cols[attr].length:h->scan.join.index_key_bytes;
+                    if(bytes!=2 && bytes!=4 && bytes!=8) return -2;
+                    int null=(info&0x8000) && !(t[8]&(1U<<k)),slot=h->scan.cols[attr].slot;
+                    if(!null) off=(off+bytes-1)&~(bytes-1);
+                    if(slot>=0) {
+                        int64_t value=0;
+                        if(!null) {
+                            if(len<off+bytes) return -2;
+                            if(bytes==2) value=(int16_t)u16(t+off);
+                            else if(bytes==4) value=(int32_t)u32(t+off);
+                            else memcpy(&value,t+off,8);
+                        }
+                        qs_values(out)[(size_t)slot*out->capacity+out->rows]=value;
+                        qs_dscales(out)[(size_t)slot*out->capacity+out->rows]=0;
+                        if(null) qs_nulls(out)[(size_t)slot*((out->capacity+7)/8)+out->rows/8]|=1U<<(out->rows%8);
                     }
-                    qs_values(out)[(size_t)slot*out->capacity+out->rows]=value;
-                    qs_dscales(out)[(size_t)slot*out->capacity+out->rows]=0;
-                    if(null) qs_nulls(out)[(size_t)slot*((out->capacity+7)/8)+out->rows/8]|=1U<<(out->rows%8);
+                    if(!null) { if(off+bytes>len) return -2; off+=bytes; }
                 }
                 qs_selection(out)[out->rows]=out->rows; ++out->rows; ++out->selected;
                 if(out->rows==out->capacity) return 0;

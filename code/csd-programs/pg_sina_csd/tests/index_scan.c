@@ -10,7 +10,7 @@
 #include <string.h>
 typedef int64_t (*function)(struct femu_csd_args *);
 static unsigned key_bytes=4;
-static int empty_index,large_index,retained_window;
+static int empty_index,large_index,retained_window,pair_keys;
 static void (*heap_window)(struct qs_join_control *,unsigned,const void *,uint32_t,uint32_t);
 static unsigned char index_pages[4][QS_PAGE],heap[256][QS_PAGE];
 static void w16(void *p,uint16_t v) { memcpy(p,&v,2); }
@@ -24,9 +24,11 @@ static void add(unsigned char *p,const void *tuple,unsigned len)
 }
 static void index_tuple(unsigned char *p,int key,unsigned block,unsigned item,int pivot)
 {
-    unsigned char t[16]={0}; w16(t,block>>16); w16(t+2,block); w16(t+4,pivot?1:item); w16(t+6,16|(pivot?0x2000:0)); if(key_bytes==2) w16(t+8,key); else if(key_bytes==4) w32(t+8,key); else { int64_t v=key; memcpy(t+8,&v,8); }
+    unsigned size=pair_keys && key_bytes==8?24:16;
+    unsigned char t[24]={0}; w16(t,block>>16); w16(t+2,block); w16(t+4,pivot?1:item); w16(t+6,size|(pivot?0x2000:0)); if(key_bytes==2) w16(t+8,key); else if(key_bytes==4) w32(t+8,key); else { int64_t v=key; memcpy(t+8,&v,8); }
     if(key_bytes<8) w32(t+12,item);
-    add(p,t,16);
+    else if(pair_keys) w32(t+16,item);
+    add(p,t,size);
 }
 static void pages(void)
 {
@@ -121,8 +123,11 @@ static void ordered_scan(void *library,unsigned rows,int empty,int flags)
     assert(init && scan && close);
     struct qs_plan p={.nattrs=2,.ncols=2,.join={.nattrs=2,.build_key=1,.index_key_bytes=key_bytes,.indexroot=empty?0:1,.work_mem_bytes=QS_INDEX_WORK_BYTES}};
     for(unsigned i=0;i<2;++i) p.cols[i]=(struct qs_column){.slot=i,.length=4,.align=4,.type=Q_INTEGER};
-    if(flags&4) { p.cols[1].slot=-1; p.ncols=1; }
+    if((flags&4) && !(flags&8)) { p.cols[1].slot=-1; p.ncols=1; }
+    if(flags&8) p.join.build_key2=2;
     struct qs_join_control control={0}; struct qs_task task={0}; assert(!init(&p,&control));
+    void (*range)(struct qs_join_control *,unsigned,unsigned)=dlsym(library,"qs_index_scan_range"); assert(range);
+    if(flags&16) range(&control,1,3);
     struct qs_chunk *out=calloc(1,qs_chunk_bytes(17,2)); assert(out); out->capacity=17; out->ncols=p.ncols;
     char *io=calloc(1,QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE); assert(io);
     unsigned seen=0;
@@ -138,11 +143,16 @@ static void ordered_scan(void *library,unsigned rows,int empty,int flags)
             continue;
         }
         assert(!status);
-        if(!out->rows) break;
+        if(!out->rows) {
+            if((flags&16) && seen==4) { range(&control,3,4); continue; }
+            break;
+        }
         for(unsigned i=0;i<out->rows;++i) {
-            if((flags&4) && rows==9 && seen==8) assert(qs_nulls(out)[i/8]&(1U<<(i%8)));
-            else if(flags&4) assert(qs_values(out)[i]==(rows<=9?(seen<2?-2:seen<6?7:9):(int)seen));
+            if((flags&4) && ((rows==9 && seen==8) || (rows==10 && seen==9))) assert(qs_nulls(out)[i/8]&(1U<<(i%8)));
+            else if(flags&4) assert(qs_values(out)[i]==(rows<=10?(seen<2?-2:seen<6?7:seen<8?9:99):(int)seen));
             else assert(qs_values(out)[out->capacity+i]==10+seen);
+            if((flags&8) && rows==10 && seen==8) assert(qs_nulls(out)[(out->capacity+7)/8+i/8]&(1U<<(i%8)));
+            else if(flags&8) assert(qs_values(out)[out->capacity+i]==(rows==10 && seen==9?42:seen%4+1));
             ++seen;
         }
         out->rows=out->selected=0;
@@ -156,10 +166,20 @@ int main(int argc,char **argv)
     function build=(function)dlsym(join,"pg_sina_join_build"),probe=(function)dlsym(join,"pg_sina_join_probe"),close=(function)dlsym(join,"pg_sina_join_close"),source=(function)dlsym(agg,"pg_sina_aggregate_source"); assert(build && probe && close && source);
     heap_window=(void (*)(struct qs_join_control *,unsigned,const void *,uint32_t,uint32_t))dlsym(join,"qs_index_heap_window"); assert(heap_window);
     key_bytes=4; pages(); ordered_scan(join,8,0,0); ordered_scan(join,8,1,2); ordered_scan(join,8,0,4);
+    ordered_scan(join,8,0,12);
+    ordered_scan(join,8,0,20); ordered_scan(join,8,0,28);
+    /* Physical ranges do not follow downlinks through ignored pages. */
+    w16(index_pages[1]+QS_PAGE-4,4); ordered_scan(join,8,0,20);
+    w16(index_pages[1]+QS_PAGE-4,16); ordered_scan(join,8,0,28); pages();
+    unsigned char nullable_pair[24]={0}; w16(nullable_pair+6,0x8000|24);
+    nullable_pair[8]=1; w32(nullable_pair+16,99); add(index_pages[3],nullable_pair,24);
+    nullable_pair[8]=2; w32(nullable_pair+16,42); add(index_pages[3],nullable_pair,24);
+    ordered_scan(join,10,0,12); ordered_scan(join,10,0,28); pages();
     unsigned char null_key[16]={0}; w16(null_key+6,0x8000|16); add(index_pages[3],null_key,16);
     ordered_scan(join,9,0,4);
     large_pages(); ordered_scan(join,256,0,0); ordered_scan(join,256,0,2); ordered_scan(join,256,0,4);
     for(key_bytes=2;key_bytes<=8;key_bytes*=2) {
+        pair_keys=1; pages(); ordered_scan(join,8,0,12); ordered_scan(join,8,0,28); pair_keys=0;
         pages(); ordered_scan(join,8,0,4);
         for(retained_window=1;retained_window<=2;++retained_window) {
             check(build,probe,close,source,0,0); check(build,probe,close,source,1,0);

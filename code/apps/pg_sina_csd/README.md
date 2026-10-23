@@ -10,6 +10,8 @@
 
 支持的节点包括投影/过滤、INNER/LEFT/SEMI/ANTI 等值连接、SUM/AVG/COUNT/MIN/MAX、COUNT DISTINCT、HAVING、Sort、Limit/Offset、派生表、共享 CTE、标量 InitPlan 和整数 IN/NOT IN 集合。相关标量聚合目前仅将严格 WHERE 条件中的 SUM/AVG/MIN/MAX 按整数等值关联键去关联；COUNT 的空输入、OR 等不安全形态保留 PG 执行。不能转换的计划整体回退原生 PG。`auto` 尚未实现，不接受该配置值。
 
+在 PG 计划上只做满足语义条件的局部优化：不要求输出有序的等值连接采用 Hash；只返回唯一键的连接，可将键集合过滤下推到分组之前；按左侧主键分组的 LEFT JOIN COUNT 可先统计右表，再连接计数并把未匹配值补为零。COUNT DISTINCT 在精确键投影下先对“分组键＋参数”去重，再统计非 NULL 参数，复用现有有界 Hash Aggregate 和 spill。它们都不依赖 TPC-H 查询编号。覆盖索引支持前两个整数列；无需索引顺序时，多个 CU 动态领取物理叶页范围，有序消费者仍沿叶链读取。
+
 这里的“设备执行树”只是 `include/plan.h` 定义的本应用参数，由 `pg-sina-plan.so` 解释；FEMU 和 SNIA 不解释 SQL，也没有新增设备 runtime。
 
 ```text

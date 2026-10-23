@@ -4,7 +4,7 @@
 
 ## PG 原生计划执行
 
-`plan.c` 编译成 `pg-sina-plan.so`。Guest 将 PG 已选中的 Plan 转换为 `apps/pg_sina_csd/include/plan.h` 中的节点数组，保留连接树和左右输入。该格式只属于本应用，FEMU 和 SNIA 没有为 SQL 增加协议。
+`plan.c` 编译成 `pg-sina-plan.so`。Guest 以 PG 已选中的连接树为基础，进行分组键过滤下推、计数预聚合等局部改写，转换为 `apps/pg_sina_csd/include/plan.h` 中的节点数组。该格式只属于本应用，FEMU 和 SNIA 没有为 SQL 增加协议。
 
 入口 `pg_sina_plan` 按顺序接收五个 AFDM：
 
@@ -29,8 +29,8 @@ Guest 从 PG 选定的树中标记可并行的扫描/投影/Hash 或 Index Probe
 - Merge Join：分别排序输入，按键归并；重复键组可 spill，保留 NULL、重复和外连接语义。
 - Index Join：复用 `index_scan.c` 的 PG12 整数 B-tree 下探与 Heap Tuple 解码，可在连接树多个位置出现。最多批量 64 个外侧键；要求保留顺序时一次一个键。缺页只通过控制记录交给 Guest 批量提交内部 LOAD。SEMI/ANTI 在消费端确认条件满足后停止查找该键；索引自连接复用当前扫描块中的 Heap 页，超出该块再读取，不建立跨查询缓存。
 - 有序 Index Scan：同一文件沿 PG12 B-tree 正向叶链收集 TID，批量回表，按索引顺序生成列批次。保持单游标供流式 GroupAggregate 消费；不把有序输入任意拆给多个 CU。沿叶链预读至多 16 页，Heap 在 PG 提供的正相关性大于 0.9 时预读至多 32 页，均受文件边界和原页缓存限制；无统计或相关性低时按需读取。额外 TID 列表仅为该游标分配，等值连接不承担这份开销。
-- Index Only Scan：对于冻结镜像中仅需整数前导键的覆盖扫描，沿叶链直接输出键和 NULL 位图，不请求 Heap 页；不支持的覆盖列仍走回表或原回退路径。
-- Aggregate：扫描或等值连接输出上的单个 SUM/COUNT/AVG 可用有界 Hash 表聚合，支持多键（包括字符串、numeric、NULL）及聚合参数的算术表达式；LEFT JOIN 补出的 NULL 不计入 COUNT(列)，COUNT(*) 则计入行数。保留精确 SUM/count，AVG 在最终输出时才相除。单整数键保留紧凑实现，多键表从 128 槽开始按实际分组数增长，键只占实际列数的空间；需要 ORDER BY 时在聚合后排序，保持升降序及 NULL 顺序。预算不足时将部分状态交给现有 Sort/spill 归并，不重读明细；不覆盖的形态沿用原算法。支持任意组合的 SUM/AVG/COUNT/MIN/MAX、分组和 HAVING；按组有序输入流式计算，否则先外部排序。COUNT DISTINCT 支持一组共享的 DISTINCT 输入列，排序后跳过重复/NULL。
+- Index Only Scan：冻结镜像中支持前两个整数索引列，直接输出键和 NULL 位图，不请求 Heap 页。需要索引顺序时沿叶链读取；无需顺序时各 CU 动态领取互不重叠的物理页范围，只处理叶页，跳过内部页和已删除页。每个 CU 使用私有游标、页缓存和列批次；不支持的覆盖列仍走回表或原回退路径。
+- Aggregate：扫描或等值连接输出上的单个 SUM/COUNT/AVG 可用有界 Hash 表聚合，支持多键（包括字符串、numeric、NULL）及聚合参数的算术表达式；LEFT JOIN 补出的 NULL 不计入 COUNT(列)，COUNT(*) 则计入行数。保留精确 SUM/count，AVG 在最终输出时才相除。整数和字符串字典 ID 按 64 位保存，NULL 使用位图；numeric 键保留完整精度。直接扫描可按估计组数预留，阻塞子节点之上的表仍从 128 槽开始增长，避免挤占子节点的预算。聚合同时预留将启动的 worker 状态及 spill 空间；实际无法容纳时该段串行执行。需要 ORDER BY 时在聚合后排序；预算不足时归并部分状态，不重读明细。COUNT DISTINCT 的精确键投影先按“分组键＋参数”做 Hash 去重，再 COUNT 非 NULL 参数；不覆盖的形态保留排序去重。任意组合的 SUM/AVG/COUNT/MIN/MAX、分组和 HAVING 仍可走原有流式或外部排序聚合。
 - Sort/Limit：复用 `sort.c` 的有界工作内存 run 和分批归并，完整处理输入、OFFSET/LIMIT、提前结束与回收。
 - CTE/InitPlan：共享 CTE 在设备计算一次并暂存，读者各自持有游标；标量初始化结果保存在设备参数数组。整数 IN/NOT IN 集合保留 NULL 和空集合语义。
 

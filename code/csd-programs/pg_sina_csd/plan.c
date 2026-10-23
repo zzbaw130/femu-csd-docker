@@ -107,7 +107,7 @@ struct operator_state {
     int hash_matched,hash_fallback,hash_shared;
     struct external_hash *external;
     struct compact_group *groups;
-    unsigned group_capacity,group_count,group_flush,group_phase,group_stride;
+    unsigned group_capacity,group_count,group_flush,group_phase,group_stride,group_integer;
     struct set_key *set;
     unsigned set_capacity,set_count;
     int set_null,set_ready;
@@ -860,11 +860,18 @@ static int64_t scan_next(struct execution *s,unsigned id,struct qs_cell *row)
             continue;
         }
         if(n->ordered_index) {
+            if(s->worker && (n->ordered_index&8) && !o->input_done) {
+                uint64_t first=atomic_fetch_add_explicit(&s->owner->next_offset,16*QS_PAGE,memory_order_relaxed)/QS_PAGE;
+                unsigned pages=n->index_bytes/QS_PAGE;
+                if(first>=pages) return 0;
+                qs_index_scan_range(&o->index_control,first?first:1,first+16<pages?first+16:pages);
+                o->input_done=1;
+            }
             if(o->index_task.index_pending) {
                 if(!s->control->ready) return QP_WAIT;
                 s->control->ready=s->control->index_nreads=0;
             } else chunk->rows=chunk->selected=0;
-            int64_t status=qs_index_scan(chunk,&o->index_task,&o->index_control,s->arena+n->input_offset,
+            int64_t status=qs_index_scan(chunk,&o->index_task,&o->index_control,s->arena+input_offset(s,n),
                 n->bytes/QS_PAGE,n->index_bytes/QS_PAGE,n->ordered_index);
             if(status==QS_INDEX_WAIT) {
                 s->control->node=id; s->control->index_nreads=o->index_task.index_nreads;
@@ -873,7 +880,10 @@ static int64_t scan_next(struct execution *s,unsigned id,struct qs_cell *row)
             }
             if(status) return status;
             o->scan_position=0; s->metrics.scanned+=chunk->rows;
-            if(!chunk->rows) return 0;
+            if(!chunk->rows) {
+                if(s->worker && (n->ordered_index&8)) { o->input_done=0; continue; }
+                return 0;
+            }
             continue;
         }
         if(s->control->ready && s->control->node==id && !s->control->index_nreads) {
@@ -967,7 +977,10 @@ static struct compact_group *group_at(struct operator_state *o,unsigned slot)
 { return (void *)((unsigned char *)o->groups+(size_t)slot*o->group_stride); }
 static void group_keys(const struct qp_node *n,const struct operator_state *o,const struct compact_group *g,struct qs_cell *keys)
 {
-    if(o->group_stride>sizeof(*g)) memcpy(keys,g+1,n->nkeys*sizeof(*keys));
+    if(o->group_stride>sizeof(*g) && o->group_integer) {
+        const int64_t *values=(const void *)(g+1);
+        for(unsigned k=0;k<n->nkeys;++k) keys[k]=(struct qs_cell){.value=values[k],.isnull=!!(g->occupied&(2U<<k))};
+    } else if(o->group_stride>sizeof(*g)) memcpy(keys,g+1,n->nkeys*sizeof(*keys));
     else keys[0]=(struct qs_cell){.value=g->key,.isnull=g->occupied==2};
 }
 static uint64_t group_hash(const struct qp_node *n,const struct qs_cell *row)
@@ -1007,6 +1020,20 @@ static int group_result(struct execution *s,const struct qp_node *n,struct compa
 }
 /* Retain the compact integer-key path. Other keys add only their actual cell
  * count and grow from a small table; spill SUM/count states, never raw rows. */
+static size_t group_reserve(const struct execution *s,const struct qp_node *n)
+{
+    size_t reserve=2*s->sort_limit;
+    /* Hash groups are allocated before their scan launches. Reserve the actual
+     * worker state too, or a small query budget can lose
+     * all spill space as soon as the workers start. Active workers are already
+     * charged to the parent and must not be counted a second time. */
+    if(s->plan->workers>1 && !s->parallel_started && s->plan->nodes[n->left].parallel) {
+        int leaf=qp_probe_scan(s->plan,n->left);
+        size_t index=leaf>=0 && s->plan->nodes[leaf].ordered_index?QS_INDEX_WORK_BYTES+sizeof(struct qs_plan):0;
+        reserve+=s->plan->workers*(sizeof(*s)+s->plan->count*sizeof(*s->nodes)+sizeof(struct qs_plan)+index+256);
+    }
+    return reserve;
+}
 static int64_t hash_aggregate_next(struct execution *s,unsigned id,struct qs_cell *row)
 {
     struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
@@ -1015,11 +1042,21 @@ static int64_t hash_aggregate_next(struct execution *s,unsigned id,struct qs_cel
     if(!o->group_capacity) {
         struct cs_work_context_stats memory;
         if(cs_work_get_context_stats(s->context,&memory)) return -4;
-        size_t available=memory.limit_bytes-memory.used_bytes,reserve=2*s->sort_limit;
+        size_t available=memory.limit_bytes-memory.used_bytes,reserve=group_reserve(s,n);
         available=available>reserve?available-reserve:available/2;
-        o->group_stride=sizeof(*o->groups)+(wide?n->nkeys*sizeof(struct qs_cell):0);
+        o->group_integer=1;
+        /* Runtime strings are canonical dictionary IDs, also 64-bit keys. */
+        for(unsigned k=0;k<n->nkeys;++k) {
+            unsigned type=n->expr.exprs[n->expr.keys[k]].type;
+            if(type!=Q_INTEGER && type!=Q_STRING) o->group_integer=0;
+        }
+        o->group_stride=sizeof(*o->groups)+(wide?n->nkeys*(o->group_integer?sizeof(int64_t):sizeof(struct qs_cell)):0);
+        o->group_stride=(o->group_stride+15)&~15U;
         unsigned capacity=128;
-        while(!wide && capacity< n->estimated_rows*8/7 && (size_t)capacity*2*o->group_stride<=available && capacity<UINT_MAX/2)
+        /* A leaf scan has no blocking child that needs this space first.
+         * Reserve its estimated groups directly, avoiding old+new tables. */
+        while((!wide || s->plan->nodes[n->left].kind==QP_SCAN) && capacity< n->estimated_rows*8/7 &&
+              (size_t)capacity*2*o->group_stride<=available && capacity<UINT_MAX/2)
             capacity*=2;
         for(;;) {
             o->groups=cs_work_calloc(s->context,capacity,o->group_stride);
@@ -1042,12 +1079,24 @@ static int64_t hash_aggregate_next(struct execution *s,unsigned id,struct qs_cel
             struct qs_cell key=keys[0];
             if(!wide && !key.isnull && (key.scale || key.value<INT64_MIN || key.value>INT64_MAX)) return -5;
             unsigned occupied=key.isnull?2:1,mask=o->group_capacity-1;
+            if(wide && o->group_integer) {
+                occupied=1;
+                for(unsigned k=0;k<n->nkeys;++k) {
+                    if(!keys[k].isnull && (keys[k].scale || keys[k].value<INT64_MIN || keys[k].value>INT64_MAX)) return -5;
+                    if(keys[k].isnull) occupied|=2U<<k;
+                }
+            }
             uint64_t hash=wide?group_hash(n,o->left):mix_hash(key.isnull?0:(uint64_t)key.value);
             unsigned at=hash&mask;
             struct compact_group *g;
             for(;;) {
                 g=group_at(o,at); if(!g->occupied) break;
-                int equal=wide?group_equal(s,n,keys,(struct qs_cell *)(g+1)):
+                int equal;
+                if(wide && o->group_integer) {
+                    const int64_t *values=(const void *)(g+1); equal=g->occupied==occupied;
+                    for(unsigned k=0;equal && k<n->nkeys;++k)
+                        if(!keys[k].isnull && values[k]!=(int64_t)keys[k].value) equal=0;
+                } else equal=wide?group_equal(s,n,keys,(struct qs_cell *)(g+1)):
                     g->occupied==occupied && (key.isnull || g->key==(int64_t)key.value);
                 if(equal<0) return equal;
                 if(equal) break;
@@ -1058,7 +1107,7 @@ static int64_t hash_aggregate_next(struct execution *s,unsigned id,struct qs_cel
                     unsigned capacity=o->group_capacity*2;
                     struct cs_work_context_stats m;
                     if(cs_work_get_context_stats(s->context,&m)) return -4;
-                    size_t available=m.limit_bytes-m.used_bytes,reserve=2*s->sort_limit;
+                    size_t available=m.limit_bytes-m.used_bytes,reserve=group_reserve(s,n);
                     available=available>reserve?available-reserve:0;
                     void *larger=wide && capacity>o->group_capacity && (size_t)capacity*o->group_stride<=available?
                         cs_work_calloc(s->context,capacity,o->group_stride):NULL;
@@ -1077,7 +1126,10 @@ static int64_t hash_aggregate_next(struct execution *s,unsigned id,struct qs_cel
                     o->group_phase=1; continue;
                 }
                 g->occupied=occupied; g->key=wide?(int64_t)hash:key.isnull?0:key.value; g->sum.isnull=1; ++o->group_count;
-                if(wide) memcpy(g+1,keys,n->nkeys*sizeof(*keys));
+                if(wide && o->group_integer) {
+                    int64_t *values=(void *)(g+1);
+                    for(unsigned k=0;k<n->nkeys;++k) values[k]=keys[k].isnull?0:(int64_t)keys[k].value;
+                } else if(wide) memcpy(g+1,keys,n->nkeys*sizeof(*keys));
             }
             struct qs_cell value={.value=1};
             if(kind!=Q_COUNT_STAR) {
@@ -1418,6 +1470,20 @@ restart:
         for(unsigned w=0;w<p->workers;++w) {
             struct cs_work_context_stats stats;
             if(cs_work_get_context_stats(s->context,&stats)) return -4;
+            const struct qp_node *leaf=&p->nodes[qp_probe_scan(p,root)];
+            size_t private_bytes=sizeof(*s)+p->count*sizeof(*s->nodes)+sizeof(struct qs_plan)+256;
+            if(leaf->ordered_index) private_bytes+=QS_INDEX_WORK_BYTES+sizeof(struct qs_plan);
+            size_t spill_reserve=0;
+            for(unsigned i=0;i<p->count;++i)
+                if(p->nodes[i].kind==QP_AGGREGATE && p->nodes[i].left==(int)root && s->nodes[i].group_capacity)
+                    spill_reserve=2*s->sort_limit;
+            /* Cursor/filter state is allocated lazily by the worker. Keep
+             * that space and the existing spill reserve before launching;
+             * otherwise a successful launch can fail on its first page. */
+            if(stats.limit_bytes-stats.used_bytes<(p->workers-w)*private_bytes+spill_reserve) {
+                close_workers(s); p->workers=1;
+                return next_row(s,root,row);
+            }
             cs_work_context *context=cs_work_begin_child(s->context,stats.limit_bytes);
             struct execution *e=context?cs_work_calloc(context,1,sizeof(*e)):NULL;
             if(e) e->nodes=cs_work_calloc(context,p->count,sizeof(*e->nodes));
@@ -1450,9 +1516,8 @@ restart:
                 }
             }
             *e->control=(struct qp_control){.state=(uintptr_t)e}; s->workers[w]=e;
-            const struct qp_node *leaf=&p->nodes[qp_probe_scan(p,root)];
             *(struct qs_chunk *)(s->arena+vector_offset(e,leaf))=
-                (struct qs_chunk){.capacity=qp_scan_buffer_bytes(p,leaf)/24,.ncols=leaf->expr.ncols};
+                (struct qs_chunk){.capacity=leaf->ordered_index?256:qp_scan_buffer_bytes(p,leaf)/24,.ncols=leaf->expr.ncols};
         }
         s->parallel_node=root; s->parallel_done=0;
         memset(s->parallel_position,0,sizeof(s->parallel_position)); atomic_store(&s->next_offset,0);

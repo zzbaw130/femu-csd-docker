@@ -402,7 +402,8 @@ static void nested_sort(function run,unsigned type,unsigned hash,unsigned kind)
                 assert(out->data[r].cells[1].isnull==want[seen].value.isnull);
                 if(!want[seen].value.isnull) assert(!qs_compare(out->data[r].cells[1],want[seen].value,&cmp) && !cmp);
                 if(want[seen].key==UINT32_MAX) assert(out->data[r].cells[0].isnull);
-                else assert(!out->data[r].cells[0].isnull && out->data[r].cells[0].value==want[seen].key); ++seen; continue;
+                else assert(!out->data[r].cells[0].isnull && out->data[r].cells[0].value==want[seen].key);
+                ++seen; continue;
             }
             if(seen>=rows || out->data[r].cells[1].value!=expected[seen]) {
                 fprintf(stderr,"nested sort row=%u got=%lld expected=%d\n",seen,(long long)out->data[r].cells[1].value,seen<rows?expected[seen]:0); abort();
@@ -430,7 +431,7 @@ static int multi_order(const void *ap,const void *bp)
     if(a->b==17 || b->b==17) return (a->b==17)-(b->b==17);
     return (a->b<b->b)-(a->b>b->b);
 }
-static void multiple_groups(function run,unsigned memory,unsigned kind)
+static void multiple_groups(function run,unsigned memory,unsigned kind,int integer_keys)
 {
     unsigned rows=50003,total=1022*18,groups=0; size_t raw_bytes;
     unsigned char *raw=heap(rows,2,&raw_bytes);
@@ -468,6 +469,19 @@ static void multiple_groups(function run,unsigned memory,unsigned kind)
     a->expr.outputs[0]=(struct qs_output){.index=0,.type_oid=25};
     a->expr.outputs[1]=(struct qs_output){.index=1,.type_oid=23};
     a->expr.outputs[2]=(struct qs_output){.index=2,.type_oid=1700};
+    if(integer_keys) {
+        leaf->expr.exprs[0].type=a->expr.exprs[0].type=Q_INTEGER;
+        leaf->expr.outputs[0].type_oid=a->expr.outputs[0].type_oid=23;
+    }
+    if(kind==Q_COUNT) {
+        /* DISTINCT stage emits each nullable pair once; the outer COUNT
+         * must ignore a NULL argument even when its group is retained. */
+        p->count=4; p->nodes[3]=*a;
+        p->nodes[3].expr.nout=p->nodes[3].expr.nexprs=2;
+        p->nodes[3].expr.aggs[0]=(struct qs_agg){.kind=Q_COUNT_STAR,.expr=-1};
+        a->left=3; a->expr.aggs[0].expr=1;
+        a->expr.outputs[2].type_oid=20; a->expr.exprs[2].type=Q_INTEGER;
+    }
     struct qp_node *sort=&p->nodes[0]; sort->kind=QP_SORT; sort->left=1; sort->right=-1;
     sort->expr=a->expr; sort->expr.nexprs=3; sort->expr.nattrs=3; sort->expr.naggs=0;
     sort->expr.work_mem_bytes=(uint64_t)memory*1024*1024; sort->expr.limit=-1;
@@ -491,8 +505,10 @@ static void multiple_groups(function run,unsigned memory,unsigned kind)
         for(unsigned r=0;r<out->rows;++r) {
             assert(seen<groups); const struct expected_multi *w=&expected[seen++]; struct qs_cell *v=out->data[r].cells;
             assert(v[0].isnull==(w->a==1021) && v[1].isnull==(w->b==17));
-            if(w->a!=1021) { char text[8]; int n=snprintf(text,sizeof(text),"k%04u",w->a); assert(qs_cell_string(&v[0])==(unsigned)n && !memcmp(qs_cell_string_bytes(&v[0]),text,n)); }
+            if(w->a!=1021 && integer_keys) assert(v[0].value==ids[w->a]);
+            else if(w->a!=1021) { char text[8]; int n=snprintf(text,sizeof(text),"k%04u",w->a); assert(qs_cell_string(&v[0])==(unsigned)n && !memcmp(qs_cell_string_bytes(&v[0]),text,n)); }
             if(w->b!=17) assert(v[1].value==(int)w->b-8);
+            if(kind==Q_COUNT) { assert(!v[2].isnull && v[2].value==!!w->count); continue; }
             assert(v[2].isnull==!w->count);
             if(w->count) {
                 struct qs_cell sum={.value=w->sum,.scale=2,.dscale=2}; int cmp;
@@ -531,8 +547,23 @@ static void parallel_dictionary(void)
     for(unsigned w=0;w<4;++w) assert(!pthread_join(threads[w],NULL));
     assert(d->count==20997); free(d);
 }
+static void merge_input_parallelism(void)
+{
+    struct qp_plan *p=calloc(1,sizeof(*p)); assert(p);
+    p->count=5;
+    for(unsigned i=0;i<p->count;++i) p->nodes[i].left=p->nodes[i].right=-1;
+    p->nodes[0].kind=QP_JOIN; p->nodes[0].left=1; p->nodes[0].right=2;
+    p->nodes[1].kind=QP_SCAN;
+    p->nodes[2].kind=QP_AGGREGATE; p->nodes[2].left=3;
+    p->nodes[3].kind=QP_SCAN; p->nodes[3].bytes=8*QP_SCAN_BYTES;
+    qp_parallel_boundaries(p,0); assert(p->nodes[3].parallel);
+    p->nodes[3].parallel=0; p->nodes[0].kind=QP_INDEX_JOIN;
+    qp_parallel_boundaries(p,0); assert(!p->nodes[3].parallel);
+    free(p);
+}
 int main(int argc,char **argv)
 {
+    merge_input_parallelism();
     assert(argc==2); void *library=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(library);
     function run=(function)dlsym(library,"pg_sina_plan"); assert(run); assert(!cs_work_init(64*1024*1024));
     for(int hash=0;hash<3;++hash)
@@ -562,6 +593,8 @@ int main(int argc,char **argv)
     nested_sort(run,23,0,Q_SUM); nested_sort(run,1700,0,Q_SUM);
     nested_sort(run,1700,1,Q_SUM); nested_sort(run,1700,1,Q_AVG); nested_sort(run,1700,2,Q_AVG);
     nested_sort(run,20,1,Q_COUNT); nested_sort(run,20,1,Q_COUNT_STAR); nested_sort(run,1700,3,Q_AVG); parallel_dictionary();
-    multiple_groups(run,4,Q_SUM); multiple_groups(run,64,Q_SUM); multiple_groups(run,4,Q_AVG);
+    multiple_groups(run,4,Q_SUM,0); multiple_groups(run,64,Q_SUM,0); multiple_groups(run,4,Q_AVG,0);
+    multiple_groups(run,4,Q_SUM,1); multiple_groups(run,64,Q_SUM,1); multiple_groups(run,4,Q_AVG,1);
+    multiple_groups(run,4,Q_COUNT,0); multiple_groups(run,64,Q_COUNT,0);
     puts("PASS native Plan joins, NULL/duplicate keys, MIN/MAX/AVG, spill and cleanup");
 }

@@ -572,6 +572,120 @@ static bool group_output(const struct qs_plan *p,int index,const struct qp_node 
     return (x->op==Q_ADD || x->op==Q_SUB || x->op==Q_MUL || x->op==Q_DIV) &&
         group_output(p,x->left,n) && group_output(p,x->right,n);
 }
+/* A unique integer-key join that only returns its key is a membership test.
+ * Move that test below GROUP BY, where it removes whole groups, never rows
+ * within a retained group. Reuse the existing device IN set and initializer. */
+static void push_group_key_filter(struct qp_plan *tree,struct qp_node *join)
+{
+    if(join->join_type!=QP_INNER || join->nkeys!=1 || join->join_qual>=0 ||
+       join->expr.predicate>=0 || tree->count+2>QP_NODES || tree->ninit==QP_PARAMS) return;
+    const struct qp_node *right=&tree->nodes[join->right];
+    if(right->kind!=QP_SCAN || right->expr.nout!=1 || join->right_keys[0]!=0 ||
+       right->expr.exprs[right->expr.outputs[0].index].type!=Q_INTEGER) return;
+    int id=join->left,column=join->left_keys[0];
+    while(id>=0 && tree->nodes[id].kind==QP_PROJECT) {
+        const struct qp_node *p=&tree->nodes[id];
+        const struct qs_expr *x=&p->expr.exprs[p->expr.outputs[column].index];
+        if(x->op!=Q_COLUMN || p->expr.predicate>=0) return;
+        column=x->column; id=p->left;
+    }
+    if(id<0) return;
+    struct qp_node *aggregate=&tree->nodes[id];
+    if(aggregate->kind!=QP_AGGREGATE || !aggregate->hash || aggregate->left<0) return;
+    const struct qs_expr *key=&aggregate->expr.exprs[aggregate->expr.outputs[column].index];
+    if(key->op!=Q_COLUMN || key->type!=Q_INTEGER) return;
+    int grouped=0;
+    for(unsigned k=0;k<aggregate->nkeys;++k) if(aggregate->left_keys[k]==key->column) grouped=1;
+    if(!grouped) return;
+    const struct qp_node *input=&tree->nodes[aggregate->left];
+    if(input->kind!=QP_SCAN || right->estimated_rows>=aggregate->estimated_rows/4) return;
+    unsigned width=tree->nodes[join->left].expr.nout;
+    for(unsigned i=0;i<join->expr.nexprs;++i) {
+        const struct qs_expr *x=&join->expr.exprs[i];
+        if(x->op==Q_COLUMN && x->column>=(int)width && x->column!=(int)width) return;
+    }
+    unsigned set=tree->count++,filter=tree->count++;
+    tree->nodes[set]=(struct qp_node){.kind=QP_SET,.left=join->right,.right=-1,.expr=right->expr};
+    unsigned init=tree->ninit++; tree->init_nodes[init]=set; tree->init_params[init]=-1;
+    struct qp_node *f=&tree->nodes[filter];
+    *f=(struct qp_node){.kind=QP_PROJECT,.left=aggregate->left,.right=-1,.estimated_rows=input->estimated_rows};
+    f->expr.nattrs=f->expr.ncols=f->expr.nout=f->expr.nexprs=input->expr.nout;
+    f->expr.having=-1; f->expr.limit=-1;
+    for(unsigned i=0;i<f->expr.nout;++i) {
+        f->expr.outputs[i]=input->expr.outputs[i]; f->expr.outputs[i].index=i;
+        f->expr.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.column=i,.type=input->expr.exprs[input->expr.outputs[i].index].type};
+        f->expr.cols[i]=(struct qs_column){.slot=i,.type=f->expr.exprs[i].type};
+    }
+    f->expr.predicate=add_expr(&f->expr,(struct qs_expr){.op=QP_INSET,.type=Q_BOOLEAN,.left=key->column,.column=set});
+    aggregate->left=filter;
+    for(unsigned i=0;i<join->expr.nexprs;++i) {
+        struct qs_expr *x=&join->expr.exprs[i];
+        if(x->op==Q_COLUMN && x->column==(int)width) x->column=join->left_keys[0];
+    }
+    join->kind=QP_PROJECT; join->right=-1; join->hash=join->nkeys=0;
+    join->expr.nattrs=join->expr.ncols=width; join->expr.norder=0;
+}
+/* GROUP BY a left primary key after LEFT JOIN COUNT(right.value): count the
+ * right rows first and join one count per key. Missing matches still yield 0.
+ * The primary-key guard is essential: duplicate/NULL left keys cannot bypass
+ * the original grouping. No extra scan or intermediate row format is needed. */
+static void push_left_join_count(struct qp_plan *tree,struct qp_node *aggregate)
+{
+    struct qs_plan *p=&aggregate->expr;
+    if(!aggregate->hash || aggregate->nkeys!=1 || p->naggs!=1 || p->aggs[0].kind!=Q_COUNT ||
+       p->predicate>=0 || p->having>=0 || tree->count==QP_NODES || p->nexprs+2>QS_EXPRS) return;
+    struct qp_node *join=&tree->nodes[aggregate->left];
+    if(join->kind!=QP_JOIN || !join->hash || join->join_type!=QP_LEFT || join->nkeys!=1 ||
+       join->join_qual>=0 || join->expr.predicate>=0) return;
+    const struct qp_node *left=&tree->nodes[join->left],*right=&tree->nodes[join->right];
+    if(left->kind!=QP_SCAN || !(left->ordered_index&4) || right->kind!=QP_SCAN) return;
+    unsigned width=left->expr.nout;
+    const struct qs_expr *primary=&left->expr.exprs[left->expr.outputs[join->left_keys[0]].index];
+    if(primary->op!=Q_COLUMN || primary->column!=left->expr.join.build_key-1) return;
+    const struct qs_expr *group=&join->expr.exprs[join->expr.outputs[aggregate->left_keys[0]].index];
+    const struct qs_expr *argument=&p->exprs[p->aggs[0].expr];
+    if(group->op!=Q_COLUMN || group->column!=join->left_keys[0] || argument->op!=Q_COLUMN) return;
+    const struct qs_expr *value=&join->expr.exprs[join->expr.outputs[argument->column].index];
+    if(value->op!=Q_COLUMN || value->column<(int)width) return;
+    int column=value->column-width,key=join->right_keys[0];
+    if(column==key) return;
+    for(unsigned i=0;i<join->expr.nexprs;++i) {
+        const struct qs_expr *x=&join->expr.exprs[i];
+        if(x->op==Q_COLUMN && x->column>=(int)width && x->column!=(int)width+key && x->column!=(int)width+column) return;
+    }
+    for(unsigned i=0;i<p->nout;++i) if(!group_output(p,p->outputs[i].index,aggregate)) return;
+    Relation index=relation_open(left->expr.join.indexid,NoLock);
+    bool unique=index->rd_index->indisprimary && index->rd_index->indnkeyatts==1;
+    relation_close(index,NoLock); if(!unique) return;
+    unsigned id=tree->count++; struct qp_node *count=&tree->nodes[id];
+    *count=(struct qp_node){.kind=QP_AGGREGATE,.left=join->right,.right=-1,.hash=1,.nkeys=1,
+        .estimated_rows=left->estimated_rows};
+    count->left_keys[0]=key; count->expr.nkeys=1; count->expr.keys[0]=0;
+    count->expr.predicate=count->expr.having=-1; count->expr.limit=-1;
+    count->expr.nattrs=count->expr.ncols=right->expr.nout; count->expr.nexprs=3; count->expr.nout=2;
+    count->expr.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.column=key,.type=Q_INTEGER};
+    count->expr.exprs[1]=(struct qs_expr){.op=Q_COLUMN,.column=column,.type=argument->type};
+    count->expr.exprs[2]=(struct qs_expr){.op=Q_AGGREF,.column=0,.type=Q_INTEGER};
+    count->expr.outputs[0]=right->expr.outputs[key]; count->expr.outputs[0].index=0;
+    count->expr.outputs[1]=(struct qs_output){.index=2,.type_oid=INT8OID};
+    count->expr.naggs=1; count->expr.aggs[0]=(struct qs_agg){.kind=Q_COUNT,.expr=1};
+    for(unsigned i=0;i<join->expr.nexprs;++i) {
+        struct qs_expr *x=&join->expr.exprs[i];
+        if(x->op==Q_COLUMN && x->column>=(int)width) x->column=width+(x->column==(int)width+column);
+    }
+    join->right=id; join->right_keys[0]=0; join->expr.nattrs=join->expr.ncols=width+2;
+    join->expr.cols[width].type=join->expr.cols[width+1].type=Q_INTEGER;
+    for(unsigned i=0;i<join->expr.nout;++i)
+        if(join->expr.exprs[join->expr.outputs[i].index].op==Q_COLUMN &&
+           join->expr.exprs[join->expr.outputs[i].index].column==(int)width+1)
+            join->expr.outputs[i]=(struct qs_output){.index=join->expr.outputs[i].index,.type_oid=INT8OID,.typmod=-1};
+    int input=add_expr(p,(struct qs_expr){.op=Q_COLUMN,.column=argument->column,.type=Q_INTEGER});
+    int zero=add_expr(p,(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER});
+    for(unsigned i=0;i<p->nexprs;++i) if(p->exprs[i].op==Q_AGGREF)
+        p->exprs[i]=(struct qs_expr){.op=QP_COALESCE,.left=input,.right=zero,.type=Q_INTEGER};
+    aggregate->kind=QP_PROJECT; aggregate->hash=aggregate->nkeys=aggregate->sorted_input=0;
+    p->naggs=p->nkeys=0;
+}
 static int ordered_heap_scan(struct binding *b,struct qp_plan *tree,unsigned id,Oid indexid,ScanDirection direction,bool ordered,bool index_only)
 {
     if(direction==NoMovementScanDirection || (!ordered && !index_only)) return id;
@@ -581,12 +695,20 @@ static int ordered_heap_scan(struct binding *b,struct qp_plan *tree,unsigned id,
        index_metadata(indexid,b->node->expr.relid,index->rd_index->indkey.values[0],&b->node->expr.join)) {
         b->node->ordered_index=1;
         int key=index->rd_index->indkey.values[0]-1;
+        int second=index->rd_index->indnatts>1?index->rd_index->indkey.values[1]-1:-1;
+        bool second_integer=second>=0 && second<(int)b->node->expr.nattrs &&
+            b->node->expr.cols[second].type==Q_INTEGER &&
+            (b->node->expr.cols[second].length==2 || b->node->expr.cols[second].length==4 || b->node->expr.cols[second].length==8);
         bool covered=index_only && key>=0 && key<(int)b->node->expr.nattrs;
         for(unsigned i=0;i<b->node->expr.nattrs;++i)
-            if(b->node->expr.cols[i].slot>=0 && (int)i!=key) covered=false;
+            if(b->node->expr.cols[i].slot>=0 && (int)i!=key && (!second_integer || (int)i!=second)) covered=false;
         if(covered) {
             b->node->ordered_index|=4;
+            if(!ordered) b->node->ordered_index|=8; /* Independent physical leaf ranges. */
             b->node->expr.join.build_key=key+1;
+            /* The existing second-key field also describes a covered leaf
+             * tuple; point lookups retain their original argument layout. */
+            b->node->expr.join.build_key2=second_integer?second+1:0;
         }
         if(!ordered && !covered) {
             b->node->ordered_index=0; memset(&b->node->expr.join,0,sizeof(b->node->expr.join));
@@ -752,6 +874,9 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
             }
         }
         if(!n->nkeys) return -1;
+        /* Keep PG's join order, but equality joins whose output need not be
+         * ordered can use Hash without sorting both complete inputs. */
+        if(!ordered) n->hash=1;
         if(IsA(native,MergeJoin)) {
             MergeJoin *m=(MergeJoin *)native;
             for(unsigned i=0;i<n->nkeys;++i)
@@ -854,6 +979,46 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
             }
         }
     }
+    /* DISTINCT already sorts by group keys plus its argument inside the
+     * aggregate. Bypass PG's grouping-only Sort when it is a pure identity. */
+    if(n->kind==QP_AGGREGATE && n->distinct && n->left>=0 && tree->nodes[n->left].kind==QP_SORT) {
+        struct qp_node *sort=&tree->nodes[n->left];
+        bool identity=sort->left>=0 && sort->expr.nout==tree->nodes[sort->left].expr.nout;
+        for(unsigned i=0;identity && i<sort->expr.nout;++i) {
+            const struct qs_expr *x=&sort->expr.exprs[sort->expr.outputs[i].index];
+            if(x->op!=Q_COLUMN || x->column!=(int)i) identity=false;
+        }
+        if(identity) { n->left=sort->left; n->sorted_input=0; }
+    }
+    /* Like DuckDB's DISTINCT table, first deduplicate (group, argument), then
+     * COUNT the non-NULL arguments. Both stages use the existing bounded Hash
+     * Aggregate and spill protocol. Restrict this to an exact key projection. */
+    if(n->kind==QP_AGGREGATE && n->distinct && n->nkeys<QS_KEYS && p->naggs==1 &&
+       p->aggs[0].kind==Q_COUNT && p->predicate<0 && p->having<0 && tree->count<QP_NODES) {
+        unsigned width=tree->nodes[n->left].expr.nout,mask=1U<<(n->distinct-1);
+        bool supported=width==n->nkeys+1;
+        for(unsigned k=0;k<n->nkeys;++k) mask|=1U<<n->left_keys[k];
+        if(mask!=((1U<<width)-1)) supported=false;
+        for(unsigned i=0;i<p->nout;++i) if(!group_output(p,p->outputs[i].index,n)) supported=false;
+        if(supported) {
+            unsigned dedup=tree->count++; struct qp_node *d=&tree->nodes[dedup];
+            *d=(struct qp_node){.kind=QP_AGGREGATE,.left=n->left,.right=-1,.hash=1,
+                .estimated_rows=tree->nodes[n->left].estimated_rows};
+            d->expr.predicate=d->expr.having=-1; d->expr.limit=-1;
+            d->expr.nattrs=d->expr.ncols=d->expr.nexprs=d->expr.nout=width;
+            for(unsigned i=0;i<width;++i) {
+                const struct qs_output *out=&tree->nodes[n->left].expr.outputs[i];
+                d->expr.outputs[i]=*out; d->expr.outputs[i].index=i;
+                d->expr.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.column=i,
+                    .type=tree->nodes[n->left].expr.exprs[out->index].type};
+                d->expr.cols[i]=(struct qs_column){.slot=i,.type=d->expr.exprs[i].type};
+                d->left_keys[i]=d->expr.keys[i]=i;
+            }
+            d->nkeys=d->expr.nkeys=width; d->expr.naggs=1;
+            d->expr.aggs[0]=(struct qs_agg){.kind=Q_COUNT_STAR,.expr=-1};
+            n->left=dedup; n->distinct=n->distinct_aggs=n->sorted_input=0; n->hash=1;
+        }
+    }
     if(n->kind==QP_SCAN && IsA(native,IndexScan)) {
         int extra=conditions(&b,((IndexScan *)native)->indexqualorig); if(extra==-2) return -1;
         if(extra>=0) p->predicate=p->predicate<0?extra:add_expr(p,(struct qs_expr){.op=Q_AND,.type=Q_BOOLEAN,.left=p->predicate,.right=extra});
@@ -866,6 +1031,8 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
         if(extra>=0) p->predicate=p->predicate<0?extra:add_expr(p,(struct qs_expr){.op=Q_AND,.type=Q_BOOLEAN,.left=p->predicate,.right=extra});
         return ordered_heap_scan(&b,tree,id,index->indexid,index->indexorderdir,ordered,true);
     }
+    if(n->kind==QP_JOIN && !ordered && ((Join *)native)->inner_unique) push_group_key_filter(tree,n);
+    if(n->kind==QP_AGGREGATE) push_left_join_count(tree,n);
     return id;
 }
 
