@@ -18,9 +18,11 @@
 
 本项目约定：`cparam1` 的最低位表示计时开关，其余位为执行槽编号；0 推进整树，1–64 执行当前并行流水线。可用和已消费槽的位图为 64 位，最高槽使用第 63 位；64 槽的完整掩码为 UINT64_MAX。执行槽不是固定的物理 CU 绑定，每次普通 E1 请求占用一个可用 CU。`cparam2` 仍仅由 SNIA 用于 spill 重入。参数顺序由双方代码约定，不改变 SNIA/FEMU 接口，也没有参数解码框架。
 
-设备 Scan 需要数据页时写控制记录并正常返回；Guest 仅把这些地址转换为 `csQueueStorageRequest(NVM_TO_AFDM)` 再继续调用。扫描块由 Guest 根据 FDM 容量在 4/2/1 MiB 中选择，索引按需读取 8 KiB 页。原始数据不经过 Guest PG 缓冲。设备执行中发现 spill 需要时直接返回 `csNeedStore/Load/Free` 完成值，由已有 SNIA batch 调度器处理并重入，PG 不接收或解释中间行。
+并行 Heap 顺序扫描由 Guest 按空闲 worker 提前分配不重叠的数据块，提交 `LOAD→CSF`。CSF 的现有 cparam1 低位保留 profile 和 worker 编号，位 8 表示此次附带已安排的输入，位 9 以上为 Heap 页号；cparam2 仍仅用于 spill 重入。这是本应用的计算参数约定，不改变 SNIA/FEMU 接口。设备接收输入后连续执行当前算子链，CompValue 的低三位分别表示有输出、输入耗尽、worker 完成，省去每块数据的控制记录读取和 ready 写入；有输出尚未被下游消费时不覆盖缓冲。共享 Hash/聚合 Sink 能消费下一批时，在同一次 CSF 内继续处理当前输入块。
 
-Guest 从 PG 选定的树中标记可并行的扫描/投影/Hash 或 Index Probe 段，包含初始化和 Hash Build 输入。设备先完成共享 Hash 表，再建立各 CU 独立的游标；任务从原子游标动态领取输入块。阻塞节点消费投影后的行批次，不重复构建 Hash 表。Guest 通过已有事件和批次请求推进每个完成的槽，不需要设备调度 runtime 或代理。
+索引、临时分区及串行 Scan 仍在需要数据页时写控制记录并正常返回，Guest 把地址转换为 `csQueueStorageRequest(NVM_TO_AFDM)` 再继续调用。扫描块由 Guest 根据 FDM 容量在 4/2/1 MiB 中选择，索引按需读取 8 KiB 页。原始数据不经过 Guest PG 缓冲。设备执行中发现 spill 需要时直接返回 `csNeedStore/Load/Free` 完成值，由已有 SNIA batch 调度器处理并重入，PG 不接收或解释中间行。
+
+Guest 从 PG 选定的树中标记可并行的扫描/投影/Hash 或 Index Probe 段，包含初始化和 Hash Build 输入。设备先完成共享 Hash 表，再建立各 CU 独立的游标；Heap 输入由 PG 动态分配，索引及临时分区任务继续从设备原子游标领取。阻塞节点消费投影后的行批次，不重复构建 Hash 表。Guest 通过已有事件和批次请求推进每个完成的槽，不需要设备调度 runtime 或代理。
 
 不同流水线依次复用 AFDM；各任务的动态状态通过子 context 计入同一个查询预算。整树节点仍按行拉取组合，中间值保持精确 `qs_cell` 的 int128、精度和 NULL；Scan/Filter 则复用已有列向量和 SIMD 路径。Q1/Q6 继续使用下文的单表快路径。
 

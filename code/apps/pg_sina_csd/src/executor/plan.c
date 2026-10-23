@@ -19,6 +19,8 @@ struct plan_slot {
     CS_EVT_HANDLE event;
     CS_REQ_HANDLE pending;
     bool ready, done;
+    unsigned scan_node;
+    bool need_input;
     uint64_t queued_ns;
 };
 typedef struct {
@@ -26,12 +28,14 @@ typedef struct {
     struct qp_plan *plan;
     struct plan_slot slots[QS_WORKERS+1];
     unsigned workers, epoch, device_cus;
+    uint64_t next_scan_offset;
     bool parallel;
     uint64_t load_ns, load_calls;
     /* Host-thread wall times: queue/load preparation are subsets of submit;
      * pending time is summed across concurrent requests, not query latency. */
     uint64_t poll_ns, completion_copy_ns, submit_ns, queue_ns, control_write_ns, idle_ns, pending_ns;
     uint64_t submits, polls, completions;
+    uint64_t scheduled_loads, completion_reads, control_writes;
     struct qs_request files[QP_NODES];
     struct qs_extent *extents[QP_NODES];
     struct qs_request indexes[QP_NODES];
@@ -175,6 +179,7 @@ static void start(PlanStateCsd *s)
     s->profiling=pg_sina_profile; s->start_ns=clock_ns(); s->load_ns=s->load_calls=0;
     s->poll_ns=s->completion_copy_ns=s->submit_ns=s->queue_ns=s->control_write_ns=0;
     s->idle_ns=s->pending_ns=s->submits=s->polls=s->completions=0;
+    s->scheduled_loads=s->completion_reads=s->control_writes=0;
     memset(s->plan->pipelines,0,sizeof(s->plan->pipelines));
     s->plan->nodes[s->plan->root].expr.work_mem_bytes=pg_sina_query_memory();
     s->lock_fd=open(device,O_RDONLY|O_CLOEXEC);
@@ -316,29 +321,48 @@ static void submit(PlanStateCsd *s,unsigned worker)
 {
     uint64_t started=s->profiling?clock_ns():0;
     struct plan_slot *slot=&s->slots[worker];
+    uint64_t parameter=s->profiling|(worker<<1);
+    bool assigned=slot->scan_node && slot->need_input;
+    if(assigned) {
+        const struct qp_node *n=&s->plan->nodes[slot->scan_node-1];
+        uint64_t offset=Min(s->next_scan_offset,n->bytes);
+        slot->control.node=slot->scan_node-1; slot->control.offset=offset;
+        slot->control.bytes=Min((uint64_t)s->plan->scan_bytes,n->bytes-offset);
+        slot->control.ready=slot->control.index_nreads=0;
+        if(offset<n->bytes) { s->next_scan_offset+=slot->control.bytes; ++s->scheduled_loads; }
+        Assert(offset%QS_PAGE==0 && offset/QS_PAGE<=(UINT64_MAX>>QP_SCAN_PAGE_SHIFT));
+        parameter|=QP_SCAN_INPUT | ((offset/QS_PAGE)<<QP_SCAN_PAGE_SHIFT);
+        slot->need_input=false;
+    }
     if((slot->control.bytes || slot->control.index_nreads) && !slot->control.ready) {
         unsigned groups=1;
         for(unsigned j=1;j<slot->control.index_nreads;++j)
             groups+=slot->control.index_reads[j].slot!=slot->control.index_reads[j-1].slot+1;
         if(groups<64) checked(csAllocBatchRequest(CS_BATCH_SERIAL,groups+1,&slot->resume),"allocate LOAD batch");
         slot->previous=0; load_pages(s,worker);
-        uint64_t written=s->profiling?clock_ns():0;
-        checked(transfer(s->memory[1],worker*sizeof(struct qp_control)+offsetof(struct qp_control,ready),&slot->control.ready,sizeof(slot->control.ready),true),"resume LOAD");
-        if(s->profiling) s->control_write_ns+=clock_ns()-written;
-        if(slot->resume) {
-            CsBatchRequest *request=palloc0(sizeof(*request)+6*sizeof(CsComputeArg));
-            request->ReqType=CS_QUEUE_COMPUTE; request->u.Compute.CSFId=s->function; request->u.Compute.NumArgs=6;
-            for(unsigned i=0;i<5;++i) csHelperSetComputeArg(&request->u.Compute.Args[i],CS_AFDM_TYPE,s->memory[i],0UL);
-            csHelperSetComputeArg(&request->u.Compute.Args[4],CS_AFDM_TYPE,worker?s->worker_io[worker-1]:s->memory[4],0UL);
-            csHelperSetComputeArg(&request->u.Compute.Args[5],CS_64BIT_VALUE_TYPE,(u64)(s->profiling|(worker<<1)));
-            CS_BATCH_INDEX current;
-            checked(csConfigureBatchEntry(slot->resume,CS_BATCH_ADD,request,0,slot->previous,&current),"configure resumed compute"); pfree(request);
+        if(!assigned) {
+            uint64_t written=s->profiling?clock_ns():0;
+            checked(transfer(s->memory[1],worker*sizeof(struct qp_control)+offsetof(struct qp_control,ready),&slot->control.ready,sizeof(slot->control.ready),true),"resume LOAD");
+            if(s->profiling) { s->control_write_ns+=clock_ns()-written; ++s->control_writes; }
         }
+    } else if(assigned) {
+        /* No LOAD at EOF, but each live worker must finish its own state. */
+        checked(csAllocBatchRequest(CS_BATCH_SERIAL,1,&slot->resume),"allocate scan EOF batch");
+        slot->previous=0;
+    }
+    if(slot->resume) {
+        CsBatchRequest *request=palloc0(sizeof(*request)+6*sizeof(CsComputeArg));
+        request->ReqType=CS_QUEUE_COMPUTE; request->u.Compute.CSFId=s->function; request->u.Compute.NumArgs=6;
+        for(unsigned i=0;i<5;++i) csHelperSetComputeArg(&request->u.Compute.Args[i],CS_AFDM_TYPE,s->memory[i],0UL);
+        csHelperSetComputeArg(&request->u.Compute.Args[4],CS_AFDM_TYPE,worker?s->worker_io[worker-1]:s->memory[4],0UL);
+        csHelperSetComputeArg(&request->u.Compute.Args[5],CS_64BIT_VALUE_TYPE,(u64)parameter);
+        CS_BATCH_INDEX current;
+        checked(csConfigureBatchEntry(slot->resume,CS_BATCH_ADD,request,0,slot->previous,&current),"configure resumed compute"); pfree(request);
     }
     if(!worker && slot->control.available) {
         uint64_t written=s->profiling?clock_ns():0;
         checked(transfer(s->memory[1],offsetof(struct qp_control,available),&slot->control.available,sizeof(slot->control.available),true),"provide worker rows");
-        if(s->profiling) s->control_write_ns+=clock_ns()-written;
+        if(s->profiling) { s->control_write_ns+=clock_ns()-written; ++s->control_writes; }
     }
     if(s->profiling) slot->queued_ns=clock_ns();
     CS_STATUS status=csQueueBatchRequest(slot->resume?slot->resume:slot->batch,NULL,NULL,slot->event,&slot->pending,NULL);
@@ -358,14 +382,22 @@ static void fetch(PlanStateCsd *s)
             struct plan_slot *slot=&s->slots[w];
             if(!slot->pending) continue;
             uint64_t polled=s->profiling?clock_ns():0;
-            HOLD_INTERRUPTS(); CS_STATUS status=csPollEvent(slot->event,NULL,NULL);
+            u64 value=0;
+            HOLD_INTERRUPTS(); CS_STATUS status=csPollEvent(slot->event,NULL,&value);
             uint64_t completed=s->profiling?clock_ns():0;
             if(s->profiling) { s->poll_ns+=completed-polled; ++s->polls; }
             if(status==CS_NOT_DONE) { RESUME_INTERRUPTS(); continue; }
             if(s->profiling) { s->pending_ns+=completed-slot->queued_ns; ++s->completions; }
             slot->pending=NULL;
-            CS_STATUS copied=transfer(s->memory[1],w*sizeof(struct qp_control),&slot->control,sizeof(slot->control),false);
-            if(status==CS_SUCCESS) status=copied;
+            if(w && slot->scan_node && status==CS_SUCCESS) {
+                slot->control.output_rows=(value&QP_OUTPUT_READY)!=0;
+                slot->control.finished=(value&QP_WORKER_FINISHED)!=0;
+                slot->need_input=(value&QP_INPUT_DRAINED)!=0;
+            } else {
+                CS_STATUS copied=transfer(s->memory[1],w*sizeof(struct qp_control),&slot->control,sizeof(slot->control),false);
+                if(status==CS_SUCCESS) status=copied;
+                if(s->profiling) ++s->completion_reads;
+            }
             struct qs_result header;
             if(!w) {
                 memset(&header,0,offsetof(struct qs_result,data));
@@ -384,9 +416,15 @@ static void fetch(PlanStateCsd *s)
             s->parallel=slot->control.parallel;
             if(slot->control.epoch!=s->epoch) {
                 s->epoch=slot->control.epoch;
-                for(unsigned i=1;i<=s->workers;++i) s->slots[i].ready=s->slots[i].done=false;
-                for(unsigned i=1;i<=s->workers;++i)
-                    checked(transfer(s->memory[1],i*sizeof(struct qp_control),&s->slots[i].control,sizeof(struct qp_control),false),"read worker state");
+                s->next_scan_offset=0;
+                for(unsigned i=1;i<=s->workers;++i) {
+                    struct plan_slot *worker=&s->slots[i];
+                    worker->ready=worker->done=false;
+                    worker->scan_node=slot->control.scan_node;
+                    worker->need_input=worker->scan_node!=0;
+                    if(worker->scan_node) memset(&worker->control,0,sizeof(worker->control));
+                    else checked(transfer(s->memory[1],i*sizeof(struct qp_control),&worker->control,sizeof(worker->control),false),"read worker state");
+                }
             }
             if(s->result->rows>QS_RESULT_ROWS) elog(ERROR,"invalid CSD result page");
             if(s->result->rows) {
@@ -548,6 +586,9 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
             ExplainPropertyInteger("CSD Host Submissions",NULL,s->submits,es);
             ExplainPropertyInteger("CSD Host Polls",NULL,s->polls,es);
             ExplainPropertyInteger("CSD Host Completions",NULL,s->completions,es);
+            ExplainPropertyInteger("CSD Host Assigned LOADs",NULL,s->scheduled_loads,es);
+            ExplainPropertyInteger("CSD Host Completion Reads",NULL,s->completion_reads,es);
+            ExplainPropertyInteger("CSD Host Control Writes",NULL,s->control_writes,es);
         }
     }
 }

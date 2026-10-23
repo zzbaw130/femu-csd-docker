@@ -132,7 +132,7 @@ struct execution {
     struct qs_profile profile;
     uint64_t local_profile_cpu, pipeline_start, pipeline_tick;
     uint64_t sink_ns,sink_rows;
-    bool profiling;
+    bool profiling, host_scan, scan_drained;
     struct femu_csd_args *args;
     unsigned initializer,initializer_phase;
     unsigned worker, parallel_position[QS_WORKERS];
@@ -984,6 +984,10 @@ static int64_t scan_next(struct execution *s,unsigned id,struct qs_cell *row)
             }
             o->scan_position=0; o->position+=task.input_bytes; s->control->ready=0; s->control->bytes=0; continue;
         }
+        if(s->host_scan && id==(unsigned)qp_probe_scan(s->plan,s->root)) {
+            s->scan_drained=true;
+            return o->position>=n->bytes?0:QP_WAIT;
+        }
         if(s->worker && id==(unsigned)qp_probe_scan(s->plan,s->root))
             o->position=atomic_fetch_add_explicit(&s->owner->next_offset,s->plan->scan_bytes,memory_order_relaxed);
         if(o->position>=n->bytes) return 0;
@@ -1666,6 +1670,12 @@ restart:
         s->parallel_node=root; s->parallel_done=0;
         memset(s->parallel_position,0,sizeof(s->parallel_position)); atomic_store(&s->next_offset,0);
         s->control->parallel=hash_sink || group_sink?2:1; ++s->control->epoch; s->control->available=s->control->drained=0;
+        s->control->scan_node=0;
+        int scan=qp_probe_scan(p,root);
+        bool scheduled=s->partition_join<0 && scan>=0 && !p->nodes[scan].ordered_index;
+        for(int id=root;scheduled && id!=scan;id=p->nodes[id].left)
+            if(p->nodes[id].kind==QP_INDEX_JOIN) scheduled=false;
+        if(scheduled) s->control->scan_node=scan+1;
         s->parallel_started=1; s->used_workers=p->workers;
         if(s->profiling) { s->pipeline_start=now_ns(CLOCK_MONOTONIC); s->pipeline_tick=now_ns(CLOCK_THREAD_CPUTIME_ID); }
     }
@@ -1752,7 +1762,7 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
     if(!a || a->numr!=5 || a->mr_len[0]<(long long)sizeof(struct qp_plan) ||
         a->mr_len[1]<(long long)sizeof(struct qp_control) || a->mr_len[2]<(long long)sizeof(struct qs_result) ||
         a->mr_len[4]<QS_SORT_IO_BYTES) return -1;
-    struct qp_plan *plan=a->mr_addr[0]; unsigned worker=(uint64_t)a->cparam1>>1;
+    struct qp_plan *plan=a->mr_addr[0]; unsigned worker=((uint64_t)a->cparam1>>1)&127;
     if(plan->workers>QS_WORKERS || worker>plan->workers || a->mr_len[1]<(long long)((worker+1)*sizeof(struct qp_control)) ||
        a->mr_len[2]<(long long)((worker+1)*sizeof(struct qs_result))) return -1;
     struct qp_control *control=(struct qp_control *)a->mr_addr[1]+worker;
@@ -1777,6 +1787,20 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
         s->profiling=a->cparam1&1; s->outputs=a->mr_addr[2]; control->state=(uintptr_t)s;
     }
     s->args=a;
+    if(((uint64_t)a->cparam1&QP_SCAN_INPUT) && !csIsReentry(a)) {
+        int id=qp_probe_scan(plan,s->root);
+        uint64_t page=(uint64_t)a->cparam1>>QP_SCAN_PAGE_SHIFT;
+        if(!worker || id<0 || plan->nodes[id].ordered_index || page>UINT64_MAX/QS_PAGE) return -1;
+        struct qp_node *n=&plan->nodes[id]; struct operator_state *o=&s->nodes[id];
+        uint64_t offset=page*QS_PAGE;
+        if(offset>n->bytes || (s->host_scan && !s->scan_drained)) return -1;
+        s->host_scan=true; s->scan_drained=false;
+        o->position=offset; o->scan_position=0;
+        struct qs_chunk *chunk=(void *)(s->arena+vector_offset(s,n)); chunk->rows=chunk->selected=0;
+        control->node=id; control->offset=offset;
+        control->bytes=n->bytes-offset<plan->scan_bytes?n->bytes-offset:plan->scan_bytes;
+        control->ready=control->bytes!=0;
+    }
     /* The last AFDM is private to this CU, also for SNIA NEED_LOAD/STORE. */
     s->io=a->mr_addr[4]; s->io_bytes=a->mr_len[4];
     /* SNIA may invoke us repeatedly inside one batch submission for spill.
@@ -1819,6 +1843,7 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
     /* Internal buffers pack only the pipeline's projected columns. A two-column
      * pipeline fits 2048 rows in the same AFDM as 256 final sixteen-cell rows. */
     unsigned capacity=worker?QS_RESULT_ROWS*QS_OUT/(columns?columns:1):QS_RESULT_ROWS;
+produce:
     while(status>=0 && status!=QP_WAIT && status<=2 && out->rows<capacity) {
         struct qs_cell *row=worker?(struct qs_cell *)out->data+(size_t)out->rows*columns:out->data[out->rows].cells;
         status=next_row(s,worker?(int)s->root:(int)plan->root,row);
@@ -1841,6 +1866,9 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
         if(s->hash_sink) hash_sink_batch(s,out);
         if(s->group_sink) { int added=group_sink_batch(s,out); if(added<0) status=added; }
         if(s->profiling) { s->sink_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-cpu; s->sink_rows+=rows-out->rows; }
+        /* A direct sink can consume another output batch from the same input
+         * without asking PG to submit another compute request. */
+        if(s->host_scan && !out->rows && status==2) goto produce;
     }
     if(s->profiling) {
         struct qs_timing *t=&s->profile.operators[QS_JOIN_PROBE];
@@ -1859,6 +1887,9 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
     struct cs_work_context_stats memory;
     if(!cs_work_get_context_stats(s->context,&memory)) out->metrics.work_peak=memory.peak_used_bytes;
     if(status<0) return status;
+    if(worker && s->host_scan && status<=2)
+        return (out->rows?QP_OUTPUT_READY:0) | (s->scan_drained?QP_INPUT_DRAINED:0) |
+            (out->finished?QP_WORKER_FINISHED:0);
     if(out->finished && !worker) close_execution(s);
     return status==QP_WAIT?0:status>2?status:0;
 }

@@ -6,6 +6,14 @@
 #define QP_NODES 96
 #define QP_PARAMS 128
 #define QP_SCAN_BYTES (1024U*1024)
+/* cparam1: profile bit 0, CU slot bits 1..7. A scheduled heap input uses
+ * bit 8 and its page number in bits 9..63; cparam2 stays reserved for spill. */
+#define QP_SCAN_INPUT (UINT64_C(1)<<8)
+#define QP_SCAN_PAGE_SHIFT 9
+/* Ordinary CompValue bits for a host-scheduled scan, below SNIA spill bits. */
+#define QP_OUTPUT_READY 1U
+#define QP_INPUT_DRAINED 2U
+#define QP_WORKER_FINISHED 4U
 enum qp_kind { QP_SCAN, QP_PROJECT, QP_JOIN, QP_AGGREGATE, QP_SORT, QP_LIMIT, QP_INDEX_JOIN, QP_CTE_SCAN, QP_MATERIALIZED, QP_SET };
 enum qp_join { QP_INNER, QP_LEFT, QP_SEMI, QP_ANTI };
 enum qp_expr { QP_PARAMETER=Q_DIV+1, QP_LIKE, QP_SUBSTRING, QP_COALESCE, QP_INSET };
@@ -43,6 +51,8 @@ struct qp_control {
     unsigned error_node;
     /* parallel=2 adds a CU wave barrier before a shared sink can resize/spill. */
     unsigned parallel, epoch;
+    /* One-based heap scan whose input blocks PG can assign in this phase. */
+    unsigned scan_node;
     uint64_t available, drained;
     /* Completion metadata avoids a second AFDM read for internal row batches. */
     unsigned output_rows, peak_cus;

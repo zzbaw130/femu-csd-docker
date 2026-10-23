@@ -9,9 +9,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <stdbool.h>
+#include <stdatomic.h>
 typedef int64_t (*function)(struct femu_csd_args *);
 enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL };
 static unsigned test_workers=4;
+static bool test_scheduled;
 static void w16(void *p,uint16_t x) { memcpy(p,&x,2); }
 static void w32(void *p,uint32_t x) { memcpy(p,&x,4); }
 static unsigned char *heap(unsigned rows,unsigned side,size_t *size)
@@ -67,6 +70,9 @@ struct probe_test {
     unsigned worker;
     void **tokens;
     size_t ntokens;
+    atomic_uint_fast64_t *next_offset;
+    bool *need_input;
+    unsigned scan_node;
 };
 static void *probe_worker(void *arg)
 {
@@ -78,7 +84,17 @@ static void *probe_worker(void *arg)
     for(unsigned iteration=0;;++iteration) {
         assert(iteration<1000000);
         struct qp_control *c=t->control;
-        if((c->index_nreads || c->bytes) && !c->ready) {
+        t->args.cparam1=(t->worker<<1)|(t->args.cparam1&1);
+        if(t->next_offset && *t->need_input && !csIsReentry(&t->args)) {
+            const struct qp_node *n=&t->plan->nodes[t->scan_node-1];
+            uint64_t offset=atomic_fetch_add(t->next_offset,t->plan->scan_bytes);
+            if(offset>n->bytes) offset=n->bytes;
+            size_t bytes=n->bytes-offset<t->plan->scan_bytes?n->bytes-offset:t->plan->scan_bytes;
+            size_t input=t->worker>1?n->parallel_input+(t->worker-2)*t->plan->parallel_stride:n->input_offset;
+            memcpy(t->arena+input,((t->scan_node-1==3 || t->scan_node-1==6)?t->heap:t->raw)+offset,bytes);
+            t->args.cparam1|=QP_SCAN_INPUT | ((offset/QS_PAGE)<<QP_SCAN_PAGE_SHIFT);
+            *t->need_input=false;
+        } else if(!t->next_offset && (c->index_nreads || c->bytes) && !c->ready) {
             const struct qp_node *n=&t->plan->nodes[c->node];
             size_t offset=t->worker>1?n->parallel_input+(t->worker-2)*t->plan->parallel_stride:n->input_offset;
             if(c->index_nreads) {
@@ -91,13 +107,19 @@ static void *probe_worker(void *arg)
             c->ready=1;
         }
         int64_t status=t->run(&t->args); assert(status>=0);
-        if(status) {
+        if((uint64_t)status>>60) {
             uint64_t op=(uint64_t)status>>60,id=(uint64_t)status&CS_IO_VALUE_MASK;
             assert(op==2 && id && id<=t->ntokens && t->tokens[id-1]);
             memcpy(t->args.mr_addr[4],t->tokens[id-1],QS_SORT_IO_BYTES);
             t->args.cparam2=id; continue;
         }
         t->args.cparam2=0;
+        if(t->next_offset) {
+            assert((unsigned)status<=7);
+            assert(((status&QP_OUTPUT_READY)!=0)==(t->out->rows!=0));
+            assert(((status&QP_WORKER_FINISHED)!=0)==(t->out->finished!=0));
+            *t->need_input=(status&QP_INPUT_DRAINED)!=0;
+        }
         if(t->out->rows || t->out->finished) return NULL;
         /* A direct sink can consume a batch without emitting rows or I/O. */
     }
@@ -238,12 +260,18 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         }
     }
     uint64_t available=0,done=0; unsigned epoch=0;
+    atomic_uint_fast64_t host_offset=0;
+    bool need_input[QS_WORKERS]={0};
     for(unsigned iteration=0;!out->finished;++iteration) {
         if(control.parallel && !csIsReentry(&args)) {
             pthread_t threads[QS_WORKERS]; struct probe_test tasks[QS_WORKERS]; uint64_t started=0;
             for(unsigned w=0;w<plan->workers;++w) if(!((available|done)&(UINT64_C(1)<<w))) {
-                tasks[w]=(struct probe_test){run,args,plan,&controls[w+1],&out[w+1],arena,raw[0],raw[1],index,w+1,tokens,ntokens};
+                tasks[w]=(struct probe_test){run,args,plan,&controls[w+1],&out[w+1],arena,raw[0],raw[1],index,w+1,tokens,ntokens,NULL,NULL,0};
                 tasks[w].args.cparam1=((w+1)<<1)|(args.cparam1&1);
+                if(test_scheduled && control.scan_node) {
+                    tasks[w].next_offset=&host_offset; tasks[w].need_input=&need_input[w];
+                    tasks[w].scan_node=control.scan_node;
+                }
                 assert(!pthread_create(&threads[w],NULL,probe_worker,&tasks[w])); started|=UINT64_C(1)<<w;
             }
             for(unsigned w=0;w<plan->workers;++w) if(started&(UINT64_C(1)<<w)) {
@@ -265,7 +293,11 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             continue;
         }
         args.cparam2=0; available&=~control.drained;
-        if(control.epoch!=epoch) { epoch=control.epoch; available=done=0; }
+        if(control.epoch!=epoch) {
+            epoch=control.epoch; available=done=0;
+            atomic_store(&host_offset,0);
+            for(unsigned w=0;w<plan->workers;++w) need_input[w]=true;
+        }
         for(unsigned r=0;r<out->rows;++r) {
             if(parallel==TEST_COUNT_ROWS || parallel>=TEST_PARTITION) {
                 uint64_t expected=0; for(unsigned i=0;i<12;++i) expected+=counts[i];
@@ -523,13 +555,19 @@ static void multiple_groups(function run,unsigned memory,unsigned kind,int integ
     void *mr[]={p,&control,out,arena,io}; long long len[]={sizeof(*p),(workers+1)*sizeof(*controls),(workers+1)*sizeof(*out),bytes,(workers+1)*QS_SORT_IO_BYTES};
     struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=len,.cparam1=workers?1:0};
     uint64_t available=0,done=0; unsigned epoch=0;
+    atomic_uint_fast64_t host_offset=0;
+    bool need_input[QS_WORKERS]={0};
     void **tokens=NULL; unsigned ntokens=0,seen=0;
     while(!out->finished) {
         if(control.parallel && !csIsReentry(&args)) {
             pthread_t threads[QS_WORKERS]; struct probe_test tasks[QS_WORKERS]; uint64_t started=0;
             for(unsigned w=0;w<p->workers;++w) if(!((available|done)&(UINT64_C(1)<<w))) {
-                tasks[w]=(struct probe_test){run,args,p,&controls[w+1],&out[w+1],arena,raw,raw,NULL,w+1,tokens,ntokens};
+                tasks[w]=(struct probe_test){run,args,p,&controls[w+1],&out[w+1],arena,raw,raw,NULL,w+1,tokens,ntokens,NULL,NULL,0};
                 tasks[w].args.cparam1=((w+1)<<1)|1;
+                if(test_scheduled && control.scan_node) {
+                    tasks[w].next_offset=&host_offset; tasks[w].need_input=&need_input[w];
+                    tasks[w].scan_node=control.scan_node;
+                }
                 assert(!pthread_create(&threads[w],NULL,probe_worker,&tasks[w])); started|=UINT64_C(1)<<w;
             }
             for(unsigned w=0;w<p->workers;++w) if(started&(UINT64_C(1)<<w)) {
@@ -547,7 +585,11 @@ static void multiple_groups(function run,unsigned memory,unsigned kind,int integ
             continue;
         }
         args.cparam2=0; available&=~control.drained;
-        if(control.epoch!=epoch) { epoch=control.epoch; available=done=0; }
+        if(control.epoch!=epoch) {
+            epoch=control.epoch; available=done=0;
+            atomic_store(&host_offset,0);
+            for(unsigned w=0;w<p->workers;++w) need_input[w]=true;
+        }
         for(unsigned r=0;r<out->rows;++r) {
             assert(seen<groups); const struct expected_multi *w=&expected[seen++]; struct qs_cell *v=out->data[r].cells;
             assert(v[0].isnull==(w->a==1021) && v[1].isnull==(w->b==17));
@@ -632,6 +674,11 @@ int main(int argc,char **argv)
     if(argc==4) {
         assert(!strcmp(argv[2],"--workers")); test_workers=strtoul(argv[3],NULL,10);
         assert(test_workers && test_workers<=QS_WORKERS && !cs_work_init(256*1024*1024));
+        test_scheduled=true;
+        for(unsigned join=QP_INNER;join<=QP_ANTI;++join)
+            test(run,join,20003,23,256,1,TEST_BUILD_PHASE);
+        test(run,QP_INNER,31,50003,256,1,TEST_BUILD_PHASE);
+        test_scheduled=false;
         for(unsigned join=QP_INNER;join<=QP_ANTI;++join)
             test(run,join,20003,23,256,1,TEST_BUILD_PHASE);
         test(run,QP_INNER,31,50003,256,1,TEST_BUILD_PHASE);
@@ -643,6 +690,18 @@ int main(int argc,char **argv)
         return 0;
     }
     assert(!cs_work_init(64*1024*1024));
+    test_scheduled=true;
+    for(unsigned join=QP_INNER;join<=QP_ANTI;++join) {
+        test(run,join,20003,23,64,1,TEST_BUILD_PHASE);
+        test(run,join,31,50003,64,1,TEST_BUILD_PHASE);
+    }
+    test(run,QP_INNER,31,23,64,1,TEST_BUILD_PHASE);
+    test(run,QP_INNER,0,23,64,1,TEST_COUNT_ROWS);
+    test(run,QP_LEFT,20003,23,4,1,TEST_HASH_GROUP);
+    test(run,QP_INNER,31,150000,4,1,TEST_PARTITION);
+    multiple_groups(run,64,Q_SUM,0,4); multiple_groups(run,64,Q_AVG,1,4);
+    multiple_groups(run,64,Q_COUNT,0,4); multiple_groups(run,4,Q_SUM,1,4);
+    test_scheduled=false;
     for(int hash=0;hash<3;++hash)
         for(unsigned join=QP_INNER;join<=QP_ANTI;++join) test(run,join,517,23,64,hash,TEST_SERIAL);
     for(unsigned join=QP_INNER;join<=QP_ANTI;++join) {
