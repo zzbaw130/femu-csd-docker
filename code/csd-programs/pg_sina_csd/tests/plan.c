@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <pthread.h>
 typedef int64_t (*function)(struct femu_csd_args *);
-enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN };
+enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH };
 static void w16(void *p,uint16_t x) { memcpy(p,&x,2); }
 static void w32(void *p,uint32_t x) { memcpy(p,&x,4); }
 static unsigned char *heap(unsigned rows,unsigned side,size_t *size)
@@ -91,6 +91,22 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
 {
     struct qp_plan *plan=calloc(1,sizeof(*plan)); assert(plan); plan->count=4; plan->scan_bytes=parallel==TEST_LARGE_SCAN?QS_CHUNK:QP_SCAN_BYTES;
     scan(&plan->nodes[2]); scan(&plan->nodes[3]);
+    __int128 factor=parallel==TEST_WIDE_HASH?((__int128)1<<64):parallel==TEST_SIGNED_HASH?-1:parallel==TEST_BIGINT_HASH?INT64_C(1)<<32:1;
+    if(parallel==TEST_WIDE_HASH) {
+        struct qs_plan *p=&plan->nodes[3].expr; p->nexprs=6;
+        /* Constants are int64; two products create a genuine int128 payload. */
+        p->exprs[2]=(struct qs_expr){.op=Q_CONST,.type=Q_DECIMAL,.constant=INT64_C(1)<<32,.scale=2,.dscale=3};
+        p->exprs[3]=(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=1,.right=2,.scale=2,.dscale=3};
+        p->exprs[4]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=INT64_C(1)<<32};
+        p->exprs[5]=(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=3,.right=4,.scale=2,.dscale=3};
+        p->outputs[1]=(struct qs_output){.index=5,.type_oid=1700};
+    }
+    if(parallel==TEST_SIGNED_HASH || parallel==TEST_BIGINT_HASH) {
+        struct qs_plan *p=&plan->nodes[3].expr; p->nexprs=4;
+        p->exprs[2]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=(int64_t)factor};
+        p->exprs[3]=(struct qs_expr){.op=Q_MUL,.type=Q_INTEGER,.left=1,.right=2};
+        p->outputs[1]=(struct qs_output){.index=3,.type_oid=parallel==TEST_BIGINT_HASH?20:23};
+    }
     struct qp_node *j=&plan->nodes[1]; j->kind=QP_JOIN; j->left=2; j->right=3; j->join_type=join; j->join_qual=-1;
     j->hash=hash==1;
     if(hash==2) {
@@ -237,8 +253,10 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
                 fprintf(stderr,"join=%u key=%u count=%lld expected=%llu sum=%lld expected=%llu\n",join,key,(long long)v[2].value,(unsigned long long)counts[key],(long long)v[1].value,(unsigned long long)sums[key]);
             assert(v[1].isnull==!counts[key] && v[2].value==counts[key]);
             if(counts[key]) {
-                assert(v[1].value==sums[key] && v[3].value==mins[key] && v[4].value==maxs[key]);
-                struct qs_cell avg; assert(!qs_average((struct qs_cell){.value=sums[key]},counts[key],&avg));
+                unsigned min=factor<0?maxs[key]:mins[key],max=factor<0?mins[key]:maxs[key];
+                assert(v[1].value==(__int128)sums[key]*factor && v[3].value==(__int128)min*factor && v[4].value==(__int128)max*factor);
+                if(parallel==TEST_WIDE_HASH) assert(v[1].scale==2 && v[1].dscale==3);
+                struct qs_cell avg; assert(!qs_average((struct qs_cell){.value=(__int128)sums[key]*factor,.scale=parallel==TEST_WIDE_HASH?2:0,.dscale=parallel==TEST_WIDE_HASH?3:0},counts[key],&avg));
                 assert(v[5].value==avg.value && v[5].scale==avg.scale);
             }
         }
@@ -413,6 +431,9 @@ int main(int argc,char **argv)
     test(run,QP_INNER,120000,23,8,1,TEST_PARALLEL);
     test(run,QP_INNER,120000,23,8,1,TEST_LARGE_SCAN);
     test(run,QP_INNER,5170,23,64,1,TEST_COUNT_ROWS);
+    test(run,QP_LEFT,23,23,64,1,TEST_WIDE_HASH);
+    test(run,QP_LEFT,23,23,64,1,TEST_SIGNED_HASH);
+    test(run,QP_LEFT,23,23,64,1,TEST_BIGINT_HASH);
     test(run,QP_LEFT,20000,23,4,0,TEST_SERIAL);
     test(run,QP_LEFT,73,20000,8,1,TEST_SERIAL);
     test(run,QP_INNER,73,60000,8,1,TEST_BUILD_FALLBACK);

@@ -265,10 +265,33 @@ void *cs_work_realloc(cs_work_context *handle, void *ptr, size_t bytes)
     void *p = NULL;
     if (!b)
         goto out;
+    if (bytes > SIZE_MAX - sizeof(block) - (ALIGN - 1)) {
+        errno = ENOMEM;
+        goto out;
+    }
     size_t old = b->h.requested;
+    size_t need = sizeof(block) + (bytes + ALIGN - 1) / ALIGN * ALIGN;
+    /* An adjacent free tail can grow the block without a second full copy.
+     * Charge only the added span, including every parent context's limit. */
+    if (need > b->h.span && b->h.next && !b->h.next->h.owner) {
+        size_t combined = b->h.span + b->h.next->h.span;
+        size_t charge = combined >= need && combined - need >= sizeof(block) + ALIGN ? need : combined;
+        if (combined >= need && may_charge(ctx, charge - b->h.span)) {
+            size_t original = b->h.span;
+            merge_next_locked(b);
+            split_locked(b, need);
+            pool.used += b->h.span - original;
+            pool.requested += bytes - old;
+            account(ctx,original,b->h.span,old,bytes,0,0);
+            if (pool.used > pool.peak)
+                pool.peak = pool.used;
+            b->h.requested = bytes;
+            p = ptr;
+            goto out;
+        }
+    }
     if (bytes <= b->h.span - sizeof(block)) {
         /* Shrink in place and return a usable tail to the shared pool. */
-        size_t need = sizeof(block) + (bytes + ALIGN - 1) / ALIGN * ALIGN;
         size_t original = b->h.span;
         split_locked(b, need);
         if (b->h.span != original)

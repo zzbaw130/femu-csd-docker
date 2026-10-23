@@ -80,6 +80,17 @@ int main(void)
     assert(!cs_work_get_context_stats(a,&local) && local.requested_bytes==7*1024);
     assert(!cs_work_alloc(c1,12*1024));
     assert(!cs_work_end(c1) && !cs_work_end(c2) && !cs_work_end(a));
+    /* Growth fits the parent only in place; the old+new copies would exceed it. */
+    a=cs_work_begin_limit(16*1024); c1=cs_work_begin_child(a,16*1024);
+    p=cs_work_alloc(c1,8*1024); assert(p); memset(p,0x5a,8*1024);
+    assert(cs_work_realloc(c1,p,12*1024)==p);
+    for(unsigned i=0;i<8*1024;++i) assert(p[i]==0x5a);
+    assert(!cs_work_get_context_stats(a,&local) && local.requested_bytes==12*1024 && local.allocations==1);
+    assert(!cs_work_realloc(c1,p,16*1024) && errno==ENOMEM);
+    assert(p[8191]==0x5a);
+    assert(!cs_work_get_context_stats(a,&local) && local.requested_bytes==12*1024);
+    assert(!cs_work_realloc(c1,p,SIZE_MAX) && errno==ENOMEM);
+    assert(!cs_work_end(c1) && !cs_work_end(a));
     pthread_t threads[8];
     for (unsigned i = 0; i < 8; i++)
         assert(!pthread_create(&threads[i], NULL, stress, NULL));

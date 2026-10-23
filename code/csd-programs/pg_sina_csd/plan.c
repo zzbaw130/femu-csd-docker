@@ -17,6 +17,39 @@ extern int64_t pg_sina_sort_sink_impl(struct femu_csd_args *);
 extern int64_t pg_sina_sort_source_impl(struct femu_csd_args *);
 extern void qs_sort_dictionary(uint64_t,struct qs_dict *);
 #define QP_WAIT 1
+/* Store PG integer/date widths directly; numeric and other values retain all
+ * 128 bits. Keep scale/dscale/NULL, and avoid unaligned integer accesses. */
+static unsigned hash_value_bytes(const struct qs_plan *p,unsigned column)
+{
+    switch(p->outputs[column].type_oid) {
+    case 16:case 21:case 23:case 1082:return 4;
+    case 20:return 8;
+    default:return 16;
+    }
+}
+static unsigned hash_row_bytes(const struct qs_plan *p)
+{
+    unsigned bytes=0; for(unsigned i=0;i<p->nout;++i) bytes+=hash_value_bytes(p,i)+3;
+    return bytes;
+}
+static void hash_store(unsigned char *to,const struct qs_cell *from,const struct qs_plan *p)
+{
+    for(unsigned i=0;i<p->nout;++i) {
+        unsigned bytes=hash_value_bytes(p,i);
+        memcpy(to,&from[i].value,bytes);
+        to[bytes]=from[i].scale; to[bytes+1]=from[i].dscale; to[bytes+2]=from[i].isnull; to+=bytes+3;
+    }
+}
+static void hash_load(struct qs_cell *to,const unsigned char *from,const struct qs_plan *p)
+{
+    for(unsigned i=0;i<p->nout;++i) {
+        unsigned bytes=hash_value_bytes(p,i);
+        if(bytes==4) { int32_t v; memcpy(&v,from,4); to[i].value=v; }
+        else if(bytes==8) { int64_t v; memcpy(&v,from,8); to[i].value=v; }
+        else memcpy(&to[i].value,from,16);
+        to[i].scale=from[bytes]; to[i].dscale=from[bytes+1]; to[i].isnull=from[bytes+2]; from+=bytes+3;
+    }
+}
 struct sorted_rows {
     struct qs_plan plan;
     struct qs_task task;
@@ -24,7 +57,7 @@ struct sorted_rows {
     struct qs_result *input,*output;
     unsigned position;
     int initialized, complete, drained, input_pending;
-    struct qs_cell *prefix;
+    unsigned char *prefix;
     unsigned prefix_rows,prefix_position;
     struct qs_metrics metrics;
 };
@@ -56,7 +89,7 @@ struct operator_state {
     unsigned index_count, index_unmatched;
     unsigned index_position;
     int index_resume, index_flush;
-    struct qs_cell *hash_data;
+    unsigned char *hash_data;
     unsigned hash_rows,hash_capacity,hash_match,hash_phase;
     int hash_matched,hash_fallback,hash_shared;
     struct compact_group *groups;
@@ -308,8 +341,8 @@ static int64_t sorted_input(struct execution *s,struct sorted_rows *sort,unsigne
             sort->input_pending=0; sort->input->rows=0;
         }
         if(sort->prefix_position<sort->prefix_rows) {
-            memcpy(sort->input->data[sort->input->rows].cells,
-                sort->prefix+(size_t)sort->prefix_position++*input->expr.nout,input->expr.nout*sizeof(struct qs_cell));
+            hash_load(sort->input->data[sort->input->rows].cells,
+                sort->prefix+(size_t)sort->prefix_position++*hash_row_bytes(&input->expr),&input->expr);
             status=2;
         } else {
             if(sort->prefix) { cs_work_free(s->context,sort->prefix); sort->prefix=NULL; }
@@ -350,9 +383,10 @@ static uint64_t row_hash(const struct qp_node *n,const struct qs_cell *row,int r
 static int64_t hash_build(struct execution *s,unsigned id)
 {
     const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
-    unsigned rn=s->plan->nodes[n->right].expr.nout;
+    const struct qs_plan *right=&s->plan->nodes[n->right].expr;
+    unsigned row_bytes=hash_row_bytes(right);
     if(o->hash_fallback) return 0;
-    size_t stride=rn*sizeof(struct qs_cell)+3*sizeof(uint32_t);
+    size_t stride=row_bytes+3*sizeof(uint32_t);
     /* Hash build is not a sort run: allow it to use the query budget while
      * retaining two sort quotas for a Merge fallback. The parent allocator
      * still enforces actual usage across all active nodes and workers. */
@@ -361,6 +395,8 @@ static int64_t hash_build(struct execution *s,unsigned id)
     size_t hash_limit=memory.limit_bytes-2*s->sort_limit;
     if(!o->hash_capacity) {
         uint64_t estimate=s->plan->nodes[n->right].estimated_rows;
+        /* Blocking children need their working space before producing rows. */
+        if(s->plan->nodes[n->right].kind!=QP_SCAN) estimate=128;
         unsigned max=1; while((size_t)max*2*stride<=hash_limit && max<UINT_MAX/4) max*=2;
         unsigned capacity=128; while(capacity<estimate && capacity<max) capacity*=2;
         if(capacity>max) capacity=max;
@@ -376,19 +412,21 @@ static int64_t hash_build(struct execution *s,unsigned id)
                 /* Preserve already-built projected rows. The fallback sorts
                  * this prefix plus the remaining child stream, never rereads
                  * or decodes the original heap for another build batch. */
-                o->right_sort.prefix=o->hash_data; o->right_sort.prefix_rows=o->hash_rows;
+                size_t used=(size_t)o->hash_rows*row_bytes;
+                void *prefix=cs_work_realloc(s->context,o->hash_data,used);
+                o->right_sort.prefix=prefix?prefix:o->hash_data; o->right_sort.prefix_rows=o->hash_rows;
                 o->hash_data=NULL; o->hash_fallback=1; return 0;
             }
             o->hash_data=data; o->hash_capacity*=2;
         }
-        int64_t status=next_row(s,n->right,o->hash_data+(size_t)o->hash_rows*rn);
+        int64_t status=next_row(s,n->right,o->right);
         if(status==QP_WAIT || status<0 || status>2) return status;
-        if(status==2) { ++o->hash_rows; ++s->metrics.build_rows; continue; }
-        uint32_t *next=(void *)(o->hash_data+(size_t)o->hash_capacity*rn),*buckets=next+o->hash_capacity;
+        if(status==2) { hash_store(o->hash_data+(size_t)o->hash_rows*row_bytes,o->right,right); ++o->hash_rows; ++s->metrics.build_rows; continue; }
+        uint32_t *next=(void *)(o->hash_data+(size_t)o->hash_capacity*row_bytes),*buckets=next+o->hash_capacity;
         memset(buckets,0xff,(size_t)o->hash_capacity*2*sizeof(*buckets));
         for(unsigned i=0;i<o->hash_rows;++i) {
-            const struct qs_cell *v=o->hash_data+(size_t)i*rn;
-            unsigned bucket=row_hash(n,v,1)&(2*o->hash_capacity-1);
+            hash_load(o->right,o->hash_data+(size_t)i*row_bytes,right);
+            unsigned bucket=row_hash(n,o->right,1)&(2*o->hash_capacity-1);
             next[i]=buckets[bucket]; buckets[bucket]=i;
         }
         o->hash_phase=1;
@@ -399,9 +437,11 @@ static int64_t hash_next(struct execution *s,unsigned id,struct qs_cell *row)
 {
     const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
     unsigned rn=s->plan->nodes[n->right].expr.nout,ln=s->plan->nodes[n->left].expr.nout;
+    const struct qs_plan *right_plan=&s->plan->nodes[n->right].expr;
+    unsigned row_bytes=hash_row_bytes(right_plan);
     if(!o->hash_phase && !o->hash_fallback) { int64_t status=hash_build(s,id); if(status) return status; }
     if(o->hash_fallback) return join_next(s,id,row);
-    uint32_t *next=(void *)(o->hash_data+(size_t)o->hash_capacity*rn),*buckets=next+o->hash_capacity;
+    uint32_t *next=(void *)(o->hash_data+(size_t)o->hash_capacity*row_bytes),*buckets=next+o->hash_capacity;
     for(;;) {
         if(!o->have_left) {
             int64_t status=next_row(s,n->left,o->left);
@@ -415,7 +455,8 @@ static int64_t hash_next(struct execution *s,unsigned id,struct qs_cell *row)
         }
         while(o->hash_match) {
             unsigned at=o->hash_match-1; o->hash_match=next[at]==UINT_MAX?0:next[at]+1;
-            const struct qs_cell *right=o->hash_data+(size_t)at*rn;
+            hash_load(o->right,o->hash_data+(size_t)at*row_bytes,right_plan);
+            const struct qs_cell *right=o->right;
             if(key_compare(s,n,o->left,right)) continue;
             int null=0; for(unsigned i=0;i<n->nkeys;++i) null|=right[n->right_keys[i]].isnull;
             if(null) continue;
@@ -785,7 +826,8 @@ static int64_t hash_aggregate_next(struct execution *s,unsigned id,struct qs_cel
     if(!o->group_capacity) {
         struct cs_work_context_stats memory;
         if(cs_work_get_context_stats(s->context,&memory)) return -4;
-        size_t available=(memory.limit_bytes-memory.used_bytes)/2;
+        size_t available=memory.limit_bytes-memory.used_bytes,reserve=2*s->sort_limit;
+        available=available>reserve?available-reserve:available/2;
         unsigned capacity=128;
         while(capacity< n->estimated_rows*8/7 && (size_t)capacity*2*sizeof(*o->groups)<=available && capacity<UINT_MAX/2)
             capacity*=2;
