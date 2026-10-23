@@ -29,7 +29,9 @@ static unsigned hash_value_bytes(const struct qs_plan *p,unsigned column)
 }
 static unsigned hash_row_bytes(const struct qs_plan *p)
 {
-    unsigned bytes=0; for(unsigned i=0;i<p->nout;++i) bytes+=hash_value_bytes(p,i)+3;
+    unsigned bytes=0; for(unsigned i=0;i<p->nout;++i) {
+        unsigned value=hash_value_bytes(p,i); bytes+=value+(value<16?1:3);
+    }
     return bytes;
 }
 static void hash_store(unsigned char *to,const struct qs_cell *from,const struct qs_plan *p)
@@ -37,7 +39,8 @@ static void hash_store(unsigned char *to,const struct qs_cell *from,const struct
     for(unsigned i=0;i<p->nout;++i) {
         unsigned bytes=hash_value_bytes(p,i);
         memcpy(to,&from[i].value,bytes);
-        to[bytes]=from[i].scale; to[bytes+1]=from[i].dscale; to[bytes+2]=from[i].isnull; to+=bytes+3;
+        if(bytes<16) { to[bytes]=from[i].isnull; to+=bytes+1; }
+        else { to[bytes]=from[i].scale; to[bytes+1]=from[i].dscale; to[bytes+2]=from[i].isnull; to+=bytes+3; }
     }
 }
 static void hash_load(struct qs_cell *to,const unsigned char *from,const struct qs_plan *p)
@@ -47,7 +50,8 @@ static void hash_load(struct qs_cell *to,const unsigned char *from,const struct 
         if(bytes==4) { int32_t v; memcpy(&v,from,4); to[i].value=v; }
         else if(bytes==8) { int64_t v; memcpy(&v,from,8); to[i].value=v; }
         else memcpy(&to[i].value,from,16);
-        to[i].scale=from[bytes]; to[i].dscale=from[bytes+1]; to[i].isnull=from[bytes+2]; from+=bytes+3;
+        if(bytes<16) { to[i].scale=to[i].dscale=0; to[i].isnull=from[bytes]; from+=bytes+1; }
+        else { to[i].scale=from[bytes]; to[i].dscale=from[bytes+1]; to[i].isnull=from[bytes+2]; from+=bytes+3; }
     }
 }
 struct sorted_rows {

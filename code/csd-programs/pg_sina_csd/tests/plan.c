@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <pthread.h>
 typedef int64_t (*function)(struct femu_csd_args *);
-enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH };
+enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP };
 static void w16(void *p,uint16_t x) { memcpy(p,&x,2); }
 static void w32(void *p,uint32_t x) { memcpy(p,&x,4); }
 static unsigned char *heap(unsigned rows,unsigned side,size_t *size)
@@ -137,6 +137,11 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         a->expr.naggs=a->expr.nout=1; a->expr.aggs[0]=(struct qs_agg){.kind=Q_COUNT_STAR};
         a->expr.outputs[0]=(struct qs_output){.index=3,.type_oid=20};
     }
+    if(parallel==TEST_HASH_GROUP) {
+        a->hash=1; a->estimated_rows=12; a->expr.naggs=1; a->expr.nout=2;
+        a->expr.aggs[0]=(struct qs_agg){.expr=2,.kind=Q_COUNT};
+        a->expr.outputs[1]=(struct qs_output){.index=3,.type_oid=20};
+    }
     if(parallel==TEST_BUILD_FALLBACK) {
         /* The small inner build needs a parallel grouped input; the large
          * outer build falls back while its own scan still has buffered rows. */
@@ -249,6 +254,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             }
             struct qs_cell *v=out->data[r].cells; unsigned key=v[0].isnull?11:(unsigned)v[0].value;
             assert(key<12 && seen[key]); seen[key]=0; ++got;
+            if(parallel==TEST_HASH_GROUP) { assert(!v[1].isnull && v[1].value==counts[key]); continue; }
             if(v[1].isnull!=!counts[key] || v[2].value!=counts[key])
                 fprintf(stderr,"join=%u key=%u count=%lld expected=%llu sum=%lld expected=%llu\n",join,key,(long long)v[2].value,(unsigned long long)counts[key],(long long)v[1].value,(unsigned long long)sums[key]);
             assert(v[1].isnull==!counts[key] && v[2].value==counts[key]);
@@ -434,6 +440,8 @@ int main(int argc,char **argv)
     test(run,QP_LEFT,23,23,64,1,TEST_WIDE_HASH);
     test(run,QP_LEFT,23,23,64,1,TEST_SIGNED_HASH);
     test(run,QP_LEFT,23,23,64,1,TEST_BIGINT_HASH);
+    test(run,QP_LEFT,5170,23,4,1,TEST_HASH_GROUP);
+    test(run,QP_INNER,5170,23,64,1,TEST_HASH_GROUP);
     test(run,QP_LEFT,20000,23,4,0,TEST_SERIAL);
     test(run,QP_LEFT,73,20000,8,1,TEST_SERIAL);
     test(run,QP_INNER,73,60000,8,1,TEST_BUILD_FALLBACK);

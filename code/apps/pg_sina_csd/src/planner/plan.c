@@ -647,6 +647,10 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
          * Parameterized index paths are handled by their parent below. */
         n->kind=QP_SCAN; b.scan=((Scan *)native)->scanrelid;
         if(!describe_scan(root,(Scan *)native,p)) return -1;
+        /* PG parallel scan rows are per worker; this device node consumes the
+         * complete relation. Use PG's total filtered estimate for reservation. */
+        if(native->parallel_aware && root->simple_rel_array[b.scan])
+            n->estimated_rows=root->simple_rel_array[b.scan]->rows;
     } else if(IsA(native,HashJoin) || IsA(native,MergeJoin) || IsA(native,NestLoop)) {
         Join *j=(Join *)native; n->kind=QP_JOIN;
         n->hash=IsA(native,HashJoin);
@@ -792,19 +796,22 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
         if(l->limitCount) { if(!IsA(l->limitCount,Const)) return -1; Const *v=(Const *)l->limitCount; if(!v->constisnull) p->limit=DatumGetInt64(v->constvalue); }
         if(l->limitOffset) { if(!IsA(l->limitOffset,Const)) return -1; Const *v=(Const *)l->limitOffset; if(!v->constisnull) p->offset=DatumGetInt64(v->constvalue); }
     }
-    /* Replace a grouping-only Sort over a scan when no parent needs its order.
-     * Keep joins and ordered/index-backed aggregation unchanged. */
+    /* Keep PG HashAggregate, or remove a grouping-only Sort when no parent
+     * needs its order. The same bounded states consume projected/join rows. */
     if(n->kind==QP_AGGREGATE && !ordered && n->nkeys==1 && p->naggs==1 && !n->distinct && !n->distinct_aggs &&
-       p->predicate<0 && p->having<0 && n->left>=0 && tree->nodes[n->left].kind==QP_SORT) {
-        int scan=tree->nodes[n->left].left,key=n->left_keys[0];
+       p->predicate<0 && p->having<0 && n->left>=0 && (tree->nodes[n->left].kind==QP_SORT ||
+        (IsA(native,Agg) && ((Agg *)native)->aggstrategy==AGG_HASHED))) {
+        bool remove_sort=tree->nodes[n->left].kind==QP_SORT;
+        int input=remove_sort?tree->nodes[n->left].left:n->left,key=n->left_keys[0];
         unsigned kind=p->aggs[0].kind;
-        bool supported=scan>=0 && tree->nodes[scan].kind==QP_SCAN && !tree->nodes[scan].ordered_index &&
+        bool supported=input>=0 && (!remove_sort || tree->nodes[input].kind==QP_JOIN ||
+            (tree->nodes[input].kind==QP_SCAN && !tree->nodes[input].ordered_index)) &&
             p->exprs[p->keys[0]].type==Q_INTEGER &&
             (kind==Q_COUNT_STAR || ((kind==Q_SUM || kind==Q_AVG || kind==Q_COUNT) && p->aggs[0].expr>=0 &&
              p->exprs[p->aggs[0].expr].op==Q_COLUMN));
         const struct qs_plan *sorted=&tree->nodes[n->left].expr;
-        if(scan>=0) {
-            if(sorted->nout!=tree->nodes[scan].expr.nout) supported=false;
+        if(remove_sort && input>=0) {
+            if(sorted->nout!=tree->nodes[input].expr.nout) supported=false;
             for(unsigned i=0;i<sorted->nout;++i) {
                 const struct qs_expr *x=&sorted->exprs[sorted->outputs[i].index];
                 if(x->op!=Q_COLUMN || x->column!=(int)i) supported=false;
@@ -813,7 +820,7 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
         for(unsigned i=0;i<p->nout;++i) {
             if(!group_output(p,p->outputs[i].index,key)) supported=false;
         }
-        if(supported) { n->left=scan; n->sorted_input=0; n->hash=1; }
+        if(supported) { n->left=input; n->sorted_input=0; n->hash=1; }
     }
     if(n->kind==QP_SCAN && IsA(native,IndexScan)) {
         int extra=conditions(&b,((IndexScan *)native)->indexqualorig); if(extra==-2) return -1;

@@ -931,7 +931,7 @@ Q3/Q21 仍有大量索引页请求，Q11 的短查询受固定准备/请求开�
 
 ## Q9/Q13/Q17/Q18 专项诊断与低内存修复
 
-以下为专项状态。只使用原始 SQL，分别冷启动 host/CSD；64 MiB 查询上限、64 MiB 物理池、4 CU 不变。Q9/Q13/Q17 最新数据在 `results/tpch.5ZsCLL/`，包含 Q17 的 32 MiB 定向验证；Q18 已由下述有序扫描实现更新，数据在 `results/tpch.3OY5UA/`、`results/tpch.fXQKVr/`。没有运行完整 TPC-H，也未在测量时并行构建或运行单元测试。
+以下为专项状态。只使用原始 SQL，分别冷启动 host/CSD；64 MiB 查询上限、64 MiB 物理池、4 CU 不变。Q9/Q13/Q17 最新数据在 `results/tpch.UJUJOo/`，包含 Q17 的 32 MiB 定向验证；Q13 重复测量在 `results/tpch.7pbNx8/`；Q18 已由下述有序扫描实现更新，数据在 `results/tpch.3OY5UA/`、`results/tpch.fXQKVr/`。没有运行完整 TPC-H，也未在测量时并行构建或运行单元测试。
 
 本次修复排序 run 描述的固定开销：原归并头一律保存 16 个单元，现在按实际投影列宽与 token 一起分配，保持对齐及 workmem 记账。4 MiB 嵌套 Hash→Merge 回退用例原本失败时，根 context 实际仅用约 1.69 MiB，单个排序约 500 KiB 的配额却被描述挤满；修复后完整结果及 context 回收通过。这是元数据实现问题，不能解释成物理内存耗尽。
 
@@ -939,26 +939,28 @@ Q3/Q21 仍有大量索引页请求，Q11 的短查询受固定准备/请求开�
 
 | 查询 | host 秒 | CSD 秒 | 根内存峰值 MiB | spill 读/写各 MiB | CSF CPU 秒 | Sort sink/source CPU 秒 |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Q9 | 4.402 | 11.777 | 63.60 | 414.31 | 9.54 | 3.51 / 1.08 |
-| Q13 | 1.143 | 11.531 | 30.95 | 353.19 | 8.49 | 4.50 / 1.74 |
-| Q17 | 4.362 | 4.975 | 25.78 | 0 | 5.28 | 0 / 0 |
+| Q9 | 4.220 | 11.779 | 60.04 | 414.31 | 9.57 | 3.55 / 1.02 |
+| Q13 | 1.184 | 1.336 | 61.58 | 0 | 1.75 | <0.001 / <0.001 |
+| Q17 | 4.576 | 3.620 | 25.28 | 0 | 4.91 | 0 / 0 |
 | Q18 | 8.848 | 7.360 | 36.58 | 0 | 4.49 | <0.001 / <0.001 |
 
-延迟为关闭 profile 的单次样本；内存、spill 和 CPU 来自另外独立冷启动的 `*.profile.log`，CPU 跨 CU 累计，排序分项包含在总 CPU 中。四条完整结果及实际卸载均通过；Q9/Q13 性能仍不合格；Q17 本轮关闭计时的 CSD 慢约 0.6s，另外独立 profile 的树墙钟为 4.24s，无 spill，不能宣称稳定加速，也不能用内存不足解释本轮差距。Q18 两轮关闭计时的 host 为 8.848/8.873s、CSD 为 7.360/7.258s，独立 profile 的 spill 读写均为 0。只报告这两轮结果，不据此保证固定加速比。
+延迟为关闭 profile 的单次样本；内存、spill 和 CPU 来自另外独立冷启动的 `*.profile.log`，CPU 跨 CU 累计，排序分项包含在总 CPU 中。四条完整结果及实际卸载均通过；Q9 性能仍不合格。Q13 两轮 host 为 1.184/1.355s、CSD 为 1.336/1.337s，spill 为零但仍有较慢样本，尚未稳定达标；不能以物理内存不足解释该差距。Q17 本轮 CSD 较快，32/64 MiB 均无 spill，单轮结果不保证固定加速比。Q18 两轮关闭计时的 host 为 8.848/8.873s、CSD 为 7.360/7.258s，独立 profile 的 spill 读写均为 0。只报告这两轮结果，不据此保证固定加速比。
 
 具体瓶颈：
 
-- **Q9：大侧 Hash 构建及超限后的 Merge。** 按 PG 字段类型压缩 Hash 行、推迟阻塞子节点父表的分配并允许 workmem 原地扩容后，单向 spill 从约 677 MiB 降到 414 MiB。当前峰值 63.60 MiB，转归并仍引入大量排序，排序占累计 CSF CPU 约 48%。缺少分区 Hash Join，不能因此认定所有延迟均由物理内存不足造成。应优先让超限 Hash 分区处理，避免全量改用比较/归并路径。
-- **Q13：大侧 Hash→Merge 与串行阻塞阶段。** 保留的 LEFT JOIN 构建 orders，大量中间行继续按 customer 排序计数。原生 PG 计划是 Parallel Hash Left Join、Partial GroupAggregate、Gather Merge，顶层再 HashAggregate；CSD 的扫描/Probe 并行没有覆盖这些局部排序/聚合，排序分项占累计 CPU 约 74%。提高 CU 配置无法消除这些串行阶段，应优先分区 Hash 和局部聚合，而非继续扩大 build 配额。
-- **Q17：32/64 MiB 下均已消除 spill。** 有界 Hash Aggregate 保留精确 SUM/count，取消分组前的大排序。Hash 表按字段类型存储整数、numeric 保留完整 128 位；阻塞子节点的父表按实际输出增长，避免提前挤占聚合预算；workmem 可利用相邻空闲块原地扩容，仍遵守父/子配额。32 MiB 的独立 profile 根峰值为 25.78 MiB，spill 读写为 0，树墙钟约 4.22s；完整结果与 host 一致。此前的低内存退化属于行存储及预留问题，本次已消除该瓶颈。
+- **Q9：大侧 Hash 构建及超限后的 Merge。** 按 PG 字段类型压缩 Hash 行、推迟阻塞子节点父表的分配并允许 workmem 原地扩容后，单向 spill 从约 677 MiB 降到 414 MiB。当前峰值 60.04 MiB，转归并仍引入大量排序，排序占累计 CSF CPU 约 48%。缺少分区 Hash Join，不能因此认定所有延迟均由物理内存不足造成。应优先让超限 Hash 分区处理，避免全量改用比较/归并路径。
+- **Q13：已消除不必要的 Merge 和聚合前排序。** 单整数键 COUNT 可以直接消费 LEFT JOIN 输出，正确跳过补出的 NULL；外层 PG HashAggregate 也保留 Hash 算法。整数 Hash 字段仅保存值和 NULL，不保存恒为零的 scale/dscale。原生 Parallel SeqScan 的 618687 行是单 worker 估计，设备扫描却消费整张表；现使用 PG 基表的全表过滤后估计，避免先建小表、随后扩容时因新旧块同时驻留而回退。标准查询完整结果一致，累计 CSF CPU 1.75s，spill 读写为 0，根峰值 61.58 MiB。剩余较慢样本主要应继续检查构建/聚合组合及请求交接，不能归因于 spill。
+- **Q17：32/64 MiB 下均已消除 spill。** 有界 Hash Aggregate 保留精确 SUM/count，取消分组前的大排序。Hash 表按字段类型存储整数、numeric 保留完整 128 位；阻塞子节点的父表按实际输出增长，避免提前挤占聚合预算；workmem 可利用相邻空闲块原地扩容，仍遵守父/子配额。32 MiB 的独立 profile 根峰值为 25.28 MiB，spill 读写为 0，树墙钟约 3.82s；完整结果与 host 一致。此前的低内存退化属于行存储及预留问题，本次已消除该瓶颈。
 - **Q18：已补正向有序索引扫描。** 原生 PG 的内层 GroupAggregate 直接读取 `lineitem_pkey`；设备现在同样沿叶链批量回表、按索引顺序流式聚合，去除 Heap 后补的 Sort。复用原来的页缓存和 LOAD 请求；最多预读 16 个索引页，只有 PG 相关性统计大于 0.9 时才最多预读 32 个 Heap 页。游标/TID 列表使用 workmem，AFDM 页缓存大小不增加，单个最近页命中直接返回。当前独立 profile 有 5962 次 CSF、7036 个 Host LOAD 请求，累计 CSF CPU 4.49s，spill 为 0。其他外层阻塞阶段仍沿用原实现。
 
 本次针对性验证：7 项原生 Plan/外部排序测试（包括 4/16/64/128 MiB 与查询总预算）通过；原生 Plan ASan+UBSan 通过。新增覆盖 4 MiB 嵌套回退、多键重复值和正负整数/numeric 排序，完整回收 context；未添加新 SQL 测试集。
 
 有序扫描专项验证：原生 Plan 和 B-tree 测试、PG heap 测试及对应 ASan/UBSan 通过。新增空索引、跨叶页、17 行小批次输出、普通/预读模式的完整顺序与数量核对；真实 Q18 两轮完整结果一致并实际卸载。反向扫描仍用原排序回退。
 
-Q13 已补整数前导键覆盖的 Index Only Scan，标准 SQL 完整结果一致、实际 Scan(customer, index only)，不请求 Heap。定向 Plan/B-tree 及 ASan/UBSan 通过，覆盖 NULL、2/4/8 字节整数和跨页输出。主要剩余成本仍为 Hash 转 Merge 和聚合前排序。
+Q13 已补整数前导键覆盖的 Index Only Scan，标准 SQL 完整结果一致、实际 Scan(customer, index only)，不请求 Heap。定向 Plan/B-tree 及 ASan/UBSan 通过，覆盖 NULL、2/4/8 字节整数和跨页输出。本轮已通过连接后 Hash Aggregate 与全表估计修正消除 Merge 回退和聚合前排序。
 
 有界聚合定向验证：原生 Plan 与 ASan/UBSan 通过。测试以独立逐行 SUM/count 对照，覆盖重复键跨多次 flush、NULL 键/值、全 NULL 分组、空输入、SUM/COUNT/COUNT(*)/AVG、聚合结果算术表达式、4 MiB spill 和 64 MiB 无 spill，以及 context/token 完整回收。没有另建 SQL 验收集。
 
 Hash 存储/扩容定向验证：原生 Plan 覆盖四 CU、int32 负值、超过 int32 的 bigint、128 位 numeric 与精度、LEFT JOIN 的 NULL 补齐和 4 MiB 嵌套 Merge 回退；普通及 ASan/UBSan 通过。workmem 新增原地扩容及父配额、超限保留原块、SIZE_MAX 溢出测试；分配、共享预算与 C++ 头文件兼容测试通过。未运行完整 TPC-H。
+
+连接后聚合定向验证：原生 Plan 与 ASan/UBSan 通过，新增四 CU 的 INNER/LEFT JOIN 后 COUNT(列)，覆盖未匹配行和 NULL 分组；标准 Q13 验证两级 Hash Aggregate、结果及实际卸载。Q9/Q17 同时使用标准 SQL 冷启动回归，完整结果一致。
