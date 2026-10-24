@@ -18500,7 +18500,8 @@ static void femu_test_csd_exec_graph(void *obj,void *data,QGuestAllocator *alloc
         struct femu_graph_header h;
         struct femu_graph_node n[3];
         uint32_t mr[8];
-    } graph={.h={.count=cpu_to_le32(3),.session=cpu_to_le64(session),.cookie=cpu_to_le64(1)}};
+    } graph={.h={.count=cpu_to_le32(3),.flags=cpu_to_le32(FEMU_CSD_GRAPH_PROFILE),
+        .session=cpu_to_le64(session),.cookie=cpu_to_le64(1)}};
     graph.h.bytes=cpu_to_le32(sizeof(graph)); graph.mr[2]=cpu_to_le32(id);
     for(unsigned i=0;i<3;++i) graph.n[i]=(struct femu_graph_node){
         .operation=cpu_to_le32(FEMU_GRAPH_EXEC),.program=cpu_to_le32(1),

@@ -135,7 +135,16 @@ int main(void)
     assert(femu_openCSx("/dev/nvme0n1", NULL, &dev, &(unsigned){0}) == CS_SUCCESS);
     struct cs_device *device = dev;
     assert(device->profile);
-    for (unsigned i = 0; i < 5; ++i) assert(!device->io_timing[i].calls); // Identify excluded.
+    for (unsigned i = 0; i < 5; ++i) assert(!device->io_timing[i].calls);
+    assert(device->io_timing[11].calls == 2); // Controller and namespace Identify.
+    assert(device->io_timing[12].calls == 5); // Admin C0 GET_INFO.
+    const unsigned setup_opcodes[] = {0xb0, 0xc0, 0xf5};
+    for (unsigned i = 0; i < 3; ++i) {
+        struct nvme_passthru_cmd command = {.opcode = setup_opcodes[i]};
+        assert(cs_io(device, false, &command) == CS_SUCCESS);
+        assert(device->io_timing[6 + i].calls == 1);
+    }
+    assert(device->io_timing[12].calls == 5); // I/O C0 FREE is a different command.
     struct nvme_passthru_cmd64 compute = {.opcode = 0xe1};
     assert(cs_io64(device, false, &compute) == CS_SUCCESS);
     const unsigned opcodes[] = {0xd0, 0xd1, 9, 0xf2};

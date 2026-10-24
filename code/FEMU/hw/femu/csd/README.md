@@ -9,8 +9,8 @@ SNIA 应用仍包含 `cs.h`、链接 `-lsnia`。Guest 中的 FEMU 插件将纯�
 ```text
 Guest 应用 -> libsnia -> FEMU 插件 -> 一条 E9 EXEC_GRAPH
                                        |
-FEMU 原有 FTL 线程：识别就绪 LOAD/STORE，提交正常 FTL/NAND I/O
-                  等待模拟完成时间，推进依赖
+FEMU 原有 FTL 线程：取出到期节点，提交正常 FTL/NAND I/O
+                  用 pqueue 保存完成时间，完成时解锁后继并加入就绪队列
                                        |
 FEMU nr_cu 个 CU 线程：执行就绪 CSF，返回后释放 CU
                                        |
@@ -20,6 +20,8 @@ FEMU nr_cu 个 CU 线程：执行就绪 CSF，返回后释放 CU
 I/O 等待不占 CU；多个独立分支可以同时处于 I/O 或计算阶段，实际读取和计算可在不同分支间重叠。一个 EXEC 节点仍是一次 CSF 调用，不自动把算子拆分为多 CU。主机应使用不同输入块和缓冲构建独立分支，显式为共享 AFDM 的读写添加依赖，设备不猜测数据冲突。
 
 SERIAL 一次启动一个节点；无 SERIAL 标志时，所有前驱完成的节点均可启动。PARALLEL 与 HYBRID 的区别体现在主机构造的依赖边：前者没有边，后者等待全部前驱。使用原有 CU 线程池，不另起代理或调度进程。
+
+完成时间队列复用 FEMU NVMe poller 的 pqueue 实现，但由 CSD 自己保存节点事件，避免混用 poller 所属的 NVMe 请求队列。节点完成时只处理其后继，用剩余前驱计数判断就绪，不再扫描全部在途图及节点。FTL 主循环仍轮询，但空闲路径仅检查缓存的最早完成时间和就绪队列是否非空，不取 CSD 锁、不遍历图。CU 返回时向完成时间队列插入事件；就绪 CSF 通过原有条件变量唤醒 CU。
 
 设备在接受图时复制描述并保留程序、AFDM 引用；描述校验失败不执行节点。节点必须等待 NAND 延迟或 CSF 模拟执行时间到期后才能解锁后继。失败时停止新节点，等待在途操作结束并回收本图新增的临时 token。取消不抢占 native CSF，须等正在运行的入口返回。
 
@@ -100,3 +102,19 @@ QTEST_QEMU_BINARY=./qemu-system-x86_64 tests/qtest/qos-test \
 ```
 
 其余针对性用例为 csd-exec-graph-spill、csd-exec-graph-spill-4k、csd-exec-graph-cancel，分别覆盖跨图 token、空间不足/隔离/回收、4KiB LBA 和取消。旧接口回归使用 csd-nvm-copy、csd-info-result64、csd-exec-concurrency。
+
+## 设备图性能诊断
+
+Guest 的 SNIA_FEMU_PROFILE=1 同时令插件在设备图 flags 中设置 PROFILE（位1，值2）。这是本项目私有诊断位，不是能力查询标志，不改变 CSF 参数或标准 SNIA API。未开启时不采集下列详细计时。会话关闭时 FEMU stderr 输出一行 CSD_GRAPH，可从容器日志查看：
+
+| 字段 | 含义 |
+| --- | --- |
+| graphs、graph_ns | 已完成的诊断图数、从设备接受请求至交回完成队列的累计时间 |
+| events、event_late_ns | 已处理到期事件数、观察时间晚于 deadline 的累计时间；包含宿主调度和模拟 I/O 的实际处理超过模型延迟等因素，不等于纯调度器 CPU |
+| io_calls、io_model_ns | 内部 I/O 段数和 FTL 返回的累计模拟延迟，包含 NAND 排队 |
+| io_work_ns | FTL 处理及 backing/AFDM 复制的累计实际经过时间；使用墙钟，不是线程 CPU 时钟 |
+| cu_calls、cu_wall_ns | 图内 CSF 调用次数、实际运行墙钟之和 |
+| cu_queue_ns | CSF 入队到 CU 取走任务的累计等待 |
+| dispatch_ns | 处理到期事件和就绪图的累计墙钟，包含内部 I/O 处理，是 io_work_ns 的上层范围 |
+
+这些累计值会跨分支重叠；dispatch_ns 包含 io_work_ns，不能相加。它们应与 PG 独立采集的算子 CPU、阶段墙钟、AFDM 和 spill 统计共同分析。

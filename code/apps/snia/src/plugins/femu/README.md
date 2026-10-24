@@ -29,8 +29,10 @@ include/csd-graph.h 是设备私有线格式，与 FEMU 同名头保持一致，
 
 ## 性能诊断
 
-应用以SNIA_FEMU_PROFILE=1运行时，internal/femu_nvme_transport.c在设备关闭时向stderr打印E1、D0、D1、TRIM、F2、EXEC_GRAPH的请求次数及累计ioctl等待秒数。默认关闭；计数用原子操作，不改变并行调度或公开API。统计覆盖句柄生命周期，不是按batch自动清零。E1包含设备CSF执行时间，不能再与算子内部计时相加；D0包括原始数据和spill的LOAD。HYBRID并发时累计等待可重叠，不能直接相加视为总延迟。此功能只用于定位当前请求开销。
+应用以SNIA_FEMU_PROFILE=1运行时，internal/femu_nvme_transport.c在设备关闭时向stderr打印E1、D0、D1、TRIM、F2、EXEC_GRAPH，以及 ALLOC/FREE/F5、CSF_DOWNLOAD/CSF_ACTIVATE、IDENTIFY/GET_INFO 的请求次数及累计ioctl等待秒数。默认关闭；计数用原子操作，不改变并行调度或公开API。统计覆盖句柄生命周期，不是按batch自动清零。E1包含设备CSF执行时间，不能再与算子内部计时相加；D0包括原始数据和spill的LOAD。HYBRID并发时累计等待可重叠，不能直接相加视为总延迟。此功能只用于定位当前请求开销。
 
 同一诊断开关还输出 `LOAD_to_E1`：同一 SNIA 线程最近一次成功 D0 返回到下一次 E1 ioctl 提交之间的累计间隔及次数。多范围 LOAD 取最后一次 D0 返回；该间隔使用 Guest 同一时钟，不包含 E1 提交后在设备队列中的等待，也不表示实际 CU 已开始计算。
 
 EXEC_GRAPH 计数是整图 ioctl 次数与等待时间；图内的 LOAD、CSF、spill 不计入 Guest 的 D0/E1/D1 次数。LOAD_to_E1 仅诊断分开提交的旧路径，不能据此判断图内 I/O 与计算的间隔。图整体时间包含内部 I/O 和计算，不应与算子计时相加。
+
+SNIA_FEMU_PROFILE=1 还设置私有设备图 PROFILE 位。新 FEMU 在会话关闭时向容器日志输出 CSD_GRAPH，统计图内 I/O 模型延迟、FTL/复制开销、CU 排队、事件到期观察延迟和推进开销。默认关闭，不改变应用和算子调用。字段含义及重叠关系见[设备说明](../../../../../FEMU/hw/femu/csd/README.md#设备图性能诊断)。

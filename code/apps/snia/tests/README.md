@@ -7,7 +7,7 @@
 | common/cs_header_compatibility.cpp | csHeaderCompatibility | C++ 应用只包含 cs.h |
 | common/cs_library_management.c | csLibraryManagementRouting | 注册/注销两种插件、发现、句柄路由及请求绑定 |
 | common/cs_afdm_event_lifecycle.cpp | csAFDMEventAllocationFailure | AFDM、event、异步提交分配失败和资源回收 |
-| femu/cs_discovery.c | csDiscoveryIdentify | 生产传输的Identify、资源查询、打开失败，以及可选命令计时分类/关闭/错误码保持 |
+| femu/cs_discovery.c | csDiscoveryIdentify | 生产传输的Identify、资源查询、打开失败，以及可选命令计时分类（含同操作码的 admin GET_INFO 与 I/O FREE 区分）/关闭/错误码保持 |
 | femu/cs_csf_batch_scheduling.c | csCSFSchedulingAndBatch | AFDM、storage、event、batch依赖、整图提交次数、主机复制混合批次、排序跨批次隐藏spill、完整平均值聚合及EOF回收 |
 | CMake compare_files | csFemuGraphWireAgreement | 插件和固件的 csd-graph.h 线格式一致 |
 | csd-programs/examples/tests/sort_spill_merge.cpp（设备示例目录） | sortSpillMergeAverage、sortParallelSinkMergeAverage | 单sink和四路sink的逐项排序比对、跨context归并、spill、内存压力与中途收尾 |

@@ -8,8 +8,11 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <time.h>
-static const unsigned profile_opcodes[] = {0xe1, 0xd0, 0xd1, 9, 0xf2, 0xe9};
-static const char *profile_names[] = {"E1", "D0", "D1", "TRIM", "F2", "EXEC_GRAPH"};
+/* Bit 8 separates admin opcodes from I/O opcodes with the same byte value. */
+static const unsigned profile_opcodes[] = {0xe1, 0xd0, 0xd1, 9, 0xf2, 0xe9,
+    0xb0, 0xc0, 0xf5, 0x125, 0x123, 0x106, 0x1c0};
+static const char *profile_names[] = {"E1", "D0", "D1", "TRIM", "F2", "EXEC_GRAPH",
+    "ALLOC", "FREE", "F5", "CSF_DOWNLOAD", "CSF_ACTIVATE", "IDENTIFY", "GET_INFO"};
 /* A serial LOAD->CSF batch runs both requests on the same SNIA thread. */
 static _Thread_local struct cs_device *load_device;
 static _Thread_local uint64_t load_returned;
@@ -21,7 +24,8 @@ static uint64_t profile_clock(void)
 }
 static uint64_t profile_record(struct cs_device *d, bool admin, unsigned opcode, uint64_t start)
 {
-    if (!d->profile || admin) return 0;
+    if (!d->profile) return 0;
+    if (admin) opcode |= 0x100;
     uint64_t end = profile_clock(), elapsed = end - start;
     for (unsigned i = 0; i < sizeof(profile_opcodes)/sizeof(profile_opcodes[0]); ++i) if (profile_opcodes[i] == opcode) {
         __atomic_fetch_add(&d->io_timing[i].calls, 1, __ATOMIC_RELAXED);
