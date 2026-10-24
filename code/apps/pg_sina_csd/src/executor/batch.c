@@ -2,6 +2,11 @@
 #include "pg_internal.h"
 #include "miscadmin.h"
 #include "cs.h"
+#include "access/table.h"
+#include "access/htup_details.h"
+#include "catalog/pg_type_d.h"
+#include "storage/bufpage.h"
+#include "utils/rel.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -27,6 +32,26 @@ static uint64_t clock_ns(void)
 {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
     return (uint64_t)t.tv_sec*1000000000ULL+t.tv_nsec;
+}
+/* Bound rows by the smallest legal physical tuple, never by average width.
+ * Nullable fields may occupy no bytes; ignore alignment padding between fields.
+ * A short numeric still needs its one-byte varlena and two-byte numeric header. */
+static unsigned heap_min_tuple(Oid relid)
+{
+    Relation relation=table_open(relid,NoLock);
+    TupleDesc desc=RelationGetDescr(relation);
+    unsigned bytes=MAXALIGN(SizeofHeapTupleHeader);
+    for(int i=0;i<desc->natts;++i) {
+        Form_pg_attribute attr=TupleDescAttr(desc,i);
+        if(attr->attisdropped || !attr->attnotnull) continue;
+        bytes+=attr->attlen>0?attr->attlen:attr->atttypid==NUMERICOID?3:1;
+    }
+    table_close(relation,NoLock);
+    return MAXALIGN(bytes);
+}
+static unsigned heap_capacity(unsigned bytes,unsigned min_tuple)
+{
+    return (bytes/QS_PAGE)*Max(1U,(QS_PAGE-SizeOfPageHeaderData)/(min_tuple+sizeof(ItemIdData)));
 }
 static CS_STATUS copy(CS_MEM_HANDLE memory,unsigned offset,void *data,int bytes,int to_device)
 {
@@ -215,6 +240,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     CHECK_FOR_INTERRUPTS();
     bool joining=request->plan.join.relid!=0;
     unsigned njoins=qs_join_count(&request->plan);
+    unsigned min_tuple=heap_min_tuple(request->plan.relid);
     bool indexed=njoins && qs_join_at(&request->plan,njoins-1)->indexid;
     struct qs_request builds[QS_JOINS]={0}; struct qs_extent *build_extents[QS_JOINS]={0};
     struct qs_request index_request={0}; struct qs_extent *index_extents=NULL;
@@ -222,6 +248,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     struct qs_plan probe_plan={0},build_plan={0};
     for(unsigned i=0;i<njoins;++i) {
         const struct qs_join *j=qs_join_at(&request->plan,i); struct qs_request *b=&builds[i];
+        min_tuple=Min(min_tuple,heap_min_tuple(j->relid));
         b->plan.relid=j->relid; b->plan.relfilenode=j->relfilenode;
         build_extents[i]=pg_sina_mapping(b); max_extents=Max(max_extents,b->nextents); if(!j->indexid) build_bytes+=b->bytes;
         if(strcmp(b->device,request->device) || b->nsid!=request->nsid || b->lba_bytes!=request->lba_bytes)
@@ -253,7 +280,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     CS_MEM_HANDLE input[QS_WORKERS]={0},vectors[QS_WORKERS]={0},tasks[QS_WORKERS]={0},counters[QS_WORKERS]={0};
     CsBatchRequest *load=NULL,*compute=NULL;
     struct qs_group group={0}; int group_ready=0,lock_fd=-1;
-    unsigned workers=0,chunk=QS_CHUNK;
+    unsigned workers=0,chunk=QS_CHUNK,vector_rows=heap_capacity(chunk,min_tuple);
     struct program programs[FUNCTIONS]={
         [SCAN]={.file="pg-sina-scan.so",.symbol="pg_sina_scan",.index=501},
         [FILTER]={.file="pg-sina-filter.so",.symbol="pg_sina_filter",.index=502},
@@ -293,17 +320,17 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     unsigned dict_entries=request->plan.dict_big?QS_DICT_BIG_ENTRIES:QS_DICT_SMALL_ENTRIES;
     unsigned dict_data=request->plan.dict_big?QS_DICT_BIG_DATA:QS_DICT_SMALL_DATA;
     size_t dict_size=request->plan.runtime_dict?qs_dict_bytes(dict_entries,dict_data):0;
-    while((uint64_t)workers*(chunk+((qs_chunk_bytes(chunk/24,scan_cols)+4095)&~(size_t)4095)+4096+(profiling?4096:0)+((joined_bytes+4095)&~(size_t)4095))+
+    while((uint64_t)workers*(chunk+((qs_chunk_bytes(vector_rows,scan_cols)+4095)&~(size_t)4095)+4096+(profiling?4096:0)+((joined_bytes+4095)&~(size_t)4095))+
           ((sizeof(struct qs_result)+4095)&~(size_t)4095)+((sizeof(struct qs_plan)+4095)&~(size_t)4095)+4096+
           ((dict_size+4095)&~(size_t)4095)+
           (joining?2*((sizeof(struct qs_plan)+4095)&~(size_t)4095)+(njoins+1)*4096:0)>capacity) {
-        /* Large dictionaries dominate the FDM. Shrink the per-slot column
-         * vectors before dropping CU parallelism; more workers still win for
-         * the scan/join pipeline. Small dictionaries reduce workers first. */
-        if(dict_size>(size_t)capacity/4 && chunk>1024*1024U) chunk/=2;
+        /* Input blocks need not consume the maximum 4 MiB. Keep the available
+         * CUs busy with smaller blocks before sacrificing parallelism. */
+        if(chunk>1024*1024U) chunk/=2;
         else if(workers>1) --workers;
         else if(chunk>QS_PAGE) chunk/=2;
         else { result->status=1; strcpy(result->error,"insufficient FDM"); goto cleanup; }
+        vector_rows=heap_capacity(chunk,min_tuple);
     }
     if(indexed && chunk<QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE) { strcpy(result->error,"insufficient AFDM for index pages"); goto cleanup; }
     uint64_t nchunks=(request->bytes+chunk-1)/chunk;
@@ -373,8 +400,8 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     }
     for(unsigned i=0;i<workers;++i) {
         TRY(csAllocMem(device,chunk,&flags,&input[i],NULL));
-        TRY(csAllocMem(device,qs_chunk_bytes(chunk/24,scan_cols),&flags,&vectors[i],NULL));
-        struct qs_chunk header={.capacity=chunk/24,.ncols=joining?probe_plan.ncols:request->plan.ncols}; TRY(copy(vectors[i],0,&header,sizeof(header),1));
+        TRY(csAllocMem(device,qs_chunk_bytes(vector_rows,scan_cols),&flags,&vectors[i],NULL));
+        struct qs_chunk header={.capacity=vector_rows,.ncols=joining?probe_plan.ncols:request->plan.ncols}; TRY(copy(vectors[i],0,&header,sizeof(header),1));
         flags.Flags=CS_FDM_CLEAR; TRY(csAllocMem(device,sizeof(struct qs_task),&flags,&tasks[i],NULL)); flags.Flags=0;
         struct qs_task task={.workers=workers,.slot=i}; TRY(copy(tasks[i],0,&task,sizeof(task),1));
         if(joining) {
@@ -437,7 +464,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
             join_scan_plan(&view,&build_plan,true);
             TRY(copy(build_mem,0,&view,sizeof(view),1)); TRY(copy(scan_mem,0,&build_plan,sizeof(build_plan),1));
             for(unsigned i=0;i<workers;++i) {
-                struct qs_chunk header={.capacity=chunk/24,.ncols=build_plan.ncols}; TRY(copy(vectors[i],0,&header,sizeof(header),1));
+                struct qs_chunk header={.capacity=vector_rows,.ncols=build_plan.ncols}; TRY(copy(vectors[i],0,&header,sizeof(header),1));
             }
             /* Parallel scan/filter slots feed one build writer. Other slots may
              * compute while it appends or spills, but cannot mutate the hash state. */
@@ -503,7 +530,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
         } /* Every build uses its own workmem share and control record. */
         TRY(copy(scan_mem,0,&probe_plan,sizeof(probe_plan),1));
         for(unsigned i=0;i<workers;++i) {
-            struct qs_chunk header={.capacity=chunk/24,.ncols=probe_plan.ncols}; TRY(copy(vectors[i],0,&header,sizeof(header),1));
+            struct qs_chunk header={.capacity=vector_rows,.ncols=probe_plan.ncols}; TRY(copy(vectors[i],0,&header,sizeof(header),1));
         }
         TRY(csAllocBatchRequest(CS_BATCH_SERIAL,1,&load_batch));
         CS_MEM_HANDLE memory[]={controls_mem[0],input[0]}; compute_io_request(compute,programs[JOIN_LOAD].function,memory,2,counters[0]);
@@ -674,7 +701,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     TRY(copy(out_mem,0,result,sizeof(*result),0));
     result->metrics.fdm_bytes=((sizeof(request->plan)+4095)&~(size_t)4095)+
         ((sizeof(*result)+4095)&~(size_t)4095)+4096+
-        workers*(chunk+((qs_chunk_bytes(chunk/24,scan_cols)+4095)&~(size_t)4095)+4096+(profiling?4096:0)+((joined_bytes+4095)&~(size_t)4095))+
+        workers*(chunk+((qs_chunk_bytes(vector_rows,scan_cols)+4095)&~(size_t)4095)+4096+(profiling?4096:0)+((joined_bytes+4095)&~(size_t)4095))+
         (joining?2*((sizeof(request->plan)+4095)&~(size_t)4095)+(njoins+1)*4096:0);
     if(joining) {
         TRY(copy(join_mem,0,join_control,njoins*sizeof(join_control[0]),0));
