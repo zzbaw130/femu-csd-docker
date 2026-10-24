@@ -14,6 +14,7 @@ extern struct pg_sina_resources {
     uint64_t fdm_bytes,workmem_bytes;
 } pg_sina_resources;
 void pg_sina_read_resources(const char *device);
+unsigned pg_sina_program_index(unsigned index);
 static inline uint64_t pg_sina_query_memory(void)
 {
     uint64_t physical=pg_sina_resources.workmem_bytes;

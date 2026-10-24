@@ -6,12 +6,9 @@
 #include "access/htup_details.h"
 #include "catalog/pg_type_d.h"
 #include "storage/bufpage.h"
+#include "storage/backendid.h"
 #include "utils/rel.h"
-#include <errno.h>
-#include <fcntl.h>
 #include <stdlib.h>
-#include <sys/file.h>
-#include <unistd.h>
 #include <time.h>
 enum { SCAN,FILTER,SINK,SOURCE,SORT,LIMIT,JOIN_BUILD,JOIN_LOAD,JOIN_CLOSE,FUNCTIONS };
 /* One SERIAL batch and one reusable set of buffers per execution slot. */
@@ -22,7 +19,6 @@ struct pg_sina_stream {
     CS_BATCH_HANDLE batch;
     CS_MEM_HANDLE output,group,io,counter,dict;
     struct program source;
-    int lock_fd;
     bool profiling;
     uint64_t start,fdm_bytes;
     struct qs_profile profile,last_counter;
@@ -32,6 +28,14 @@ static uint64_t clock_ns(void)
 {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
     return (uint64_t)t.tv_sec*1000000000ULL+t.tv_nsec;
+}
+/* FEMU program indices are device-global. Give each active PG backend its
+ * own 16-slot range instead of serializing queries with a namespace flock. */
+unsigned pg_sina_program_index(unsigned index)
+{
+    if(MyBackendId<1 || MyBackendId>(UINT16_MAX-511)/16)
+        elog(ERROR,"PG backend ID exceeds the FEMU program-index range");
+    return index+(unsigned)MyBackendId*16;
 }
 /* Bound rows by the smallest legal physical tuple, never by average width.
  * Nullable fields may occupy no bytes; ignore alignment padding between fields.
@@ -89,16 +93,8 @@ void pg_sina_read_resources(const char *path)
 {
     static char cached_device[128];
     if(pg_sina_resources.workmem_bytes && !strcmp(cached_device,path)) return;
-    int fd=open(path,O_RDONLY|O_CLOEXEC);
-    if(fd<0) elog(ERROR,"cannot open CSD resource query namespace: %m");
-    while(flock(fd,LOCK_EX|LOCK_NB)) {
-        if((errno!=EWOULDBLOCK && errno!=EINTR) || QueryCancelPending || ProcDiePending) {
-            close(fd); CHECK_FOR_INTERRUPTS(); elog(ERROR,"cannot lock CSD resource query namespace");
-        }
-        pg_usleep(1000L);
-    }
     CS_DEV_HANDLE device=NULL;
-    struct program probe={.file="pg-sina-plan.so",.symbol="pg_sina_workmem_capacity",.index=511};
+    struct program probe={.file="pg-sina-plan.so",.symbol="pg_sina_workmem_capacity",.index=pg_sina_program_index(511)};
     CsProperties *cus=NULL,*fdm=NULL; u64 bytes=0;
     struct pg_sina_resources found={0};
     HOLD_INTERRUPTS();
@@ -118,7 +114,7 @@ void pg_sina_read_resources(const char *path)
         }
     }
     if(device) { unload_program(device,&probe); csCloseCSx(device); }
-    free(cus); free(fdm); close(fd);
+    free(cus); free(fdm);
     RESUME_INTERRUPTS(); CHECK_FOR_INTERRUPTS();
     if(status!=CS_SUCCESS) elog(ERROR,"CSD resource query failed: status=%d",status);
     pg_sina_resources=found; strlcpy(cached_device,path,sizeof(cached_device));
@@ -240,6 +236,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     CHECK_FOR_INTERRUPTS();
     bool joining=request->plan.join.relid!=0;
     unsigned njoins=qs_join_count(&request->plan);
+    unsigned program_offset=pg_sina_program_index(0);
     unsigned min_tuple=heap_min_tuple(request->plan.relid);
     bool indexed=njoins && qs_join_at(&request->plan,njoins-1)->indexid;
     struct qs_request builds[QS_JOINS]={0}; struct qs_extent *build_extents[QS_JOINS]={0};
@@ -279,7 +276,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     unsigned build_chunks=0;
     CS_MEM_HANDLE input[QS_WORKERS]={0},vectors[QS_WORKERS]={0},tasks[QS_WORKERS]={0},counters[QS_WORKERS]={0};
     CsBatchRequest *load=NULL,*compute=NULL;
-    struct qs_group group={0}; int group_ready=0,lock_fd=-1;
+    struct qs_group group={0}; int group_ready=0;
     unsigned workers=0,chunk=QS_CHUNK,vector_rows=heap_capacity(chunk,min_tuple);
     struct program programs[FUNCTIONS]={
         [SCAN]={.file="pg-sina-scan.so",.symbol="pg_sina_scan",.index=501},
@@ -291,6 +288,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
         [JOIN_BUILD]={.file="pg-sina-join.so",.symbol="pg_sina_join_build",.index=507},
         [JOIN_LOAD]={.file="pg-sina-join.so",.symbol="pg_sina_join_load",.index=508},
         [JOIN_CLOSE]={.file="pg-sina-join.so",.symbol="pg_sina_join_close",.index=509}};
+    for(unsigned i=0;i<FUNCTIONS;++i) programs[i].index+=program_offset;
     if(joining) { programs[SINK].file="pg-sina-join.so"; programs[SINK].symbol="pg_sina_join_probe"; }
     unsigned scan_cols=request->plan.ncols,joined_bytes=njoins*qs_join_chunk_stride(&request->plan);
     if(joining) {
@@ -305,12 +303,6 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     if(request->plan.ordered_rows) {
         programs[SINK].file=programs[SOURCE].file="pg-sina-sort.so";
         programs[SINK].symbol="pg_sina_sort_sink"; programs[SOURCE].symbol="pg_sina_sort_source";
-    }
-    lock_fd=open(request->device,O_RDONLY|O_CLOEXEC);
-    if(lock_fd<0) { result->status=1; snprintf(result->error,sizeof(result->error),"cannot lock namespace: %s",strerror(errno)); goto cleanup; }
-    while(flock(lock_fd,LOCK_EX|LOCK_NB)) {
-        if((errno!=EWOULDBLOCK && errno!=EINTR) || QueryCancelPending || ProcDiePending) goto cleanup;
-        pg_usleep(100000L);
     }
     TRY(csOpenCSx(request->device,NULL,&device));
     workers=pg_sina_resources.cus;
@@ -740,7 +732,6 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
         saved->io=input[0]; input[0]=NULL;
         saved->counter=counters[0]; counters[0]=NULL;
         saved->source=programs[SOURCE]; programs[SOURCE].active=programs[SOURCE].loaded=0;
-        saved->lock_fd=lock_fd; lock_fd=-1;
         saved->profiling=profiling; saved->start=start; saved->profile=stats;
         saved->fdm_bytes=result->metrics.fdm_bytes;
         saved->join_metrics=join_totals;
@@ -794,7 +785,6 @@ cleanup:
     if(dict_mem)csFreeMem(dict_mem,&release);
     for(unsigned i=0;i<FUNCTIONS;++i) unload_program(device,&programs[i]);
     if(device && !*stream)csCloseCSx(device);
-    if(lock_fd>=0)close(lock_fd);
     free(load);free(compute);
     free(saved);
     if(profiling) {
@@ -820,7 +810,6 @@ void pg_sina_close(struct pg_sina_stream *s)
     if(s->dict) csFreeMem(s->dict,&flags);
     if(s->counter) csFreeMem(s->counter,&flags);
     unload_program(s->device,&s->source); csCloseCSx(s->device);
-    if(s->lock_fd>=0) close(s->lock_fd);
     free(s); RESUME_INTERRUPTS();
 }
 

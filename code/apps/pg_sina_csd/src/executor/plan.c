@@ -6,11 +6,7 @@
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
-#include <fcntl.h>
-#include <errno.h>
-#include <sys/file.h>
 #include <time.h>
-#include <unistd.h>
 #include <stdatomic.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -66,7 +62,7 @@ struct PlanStateCsd {
     CS_MEM_HANDLE memory[5];
     CS_MEM_HANDLE worker_io[QS_WORKERS];
     CS_CSF_ID function;
-    int lock_fd;
+    unsigned program_index;
     unsigned row;
     bool started, explain_only, loaded, active, profiling;
     uint64_t start_ns;
@@ -122,7 +118,7 @@ static void checked(CS_STATUS status,const char *operation)
 static Node *create(CustomScan *scan)
 {
     PlanStateCsd *s=(void *)newNode(sizeof(*s),T_CustomScanState);
-    s->css.methods=&methods; s->lock_fd=-1; return (Node *)s;
+    s->css.methods=&methods; return (Node *)s;
 }
 static void close_state(void *arg)
 {
@@ -153,15 +149,14 @@ static void close_state(void *arg)
         csFreeMem(s->worker_io[w],&flags); s->worker_io[w]=NULL;
     }
     if(s->active) {
-        CsConfigInfo c={.Type=CS_CSF_ACTIVATE,.u.CSFActivateInfo={.CSFId=510,.EEIId=1,.State=CS_INACTIVE_STATE}};
+        CsConfigInfo c={.Type=CS_CSF_ACTIVATE,.u.CSFActivateInfo={.CSFId=s->program_index,.EEIId=1,.State=CS_INACTIVE_STATE}};
         CsConfigData data; int size=sizeof(data); csConfig(s->device,&size,&c,&data); s->active=false;
     }
     if(s->loaded) {
-        CsCSFDownloadInfo d={.CSEEId=1,.Index=510,.common.Unload=1}; u32 id;
+        CsCSFDownloadInfo d={.CSEEId=1,.Index=s->program_index,.common.Unload=1}; u32 id;
         csCSFDownload(s->device,&d,&id); s->loaded=false;
     }
     if(s->device) { csCloseCSx(s->device); s->device=NULL; }
-    if(s->lock_fd>=0) { close(s->lock_fd); s->lock_fd=-1; }
     if(s->profiling) s->cleanup_ns+=clock_ns()-started;
     RESUME_INTERRUPTS();
 }
@@ -243,12 +238,7 @@ static void start(PlanStateCsd *s)
     s->setup_ns=s->cleanup_ns=0;
     memset(s->plan->pipelines,0,sizeof(s->plan->pipelines));
     s->plan->nodes[s->plan->root].expr.work_mem_bytes=pg_sina_query_memory();
-    s->lock_fd=open(device,O_RDONLY|O_CLOEXEC);
-    if(s->lock_fd<0) elog(ERROR,"cannot open CSD namespace");
-    while(flock(s->lock_fd,LOCK_EX|LOCK_NB)) {
-        if(errno!=EWOULDBLOCK && errno!=EINTR) elog(ERROR,"cannot lock CSD namespace");
-        CHECK_FOR_INTERRUPTS(); pg_usleep(1000L);
-    }
+    s->program_index=pg_sina_program_index(510);
     checked(csOpenCSx(device,NULL,&s->device),"open");
     unsigned entries=big?QS_DICT_BIG_ENTRIES:QS_DICT_SMALL_ENTRIES,data=big?QS_DICT_BIG_DATA:QS_DICT_SMALL_DATA;
     bool indexed[QP_NODES]={0};
@@ -296,10 +286,10 @@ static void start(PlanStateCsd *s)
     for(unsigned w=0;w<s->workers;++w)
         checked(transfer(s->memory[1],(w+1)*sizeof(struct qp_control),&s->slots[w+1].control,sizeof(struct qp_control),true),"initialize worker control");
     char descriptor[]="pg-sina-plan.so\0pg_sina_plan";
-    CsCSFDownloadInfo download={.Type=CS_CSF_VENDOR_SPECIFIC,.SubType=CS_SUBTYPE_VENDOR_SPECIFIC,.CSEEId=1,.Index=510};
+    CsCSFDownloadInfo download={.Type=CS_CSF_VENDOR_SPECIFIC,.SubType=CS_SUBTYPE_VENDOR_SPECIFIC,.CSEEId=1,.Index=s->program_index};
     strcpy(download.common.UniqueName,"pg-sina-plan"); download.common.DataBuffer=descriptor; download.common.Length=sizeof(descriptor);
     u32 id; checked(csCSFDownload(s->device,&download,&id),"download"); s->loaded=true;
-    CsConfigInfo config={.Type=CS_CSF_ACTIVATE,.u.CSFActivateInfo={.CSFId=510,.EEIId=1,.State=CS_ACTIVE_STATE}};
+    CsConfigInfo config={.Type=CS_CSF_ACTIVATE,.u.CSFActivateInfo={.CSFId=s->program_index,.EEIId=1,.State=CS_ACTIVE_STATE}};
     CsConfigData result; int length=sizeof(result); checked(csConfig(s->device,&length,&config,&result),"activate"); s->active=true;
     length=0; int count=0; CS_STATUS status=csGetCSFId(s->device,"pg-sina-plan",0,&length,&count,NULL);
     if(status!=CS_LENGTH_RETURNED) checked(status,"lookup function length");
