@@ -91,6 +91,11 @@ struct projection_batch {
     unsigned scan,count,position;
     int group_keys[QS_KEYS],group_value;
 };
+struct hash_probe_batch {
+    uint32_t matches[QS_VECTOR_ROWS];
+    uint8_t errors[QS_VECTOR_ROWS];
+    int ready;
+};
 struct operator_state {
     struct sorted_rows left_sort,right_sort;
     struct qs_cell left[QS_OUT],right[QS_OUT],first[QS_OUT],keys[QS_KEYS];
@@ -115,6 +120,8 @@ struct operator_state {
     atomic_uint hash_rows;
     unsigned hash_capacity,hash_match,hash_phase,hash_buckets;
     int hash_matched,hash_fallback,hash_shared;
+    unsigned hash_payload; /* Columns still borrowed from the probe vector. */
+    struct hash_probe_batch *hash_probe;
     struct external_hash *external;
     struct compact_group *groups;
     unsigned group_capacity,group_flush,group_phase,group_stride,group_integer;
@@ -198,6 +205,8 @@ static inline int64_t next_row(struct execution *s,unsigned id,struct qs_cell *r
     return status;
 }
 static int64_t join_next(struct execution *,unsigned,struct qs_cell *);
+static int64_t hash_probe_input(struct execution *,unsigned,const uint32_t *);
+static void hash_left_payload(struct execution *,unsigned);
 static int64_t external_build(struct execution *,unsigned);
 static int64_t external_probe(struct execution *,unsigned,struct qs_cell *);
 static void external_advance(struct execution *,unsigned);
@@ -400,14 +409,15 @@ static int64_t sorted_input(struct execution *s,struct sorted_rows *sort,unsigne
 }
 static uint64_t mix_hash(uint64_t x)
 { x^=x>>33; x*=UINT64_C(0xff51afd7ed558ccd); x^=x>>33; x*=UINT64_C(0xc4ceb9fe1a85ec53); return x^(x>>33); }
+static uint64_t hash_key(uint64_t hash,struct qs_cell v)
+{
+    while(v.scale && !(v.value%10)) { v.value/=10; --v.scale; }
+    return mix_hash(hash^(uint64_t)v.value^(uint64_t)((unsigned __int128)v.value>>64)^((uint64_t)v.scale<<56));
+}
 static uint64_t row_hash(const struct qp_node *n,const struct qs_cell *row,int right)
 {
     uint64_t hash=0x9e3779b97f4a7c15ULL;
-    for(unsigned i=0;i<n->nkeys;++i) {
-        struct qs_cell v=row[right?n->right_keys[i]:n->left_keys[i]];
-        while(v.scale && !(v.value%10)) { v.value/=10; --v.scale; }
-        hash=mix_hash(hash^(uint64_t)v.value^(uint64_t)((unsigned __int128)v.value>>64)^((uint64_t)v.scale<<56));
-    }
+    for(unsigned i=0;i<n->nkeys;++i) hash=hash_key(hash,row[right?n->right_keys[i]:n->left_keys[i]]);
     return hash;
 }
 /* Row storage and bucket links have one writer per appended row. Bucket heads
@@ -537,15 +547,13 @@ restart:
     uint32_t *next=(void *)(o->hash_data+(size_t)o->hash_capacity*row_bytes),*buckets=next+o->hash_capacity;
     for(;;) {
         if(!o->have_left) {
-            int64_t status=o->external?external_probe(s,id,o->left):next_row(s,n->left,o->left);
+            int64_t status=hash_probe_input(s,id,buckets);
             if(status!=2) {
                 if(!status && o->external) { external_advance(s,id); goto restart; }
                 if(!status) { if(!o->hash_shared) cs_work_free(s->context,o->hash_data); o->hash_data=NULL; o->finished=1; }
                 return status;
             }
             o->have_left=1; o->hash_matched=0;
-            unsigned at=keys_null(n,o->left)?UINT_MAX:buckets[row_hash(n,o->left,0)&(o->hash_buckets-1)];
-            o->hash_match=at==UINT_MAX?0:at+1;
         }
         while(o->hash_match) {
             unsigned at=o->hash_match-1; o->hash_match=next[at]==UINT_MAX?0:next[at]+1;
@@ -554,9 +562,16 @@ restart:
             if(key_compare(s,n,o->left,right)) continue;
             int null=0; for(unsigned i=0;i<n->nkeys;++i) null|=right[n->right_keys[i]].isnull;
             if(null) continue;
+            if(n->join_type==QP_ANTI && n->join_qual<0) {
+                o->hash_matched=1; o->hash_match=0; ++s->metrics.join_rows; break;
+            }
+            hash_left_payload(s,id);
             struct qs_cell values[QS_COLS]; memcpy(values,o->left,ln*sizeof(*values)); memcpy(values+ln,right,rn*sizeof(*values));
-            struct qs_eval e; init_eval(&e,&n->expr,values,NULL); struct qs_cell match={.value=1};
-            if(n->join_qual>=0 && evaluate(s,&e,n->join_qual,&match)) return -5;
+            struct qs_cell match={.value=1};
+            if(n->join_qual>=0) {
+                struct qs_eval e; init_eval(&e,&n->expr,values,NULL);
+                if(evaluate(s,&e,n->join_qual,&match)) return -5;
+            }
             if(match.isnull || !match.value) continue;
             o->hash_matched=1; ++s->metrics.join_rows;
             if(n->join_type==QP_ANTI) { o->hash_match=0; break; }
@@ -566,6 +581,7 @@ restart:
         int unmatched=!o->hash_matched && (n->join_type==QP_LEFT || n->join_type==QP_ANTI);
         o->have_left=0;
         if(unmatched) {
+            hash_left_payload(s,id);
             struct qs_cell values[QS_COLS]; memcpy(values,o->left,ln*sizeof(*values));
             for(unsigned i=0;i<rn;++i) values[ln+i]=(struct qs_cell){.isnull=1};
             int count=project(s,n,values,NULL,row); if(count<0) return count; if(count) return 2;
@@ -1186,6 +1202,84 @@ static int64_t projection_next(struct execution *s,unsigned id,struct qs_cell *r
         row[i]=qs_vector_cell(&b->plan,b->vectors,index,b->position);
     }
     ++b->position; ++s->metrics.matched; return 2;
+}
+/* Probe the bucket array as a batch, keeping column payloads borrowed until
+ * a candidate needs them. Match-chain state remains in the join operator, so
+ * one input can produce arbitrarily many output batches without rereading it. */
+static int64_t hash_probe_input(struct execution *s,unsigned id,const uint32_t *buckets)
+{
+    const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
+    o->hash_payload=0;
+    int eligible=!o->external && s->source_node<0 &&
+        !(!s->worker && s->plan->workers>1 && s->plan->nodes[n->left].parallel);
+    if(eligible) {
+        int status=projection_init(s,n->left); if(status) return status;
+        struct projection_batch *b=s->nodes[n->left].projection;
+        if(b && !o->hash_probe) o->hash_probe=cs_work_calloc(s->context,1,sizeof(*o->hash_probe));
+        if(b && o->hash_probe) {
+            int64_t ready=projection_fill(s,n->left);
+            if(ready!=2) {
+                if(ready!=3) {
+                    if(!ready) { cs_work_free(s->context,o->hash_probe); o->hash_probe=NULL; }
+                    return ready;
+                }
+                cs_work_free(s->context,o->hash_probe); o->hash_probe=NULL;
+            } else {
+                b=s->nodes[n->left].projection;
+                struct hash_probe_batch *probe=o->hash_probe;
+                if(!b->position || !probe->ready) {
+                    for(unsigned r=0;r<b->count;++r) {
+                        uint64_t hash=UINT64_C(0x9e3779b97f4a7c15); unsigned null=0,error=0;
+                        for(unsigned col=0;col<b->plan.nout;++col)
+                            error|=b->vectors[b->plan.outputs[col].index].errors[r];
+                        for(unsigned k=0;!error && k<n->nkeys;++k) {
+                            int index=b->plan.outputs[n->left_keys[k]].index;
+                            struct qs_cell key=qs_vector_cell(&b->plan,b->vectors,index,r);
+                            null|=key.isnull; hash=hash_key(hash,key);
+                        }
+                        probe->matches[r]=null || error?UINT_MAX:hash&(o->hash_buckets-1);
+                        probe->errors[r]=error;
+                    }
+                    /* Separate hashing from random bucket loads so the CPU
+                     * can overlap independent lookups across this vector. */
+                    for(unsigned r=0;r<b->count;++r) {
+                        unsigned slot=probe->matches[r],at=slot==UINT_MAX?UINT_MAX:buckets[slot];
+                        probe->matches[r]=at==UINT_MAX?0:at+1;
+                    }
+                    probe->ready=1;
+                }
+                unsigned r=b->position++;
+                /* Report expression errors only when this input row is
+                 * requested: a LIMIT may never consume later error rows. */
+                if(probe->errors[r]) return -5;
+                o->hash_payload=(1U<<b->plan.nout)-1;
+                for(unsigned k=0;k<n->nkeys;++k) {
+                    unsigned col=n->left_keys[k]; int index=b->plan.outputs[col].index;
+                    o->left[col]=qs_vector_cell(&b->plan,b->vectors,index,r);
+                    o->hash_payload&=~(1U<<col);
+                }
+                o->hash_match=probe->matches[r];
+                ++s->metrics.matched; return 2;
+            }
+        }
+    }
+    int64_t status=o->external?external_probe(s,id,o->left):next_row(s,n->left,o->left);
+    if(status==2) {
+        unsigned at=keys_null(n,o->left)?UINT_MAX:buckets[row_hash(n,o->left,0)&(o->hash_buckets-1)];
+        o->hash_match=at==UINT_MAX?0:at+1;
+    }
+    return status;
+}
+static void hash_left_payload(struct execution *s,unsigned id)
+{
+    struct operator_state *o=&s->nodes[id]; if(!o->hash_payload) return;
+    struct projection_batch *b=s->nodes[s->plan->nodes[id].left].projection;
+    unsigned r=b->position-1;
+    for(unsigned columns=o->hash_payload;columns;columns&=columns-1) {
+        unsigned col=__builtin_ctz(columns);
+        o->left[col]=qs_vector_cell(&b->plan,b->vectors,b->plan.outputs[col].index,r);
+    }
+    o->hash_payload=0;
 }
 static int group_same(struct execution *s,const struct qp_node *n,struct operator_state *o)
 {

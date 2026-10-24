@@ -523,6 +523,55 @@ static void nested_sort(function run,unsigned type,unsigned hash,unsigned kind)
 /* Two keys (text + nullable integer), expression SUM/AVG, adaptive growth
  * and partial-state spill. The oracle groups independently by array indices. */
 struct expected_multi { unsigned a,b,rows,count; int64_t sum; };
+/* Prehashed future rows must not raise errors past LIMIT, while an input
+ * row actually requested must raise its payload error even if it cannot join. */
+static void probe_limit_errors(function run,unsigned limit)
+{
+    struct qp_plan *p=calloc(1,sizeof(*p)); assert(p); p->count=4; p->scan_bytes=QP_SCAN_BYTES;
+    scan(&p->nodes[2]); scan(&p->nodes[3]);
+    struct qs_plan *left=&p->nodes[2].expr; left->nexprs=8;
+    left->exprs[2]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER};
+    left->exprs[3]=(struct qs_expr){.op=Q_EQ,.type=Q_BOOLEAN,.left=0,.right=2};
+    left->exprs[4]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=INT64_MAX};
+    left->exprs[5]=(struct qs_expr){.op=Q_MUL,.type=Q_INTEGER,.left=4,.right=4};
+    left->exprs[6]=(struct qs_expr){.op=Q_MUL,.type=Q_INTEGER,.left=5,.right=4};
+    left->exprs[7]=(struct qs_expr){.op=Q_CASE,.type=Q_DECIMAL,.left=3,.right=5,.otherwise=6};
+    left->outputs[1]=(struct qs_output){.index=7,.type_oid=1700};
+    struct qp_node *j=&p->nodes[1]; j->kind=QP_JOIN; j->left=2; j->right=3; j->hash=1;
+    j->nkeys=1; j->join_type=QP_INNER; j->join_qual=-1;
+    j->expr=p->nodes[3].expr; j->expr.nattrs=4;
+    j->expr.exprs[1].type=Q_DECIMAL; j->expr.outputs[1].type_oid=1700;
+    struct qp_node *top=&p->nodes[0]; top->kind=QP_LIMIT; top->left=1; top->right=-1;
+    top->expr=j->expr; top->expr.limit=limit; top->expr.work_mem_bytes=64U*1024*1024;
+    size_t sizes[2],bytes=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
+    unsigned char *raw[2]={heap(2,2,&sizes[0]),heap(1,2,&sizes[1])};
+    for(unsigned i=2;i<4;++i) {
+        struct qp_node *n=&p->nodes[i]; n->bytes=sizes[i-2]; n->input_offset=bytes; bytes+=QP_SCAN_BYTES;
+        n->vector_offset=bytes; bytes+=qs_chunk_bytes(QP_SCAN_BYTES/24,2);
+    }
+    unsigned char *arena=calloc(1,bytes),*io=calloc(1,QS_SORT_IO_BYTES); assert(arena && io);
+    *(struct qs_dict *)arena=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
+    for(unsigned i=2;i<4;++i)
+        *(struct qs_chunk *)(arena+p->nodes[i].vector_offset)=(struct qs_chunk){.capacity=QP_SCAN_BYTES/24,.ncols=2};
+    struct qp_control control={0}; struct qs_result *out=calloc(1,sizeof(*out)); assert(out);
+    void *mr[]={p,&control,out,arena,io}; long long len[]={sizeof(*p),sizeof(control),sizeof(*out),bytes,QS_SORT_IO_BYTES};
+    struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=len}; int64_t status;
+    do {
+        status=run(&args); if(status<0) break;
+        assert(!status);
+        if(control.bytes && !control.ready) {
+            struct qp_node *n=&p->nodes[control.node];
+            memcpy(arena+n->input_offset,raw[control.node-2]+control.offset,control.bytes); control.ready=1;
+        }
+    } while(!out->finished);
+    if(limit==1) {
+        assert(!status && out->rows==1 && out->data[0].cells[0].value==0);
+        assert(out->data[0].cells[1].value==(__int128)INT64_MAX*INT64_MAX);
+    }
+    else { assert(status==-5); control.close=1; assert(!run(&args)); }
+    struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
+    free(raw[0]); free(raw[1]); free(arena); free(io); free(out); free(p);
+}
 static int multi_order(const void *ap,const void *bp)
 {
     const struct expected_multi *a=ap,*b=bp;
@@ -749,6 +798,7 @@ int main(int argc,char **argv)
         return 0;
     }
     assert(!cs_work_init(64*1024*1024));
+    probe_limit_errors(run,1); probe_limit_errors(run,2);
     test_scheduled=true;
     test(run,QP_INNER,20003,23,64,1,TEST_VECTOR_AGG);
     test(run,QP_INNER,0,23,64,1,TEST_VECTOR_AGG);

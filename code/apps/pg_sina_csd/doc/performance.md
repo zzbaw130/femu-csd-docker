@@ -10,7 +10,7 @@
 
 ## 完整验收
 
-原始记录：[timings.csv](../../../../results/tpch.n2BAPq/timings.csv)。22条结果与host一致、确认实际卸载，22条CSD延迟均低于同轮host，脚本退出0。额外逐条检查explain：顶层均为单个SniaCsd Custom Scan，均发现8 CU和268435456字节workmem，没有把局部出现一个Custom Scan等同于整条计划卸载。
+最近一次完整验收对应提交 `e1e925ae2`；后续 Hash Join 阶段只做以下针对性回归，不将此完整轮当作新版本22条均已复测的证明。原始记录：[timings.csv](../../../../results/tpch.n2BAPq/timings.csv)。22条结果与host一致、确认实际卸载，22条CSD延迟均低于同轮host，脚本退出0。额外逐条检查explain：顶层均为单个SniaCsd Custom Scan，均发现8 CU和268435456字节workmem，没有把局部出现一个Custom Scan等同于整条计划卸载。
 
 | 查询 | host ms | CSD ms | host/CSD |
 | --- | ---: | ---: | ---: |
@@ -68,6 +68,27 @@
 | spill读/写 | 0/0 |
 
 累计CPU跨CU汇总，分项存在包含关系，不能与墙钟直接相加。聚合流水线尚未达到8CU持续满载，局部合并/共享表更新仍有明显成本；此次证据不支持通过扩容FDM解决它。
+
+## Hash Join列输入（本阶段）
+
+参照DuckDB保留探测输入与匹配位置的方式，纯Scan/Projection探测输入借用原表达式向量，批量计算哈希后再读取桶头。只先还原Join键，匹配后补齐尚未复制的payload列；没有匹配的INNER/SEMI输入不还原完整行。匹配链与向量游标分开保存，一个输入产生多批输出时继续已有位置，不重新扫描。无额外Join条件的ANTI匹配可以直接跳过payload。
+
+每个活跃探测节点新增约9KiB私有桶头/错误记录，计入原workmem；空间不够、分区spill输入或不能借用列向量时沿用原适配器。预计算发现的表达式错误保留到对应行真正被请求时才报告，避免越过LIMIT提前报错；被请求但未能Join的行仍保留原输入表达式报错语义。Join输出当前仍使用行适配器，不宣称完成全链路列执行。
+
+[最终规范SQL冷启动回归](../../../../results/tpch.ylVmAw/timings.csv)：
+
+| 查询 | host ms | CSD ms | 结果 / 卸载 |
+| --- | ---: | ---: | --- |
+| Q10 | 3571.499 | 2005.872 | 一致 / 是 |
+| Q14 | 1412.505 | 648.875 | 一致 / 是 |
+| Q17 | 4211.235 | 1529.002 | 一致 / 是 |
+| Q19 | 1621.127 | 670.121 | 一致 / 是 |
+
+交替诊断与此前样本存在明显波动，未证明本阶段稳定降低整查询延迟，不能将接口改造本身当成性能收益。独立Q14 profile中，旧版累计CSF CPU为1365.946ms、查询树1154.487ms；最终版累计CSF CPU为1260.619ms、查询树560.689ms。累计CPU相近而墙钟及请求驻留时间差距大，尚不足以归因于探测算法。证据：[旧版profile](../../../../results/hash-probe-profile/before-q14.profile.log)、[最终版profile](../../../../results/hash-probe-profile/final-q14.profile.log)。
+
+最终版Q14的两个流水线平均活跃CU为3.93/2.21，工作内存峰值8612256字节，AFDM56626312字节，无spill。后续需要继续减少Join行输出适配，并细分通用LOAD完成与计算就绪之间的等待；此处没有内存不足证据，不扩容FDM。
+
+4项针对性CTest通过（原生及8/16/64槽）。新增探测LIMIT用例验证128位payload、未来行错误延迟及未匹配行错误；既有用例覆盖多批重复键结果、INNER/LEFT/SEMI/ANTI、并行构建、分区spill与资源回收。生产SO已重新编译部署。本阶段没有修改FEMU/SNIA协议、PG接口或新增配置。
 
 ## 验证与剩余工作
 
