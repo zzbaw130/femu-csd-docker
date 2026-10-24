@@ -557,7 +557,10 @@ static void multiple_groups(function run,unsigned memory,unsigned kind,int integ
     }
     for(unsigned i=0;i<total;++i) if(expected[i].rows) expected[groups++]=expected[i];
     qsort(expected,groups,sizeof(*expected),multi_order);
-    struct qp_node *a=&p->nodes[1]; a->kind=QP_AGGREGATE; a->left=2; a->right=-1; a->hash=1; a->estimated_rows=60000;
+    struct qp_node *a=&p->nodes[1]; a->kind=QP_AGGREGATE; a->left=2; a->right=-1; a->hash=1;
+    /* Force full-table handoff with a partially consumed expression vector.
+     * The owner must grow/spill without losing or counting those rows twice. */
+    a->estimated_rows=a->estimated_groups=128;
     a->nkeys=a->expr.nkeys=2; a->left_keys[0]=a->expr.keys[0]=0; a->left_keys[1]=a->expr.keys[1]=1;
     a->expr.predicate=-1; a->expr.nattrs=2; a->expr.nexprs=5; a->expr.nout=3; a->expr.naggs=1;
     a->expr.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.column=0,.type=Q_STRING};

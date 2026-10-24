@@ -89,6 +89,7 @@ struct projection_batch {
     struct qs_vector *vectors;
     uint8_t needed[QS_EXPRS];
     unsigned scan,count,position;
+    int group_keys[QS_KEYS],group_value;
 };
 struct operator_state {
     struct sorted_rows left_sort,right_sort;
@@ -1086,7 +1087,9 @@ static int projection_init(struct execution *s,unsigned id)
     o->projection_checked=1;
     const struct qp_node *root=&s->plan->nodes[id];
     int aggregate=root->kind==QP_AGGREGATE;
-    if(aggregate && (root->nkeys || root->distinct || root->distinct_aggs || root->left<0)) return 0;
+    if(aggregate && (root->distinct || root->distinct_aggs || root->left<0 ||
+        (root->nkeys && (!root->hash || root->expr.naggs!=1)))) return 0;
+    int grouped=aggregate && root->nkeys;
     int scan=aggregate?root->left:(int)id;
     while(s->plan->nodes[scan].kind==QP_PROJECT) {
         const struct qp_node *n=&s->plan->nodes[scan];
@@ -1101,13 +1104,29 @@ static int projection_init(struct execution *s,unsigned id)
         if(!s->nodes[scan].scan_filter) return 0;
     }
     struct projection_batch *b=cs_work_calloc(s->context,1,sizeof(*b)); if(!b) return 0;
-    b->plan=leaf->expr; b->plan.nexprs=0; b->plan.nout=aggregate?root->expr.naggs:root->expr.nout; b->scan=scan;
+    b->plan=leaf->expr; b->plan.nexprs=0; b->plan.nout=grouped?s->plan->nodes[root->left].expr.nout:
+        aggregate?root->expr.naggs:root->expr.nout; b->scan=scan;
     struct projection_import import={.execution=s,.batch=b};
+    if(grouped) {
+        for(unsigned k=0;k<root->nkeys;++k) {
+            int index=projection_import(&import,id,root->expr.keys[k]);
+            if(index<0 || qs_vector_require(&b->plan,index,b->needed)) { cs_work_free(s->context,b); return 0; }
+            b->group_keys[k]=index;
+        }
+        b->group_value=-1;
+        if(root->expr.aggs[0].kind!=Q_COUNT_STAR) {
+            int index=projection_import(&import,id,root->expr.aggs[0].expr);
+            if(index<0 || qs_vector_require(&b->plan,index,b->needed)) { cs_work_free(s->context,b); return 0; }
+            b->group_value=index;
+        }
+    }
     for(unsigned i=0;i<b->plan.nout;++i) {
-        if(aggregate && root->expr.aggs[i].kind==Q_COUNT_STAR) { b->plan.outputs[i].index=-1; continue; }
-        int index=projection_import(&import,id,aggregate?root->expr.aggs[i].expr:root->expr.outputs[i].index);
+        if(aggregate && !grouped && root->expr.aggs[i].kind==Q_COUNT_STAR) { b->plan.outputs[i].index=-1; continue; }
+        const struct qp_node *source=grouped?&s->plan->nodes[root->left]:root;
+        int index=projection_import(&import,grouped?(unsigned)root->left:id,
+            aggregate && !grouped?root->expr.aggs[i].expr:source->expr.outputs[i].index);
         if(index<0 || qs_vector_require(&b->plan,index,b->needed)) { cs_work_free(s->context,b); return 0; }
-        b->plan.outputs[i]=root->expr.outputs[i]; b->plan.outputs[i].index=index;
+        b->plan.outputs[i]=source->expr.outputs[i]; b->plan.outputs[i].index=index;
     }
     if(b->plan.nexprs) b->vectors=cs_work_alloc(s->context,b->plan.nexprs*sizeof(*b->vectors));
     if(b->plan.nexprs && !b->vectors) { cs_work_free(s->context,b); return 0; }
@@ -1230,11 +1249,11 @@ static void group_keys(const struct qp_node *n,const struct operator_state *o,co
     } else if(o->group_stride>sizeof(*g)) memcpy(keys,g+1,n->nkeys*sizeof(*keys));
     else keys[0]=(struct qs_cell){.value=g->key,.isnull=g->occupied==2};
 }
-static uint64_t group_hash(const struct qp_node *n,const struct qs_cell *row)
+static uint64_t group_hash(const struct qp_node *n,const struct qs_cell *keys)
 {
     uint64_t hash=UINT64_C(0x9e3779b97f4a7c15);
     for(unsigned k=0;k<n->nkeys;++k) {
-        struct qs_cell v=row[n->left_keys[k]];
+        struct qs_cell v=keys[k];
         if(v.isnull) v=(struct qs_cell){0};
         while(v.scale && !(v.value%10)) { v.value/=10; --v.scale; }
         hash=mix_hash(hash^(uint64_t)v.value^(uint64_t)((unsigned __int128)v.value>>64)^((uint64_t)v.scale<<56));
@@ -1271,14 +1290,12 @@ static int group_result(struct execution *s,const struct qp_node *n,struct compa
  * owner alone grows/flushes the table between CU waves; full tables leave raw
  * rows in the ordinary AFDM buffer for that existing bounded spill path. */
 #define GROUP_LOCK (1U<<31)
-static int group_sink_row(struct execution *s,unsigned id,struct operator_state *o,
-    const struct qs_cell *row,int shared)
+static int group_sink_values(struct execution *s,unsigned id,struct operator_state *o,
+    const struct qs_cell *keys,struct qs_cell value,int shared)
 {
     const struct qp_node *n=&s->plan->nodes[id];
     unsigned kind=n->expr.aggs[0].kind;
     int wide=o->group_stride>sizeof(*o->groups);
-    struct qs_cell keys[QS_KEYS],value={.value=1};
-    for(unsigned k=0;k<n->nkeys;++k) keys[k]=row[n->left_keys[k]];
     struct qs_cell key=keys[0];
     if(!wide && !key.isnull && (key.scale || key.value<INT64_MIN || key.value>INT64_MAX)) return -5;
     unsigned occupied=key.isnull?2:1;
@@ -1289,12 +1306,7 @@ static int group_sink_row(struct execution *s,unsigned id,struct operator_state 
             if(keys[k].isnull) occupied|=2U<<k;
         }
     }
-    if(kind!=Q_COUNT_STAR) {
-        int index=n->expr.aggs[0].expr;
-        if(n->expr.exprs[index].op==Q_COLUMN) value=row[n->expr.exprs[index].column];
-        else { struct qs_eval eval; init_eval(&eval,&n->expr,row,NULL); if(evaluate(s,&eval,index,&value)) return -5; }
-    }
-    uint64_t hash=wide?group_hash(n,row):mix_hash(key.isnull?0:(uint64_t)key.value);
+    uint64_t hash=wide?group_hash(n,keys):mix_hash(key.isnull?0:(uint64_t)key.value);
     unsigned mask=o->group_capacity-1,at=hash&mask;
     for(;;at=(at+1)&mask) {
         struct compact_group *g=group_at(o,at);
@@ -1337,6 +1349,51 @@ static int group_sink_row(struct execution *s,unsigned id,struct operator_state 
         atomic_store_explicit(&g->occupied,occupied,shared?memory_order_release:memory_order_relaxed);
         return status?status:1;
     }
+}
+static int group_sink_row(struct execution *s,unsigned id,struct operator_state *o,
+    const struct qs_cell *row,int shared)
+{
+    const struct qp_node *n=&s->plan->nodes[id];
+    struct qs_cell keys[QS_KEYS],value={.value=1};
+    for(unsigned k=0;k<n->nkeys;++k) keys[k]=row[n->left_keys[k]];
+    if(n->expr.aggs[0].kind!=Q_COUNT_STAR) {
+        int index=n->expr.aggs[0].expr;
+        if(n->expr.exprs[index].op==Q_COLUMN) value=row[n->expr.exprs[index].column];
+        else { struct qs_eval eval; init_eval(&eval,&n->expr,row,NULL); if(evaluate(s,&eval,index,&value)) return -5; }
+    }
+    return group_sink_values(s,id,o,keys,value,shared);
+}
+/* Keep keys and aggregate arguments in vectors. Only rows rejected by a full
+ * shared table enter the existing AFDM adapter, so its owner can grow/spill
+ * between waves without losing the remainder of this vector. */
+static int group_sink_vectors(struct execution *s,unsigned id,struct qs_result *out,unsigned capacity)
+{
+    struct projection_batch *b=s->nodes[id].projection;
+    const struct qp_node *n=&s->plan->nodes[id];
+    struct operator_state *o=&s->owner->nodes[id];
+    while(b->position<b->count && out->rows<capacity) {
+        unsigned r=b->position;
+        struct qs_cell keys[QS_KEYS],value={.value=1};
+        for(unsigned k=0;k<n->nkeys;++k) {
+            int index=b->group_keys[k]; if(b->vectors[index].errors[r]) return -5;
+            keys[k]=qs_vector_cell(&b->plan,b->vectors,index,r);
+        }
+        if(b->group_value>=0) {
+            int index=b->group_value; if(b->vectors[index].errors[r]) return -5;
+            value=qs_vector_cell(&b->plan,b->vectors,index,r);
+        }
+        int added=group_sink_values(s,id,o,keys,value,1); if(added<0) return added;
+        if(!added) {
+            struct qs_cell *row=(struct qs_cell *)out->data+(size_t)out->rows*b->plan.nout;
+            for(unsigned col=0;col<b->plan.nout;++col) {
+                int index=b->plan.outputs[col].index; if(b->vectors[index].errors[r]) return -5;
+                row[col]=qs_vector_cell(&b->plan,b->vectors,index,r);
+            }
+            ++out->rows;
+        }
+        ++b->position; ++s->metrics.matched;
+    }
+    return 0;
 }
 static int group_sink_batch(struct execution *s,struct qs_result *out)
 {
@@ -2084,6 +2141,29 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
      * pipeline fits 2048 rows in the same AFDM as 256 final sixteen-cell rows. */
     unsigned capacity=worker?QS_RESULT_ROWS*QS_OUT/(columns?columns:1):QS_RESULT_ROWS;
 produce:
+    if(worker && s->group_sink) {
+        unsigned id=s->group_sink-1;
+        status=projection_init(s,id); if(status<0) goto produced;
+        while(s->nodes[id].projection) {
+            status=projection_fill(s,id);
+            if(status!=2) {
+                if(!status) out->finished=control->finished=1;
+                if(status!=3) goto produced;
+                break;
+            }
+            struct projection_batch *b=s->nodes[id].projection;
+            unsigned before=b->position,rows=out->rows;
+            uint64_t tick=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
+            status=group_sink_vectors(s,id,out,capacity);
+            if(s->profiling) {
+                s->sink_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-tick;
+                s->sink_rows+=b->position-before-(out->rows-rows);
+            }
+            if(status<0) goto produced;
+            status=2; if(out->rows) goto produced;
+        }
+        status=2;
+    }
     if(worker && s->aggregate_sink) {
         unsigned id=s->aggregate_sink-1;
         status=projection_init(s,id); if(status<0) goto produced;
