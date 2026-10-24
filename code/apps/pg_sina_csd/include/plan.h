@@ -29,6 +29,7 @@ struct qp_node {
     uint64_t bytes, index_bytes, input_offset, vector_offset;
     uint64_t parallel_input, parallel_vector;
     double estimated_rows;
+    double estimated_groups; /* Before HAVING; output rows remain a separate estimate. */
 };
 /* Optional per-pipeline measurements; only the coordinator writes these.
  * CPU sums include all CSF slices, wall includes LOAD and scheduling waits. */

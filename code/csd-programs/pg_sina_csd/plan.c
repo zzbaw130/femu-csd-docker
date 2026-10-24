@@ -1392,8 +1392,9 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
         int key_only=kind==Q_COUNT_STAR && n->expr.nout==n->nkeys;
         for(unsigned i=0;key_only && i<n->expr.nout;++i)
             if(n->expr.exprs[n->expr.outputs[i].index].op!=Q_COLUMN) key_only=0;
+        double groups=n->estimated_groups>0?n->estimated_groups:n->estimated_rows;
         while((!wide || s->plan->nodes[n->left].kind==QP_SCAN ||
-              (key_only && s->plan->nodes[n->left].parallel)) && capacity< n->estimated_rows*8/7 &&
+              (key_only && s->plan->nodes[n->left].parallel)) && capacity<groups*8/7 &&
               (size_t)capacity*2*o->group_stride<=available && capacity<UINT_MAX/2)
             capacity*=2;
         for(;;) {
@@ -1420,7 +1421,7 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
                 if(cs_work_get_context_stats(s->context,&m)) return -4;
                 size_t available=m.limit_bytes-m.used_bytes,reserve=group_reserve(s,n);
                 available=available>reserve?available-reserve:0;
-                void *larger=wide && capacity>o->group_capacity && (size_t)capacity*o->group_stride<=available?
+                void *larger=capacity>o->group_capacity && (size_t)capacity*o->group_stride<=available?
                     cs_work_calloc(s->context,capacity,o->group_stride):NULL;
                 if(larger) {
                     struct compact_group *old=o->groups; unsigned previous=o->group_capacity;
@@ -1428,7 +1429,8 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
                     for(unsigned i=0;i<previous;++i) {
                         struct compact_group *v=(void *)((unsigned char *)old+(size_t)i*o->group_stride);
                         if(!v->occupied) continue;
-                        unsigned slot=(uint64_t)v->key&(capacity-1);
+                        uint64_t hash=wide?(uint64_t)v->key:mix_hash(v->occupied==2?0:(uint64_t)v->key);
+                        unsigned slot=hash&(capacity-1);
                         while(group_at(o,slot)->occupied) slot=(slot+1)&(capacity-1);
                         memcpy(group_at(o,slot),v,o->group_stride);
                     }
@@ -1473,7 +1475,7 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
             while(o->group_flush<o->group_capacity) {
                 struct compact_group *g=group_at(o,o->group_flush++); if(!g->occupied) continue;
                 struct qs_cell keys[QS_KEYS]; group_keys(n,o,g,keys);
-                return group_result(s,n,g,keys,row);
+                int64_t result=group_result(s,n,g,keys,row); if(result) return result;
             }
             cs_work_free(s->context,o->groups); o->groups=NULL; o->finished=1; return 0;
         }
@@ -1498,7 +1500,8 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
             int status=group_add(&g,o->right[n->nkeys],o->right[n->nkeys+1].value,kind); if(status) return status;
             o->accum[0].sum=g.sum; o->accum[0].count=g.count; o->have_right=0; continue;
         }
-        o->phase=0; return group_result(s,n,&g,o->keys,row);
+        o->phase=0;
+        int64_t result=group_result(s,n,&g,o->keys,row); if(result) return result;
     }
 }
 static int64_t hash_aggregate_next(struct execution *s,unsigned id,struct qs_cell *row)

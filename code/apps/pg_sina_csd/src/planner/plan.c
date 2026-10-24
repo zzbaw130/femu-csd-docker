@@ -569,7 +569,11 @@ static bool group_output(const struct qs_plan *p,int index,const struct qp_node 
         return false;
     }
     if(x->op==Q_AGGREF) return x->column==0;
-    return (x->op==Q_ADD || x->op==Q_SUB || x->op==Q_MUL || x->op==Q_DIV) &&
+    if(x->op==QP_PARAMETER) return true;
+    if(x->op==Q_NOT || x->op==Q_IS_NULL || x->op==Q_IS_NOT_NULL)
+        return group_output(p,x->left,n);
+    return (x->op==Q_ADD || x->op==Q_SUB || x->op==Q_MUL || x->op==Q_DIV ||
+        (x->op>=Q_EQ && x->op<=Q_OR)) &&
         group_output(p,x->left,n) && group_output(p,x->right,n);
 }
 /* A unique integer-key join that only returns its key is a membership test.
@@ -796,6 +800,7 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
     } else if(IsA(native,Agg)) {
         Agg *a=(Agg *)native; if(a->chain || a->groupingSets) return -1;
         n->kind=QP_AGGREGATE; n->sorted_input=a->aggstrategy==AGG_SORTED;
+        n->estimated_groups=a->numGroups;
         if(DO_AGGSPLIT_COMBINE(a->aggsplit)) {
             Plan *partial=partial_input(left); if(!partial) return -1;
             left=partial->lefttree;
@@ -1033,6 +1038,23 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
     }
     if(n->kind==QP_JOIN && !ordered && ((Join *)native)->inner_unique) push_group_key_filter(tree,n);
     if(n->kind==QP_AGGREGATE) push_left_join_count(tree,n);
+    /* An unfiltered, non-covering index used only to order a full GROUP BY
+     * serializes Heap decoding. If no consumer requires that order, use the
+     * bounded parallel hash aggregate while retaining PG's join tree. */
+    if(n->kind==QP_AGGREGATE && !ordered && n->sorted_input && n->nkeys &&
+       p->naggs==1 && !n->distinct && !n->distinct_aggs && p->having<0 && n->left>=0) {
+        struct qp_node *input=&tree->nodes[n->left];
+        unsigned kind=p->aggs[0].kind;
+        bool supported=input->kind==QP_SCAN && input->ordered_index && !(input->ordered_index&4) &&
+            input->expr.predicate<0 && (kind==Q_SUM || kind==Q_AVG || kind==Q_COUNT || kind==Q_COUNT_STAR);
+        for(unsigned i=0;supported && i<p->nout;++i)
+            supported=group_output(p,p->outputs[i].index,n);
+        if(supported && p->predicate>=0) supported=group_output(p,p->predicate,n);
+        if(supported) {
+            input->ordered_index=0; memset(&input->expr.join,0,sizeof(input->expr.join));
+            n->sorted_input=0; n->hash=1;
+        }
+    }
     return id;
 }
 

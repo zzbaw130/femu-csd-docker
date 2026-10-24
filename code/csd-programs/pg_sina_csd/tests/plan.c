@@ -434,6 +434,11 @@ static void nested_sort(function run,unsigned type,unsigned hash,unsigned kind)
             if(kind==Q_COUNT || kind==Q_COUNT_STAR) want[i].value=(struct qs_cell){.value=counts[i]};
             else if(!counts[i]) want[i].value.isnull=1;
         }
+        if(hash==4 || hash==5) {
+            unsigned kept=0;
+            for(unsigned i=0;i<groups;++i) if(!want[i].value.isnull) want[kept++]=want[i];
+            groups=kept;
+        }
         qsort(want,groups,sizeof(*want),group_order);
     }
     struct qp_plan *p=calloc(1,sizeof(*p)); assert(p); p->count=4; p->scan_bytes=QP_SCAN_BYTES;
@@ -458,7 +463,15 @@ static void nested_sort(function run,unsigned type,unsigned hash,unsigned kind)
         a->expr.exprs[4]=(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=1,.right=3};
         a->expr.outputs[1].index=4;
     }
-    p->nodes[0].expr.work_mem_bytes=(hash==2?64U:4U)*1024*1024;
+    if(hash==4 || hash==5) {
+        /* Underestimated integer groups must grow with the same hash function;
+         * HAVING must skip rejected groups in both resident and spilled output. */
+        a->estimated_rows=a->estimated_groups=128;
+        unsigned predicate=a->expr.nexprs++;
+        a->expr.exprs[predicate]=(struct qs_expr){.op=Q_IS_NOT_NULL,.left=1,.type=Q_BOOLEAN};
+        a->expr.predicate=predicate;
+    }
+    p->nodes[0].expr.work_mem_bytes=((hash==2 || hash==4)?64U:4U)*1024*1024;
     p->nodes[0].expr.norder=2;
     p->nodes[0].expr.order[1]=(struct qs_order){.output=0};
     p->nodes[0].expr.outputs[1].type_oid=type;
@@ -501,8 +514,8 @@ static void nested_sort(function run,unsigned type,unsigned hash,unsigned kind)
         if(control.bytes && !control.ready) { memcpy(arena+leaf->input_offset,raw+control.offset,control.bytes); control.ready=1; }
     }
     assert(seen==groups);
-    if(hash==1) assert(ntokens);
-    if(hash==2) assert(!ntokens);
+    if(hash==1 || hash==5) assert(ntokens);
+    if(hash==2 || hash==4) assert(!ntokens);
     for(unsigned i=0;i<ntokens;++i) { assert(!tokens[i]); }
     free(tokens); free(raw); free(expected); free(want); free(counts); free(p); free(arena); free(io); free(out);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
@@ -773,6 +786,8 @@ int main(int argc,char **argv)
     test(run,QP_LEFT,73,20000,8,1,TEST_SERIAL);
     test(run,QP_INNER,73,60000,8,1,TEST_BUILD_FALLBACK);
     test(run,QP_INNER,73,60000,4,1,TEST_BUILD_FALLBACK);
+    nested_sort(run,23,4,Q_SUM); nested_sort(run,23,4,Q_AVG);
+    nested_sort(run,23,5,Q_SUM); nested_sort(run,23,5,Q_AVG);
     nested_sort(run,23,0,Q_SUM); nested_sort(run,1700,0,Q_SUM);
     nested_sort(run,1700,1,Q_SUM); nested_sort(run,1700,1,Q_AVG); nested_sort(run,1700,2,Q_AVG);
     nested_sort(run,20,1,Q_COUNT); nested_sort(run,20,1,Q_COUNT_STAR); nested_sort(run,1700,3,Q_AVG); parallel_dictionary();
