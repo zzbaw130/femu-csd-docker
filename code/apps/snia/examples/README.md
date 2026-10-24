@@ -4,7 +4,7 @@ Guest应用为cs_batch_sort_avg.c，普通CPU基线为code/csd-programs/examples
 
 ## 编译与运行
 
-使用已挂载的femu-data分区及未挂载的femu-spill分区。在宿主项目根目录：
+使用已挂载的femu-data分区，FEMU配置非零csd_spill_size_mb，运行配套新固件与插件。在宿主项目根目录：
 
 ```sh
 bash tests/snia-test.sh build
@@ -42,7 +42,7 @@ sudo ./cs-batch-sort-avg /dev/nvme0n1 /data/cs-batch-input.bin --existing
 
 第一条由csAllocBatchRequest、csConfigureBatchEntry构造8个节点：每个sink只依赖自己的LOAD，四条分支之间没有依赖。每轮csQueueBatchRequest等待全部完成，再更新四个LOAD的文件extent。四个sink使用同一个程序ID420，由设备最多4个CU执行；不是每个sink内部创建线程，也不是设备自动拆分计算。
 
-task[i]是该分支的小型输入输出结构：workers=4指定本例的工作区分摊，state首次为0。sink首次创建自己的workmem状态，把64位句柄写回task[i].state；后续batch直接复用该AFDM。Guest不能解引用句柄，也不依赖HYBRID batch的单个CompValue取得四个结果。每个sink生成16个4MiB run，四个状态独立，cparam2仍留给SNIA重入I/O。
+task[i]是该分支的小型输入输出结构：workers=4指定本例的工作区分摊，state首次为0。sink首次创建自己的workmem状态，把64位句柄写回task[i].state；后续batch直接复用该AFDM。Guest不能解引用句柄，也不依赖HYBRID batch的单个CompValue取得四个结果。每个sink生成16个4MiB run，四个状态独立，cparam2仍留给设备重入I/O。
 
 全部输入完成后，Guest读取四个task，只把句柄写到group.states[0..3]。第二条source以cparam1接收state0，首次调用将其余三组run的描述接入第一个状态，只复制描述，不复制run数据。每个run保留原来的workmem context归属；source从所有64个run产生一条全局降序流。group中其余三个句柄清零，表示它们的资源已交由source统一管理。
 
@@ -83,7 +83,7 @@ result首次以CS_FDM_CLEAR分配，之后每个batch复用同一AFDM。AVG读�
 
 WORKLOAD的peak是“各context历史峰值之和＋预留的全部I/O缓冲”的保守上界，各context峰值不一定同时发生。两条路径都必须小于64MiB。代码、线程栈和库固定管理开销不属于算法预算，未设置整个进程RSS上限。
 
-普通路径用4个pthread，各自O_DIRECT读取交错分配的16个输入块、排序并按需spill；临时文件在输入目录创建后立即unlink，也使用O_DIRECT，原子分配互不重叠的写入区段。所有线程join后，主线程接入四组run并完成全局归并和AVG。CSD临时块位于femu-spill分区，通过内部D0/D1移动。
+普通路径用4个pthread，各自O_DIRECT读取交错分配的16个输入块、排序并按需spill；临时文件在输入目录创建后立即unlink，也使用O_DIRECT，原子分配互不重叠的写入区段。所有线程join后，主线程接入四组run并完成全局归并和AVG。CSD临时块位于设备隐藏空间，设备处理NEED_STORE/LOAD/FREE并自主重入，不经过Guest。
 
 出错时，Guest先读取group或task中仍然有效的句柄，再逐个调用source的单AFDM用法释放工作内存。source已接管四组run时，只清理state0；随后关闭设备，回收尚存的spill token。原来的双MR单sink ABI仍供原生及SNIA回归使用，不影响本例的三MR并行方式。
 
@@ -99,17 +99,6 @@ TIMING两阶段依次为“读取、生成run及必要spill”和“完整归并
 
 PROFILE区分sink_work、source_work与average_work，报告墙钟及线程CPU时间；run_sort_s是sink_work的子集，不能重复相加。设备统计各次CSF入口的执行，普通路径从阶段耗时扣除同步文件I/O和AVG时间得到相同口径的source_work。
 
-bench启用SNIA_FEMU_PROFILE=1，Guest插件在设备关闭时向stderr输出E1、D0、D1、TRIM、F2次数及累计ioctl等待。E1包含三个CSF的执行，不能再与算子时间相加；D0包含文件LOAD和spill LOAD。HYBRID中各分支时间存在重叠；sink_work、run_sort_s及ioctl墙钟均是各次调用耗时之和，不能当作第一阶段的实际延迟。第一阶段延迟以TIMING为准；sink线程CPU累计时间与阶段墙钟之比可以观察并行利用率。
+bench启用SNIA_FEMU_PROFILE=1，Guest插件在设备关闭时向stderr输出EXEC_GRAPH及单次E1、D0、D1、TRIM、F2的次数与累计ioctl等待。此例的存储/计算batch提交整张设备图，因此图内节点不计入Guest的E1/D0/D1次数，内部spill也不产生这些Guest命令。EXEC_GRAPH包含内部I/O与CSF执行，不能再与算子时间相加。HYBRID中各分支时间存在重叠；sink_work、run_sort_s及ioctl墙钟均是各次调用耗时之和，不能当作第一阶段的实际延迟。第一阶段延迟以TIMING为准；sink线程CPU累计时间与阶段墙钟之比可以观察并行利用率。
 
 原始日志、timings.tsv和profiles.tsv写入脚本打印的/tmp/snia-sort-avg.*。CPU/CSD是平均总延迟之比，大于1表示CSD更快。设备算子实际运行在宿主CU线程，CPU基线在Guest运行，结果不能直接代表真实SSD计算核性能。
-
-2026-10-21，同一Guest（8vCPU、8GiB）、同一256MiB文件（3个extent），主机4线程和CSD 4CU各交替运行3轮。下表为平均延迟，单位秒：
-
-| 路径 | 第一阶段：读取/并行生成run | 第二阶段：单路归并/AVG/回收 | 总延迟 |
-| --- | ---: | ---: | ---: |
-| 主机4线程 | 2.549060 | 4.928473 | 7.477533 |
-| CSD 4CU | 2.527259 | 5.485313 | 8.012572 |
-
-三轮总延迟：主机7.552882、7.449779、7.429938秒；CSD 7.849219、7.782363、8.406133秒。六次输出均为count=67108864、sum=15688155813636、average=233771.73861318827。两边均64个run、60个spill run，写入/回读各240MiB；内存上界主机66,104,320字节、CSD 66,135,168字节，均低于64MiB。
-
-历史单线程测量与已移除的并行归并实验见[开发记录](../doc/development.md)。

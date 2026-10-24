@@ -58,16 +58,18 @@ apiCall 是 C API 和工作线程的异常边界：内部错误状态及内存/�
 
 插件方法接收已绑定的私有设备/内存/CSF 标识。queue 方法在调用线程中完成一次操作；公开 API 的异步排队、callback/event 由共享请求执行器提供，因此不用每个设备重复实现。
 
-还有四个内部钩子，**不对应额外的 SNIA API**，在头文件中与标准方法分组并逐项注释：
+还有以下内部钩子，**不对应额外的 SNIA API**，在头文件中与标准方法分组并逐项注释：
 
 | 钩子 | 调用时机与用途 |
 | --- | --- |
 | getCSFResourceId | getCSFId 后，把私有 CSF 标识转换为设备资源编号，检查下载/配置是否影响仍在使用的函数 |
 | validateRequest | 可选；配置 batch 或提交请求时，检查已绑定请求的设备特有限制，不执行请求 |
 | executeBatchEntry | 可选；执行一个逻辑 batch 节点，FEMU 用于处理 spill 重入，直到节点真正完成 |
-| finishBatchExecution | 可选；整批所有工作线程退出后清理本次资源，FEMU 用于回收失败批次新增的 spill 区段 |
+| finishBatchExecution | 可选；软件 batch 所有线程退出后，回收失败批次新增的资源 |
+| queueBatchRequest | 可选；整批提交设备执行，尚未执行时才允许返回 CS_UNSUPPORTED 以选择软件调度 |
+| abortBatchRequest | 可选；取消在途 batch，设备在安全边界停止后续节点 |
 
-其余能力由分类文件直接实现：event 没有绑定设备，batch 依赖由公共库调度，参数 helper 操作标准结构，库管理负责插件加载，设备枚举汇总已加载插件。
+其余能力由分类文件直接实现：event 没有绑定设备，batch 默认由公共库调度，也可整批交给插件，参数 helper 操作标准结构，库管理负责插件加载，设备枚举汇总已加载插件。
 
 ## 插件加载和一次计算的调用路径
 
@@ -78,7 +80,7 @@ apiCall 是 C API 和工作线程的异常边界：内部错误状态及内存/�
 5. 可选的 validateRequest 检查设备限制，再调用所属插件的 queueComputeRequest 执行请求。同步调用直接返回；异步调用由共享工作线程执行并发布 callback/event。
 6. FEMU 插件将私有 AFDM ID 转为 MR，标量依次填 cparam1/2，再提交 E1。其他插件可使用不同设备协议，不修改外观层。
 
-插件使用自己的私有类型，不包含 cs_internal.hpp；公共层不包含 FEMU 头文件。插件契约保持 ABI 2，本次内部 C++ 重构不改变操作表，已有 ABI 2 的 C 插件可继续使用。插件工厂导出的操作表有一个内部 ABI 版本，防止加载接口不兼容的动态库；它与算子参数、完成值无关。可选操作为空时公共 API 返回不支持。
+插件使用自己的私有类型，不包含 cs_internal.hpp；公共层不包含 FEMU 头文件。插件契约为 ABI 3，增加可选的整批执行和取消方法，公共库与插件须配套编译。插件工厂导出的操作表有一个内部 ABI 版本，防止加载接口不兼容的动态库；它与算子参数、完成值无关。可选操作为空时公共 API 返回不支持。
 
 公开设备、AFDM、CSF 和在途请求通过 shared_ptr 维持生命周期。发现时也临时引用插件。注销插件时有引用则返回 CS_HANDLE_IN_USE，不能卸载正在执行或仍被句柄使用的代码。重复注册同一路径不会重新初始化插件。插件 CSF 私有标识须有效到设备关闭；若内部需创建包装对象，由插件随设备管理。
 
@@ -88,7 +90,9 @@ batch 在 Guest 内存中保存最多64个节点、依赖和请求快照。SERIA
 
 公共调度器执行准备就绪的节点。插件没有 executeBatchEntry 方法时，按请求类型调用 queueComputeRequest、queueCopyMemRequest 或 queueStorageRequest；有此方法时由插件完成一个逻辑节点，返回后才启动后继。所有工作线程退出后，调用可选 finishBatchExecution 清理本次执行的插件资源。
 
-FEMU 的 executeBatchEntry 解释 NEED_STORE/LOAD/FREE：完成内部 I/O，把 spill_id 填入本次执行上下文的 cparam2，再次运行 CSF，直到获得普通结果。公共调度器不解释这三个返回值；其他设备可以合法返回相同数值而不触发 FEMU 协议。配置的请求不被修改，因此可重复提交。
+FEMU 的 queueBatchRequest 将存储/计算节点及依赖转为一条 EXEC_GRAPH，由设备处理 LOAD、EXEC、STORE 以及 NEED_STORE/LOAD/FREE 重入。只有含主机复制的混合 batch 才保留公共调度，其中 executeBatchEntry 为每个计算节点提交单节点图。公共层始终不解释 NEED_*，因此其他设备合法返回相同数值不会触发 FEMU 协议。配置描述不被修改，可重复提交。
+
+设备图的取消不抢占正在执行的 native CSF：停止未开始的后继，等在途 CSF 和已发 I/O 完成，再回收本图新增 token 并返回取消。Guest callback/event 仍由公共请求执行器在整批结束后发布。
 
 ## FEMU 私有内存、I/O 与临时区
 
@@ -96,6 +100,6 @@ AFDM 保存输入/输出；排序状态、hash表等使用设备 libcs-workmem.s
 
 插件通过 Identify 查询 namespace 格式，GET_INFO 查询 FDM/CU；CU 数用于公共调度器的并发上限。固定 CSEE 已分配全部 CR，NumAvailableCRs=0 不代表瞬时忙。
 
-临时池按 GPT PARTLABEL=femu-spill 发现，以 namespace LBA 分配区段；数据通过内部 D0/D1 传输。同进程同路径的多个设备句柄共享池，分区节点的合作式 flock 防止其他本库进程重叠分配。成功 batch 保留 spill_id；失败 batch 等在途节点结束后回收本批新增区段；显式 FREE 或最后一个参与池的句柄关闭时清理。算法私有状态由算子自己的清理入口释放，没有崩溃恢复。
+FEMU 用 csd_spill_size_mb 配置设备隐藏逻辑页，通过同一 FTL/NAND/GC 访问。每个设备句柄绑定一个设备会话，token 归属会话；成功 batch 的 token 可跨 batch 保留，FREE 或句柄关闭回收。失败 batch 回收本批新增 token，保留此前成功 batch 的 token；混合批次通过 EA ROLLBACK 通知设备清理此前已完成节点的新增 token。算法私有状态由算子自己的清理入口释放，没有崩溃恢复。原有 femu-spill 分区不再使用。
 
 FEMU 程序目录仅记录进程内经本插件加载的函数；需避免跨进程程序索引冲突。AFDM→AFDM 软件回退仍经 Guest F2/F5；内部 LOAD/STORE 不经 Guest 中转。异步请求不复制 HostVAddress 数据，调用者须保留到完成。当前运行中的 CSF 不可抢占。

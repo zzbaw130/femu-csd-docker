@@ -16,12 +16,16 @@ struct cs_device {
     int fd, admin, nsid;
     uint32_t lba;
     uint64_t blocks;
-    struct cs_spill_pool *spill;
+    pthread_mutex_t graph_lock;
+    struct cs_graph_request *graphs;
+    struct cs_graph_scope *graph_scopes;
+    uint32_t graph_session;
+    uint64_t next_graph;
     char path[4096];
     struct { uint32_t workers; uint64_t fdm_bytes, features; } caps;
     /* Optional diagnostic counters; internal to this plugin, not SNIA API. */
     bool profile;
-    struct { uint64_t calls, wall_ns; } io_timing[5];
+    struct { uint64_t calls, wall_ns; } io_timing[6];
     uint64_t load_to_compute_calls, load_to_compute_ns;
 };
 struct cs_memory { struct cs_device *dev; uint32_t id; uint64_t bytes; };
@@ -39,9 +43,10 @@ void cs_transport_close(struct cs_device *);
 CS_STATUS cs_io(struct cs_device *, bool, struct nvme_passthru_cmd *);
 CS_STATUS cs_io64(struct cs_device *, bool, struct nvme_passthru_cmd64 *);
 int cs_profile_load(struct cs_device *, const char *);
-int cs_spill_region(struct cs_device *, uint64_t *, uint64_t *);
-void cs_spill_detach(struct cs_device *);
-void cs_spill_scope_end(struct cs_device *, void *, bool);
+void femu_graph_close(struct cs_device *);
+CS_STATUS femu_queueBatchRequest(void *,CS_BATCH_MODE,unsigned,const struct cs_backend_batch_entry *,bool (*)(void *),void *,u64 *);
+CS_STATUS femu_abortBatchRequest(void *,void *);
+void femu_finishBatchExecution(void *,void *,bool);
 /* Internal compute submission: reentry supplies cparam2 after batch I/O. */
 CS_STATUS femu_compute(struct cs_device *, const CsComputeRequest *, u64, u64 *);
 CS_STATUS cs_task_run(struct cs_task *, u64 *);

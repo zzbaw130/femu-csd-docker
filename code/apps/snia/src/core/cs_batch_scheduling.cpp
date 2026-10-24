@@ -80,7 +80,21 @@ public:
 } // namespace
 namespace snia {
 CS_STATUS runBatch(const Batch &batch, std::atomic_bool &cancelled, u64 *value)
-{ return BatchExecution(batch, cancelled).run(value); }
+{
+    std::array<cs_backend_batch_entry, MaxBatch> entries{};
+    Device *device = nullptr;
+    for (unsigned i = 0; i < batch.capacity; ++i) if (batch.entries[i].request) {
+        entries[i] = {batch.entries[i].request->request.get(), batch.entries[i].dependencies};
+        device = batch.entries[i].request->device;
+    }
+    if (device && device->ops().queueBatchRequest) {
+        auto isCancelled = [](void *p) { return static_cast<std::atomic_bool *>(p)->load(); };
+        auto status = device->ops().queueBatchRequest(device->privateData, batch.mode,
+            batch.capacity, entries.data(), isCancelled, &cancelled, value);
+        if (status != CS_UNSUPPORTED) return status;
+    }
+    return BatchExecution(batch, cancelled).run(value);
+}
 } // namespace snia
 CS_STATUS csAllocBatchRequest(CS_BATCH_MODE mode, int capacity, CS_BATCH_HANDLE *out)
 {

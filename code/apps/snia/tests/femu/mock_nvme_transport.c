@@ -1,6 +1,8 @@
 /* Emulates the FEMU commands used by this backend, including internal STORE. */
 #define _GNU_SOURCE
 #include "femu_internal.h"
+#include "csd-graph.h"
+#include <endian.h>
 #include <dlfcn.h>
 #include <glob.h>
 #include <fcntl.h>
@@ -12,6 +14,10 @@ static uint64_t sizes[4096], used;
 static unsigned next_id = 1;
 static uint8_t nvm[32U << 20];
 static bool nvm_initialized;
+static unsigned next_session=1,next_spill=1;
+static uint64_t hidden_used,graph_commands;
+static struct { void *data; uint64_t bytes,creator; unsigned session; } spills[16384];
+static CS_STATUS mock_graph(struct cs_device *,struct nvme_passthru_cmd64 *);
 static struct {
     bool active;
     void *library;
@@ -35,10 +41,20 @@ CS_STATUS cs_io64(struct cs_device *d, bool admin, struct nvme_passthru_cmd64 *c
 {
     (void)d;
     (void)admin;
+    if(c->opcode==FEMU_CSD_EXEC_GRAPH) return mock_graph(d,c);
     pthread_mutex_lock(&lock);
     CS_STATUS s = CS_SUCCESS;
     void *data = (void *)(uintptr_t)c->addr;
-    if (admin && c->opcode == 0xc0) {
+    if(c->opcode==FEMU_CSD_GRAPH_SESSION) {
+        if(c->cdw10==FEMU_GRAPH_OPEN) c->result=next_session++;
+        else if(c->cdw10==FEMU_GRAPH_CLOSE || c->cdw10==FEMU_GRAPH_ROLLBACK) {
+            uint64_t cookie=c->cdw12|((uint64_t)c->cdw13<<32);
+            for(unsigned i=1;i<next_spill;++i) if(spills[i].data && spills[i].session==c->cdw11 &&
+                (c->cdw10==FEMU_GRAPH_CLOSE || spills[i].creator==cookie)) {
+                hidden_used-=spills[i].bytes; free(spills[i].data); spills[i].data=NULL;
+            }
+        }
+    } else if (admin && c->opcode == 0xc0) {
         uint64_t values[] = {1, 64U << 20, used, 4, 3};
         if (c->cdw10 >= 5)
             s = CS_INVALID_ARG;
@@ -163,6 +179,83 @@ done:
     pthread_mutex_unlock(&lock);
     return s;
 }
+static CS_STATUS mock_graph(struct cs_device *d,struct nvme_passthru_cmd64 *c)
+{
+    struct femu_graph_header *h=(void *)(uintptr_t)c->addr;
+    struct femu_graph_node *nodes=(void *)(h+1);
+    unsigned count=le32toh(h->count);
+    uint64_t done=0,all=UINT64_MAX>>(64-count);
+    CS_STATUS status=CS_SUCCESS;
+    pthread_mutex_lock(&lock); ++graph_commands; pthread_mutex_unlock(&lock);
+    while(done!=all && status==CS_SUCCESS) {
+        uint64_t before=done;
+        for(unsigned i=0;i<count && status==CS_SUCCESS;++i) {
+            struct femu_graph_node *n=&nodes[i];
+            if((done&(UINT64_C(1)<<i)) || (le64toh(n->dependencies)&~done)) continue;
+            if(le32toh(n->operation)==FEMU_GRAPH_EXEC) {
+                struct nvme_passthru_cmd64 exec={.opcode=0xe1,.nsid=d->nsid,
+                    .addr=(uintptr_t)h+le32toh(n->payload),.data_len=le32toh(n->count)*32,
+                    .cdw2=le32toh(n->program),.cdw3=le32toh(n->count),
+                    .cdw10=le64toh(n->cparam1),.cdw11=le64toh(n->cparam1)>>32,
+                    .cdw12=le64toh(n->cparam2),.cdw13=le64toh(n->cparam2)>>32};
+                for(;;) {
+                    status=cs_io64(d,false,&exec);
+                    c->result=exec.result;
+                    if((int64_t)exec.result<0) status=CS_ERROR_IN_EXECUTION;
+                    uint64_t action=exec.result>>60,payload=exec.result&CS_IO_VALUE_MASK;
+                    if(status!=CS_SUCCESS || action<1 || action>3) break;
+                    uint64_t mrid;
+                    memcpy(&mrid,(void *)(uintptr_t)(exec.addr+(exec.cdw3-1)*32+8),8);
+                    pthread_mutex_lock(&lock);
+                    unsigned token=payload;
+                    if(action==1) {
+                        if(!payload || payload>sizes[mrid] || payload>(28U<<20)-hidden_used || next_spill>=16384) status=CS_NOT_ENOUGH_MEMORY;
+                        else {
+                            token=next_spill++; spills[token].data=malloc(payload);
+                            spills[token].bytes=payload; spills[token].session=le64toh(h->session);
+                            spills[token].creator=le64toh(h->cookie);
+                            hidden_used+=payload; memcpy(spills[token].data,memory[mrid],payload);
+                        }
+                    } else if(token>=next_spill || !spills[token].data || spills[token].session!=le64toh(h->session)) status=CS_INVALID_ID;
+                    else if(action==2) memcpy(memory[mrid],spills[token].data,spills[token].bytes);
+                    else { hidden_used-=spills[token].bytes; free(spills[token].data); spills[token].data=NULL; }
+                    pthread_mutex_unlock(&lock);
+                    if(status!=CS_SUCCESS) break;
+                    exec.cdw12=token; exec.cdw13=0;
+                }
+            } else {
+                struct femu_graph_range *ranges=(void *)((char *)h+le32toh(n->payload));
+                uint64_t off=le64toh(n->afdm_offset),total=0;
+                for(unsigned j=0;j<le32toh(n->count) && status==CS_SUCCESS;++j) {
+                    uint64_t lba=le64toh(ranges[j].lba),remaining=le32toh(ranges[j].blocks);
+                    while(remaining && status==CS_SUCCESS) {
+                        unsigned blocks=remaining>65536?65536:remaining;
+                        struct nvme_passthru_cmd64 io={.opcode=le32toh(n->operation)==FEMU_GRAPH_STORE?0xd1:0xd0,
+                            .nsid=d->nsid,.cdw10=lba,.cdw11=lba>>32,.cdw12=blocks-1,
+                            .cdw13=le32toh(n->afdm),.cdw14=off,.cdw15=off>>32};
+                        status=cs_io64(d,false,&io); lba+=blocks; remaining-=blocks;
+                        off+=(uint64_t)blocks*d->lba; total+=(uint64_t)blocks*d->lba;
+                    }
+                }
+                c->result=total;
+            }
+            done|=UINT64_C(1)<<i;
+        }
+        if(before==done) status=CS_INVALID_ARG;
+    }
+    if(status!=CS_SUCCESS) {
+        pthread_mutex_lock(&lock);
+        for(unsigned i=1;i<next_spill;++i) if(spills[i].data && spills[i].session==le64toh(h->session) && spills[i].creator==le64toh(h->cookie)) {
+            hidden_used-=spills[i].bytes; free(spills[i].data); spills[i].data=NULL;
+        }
+        pthread_mutex_unlock(&lock);
+    }
+    return status;
+}
+__attribute__((visibility("default"))) uint64_t mock_graph_commands(void)
+{ pthread_mutex_lock(&lock); uint64_t v=graph_commands; pthread_mutex_unlock(&lock); return v; }
+__attribute__((visibility("default"))) uint64_t mock_hidden_used(void)
+{ pthread_mutex_lock(&lock); uint64_t v=hidden_used; pthread_mutex_unlock(&lock); return v; }
 __attribute__((visibility("default"))) uint64_t mock_used_bytes(void)
 {
     pthread_mutex_lock(&lock);
@@ -179,14 +272,6 @@ CS_STATUS cs_io(struct cs_device *d, bool admin, struct nvme_passthru_cmd *c)
     c->result = (uint32_t)wide.result;
     return s;
 }
-int cs_spill_region(struct cs_device *d, uint64_t *start, uint64_t *blocks)
-{
-    (void)d;
-    *start = (4U << 20) / 512;
-    *blocks = (sizeof(nvm) - (4U << 20)) / 512;
-    return open("/dev/null", O_RDWR | O_CLOEXEC);
-}
-
 int __wrap_glob(const char *pattern, int flags, int (*error)(const char *, int), glob_t *out)
 {
     (void)flags; (void)error;

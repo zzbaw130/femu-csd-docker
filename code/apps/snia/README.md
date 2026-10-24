@@ -50,7 +50,7 @@ sudo ldconfig
 bash tests/snia-test.sh unit
 # 容器编译算子，Guest 编译公共库与 FEMU 插件
 bash tests/snia-test.sh build
-# Guest 真实设备测试，需已准备 femu-spill 分区
+# Guest 真实设备测试，需新 FEMU 固件及隐藏临时空间
 bash tests/snia-test.sh smoke
 # 完整文件排序示例
 bash tests/snia-test.sh example
@@ -62,7 +62,9 @@ bash tests/snia-test.sh example
 
 新插件可安装到默认插件目录，也可用 `csRegisterPlugin` 显式加载绝对路径；`csDeregisterPlugin` 在仍有设备或请求引用插件时返回 `CS_HANDLE_IN_USE`。这个 C 工厂契约是本项目的适配器接口，不是 SNIA 规定的通用插件二进制格式。
 
-FEMU 插件用 Identify 校验 CSD 身份及 namespace 格式，用 GET_INFO 查询 FDM/CU，无需手工配置。公共 batch 使用插件报告的并发数调度：SERIAL 单线程、PARALLEL 独立节点并行、HYBRID 等全部前驱完成。FEMU 不接收整张图，硬件 batch 标志仍为 0。
+FEMU 插件用 Identify 校验 CSD 身份及 namespace 格式，用 GET_INFO 查询 FDM/CU，无需手工配置。仅含存储与计算的 batch 编码为一条 EXEC_GRAPH（E9）命令，由设备按依赖自主执行：SERIAL 逐节点执行，PARALLEL 独立节点就绪，HYBRID 等全部前驱完成。设备最多使用 nr_cu 个 CU，内部 LOAD/STORE 等待不占 CU。含主机内存复制的 batch 仍由公共层调度，其计算节点各提交一条设备图。应用继续使用原有 csQueueBatchRequest，无需区分这两条路径。
+
+设备图是本项目的 FEMU 扩展，不新增公开能力查询标志。此版本 FEMU 插件要求同时更新设备固件；不探测旧固件再静默回退。私有插件操作表升级为 ABI 3，公共库与插件须一起重新编译；应用的 cs.h 与链接规则不变。
 
 ## 二、上层应用：参数按算子约定填写
 
@@ -104,11 +106,11 @@ FEMU 的 CSF 下载描述为 `文件名\0入口符号\0`，例如 `merge-sort.so
 
 当前原生 MR 只表示整块 AFDM，计算请求的非零 `ByteOffset` 返回 `CS_UNSUPPORTED`。需要偏移时，应用按算子自己的接口把偏移放入标量或输入数据中，算子自行计算地址。超过两个 64 位标量位置也返回不支持；复杂配置直接作为应用定义的输入数据传入。
 
-完整排序示例中，sort_sink 约定 MR[0] 为4MiB输入、MR[1] 为256KiB spill I/O。第一次不传标量，cparam1=0，sink 创建状态并把64位标识作为 CompValue 返回；后续请求把这个标识放进第一个64位标量，cparam2 留给重入协议。source 接收同一标识，直接访问状态中的全部 run。
+完整四路排序示例中，sort_sink 的 MR[0] 为4MiB输入、MR[1] 为分支状态 task、MR[2] 为256KiB spill I/O。task.state 首次为0，sink 创建状态并写回64位句柄，后续请求复用 task；source 接收包含四个句柄的 group AFDM 及 cparam1 中的首句柄，归并全部 run。cparam2 保留给重入协议。
 
 应用先用一个 batch 反复提交 LOAD → sink，全部输入完成后再提交 source → avg。csConfigureBatchEntry 复制请求描述并保留算子/AFDM句柄，因此之后可释放原请求结构；它不会复制 AFDM 内的数据。batch 仍引用的 AFDM 不能释放，应先释放 batch。完整请求构造、参数更新和回收见[可执行示例](examples/cs_batch_sort_avg.c)。
 
-当前重入协议选取**当前这一个计算请求中最后一个 AFDM**作为 STORE 数据来源或 LOAD 目的地。sort 中就是 io，设备端为 MR[1]；这不是整个 batch 最后一个 AFDM，也不是 SNIA 规定的位置，而是本设备适配器和算子共同采用的约定。
+当前重入协议选取**当前这一个计算请求中最后一个 AFDM**作为 STORE 数据来源或 LOAD 目的地。四路 sort 中就是 io，设备端为 MR[2]；这不是整个 batch 最后一个 AFDM，也不是 SNIA 规定的位置，而是本设备适配器和算子共同采用的约定。
 
 ## 三、设备算子：在入口判断是否重入
 
@@ -122,9 +124,9 @@ FEMU 的 CSF 下载描述为 `文件名\0入口符号\0`，例如 `merge-sort.so
 
 source 直接使用驻留 run，按需 LOAD spill 块；读缓冲申请失败也可淘汰驻留 run。最后一个输出 chunk 产生后，source FREE token、结束 workmem，在输出中设置 finished=1。提前停止或失败也由同一 source 入口收尾，具体参数见[示例说明](examples/README.md)。
 
-实际调用顺序是算子返回 csNeedStore(bytes)，Guest FEMU 插件分配 spill LBA 并执行内部 D1，再次调用相同 CSF，将标识填入 cparam2；CSF 的重入分支只记录标识并继续未完成的工作。LOAD 和 FREE 同理。
+实际调用顺序是算子返回 csNeedStore(bytes)，FEMU 设备从隐藏临时空间分配区段，将最后一个 AFDM 的数据写入 NVM，等待内部写入完成，再将 token 填入 cparam2 并排队调用相同 CSF。CSF 的重入分支记录 token 并继续工作；LOAD 和 FREE 同理。整个过程不返回 Guest，也不额外提交 D0/D1/E1 命令。原有 femu_csd_args 不变，MR、cparam1、data_buffer 保持本次请求的内容。
 
-| 算子返回 | FEMU 插件执行 | 再次调用 CSF 时 |
+| 算子返回 | FEMU 设备执行 | 再次调用 CSF 时 |
 | --- | --- | --- |
 | `csNeedStore(bytes)` | 分配区段，I/O AFDM → NVM | `cparam2=新 spill_id` |
 | `csNeedLoad(spill_id)` | NVM → I/O AFDM | `cparam2=同一 spill_id` |
@@ -133,7 +135,7 @@ source 直接使用驻留 run，按需 LOAD spill 块；读缓冲申请失败也
 
 这些请求通过标准 `CompValue` 返回，不新增 `CS_STATUS`。仅用一个 64 位值的高 4 位表示 STORE/LOAD/FREE、低 60 位表示长度或标识；这三个结果范围供 batch I/O 请求使用，没有版本字段、magic 或 128 位控制封装。负的原生返回值仍表示执行错误。
 
-FEMU 插件在 batch 节点内自动处理整个循环，直到得到普通结果才启动后继或发布 callback/event。单独 `csQueueComputeRequest` 执行一轮并返回原始 `CompValue`。
+FEMU 在设备图节点内自动处理整个循环，直到得到普通结果才启动后继。整图结束后，Guest SNIA 才发布一次 callback/event；不会对内部 spill 逐次回调。单独 `csQueueComputeRequest` 仍通过 E1 执行一轮并返回原始 `CompValue`。
 
 异步请求完成并释放请求快照后，SNIA 再调用标准 callback；此时已归还该请求的并发名额。应用可在 callback 中用 SNIA API 重配已完成的 batch 并续交下一块，包括已有 64 路请求时。应用自行保证缓冲可复用，并在取消或释放上下文前停止续交、等待回调结束；callback 不应调用所属应用中只允许主线程使用的接口。
 
@@ -141,10 +143,14 @@ FEMU 插件在 batch 节点内自动处理整个循环，直到得到普通结�
 
 ## spill 区与资源生命周期
 
-Guest 先执行 `/home/femu/scripts/init-csd-env.sh`：准备模拟盘的 80% 数据分区并挂载到 `/data`，20% 作为不格式化、不挂载的 spill 区，同时编译安装 SNIA 动态库。首次分区会清除模拟盘。FEMU 插件按 GPT PARTLABEL=`femu-spill` 识别专区，不依赖 p1/p2 编号。
+新启动 FEMU 时设置设备属性 `csd_spill_size_mb`，单位 MiB。设备属性默认0（关闭隐藏临时空间）；`run-csd.sh` 使用环境变量 `CSD_SPILL_SIZE_MB`，未设置时取256MiB。总 NAND 容量必须容纳 namespace、隐藏空间及原有 GC 保留量，容量不足会拒绝启动。隐藏空间不出现在 Identify 的 namespace 容量中，也不属于 AFDM 或 workmem。
 
-STORE/LOAD 数据走 D1/D0，不经过 Guest。I/O AFDM 必须容纳按 LBA 向上取整后的长度，算子应初始化最后的填充字节。长度本来就由算子掌握，不在重入时重复传递。
+内部临时 I/O 使用正常 FTL 的映射、NAND 延迟和 GC，数据不经过 Guest。算子只需保证最后一个 AFDM 能容纳实际请求的字节数；设备记录精确长度，在内部按页分配，不要求算子填充页尾。显式 csQueueStorageRequest 的 LOAD/STORE 仍访问应用指定的 namespace LBA，二者用途不同。
 
-成功 batch 的 spill_id 可供后续 batch 使用；显式 FREE 或最后一个参与池的设备句柄关闭时回收。失败 batch 回收本批新分配的区段，之前成功 batch 的区段保留；算子私有状态由应用通过设备程序自己的清理入口销毁。标识仅在当前进程和 namespace 生命周期内有效，没有崩溃恢复。
+每个打开的 FEMU 设备句柄延迟创建一个设备会话；会话是设备保存 token 归属的对象，不是额外进程。同一会话成功 batch 的 token 可供后续 batch 使用，不能传给另一个设备句柄。显式 FREE 或关闭所属设备句柄时回收。失败/取消的图回收本图新增 token；含主机复制的混合批次失败时，插件通知设备回收本批先前节点新增的 token。此前成功 batch 的 token 保留。算子私有 workmem 状态仍须由应用调用算子清理入口释放；token 不含这些状态，也没有崩溃恢复。
+
+新的临时路径不再发现或访问 GPT `femu-spill` 分区。已有初始化脚本仍保留80%/20%的历史分区布局，避免此次修改重建数据盘；其中20%不再用于新设备 spill。已挂载数据盘时无需为了本功能重新分区。新固件与新插件应配套启用，勿把新插件安装到仍运行旧固件的 Guest。
+
+设备指令布局和执行流程见 [FEMU 设备图说明](../../FEMU/hw/femu/csd/README.md)。
 
 真实 Guest 测试使用完整示例：`sudo build/cs-batch-sort-avg /dev/nvme0n1 /data/cs-batch-input.bin`。程序索引为420–422；库不能枚举其他进程加载的程序，应避免索引冲突。

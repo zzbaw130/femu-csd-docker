@@ -13,8 +13,9 @@
 | 内部 LOAD / STORE | D0 / D1；SLBA=CDW10/11，NLB-1=CDW12低16位，AFDM ID=CDW13，offset=CDW14/15 |
 | CSF 加载/卸载、激活 | admin 25 / 22、23 |
 | 执行 | E1，IO64 ioctl 接收完整 int64_t 返回值 |
-| 临时区释放 | DSM 09，AD=1 |
-| batch、event/callback | Guest 库实现 |
+| batch | E9 EXEC_GRAPH，依赖与内部重入由设备执行；含主机复制时公共层调度 |
+| 会话/取消/回收 | EA GRAPH_SESSION，无数据载荷 |
+| event/callback | Guest 库在整批完成后通知 |
 
 计算的 AFDM offset 目前只支持 0；多个 AFDM 保留相互顺序，标量保留相互顺序，最多两个 64 位标量位置。两个 cparam 独立传递，128 位参数不支持。零 MR 请求直接执行纯标量 CSF，不分配占位 AFDM。native MR length=0 表示整个 AFDM。
 
@@ -32,4 +33,6 @@ SNIA 请求没有直接对应原生附加载荷的主机字节数组成员。标
 
 CompValue 的高四位为操作：1 STORE、2 LOAD、3 FREE，低 60 位为字节数或 spill_id；这三个范围用于 batch I/O 请求。其他非负值完成节点，负 int64_t 转为执行错误。没有附加的控制参数。
 
-库按请求完成内部 I/O，再在执行副本中填入 cparam2，重新执行 E1。STORE 返回新 ID，LOAD/FREE 返回原 ID；算法自己的 pending 状态解释确认。原 batch 描述不变。单个计算请求不自动推进重入，batch 才自动推进。
+设备图执行器解析 CSF 返回值，在隐藏临时空间完成 I/O，再在执行副本中填入 cparam2，排队重入同一 CSF。STORE 返回新 token，LOAD/FREE 返回原 token；算法自己的 pending 状态解释确认。没有额外的 Guest E1/D0/D1 往返。原 batch 描述不变。单个计算请求仍只执行一次 E1，不自动推进重入。
+
+E9 的描述布局、EA 的会话与取消操作见 [设备指令说明](../../../FEMU/hw/femu/csd/README.md)。插件内保存同一 csd-graph.h，以便 Guest 独立编译；测试比较两个头是否一致。该线格式及 NEED_* 均为本项目 FEMU 约定，不是 SNIA 标准的新指令或状态。

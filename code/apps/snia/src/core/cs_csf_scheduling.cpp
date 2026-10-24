@@ -49,9 +49,18 @@ CS_STATUS csAbortRequest(CS_REQ_HANDLE handle)
     return apiCall([&] {
         auto request = acquireHandle<Request>(handle);
         if (!request) return CS_INVALID_HANDLE;
-        std::lock_guard<std::mutex> lock(handlesMutex);
-        if (request->started) return CS_UNSUPPORTED;
-        request->cancelled = true;
+        std::shared_ptr<Batch> batch;
+        Device *device = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(handlesMutex);
+            batch = request->batch;
+            if (batch) for (const auto &entry : batch->entries)
+                if (entry.request) { device = entry.request->device; break; }
+            if (request->started && (!device || !device->ops().abortBatchRequest)) return CS_UNSUPPORTED;
+            request->cancelled = true;
+        }
+        if (device && device->ops().abortBatchRequest)
+            return device->ops().abortBatchRequest(device->privateData, &request->cancelled);
         return CS_SUCCESS;
     });
 }

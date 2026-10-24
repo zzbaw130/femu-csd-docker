@@ -3,12 +3,13 @@
  * csQueryDeviceProperties -> queryDeviceProperties。
  * 所有跨接口的句柄均为插件私有标识，公共库负责公开句柄与资源引用。
  * queue* 方法在调用线程中完成一次操作；异步排队、callback/event 和
- * batch 依赖由公共库处理，因此插件不重复实现这些通用机制。 */
+ * batch 默认由公共库调度；提供 queueBatchRequest 的插件可将依赖图交给设备。 */
 #ifndef CS_BACKEND_H
 #define CS_BACKEND_H
 #include "cs.h"
 #include <stdbool.h>
-#define CS_BACKEND_ABI 2
+#define CS_BACKEND_ABI 3
+struct cs_backend_batch_entry { const CsBatchRequest *request; u64 dependencies; };
 struct cs_backend_ops {
     unsigned abi;
     const char *name;
@@ -67,6 +68,14 @@ struct cs_backend_ops {
      * FEMU 据此保留成功执行的 spill 区段，或回收失败执行新增的区段。
      * 这是适配器的批次资源清理钩子，不是算子的完成回调。 */
     void (*finishBatchExecution)(void *device, void *execution, bool success);
+
+    /* 可选的整批设备执行路径。参数保留 batch 的槽编号及依赖；空槽 request
+     * 为 NULL。CS_UNSUPPORTED 只能在尚未执行任何节点时返回，公共层随后使用
+     * 软件调度。execution 是本次取消标志的地址，仅用于关联 abort。 */
+    CS_STATUS (*queueBatchRequest)(void *device, CS_BATCH_MODE mode, unsigned capacity,
+        const struct cs_backend_batch_entry *entries, bool (*isCancelled)(void *),
+        void *execution, u64 *value);
+    CS_STATUS (*abortBatchRequest)(void *device, void *execution);
 };
 /* 内部插件工厂契约，不属于 SNIA API。每个动态库导出这两个 C 符号；
  * destroy 只在设备、请求等引用全部结束后执行。 */

@@ -8,12 +8,13 @@
 | common/cs_library_management.c | csLibraryManagementRouting | 注册/注销两种插件、发现、句柄路由及请求绑定 |
 | common/cs_afdm_event_lifecycle.cpp | csAFDMEventAllocationFailure | AFDM、event、异步提交分配失败和资源回收 |
 | femu/cs_discovery.c | csDiscoveryIdentify | 生产传输的Identify、资源查询、打开失败，以及可选命令计时分类/关闭/错误码保持 |
-| femu/cs_csf_batch_scheduling.c | csCSFSchedulingAndBatch | AFDM、storage、event、batch依赖、排序跨批次spill、完整平均值聚合及EOF回收 |
+| femu/cs_csf_batch_scheduling.c | csCSFSchedulingAndBatch | AFDM、storage、event、batch依赖、整图提交次数、主机复制混合批次、排序跨批次隐藏spill、完整平均值聚合及EOF回收 |
+| CMake compare_files | csFemuGraphWireAgreement | 插件和固件的 csd-graph.h 线格式一致 |
 | csd-programs/examples/tests/sort_spill_merge.cpp（设备示例目录） | sortSpillMergeAverage、sortParallelSinkMergeAverage | 单sink和四路sink的逐项排序比对、跨context归并、spill、内存压力与中途收尾 |
 | csd-programs/examples/tests/read_merge_sort_avg.c（设备示例目录） | 手动 read-merge-sort-avg | 四线程读文件/生成run、单线程全局归并、64MiB总算法预算，与CSD比较完整排序和AVG延迟 |
 | examples/cs_batch_sort_avg.c（项目 examples/） | 手动 cs-batch-sort-avg | Guest真实设备四路HYBRID sink、单路source、全量均值与自动回收 |
 
-common/mock_cs_backend.c 是第二种非NVMe设备；femu/mock_nvme_transport.c 在内存中模拟原生命令。这些文件仅提供测试后端或场景，不是标准接口实现。
+common/mock_cs_backend.c 是第二种非NVMe设备；femu/mock_nvme_transport.c 在内存中模拟原生命令。mock 设备图按依赖串行推进，用于参数及资源检查，不用于验证 CU 并行或 NAND 延迟；真实设备调度使用 FEMU qtest 的 csd-exec-graph* 用例验证。这些文件仅提供测试后端或场景，不是标准接口实现。
 
 构建与运行：
 

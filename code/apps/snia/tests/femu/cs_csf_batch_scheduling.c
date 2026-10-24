@@ -20,6 +20,7 @@ static atomic_uint checks;
     } while (0)
 #define OK(x) CHECK((x) == CS_SUCCESS)
 static uint64_t (*mock_used_bytes)(void);
+static uint64_t (*mock_graph_commands)(void),(*mock_hidden_used)(void);
 static CS_CSF_ID load(CS_DEV_HANDLE d, const char *file, const char *symbol, const char *name, unsigned index)
 {
     char descriptor[128];
@@ -132,6 +133,9 @@ int main(void)
     assert(mock);
     mock_used_bytes = dlsym(mock, "mock_used_bytes");
     assert(mock_used_bytes);
+    mock_graph_commands=dlsym(mock,"mock_graph_commands");
+    mock_hidden_used=dlsym(mock,"mock_hidden_used");
+    CHECK(mock_graph_commands && mock_hidden_used);
     /* Keep this test-only observation handle until process exit. */
 
     CS_DEV_HANDLE d;
@@ -311,14 +315,25 @@ int main(void)
             expected_sum += data[i];
         }
         OK(copy(input, data, SORT_CHUNK_BYTES, CS_COPY_TO_DEVICE, 0));
+        if(chunk==3) {
+            /* Host copies select software scheduling; compute still spills on device. */
+            OK(csHelperResizeBatchRequest(batch,2));
+            CsBatchRequest host_copy={.ReqType=CS_COPY_AFDM,.u.CopyMem={
+                .Type=CS_COPY_FROM_DEVICE,.DevMem={input,0},
+                .u.HostVAddress=&copied_value,.Bytes=sizeof(copied_value)}};
+            OK(csConfigureBatchEntry(batch,CS_BATCH_ADD,&host_copy,0,first,&second));
+        }
+        uint64_t commands=mock_graph_commands();
         OK(csQueueBatchRequest(batch, NULL, NULL, NULL, NULL, &value));
+        CHECK(mock_graph_commands()==commands+1);
         if (!state) {
             state = value;
             CHECK(state > UINT32_MAX); // The first sink returns a complete 64-bit device handle.
             request->u.Compute.NumArgs = 3;
             csHelperSetComputeArg(&request->u.Compute.Args[2], CS_64BIT_VALUE_TYPE, state);
             OK(csConfigureBatchEntry(batch, CS_BATCH_RECONFIG, request, first, 0, NULL));
-        } else CHECK(value == state);
+        } else if(chunk==3) CHECK(value==sizeof(copied_value) && (int32_t)copied_value==data[0]);
+        else CHECK(value == state);
     }
     OK(csFreeBatchRequest(batch));
     request->u.Compute.CSFId = source;
@@ -338,6 +353,7 @@ int main(void)
     } while (!result.finished);
     CHECK(result.count == 4ULL * SORT_OUTPUT_VALUES && result.sum == expected_sum);
     CHECK(result.average == (double)expected_sum / (double)result.count);
+    CHECK(mock_hidden_used()==0);
     OK(csDeleteEvent(event));
     OK(csFreeBatchRequest(batch));
     OK(csFreeMem(output, &f)); OK(csFreeMem(sorted, &f));

@@ -3,14 +3,13 @@
 #include <endian.h>
 #include <errno.h>
 #include <glob.h>
-#include <sys/file.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <time.h>
-static const unsigned profile_opcodes[] = {0xe1, 0xd0, 0xd1, 9, 0xf2};
-static const char *profile_names[] = {"E1", "D0", "D1", "TRIM", "F2"};
+static const unsigned profile_opcodes[] = {0xe1, 0xd0, 0xd1, 9, 0xf2, 0xe9};
+static const char *profile_names[] = {"E1", "D0", "D1", "TRIM", "F2", "EXEC_GRAPH"};
 /* A serial LOAD->CSF batch runs both requests on the same SNIA thread. */
 static _Thread_local struct cs_device *load_device;
 static _Thread_local uint64_t load_returned;
@@ -24,7 +23,7 @@ static uint64_t profile_record(struct cs_device *d, bool admin, unsigned opcode,
 {
     if (!d->profile || admin) return 0;
     uint64_t end = profile_clock(), elapsed = end - start;
-    for (unsigned i = 0; i < 5; ++i) if (profile_opcodes[i] == opcode) {
+    for (unsigned i = 0; i < sizeof(profile_opcodes)/sizeof(profile_opcodes[0]); ++i) if (profile_opcodes[i] == opcode) {
         __atomic_fetch_add(&d->io_timing[i].calls, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&d->io_timing[i].wall_ns, elapsed, __ATOMIC_RELAXED);
         break;
@@ -85,7 +84,7 @@ int cs_transport_open(struct cs_device *d, const char *name)
 void cs_transport_close(struct cs_device *d)
 {
     if (load_device == d) { load_device = NULL; load_returned = 0; }
-    if (d->profile) for (unsigned i = 0; i < 5; ++i)
+    if (d->profile) for (unsigned i = 0; i < sizeof(profile_opcodes)/sizeof(profile_opcodes[0]); ++i)
         fprintf(stderr, "PROFILE CSD %s calls=%llu wall_s=%.9f\n", profile_names[i],
                 (unsigned long long)d->io_timing[i].calls, d->io_timing[i].wall_ns / 1e9);
     if (d->profile)
@@ -133,6 +132,7 @@ CS_STATUS cs_io(struct cs_device *d, bool admin, struct nvme_passthru_cmd *cmd)
 CS_STATUS cs_io64(struct cs_device *d, bool admin, struct nvme_passthru_cmd64 *cmd)
 {
     cmd->timeout_ms = 600000;
+    if(!admin && cmd->opcode==0xe9 && load_device==d) { load_device=NULL; load_returned=0; }
     uint64_t start = d->profile ? profile_clock() : 0;
     if (start && !admin && cmd->opcode == 0xe1 && load_device == d && load_returned) {
         __atomic_fetch_add(&d->load_to_compute_calls, 1, __ATOMIC_RELAXED);
@@ -145,65 +145,4 @@ CS_STATUS cs_io64(struct cs_device *d, bool admin, struct nvme_passthru_cmd64 *c
     profile_record(d, admin, cmd->opcode, start);
     errno = saved_errno;
     return io_status(result);
-}
-/* GPT PARTNAME determines the role, never the partition number. Sysfs start/size
- * use 512-byte sectors even on a namespace formatted with 4 KiB LBAs. */
-int cs_spill_region(struct cs_device *d, uint64_t *start, uint64_t *blocks)
-{
-    const char *name = strrchr(d->path, '/') + 1;
-    char pattern[256];
-    snprintf(pattern, sizeof(pattern), "/sys/class/block/%s/%sp*/uevent", name, name);
-    glob_t matches = {0};
-    int fd = -1;
-    if (glob(pattern, 0, NULL, &matches))
-        return -1;
-    for (size_t i = 0; i < matches.gl_pathc; i++) {
-        char path[4096], line[256];
-        snprintf(path, sizeof(path), "%s", matches.gl_pathv[i]);
-        FILE *f = fopen(path, "r");
-        bool spill = false;
-        if (!f)
-            continue;
-        while (fgets(line, sizeof(line), f))
-            if (!strcmp(line, "PARTNAME=femu-spill\n"))
-                spill = true;
-        fclose(f);
-        if (!spill)
-            continue;
-        char *tail = strrchr(path, '/') + 1;
-        strcpy(tail, "start");
-        unsigned long long first, count;
-        f = fopen(path, "r");
-        if (!f)
-            break;
-        int ok = fscanf(f, "%llu", &first);
-        fclose(f);
-        if (ok != 1)
-            break;
-        strcpy(tail, "size");
-        f = fopen(path, "r");
-        if (!f)
-            break;
-        ok = fscanf(f, "%llu", &count);
-        fclose(f);
-        if (ok != 1 || !count || first > UINT64_MAX / 512 || count > UINT64_MAX / 512 ||
-            first * 512 % d->lba || count * 512 % d->lba)
-            break;
-        *start = first * 512 / d->lba;
-        *blocks = count * 512 / d->lba;
-        if (*start > d->blocks || *blocks > d->blocks - *start)
-            break;
-        tail[-1] = 0;
-        const char *part = strrchr(path, '/') + 1;
-        char device[256];
-        snprintf(device, sizeof(device), "/dev/%s", part);
-        fd = open(device, O_RDWR | O_CLOEXEC);
-        if (fd >= 0 && flock(fd, LOCK_EX | LOCK_NB)) {
-            close(fd);
-            fd = -1;
-        }
-        break;
-    }
-    globfree(&matches);
-    return fd;
 }

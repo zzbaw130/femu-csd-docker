@@ -5,10 +5,6 @@ static u32 getCSFResourceId(void *device, CS_CSF_ID function)
     (void)device;
     return (u32)(uintptr_t)function;
 }
-static void finishBatchExecution(void *device, void *scope, bool success)
-{
-    cs_spill_scope_end(device, scope, success);
-}
 static const struct cs_backend_ops ops = {
     .abi = CS_BACKEND_ABI, .name = "femu", .type = CS_PLUGIN_NVME,
     .queryCSxList = femu_queryCSxList, .getCSxFromPath = femu_getCSxFromPath,
@@ -20,7 +16,9 @@ static const struct cs_backend_ops ops = {
     .queueCopyMemRequest = femu_queueCopyMemRequest,
     .queueStorageRequest = femu_queueStorageRequest,
     .executeBatchEntry = femu_executeBatchEntry,
-    .finishBatchExecution = finishBatchExecution, .queryDeviceProperties = femu_queryDeviceProperties,
+    .queueBatchRequest = femu_queueBatchRequest, .abortBatchRequest = femu_abortBatchRequest,
+    .finishBatchExecution = femu_finishBatchExecution,
+    .queryDeviceProperties = femu_queryDeviceProperties,
     .CSFDownload = femu_CSFDownload, .config = femu_config
 };
 __attribute__((visibility("default")))

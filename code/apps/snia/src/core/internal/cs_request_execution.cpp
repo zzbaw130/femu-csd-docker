@@ -32,10 +32,10 @@ void runRequest(const std::shared_ptr<Request> &request)
                               : request->task->execute(&value);
     });
     if (request->cancelled) status = CS_ERROR_IN_EXECUTION;
-    request->task.reset();
-    request->batch.reset();
     {
         std::lock_guard<std::mutex> lock(handlesMutex);
+        request->task.reset();
+        request->batch.reset();
         handles.erase(request->id);
         // Execution and its resource snapshots have ended. A completion
         // callback may submit the replacement even at the 64-request limit.

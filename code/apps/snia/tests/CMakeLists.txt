@@ -45,3 +45,7 @@ add_test(NAME csAFDMEventAllocationFailure COMMAND cs-afdm-event-lifecycle)
 foreach(target cs-header-compatibility cs-csf-batch-scheduling cs-discovery cs-library-management cs-afdm-event-lifecycle)
     target_compile_options(${target} PRIVATE -UNDEBUG)
 endforeach()
+if(EXISTS "${PROJECT_SOURCE_DIR}/../../FEMU/hw/femu/csd/csd-graph.h")
+    add_test(NAME csFemuGraphWireAgreement COMMAND ${CMAKE_COMMAND} -E compare_files
+        "${FEMU_DIR}/include/csd-graph.h" "${PROJECT_SOURCE_DIR}/../../FEMU/hw/femu/csd/csd-graph.h")
+endif()
