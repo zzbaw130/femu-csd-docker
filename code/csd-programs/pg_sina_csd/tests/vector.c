@@ -5,6 +5,99 @@
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
+static void string_views(void)
+{
+    assert(qs_text_like("_",1,"猫",3)==1);
+    assert(qs_text_like("\\%",2,"%",1)==1);
+    assert(qs_text_like("\\",1,"x",1)<0);
+    assert(!qs_text_like("\\",1,"",0));
+    const char *texts[]={"23-abc","21-xyz","abcdef","猫狗魚","","NULL"};
+    const char *prefixes[]={"23","21","ab","猫狗",""};
+    unsigned char raw[128]={0}; unsigned used=0;
+    size_t bytes=qs_chunk_bytes(6,1); struct qs_chunk *c=calloc(1,bytes); assert(c);
+    c->capacity=c->rows=c->selected=6; c->ncols=1;
+    for(unsigned i=0;i<6;++i) {
+        struct qs_heap_ref ref={used,strlen(texts[i])};
+        memcpy(qs_values(c)+i,&ref,sizeof(ref)); memcpy(raw+used,texts[i],ref.bytes); used+=ref.bytes;
+    }
+    qs_nulls(c)[0]=1U<<5;
+    struct qs_dict *dict=calloc(1,qs_dict_bytes(16,512)); assert(dict);
+    *dict=(struct qs_dict){.entries=16,.capacity=16,.data=512};
+    int literal=qs_dict_insert(dict,"23",2),pattern=qs_dict_insert(dict,"2_",2);
+    struct qs_plan p={.nattrs=1,.ncols=1,.nexprs=10};
+    p.cols[0]=(struct qs_column){.slot=0,.type=Q_STRING,.deferred=1};
+    p.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.column=0,.type=Q_STRING};
+    p.exprs[1]=(struct qs_expr){.op=Q_CONST,.constant=1,.type=Q_INTEGER};
+    p.exprs[2]=(struct qs_expr){.op=Q_CONST,.constant=2,.type=Q_INTEGER};
+    p.exprs[3]=(struct qs_expr){.op=Q_SUBSTRING,.left=0,.right=1,.otherwise=2,.type=Q_STRING};
+    p.exprs[4]=(struct qs_expr){.op=Q_CONST,.constant=literal,.type=Q_STRING};
+    p.exprs[5]=(struct qs_expr){.op=Q_EQ,.left=3,.right=4,.type=Q_BOOLEAN};
+    p.exprs[6]=(struct qs_expr){.op=Q_CONST,.constant=pattern,.type=Q_STRING};
+    p.exprs[7]=(struct qs_expr){.op=Q_LIKE,.left=3,.right=6,.type=Q_BOOLEAN};
+    p.exprs[8]=(struct qs_expr){.op=Q_CONST,.constant=qs_dict_insert(dict,"21",2),.type=Q_STRING};
+    p.exprs[9]=(struct qs_expr){.op=Q_GT,.left=3,.right=8,.type=Q_BOOLEAN};
+    struct qs_vector *v=calloc(QS_EXPRS,sizeof(*v)); assert(v); uint8_t needed[QS_EXPRS]={0};
+    assert(!qs_vector_require(&p,3,needed) && !qs_vector_require(&p,5,needed));
+    assert(!qs_vector_require(&p,7,needed) && !qs_vector_require(&p,9,needed));
+    assert(!qs_vector_execute_raw_dict(&p,c,NULL,0,6,needed,v,raw,used,dict));
+    for(unsigned i=0;i<5;++i) {
+        assert(v[3].kind==QS_TEXT && !v[3].errors[i] && !qs_vector_null(&v[3],i));
+        assert(v[3].strings[i].length==strlen(prefixes[i]) && !memcmp(v[3].strings[i].data,prefixes[i],strlen(prefixes[i])));
+        assert(qs_vector_value(&v[5],i)==(i==0)); assert(qs_vector_value(&v[7],i)==(i<2));
+        assert(qs_vector_value(&v[9],i)==(i==0 || i==2 || i==3));
+    }
+    assert(qs_vector_null(&v[3],5) && qs_vector_null(&v[5],5));
+    assert(dict->count==3); /* No complete phone/string or substring was interned. */
+    p.exprs[1].constant=-1; p.exprs[2].constant=3;
+    assert(!qs_vector_execute_raw_dict(&p,c,NULL,0,6,needed,v,raw,used,dict));
+    for(unsigned i=0;i<5;++i) assert(v[3].strings[i].length==(i==3?3:i==4?0:1));
+    p.exprs[1].constant=1; p.exprs[2].constant=-1;
+    assert(!qs_vector_execute_raw_dict(&p,c,NULL,0,6,needed,v,raw,used,dict));
+    for(unsigned i=0;i<5;++i) assert(v[3].errors[i]);
+    assert(!v[3].errors[5] && qs_vector_null(&v[3],5));
+    /* An unselected CASE branch must not execute an invalid substring. */
+    p.exprs[2].constant=2; p.nexprs=14;
+    p.exprs[10]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=-1};
+    p.exprs[11]=(struct qs_expr){.op=Q_SUBSTRING,.left=0,.right=1,.otherwise=10,.type=Q_STRING};
+    p.exprs[12]=(struct qs_expr){.op=Q_CONST,.type=Q_BOOLEAN};
+    p.exprs[13]=(struct qs_expr){.op=Q_CASE,.left=12,.right=11,.otherwise=3,.type=Q_STRING};
+    memset(needed,0,sizeof(needed)); assert(!qs_vector_require(&p,13,needed));
+    assert(!qs_vector_execute_raw_dict(&p,c,NULL,0,6,needed,v,raw,used,dict));
+    for(unsigned i=0;i<5;++i) assert(!v[13].errors[i] && v[13].strings[i].length==strlen(prefixes[i]));
+    assert(!qs_vector_materialize_text(&v[13],6,dict));
+    struct qs_vector_input input={.vectors=v,.dictionary=dict};
+    for(unsigned i=0;i<5;++i) {
+        const char *text; unsigned length; assert(!qs_vector_text(&input,13,i,&text,&length));
+        assert(length==strlen(prefixes[i]) && !memcmp(text,prefixes[i],length));
+    }
+    assert(qs_vector_null(&v[13],5));
+    struct qs_heap_ref bad={sizeof(raw),1}; memcpy(qs_values(c)+2,&bad,sizeof(bad));
+    assert(qs_vector_execute_raw_dict(&p,c,NULL,0,6,needed,v,raw,used,dict));
+    free(v); free(dict); free(c);
+}
+static void wide_parameters(void)
+{
+    size_t bytes=qs_chunk_bytes(4,1); struct qs_chunk *c=calloc(1,bytes); assert(c);
+    c->capacity=c->rows=4; c->ncols=1;
+    const int64_t values[]={500025,500026,500024,0}; memcpy(qs_values(c),values,sizeof(values));
+    struct qs_plan p={.nattrs=1,.ncols=1,.nexprs=3};
+    p.cols[0]=(struct qs_column){.slot=0,.type=Q_DECIMAL,.scale=2};
+    p.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.column=0,.type=Q_DECIMAL,.scale=2};
+    p.exprs[1]=(struct qs_expr){.op=Q_PARAMETER,.column=0,.type=Q_DECIMAL,.scale=2};
+    p.exprs[2]=(struct qs_expr){.op=Q_GT,.left=0,.right=1,.type=Q_BOOLEAN};
+    struct qs_cell parameter={.value=(__int128)5000255*INT64_C(100000000000000000),.scale=20,.dscale=20};
+    assert(parameter.value>INT64_MAX);
+    struct qs_vector *v=calloc(3,sizeof(*v)); assert(v); uint8_t needed[QS_EXPRS]={0};
+    assert(!qs_vector_require(&p,2,needed));
+    struct qs_vector_input input={.parameters=&parameter,.nparameters=1};
+    assert(!qs_vector_execute_input(&p,c,NULL,0,4,needed,v,input));
+    for(unsigned i=0;i<4;++i) assert(!v[2].errors[i] && !qs_vector_null(&v[2],i) && qs_vector_value(&v[2],i)==(i==1));
+    parameter.isnull=1;
+    assert(!qs_vector_execute_input(&p,c,NULL,0,4,needed,v,input));
+    for(unsigned i=0;i<4;++i) assert(!v[2].errors[i] && qs_vector_null(&v[2],i));
+    p.exprs[1].column=1; assert(qs_vector_execute_input(&p,c,NULL,0,4,needed,v,input));
+    free(v); free(c);
+}
 static void expressions(void)
 {
     struct qs_plan p={.having=-1,.nattrs=3,.ncols=3,.nexprs=27};
@@ -194,6 +287,6 @@ static void aggregates(const char *path)
 }
 int main(int argc,char **argv)
 {
-    assert(argc==2); expressions(); arithmetic(); case_and_division(); aggregates(argv[1]);
+    assert(argc==2); string_views(); wide_parameters(); expressions(); arithmetic(); case_and_division(); aggregates(argv[1]);
     puts("PASS batch expressions vs scalar, NULL/short-circuit/overflow, selection tails and shared aggregate states"); return 0;
 }

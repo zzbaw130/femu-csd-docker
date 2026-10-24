@@ -17,7 +17,8 @@
 #define QP_WORKER_FINISHED 4U
 enum qp_kind { QP_SCAN, QP_PROJECT, QP_JOIN, QP_AGGREGATE, QP_SORT, QP_LIMIT, QP_INDEX_JOIN, QP_CTE_SCAN, QP_MATERIALIZED, QP_SET };
 enum qp_join { QP_INNER, QP_LEFT, QP_SEMI, QP_ANTI };
-enum qp_expr { QP_PARAMETER=Q_DIV+1, QP_LIKE, QP_SUBSTRING, QP_COALESCE, QP_INSET };
+enum qp_expr { QP_PARAMETER=Q_PARAMETER, QP_LIKE=Q_LIKE, QP_SUBSTRING=Q_SUBSTRING,
+               QP_COALESCE=Q_COALESCE, QP_INSET=Q_INSET };
 struct qp_node {
     struct qs_plan expr;
     int kind, left, right, join_type, join_qual;

@@ -31,7 +31,9 @@ static struct group *get_group(struct state *s,struct qs_cell *keys)
 static int accumulate(struct state *s,struct qs_chunk *c,unsigned first,unsigned count)
 {
     const struct qs_plan *p=&s->plan;
-    if(qs_vector_execute(p,c,qs_selection(c),first,count,s->needed,s->vectors)) return -5;
+    if(qs_vector_execute_raw_dict(p,c,qs_selection(c),first,count,s->needed,s->vectors,NULL,0,s->dict)) return -5;
+    for(unsigned i=0;i<p->nexprs;++i) if((s->needed[i]&2) &&
+        qs_vector_materialize_text(&s->vectors[i],count,s->dict)) return -5;
     struct group *groups[QS_VECTOR_ROWS];
     for(unsigned i=0;i<count;++i) {
         if(!p->nkeys) { groups[i]=&s->groups[0]; continue; }

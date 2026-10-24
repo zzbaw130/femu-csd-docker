@@ -32,8 +32,12 @@ static inline size_t qs_index_work_bytes(unsigned workers)
 #define QS_INDEX_WAIT 1 /* Private join continuation; never a SNIA status. */
 enum qs_type { Q_DECIMAL, Q_INTEGER, Q_DATE, Q_CHAR, Q_BOOLEAN, Q_STRING, Q_PREFIX, Q_PATTERN, Q_DICTIONARY };
 enum qs_op { Q_COLUMN, Q_CONST, Q_ADD, Q_SUB, Q_MUL, Q_EQ, Q_NE, Q_LT, Q_LE, Q_GT, Q_GE,
-             Q_AND, Q_OR, Q_NOT, Q_IS_NULL, Q_IS_NOT_NULL, Q_CASE, Q_YEAR, Q_AGGREF, Q_DIV };
+             Q_AND, Q_OR, Q_NOT, Q_IS_NULL, Q_IS_NOT_NULL, Q_CASE, Q_YEAR, Q_AGGREF, Q_DIV,
+             Q_PARAMETER, Q_LIKE, Q_SUBSTRING, Q_COALESCE, Q_INSET };
 enum qs_agg_kind { Q_SUM, Q_AVG, Q_COUNT, Q_COUNT_STAR, Q_MIN, Q_MAX };
+/* Filter-only fields keep their Heap references after selection; outputs
+ * use QS_DEFERRED so their values survive reuse of the input block. */
+enum qs_deferred { QS_EAGER, QS_DEFERRED, QS_FILTER_ONLY };
 struct qs_column { int16_t length, slot; uint8_t align, type, scale, deferred, prefix_len, trim_spaces, restricted, dict_big; char prefix[32]; };
 /* SQL literal dictionary: IDs 1..nstrings; 0 means another non-NULL string.
  * Only a proven equality/IN restriction permits returning/grouping a string. */

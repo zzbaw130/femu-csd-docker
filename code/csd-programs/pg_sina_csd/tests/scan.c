@@ -165,6 +165,37 @@ static void prefix_projection(function scan)
     p.strings[0].length=255; assert(scan_rows(scan,&p,c,bytes,raw)==-3);
     free(c);
 }
+static void deferred_strings(function scan,function filter)
+{
+    unsigned char raw[2*QS_PAGE]={0}; make_pages(raw);
+    /* The first string is rejected and must never enter the dictionary. */
+    memcpy(raw+QS_PAGE-64+29,"xyz",3);
+    memcpy(raw+QS_PAGE-128+29,"ab ",3);
+    struct qs_plan p={.nattrs=4,.ncols=1,.nexprs=6,.predicate=5};
+    for(unsigned i=0;i<4;++i) p.cols[i]=(struct qs_column){.length=i?-1:4,.align=4,.slot=-1};
+    p.cols[1].slot=0; p.cols[1].type=Q_STRING; p.cols[1].deferred=1; p.cols[1].trim_spaces=1;
+    struct qs_dict *dict=calloc(1,qs_dict_bytes(16,512)); assert(dict);
+    *dict=(struct qs_dict){.entries=16,.capacity=16,.data=512};
+    p.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.type=Q_STRING,.column=1};
+    p.exprs[1]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=1};
+    p.exprs[2]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=2};
+    p.exprs[3]=(struct qs_expr){.op=Q_SUBSTRING,.type=Q_STRING,.left=0,.right=1,.otherwise=2};
+    p.exprs[4]=(struct qs_expr){.op=Q_CONST,.type=Q_STRING,.constant=qs_dict_insert(dict,"ab",2)};
+    p.exprs[5]=(struct qs_expr){.op=Q_EQ,.type=Q_BOOLEAN,.left=3,.right=4};
+    size_t bytes=qs_chunk_bytes(128,1); struct qs_chunk *c=calloc(1,bytes); assert(c);
+    c->capacity=128; c->ncols=1; assert(!scan_rows(scan,&p,c,bytes,raw));
+    assert(dict->count==1);
+    void *mr[]={c,&p,raw,dict}; long long lengths[]={bytes,sizeof(p),sizeof(raw),qs_dict_bytes(16,512)};
+    struct femu_csd_args a={.numr=4,.mr_addr=mr,.mr_len=lengths};
+    p.cols[1].deferred=QS_FILTER_ONLY;
+    assert(!filter(&a) && c->selected==61 && dict->count==1);
+    p.cols[1].deferred=QS_DEFERRED;
+    assert(!scan_rows(scan,&p,c,bytes,raw));
+    assert(!filter(&a) && c->selected==61);
+    int id=qs_dict_find(dict,"abc",3); assert(id>0 && dict->count==2 && !qs_dict_find(dict,"xyz",3));
+    for(unsigned i=0;i<c->selected;++i) assert(qs_values(c)[qs_selection(c)[i]]==(i==0?p.exprs[4].constant:id));
+    free(c); free(dict);
+}
 int main(int argc,char **argv)
 {
     numeric_formats();
@@ -172,7 +203,7 @@ int main(int argc,char **argv)
     void *scan_so=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL),*filter_so=dlopen(argv[2],RTLD_NOW|RTLD_LOCAL);
     assert(scan_so && filter_so);
     function scan=(function)dlsym(scan_so,"pg_sina_scan"),filter=(function)dlsym(filter_so,"pg_sina_filter"); assert(scan && filter);
-    prefix_projection(scan); fixed_prefix_projection(scan);
+    prefix_projection(scan); fixed_prefix_projection(scan); deferred_strings(scan,filter);
     unsigned char raw[2*QS_PAGE]={0}; make_pages(raw);
     struct qs_plan p={.nattrs=4,.ncols=3,.nexprs=7,.predicate=6};
     p.cols[0]=(struct qs_column){.length=4,.align=4,.slot=0,.type=Q_INTEGER};

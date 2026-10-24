@@ -412,3 +412,17 @@ Q9提交后复核Q5/Q10（连接顺序/预算已变化）：Q5 host均值2275.09
 真实 Guest：唯一入口 `tpch-test.sh` 完整 22 条结果一致并实际卸载；对 Q3/Q11/Q15/Q21 又各做两轮冷启动，所有结果一致。11 条无 spill 查询的独立 profile 都观察到 CU 并发峰值 4；没有改变 64 MiB 总 workmem。取消测试用原始 Q12 在 250ms 超时，再在同一个 backend 完成原始 Q12、Q7，完整结果与 host 一致。日志在 `results/tpch.qf481C/`、`tpch.8RuIV4/`、`tpch.PFtKzS/`。
 
 性能：完整轮 13 条未更慢、9 条仍未达标。Q3/Q11/Q21 的重复测量接近持平，个别样本略慢，不能宣称稳定加速；Q15 三轮中位数 host 2.263s / CSD 1.494s。其余 9 条的 spill 尚不能归因于物理 64 MiB 内存耗尽，节点配额和算法成本仍需继续优化。具体数据及口径见 performance.md 最后一节，结果正确和性能验收分别报告。
+
+## 当前改造目标与三层边界（2026-10-24）
+
+目标是使用唯一验收目录中的全部 22 条 SQL，在 8 CU、256 MiB workmem 下实现完整卸载与全面加速。结果正确、实际卸载和性能合格分别验证；尚未贯通的列接口或未分析的慢样本不能视作完成。
+
+- PG 扩展：采用 PG 选定的 Plan/Join 顺序，完成 SQL rewrite、物理列与 extent 准备、pipeline 编排和资源容量选择。已通过 SNIA 读取 CU/FDM 容量；workmem 通过普通 CSF 查询分配器容量。FDM 配置变化后新连接重新发现，无需硬编码扩展。
+- SNIA/FEMU adapter：把标准 batch 翻译成通用 EXEC_GRAPH，处理请求、事件和会话生命周期；不解析 SQL、Heap 或 Join 顺序。
+- FEMU CSD 固件：只管理通用 LOAD/STORE/COMPUTE、AFDM、CU、依赖就绪与完成时间队列，以及隐藏临时空间/通用重入。SQL 算法仅存在于设备程序 `csd-programs/pg_sina_csd`，不放进固件。
+
+本轮推进了字符串列批次过滤和精确参数引用。`query_vector.h` 中字符串向量借用原始 LOAD 或不可变字典中的字节，SUBSTRING 产生切片而不是立即插入字典；结果需要保留时才物化。Scan/Filter 私有计划中的 `deferred` 区分普通延迟列与仅用于过滤的列，后者不离开 Scan 的输出。通用 plan 程序直接向 Filter 实现传递原始输入、字典和参数数组，不增加 NVMe/SNIA 协议或主机控制标志。
+
+参数引用保留 128 位数值与实际 scale。对过滤计划的私有副本更新相关表达式 scale，SIMD 不能安全表示参数时使用精确的宽整数比较。原始 PG 计划不变。UTF-8、NULL、负/零起点、负长度错误、LIKE 转义、CASE 未执行分支与投影字符串生命周期都有针对性测试。
+
+继续改造时仍需逐项完成：Join/分组聚合的列批次接口、局部/共享状态与 Combine/Finalize 覆盖、跨块持续执行、实际总内存预算与 spill 配额。当前保持 64 MiB FDM；仅在测量证明它约束吞吐后才尝试扩容，不以加大 FDM 掩盖执行器问题。最新性能结论以 performance.md 和其关联的规范 SQL 原始日志为准。

@@ -26,6 +26,7 @@ static int comparisons(const struct qs_plan *p,struct qs_chunk *c,int index,
     }
     if(column->op!=Q_COLUMN || constant->op!=Q_CONST || constant->isnull ||
         column->column<0 || (unsigned)column->column>=p->nattrs || *count>=QS_EXPRS) return 0;
+    if(p->cols[column->column].type==Q_STRING) return 0;
     int slot=p->cols[column->column].slot;
     if(slot<0 || (unsigned)slot>=c->ncols) return 0;
     __int128 value=constant->constant;
@@ -131,8 +132,8 @@ static int select_deferred(const struct qs_plan *p,struct qs_chunk *c,const stru
 }
 int64_t pg_sina_filter(struct femu_csd_args *a)
 {
-    if(!a || (a->numr!=2 && a->numr!=3) || a->mr_len[1]<(long long)sizeof(struct qs_plan)) return -1;
-    if(a->numr==3 && (a->mr_len[2]<0 || !a->mr_addr[2])) return -1;
+    if(!a || (a->numr<2 || a->numr>5) || a->mr_len[1]<(long long)sizeof(struct qs_plan)) return -1;
+    if(a->numr>=3 && (a->mr_len[2]<0 || !a->mr_addr[2])) return -1;
     struct qs_chunk *c=a->mr_addr[0]; const struct qs_plan *p=a->mr_addr[1];
     if(a->mr_len[0]<(long long)sizeof(*c) || qs_chunk_bytes(c->capacity,c->ncols)>(uint64_t)a->mr_len[0] ||
         c->ncols!=p->ncols || c->rows>c->capacity || p->nattrs>QS_COLS || p->nexprs>QS_EXPRS) return -1;
@@ -142,7 +143,7 @@ int64_t pg_sina_filter(struct femu_csd_args *a)
         unsigned prefix=0;
         while(prefix<count && !p->cols[p->exprs[predicates[prefix].expression].column].deferred) ++prefix;
         if(prefix<count) {
-            int status=select_deferred(p,c,predicates,count,prefix,a->numr==3?a->mr_addr[2]:NULL,a->numr==3?a->mr_len[2]:0);
+            int status=select_deferred(p,c,predicates,count,prefix,a->numr>=3?a->mr_addr[2]:NULL,a->numr>=3?a->mr_len[2]:0);
             if(status) return status;
         } else {
 #if defined(__x86_64__) || defined(__i386__)
@@ -161,8 +162,11 @@ int64_t pg_sina_filter(struct femu_csd_args *a)
         if(!vectors) { cs_work_end(context); return -4; }
         for(unsigned first=0;first<c->rows;first+=QS_VECTOR_ROWS) {
             unsigned n=c->rows-first; if(n>QS_VECTOR_ROWS) n=QS_VECTOR_ROWS;
-            if(qs_vector_execute_raw(p,c,NULL,first,n,needed,vectors,
-                a->numr==3?a->mr_addr[2]:NULL,a->numr==3?a->mr_len[2]:0)) { cs_work_end(context); return -2; }
+            struct qs_vector_input input={.raw=a->numr>=3?a->mr_addr[2]:NULL,
+                .raw_bytes=a->numr>=3?a->mr_len[2]:0,.dictionary=a->numr>=4?a->mr_addr[3]:NULL,
+                .parameters=a->numr==5?a->mr_addr[4]:NULL,
+                .nparameters=a->numr==5 && a->mr_len[4]>0?(uint64_t)a->mr_len[4]/sizeof(struct qs_cell):0};
+            if(qs_vector_execute_input(p,c,NULL,first,n,needed,vectors,input)) { cs_work_end(context); return -2; }
             const struct qs_vector *result=&vectors[p->predicate];
             for(unsigned i=0;i<n;++i) {
                 if(result->errors[i]) { cs_work_end(context); return -2; }
@@ -171,12 +175,12 @@ int64_t pg_sina_filter(struct femu_csd_args *a)
         }
         cs_work_end(context);
     }
-    /* The raw LOAD buffer stays in AFDM until Aggregate.sink finishes.
-     * Decode aggregate-only numerics here to avoid an extra CSF command. */
+    /* The retained LOAD stays valid during filtering. Materialize values that
+     * leave Scan; predicate-only references never escape this input block. */
     for(unsigned col=0;col<p->nattrs;++col) {
         const struct qs_column *spec=&p->cols[col];
-        if(!spec->deferred) continue;
-        if(a->numr!=3 || spec->type!=Q_DECIMAL || spec->slot<0 || (unsigned)spec->slot>=c->ncols || a->mr_len[2]<0) return -1;
+        if(!spec->deferred || spec->deferred==QS_FILTER_ONLY) continue;
+        if(a->numr<3 || (spec->type!=Q_DECIMAL && spec->type!=Q_STRING) || spec->slot<0 || (unsigned)spec->slot>=c->ncols || a->mr_len[2]<0) return -1;
         int64_t *values=qs_values(c)+(size_t)spec->slot*c->capacity;
         unsigned char *nulls=qs_nulls(c)+(size_t)spec->slot*((c->capacity+7)/8);
         unsigned char *scales=qs_dscales(c)+(size_t)spec->slot*c->capacity;
@@ -185,6 +189,13 @@ int64_t pg_sina_filter(struct femu_csd_args *a)
             if(nulls[row/8]&(1U<<(row%8))) continue;
             struct qs_heap_ref ref; memcpy(&ref,&values[row],sizeof(ref));
             if(ref.offset>(uint64_t)a->mr_len[2] || ref.bytes>(uint64_t)a->mr_len[2]-ref.offset) return -2;
+            if(spec->type==Q_STRING) {
+                if(a->numr<4 || !a->mr_addr[3]) return -1;
+                const char *text=(const char *)a->mr_addr[2]+ref.offset; unsigned length=ref.bytes;
+                if(spec->trim_spaces) while(length && text[length-1]==' ') --length;
+                int id=qs_dict_insert(a->mr_addr[3],text,length); if(id<0) return -3;
+                values[row]=id; scales[row]=0; continue;
+            }
             unsigned dscale;
             if(qs_numeric_cents((const unsigned char *)a->mr_addr[2]+ref.offset,ref.bytes,&values[row],&dscale)) return -3;
             scales[row]=dscale;

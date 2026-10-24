@@ -222,29 +222,6 @@ static int compare_cell(struct execution *s,struct qs_cell a,struct qs_cell b,un
     }
     int cmp=0; return qs_compare(a,b,&cmp)?INT_MIN:cmp;
 }
-static unsigned character_bytes(const char *text,unsigned available)
-{
-    if(!available) return 0;
-    unsigned char c=*text; unsigned n=c<128?1:(c&0xe0)==0xc0?2:(c&0xf0)==0xe0?3:4;
-    return n<=available?n:available;
-}
-static int glob(const char *p,unsigned pn,const char *v,unsigned vn)
-{
-    if(!pn) return !vn;
-    if(*p=='%') {
-        while(pn && *p=='%') { ++p; --pn; }
-        if(!pn) return 1;
-        for(unsigned i=0;;) {
-            if(glob(p,pn,v+i,vn-i)) return 1;
-            if(i==vn) break;
-            i+=character_bytes(v+i,vn-i);
-        }
-        return 0;
-    }
-    if(*p=='\\' && pn>1) { ++p; --pn; return vn && *p==*v && glob(p+1,pn-1,v+1,vn-1); }
-    if(*p=='_') { unsigned n=character_bytes(v,vn); return n && glob(p+1,pn-1,v+n,vn-n); }
-    return vn && *p==*v && glob(p+1,pn-1,v+1,vn-1);
-}
 static int evaluate(struct execution *s,struct qs_eval *e,int index,struct qs_cell *out)
 {
     if(index<0 || (unsigned)index>=e->plan->nexprs) return -1;
@@ -300,15 +277,15 @@ static int evaluate(struct execution *s,struct qs_eval *e,int index,struct qs_ce
                             if(begin<0) begin=0;
                             if(end<begin) end=begin;
                             unsigned first=0,last=0; int64_t character=0;
-                            while(first<ln && character<begin) { first+=character_bytes(left+first,ln-first); ++character; }
+                            while(first<ln && character<begin) { first+=qs_text_character(left+first,ln-first); ++character; }
                             last=first;
-                            while(last<ln && character<end) { last+=character_bytes(left+last,ln-last); ++character; }
+                            while(last<ln && character<end) { last+=qs_text_character(left+last,ln-last); ++character; }
                             int id=qs_dict_insert(s->dictionary,left+first,last-first); if(id<0) return -3;
                             v.value=id;
                         }
                     } else {
                         if(qs_dict_get(s->dictionary,(unsigned)b.value,&right,&rn)) return -3;
-                        if(x->op==QP_LIKE) v.value=glob(right,rn,left,ln);
+                        if(x->op==QP_LIKE) { int match=qs_text_like(right,rn,left,ln); if(match<0) return -5; v.value=match; }
                         else {
                             int cmp=memcmp(left,right,ln<rn?ln:rn); if(!cmp) cmp=(ln>rn)-(ln<rn);
                             v.value=x->op==Q_EQ?cmp==0:x->op==Q_NE?cmp!=0:x->op==Q_LT?cmp<0:x->op==Q_LE?cmp<=0:x->op==Q_GT?cmp>0:cmp>=0;
@@ -894,27 +871,54 @@ static int64_t join_next(struct execution *s,unsigned id,struct qs_cell *row)
         memcpy(o->first,o->left,ln*sizeof(*o->first)); o->have_left=0; o->phase=2;
     }
 }
-/* Reuse the existing selection-vector evaluator. String equality can compare
- * dictionary IDs; lexical ordering/LIKE and parameters retain scalar semantics. */
+/* Filter retained Heap values by selection vectors. Byte views avoid interning
+ * rejected strings; InitPlan parameters retain their full numeric precision. */
 static int scan_filter_init(struct execution *s,const struct qs_plan *p,struct operator_state *o)
 {
     if(!o->scan_filter_checked) {
         o->scan_filter_checked=1; uint8_t needed[QS_EXPRS]={0};
-        if(p->predicate<0 || qs_vector_require(p,p->predicate,needed)) return 0;
-        for(unsigned i=0;i<p->nexprs;++i) if(needed[i]) {
-            const struct qs_expr *x=&p->exprs[i];
-            if(x->op>=Q_LT && x->op<=Q_GE && p->exprs[x->left].type==Q_STRING) return 0;
+        if(p->predicate<0) return 0;
+        struct qs_plan *filter=cs_work_alloc(s->context,sizeof(*p)); if(!filter) return 0;
+        *filter=*p; filter->work_mem_parent=(uintptr_t)s->context;
+        /* Parameter values keep int128 payloads and their actual numeric scale.
+         * The original PG plan remains unchanged; this copy belongs to a CU. */
+        for(unsigned i=0;i<filter->nexprs;++i) {
+            struct qs_expr *e=&filter->exprs[i];
+            if(e->op==QP_PARAMETER) {
+                if(e->column<0 || e->column>=QP_PARAMS) goto scalar;
+                e->scale=s->params[e->column].scale; e->dscale=s->params[e->column].dscale;
+            } else if(e->op==Q_ADD || e->op==Q_SUB || e->op==Q_MUL || e->op==Q_CASE) {
+                if(e->left<0 || e->right<0 || e->left>=(int)i || e->right>=(int)i) goto scalar;
+                unsigned left=filter->exprs[e->left].scale,right=filter->exprs[e->right].scale;
+                unsigned scale=e->op==Q_MUL?left+right:left>right?left:right;
+                if(e->op==Q_CASE) {
+                    if(e->otherwise<0 || e->otherwise>=(int)i) goto scalar;
+                    scale=right>filter->exprs[e->otherwise].scale?right:filter->exprs[e->otherwise].scale;
+                }
+                if(scale>UINT8_MAX) goto scalar;
+                e->scale=scale;
+            }
         }
-        o->scan_filter=cs_work_alloc(s->context,sizeof(*p));
-        if(!o->scan_filter) return 0;
-        *o->scan_filter=*p; o->scan_filter->work_mem_parent=(uintptr_t)s->context;
-        for(unsigned i=0;i<p->nattrs;++i) if(p->cols[i].type==Q_DECIMAL && p->cols[i].slot>=0)
-            o->scan_filter->cols[i].deferred=1;
-        for(unsigned i=0;i<p->nexprs;++i) if(needed[i] && p->exprs[i].op==Q_CONST && p->exprs[i].type==Q_STRING && !p->exprs[i].isnull) {
-            const struct qs_string *literal=&p->strings[p->exprs[i].constant];
-            int id=qs_dict_insert(s->dictionary,literal->bytes,literal->length); if(id<0) return -3;
-            o->scan_filter->exprs[i].constant=id;
+        if(qs_vector_require(filter,filter->predicate,needed)) goto scalar;
+        uint8_t projected[QS_EXPRS]={0}; int known=1;
+        for(unsigned i=0;i<filter->nout;++i)
+            if(qs_vector_require(filter,filter->outputs[i].index,projected)) { known=0; break; }
+        for(unsigned col=0;col<filter->nattrs;++col) {
+            struct qs_column *c=&filter->cols[col];
+            if((c->type!=Q_DECIMAL && c->type!=Q_STRING) || c->slot<0) continue;
+            c->deferred=known?QS_FILTER_ONLY:QS_DEFERRED;
+            for(unsigned i=0;i<filter->nexprs;++i) if(projected[i] && filter->exprs[i].op==Q_COLUMN && filter->exprs[i].column==(int)col)
+                c->deferred=QS_DEFERRED;
         }
+        for(unsigned i=0;i<filter->nexprs;++i) if(needed[i] && filter->exprs[i].op==Q_CONST && filter->exprs[i].type==Q_STRING && !filter->exprs[i].isnull) {
+            const struct qs_string *literal=&filter->strings[filter->exprs[i].constant];
+            int id=qs_dict_insert(s->dictionary,literal->bytes,literal->length);
+            if(id<0) { cs_work_free(s->context,filter); return -3; }
+            filter->exprs[i].constant=id;
+        }
+        o->scan_filter=filter; return 0;
+scalar:
+        cs_work_free(s->context,filter);
     }
     return 0;
 }
@@ -986,9 +990,9 @@ static int64_t scan_chunk_next(struct execution *s,unsigned id)
             status=timed_call(s,pg_sina_scan_impl,&a,QS_SCAN); if(status) return status;
             s->metrics.scanned+=chunk->rows; s->metrics.input_bytes+=task.input_bytes; ++s->metrics.chunks;
             if(o->scan_filter) {
-                void *fm[]={chunk,o->scan_filter,mr[0]};
-                long long fl[]={len[2],sizeof(*p),task.input_bytes};
-                struct femu_csd_args filter={.numr=3,.mr_addr=fm,.mr_len=fl};
+                void *fm[]={chunk,o->scan_filter,mr[0],s->dictionary,s->params};
+                long long fl[]={len[2],sizeof(*p),task.input_bytes,0,sizeof(s->params)};
+                struct femu_csd_args filter={.numr=5,.mr_addr=fm,.mr_len=fl};
                 status=timed_call(s,pg_sina_filter_impl,&filter,QS_FILTER);
                 if(status==-4) {
                     /* Keep the query budget: if vector scratch does not fit,
@@ -1130,7 +1134,13 @@ static int64_t projection_fill(struct execution *s,unsigned id)
         struct operator_state *scan=&s->nodes[b->scan];
         struct qs_chunk *chunk=(void *)(s->arena+vector_offset(s,&s->plan->nodes[b->scan]));
         b->count=chunk->selected-scan->scan_position; if(b->count>QS_VECTOR_ROWS) b->count=QS_VECTOR_ROWS;
-        if(qs_vector_execute(&b->plan,chunk,qs_selection(chunk),scan->scan_position,b->count,b->needed,b->vectors)) return -5;
+        if(qs_vector_execute_raw_dict(&b->plan,chunk,qs_selection(chunk),scan->scan_position,b->count,b->needed,b->vectors,NULL,0,s->dictionary)) return -5;
+        /* A retained output must outlive this vector's byte views. Predicates
+         * do not intern their temporary slices; projected text does. */
+        for(unsigned o=0;o<b->plan.nout;++o) {
+            int index=b->plan.outputs[o].index; if(index<0) continue;
+            if(qs_vector_materialize_text(&b->vectors[index],b->count,s->dictionary)) return -3;
+        }
         scan->scan_position+=b->count; b->position=0;
     }
     return 2;

@@ -93,6 +93,8 @@ spill 使用现有 SNIA batch 的 NEED_STORE/NEED_LOAD/NEED_FREE 重入协议，
 
 通用执行器中的 Scan 和无额外过滤的连续 Project，直接在列批次上求值：输入列保留引用，常量保留常量向量，算术表达式复用现有向量/SIMD 求值器，仅在需要行接口的边界组装 `qs_cell`。不支持的表达式或 scratch 分配失败时保留原来的逐行路径；scratch 由查询 workmem context 记账，输入结束后释放。
 
+字符串过滤可以直接引用保留的 Heap 字节，按字符处理 SUBSTRING、LIKE 和字节序比较；只用于过滤的列不写入字典，离开 Scan 的字符串结果才物化。InitPlan 参数作为常量向量引用，保留 int128 值及实际 numeric scale，不为适配向量计算截断为 int64。substring 采用 PG 的起点和负长度规则，保持 NULL、CASE/AND/OR 短路。
+
 无分组、无 DISTINCT 的 SUM/AVG/COUNT/MIN/MAX 使用每 CU 的局部状态，流水线结束后在协调 CU 合并。AVG 合并 sum/count，最后才相除；纯 Scan/Project 输入直接由列向量累加，Join 等输入暂时通过行批次适配。分组与 DISTINCT 聚合保留原有执行方式，没有为并行关闭其 SQL 语义。
 
 ## 精度和回退范围
