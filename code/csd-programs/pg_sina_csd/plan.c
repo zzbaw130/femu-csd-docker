@@ -83,6 +83,13 @@ struct external_hash {
 struct accumulator { struct qs_cell sum,extreme,last; uint64_t count; int has_last; };
 struct compact_group { struct qs_cell sum; int64_t key; uint64_t count; atomic_uint occupied; };
 struct set_key { int64_t value; unsigned occupied; };
+/* Private per-CU expression state; referenced input columns stay in AFDM. */
+struct projection_batch {
+    struct qs_plan plan;
+    struct qs_vector *vectors;
+    uint8_t needed[QS_EXPRS];
+    unsigned scan,count,position;
+};
 struct operator_state {
     struct sorted_rows left_sort,right_sort;
     struct qs_cell left[QS_OUT],right[QS_OUT],first[QS_OUT],keys[QS_KEYS];
@@ -91,7 +98,8 @@ struct operator_state {
     uint64_t position, skipped, emitted;
     unsigned scan_position, scan_input, scan_bytes;
     struct qs_plan *scan_filter;
-    int scan_filter_checked;
+    int scan_filter_checked,projection_checked;
+    struct projection_batch *projection;
     int phase, have_left, have_right, input_done, group_ready, matched, finished;
     struct qs_plan *index_plan;
     struct qs_join_control index_control;
@@ -140,7 +148,7 @@ struct execution {
     int parallel_started;
     unsigned parallel_node, root, used_workers;
     /* One-based parent receiving rows directly from parallel workers. */
-    unsigned hash_sink,group_sink;
+    unsigned hash_sink,group_sink,aggregate_sink;
     atomic_uint_fast64_t next_offset;
     atomic_uint active_cus, peak_cus;
     struct execution *owner, *workers[QS_WORKERS];
@@ -910,7 +918,7 @@ static int scan_filter_init(struct execution *s,const struct qs_plan *p,struct o
     }
     return 0;
 }
-static int64_t scan_next(struct execution *s,unsigned id,struct qs_cell *row)
+static int64_t scan_chunk_next(struct execution *s,unsigned id)
 {
     const struct qp_node *n=&s->plan->nodes[id]; const struct qs_plan *p=&n->expr; struct operator_state *o=&s->nodes[id];
     struct qs_chunk *chunk=(void *)(s->arena+vector_offset(s,n));
@@ -922,18 +930,7 @@ static int64_t scan_next(struct execution *s,unsigned id,struct qs_cell *row)
         qs_index_dictionary(&o->index_control,s->dictionary);
     }
     for(;;) {
-        if(!o->index_task.index_pending && o->scan_position<chunk->selected) {
-            unsigned at=qs_selection(chunk)[o->scan_position++]; struct qs_cell values[QS_COLS];
-            for(unsigned i=0;i<p->nattrs;++i) if(p->cols[i].slot>=0) {
-                unsigned slot=p->cols[i].slot;
-                values[i]=(struct qs_cell){.value=qs_values(chunk)[(size_t)slot*chunk->capacity+at],
-                    .scale=p->cols[i].scale,.dscale=qs_dscales(chunk)[(size_t)slot*chunk->capacity+at],
-                    .isnull=(qs_nulls(chunk)[(size_t)slot*((chunk->capacity+7)/8)+at/8]>>(at%8))&1};
-            }
-            int count=project_filtered(s,n,values,NULL,row,o->scan_filter!=NULL); if(count<0) return count;
-            if(count) { ++s->metrics.matched; return 2; }
-            continue;
-        }
+        if(!o->index_task.index_pending && o->scan_position<chunk->selected) return 2;
         if(n->ordered_index) {
             if(s->worker && (n->ordered_index&8) && !o->input_done) {
                 uint64_t first=atomic_fetch_add_explicit(&s->owner->next_offset,16*QS_PAGE,memory_order_relaxed)/QS_PAGE;
@@ -1017,6 +1014,140 @@ static int64_t scan_next(struct execution *s,unsigned id,struct qs_cell *row)
         return QP_WAIT;
     }
 }
+static int64_t scan_next(struct execution *s,unsigned id,struct qs_cell *row)
+{
+    const struct qp_node *n=&s->plan->nodes[id]; const struct qs_plan *p=&n->expr;
+    struct operator_state *o=&s->nodes[id];
+    struct qs_chunk *chunk=(void *)(s->arena+vector_offset(s,n));
+    for(;;) {
+        int64_t status=scan_chunk_next(s,id); if(status!=2) return status;
+        unsigned at=qs_selection(chunk)[o->scan_position++]; struct qs_cell values[QS_COLS];
+        for(unsigned i=0;i<p->nattrs;++i) if(p->cols[i].slot>=0) {
+            unsigned slot=p->cols[i].slot;
+            values[i]=(struct qs_cell){.value=qs_values(chunk)[(size_t)slot*chunk->capacity+at],
+                .scale=p->cols[i].scale,.dscale=qs_dscales(chunk)[(size_t)slot*chunk->capacity+at],
+                .isnull=(qs_nulls(chunk)[(size_t)slot*((chunk->capacity+7)/8)+at/8]>>(at%8))&1};
+        }
+        int count=project_filtered(s,n,values,NULL,row,o->scan_filter!=NULL); if(count<0) return count;
+        if(count) { ++s->metrics.matched; return 2; }
+    }
+}
+/* Translate a projection chain into one expression DAG over the original
+ * scan columns. This preserves PG's tree and avoids row materialization
+ * between adjacent projections. Unsupported expressions keep the old path. */
+struct projection_import {
+    struct execution *execution;
+    struct projection_batch *batch;
+    unsigned nodes[QS_EXPRS],expressions[QS_EXPRS];
+};
+static int projection_import(struct projection_import *in,unsigned node,int index)
+{
+    const struct qp_node *n=&in->execution->plan->nodes[node];
+    if(index<0 || (unsigned)index>=n->expr.nexprs) return -1;
+    struct qs_plan *p=&in->batch->plan;
+    for(unsigned i=0;i<p->nexprs;++i) if(in->nodes[i]==node && in->expressions[i]==(unsigned)index) return i;
+    struct qs_expr e=n->expr.exprs[index];
+    if(e.op>Q_CASE && e.op!=Q_YEAR) return -1;
+    if(e.op==Q_COLUMN && (n->kind==QP_PROJECT || n->kind==QP_AGGREGATE)) {
+        const struct qp_node *child=&in->execution->plan->nodes[n->left];
+        if(e.column<0 || (unsigned)e.column>=child->expr.nout) return -1;
+        return projection_import(in,n->left,child->expr.outputs[e.column].index);
+    }
+    if(e.op!=Q_COLUMN && e.op!=Q_CONST) {
+        if(e.left<0 || e.left>=index) return -1;
+        if(e.op>=Q_LT && e.op<=Q_GE && n->expr.exprs[e.left].type==Q_STRING) return -1;
+        e.left=projection_import(in,node,e.left); if(e.left<0) return -1;
+        if(e.op!=Q_NOT && e.op!=Q_IS_NULL && e.op!=Q_IS_NOT_NULL && e.op!=Q_YEAR) {
+            if(e.right<0 || e.right>=index) return -1;
+            e.right=projection_import(in,node,e.right); if(e.right<0) return -1;
+        }
+        if(e.op==Q_CASE) {
+            if(e.otherwise<0 || e.otherwise>=index) return -1;
+            e.otherwise=projection_import(in,node,e.otherwise); if(e.otherwise<0) return -1;
+        }
+    }
+    if(e.op==Q_CONST && e.type==Q_STRING && !e.isnull) {
+        if(e.constant<0 || e.constant>=n->expr.nstrings) return -1;
+        const struct qs_string *v=&n->expr.strings[(unsigned)e.constant];
+        int id=qs_dict_insert(in->execution->dictionary,v->bytes,v->length); if(id<0) return -1;
+        e.constant=id;
+    }
+    if(p->nexprs==QS_EXPRS) return -1;
+    unsigned at=p->nexprs++; p->exprs[at]=e; in->nodes[at]=node; in->expressions[at]=index;
+    return at;
+}
+static int projection_init(struct execution *s,unsigned id)
+{
+    struct operator_state *o=&s->nodes[id]; if(o->projection_checked) return 0;
+    o->projection_checked=1;
+    const struct qp_node *root=&s->plan->nodes[id];
+    int aggregate=root->kind==QP_AGGREGATE;
+    if(aggregate && (root->nkeys || root->distinct || root->distinct_aggs || root->left<0)) return 0;
+    int scan=aggregate?root->left:(int)id;
+    while(s->plan->nodes[scan].kind==QP_PROJECT) {
+        const struct qp_node *n=&s->plan->nodes[scan];
+        if(n->left<0 || n->expr.predicate>=0 || (!s->worker && s->plan->workers>1 && n->parallel)) return 0;
+        scan=n->left;
+    }
+    const struct qp_node *leaf=&s->plan->nodes[scan];
+    if(leaf->kind!=QP_SCAN || (!s->worker && s->plan->workers>1 && leaf->parallel)) return 0;
+    if(leaf->expr.predicate>=0) {
+        if(leaf->ordered_index) return 0;
+        int status=scan_filter_init(s,&leaf->expr,&s->nodes[scan]); if(status) return status;
+        if(!s->nodes[scan].scan_filter) return 0;
+    }
+    struct projection_batch *b=cs_work_calloc(s->context,1,sizeof(*b)); if(!b) return 0;
+    b->plan=leaf->expr; b->plan.nexprs=0; b->plan.nout=aggregate?root->expr.naggs:root->expr.nout; b->scan=scan;
+    struct projection_import import={.execution=s,.batch=b};
+    for(unsigned i=0;i<b->plan.nout;++i) {
+        if(aggregate && root->expr.aggs[i].kind==Q_COUNT_STAR) { b->plan.outputs[i].index=-1; continue; }
+        int index=projection_import(&import,id,aggregate?root->expr.aggs[i].expr:root->expr.outputs[i].index);
+        if(index<0 || qs_vector_require(&b->plan,index,b->needed)) { cs_work_free(s->context,b); return 0; }
+        b->plan.outputs[i]=root->expr.outputs[i]; b->plan.outputs[i].index=index;
+    }
+    if(b->plan.nexprs) b->vectors=cs_work_alloc(s->context,b->plan.nexprs*sizeof(*b->vectors));
+    if(b->plan.nexprs && !b->vectors) { cs_work_free(s->context,b); return 0; }
+    o->projection=b; return 0;
+}
+/* Return 3 only for an internal scalar fallback, before consuming input. */
+static int64_t projection_fill(struct execution *s,unsigned id)
+{
+    struct projection_batch *b=s->nodes[id].projection;
+    if(b->position==b->count) {
+        int64_t status=scan_chunk_next(s,b->scan);
+        if(status!=2) {
+            if(!status) {
+                cs_work_free(s->context,b->vectors); cs_work_free(s->context,b);
+                s->nodes[id].projection=NULL;
+            }
+            return status;
+        }
+        /* Filter may have fallen back after exhausting its scratch budget. */
+        if(s->plan->nodes[b->scan].expr.predicate>=0 && !s->nodes[b->scan].scan_filter) {
+            cs_work_free(s->context,b->vectors); cs_work_free(s->context,b);
+            s->nodes[id].projection=NULL; return 3;
+        }
+        struct operator_state *scan=&s->nodes[b->scan];
+        struct qs_chunk *chunk=(void *)(s->arena+vector_offset(s,&s->plan->nodes[b->scan]));
+        b->count=chunk->selected-scan->scan_position; if(b->count>QS_VECTOR_ROWS) b->count=QS_VECTOR_ROWS;
+        if(qs_vector_execute(&b->plan,chunk,qs_selection(chunk),scan->scan_position,b->count,b->needed,b->vectors)) return -5;
+        scan->scan_position+=b->count; b->position=0;
+    }
+    return 2;
+}
+static int64_t projection_next(struct execution *s,unsigned id,struct qs_cell *row)
+{
+    int64_t status=projection_fill(s,id);
+    if(status==3) return next_row_impl(s,id,row);
+    if(status!=2) return status;
+    struct projection_batch *b=s->nodes[id].projection;
+    for(unsigned i=0;i<b->plan.nout;++i) {
+        unsigned index=b->plan.outputs[i].index;
+        if(b->vectors[index].errors[b->position]) return -5;
+        row[i]=qs_vector_cell(&b->plan,b->vectors,index,b->position);
+    }
+    ++b->position; ++s->metrics.matched; return 2;
+}
 static int group_same(struct execution *s,const struct qp_node *n,struct operator_state *o)
 {
     struct qs_eval e; init_eval(&e,&n->expr,o->left,NULL);
@@ -1027,6 +1158,25 @@ static int group_same(struct execution *s,const struct qp_node *n,struct operato
         if(cmp) return 0;
     }
     return 1;
+}
+static inline int accumulate_value(struct execution *s,const struct qp_node *n,
+    const struct qs_agg *agg,struct accumulator *a,struct qs_cell v)
+{
+    if(agg->kind==Q_MIN || agg->kind==Q_MAX) {
+        int cmp=a->count?compare_cell(s,v,a->extreme,n->expr.exprs[agg->expr].type):0;
+        if(cmp==INT_MIN) return -5;
+        if(!a->count || (agg->kind==Q_MIN?cmp<0:cmp>0)) a->extreme=v;
+    } else if(agg->kind==Q_SUM || agg->kind==Q_AVG) {
+        if(!a->count) a->sum=v;
+        else {
+            unsigned scale=v.scale>a->sum.scale?v.scale:a->sum.scale; __int128 left,right;
+            if(qs_scale(a->sum.value,scale-a->sum.scale,&left) || qs_scale(v.value,scale-v.scale,&right) ||
+                __builtin_add_overflow(left,right,&a->sum.value)) return -5;
+            a->sum.scale=scale; if(v.dscale>a->sum.dscale) a->sum.dscale=v.dscale;
+        }
+    }
+    ++a->count;
+    return 0;
 }
 static int accumulate(struct execution *s,const struct qp_node *n,struct operator_state *o)
 {
@@ -1042,20 +1192,7 @@ static int accumulate(struct execution *s,const struct qp_node *n,struct operato
             if(!cmp) continue;
             a->last=v; a->has_last=1;
         }
-        if(agg->kind==Q_MIN || agg->kind==Q_MAX) {
-            int cmp=a->count?compare_cell(s,v,a->extreme,n->expr.exprs[agg->expr].type):0;
-            if(cmp==INT_MIN) return -5;
-            if(!a->count || (agg->kind==Q_MIN?cmp<0:cmp>0)) a->extreme=v;
-        } else if(agg->kind==Q_SUM || agg->kind==Q_AVG) {
-            if(!a->count) a->sum=v;
-            else {
-                unsigned scale=v.scale>a->sum.scale?v.scale:a->sum.scale; __int128 left,right;
-                if(qs_scale(a->sum.value,scale-a->sum.scale,&left) || qs_scale(v.value,scale-v.scale,&right) ||
-                    __builtin_add_overflow(left,right,&a->sum.value)) return -5;
-                a->sum.scale=scale; if(v.dscale>a->sum.dscale) a->sum.dscale=v.dscale;
-            }
-        }
-        ++a->count;
+        int status=accumulate_value(s,n,agg,a,v); if(status) return status;
     }
     return 0;
 }
@@ -1366,6 +1503,11 @@ static int64_t aggregate_next(struct execution *s,unsigned id,struct qs_cell *ro
 {
     const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
     if(n->hash) return hash_aggregate_next(s,id,row);
+    /* Initialize before starting the child pipeline: parallel workers combine
+     * their local states here before the first (and only) output row. */
+    if(!n->nkeys && !o->phase && !o->emitted) {
+        memset(o->accum,0,sizeof(o->accum)); o->phase=1;
+    }
     for(;;) {
         if(!o->have_left && !o->input_done) {
             int64_t status;
@@ -1559,6 +1701,10 @@ static int64_t next_row_impl(struct execution *s,unsigned id,struct qs_cell *row
     }
     if(o->finished) return 0;
     if(!s->worker && s->plan->workers>1 && n->parallel) return parallel_next(s,id,row);
+    if(n->kind==QP_SCAN || (n->kind==QP_PROJECT && n->left>=0)) {
+        int status=projection_init(s,id); if(status) return status;
+        if(o->projection) return projection_next(s,id,row);
+    }
     if(n->kind==QP_SCAN) return scan_next(s,id,row);
     if(n->kind==QP_JOIN) return n->hash?hash_next(s,id,row):join_next(s,id,row);
     if(n->kind==QP_INDEX_JOIN) return index_next(s,id,row);
@@ -1585,6 +1731,56 @@ static int64_t next_row_impl(struct execution *s,unsigned id,struct qs_cell *row
         int count=project(s,n,o->left,NULL,row); if(count<0) return count;
         if(count) { ++o->emitted; return 2; }
     }
+}
+/* DuckDB-style local ungrouped states, combined after the worker finishes.
+ * AVG transfers sum/count; only the coordinator performs the final division. */
+static int aggregate_combine(struct execution *s,unsigned id,const struct operator_state *from)
+{
+    const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *to=&s->nodes[id];
+    for(unsigned i=0;i<n->expr.naggs;++i) {
+        const struct accumulator *a=&from->accum[i]; struct accumulator *b=&to->accum[i];
+        if(!a->count) continue;
+        unsigned kind=n->expr.aggs[i].kind;
+        if(kind==Q_MIN || kind==Q_MAX) {
+            int cmp=b->count?compare_cell(s,a->extreme,b->extreme,n->expr.exprs[n->expr.aggs[i].expr].type):0;
+            if(cmp==INT_MIN) return -5;
+            if(!b->count || (kind==Q_MIN?cmp<0:cmp>0)) b->extreme=a->extreme;
+        }
+        struct compact_group partial={.sum=b->sum,.count=b->count};
+        int status=group_add(&partial,a->sum,a->count,kind); if(status) return status;
+        b->sum=partial.sum; b->count=partial.count;
+    }
+    return 0;
+}
+/* A scan/projection-only input can feed the local aggregate directly from
+ * expression vectors. Row batches remain the adapter for joins and other
+ * operators that have not yet acquired a column-batch interface. */
+static int aggregate_sink_vectors(struct execution *s,unsigned id)
+{
+    struct projection_batch *b=s->nodes[id].projection;
+    const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
+    for(unsigned a=0;a<n->expr.naggs;++a) {
+        const struct qs_agg *agg=&n->expr.aggs[a]; int index=b->plan.outputs[a].index;
+        if(agg->kind==Q_COUNT_STAR) { o->accum[a].count+=b->count; continue; }
+        const struct qs_vector *v=&b->vectors[index];
+        for(unsigned r=0;r<b->count;++r) {
+            if(v->errors[r]) return -5;
+            if(qs_vector_null(v,r)) continue;
+            struct qs_cell value=qs_vector_cell(&b->plan,b->vectors,index,r);
+            int status=accumulate_value(s,n,agg,&o->accum[a],value); if(status) return status;
+        }
+    }
+    b->position=b->count; s->metrics.matched+=b->count; return 0;
+}
+static int aggregate_sink_batch(struct execution *s,struct qs_result *out)
+{
+    unsigned id=s->aggregate_sink-1,columns=s->plan->nodes[s->root].expr.nout;
+    struct operator_state *o=&s->nodes[id];
+    for(unsigned r=0;r<out->rows;++r) {
+        memcpy(o->left,(struct qs_cell *)out->data+(size_t)r*columns,columns*sizeof(*o->left));
+        int status=accumulate(s,&s->plan->nodes[id],o); if(status) return status;
+    }
+    out->rows=0; return 0;
 }
 /* Build the read-only side once, then give each CU its own probe cursor,
  * index cache and AFDM output. The host schedules these ordinary CSF calls. */
@@ -1623,7 +1819,13 @@ restart:
                 return next_row(s,root,row);
             }
         }
-        unsigned hash_sink=0,group_sink=0;
+        unsigned hash_sink=0,group_sink=0,aggregate_sink=0;
+        for(unsigned i=0;i<p->count;++i) {
+            const struct qp_node *parent=&p->nodes[i];
+            if(parent->kind==QP_AGGREGATE && parent->left==(int)root &&
+               !parent->nkeys && !parent->distinct && !parent->distinct_aggs)
+                aggregate_sink=i+1;
+        }
         for(unsigned i=0;i<p->count;++i)
             if(p->nodes[i].kind==QP_AGGREGATE && p->nodes[i].left==(int)root &&
                p->nodes[i].hash && s->nodes[i].groups && !s->nodes[i].group_phase)
@@ -1661,7 +1863,7 @@ restart:
                 return next_row(s,root,row);
             }
             e->context=context; e->plan=p; e->owner=s; e->worker=w+1; e->root=root;
-            e->hash_sink=hash_sink; e->group_sink=group_sink;
+            e->hash_sink=hash_sink; e->group_sink=group_sink; e->aggregate_sink=aggregate_sink;
             e->control=s->control+w+1; e->dictionary=s->dictionary; e->arena=s->arena;
             e->io_bytes=QS_SORT_IO_BYTES;
             e->sort_limit=s->sort_limit; e->profiling=s->profiling; e->initializer=p->ninit;
@@ -1718,6 +1920,10 @@ restart:
         }
         for(unsigned w=0;w<p->workers;++w) {
             const struct qs_result *v=&s->outputs[w+1];
+            if(s->workers[w]->aggregate_sink) {
+                unsigned id=s->workers[w]->aggregate_sink-1;
+                int status=aggregate_combine(s,id,&s->workers[w]->nodes[id]); if(status) return status;
+            }
             if(s->profiling) {
                 phase->worker_ns+=v->profile.operators[QS_JOIN_PROBE].cpu_ns;
                 phase->sink_ns+=s->workers[w]->sink_ns; phase->sink_rows+=s->workers[w]->sink_rows;
@@ -1865,6 +2071,24 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
      * pipeline fits 2048 rows in the same AFDM as 256 final sixteen-cell rows. */
     unsigned capacity=worker?QS_RESULT_ROWS*QS_OUT/(columns?columns:1):QS_RESULT_ROWS;
 produce:
+    if(worker && s->aggregate_sink) {
+        unsigned id=s->aggregate_sink-1;
+        status=projection_init(s,id); if(status<0) goto produced;
+        while(s->nodes[id].projection) {
+            status=projection_fill(s,id);
+            if(status!=2) {
+                if(!status) out->finished=control->finished=1;
+                if(status!=3) goto produced;
+                break;
+            }
+            uint64_t tick=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
+            unsigned rows=s->nodes[id].projection->count;
+            status=aggregate_sink_vectors(s,id);
+            if(s->profiling) { s->sink_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-tick; s->sink_rows+=rows; }
+            if(status<0) goto produced;
+        }
+        status=2;
+    }
     while(status>=0 && status!=QP_WAIT && status<=2 && out->rows<capacity) {
         struct qs_cell *row=worker?(struct qs_cell *)out->data+(size_t)out->rows*columns:out->data[out->rows].cells;
         status=next_row(s,worker?(int)s->root:(int)plan->root,row);
@@ -1881,11 +2105,13 @@ produce:
         }
         ++out->rows;
     }
-    if(worker && (s->hash_sink || s->group_sink) && status>=0 && status<=2) {
+produced:
+    if(worker && (s->hash_sink || s->group_sink || s->aggregate_sink) && status>=0 && status<=2) {
         uint64_t cpu=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
         unsigned rows=out->rows;
         if(s->hash_sink) hash_sink_batch(s,out);
         if(s->group_sink) { int added=group_sink_batch(s,out); if(added<0) status=added; }
+        if(s->aggregate_sink) { int added=aggregate_sink_batch(s,out); if(added<0) status=added; }
         if(s->profiling) { s->sink_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-cpu; s->sink_rows+=rows-out->rows; }
         /* A direct sink can consume another output batch from the same input
          * without asking PG to submit another compute request. */

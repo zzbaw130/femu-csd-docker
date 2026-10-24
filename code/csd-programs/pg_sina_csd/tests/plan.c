@@ -12,7 +12,7 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 typedef int64_t (*function)(struct femu_csd_args *);
-enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL };
+enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL, TEST_VECTOR_AGG=-1 };
 static unsigned test_workers=4;
 static bool test_scheduled;
 static void w16(void *p,uint16_t x) { memcpy(p,&x,2); }
@@ -150,6 +150,20 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     }
     struct qp_node *j=&plan->nodes[1]; j->kind=QP_JOIN; j->left=2; j->right=3; j->join_type=join; j->join_qual=-1;
     j->hash=hash==1;
+    if(parallel==TEST_WIDE_HASH) {
+        /* Fuse a second projection over a genuine int128 scan expression.
+         * It must keep the wide payload and numeric display scale. */
+        plan->count=5; j->right=4;
+        struct qp_node *projection=&plan->nodes[4];
+        projection->kind=QP_PROJECT; projection->left=3; projection->right=-1;
+        struct qs_plan *p=&projection->expr; p->predicate=-1; p->nattrs=p->nout=2; p->nexprs=4;
+        p->exprs[0]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER,.column=0};
+        p->exprs[1]=(struct qs_expr){.op=Q_COLUMN,.type=Q_DECIMAL,.column=1,.scale=2};
+        p->exprs[2]=(struct qs_expr){.op=Q_CONST,.type=Q_DECIMAL,.scale=2};
+        p->exprs[3]=(struct qs_expr){.op=Q_ADD,.type=Q_DECIMAL,.left=1,.right=2,.scale=2};
+        p->outputs[0]=(struct qs_output){.index=0,.type_oid=23};
+        p->outputs[1]=(struct qs_output){.index=3,.type_oid=1700};
+    }
     if(hash==2) {
         j->kind=QP_INDEX_JOIN;
         plan->nodes[3].expr.join=(struct qs_join){.indexid=1,.indexroot=1,.index_key_bytes=4,.build_key=1};
@@ -171,6 +185,16 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     for(unsigned i=0;i<5;++i) {
         a->expr.exprs[3+i]=(struct qs_expr){.op=Q_AGGREF,.column=i,.type=i==4?Q_DECIMAL:Q_INTEGER};
         a->expr.outputs[i+1]=(struct qs_output){.index=3+i,.type_oid=i==4?1700:20};
+    }
+    if(parallel==TEST_VECTOR_AGG) {
+        /* A nullable CASE projection feeds all five local aggregate kinds. */
+        j->kind=QP_PROJECT; j->right=-1; j->expr.nattrs=2; j->expr.nexprs=7;
+        j->expr.exprs[4]=(struct qs_expr){.op=Q_IS_NULL,.type=Q_BOOLEAN,.left=0};
+        j->expr.exprs[5]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.isnull=1};
+        j->expr.exprs[6]=(struct qs_expr){.op=Q_CASE,.type=Q_INTEGER,.left=4,.right=5,.otherwise=1};
+        j->expr.outputs[2].index=6;
+        a->nkeys=a->expr.nkeys=0;
+        a->expr.exprs[0]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER};
     }
     if(parallel==TEST_COUNT_ROWS || parallel>=TEST_PARTITION) {
         /* COUNT(*) needs row cardinality but no payload from the probe pipeline. */
@@ -261,6 +285,15 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         else if(!matched) {
             key=l%17?key:11; unsigned v=l%19+1; seen[key]=1;
             ++counts[key]; sums[key]+=v; if(!mins[key] || mins[key]>v) mins[key]=v; if(maxs[key]<v) maxs[key]=v;
+        }
+    }
+    if(parallel==TEST_VECTOR_AGG) {
+        memset(seen,0,sizeof(seen)); memset(counts,0,sizeof(counts)); memset(sums,0,sizeof(sums));
+        memset(mins,0,sizeof(mins)); memset(maxs,0,sizeof(maxs)); seen[0]=1;
+        for(unsigned i=0;i<rows;++i) if(i%17) {
+            unsigned v=i%19+1; ++counts[0]; sums[0]+=v;
+            if(!mins[0] || v<mins[0]) mins[0]=v;
+            if(v>maxs[0]) maxs[0]=v;
         }
     }
     uint64_t available=0,done=0; unsigned epoch=0;
@@ -679,6 +712,9 @@ int main(int argc,char **argv)
         assert(!strcmp(argv[2],"--workers")); test_workers=strtoul(argv[3],NULL,10);
         assert(test_workers && test_workers<=QS_WORKERS && !cs_work_init(256*1024*1024));
         test_scheduled=true;
+        test(run,QP_INNER,20003,23,256,1,TEST_VECTOR_AGG);
+        test(run,QP_INNER,0,23,256,1,TEST_VECTOR_AGG);
+        test(run,QP_INNER,1,23,256,1,TEST_VECTOR_AGG);
         for(unsigned join=QP_INNER;join<=QP_ANTI;++join)
             test(run,join,20003,23,256,1,TEST_BUILD_PHASE);
         test(run,QP_INNER,31,50003,256,1,TEST_BUILD_PHASE);
@@ -695,6 +731,10 @@ int main(int argc,char **argv)
     }
     assert(!cs_work_init(64*1024*1024));
     test_scheduled=true;
+    test(run,QP_INNER,20003,23,64,1,TEST_VECTOR_AGG);
+    test(run,QP_INNER,0,23,64,1,TEST_VECTOR_AGG);
+    test(run,QP_INNER,1,23,64,1,TEST_VECTOR_AGG);
+    test(run,QP_INNER,20003,23,4,1,TEST_VECTOR_AGG);
     for(unsigned join=QP_INNER;join<=QP_ANTI;++join) {
         test(run,join,20003,23,64,1,TEST_BUILD_PHASE);
         test(run,join,31,50003,64,1,TEST_BUILD_PHASE);

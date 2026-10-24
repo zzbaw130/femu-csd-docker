@@ -89,7 +89,11 @@ Hash Probe 和索引游标仅为实际用到的槽分配，避免扩大槽容量
 
 spill 使用现有 SNIA batch 的 NEED_STORE/NEED_LOAD/NEED_FREE 重入协议，经设备内部 AFDM↔NVM 短路径存取临时 token。多路归并按缓存预算分轮合并；输入缓存不足时先 spill 驻留 run，为读缓存留出空间。查询正常完成、提前 Limit、取消和错误都要回收工作内存，关闭本查询 SNIA 会话时回收剩余临时 token。
 
-设备程序索引 510 供通用树使用，旧快路径使用 501–509，511 仅在首次发现资源时短暂加载容量查询函数并随即卸载；当前查询持有 namespace 文件锁，尚未支持多个 PG backend 同时卸载。SNIA 不能强制中断正在执行的 CSF，取消要等待当前请求完成再回收。
+设备程序的基础索引 510 供通用树使用，旧快路径使用 501–509，511 供容量查询使用；实际编号按前述 BackendId 规则分段，不持有 namespace 文件锁。SNIA 不能强制中断正在执行的 CSF，取消要等待当前请求完成再回收。
+
+通用执行器中的 Scan 和无额外过滤的连续 Project，直接在列批次上求值：输入列保留引用，常量保留常量向量，算术表达式复用现有向量/SIMD 求值器，仅在需要行接口的边界组装 `qs_cell`。不支持的表达式或 scratch 分配失败时保留原来的逐行路径；scratch 由查询 workmem context 记账，输入结束后释放。
+
+无分组、无 DISTINCT 的 SUM/AVG/COUNT/MIN/MAX 使用每 CU 的局部状态，流水线结束后在协调 CU 合并。AVG 合并 sum/count，最后才相除；纯 Scan/Project 输入直接由列向量累加，Join 等输入暂时通过行批次适配。分组与 DISTINCT 聚合保留原有执行方式，没有为并行关闭其 SQL 语义。
 
 ## 精度和回退范围
 
