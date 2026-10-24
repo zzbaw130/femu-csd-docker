@@ -1,5 +1,30 @@
 # 当前性能与未完成项（2026-10-25）
 
+## 按物理输入约束字典预留
+
+PG不再因某张含字符串表大于64KiB就一律预留最大字典。只计需要解码的字符串列：用Heap文件大小和最小tuple/line-pointer开销约束条目数，用整个Heap字节数约束其所有内联字符串的总字节数，并计入SQL常量。不是过滤后行数或NDV估计；多个字符串列不会重复累加整个文件的字节上界。会生成新字符串的表达式保留原最大容量，当前不支持的TOAST/压缩值仍不在可卸载Heap格式内。
+
+本阶段规范Q7/Q11/Q21/Q22均正确、整条卸载并快于host，记录见[四条回归](../../../../results/tpch.iKPaFo/timings.csv)。Q15另行冷启动验收为host **2687.041ms**、CSD **893.226ms**，见[Q15回归](../../../../results/tpch.pxJelM/timings.csv)。未重复完整22条；设备仍为8 CU / 256MiB workmem / 64MiB FDM。
+
+Q15对照只切换PG字典预留逻辑，保持设备程序与其他代码不变：[原预留profile](../../../../results/index-columns.T4R3iT/q15-original-dictionary.profile.log)、[新预留profile](../../../../results/index-columns.T4R3iT/q15-sized-dictionary.profile.log)。
+
+| 指标 | 原预留 | 新预留 |
+| --- | ---: | ---: |
+| 字典AFDM | 33554456字节 | 5029912字节 |
+| 总AFDM | 57797768字节 | 48147592字节 |
+| 读取块 | 2MiB | 4MiB |
+| 工作槽 | 8 | 8 |
+| 主机提交 | 617 | 344 |
+| 两条流水线平均活跃CU | 2.18 / 2.01 | 3.16 / 3.58 |
+| 累计CSF CPU | 2474.798ms | 2772.581ms |
+| profile查询树墙钟 | 1295.554ms | 1011.900ms |
+
+两者读取1843273728字节、工作内存峰值25247952字节、无spill。减少空置预留使现有布局能保留更大的输入块，减少续交；CPU没有下降，不能解释成算法计算量减少，也不能将profile墙钟代替普通延迟。
+
+`EXPLAIN ANALYZE`新增 `CSD Dictionary AFDM`，表示预留容量。Q7原本已使用小字典，本次没有实质释放空间。[Q21当前profile](../../../../results/index-columns.T4R3iT/q21-sized-dictionary.profile.log)仍是6工作槽、64799288字节AFDM：orders状态字符串列对应的大Heap使保守上界仍达到最大容量，不能声称已解决Q21的并行度。当前字典仍驻留共享AFDM，尚未实现按实际增长的workmem字符串管理，这是后续内存改造的边界。
+
+4项设备NativePlan/并行CTest及Guest Heap布局测试通过；新增容量测试覆盖极小输出估计、大物理输入、未使用字符串列、多字符串列、SQL常量、新字符串表达式及最大uint64文件长度。生产扩展已重新构建安装，未改SNIA或固件接口。
+
 ## Index Join 列批次阶段的针对性回归
 
 本阶段只修改设备SQL程序的计划执行与测试，不改变PG规划、SNIA适配层或FEMU协议。规范SQL仍采用冷启动、关闭profile、设备8 CU / 256 MiB workmem / 64 MiB FDM；测量期间没有并行运行编译或单测。

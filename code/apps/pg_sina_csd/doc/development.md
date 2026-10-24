@@ -472,3 +472,9 @@ Hash匹配链推进与结果投影分开，按所需列收集256行批次，接�
 Index可以位于Hash/Project/聚合的列生产链中；Heap窗口优化只沿不含Index的Scan/Hash/Project链判断。Index可能尚有查找或I/O待推进，不能凭远端Scan行已耗尽提前宣布边界。已收集输出前缀的后续错误延迟到前缀消费后报告，EOF也必须记录到生产者，防止释放列批次后误走未初始化的逐行缓冲。
 
 NativePlan与8/16/64 CU测试通过，覆盖多层Index/Hash、NULL外连接、重复键、宽numeric、LIMIT错误时机、4MiB预算及清理。规范Q2/Q8/Q17/Q18/Q21针对性冷启动回归全部正确、整条卸载并快于同轮host；本阶段没有重复完整TPC-H，当前证据见performance.md。PG、SNIA、FEMU本阶段均未增加接口或SQL语义。
+
+## 字典预留的物理上界（2026-10-25）
+
+参照DuckDB只为需要保留的字符串建立存储的方向，先修正PG对既有AFDM字典的预留。`qp_dictionary_size`根据实际Heap字节、所需字符串列和常量求保守上界；最小tuple头24字节、line pointer4字节约束条目数，同表全部内联字符串总字节不超过Heap大小。CASE/COALESCE等只引用已有值；会创建新文本的表达式仍保留原容量，不使用NDV或过滤后行数缩小容量。新增EXPLAIN字段报告字典预留容量。
+
+容量及NativePlan/8/16/64 CU测试、Guest布局测试通过。规范Q7/Q11/Q15/Q21/Q22冷启动结果一致、整条卸载且快于host。Q15对照证实字典AFDM约32MiB降至4.80MiB，允许4MiB输入块、减少主机续交，未增加FDM。Q7原已是小字典，Q21仍因orders状态列的大输入保留最大容量、只有6工作槽；本阶段没有解决共享字典在AFDM中的运行时存储，也不宣称所有查询充分使用8 CU。当前证据见performance.md，未重复全量TPC-H。

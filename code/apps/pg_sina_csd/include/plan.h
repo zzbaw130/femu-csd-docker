@@ -74,6 +74,40 @@ static inline unsigned qp_scan_capacity(const struct qp_plan *p,const struct qp_
     unsigned rows=qp_scan_buffer_bytes(p,n)/24;
     return rows<QP_VECTOR_ROWS?rows:QP_VECTOR_ROWS;
 }
+/* Bound dictionary reservation by physical Heap input, not estimated output
+ * rows/NDV. A tuple needs at least a 24-byte header and a 4-byte line pointer;
+ * all of its inline string bytes together fit inside the relation's bytes.
+ * Expressions creating new strings keep the existing maximum reservation. */
+static inline void qp_dictionary_size(const struct qp_plan *p,unsigned *entries,unsigned *data)
+{
+    uint64_t count=QS_DICT_SMALL_ENTRIES,bytes=QS_DICT_SMALL_DATA;
+    for(unsigned i=0;i<p->count;++i) {
+        const struct qp_node *n=&p->nodes[i];
+        unsigned strings=0;
+        if(n->kind==QP_SCAN) for(unsigned c=0;c<n->expr.nattrs;++c)
+            strings+=n->expr.cols[c].slot>=0 && n->expr.cols[c].type==Q_STRING;
+        if(strings) {
+            uint64_t rows=n->bytes/28+1;
+            if(rows>QS_DICT_BIG_ENTRIES) rows=QS_DICT_BIG_ENTRIES;
+            count+=rows*strings;
+            bytes+=n->bytes<QS_DICT_BIG_DATA?n->bytes:QS_DICT_BIG_DATA;
+        }
+        count+=n->expr.nstrings;
+        for(unsigned j=0;j<n->expr.nstrings;++j) bytes+=n->expr.strings[j].length;
+        for(unsigned j=0;j<n->expr.nexprs;++j) {
+            const struct qs_expr *e=&n->expr.exprs[j];
+            if(e->type==Q_STRING && e->op!=Q_COLUMN && e->op!=Q_CONST &&
+               e->op!=Q_CASE && e->op!=Q_COALESCE && e->op!=Q_AGGREF && e->op!=Q_PARAMETER) {
+                count=QS_DICT_BIG_ENTRIES; bytes=QS_DICT_BIG_DATA;
+            }
+        }
+        if(count>QS_DICT_BIG_ENTRIES) count=QS_DICT_BIG_ENTRIES;
+        if(bytes>QS_DICT_BIG_DATA) bytes=QS_DICT_BIG_DATA;
+    }
+    *entries=QS_DICT_SMALL_ENTRIES;
+    while(*entries<count) *entries*=2;
+    *data=(bytes+4095)&~UINT64_C(4095);
+}
 /* A parallel probe pipeline ends before an order-dependent/blocking operator.
  * Hash build children retain the exact PG-selected tree and are built once. */
 static inline int qp_probe_scan(const struct qp_plan *p,int id)

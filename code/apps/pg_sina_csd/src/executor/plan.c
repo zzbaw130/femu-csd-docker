@@ -209,7 +209,7 @@ static size_t layout_buffers(PlanStateCsd *s,unsigned entries,unsigned data,cons
 }
 static void start(PlanStateCsd *s)
 {
-    const char *device=NULL; bool big=false;
+    const char *device=NULL;
     for(unsigned i=0;i<s->plan->count;++i) {
         struct qp_node *n=&s->plan->nodes[i];
         if(n->kind!=QP_SCAN) continue;
@@ -223,8 +223,6 @@ static void start(PlanStateCsd *s)
             s->index_extents[i]=pg_sina_mapping(&s->indexes[i]);
             n->index_bytes=s->indexes[i].bytes;
         }
-        for(unsigned col=0;col<n->expr.nattrs;++col)
-            if(n->expr.cols[col].slot>=0 && n->expr.cols[col].type==Q_STRING && r->bytes>QS_DICT_SMALL_DATA) big=true;
     }
     if(!device) elog(ERROR,"CSD PG Plan has no prepared relation");
     pg_sina_read_resources(device);
@@ -240,7 +238,8 @@ static void start(PlanStateCsd *s)
     s->plan->nodes[s->plan->root].expr.work_mem_bytes=pg_sina_query_memory();
     s->program_index=pg_sina_program_index(510);
     checked(csOpenCSx(device,NULL,&s->device),"open");
-    unsigned entries=big?QS_DICT_BIG_ENTRIES:QS_DICT_SMALL_ENTRIES,data=big?QS_DICT_BIG_DATA:QS_DICT_SMALL_DATA;
+    unsigned entries,data;
+    qp_dictionary_size(s->plan,&entries,&data);
     bool indexed[QP_NODES]={0};
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_INDEX_JOIN) indexed[s->plan->nodes[i].right]=true;
     qp_parallel_boundaries(s->plan,s->plan->root);
@@ -670,6 +669,8 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     }
     ExplainPropertyText("CSD Plan",tree.data,es); pfree(tree.data);
     if(s->started) {
+        unsigned entries,data; qp_dictionary_size(s->plan,&entries,&data);
+        ExplainPropertyInteger("CSD Dictionary AFDM","bytes",qs_dict_bytes(entries,data),es);
         ExplainPropertyInteger("CSD Heap Rows",NULL,s->result->metrics.scanned,es);
         ExplainPropertyInteger("CSD Internal Read","bytes",s->result->metrics.input_bytes,es);
         ExplainPropertyInteger("CSD Index/Heap Page Loads",NULL,s->result->metrics.index_pages,es);

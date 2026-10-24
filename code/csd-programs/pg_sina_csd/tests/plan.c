@@ -15,6 +15,32 @@ typedef int64_t (*function)(struct femu_csd_args *);
 enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_INDEX_PIPELINE,TEST_INDEX_HASH,TEST_INDEX_CHAIN,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL, TEST_VECTOR_AGG=-1 };
 static unsigned test_workers=4;
 static bool test_scheduled;
+/* Reservations must cover physical input even when filters/NDV estimates
+ * are tiny, while unused string columns must not consume AFDM. */
+static void dictionary_size(void)
+{
+    struct qp_plan *p=calloc(1,sizeof(*p)); assert(p); p->count=1;
+    struct qp_node *n=&p->nodes[0]; n->kind=QP_SCAN; n->bytes=1024*1024;
+    n->expr.nattrs=1; n->expr.cols[0].type=Q_STRING; n->expr.cols[0].slot=-1;
+    unsigned entries,data; qp_dictionary_size(p,&entries,&data);
+    assert(entries==QS_DICT_SMALL_ENTRIES && data==QS_DICT_SMALL_DATA);
+    n->expr.cols[0].slot=0; n->estimated_rows=1;
+    qp_dictionary_size(p,&entries,&data);
+    assert(entries>=512+n->bytes/28+1 && !(entries&(entries-1)));
+    assert(data>=65536+n->bytes && qs_dict_bytes(entries,data)<2*1024*1024);
+    n->expr.nattrs=2; n->expr.cols[1]=n->expr.cols[0]; n->expr.cols[1].slot=1;
+    qp_dictionary_size(p,&entries,&data);
+    assert(entries>=512+2*(n->bytes/28+1) && data==65536+n->bytes);
+    n->expr.nstrings=1; n->expr.strings[0].length=127;
+    qp_dictionary_size(p,&entries,&data); assert(data>=65536+n->bytes+127);
+    n->expr.nexprs=1; n->expr.exprs[0].type=Q_STRING; n->expr.exprs[0].op=Q_SUBSTRING;
+    qp_dictionary_size(p,&entries,&data);
+    assert(entries==QS_DICT_BIG_ENTRIES && data==QS_DICT_BIG_DATA);
+    n->expr.nexprs=0; n->bytes=UINT64_MAX;
+    qp_dictionary_size(p,&entries,&data);
+    assert(entries==QS_DICT_BIG_ENTRIES && data==QS_DICT_BIG_DATA);
+    free(p);
+}
 static void w16(void *p,uint16_t x) { memcpy(p,&x,2); }
 static void w32(void *p,uint32_t x) { memcpy(p,&x,4); }
 static unsigned char *heap(unsigned rows,unsigned side,size_t *size)
@@ -869,6 +895,7 @@ static void merge_input_parallelism(void)
 }
 int main(int argc,char **argv)
 {
+    dictionary_size();
     merge_input_parallelism();
     assert(qp_worker_mask(0)==0 && qp_worker_mask(32)==UINT32_MAX && qp_worker_mask(64)==UINT64_MAX);
     assert(argc==2 || argc==3 || argc==4); void *library=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(library);
