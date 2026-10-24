@@ -547,7 +547,9 @@ static void multiple_groups(function run,unsigned memory,unsigned kind,int integ
     int ids[1021];
     for(unsigned i=0;i<1021;++i) { char text[8]; int n=snprintf(text,sizeof(text),"k%04u",i); ids[i]=qs_dict_insert(dict,text,n); assert(ids[i]>=0); }
     for(unsigned i=0;i<rows;++i) {
-        unsigned a=i%17?i%1021:1021,b=i%19?(i/1021)%17:17;
+        /* Cluster integer inputs; retain shuffled string keys in other cases. */
+        unsigned position=integer_keys?i/4:i;
+        unsigned a=position%17?position%1021:1021,b=position%19?(position/1021)%17:17;
         struct expected_multi *w=&expected[a*18+b]; w->a=a; w->b=b; ++w->rows;
         if(b!=17) { w->sum+=((int)b-8)*125; ++w->count; }
         unsigned char *t=raw+(i/100)*QS_PAGE+QS_PAGE-(i%100+1)*40;
@@ -567,7 +569,8 @@ static void multiple_groups(function run,unsigned memory,unsigned kind,int integ
     a->expr.exprs[1]=(struct qs_expr){.op=Q_COLUMN,.column=1,.type=Q_INTEGER};
     a->expr.exprs[2]=(struct qs_expr){.op=Q_AGGREF,.column=0,.type=Q_DECIMAL};
     a->expr.exprs[3]=(struct qs_expr){.op=Q_CONST,.type=Q_DECIMAL,.constant=125,.scale=2,.dscale=2};
-    a->expr.exprs[4]=(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=1,.right=3,.scale=2,.dscale=2};
+    /* Generic PG scale metadata must be derived from imported children. */
+    a->expr.exprs[4]=(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=1,.right=3,.scale=0,.dscale=2};
     a->expr.aggs[0]=(struct qs_agg){.kind=kind,.expr=4};
     a->expr.outputs[0]=(struct qs_output){.index=0,.type_oid=25};
     a->expr.outputs[1]=(struct qs_output){.index=1,.type_oid=23};

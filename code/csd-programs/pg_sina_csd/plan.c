@@ -1071,6 +1071,16 @@ static int projection_import(struct projection_import *in,unsigned node,int inde
             e.otherwise=projection_import(in,node,e.otherwise); if(e.otherwise<0) return -1;
         }
     }
+    /* PG numeric expressions carry a generic declared scale. The imported
+     * vector DAG needs the actual scale of its rebound children, just as the
+     * scalar evaluator derives it from runtime values. */
+    if(e.op==Q_ADD || e.op==Q_SUB || e.op==Q_MUL || e.op==Q_CASE) {
+        unsigned left=p->exprs[e.left].scale,right=p->exprs[e.right].scale;
+        unsigned scale=e.op==Q_MUL?left+right:left>right?left:right;
+        if(e.op==Q_CASE) scale=right>p->exprs[e.otherwise].scale?right:p->exprs[e.otherwise].scale;
+        if(scale>UINT8_MAX) return -1;
+        e.scale=scale;
+    }
     if(e.op==Q_CONST && e.type==Q_STRING && !e.isnull) {
         if(e.constant<0 || e.constant>=n->expr.nstrings) return -1;
         const struct qs_string *v=&n->expr.strings[(unsigned)e.constant];
@@ -1284,14 +1294,15 @@ static int group_result(struct execution *s,const struct qp_node *n,struct compa
     int status=project(s,n,input,&value,row);
     return status<0?status:status?2:0;
 }
-/* Only the bucket being updated is locked, including its first publication.
+/* Published keys stay immutable throughout a CU wave. Probe them without
+ * locking collisions; only publication and the matched aggregate are locked.
  * Tables are shared instead of replicated per CU: four copies of Q17's groups
  * would consume the entire device budget before scans and merge state. The
  * owner alone grows/flushes the table between CU waves; full tables leave raw
  * rows in the ordinary AFDM buffer for that existing bounded spill path. */
 #define GROUP_LOCK (1U<<31)
 static int group_sink_values(struct execution *s,unsigned id,struct operator_state *o,
-    const struct qs_cell *keys,struct qs_cell value,int shared)
+    const struct qs_cell *keys,struct qs_cell value,uint64_t count,int shared)
 {
     const struct qp_node *n=&s->plan->nodes[id];
     unsigned kind=n->expr.aggs[0].kind;
@@ -1310,14 +1321,13 @@ static int group_sink_values(struct execution *s,unsigned id,struct operator_sta
     unsigned mask=o->group_capacity-1,at=hash&mask;
     for(;;at=(at+1)&mask) {
         struct compact_group *g=group_at(o,at);
-        unsigned old=atomic_load_explicit(&g->occupied,memory_order_relaxed);
-        if(shared) {
-            do {
-                if(old&GROUP_LOCK) { old=atomic_load_explicit(&g->occupied,memory_order_relaxed); continue; }
-                if(atomic_compare_exchange_weak_explicit(&g->occupied,&old,old|GROUP_LOCK,
-                    memory_order_acquire,memory_order_relaxed)) break;
-            } while(1);
-        }
+retry_bucket:
+        ;
+        unsigned state=atomic_load_explicit(&g->occupied,shared?memory_order_acquire:memory_order_relaxed);
+        /* A creator has not published its keys yet. An updater keeps the
+         * occupied bits, so other probes can already compare immutable keys. */
+        if(state==GROUP_LOCK) goto retry_bucket;
+        unsigned old=state&~GROUP_LOCK;
         int equal=!old;
         if(old && wide && o->group_integer) {
             const int64_t *values=(const void *)(g+1); equal=old==occupied;
@@ -1325,10 +1335,12 @@ static int group_sink_values(struct execution *s,unsigned id,struct operator_sta
                 if(!keys[k].isnull && values[k]!=(int64_t)keys[k].value) equal=0;
         } else if(old) equal=wide?group_equal(s,n,keys,(struct qs_cell *)(g+1)):
             old==occupied && (key.isnull || g->key==(int64_t)key.value);
-        if(equal<=0) {
-            if(shared) atomic_store_explicit(&g->occupied,old,memory_order_release);
-            if(equal<0) return equal;
-            continue;
+        if(equal<0) return equal;
+        if(!equal) continue;
+        if(shared) {
+            if(state&GROUP_LOCK) goto retry_bucket;
+            if(!atomic_compare_exchange_weak_explicit(&g->occupied,&state,state|GROUP_LOCK,
+                memory_order_acquire,memory_order_relaxed)) goto retry_bucket;
         }
         if(!old) {
             unsigned count=atomic_load_explicit(&o->group_count,memory_order_relaxed);
@@ -1345,7 +1357,7 @@ static int group_sink_values(struct execution *s,unsigned id,struct operator_sta
                 for(unsigned k=0;k<n->nkeys;++k) values[k]=keys[k].isnull?0:(int64_t)keys[k].value;
             } else if(wide) memcpy(g+1,keys,n->nkeys*sizeof(*keys));
         }
-        int status=group_add(g,value,!value.isnull,kind);
+        int status=group_add(g,value,count,kind);
         atomic_store_explicit(&g->occupied,occupied,shared?memory_order_release:memory_order_relaxed);
         return status?status:1;
     }
@@ -1361,7 +1373,7 @@ static int group_sink_row(struct execution *s,unsigned id,struct operator_state 
         if(n->expr.exprs[index].op==Q_COLUMN) value=row[n->expr.exprs[index].column];
         else { struct qs_eval eval; init_eval(&eval,&n->expr,row,NULL); if(evaluate(s,&eval,index,&value)) return -5; }
     }
-    return group_sink_values(s,id,o,keys,value,shared);
+    return group_sink_values(s,id,o,keys,value,!value.isnull,shared);
 }
 /* Keep keys and aggregate arguments in vectors. Only rows rejected by a full
  * shared table enter the existing AFDM adapter, so its owner can grow/spill
@@ -1371,27 +1383,61 @@ static int group_sink_vectors(struct execution *s,unsigned id,struct qs_result *
     struct projection_batch *b=s->nodes[id].projection;
     const struct qp_node *n=&s->plan->nodes[id];
     struct operator_state *o=&s->owner->nodes[id];
-    while(b->position<b->count && out->rows<capacity) {
-        unsigned r=b->position;
-        struct qs_cell keys[QS_KEYS],value={.value=1};
+    unsigned kind=n->expr.aggs[0].kind;
+    /* Unclustered keys would pay for comparisons without saving updates.
+     * Inspect at most 16 adjacent rows before choosing local run combine. */
+    int combine=0;
+    unsigned sample=b->count-b->position; if(sample>16) sample=16;
+    struct qs_cell previous[QS_KEYS];
+    for(unsigned r=0;r<sample && !combine;++r) {
+        struct qs_cell keys[QS_KEYS];
         for(unsigned k=0;k<n->nkeys;++k) {
-            int index=b->group_keys[k]; if(b->vectors[index].errors[r]) return -5;
-            keys[k]=qs_vector_cell(&b->plan,b->vectors,index,r);
+            int index=b->group_keys[k]; if(b->vectors[index].errors[b->position+r]) return -5;
+            keys[k]=qs_vector_cell(&b->plan,b->vectors,index,b->position+r);
         }
-        if(b->group_value>=0) {
-            int index=b->group_value; if(b->vectors[index].errors[r]) return -5;
-            value=qs_vector_cell(&b->plan,b->vectors,index,r);
+        if(r) { combine=group_equal(s,n,previous,keys); if(combine<0) return combine; }
+        memcpy(previous,keys,n->nkeys*sizeof(*keys));
+    }
+    while(b->position<b->count && out->rows<capacity) {
+        unsigned first=b->position,end=first;
+        struct qs_cell keys[QS_KEYS];
+        for(unsigned k=0;k<n->nkeys;++k) {
+            int index=b->group_keys[k]; if(b->vectors[index].errors[first]) return -5;
+            keys[k]=qs_vector_cell(&b->plan,b->vectors,index,first);
         }
-        int added=group_sink_values(s,id,o,keys,value,1); if(added<0) return added;
-        if(!added) {
-            struct qs_cell *row=(struct qs_cell *)out->data+(size_t)out->rows*b->plan.nout;
-            for(unsigned col=0;col<b->plan.nout;++col) {
-                int index=b->plan.outputs[col].index; if(b->vectors[index].errors[r]) return -5;
-                row[col]=qs_vector_cell(&b->plan,b->vectors,index,r);
+        /* Combine adjacent equal keys locally before touching the shared
+         * table. This needs only one partial state, not a table per CU. */
+        struct compact_group partial={.sum={.isnull=1}};
+        do {
+            if(end!=first) {
+                struct qs_cell next[QS_KEYS];
+                for(unsigned k=0;k<n->nkeys;++k) {
+                    int index=b->group_keys[k]; if(b->vectors[index].errors[end]) return -5;
+                    next[k]=qs_vector_cell(&b->plan,b->vectors,index,end);
+                }
+                int equal=group_equal(s,n,keys,next); if(equal<0) return equal;
+                if(!equal) break;
             }
-            ++out->rows;
+            struct qs_cell value={.value=1};
+            if(b->group_value>=0) {
+                int index=b->group_value; if(b->vectors[index].errors[end]) return -5;
+                value=qs_vector_cell(&b->plan,b->vectors,index,end);
+            }
+            int status=group_add(&partial,value,!value.isnull,kind); if(status) return status;
+            ++end;
+        } while(combine && end<b->count && end-first<capacity-out->rows);
+        int added=group_sink_values(s,id,o,keys,partial.sum,partial.count,1); if(added<0) return added;
+        if(!added) {
+            for(unsigned r=first;r<end;++r) {
+                struct qs_cell *row=(struct qs_cell *)out->data+(size_t)out->rows*b->plan.nout;
+                for(unsigned col=0;col<b->plan.nout;++col) {
+                    int index=b->plan.outputs[col].index; if(b->vectors[index].errors[r]) return -5;
+                    row[col]=qs_vector_cell(&b->plan,b->vectors,index,r);
+                }
+                ++out->rows;
+            }
         }
-        ++b->position; ++s->metrics.matched;
+        s->metrics.matched+=end-first; b->position=end;
     }
     return 0;
 }
