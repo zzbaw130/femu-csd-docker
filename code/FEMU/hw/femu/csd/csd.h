@@ -2,6 +2,7 @@
 #define FEMU_CSD_H
 
 #include "../nvme.h"
+#include "csd-graph.h"
 
 enum FemuCsdIoCommands {
     NVME_CMD_CSD_ALLOC_FDM      = 0xb0,
@@ -134,6 +135,8 @@ typedef NvmeCsdNvmToAfdmCmd NvmeCsdAfdmToNvmCmd;
 /* Called by the controller FTL thread for internal namespace/AFDM copies. */
 bool csd_ftl_storage(FemuCtrl *n, NvmeNamespace *ns, NvmeRequest *req,
                      uint64_t *lat);
+/* Called only by the FTL thread, inside its dataplane pause guard. */
+void femu_csd_graph_poll(FemuCtrl *n);
 
 typedef struct QEMU_PACKED NvmeCsdExecCmd {
     uint8_t     opcode;

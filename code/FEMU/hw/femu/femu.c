@@ -2032,6 +2032,16 @@ static void *femu_ftl_thread(void *arg)
             continue;
         }
 
+        /* Graph I/O shares this sole FTL owner with ordinary namespace I/O. */
+        if (n->csd_ctrl_state) {
+            n->ftl_in_sweep = true;
+            smp_mb();
+            if (n->dataplane_started) {
+                femu_csd_graph_poll(n);
+            }
+            n->ftl_in_sweep = false;
+        }
+
         /* A state query, served between two requests like one of them. */
         if (unlikely(qatomic_read(&n->query_req))) {
             n->ftl_in_sweep = true;
@@ -3489,6 +3499,7 @@ static const Property femu_props[] = {
      */
     DEFINE_PROP_UINT8("learly_reset", FemuCtrl, params.oc20.early_reset, 0),
     DEFINE_PROP_UINT64("fdm_size", FemuCtrl, csd_params.fdm_size_mb, 0),
+    DEFINE_PROP_UINT64("csd_spill_size_mb", FemuCtrl, csd_params.spill_size_mb, 0),
     DEFINE_PROP_UINT8("nr_cu", FemuCtrl, csd_params.nr_cu, 4),
     DEFINE_PROP_UINT8("nr_thread", FemuCtrl, csd_params.nr_thread, 4),
     DEFINE_PROP_UINT64("time_slice", FemuCtrl, csd_params.time_slice, 200000),
