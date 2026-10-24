@@ -67,6 +67,8 @@ EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT count(*) FROM lineitem;
 
 查询不持有 namespace 执行锁。每个 PG 后端使用独立的 CSF 程序编号段（原编号加 `BackendId * 16`），AFDM 和算子状态按执行独立分配、释放，避免不同连接覆盖彼此的程序和缓冲区。FEMU 的程序编号为 16 位，当前分段支持 BackendId 1–4064；并发请求仍受设备实际 AFDM/workmem 总容量约束，分配失败会返回错误，不会把整条查询串行化等待。
 
+Heap 扫描从页内行指针直接取得各 tuple 的起点，不依赖前一个 tuple 的长度。读取块分配给不同 CU 并行解码；CU 内每批最多收集 64 个 tuple，按列定位字段、转换并连续写入列向量，参考 pg_duckdb 的批量 tuple 转换方式。变长字段之后的偏移仍依赖同一 tuple 的前置字段，各 tuple 各自保存偏移；这不表示 Heap 解码已全部使用 SIMD，也不在 CSF 内另起线程。
+
 设备可在连接树任意位置使用参数化整数前导键 B-tree 等值查找，支持复合索引的前导键，剩余条件仍在设备判断。一次最多收集 64 个外侧键；需要保留外侧顺序时按单键推进。缺页时只将页号写入控制 AFDM，PG 根据 extent 合并连续目的缓冲和相邻 LBA，通过 SERIAL batch 提交内部 NVM→AFDM LOAD→继续计算；不同执行槽可以独立推进。SEMI/ANTI 在确认匹配后立即停止该键的查找。索引页和 Heap Tuple 仍在设备解析。
 
 需要顺序的、已准备映射的 PG12 整数前导键 B-tree 支持正向叶页遍历，按索引顺序回表并直接交给有序聚合，不再补 Heap 排序。索引页做有界预读；PG 相关性统计大于 0.9 时，Heap 也做有界正向预读。游标受 workmem 约束，页留在原 AFDM 缓存中。其他独立扫描仍可能降为 Heap；反向有序扫描仍补排序。Index Only Scan 当前仅支持所需列完全由已映射索引的整数前导键覆盖的形态，直接读取索引键，不回表；其他形态回退原路径。仍没有 Bitmap Scan、通用索引范围游标、部分/表达式索引或 PG13+ posting list 支持。

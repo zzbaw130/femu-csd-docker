@@ -105,26 +105,27 @@ static void fixed_prefix_projection(function scan)
     p.cols[1]=(struct qs_column){.length=8,.align=8,.slot=-1};
     p.cols[2]=(struct qs_column){.length=4,.align=4,.slot=0,.type=Q_INTEGER};
     /* Alternate bitmap/no-bitmap tuples; skip padding before the int64 field.
-     * Some bitmap tuples have a NULL prefix, which changes the value offset. */
+     * Some bitmap tuples have a NULL prefix, which changes the value offset.
+     * Shuffled line pointers and 75 rows/page cross the 64-row batch boundary. */
     for(unsigned page=0;page<2;++page) {
         unsigned char *b=raw+page*QS_PAGE;
-        write16(b+10,4); write16(b+12,24+31*4); write16(b+14,QS_PAGE-31*48);
+        write16(b+10,4); write16(b+12,24+75*4); write16(b+14,QS_PAGE-75*48);
         write16(b+16,QS_PAGE); write16(b+18,QS_PAGE|4);
-        for(unsigned row=0;row<31;++row) {
-            unsigned off=QS_PAGE-(row+1)*48; unsigned char *t=b+off;
+        for(unsigned row=0;row<75;++row) {
+            unsigned off=QS_PAGE-((row*37)%75+1)*48; unsigned char *t=b+off;
             write32(b+24+row*4,off|(1U<<15)|(48U<<17));
             write16(t+18,3); write16(t+20,0xb00|(row%2)); t[22]=24;
             t[23]=row%3?7:6;
-            write32(t+((row%2 && row%3==0)?32:40),page*31+row);
+            write32(t+((row%2 && row%3==0)?32:40),page*75+row);
         }
     }
-    size_t bytes=qs_chunk_bytes(62,1); struct qs_chunk *c=calloc(1,bytes); assert(c);
-    c->capacity=62; c->ncols=1;
-    assert(!scan_rows(scan,&p,c,bytes,raw) && c->rows==62);
-    for(unsigned row=0;row<62;++row) assert(qs_values(c)[row]==row);
+    size_t bytes=qs_chunk_bytes(150,1); struct qs_chunk *c=calloc(1,bytes); assert(c);
+    c->capacity=150; c->ncols=1;
+    assert(!scan_rows(scan,&p,c,bytes,raw) && c->rows==150);
+    for(unsigned row=0;row<150;++row) assert(qs_values(c)[row]==row);
     /* A too-small output and truncated tuples must still be rejected. */
-    c->capacity=61; assert(scan_rows(scan,&p,c,bytes,raw)==-2);
-    c->capacity=62;
+    c->capacity=149; assert(scan_rows(scan,&p,c,bytes,raw)==-2);
+    c->capacity=150;
     write32(raw+24,(QS_PAGE-48)|(1U<<15)|(32U<<17));
     assert(scan_rows(scan,&p,c,bytes,raw)==-2);
     free(c);
