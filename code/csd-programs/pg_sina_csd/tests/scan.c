@@ -97,6 +97,38 @@ static void numeric_formats(void)
         assert(qs_numeric_cents((const unsigned char *)invalid[i],i==3?4:8,&value,&scale)<0);
     }
 }
+static void fixed_prefix_projection(function scan)
+{
+    unsigned char raw[2*QS_PAGE]={0};
+    struct qs_plan p={.nattrs=3,.ncols=1};
+    p.cols[0]=(struct qs_column){.length=1,.align=1,.slot=-1};
+    p.cols[1]=(struct qs_column){.length=8,.align=8,.slot=-1};
+    p.cols[2]=(struct qs_column){.length=4,.align=4,.slot=0,.type=Q_INTEGER};
+    /* Alternate bitmap/no-bitmap tuples; skip padding before the int64 field.
+     * Some bitmap tuples have a NULL prefix, which changes the value offset. */
+    for(unsigned page=0;page<2;++page) {
+        unsigned char *b=raw+page*QS_PAGE;
+        write16(b+10,4); write16(b+12,24+31*4); write16(b+14,QS_PAGE-31*48);
+        write16(b+16,QS_PAGE); write16(b+18,QS_PAGE|4);
+        for(unsigned row=0;row<31;++row) {
+            unsigned off=QS_PAGE-(row+1)*48; unsigned char *t=b+off;
+            write32(b+24+row*4,off|(1U<<15)|(48U<<17));
+            write16(t+18,3); write16(t+20,0xb00|(row%2)); t[22]=24;
+            t[23]=row%3?7:6;
+            write32(t+((row%2 && row%3==0)?32:40),page*31+row);
+        }
+    }
+    size_t bytes=qs_chunk_bytes(62,1); struct qs_chunk *c=calloc(1,bytes); assert(c);
+    c->capacity=62; c->ncols=1;
+    assert(!scan_rows(scan,&p,c,bytes,raw) && c->rows==62);
+    for(unsigned row=0;row<62;++row) assert(qs_values(c)[row]==row);
+    /* A too-small output and truncated tuples must still be rejected. */
+    c->capacity=61; assert(scan_rows(scan,&p,c,bytes,raw)==-2);
+    c->capacity=62;
+    write32(raw+24,(QS_PAGE-48)|(1U<<15)|(32U<<17));
+    assert(scan_rows(scan,&p,c,bytes,raw)==-2);
+    free(c);
+}
 static void prefix_projection(function scan)
 {
     unsigned char raw[2*QS_PAGE]={0}; make_pages(raw);
@@ -139,7 +171,7 @@ int main(int argc,char **argv)
     void *scan_so=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL),*filter_so=dlopen(argv[2],RTLD_NOW|RTLD_LOCAL);
     assert(scan_so && filter_so);
     function scan=(function)dlsym(scan_so,"pg_sina_scan"),filter=(function)dlsym(filter_so,"pg_sina_filter"); assert(scan && filter);
-    prefix_projection(scan);
+    prefix_projection(scan); fixed_prefix_projection(scan);
     unsigned char raw[2*QS_PAGE]={0}; make_pages(raw);
     struct qs_plan p={.nattrs=4,.ncols=3,.nexprs=7,.predicate=6};
     p.cols[0]=(struct qs_column){.length=4,.align=4,.slot=0,.type=Q_INTEGER};

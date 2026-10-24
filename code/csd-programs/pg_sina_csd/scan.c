@@ -17,15 +17,16 @@ static int glob_match(const char *pattern,unsigned plen,const char *text,unsigne
     }
     return tlen && pattern[0]==text[0] && glob_match(pattern+1,plen-1,text+1,tlen-1);
 }
-/* Decode one already-located immutable tuple into its projected column slots.
- * Index scans use the same decoder and visibility checks as full heap scans. */
-int qs_scan_tuple(const struct qs_plan *p,const unsigned char *raw,unsigned offset,unsigned len,unsigned page,struct qs_chunk *c,unsigned row,struct qs_dict *dict)
+static int scan_tuple(const struct qs_plan *p,const unsigned char *raw,unsigned offset,unsigned len,unsigned page,struct qs_chunk *c,unsigned row,struct qs_dict *dict,int last,unsigned first,unsigned prefix)
 {
-    int last=-1; for(unsigned i=0;i<p->nattrs;++i) if(p->cols[i].slot>=0) last=i;
     const unsigned char *tuple=raw+offset; unsigned mask=read16(tuple+20),off=tuple[22];
     if((read16(tuple+18)&0x7ff)!=p->nattrs || off>len || off%8 ||
         off<23+((mask&1)?(p->nattrs+7)/8:0) || (mask&8) || (mask&0x300)!=0x300 || !(mask&0x800)) return -2;
-    for(int col=0;col<=last;++col) {
+    /* Without NULLs, fixed-width unprojected leading fields have one constant
+     * offset. NULL bitmaps require the ordinary attribute walk instead. */
+    if(!(mask&1)) off+=prefix; else first=0;
+    if(off>len) return -2;
+    for(int col=first;col<=last;++col) {
         const struct qs_column *spec=&p->cols[col]; int slot=spec->slot;
         if((mask&1) && !(tuple[23+col/8]&(1U<<(col%8)))) {
             if(slot>=0) { qs_nulls(c)[(size_t)slot*((c->capacity+7)/8)+row/8]|=1U<<(row%8); qs_values(c)[(size_t)slot*c->capacity+row]=0; qs_dscales(c)[(size_t)slot*c->capacity+row]=0; }
@@ -88,6 +89,12 @@ int qs_scan_tuple(const struct qs_plan *p,const unsigned char *raw,unsigned offs
     }
     return 0;
 }
+/* Index scans retain the same tuple decoder and visibility checks. */
+int qs_scan_tuple(const struct qs_plan *p,const unsigned char *raw,unsigned offset,unsigned len,unsigned page,struct qs_chunk *c,unsigned row,struct qs_dict *dict)
+{
+    int last=-1; for(unsigned i=0;i<p->nattrs;++i) if(p->cols[i].slot>=0) last=i;
+    return scan_tuple(p,raw,offset,len,page,c,row,dict,last,0,0);
+}
 int64_t pg_sina_scan(struct femu_csd_args *a)
 {
     if(!a || (a->numr!=4 && a->numr!=5) || a->mr_len[1]<(long long)sizeof(struct qs_plan) || a->mr_len[3]<(long long)sizeof(struct qs_task)) return -1;
@@ -98,6 +105,12 @@ int64_t pg_sina_scan(struct femu_csd_args *a)
         c->ncols!=p->ncols || qs_chunk_bytes(c->capacity,c->ncols)>(uint64_t)a->mr_len[2] ||
         bytes%QS_PAGE || bytes>(uint64_t)a->mr_len[0]) return -1;
     c->rows=c->selected=0; memset(qs_nulls(c),0,((c->capacity+7)/8)*(size_t)c->ncols);
+    int last=-1; for(unsigned i=0;i<p->nattrs;++i) if(p->cols[i].slot>=0) last=i;
+    unsigned first=0,prefix=0;
+    while((int)first<=last && p->cols[first].slot<0 && p->cols[first].length>0) {
+        const struct qs_column *spec=&p->cols[first++];
+        prefix=((prefix+spec->align-1)&~(spec->align-1U))+spec->length;
+    }
     for(unsigned page=0;page<bytes;page+=QS_PAGE) {
         const unsigned char *raw=(unsigned char *)a->mr_addr[0]+page;
         unsigned lower=read16(raw+12),upper=read16(raw+14);
@@ -107,7 +120,7 @@ int64_t pg_sina_scan(struct femu_csd_args *a)
             uint32_t lp=read32(raw+24+4*i); unsigned offset=lp&0x7fff,flags=(lp>>15)&3,len=lp>>17;
             if(flags!=1) continue;
             if(offset<upper || offset>QS_PAGE || len<23 || len>QS_PAGE-offset || c->rows>=c->capacity) return -2;
-            int status=qs_scan_tuple(p,raw,offset,len,page,c,c->rows,dict); if(status) return status;
+            int status=scan_tuple(p,raw,offset,len,page,c,c->rows,dict,last,first,prefix); if(status) return status;
             qs_selection(c)[c->rows]=c->rows; ++c->rows;
         }
     }
