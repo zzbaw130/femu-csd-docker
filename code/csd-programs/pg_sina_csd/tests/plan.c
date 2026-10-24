@@ -12,7 +12,7 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 typedef int64_t (*function)(struct femu_csd_args *);
-enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL, TEST_VECTOR_AGG=-1 };
+enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_INDEX_PIPELINE,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL, TEST_VECTOR_AGG=-1 };
 static unsigned test_workers=4;
 static bool test_scheduled;
 static void w16(void *p,uint16_t x) { memcpy(p,&x,2); }
@@ -172,6 +172,14 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     for(unsigned i=0;i<4;++i) j->expr.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER,.column=i};
     for(unsigned i=0;i<3;++i) j->expr.outputs[i]=(struct qs_output){.index=i==2?3:(int)i,.type_oid=23};
     if(join==QP_SEMI || join==QP_ANTI) j->expr.outputs[2].index=1;
+    if(parallel==TEST_INDEX_PIPELINE) {
+        /* A membership Hash Join below an INNER Index Join preserves its
+         * results while exercising retained scan windows and both I/O paths. */
+        assert(hash==2 && join==QP_INNER); plan->count=5;
+        struct qp_node *probe=&plan->nodes[4]; *probe=*j;
+        probe->kind=QP_JOIN; probe->hash=1; probe->join_type=QP_SEMI; probe->expr.nout=2;
+        j->left=4;
+    }
     struct qp_node *a=&plan->nodes[0]; a->kind=QP_AGGREGATE; a->left=1; a->right=-1; a->nkeys=1; a->left_keys[0]=0;
     a->expr.predicate=-1; a->expr.work_mem_bytes=(uint64_t)memory*1024*1024; a->expr.nattrs=3; a->expr.nexprs=9;
     for(unsigned i=0;i<3;++i) a->expr.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER,.column=i};
@@ -525,7 +533,7 @@ static void nested_sort(function run,unsigned type,unsigned hash,unsigned kind)
 struct expected_multi { unsigned a,b,rows,count; int64_t sum; };
 /* Prehashed future rows must not raise errors past LIMIT, while an input
  * row actually requested must raise its payload error even if it cannot join. */
-static void probe_limit_errors(function run,unsigned limit)
+static void probe_payload(function run,unsigned limit,int strings)
 {
     struct qp_plan *p=calloc(1,sizeof(*p)); assert(p); p->count=4; p->scan_bytes=QP_SCAN_BYTES;
     scan(&p->nodes[2]); scan(&p->nodes[3]);
@@ -537,14 +545,22 @@ static void probe_limit_errors(function run,unsigned limit)
     left->exprs[6]=(struct qs_expr){.op=Q_MUL,.type=Q_INTEGER,.left=5,.right=4};
     left->exprs[7]=(struct qs_expr){.op=Q_CASE,.type=Q_DECIMAL,.left=3,.right=5,.otherwise=6};
     left->outputs[1]=(struct qs_output){.index=7,.type_oid=1700};
+    if(strings) {
+        left->nexprs=2; left->cols[1].length=-1; left->cols[1].type=Q_STRING;
+        left->exprs[1].type=Q_STRING; left->outputs[1]=(struct qs_output){.index=1,.type_oid=25};
+    }
     struct qp_node *j=&p->nodes[1]; j->kind=QP_JOIN; j->left=2; j->right=3; j->hash=1;
     j->nkeys=1; j->join_type=QP_INNER; j->join_qual=-1;
     j->expr=p->nodes[3].expr; j->expr.nattrs=4;
-    j->expr.exprs[1].type=Q_DECIMAL; j->expr.outputs[1].type_oid=1700;
+    j->expr.exprs[1].type=strings?Q_STRING:Q_DECIMAL; j->expr.outputs[1].type_oid=strings?25:1700;
     struct qp_node *top=&p->nodes[0]; top->kind=QP_LIMIT; top->left=1; top->right=-1;
     top->expr=j->expr; top->expr.limit=limit; top->expr.work_mem_bytes=64U*1024*1024;
     size_t sizes[2],bytes=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
     unsigned char *raw[2]={heap(2,2,&sizes[0]),heap(1,2,&sizes[1])};
+    if(strings) for(unsigned r=0;r<2;++r) {
+        unsigned char *tuple=raw[0]+QS_PAGE-(r+1)*40;
+        tuple[28]=(5U<<1)|1U; memcpy(tuple+29,r?"skip":"keep",4);
+    }
     for(unsigned i=2;i<4;++i) {
         struct qp_node *n=&p->nodes[i]; n->bytes=sizes[i-2]; n->input_offset=bytes; bytes+=QP_SCAN_BYTES;
         n->vector_offset=bytes; bytes+=qs_chunk_bytes(QP_SCAN_BYTES/24,2);
@@ -564,11 +580,57 @@ static void probe_limit_errors(function run,unsigned limit)
             memcpy(arena+n->input_offset,raw[control.node-2]+control.offset,control.bytes); control.ready=1;
         }
     } while(!out->finished);
-    if(limit==1) {
+    if(strings) {
+        assert(!status && out->rows==1 && qs_cell_string(&out->data[0].cells[1])==4);
+        assert(!memcmp(qs_cell_string_bytes(&out->data[0].cells[1]),"keep",4));
+        assert(((struct qs_dict *)arena)->count==1); /* unmatched "skip" was never interned */
+    } else if(limit==1) {
         assert(!status && out->rows==1 && out->data[0].cells[0].value==0);
         assert(out->data[0].cells[1].value==(__int128)INT64_MAX*INT64_MAX);
     }
     else { assert(status==-5); control.close=1; assert(!run(&args)); }
+    struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
+    free(raw[0]); free(raw[1]); free(arena); free(io); free(out); free(p);
+}
+/* A grouped probe must join its final SUM, not expose the aggregate's
+ * internal input vectors as ordinary rows. */
+static void grouped_probe(function run)
+{
+    struct qp_plan *p=calloc(1,sizeof(*p)); assert(p); p->count=5; p->scan_bytes=QP_SCAN_BYTES;
+    scan(&p->nodes[3]); scan(&p->nodes[4]);
+    struct qp_node *group=&p->nodes[2]; group->kind=QP_AGGREGATE; group->hash=1; group->left=3; group->right=-1;
+    group->nkeys=group->expr.nkeys=1; group->expr=p->nodes[3].expr;
+    group->expr.nkeys=1; group->expr.naggs=1; group->expr.nexprs=3;
+    group->expr.exprs[2]=(struct qs_expr){.op=Q_AGGREF,.column=0,.type=Q_INTEGER};
+    group->expr.aggs[0]=(struct qs_agg){.kind=Q_SUM,.expr=1}; group->expr.outputs[1].index=2;
+    struct qp_node *join=&p->nodes[1]; join->kind=QP_JOIN; join->hash=1; join->left=2; join->right=4;
+    join->join_type=QP_INNER; join->join_qual=-1; join->nkeys=1; join->expr=p->nodes[3].expr; join->expr.nattrs=4;
+    p->nodes[0]=(struct qp_node){.kind=QP_LIMIT,.left=1,.right=-1,.expr=join->expr};
+    p->nodes[0].expr.limit=5; p->nodes[0].expr.work_mem_bytes=64U*1024*1024;
+    size_t sizes[2],bytes=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
+    unsigned char *raw[]={heap(3,2,&sizes[0]),heap(1,2,&sizes[1])};
+    for(unsigned r=0;r<3;++r) {
+        unsigned char *tuple=raw[0]+QS_PAGE-(r+1)*40; w32(tuple+24,r/2); w32(tuple+28,(r+1)*10);
+    }
+    for(unsigned i=3;i<5;++i) {
+        struct qp_node *n=&p->nodes[i]; n->bytes=sizes[i-3]; n->input_offset=bytes; bytes+=QP_SCAN_BYTES;
+        n->vector_offset=bytes; bytes+=qs_chunk_bytes(QP_SCAN_BYTES/24,2);
+    }
+    unsigned char *arena=calloc(1,bytes),*io=calloc(1,QS_SORT_IO_BYTES); assert(arena && io);
+    *(struct qs_dict *)arena=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
+    for(unsigned i=3;i<5;++i)
+        *(struct qs_chunk *)(arena+p->nodes[i].vector_offset)=(struct qs_chunk){.capacity=QP_SCAN_BYTES/24,.ncols=2};
+    struct qp_control control={0}; struct qs_result *out=calloc(1,sizeof(*out)); assert(out);
+    void *mr[]={p,&control,out,arena,io}; long long len[]={sizeof(*p),sizeof(control),sizeof(*out),bytes,QS_SORT_IO_BYTES};
+    struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=len};
+    do {
+        assert(!run(&args));
+        if(control.bytes && !control.ready) {
+            struct qp_node *n=&p->nodes[control.node];
+            memcpy(arena+n->input_offset,raw[control.node-3]+control.offset,control.bytes); control.ready=1;
+        }
+    } while(!out->finished);
+    assert(out->rows==1 && out->data[0].cells[0].value==0 && out->data[0].cells[1].value==30);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
     free(raw[0]); free(raw[1]); free(arena); free(io); free(out); free(p);
 }
@@ -798,7 +860,7 @@ int main(int argc,char **argv)
         return 0;
     }
     assert(!cs_work_init(64*1024*1024));
-    probe_limit_errors(run,1); probe_limit_errors(run,2);
+    probe_payload(run,1,0); probe_payload(run,2,0); probe_payload(run,2,1); grouped_probe(run);
     test_scheduled=true;
     test(run,QP_INNER,20003,23,64,1,TEST_VECTOR_AGG);
     test(run,QP_INNER,0,23,64,1,TEST_VECTOR_AGG);
@@ -825,6 +887,7 @@ int main(int argc,char **argv)
     /* Concurrent duplicate-key builds, including multiple growth barriers. */
     test(run,QP_INNER,31,50003,64,1,TEST_BUILD_PHASE);
     test(run,QP_ANTI,31,50003,4,1,TEST_BUILD_PHASE);
+    test(run,QP_INNER,20003,23,64,2,TEST_INDEX_PIPELINE);
     test(run,QP_INNER,120000,23,8,1,TEST_PARALLEL);
     test(run,QP_INNER,120000,23,8,1,TEST_LARGE_SCAN);
     test(run,QP_INNER,5170,23,64,1,TEST_COUNT_ROWS);

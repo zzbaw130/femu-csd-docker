@@ -10,15 +10,16 @@
 #include <immintrin.h>
 #endif
 #define QS_VECTOR_ROWS 256
-enum qs_vector_kind { QS_WIDE, QS_NARROW, QS_REFERENCE, QS_CONSTANT, QS_TEXT };
+enum qs_vector_kind { QS_WIDE, QS_NARROW, QS_REFERENCE, QS_CONSTANT, QS_TEXT, QS_CELLS, QS_DYNAMIC };
 struct qs_vector {
     union {
         __int128 values[QS_VECTOR_ROWS]; int64_t narrow[QS_VECTOR_ROWS];
         struct { const char *data; unsigned length; } strings[QS_VECTOR_ROWS];
     };
-    uint8_t nulls[QS_VECTOR_ROWS], dscales[QS_VECTOR_ROWS], errors[QS_VECTOR_ROWS];
+    uint8_t nulls[QS_VECTOR_ROWS], dscales[QS_VECTOR_ROWS], errors[QS_VECTOR_ROWS], scales[QS_VECTOR_ROWS];
     unsigned kind, done, all_valid;
     struct qs_cell constant;
+    const struct qs_cell *cells;
     const int64_t *column;
     const uint8_t *column_nulls, *column_scales;
     const uint32_t *selection;
@@ -73,6 +74,7 @@ static inline unsigned qs_vector_row(const struct qs_vector *v,unsigned i)
 { return v->selection?v->selection[v->first+i]:v->first+i; }
 static inline __int128 qs_vector_value(const struct qs_vector *v,unsigned i)
 {
+    if(v->kind==QS_CELLS) return v->cells[i].value;
     if(v->kind==QS_TEXT) return 0; /* Text stays a byte view until materialized. */
     if(v->kind==QS_REFERENCE) return v->column[qs_vector_row(v,i)];
     if(v->kind==QS_CONSTANT) return v->constant.value;
@@ -80,15 +82,17 @@ static inline __int128 qs_vector_value(const struct qs_vector *v,unsigned i)
 }
 static inline unsigned qs_vector_null(const struct qs_vector *v,unsigned i)
 {
+    if(v->kind==QS_CELLS) return v->cells[i].isnull;
     if(v->kind==QS_REFERENCE) { unsigned row=qs_vector_row(v,i); return (v->column_nulls[row/8]>>(row%8))&1; }
     return v->kind==QS_CONSTANT?v->constant.isnull:v->nulls[i];
 }
 static inline unsigned qs_vector_dscale(const struct qs_vector *v,unsigned i)
-{ return v->kind==QS_REFERENCE?v->column_scales[qs_vector_row(v,i)]:v->kind==QS_CONSTANT?v->constant.dscale:v->dscales[i]; }
+{ return v->kind==QS_CELLS?v->cells[i].dscale:v->kind==QS_REFERENCE?v->column_scales[qs_vector_row(v,i)]:v->kind==QS_CONSTANT?v->constant.dscale:v->dscales[i]; }
 static inline struct qs_cell qs_vector_cell(const struct qs_plan *p,const struct qs_vector *v,unsigned index,unsigned row)
 {
+    if(v[index].kind==QS_CELLS) return v[index].cells[row];
     if(v[index].kind==QS_CONSTANT) return v[index].constant;
-    return (struct qs_cell){.value=qs_vector_value(&v[index],row),.scale=p->exprs[index].scale,
+    return (struct qs_cell){.value=qs_vector_value(&v[index],row),.scale=v[index].kind==QS_DYNAMIC?v[index].scales[row]:p->exprs[index].scale,
         .dscale=qs_vector_dscale(&v[index],row),.isnull=qs_vector_null(&v[index],row)};
 }
 #if defined(__x86_64__) || defined(__i386__)
@@ -110,7 +114,8 @@ __attribute__((target("avx2")))
 static int qs_vector_simd(const struct qs_expr *e,const struct qs_expr *le,const struct qs_expr *re,
     const struct qs_vector *left,const struct qs_vector *right,struct qs_vector *out,unsigned count)
 {
-    if(!left->all_valid || !right->all_valid || left->kind==QS_WIDE || right->kind==QS_WIDE) return 0;
+    if(!left->all_valid || !right->all_valid || left->kind==QS_WIDE || right->kind==QS_WIDE ||
+        left->kind==QS_CELLS || right->kind==QS_CELLS || left->kind==QS_DYNAMIC || right->kind==QS_DYNAMIC) return 0;
     if((left->kind==QS_CONSTANT && (left->constant.value<INT64_MIN || left->constant.value>INT64_MAX)) ||
        (right->kind==QS_CONSTANT && (right->constant.value<INT64_MIN || right->constant.value>INT64_MAX))) return 0;
     int64_t lc=left->kind==QS_CONSTANT?(int64_t)left->constant.value:0;
@@ -178,6 +183,7 @@ struct qs_vector_input {
     struct qs_dict *dictionary;
     const struct qs_cell *parameters;
     unsigned nparameters;
+    const struct qs_cell *cells; /* Materialized columns, QS_VECTOR_ROWS cells per slot. */
 };
 /* The byte view borrows the retained LOAD buffer or immutable dictionary.
  * SUBSTRING counts UTF-8 characters using PG's positive/zero/negative-start
@@ -291,6 +297,8 @@ static int qs_vector_evaluate(struct qs_vector_input *input,unsigned index,const
         }
         if(qs_vector_evaluate(input,e->right,rhs,nt) ||
             qs_vector_evaluate(input,e->otherwise,false_rows,nf)) return -1;
+        if(!text && (input->vectors[e->right].kind==QS_CELLS || input->vectors[e->right].kind==QS_DYNAMIC ||
+            input->vectors[e->otherwise].kind==QS_CELLS || input->vectors[e->otherwise].kind==QS_DYNAMIC)) out->kind=QS_DYNAMIC;
         for(unsigned j=0;j<n;++j) {
             unsigned i=rows[j]; unsigned error=left->errors[i]; struct qs_cell v={0};
             if(!error) {
@@ -298,9 +306,12 @@ static int qs_vector_evaluate(struct qs_vector_input *input,unsigned index,const
                 v=qs_vector_cell(p,input->vectors,branch,i); error=input->vectors[branch].errors[i];
                 if(text && !v.isnull && !error) {
                     error=qs_vector_text(input,branch,i,&out->strings[i].data,&out->strings[i].length)!=0;
-                } else if(!text && !v.isnull) error|=v.scale>e->scale || qs_scale(v.value,e->scale-v.scale,&v.value);
+                } else if(!text && out->kind!=QS_DYNAMIC && !v.isnull) error|=v.scale>e->scale || qs_scale(v.value,e->scale-v.scale,&v.value);
             }
-            if(!text) out->values[i]=v.value;
+            if(!text) {
+                if(out->kind!=QS_DYNAMIC) v.scale=e->scale;
+                out->values[i]=v.value; out->scales[i]=v.scale;
+            }
             out->nulls[i]=v.isnull; out->dscales[i]=v.dscale; out->errors[i]=error;
             out->all_valid&=!error && !v.isnull;
         }
@@ -357,6 +368,8 @@ static int qs_vector_evaluate(struct qs_vector_input *input,unsigned index,const
         }
         out->kind=QS_TEXT; out->done+=n; return 0;
     }
+    if((e->op==Q_ADD || e->op==Q_SUB || e->op==Q_MUL) &&
+        (left->kind==QS_CELLS || left->kind==QS_DYNAMIC || right->kind==QS_CELLS || right->kind==QS_DYNAMIC)) out->kind=QS_DYNAMIC;
     for(unsigned j=0;j<n;++j) {
         unsigned i=rows[j]; struct qs_cell a=qs_vector_cell(p,input->vectors,e->left,i),b={0};
         struct qs_cell v={.scale=e->scale,.dscale=e->dscale}; unsigned error=left->errors[i];
@@ -383,10 +396,11 @@ static int qs_vector_evaluate(struct qs_vector_input *input,unsigned index,const
                             v.value=e->op==Q_EQ?cmp==0:e->op==Q_NE?cmp!=0:e->op==Q_LT?cmp<0:e->op==Q_LE?cmp<=0:e->op==Q_GT?cmp>0:cmp>=0;
                         }
                     }
-                } else if(e->op==Q_MUL) { error=__builtin_mul_overflow(a.value,b.value,&v.value); v.dscale=a.dscale+b.dscale; }
+                } else if(e->op==Q_MUL) { error=__builtin_mul_overflow(a.value,b.value,&v.value); v.scale=a.scale+b.scale; v.dscale=a.dscale+b.dscale; }
                 else if(e->op==Q_ADD || e->op==Q_SUB) {
                     __int128 l,r;
-                    error=qs_scale(a.value,e->scale-a.scale,&l) || qs_scale(b.value,e->scale-b.scale,&r);
+                    v.scale=out->kind==QS_DYNAMIC?(a.scale>b.scale?a.scale:b.scale):e->scale;
+                    error=qs_scale(a.value,v.scale-a.scale,&l) || qs_scale(b.value,v.scale-b.scale,&r);
                     if(!error) error=e->op==Q_ADD?__builtin_add_overflow(l,r,&v.value):__builtin_sub_overflow(l,r,&v.value);
                     v.dscale=a.dscale>b.dscale?a.dscale:b.dscale;
                 } else {
@@ -395,7 +409,7 @@ static int qs_vector_evaluate(struct qs_vector_input *input,unsigned index,const
                 }
             }
         }
-        out->values[i]=v.value; out->nulls[i]=v.isnull; out->dscales[i]=v.dscale; out->errors[i]=error;
+        out->values[i]=v.value; out->scales[i]=v.scale; out->nulls[i]=v.isnull; out->dscales[i]=v.dscale; out->errors[i]=error;
         out->all_valid&=!error && !v.isnull;
     }
     out->done+=n; return 0;
@@ -405,8 +419,10 @@ static inline int qs_vector_execute_input(const struct qs_plan *p,struct qs_chun
     struct qs_vector_input input)
 {
     if(count>QS_VECTOR_ROWS) return -1;
-    unsigned low=chunk->rows,high=0;
-    for(unsigned i=0;i<count;++i) {
+    int column_input=chunk==NULL;
+    if(column_input && ((p->ncols && !input.cells) || selection || first+count>QS_VECTOR_ROWS)) return -1;
+    unsigned low=column_input?0:chunk->rows,high=0;
+    for(unsigned i=0;!column_input && i<count;++i) {
         unsigned row=selection?selection[first+i]:first+i;
         if(row>=chunk->rows) return -1;
         if(row<low) low=row;
@@ -419,6 +435,18 @@ static inline int qs_vector_execute_input(const struct qs_plan *p,struct qs_chun
         if(e->op==Q_COLUMN) {
             if(e->column<0 || (unsigned)e->column>=p->nattrs) return -1;
             const struct qs_column *col=&p->cols[e->column]; int slot=col->slot;
+            if(column_input) {
+                if(slot<0 || (unsigned)slot>=p->ncols) return -1;
+                out->cells=input.cells+(size_t)slot*QS_VECTOR_ROWS+first;
+                out->kind=QS_NARROW; out->done=count;
+                for(unsigned i=0;i<count;++i) {
+                    struct qs_cell v=out->cells[i];
+                    out->narrow[i]=v.isnull?0:(int64_t)v.value; out->nulls[i]=v.isnull; out->dscales[i]=v.dscale;
+                    out->all_valid&=!v.isnull;
+                    if(!v.isnull && (v.scale!=e->scale || v.value<INT64_MIN || v.value>INT64_MAX)) out->kind=QS_CELLS;
+                }
+                memset(out->errors,0,count); continue;
+            }
             if(slot<0 || (unsigned)slot>=chunk->ncols) return -1;
             out->column=qs_values(chunk)+(size_t)slot*chunk->capacity;
             out->column_nulls=qs_nulls(chunk)+(size_t)slot*((chunk->capacity+7)/8);

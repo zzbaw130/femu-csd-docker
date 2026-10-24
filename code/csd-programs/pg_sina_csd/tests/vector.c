@@ -5,6 +5,38 @@
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
+static void materialized_columns(void)
+{
+    struct qs_plan p={.nattrs=2,.ncols=2,.nexprs=6};
+    p.cols[0].slot=0; p.cols[1].slot=1;
+    p.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.column=0,.type=Q_DECIMAL,.scale=2};
+    p.exprs[1]=(struct qs_expr){.op=Q_COLUMN,.column=1,.type=Q_BOOLEAN};
+    p.exprs[2]=(struct qs_expr){.op=Q_CONST,.type=Q_DECIMAL,.constant=125,.scale=2,.dscale=2};
+    p.exprs[3]=(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=0,.right=2,.scale=4};
+    p.exprs[4]=(struct qs_expr){.op=Q_ADD,.type=Q_DECIMAL,.left=0,.right=2,.scale=2};
+    p.exprs[5]=(struct qs_expr){.op=Q_CASE,.type=Q_DECIMAL,.left=1,.right=3,.otherwise=0,.scale=4};
+    struct qs_cell *columns=calloc(2*QS_VECTOR_ROWS,sizeof(*columns));
+    struct qs_vector *vectors=calloc(p.nexprs,sizeof(*vectors)); assert(columns && vectors);
+    for(unsigned r=0;r<QS_VECTOR_ROWS;++r) {
+        columns[r]=(struct qs_cell){.value=(r%2?-1:1)*(((__int128)1<<80)+r),.scale=r%5,.dscale=r%5,.isnull=r%7==0};
+        columns[QS_VECTOR_ROWS+r]=(struct qs_cell){.value=r%2};
+    }
+    uint8_t needed[QS_EXPRS]={0};
+    for(unsigned i=3;i<6;++i) assert(!qs_vector_require(&p,i,needed));
+    struct qs_vector_input input={.cells=columns};
+    assert(!qs_vector_execute_input(&p,NULL,NULL,0,QS_VECTOR_ROWS,needed,vectors,input));
+    assert(vectors[0].kind==QS_CELLS && vectors[3].kind==QS_DYNAMIC && vectors[5].kind==QS_DYNAMIC);
+    for(unsigned r=0;r<QS_VECTOR_ROWS;++r) for(unsigned root=3;root<6;++root) {
+        struct qs_cell tuple[]={columns[r],columns[QS_VECTOR_ROWS+r]},expected;
+        struct qs_eval eval={.plan=&p,.tuple=tuple};
+        /* PG CASE retains the chosen value's actual scale. */
+        assert(!qs_evaluate(&eval,root==5?(tuple[1].value?3:0):(int)root,&expected));
+        struct qs_cell actual=qs_vector_cell(&p,vectors,root,r);
+        assert(!vectors[root].errors[r] && actual.isnull==expected.isnull);
+        if(!actual.isnull) assert(actual.value==expected.value && actual.scale==expected.scale && actual.dscale==expected.dscale);
+    }
+    free(columns); free(vectors);
+}
 static void string_views(void)
 {
     assert(qs_text_like("_",1,"猫",3)==1);
@@ -287,6 +319,6 @@ static void aggregates(const char *path)
 }
 int main(int argc,char **argv)
 {
-    assert(argc==2); string_views(); wide_parameters(); expressions(); arithmetic(); case_and_division(); aggregates(argv[1]);
+    assert(argc==2); materialized_columns(); string_views(); wide_parameters(); expressions(); arithmetic(); case_and_division(); aggregates(argv[1]);
     puts("PASS batch expressions vs scalar, NULL/short-circuit/overflow, selection tails and shared aggregate states"); return 0;
 }

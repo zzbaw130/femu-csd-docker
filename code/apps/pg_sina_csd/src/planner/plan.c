@@ -557,24 +557,27 @@ static Node *heap_index_var(Node *node,List *tlist)
     }
     return expression_tree_mutator(node,heap_index_var,tlist);
 }
-/* A full index path may supply ordering without a Sort node. Reading its
- * immutable heap is valid only if we explicitly retain that ordering. */
-static bool group_output(const struct qs_plan *p,int index,const struct qp_node *n)
+/* Validate expressions over group keys and the aggregate result. When
+ * lowering a PG-validated group, dependent output columns can be retained
+ * as additional physical keys without changing the SQL groups. */
+static bool group_output(struct qs_plan *p,int index,struct qp_node *n,bool retain)
 {
     if(index<0 || (unsigned)index>=p->nexprs) return false;
     const struct qs_expr *x=&p->exprs[index];
     if(x->op==Q_CONST) return true;
     if(x->op==Q_COLUMN) {
         for(unsigned k=0;k<n->nkeys;++k) if(x->column==n->left_keys[k]) return true;
-        return false;
+        if(!retain || n->nkeys==QS_KEYS) return false;
+        p->keys[p->nkeys++]=index; n->left_keys[n->nkeys++]=x->column;
+        return true;
     }
     if(x->op==Q_AGGREF) return x->column==0;
     if(x->op==QP_PARAMETER) return true;
     if(x->op==Q_NOT || x->op==Q_IS_NULL || x->op==Q_IS_NOT_NULL)
-        return group_output(p,x->left,n);
+        return group_output(p,x->left,n,retain);
     return (x->op==Q_ADD || x->op==Q_SUB || x->op==Q_MUL || x->op==Q_DIV ||
         (x->op>=Q_EQ && x->op<=Q_OR)) &&
-        group_output(p,x->left,n) && group_output(p,x->right,n);
+        group_output(p,x->left,n,retain) && group_output(p,x->right,n,retain);
 }
 /* A unique integer-key join that only returns its key is a membership test.
  * Move that test below GROUP BY, where it removes whole groups, never rows
@@ -657,7 +660,7 @@ static void push_left_join_count(struct qp_plan *tree,struct qp_node *aggregate)
         const struct qs_expr *x=&join->expr.exprs[i];
         if(x->op==Q_COLUMN && x->column>=(int)width && x->column!=(int)width+key && x->column!=(int)width+column) return;
     }
-    for(unsigned i=0;i<p->nout;++i) if(!group_output(p,p->outputs[i].index,aggregate)) return;
+    for(unsigned i=0;i<p->nout;++i) if(!group_output(p,p->outputs[i].index,aggregate,false)) return;
     Relation index=relation_open(left->expr.join.indexid,NoLock);
     bool unique=index->rd_index->indisprimary && index->rd_index->indnkeyatts==1;
     relation_close(index,NoLock); if(!unique) return;
@@ -932,7 +935,7 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
     /* Keep PG HashAggregate or replace grouping-only sorting with bounded
      * states. Required output order is reapplied above the aggregate. */
     if(n->kind==QP_AGGREGATE && n->nkeys && p->naggs==1 && !n->distinct && !n->distinct_aggs &&
-       p->predicate<0 && p->having<0 && n->left>=0 && (tree->nodes[n->left].kind==QP_SORT ||
+       p->having<0 && n->left>=0 && (tree->nodes[n->left].kind==QP_SORT ||
         (!ordered && IsA(native,Agg) && ((Agg *)native)->aggstrategy==AGG_HASHED))) {
         bool remove_sort=tree->nodes[n->left].kind==QP_SORT;
         int sort_id=n->left,input=remove_sort?tree->nodes[sort_id].left:n->left;
@@ -949,8 +952,9 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
             }
         }
         for(unsigned i=0;i<p->nout;++i) {
-            if(!group_output(p,p->outputs[i].index,n)) supported=false;
+            if(!group_output(p,p->outputs[i].index,n,false)) supported=false;
         }
+        if(p->predicate>=0 && !group_output(p,p->predicate,n,false)) supported=false;
         /* A sorted GroupAggregate can also supply SQL ORDER BY. Preserve
          * that order by moving its Sort above the aggregate, using output
          * column positions. The two existing nodes suffice. */
@@ -1004,7 +1008,7 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
         bool supported=width==n->nkeys+1;
         for(unsigned k=0;k<n->nkeys;++k) mask|=1U<<n->left_keys[k];
         if(mask!=((1U<<width)-1)) supported=false;
-        for(unsigned i=0;i<p->nout;++i) if(!group_output(p,p->outputs[i].index,n)) supported=false;
+        for(unsigned i=0;i<p->nout;++i) if(!group_output(p,p->outputs[i].index,n,false)) supported=false;
         if(supported) {
             unsigned dedup=tree->count++; struct qp_node *d=&tree->nodes[dedup];
             *d=(struct qp_node){.kind=QP_AGGREGATE,.left=n->left,.right=-1,.hash=1,
@@ -1038,22 +1042,29 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
     }
     if(n->kind==QP_JOIN && !ordered && ((Join *)native)->inner_unique) push_group_key_filter(tree,n);
     if(n->kind==QP_AGGREGATE) push_left_join_count(tree,n);
-    /* An unfiltered, non-covering index used only to order a full GROUP BY
-     * serializes Heap decoding. If no consumer requires that order, use the
-     * bounded parallel hash aggregate while retaining PG's join tree. */
+    /* If no consumer requires group order, avoid sorting the full input or
+     * serializing an unfiltered Heap scan through a non-covering index.
+     * Keep PG's join tree and the input target list; use bounded Hash Group. */
     if(n->kind==QP_AGGREGATE && !ordered && n->sorted_input && n->nkeys &&
        p->naggs==1 && !n->distinct && !n->distinct_aggs && p->having<0 && n->left>=0) {
         struct qp_node *input=&tree->nodes[n->left];
         unsigned kind=p->aggs[0].kind;
-        bool supported=input->kind==QP_SCAN && input->ordered_index && !(input->ordered_index&4) &&
-            input->expr.predicate<0 && (kind==Q_SUM || kind==Q_AVG || kind==Q_COUNT || kind==Q_COUNT_STAR);
+        bool sorting=input->kind==QP_SORT && input->expr.limit<0 && !input->expr.offset;
+        bool index=input->kind==QP_SCAN && input->ordered_index && !(input->ordered_index&4) && input->expr.predicate<0;
+        bool supported=(sorting || index) && (kind==Q_SUM || kind==Q_AVG || kind==Q_COUNT || kind==Q_COUNT_STAR);
+        unsigned keys=n->nkeys,plan_keys=p->nkeys;
+        /* PG has already validated that non-aggregate output attributes are
+         * functionally dependent on the grouping keys. Retain them as extra
+         * physical keys, so Hash Group can return that payload without
+         * changing the SQL groups. Do not infer dependencies on the device. */
         for(unsigned i=0;supported && i<p->nout;++i)
-            supported=group_output(p,p->outputs[i].index,n);
-        if(supported && p->predicate>=0) supported=group_output(p,p->predicate,n);
+            supported=group_output(p,p->outputs[i].index,n,sorting);
+        if(supported && p->predicate>=0) supported=group_output(p,p->predicate,n,sorting);
         if(supported) {
-            input->ordered_index=0; memset(&input->expr.join,0,sizeof(input->expr.join));
+            if(sorting) { input->kind=QP_PROJECT; input->expr.norder=0; }
+            else { input->ordered_index=0; memset(&input->expr.join,0,sizeof(input->expr.join)); }
             n->sorted_input=0; n->hash=1;
-        }
+        } else { n->nkeys=keys; p->nkeys=plan_keys; }
     }
     return id;
 }
