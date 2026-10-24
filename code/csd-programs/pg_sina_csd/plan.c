@@ -2398,6 +2398,8 @@ int64_t pg_sina_workmem_capacity(struct femu_csd_args *a)
 /* plan, lifecycle/page requests, result, input/dictionary arena, spill I/O.
  * A successful call either returns result rows or asks PG to LOAD pages.
  * NEED_STORE/LOAD is handled entirely by the existing SNIA batch scheduler. */
+static void *dictionary_allocate(void *context,size_t bytes)
+{ return cs_work_alloc(context,bytes); }
 int64_t pg_sina_plan(struct femu_csd_args *a)
 {
     if(!a || a->numr!=5 || a->mr_len[0]<(long long)sizeof(struct qp_plan) ||
@@ -2418,7 +2420,21 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
         if(!budget || budget>stats.capacity_bytes) budget=stats.capacity_bytes;
         cs_work_context *context=cs_work_begin_limit(budget); if(!context) return -4;
         s=cs_work_calloc(context,1,sizeof(*s)); if(!s) { cs_work_end(context); return -4; }
-        s->context=context; s->plan=plan; s->control=control; s->dictionary=a->mr_addr[3];
+        s->context=context; s->plan=plan; s->control=control;
+        const struct qs_dict *config=a->mr_addr[3];
+        s->dictionary=cs_work_calloc(context,1,sizeof(*s->dictionary));
+        if(!s->dictionary) { cs_work_end(context); return -4; }
+        *s->dictionary=(struct qs_dict){.entries=config->entries,.capacity=config->entries,.data=config->data,
+            .context=context,.allocate=dictionary_allocate};
+        /* An input can already contain dictionary IDs (for example a
+         * materialized column batch). Preserve those IDs while moving its
+         * backing strings into this query's budget. PG's config is empty. */
+        for(unsigned id=1;id<=config->count;++id) {
+            const char *bytes; unsigned length;
+            if(qs_dict_get(config,id,&bytes,&length) || qs_dict_insert(s->dictionary,bytes,length)!=(int)id) {
+                cs_work_end(context); return -3;
+            }
+        }
         s->partition_join=s->source_node=-1;
         s->arena=a->mr_addr[3]; s->io=a->mr_addr[4]; s->io_bytes=a->mr_len[4];
         s->nodes=cs_work_calloc(context,plan->count,sizeof(*s->nodes));
@@ -2563,6 +2579,8 @@ produced:
     }
     control->output_rows=out->rows;
     out->metrics=s->metrics; out->metrics.workers=s->used_workers?s->used_workers:1; out->profile=s->profile;
+    out->metrics.dictionary_entries=__atomic_load_n(&s->dictionary->count,__ATOMIC_ACQUIRE);
+    out->metrics.dictionary_bytes=__atomic_load_n(&s->dictionary->bytes,__ATOMIC_RELAXED);
     for(unsigned i=0;i<plan->count;++i) if(plan->nodes[i].kind==QP_INDEX_JOIN || plan->nodes[i].ordered_index) {
         out->metrics.index_pages+=s->nodes[i].index_task.index_pages;
         out->metrics.index_tuples+=s->nodes[i].index_task.index_tuples;

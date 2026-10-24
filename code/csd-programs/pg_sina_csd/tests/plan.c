@@ -41,6 +41,49 @@ static void dictionary_size(void)
     assert(entries==QS_DICT_BIG_ENTRIES && data==QS_DICT_BIG_DATA);
     free(p);
 }
+static void *dictionary_alloc(void *context,size_t bytes)
+{ return cs_work_alloc(context,bytes); }
+static void *dictionary_no_memory(void *context,size_t bytes)
+{ (void)context; (void)bytes; return NULL; }
+static void *dictionary_insert_worker(void *arg)
+{
+    struct qs_dict *dict=arg;
+    for(unsigned i=0;i<4096;++i) {
+        char text[81]; unsigned prefix=snprintf(text,sizeof(text),"key-%u-",i);
+        memset(text+prefix,'x',80-prefix); text[80]=0;
+        int id=qs_dict_insert(dict,text,80); assert(id>0);
+        const char *bytes; unsigned length;
+        assert(!qs_dict_get(dict,id,&bytes,&length) && length==80 && !memcmp(bytes,text,80));
+        assert(qs_dict_find(dict,text,80)==id);
+    }
+    return NULL;
+}
+static void dictionary_growth(void)
+{
+    cs_work_context *context=cs_work_begin_limit(4U*1024*1024); assert(context);
+    struct qs_dict dict={.entries=8192,.capacity=8192,.data=1024*1024,
+        .context=context,.allocate=dictionary_alloc};
+    int first=qs_dict_insert(&dict,"held",4); assert(first>0);
+    const char *held; unsigned length; assert(!qs_dict_get(&dict,first,&held,&length) && length==4);
+    struct qs_dict *original=qs_dict_storage(&dict);
+    pthread_t threads[4];
+    for(unsigned i=0;i<4;++i) assert(!pthread_create(&threads[i],NULL,dictionary_insert_worker,&dict));
+    for(unsigned i=0;i<4;++i) assert(!pthread_join(threads[i],NULL));
+    assert(dict.count==4097 && dict.bytes==4+4096*80 && qs_dict_storage(&dict)!=original);
+    assert(!memcmp(held,"held",4)); /* A byte view borrowed before all growth. */
+    struct cs_work_context_stats memory; assert(!cs_work_get_context_stats(context,&memory));
+    assert(memory.used_bytes>qs_dict_bytes(qs_dict_storage(&dict)->entries,qs_dict_storage(&dict)->data));
+    dict.allocate=dictionary_no_memory;
+    unsigned before=dict.count; int status=0;
+    for(unsigned i=0;i<8192 && status>=0;++i) {
+        char text[100]; memset(text,'y',sizeof(text)); snprintf(text,32,"extra-%u",i);
+        status=qs_dict_insert(&dict,text,sizeof(text));
+    }
+    assert(status<0 && dict.count>=before && !memcmp(held,"held",4));
+    const char *bytes; assert(!qs_dict_get(&dict,first,&bytes,&length) && length==4 && !memcmp(bytes,"held",4));
+    assert(!cs_work_end(context));
+    struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
+}
 static void w16(void *p,uint16_t x) { memcpy(p,&x,2); }
 static void w32(void *p,uint32_t x) { memcpy(p,&x,4); }
 static unsigned char *heap(unsigned rows,unsigned side,size_t *size)
@@ -654,7 +697,7 @@ static void probe_payload(function run,unsigned limit,int strings,int indexed)
     if(strings) {
         assert(!status && out->rows==1 && qs_cell_string(&out->data[0].cells[1])==4);
         assert(!memcmp(qs_cell_string_bytes(&out->data[0].cells[1]),"keep",4));
-        assert(((struct qs_dict *)arena)->count==1); /* unmatched "skip" was never interned */
+        assert(out->metrics.dictionary_entries==1); /* unmatched "skip" was never interned */
     } else if(limit==1) {
         assert(!status && out->rows==1 && out->data[0].cells[0].value==(indexed?1:0));
         assert(out->data[0].cells[1].value==(__int128)INT64_MAX*INT64_MAX);
@@ -933,6 +976,7 @@ int main(int argc,char **argv)
         return 0;
     }
     assert(!cs_work_init(64*1024*1024));
+    dictionary_growth();
     probe_payload(run,1,0,0); probe_payload(run,2,0,0); probe_payload(run,2,1,0);
     probe_payload(run,1,0,1); probe_payload(run,2,0,1); grouped_probe(run);
     test_scheduled=true;

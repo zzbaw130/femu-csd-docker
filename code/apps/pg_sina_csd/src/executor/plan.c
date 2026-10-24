@@ -174,9 +174,9 @@ static void begin(CustomScanState *node,EState *estate,int flags)
 }
 /* Compute offsets without allocating, so a larger I/O block can be tried
  * before reducing CU concurrency. Small relations need only their own bytes. */
-static size_t layout_buffers(PlanStateCsd *s,unsigned entries,unsigned data,const bool *indexed)
+static size_t layout_buffers(PlanStateCsd *s,const bool *indexed)
 {
-    size_t arena=(qs_dict_bytes(entries,data)+4095)&~(size_t)4095;
+    size_t arena=(sizeof(struct qs_dict)+4095)&~(size_t)4095;
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_SCAN && !indexed[i]) {
         struct qp_node *n=&s->plan->nodes[i]; unsigned bytes=n->ordered_index?QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE:qp_scan_buffer_bytes(s->plan,n);
         n->input_offset=arena; arena+=bytes; n->vector_offset=arena;
@@ -254,7 +254,7 @@ static void start(PlanStateCsd *s)
     s->plan->scan_bytes=QS_CHUNK;
     size_t arena;
     for(;;) {
-        arena=layout_buffers(s,entries,data,indexed);
+        arena=layout_buffers(s,indexed);
         size_t needed=arena+sizeof(*s->plan)+(s->workers+1)*(sizeof(struct qp_control)+sizeof(*s->result)+QS_SORT_IO_BYTES)+65536;
         if(capacity && needed>capacity) {
             if(s->plan->scan_bytes>QP_SCAN_BYTES) { s->plan->scan_bytes/=2; continue; }
@@ -273,10 +273,6 @@ static void start(PlanStateCsd *s)
     checked(transfer(s->memory[1],0,&s->slots[0].control,sizeof(s->slots[0].control),true),"initialize control");
     struct qs_dict dictionary={.entries=entries,.capacity=entries,.data=data};
     checked(transfer(s->memory[3],0,&dictionary,sizeof(dictionary),true),"initialize strings");
-    char zeros[QS_SORT_IO_BYTES]={0};
-    size_t offset=sizeof(dictionary)+(size_t)entries*sizeof(struct qs_dict_entry);
-    for(size_t i=0;i<(size_t)entries*4;i+=sizeof(zeros))
-        checked(transfer(s->memory[3],offset+i,zeros,Min(sizeof(zeros),(size_t)entries*4-i),true),"clear string buckets");
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_SCAN && !indexed[i]) {
         struct qp_node *n=&s->plan->nodes[i];
         struct qs_chunk header={.capacity=n->ordered_index?256:qp_scan_capacity(s->plan,n),.ncols=n->expr.ncols};
@@ -669,8 +665,9 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     }
     ExplainPropertyText("CSD Plan",tree.data,es); pfree(tree.data);
     if(s->started) {
-        unsigned entries,data; qp_dictionary_size(s->plan,&entries,&data);
-        ExplainPropertyInteger("CSD Dictionary AFDM","bytes",qs_dict_bytes(entries,data),es);
+        ExplainPropertyInteger("CSD Dictionary AFDM","bytes",4096,es);
+        ExplainPropertyInteger("CSD Dictionary Entries",NULL,s->result->metrics.dictionary_entries,es);
+        ExplainPropertyInteger("CSD Dictionary Bytes","bytes",s->result->metrics.dictionary_bytes,es);
         ExplainPropertyInteger("CSD Heap Rows",NULL,s->result->metrics.scanned,es);
         ExplainPropertyInteger("CSD Internal Read","bytes",s->result->metrics.input_bytes,es);
         ExplainPropertyInteger("CSD Index/Heap Page Loads",NULL,s->result->metrics.index_pages,es);

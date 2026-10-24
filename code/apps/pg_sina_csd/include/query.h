@@ -148,12 +148,16 @@ static inline const char *qs_cell_string_bytes(const struct qs_cell *cell)
 { return (const char *)&cell->value; }
 static inline int qs_cell_is_string_ref(const struct qs_cell *cell)
 { return cell->dscale==1; }
-/* Shared by every scan slot in a query. The dictionary header is followed by
- * an open-addressing bucket array, entries, and a byte arena; PG allocates the
- * whole AFDM and initializes the header. */
+/* Shared by query CUs. Flat dictionaries keep entries/buckets/bytes after
+ * this header. Native-tree execution supplies a workmem allocator and grows
+ * flat snapshots lazily; old snapshots stay alive until query cleanup so
+ * readers and borrowed text views remain valid across growth. */
 struct qs_dict_entry { uint32_t offset; uint16_t length; };
 struct qs_dict {
     uint32_t lock, count, bytes, entries, capacity, data;
+    struct qs_dict *current;
+    void *context;
+    void *(*allocate)(void *,size_t);
 };
 static inline size_t qs_dict_bytes(unsigned entries,unsigned data)
 {
@@ -172,18 +176,53 @@ static inline uint32_t qs_dict_hash(const char *bytes,unsigned length)
     for(unsigned i=0;i<length;++i) { hash^=(unsigned char)bytes[i]; hash*=16777619U; }
     return hash;
 }
-/* Published entries never move. Existing strings can be found without the
- * insertion lock, including when several CUs decode the same enum columns. */
+static inline struct qs_dict *qs_dict_storage(const struct qs_dict *dict)
+{
+    struct qs_dict *d=__atomic_load_n(&dict->current,__ATOMIC_ACQUIRE);
+    return d?d:dict->allocate?NULL:(struct qs_dict *)dict;
+}
+/* Called only under the insertion lock. A published snapshot's layout never
+ * changes. Keeping old allocations in the query context avoids a separate
+ * reader lifetime protocol and charges their real cost to workmem. */
+static inline struct qs_dict *qs_dict_grow(struct qs_dict *dict,unsigned count,unsigned bytes)
+{
+    if(!dict->allocate || count>dict->entries || bytes>dict->data) return NULL;
+    struct qs_dict *old=qs_dict_storage(dict);
+    unsigned entries=old?old->entries:dict->entries<512?dict->entries:512;
+    unsigned data=old?old->data:dict->data<65536?dict->data:65536;
+    while(entries<count || (count>entries*3/4 && entries<dict->entries))
+        entries=entries<=dict->entries/2?entries*2:dict->entries;
+    while(data<bytes) data=data<=dict->data/2?data*2:dict->data;
+    struct qs_dict *d=dict->allocate(dict->context,qs_dict_bytes(entries,data));
+    if(!d) return NULL;
+    *d=(struct qs_dict){.entries=entries,.capacity=entries,.data=data};
+    memset(qs_dict_buckets(d),0,(size_t)entries*sizeof(uint32_t));
+    if(old) {
+        memcpy(qs_dict_entries(d),qs_dict_entries(old),(size_t)dict->count*sizeof(struct qs_dict_entry));
+        memcpy(qs_dict_data(d),qs_dict_data(old),dict->bytes);
+        for(unsigned i=0;i<dict->count;++i) {
+            const struct qs_dict_entry *e=&qs_dict_entries(d)[i];
+            uint32_t at=qs_dict_hash(qs_dict_data(d)+e->offset,e->length)&(entries-1);
+            while(qs_dict_buckets(d)[at]) at=(at+1)&(entries-1);
+            qs_dict_buckets(d)[at]=i+1;
+        }
+    }
+    __atomic_store_n(&dict->current,d,__ATOMIC_RELEASE);
+    return d;
+}
+/* Existing strings can be found without the insertion lock. A reader on an
+ * older snapshot can miss a new value; insertion rechecks under the lock. */
 static inline int qs_dict_find(struct qs_dict *dict,const char *bytes,unsigned length)
 {
-    struct qs_dict_entry *entries=qs_dict_entries(dict);
-    uint32_t *buckets=qs_dict_buckets(dict),mask=dict->capacity-1;
+    struct qs_dict *d=qs_dict_storage(dict); if(!d) return 0;
+    struct qs_dict_entry *entries=qs_dict_entries(d);
+    uint32_t *buckets=qs_dict_buckets(d),mask=d->capacity-1;
     uint32_t at=qs_dict_hash(bytes,length)&mask;
-    for(unsigned probes=0;probes<dict->capacity;++probes) {
+    for(unsigned probes=0;probes<d->capacity;++probes) {
         uint32_t id=__atomic_load_n(&buckets[at],__ATOMIC_ACQUIRE);
         if(!id) return 0;
         struct qs_dict_entry *e=&entries[id-1];
-        if(e->length==length && (!length || !memcmp(qs_dict_data(dict)+e->offset,bytes,length))) return (int)id;
+        if(e->length==length && (!length || !memcmp(qs_dict_data(d)+e->offset,bytes,length))) return (int)id;
         at=(at+1)&mask;
     }
     return 0;
@@ -196,17 +235,24 @@ static inline int qs_dict_insert(struct qs_dict *dict,const char *bytes,unsigned
     id=qs_dict_find(dict,bytes,length);
     if(!id) {
         unsigned count=dict->count,used=dict->bytes;
-        if(count>=dict->entries || used+length>dict->data || length>65535U) id=-1;
+        struct qs_dict *d=qs_dict_storage(dict);
+        if(count>=dict->entries || length>65535U || length>dict->data-used) id=-1;
         else {
-            qs_dict_entries(dict)[count]=(struct qs_dict_entry){used,(uint16_t)length};
-            memcpy(qs_dict_data(dict)+used,bytes,length);
-            dict->bytes=used+length;
-            uint32_t *buckets=qs_dict_buckets(dict),mask=dict->capacity-1;
-            uint32_t at=qs_dict_hash(bytes,length)&mask;
-            while(buckets[at]) at=(at+1)&mask;
-            __atomic_store_n(&dict->count,count+1,__ATOMIC_RELEASE);
-            __atomic_store_n(&buckets[at],count+1,__ATOMIC_RELEASE);
-            id=(int)count+1;
+            if(!d || count>=d->entries || length>d->data-used ||
+               (dict->allocate && count+1>d->entries*3/4 && d->entries<dict->entries))
+                d=qs_dict_grow(dict,count+1,used+length);
+            if(!d) id=-1;
+            else {
+                qs_dict_entries(d)[count]=(struct qs_dict_entry){used,(uint16_t)length};
+                memcpy(qs_dict_data(d)+used,bytes,length);
+                __atomic_store_n(&dict->bytes,used+length,__ATOMIC_RELAXED);
+                uint32_t *buckets=qs_dict_buckets(d),mask=d->capacity-1;
+                uint32_t at=qs_dict_hash(bytes,length)&mask;
+                while(buckets[at]) at=(at+1)&mask;
+                __atomic_store_n(&dict->count,count+1,__ATOMIC_RELEASE);
+                __atomic_store_n(&buckets[at],count+1,__ATOMIC_RELEASE);
+                id=(int)count+1;
+            }
         }
     }
     __sync_lock_release(&dict->lock);
@@ -214,15 +260,17 @@ static inline int qs_dict_insert(struct qs_dict *dict,const char *bytes,unsigned
 }
 static inline int qs_dict_get(const struct qs_dict *dict,unsigned id,const char **bytes,unsigned *length)
 {
-    if(!dict || !id || id>__atomic_load_n(&dict->count,__ATOMIC_ACQUIRE) || id>dict->entries) return -1;
-    const struct qs_dict_entry *e=&((const struct qs_dict_entry *)(dict+1))[id-1];
-    const char *base=(const char *)(((const struct qs_dict_entry *)(dict+1))+dict->entries)+
-        (size_t)dict->capacity*sizeof(uint32_t);
+    if(!dict || !id || id>__atomic_load_n(&dict->count,__ATOMIC_ACQUIRE)) return -1;
+    const struct qs_dict *d=qs_dict_storage(dict); if(!d || id>d->entries) return -1;
+    const struct qs_dict_entry *e=&((const struct qs_dict_entry *)(d+1))[id-1];
+    const char *base=(const char *)(((const struct qs_dict_entry *)(d+1))+d->entries)+
+        (size_t)d->capacity*sizeof(uint32_t);
     *bytes=base+e->offset; *length=e->length; return 0;
 }
 struct qs_row { struct qs_cell cells[QS_OUT]; };
 struct qs_metrics {
     uint64_t scanned, matched, input_bytes, chunks, work_peak, fdm_bytes;
+    uint64_t dictionary_entries,dictionary_bytes;
     uint64_t spill_write_bytes, spill_read_bytes, runs, spilled_runs;
     uint64_t build_rows, join_rows, build_batches;
     uint64_t index_pages, index_tuples;

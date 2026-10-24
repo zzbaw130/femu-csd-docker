@@ -74,10 +74,10 @@ static inline unsigned qp_scan_capacity(const struct qp_plan *p,const struct qp_
     unsigned rows=qp_scan_buffer_bytes(p,n)/24;
     return rows<QP_VECTOR_ROWS?rows:QP_VECTOR_ROWS;
 }
-/* Bound dictionary reservation by physical Heap input, not estimated output
+/* Bound dictionary limits by physical Heap input, not estimated output
  * rows/NDV. A tuple needs at least a 24-byte header and a 4-byte line pointer;
  * all of its inline string bytes together fit inside the relation's bytes.
- * Expressions creating new strings keep the existing maximum reservation. */
+ * Expressions creating new strings keep the existing maximum limits. */
 static inline void qp_dictionary_size(const struct qp_plan *p,unsigned *entries,unsigned *data)
 {
     uint64_t count=QS_DICT_SMALL_ENTRIES,bytes=QS_DICT_SMALL_DATA;
