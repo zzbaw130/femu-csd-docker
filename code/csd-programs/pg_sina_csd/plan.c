@@ -222,6 +222,8 @@ static uint64_t mix_hash(uint64_t);
 static int64_t build_set(struct execution *,unsigned);
 static _Thread_local struct execution *index_execution;
 static _Thread_local unsigned index_node;
+static _Thread_local struct projection_batch *index_columns;
+static int64_t index_next(struct execution *,unsigned,struct qs_cell *,struct projection_batch *);
 #define QP_INDEX_YIELD 4
 static void init_eval(struct qs_eval *e,const struct qs_plan *plan,const struct qs_cell *row,const struct qs_cell *aggregates)
 {
@@ -549,7 +551,12 @@ static int hash_input_boundary(struct execution *s,unsigned id)
     if(!chunk->rows || s->nodes[scan].scan_position<chunk->selected) return 0;
     for(int at=id;at>=0;at=s->plan->nodes[at].left) {
         const struct operator_state *o=&s->nodes[at];
-        if(o->projection && o->projection->position<o->projection->count) return 0;
+        if(o->projection && ((at!=(int)id && o->projection->input_count) ||
+            o->projection->position<o->projection->count)) return 0;
+        /* An Index cursor owns lookup batches, not the scan's row window.
+         * Its continuation must finish before another consumer uses that
+         * boundary; do not infer an Index boundary from the distant scan. */
+        if(s->plan->nodes[at].kind==QP_INDEX_JOIN) return 0;
         if(o->hash_match || (o->have_left && !o->hash_matched &&
             (s->plan->nodes[at].join_type==QP_LEFT || s->plan->nodes[at].join_type==QP_ANTI))) return 0;
         if(at==scan) return 1;
@@ -1164,14 +1171,8 @@ static int projection_init(struct execution *s,unsigned id)
         scan=n->left;
     }
     const struct qp_node *leaf=&s->plan->nodes[scan];
-    int joined=leaf->kind==QP_JOIN && leaf->hash && leaf->expr.predicate<0;
-    /* Index Join still owns a resumable row/I/O interface. Do not prefetch
-     * through that producer until it has its own column-batch contract. */
-    for(int at=joined?leaf->left:-1;at>=0;at=s->plan->nodes[at].left) {
-        const struct qp_node *input=&s->plan->nodes[at];
-        if(input->kind==QP_INDEX_JOIN) { joined=0; break; }
-        if(input->kind!=QP_PROJECT && !(input->kind==QP_JOIN && input->hash)) break;
-    }
+    int joined=leaf->expr.predicate<0 &&
+        (leaf->kind==QP_INDEX_JOIN || (leaf->kind==QP_JOIN && leaf->hash));
     if((leaf->kind!=QP_SCAN && !joined) || (!s->worker && s->plan->workers>1 && leaf->parallel)) return 0;
     if(!joined && leaf->expr.predicate>=0) {
         if(leaf->ordered_index) return 0;
@@ -1222,11 +1223,28 @@ static int projection_init(struct execution *s,unsigned id)
     if(b->plan.nexprs && !b->vectors) { cs_work_free(s->context,b->cells); cs_work_free(s->context,b); return 0; }
     o->projection=b; return 0;
 }
+static void projection_append(struct projection_batch *b,const struct qs_cell *values)
+{
+    for(unsigned col=0;col<b->plan.nattrs;++col) {
+        int slot=b->plan.cols[col].slot;
+        if(slot>=0) b->cells[(size_t)slot*QS_VECTOR_ROWS+b->input_count]=values[col];
+    }
+    ++b->input_count;
+}
 static int64_t projection_join_fill(struct execution *s,struct projection_batch *b)
 {
     const struct qp_node *n=&s->plan->nodes[b->scan]; struct operator_state *o=&s->nodes[b->scan];
     unsigned ln=s->plan->nodes[n->left].expr.nout;
     if(b->error) { s->control->error=b->error; s->control->error_node=b->error_node; return b->error; }
+    if(n->kind==QP_INDEX_JOIN) {
+        int previous=s->control->error; unsigned previous_node=s->control->error_node;
+        int64_t status=index_next(s,b->scan,NULL,b);
+        if(status<0 && b->input_count) {
+            b->error=status; b->error_node=s->control->error?s->control->error_node:b->scan;
+            s->control->error=previous; s->control->error_node=previous_node;
+        } else if(status!=2) return status;
+        goto evaluate_batch;
+    }
     while(b->input_count<QS_VECTOR_ROWS) {
         int previous=s->control->error; unsigned previous_node=s->control->error_node;
         int64_t status=hash_match_next(s,b->scan,b->keep_window && b->input_count);
@@ -1328,7 +1346,7 @@ static int64_t hash_probe_input(struct execution *s,unsigned id,const uint32_t *
     o->hash_payload=0;
     const struct qp_node *left=&s->plan->nodes[n->left];
     /* Aggregate projection state describes sink inputs, never final rows. */
-    int eligible=(left->kind==QP_SCAN || left->kind==QP_PROJECT || left->kind==QP_JOIN) &&
+    int eligible=(left->kind==QP_SCAN || left->kind==QP_PROJECT || left->kind==QP_JOIN || left->kind==QP_INDEX_JOIN) &&
         !o->external && s->source_node<0 && !(!s->worker && s->plan->workers>1 && left->parallel);
     if(eligible) {
         int status=projection_init(s,n->left); if(status) return status;
@@ -1938,8 +1956,9 @@ int64_t qs_join_consume(unsigned stage,struct qs_chunk *chunk,const struct qs_pl
     struct execution *s=index_execution; unsigned id=index_node;
     const struct qp_node *n=&s->plan->nodes[id],*right=&s->plan->nodes[n->right];
     struct operator_state *o=&s->nodes[id]; unsigned ln=s->plan->nodes[n->left].expr.nout;
+    struct projection_batch *b=index_columns;
     if(o->index_flush) { o->index_flush=0; return 0; }
-    o->index_output->rows=0; o->index_position=0;
+    if(!b) { o->index_output->rows=0; o->index_position=0; }
     for(unsigned r=0;r<chunk->selected;++r) {
         unsigned at=qs_selection(chunk)[r]; struct qs_cell raw[QS_COLS],values[QS_COLS];
         unsigned source=qs_values(chunk)[chunk->capacity+at];
@@ -1959,23 +1978,35 @@ int64_t qs_join_consume(unsigned stage,struct qs_chunk *chunk,const struct qs_pl
         if(n->join_type==QP_SEMI && (o->index_matches&bit)) continue;
         o->index_matches|=bit; ++s->metrics.join_rows;
         if(n->join_type==QP_ANTI) continue;
-        status=project(s,n,values,NULL,o->index_output->data[o->index_output->rows].cells);
-        if(status<0) return status;
-        if(status) ++o->index_output->rows;
+        if(b) {
+            /* Keep only columns needed by the fused expression DAG. The
+             * index cursor retains the decoded chunk until this batch drains. */
+            projection_append(b,values);
+        } else {
+            status=project(s,n,values,NULL,o->index_output->data[o->index_output->rows].cells);
+            if(status<0) return status;
+            if(status) ++o->index_output->rows;
+        }
     }
     if(n->join_type==QP_SEMI || n->join_type==QP_ANTI) qs_index_skip(&o->index_control,0,o->index_matches);
-    if(o->index_output->rows) { o->index_flush=1; return QP_INDEX_YIELD; }
+    /* SEMI callbacks inspect one candidate at a time so they can skip its
+     * remaining matches. Gather the accepted left rows until the lookup batch
+     * finishes, rather than running the vector DAG for every single match. */
+    unsigned rows=b?b->input_count:o->index_output->rows;
+    if(rows && (!b || n->join_type!=QP_SEMI)) {
+        o->index_flush=1; return QP_INDEX_YIELD;
+    }
     return 0;
 }
-static int64_t index_next(struct execution *s,unsigned id,struct qs_cell *row)
+static int64_t index_next(struct execution *s,unsigned id,struct qs_cell *row,struct projection_batch *b)
 {
     const struct qp_node *n=&s->plan->nodes[id],*right=&s->plan->nodes[n->right];
     struct operator_state *o=&s->nodes[id]; unsigned ln=s->plan->nodes[n->left].expr.nout;
     if(!o->index_plan) {
         struct qs_plan *p=cs_work_calloc(s->context,1,sizeof(*p));
-        o->index_output=cs_work_calloc(s->context,1,sizeof(*o->index_output));
+        if(!b) o->index_output=cs_work_calloc(s->context,1,sizeof(*o->index_output));
         o->index_left=cs_work_alloc(s->context,64*ln*sizeof(*o->index_left));
-        if(!p || !o->index_output || !o->index_left) return -4;
+        if(!p || (!b && !o->index_output) || !o->index_left) return -4;
         o->index_plan=p; p->nattrs=right->expr.nattrs+2; p->ncols=right->expr.ncols+2; p->njoins=1;
         p->work_mem_parent=(uintptr_t)s->context;
         p->join=right->expr.join; p->join.relid=right->expr.relid; p->join.relfilenode=right->expr.relfilenode;
@@ -1996,19 +2027,26 @@ static int64_t index_next(struct execution *s,unsigned id,struct qs_cell *row)
         *output=(struct qs_chunk){.capacity=256,.ncols=p->ncols};
     }
     for(;;) {
-        if(o->index_position<o->index_output->rows) {
-            memcpy(row,o->index_output->data[o->index_position++].cells,n->expr.nout*sizeof(*row)); return 2;
+        if(!b) {
+            if(o->index_position<o->index_output->rows) {
+                memcpy(row,o->index_output->data[o->index_position++].cells,n->expr.nout*sizeof(*row)); return 2;
+            }
+            o->index_output->rows=0; o->index_position=0;
         }
-        o->index_output->rows=0; o->index_position=0;
         if(o->phase==2) {
             while(o->index_unmatched<o->index_count) {
                 unsigned at=o->index_unmatched++;
                 if((n->join_type!=QP_LEFT && n->join_type!=QP_ANTI) || (o->index_matches&(UINT64_C(1)<<at))) continue;
                 struct qs_cell values[QS_COLS]; memcpy(values,o->index_left+(size_t)at*ln,ln*sizeof(*values));
                 for(unsigned i=0;i<right->expr.nout;++i) values[ln+i]=(struct qs_cell){.isnull=1};
-                int count=project(s,n,values,NULL,row); if(count<0) return count; if(count) return 2;
+                if(b) {
+                    projection_append(b,values);
+                } else {
+                    int count=project(s,n,values,NULL,row); if(count<0) return count; if(count) return 2;
+                }
             }
             o->index_count=0; o->phase=0;
+            if(b && b->input_count) return 2;
         }
         if(!o->phase) {
             unsigned batch=n->sorted_input?1:64;
@@ -2017,7 +2055,7 @@ static int64_t index_next(struct execution *s,unsigned id,struct qs_cell *row)
                 if(status==QP_WAIT || status<0 || status>2) return status;
                 if(!status) o->input_done=1; else ++o->index_count;
             }
-            if(!o->index_count) return 0;
+            if(!o->index_count) { o->finished=1; return 0; }
             o->index_matches=0; o->index_resume=0; o->index_flush=0; o->index_unmatched=0; o->phase=1;
             struct qs_chunk *input=(void *)(s->arena+vector_offset(s,n));
             input->rows=input->selected=o->index_count; memset(qs_nulls(input),0,16);
@@ -2046,10 +2084,10 @@ static int64_t index_next(struct execution *s,unsigned id,struct qs_cell *row)
             uint64_t end=s->nodes[scan].position,begin=(end-1)/s->plan->scan_bytes*s->plan->scan_bytes;
             qs_index_heap_window(&o->index_control,0,s->arena+input_offset(s,&s->plan->nodes[scan]),begin/QS_PAGE,(end-begin)/QS_PAGE);
         }
-        index_execution=s; index_node=id;
+        index_execution=s; index_node=id; index_columns=b;
         int64_t status=qs_index_probe(0,mr[0],p,&o->index_task,&o->index_control,&a,o->index_resume);
-        o->index_resume=1;
-        if(status==QP_INDEX_YIELD) continue;
+        index_columns=NULL; o->index_resume=1;
+        if(status==QP_INDEX_YIELD) { if(b) return 2; continue; }
         if(status==QS_INDEX_WAIT && o->index_task.index_pending) {
             s->control->node=id; s->control->index_nreads=o->index_task.index_nreads;
             memcpy(s->control->index_reads,o->index_task.index_reads,s->control->index_nreads*sizeof(s->control->index_reads[0]));
@@ -2077,13 +2115,13 @@ static int64_t next_row_impl(struct execution *s,unsigned id,struct qs_cell *row
     }
     if(o->finished && (!o->projection || o->projection->position==o->projection->count)) return 0;
     if(!s->worker && s->plan->workers>1 && n->parallel) return parallel_next(s,id,row);
-    if(n->kind==QP_SCAN || (n->kind==QP_PROJECT && n->left>=0) || (n->kind==QP_JOIN && n->hash)) {
+    if(n->kind==QP_SCAN || (n->kind==QP_PROJECT && n->left>=0) || (n->kind==QP_JOIN && n->hash) || n->kind==QP_INDEX_JOIN) {
         int status=projection_init(s,id); if(status) return status;
         if(o->projection) return projection_next(s,id,row);
     }
     if(n->kind==QP_SCAN) return scan_next(s,id,row);
     if(n->kind==QP_JOIN) return n->hash?hash_next(s,id,row):join_next(s,id,row);
-    if(n->kind==QP_INDEX_JOIN) return index_next(s,id,row);
+    if(n->kind==QP_INDEX_JOIN) return index_next(s,id,row,NULL);
     if(n->kind==QP_AGGREGATE) return aggregate_next(s,id,row);
     if(n->kind==QP_PROJECT && n->left<0) {
         if(o->emitted++) return 0;

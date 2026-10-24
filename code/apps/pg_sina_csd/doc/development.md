@@ -464,3 +464,11 @@ Hash匹配链推进与结果投影分开，按所需列收集256行批次，接�
 无过滤Scan的字符串payload借用当前Heap字节窗口，仅匹配后才物化；字符串键仍物化。Index消费者需要保留窗口时先交出已有批次，Index自身的逐行/I/O生产边界暂不穿透。PG保持Join树，对合法的单聚合分组选择有界Hash并保留函数依赖输出字段及HAVING语义。宽键初始容量使用真实分组估计，但遇未完成的阻塞子节点先从小表起步，避免父表预占子节点预算。
 
 12项设备CTest与Guest布局测试通过，含混合scale、128位payload、字符串未匹配不入字典、LIMIT错误时机、聚合结果探测、Hash→Index跨块、8/16/64槽及4MiB预算spill回收。最终规范22条冷启动均正确、整条卸载且快于同轮host（52.720s→24.355s）；原始记录为results/tpch.qn4rAB。Q10总CSF CPU与Scan CPU均明显下降，Q18无spill、峰值约196MiB，FDM仍64MiB。详细当前证据与未完成边界见performance.md。没有增加固件SQL逻辑、SNIA/NVMe协议或配置项。
+
+## Index Join列输出与接续（2026-10-25）
+
+参照DuckDB Join在匹配游标之外交付结果批次的处理（`physical_nested_loop_join.cpp` 的结果Slice和HAVE_MORE_OUTPUT），计划执行器让Index消费者直接收集融合表达式所需的列。匹配链、Outer/Anti未匹配尾部与列数据分别保留；Semi仍逐候选更新skip标记，最多汇集本次64个输入键对应的左行后执行向量表达式。列化路径不再分配Index逐行结果缓冲，分配失败或表达式不支持时仍使用原接口。所有新增工作区计入原查询workmem，FDM未扩容。
+
+Index可以位于Hash/Project/聚合的列生产链中；Heap窗口优化只沿不含Index的Scan/Hash/Project链判断。Index可能尚有查找或I/O待推进，不能凭远端Scan行已耗尽提前宣布边界。已收集输出前缀的后续错误延迟到前缀消费后报告，EOF也必须记录到生产者，防止释放列批次后误走未初始化的逐行缓冲。
+
+NativePlan与8/16/64 CU测试通过，覆盖多层Index/Hash、NULL外连接、重复键、宽numeric、LIMIT错误时机、4MiB预算及清理。规范Q2/Q8/Q17/Q18/Q21针对性冷启动回归全部正确、整条卸载并快于同轮host；本阶段没有重复完整TPC-H，当前证据见performance.md。PG、SNIA、FEMU本阶段均未增加接口或SQL语义。

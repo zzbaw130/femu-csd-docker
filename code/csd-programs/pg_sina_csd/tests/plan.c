@@ -12,7 +12,7 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 typedef int64_t (*function)(struct femu_csd_args *);
-enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_INDEX_PIPELINE,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL, TEST_VECTOR_AGG=-1 };
+enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_INDEX_PIPELINE,TEST_INDEX_HASH,TEST_INDEX_CHAIN,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL, TEST_VECTOR_AGG=-1 };
 static unsigned test_workers=4;
 static bool test_scheduled;
 static void w16(void *p,uint16_t x) { memcpy(p,&x,2); }
@@ -150,7 +150,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     }
     struct qp_node *j=&plan->nodes[1]; j->kind=QP_JOIN; j->left=2; j->right=3; j->join_type=join; j->join_qual=-1;
     j->hash=hash==1;
-    if(parallel==TEST_WIDE_HASH) {
+    if(parallel==TEST_WIDE_HASH && hash!=2) {
         /* Fuse a second projection over a genuine int128 scan expression.
          * It must keep the wide payload and numeric display scale. */
         plan->count=5; j->right=4;
@@ -180,6 +180,14 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         probe->kind=QP_JOIN; probe->hash=1; probe->join_type=QP_SEMI; probe->expr.nout=2;
         j->left=4;
     }
+    if(parallel==TEST_INDEX_HASH || parallel==TEST_INDEX_CHAIN) {
+        /* An Index SEMI output is consumed by a Hash Join as columns, with
+         * duplicate matches spanning many index chunks and Heap windows. */
+        assert(hash==2 && join==QP_INNER); plan->count=5;
+        struct qp_node *probe=&plan->nodes[4]; *probe=*j;
+        probe->join_type=QP_SEMI; probe->expr.nout=2;
+        j->kind=QP_JOIN; j->hash=1; j->left=4;
+    }
     struct qp_node *a=&plan->nodes[0]; a->kind=QP_AGGREGATE; a->left=1; a->right=-1; a->nkeys=1; a->left_keys[0]=0;
     a->expr.predicate=-1; a->expr.work_mem_bytes=(uint64_t)memory*1024*1024; a->expr.nattrs=3; a->expr.nexprs=9;
     for(unsigned i=0;i<3;++i) a->expr.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER,.column=i};
@@ -193,6 +201,19 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     for(unsigned i=0;i<5;++i) {
         a->expr.exprs[3+i]=(struct qs_expr){.op=Q_AGGREF,.column=i,.type=i==4?Q_DECIMAL:Q_INTEGER};
         a->expr.outputs[i+1]=(struct qs_output){.index=3+i,.type_oid=i==4?1700:20};
+    }
+    if(parallel==TEST_INDEX_CHAIN) {
+        /* The upper Index consumer must not flush Hash's partial columns
+         * while the lower Index cursor still owns a pending lookup batch. */
+        plan->count=7; plan->nodes[6]=plan->nodes[3];
+        struct qp_node *outer=&plan->nodes[5]; *outer=plan->nodes[4];
+        outer->left=1; outer->right=6; outer->expr.nattrs=5;
+        outer->expr.nexprs=outer->expr.nout=3;
+        for(unsigned i=0;i<3;++i) {
+            outer->expr.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER,.column=i};
+            outer->expr.outputs[i]=(struct qs_output){.index=i,.type_oid=23};
+        }
+        a->left=5;
     }
     if(parallel==TEST_VECTOR_AGG) {
         /* A nullable CASE projection feeds all five local aggregate kinds. */
@@ -236,23 +257,25 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         plan->nodes[i].bytes=sizes[i-2]; plan->nodes[i].input_offset=bytes; bytes+=plan->scan_bytes;
         plan->nodes[i].vector_offset=bytes; bytes+=(qs_chunk_bytes(plan->scan_bytes/24,2)+4095)&~(size_t)4095;
     }
-    if(parallel==TEST_BUILD_FALLBACK) {
+    if(parallel==TEST_BUILD_FALLBACK || parallel==TEST_INDEX_CHAIN) {
         plan->nodes[6].bytes=plan->nodes[3].bytes;
         plan->nodes[6].input_offset=plan->nodes[3].input_offset;
         plan->nodes[6].vector_offset=plan->nodes[3].vector_offset;
     }
-    if(hash==2) {
-        j->input_offset=bytes; bytes+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE;
-        j->vector_offset=bytes; bytes+=4096+((qs_chunk_bytes(256,4)+4095)&~(size_t)4095);
+    for(unsigned i=0;i<plan->count;++i) if(plan->nodes[i].kind==QP_INDEX_JOIN) {
+        struct qp_node *indexed=&plan->nodes[i];
+        indexed->input_offset=bytes; bytes+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE;
+        indexed->vector_offset=bytes; bytes+=4096+((qs_chunk_bytes(256,4)+4095)&~(size_t)4095);
     }
     size_t parallel_bytes=bytes;
     if(parallel && parallel!=TEST_PARTITION_SERIAL) {
-        plan->workers=test_workers; plan->nodes[1].parallel=1;
+        plan->workers=test_workers; plan->nodes[parallel==TEST_INDEX_CHAIN?5:1].parallel=1;
         plan->nodes[2].parallel_input=parallel_bytes; parallel_bytes+=plan->scan_bytes;
         plan->nodes[2].parallel_vector=parallel_bytes; parallel_bytes+=(qs_chunk_bytes(plan->scan_bytes/24,2)+4095)&~(size_t)4095;
-        if(hash==2) {
-            j->parallel_input=parallel_bytes; parallel_bytes+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE;
-            j->parallel_vector=parallel_bytes; parallel_bytes+=4096+((qs_chunk_bytes(256,4)+4095)&~(size_t)4095);
+        for(unsigned i=0;i<plan->count;++i) if(plan->nodes[i].kind==QP_INDEX_JOIN) {
+            struct qp_node *indexed=&plan->nodes[i];
+            indexed->parallel_input=parallel_bytes; parallel_bytes+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE;
+            indexed->parallel_vector=parallel_bytes; parallel_bytes+=4096+((qs_chunk_bytes(256,4)+4095)&~(size_t)4095);
         }
         if(parallel==TEST_BUILD_PHASE || parallel==TEST_BUILD_FALLBACK) {
             plan->nodes[3].parallel=1;
@@ -533,7 +556,7 @@ static void nested_sort(function run,unsigned type,unsigned hash,unsigned kind)
 struct expected_multi { unsigned a,b,rows,count; int64_t sum; };
 /* Prehashed future rows must not raise errors past LIMIT, while an input
  * row actually requested must raise its payload error even if it cannot join. */
-static void probe_payload(function run,unsigned limit,int strings)
+static void probe_payload(function run,unsigned limit,int strings,int indexed)
 {
     struct qp_plan *p=calloc(1,sizeof(*p)); assert(p); p->count=4; p->scan_bytes=QP_SCAN_BYTES;
     scan(&p->nodes[2]); scan(&p->nodes[3]);
@@ -555,8 +578,19 @@ static void probe_payload(function run,unsigned limit,int strings)
     j->expr.exprs[1].type=strings?Q_STRING:Q_DECIMAL; j->expr.outputs[1].type_oid=strings?25:1700;
     struct qp_node *top=&p->nodes[0]; top->kind=QP_LIMIT; top->left=1; top->right=-1;
     top->expr=j->expr; top->expr.limit=limit; top->expr.work_mem_bytes=64U*1024*1024;
+    if(indexed) {
+        /* The right projection fails only after the first valid index match.
+         * LIMIT must consume that prefix before observing the later error. */
+        assert(!strings); p->nodes[3].expr=*left;
+        p->nodes[3].expr.exprs[2].constant=1;
+        left->nexprs=2; left->outputs[1]=(struct qs_output){.index=1,.type_oid=23};
+        j->kind=QP_INDEX_JOIN; j->hash=0; j->expr.exprs[1].column=3;
+        p->nodes[3].expr.join=(struct qs_join){.indexid=1,.indexroot=1,.index_key_bytes=4,.build_key=0};
+    }
     size_t sizes[2],bytes=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
-    unsigned char *raw[2]={heap(2,2,&sizes[0]),heap(1,2,&sizes[1])};
+    unsigned char *raw[2]={heap(2,2,&sizes[0]),heap(indexed?3:1,2,&sizes[1])};
+    unsigned char *index=indexed?index_page(3):NULL;
+    if(indexed) for(unsigned r=0;r<2;++r) w32(raw[0]+QS_PAGE-(r+1)*40+24,r+1);
     if(strings) for(unsigned r=0;r<2;++r) {
         unsigned char *tuple=raw[0]+QS_PAGE-(r+1)*40;
         tuple[28]=(5U<<1)|1U; memcpy(tuple+29,r?"skip":"keep",4);
@@ -564,6 +598,10 @@ static void probe_payload(function run,unsigned limit,int strings)
     for(unsigned i=2;i<4;++i) {
         struct qp_node *n=&p->nodes[i]; n->bytes=sizes[i-2]; n->input_offset=bytes; bytes+=QP_SCAN_BYTES;
         n->vector_offset=bytes; bytes+=qs_chunk_bytes(QP_SCAN_BYTES/24,2);
+    }
+    if(indexed) {
+        j->input_offset=bytes; bytes+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE;
+        j->vector_offset=bytes; bytes+=4096+qs_chunk_bytes(256,4);
     }
     unsigned char *arena=calloc(1,bytes),*io=calloc(1,QS_SORT_IO_BYTES); assert(arena && io);
     *(struct qs_dict *)arena=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
@@ -575,7 +613,14 @@ static void probe_payload(function run,unsigned limit,int strings)
     do {
         status=run(&args); if(status<0) break;
         assert(!status);
-        if(control.bytes && !control.ready) {
+        if(control.index_nreads && !control.ready) {
+            for(unsigned i=0;i<control.index_nreads;++i) {
+                const struct qs_index_read *r=&control.index_reads[i];
+                memcpy(arena+j->input_offset+QS_SORT_IO_BYTES+(size_t)r->slot*QS_PAGE,
+                    (r->heap?raw[1]:index)+(size_t)r->block*QS_PAGE,QS_PAGE);
+            }
+            control.ready=1;
+        } else if(control.bytes && !control.ready) {
             struct qp_node *n=&p->nodes[control.node];
             memcpy(arena+n->input_offset,raw[control.node-2]+control.offset,control.bytes); control.ready=1;
         }
@@ -585,12 +630,12 @@ static void probe_payload(function run,unsigned limit,int strings)
         assert(!memcmp(qs_cell_string_bytes(&out->data[0].cells[1]),"keep",4));
         assert(((struct qs_dict *)arena)->count==1); /* unmatched "skip" was never interned */
     } else if(limit==1) {
-        assert(!status && out->rows==1 && out->data[0].cells[0].value==0);
+        assert(!status && out->rows==1 && out->data[0].cells[0].value==(indexed?1:0));
         assert(out->data[0].cells[1].value==(__int128)INT64_MAX*INT64_MAX);
     }
     else { assert(status==-5); control.close=1; assert(!run(&args)); }
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
-    free(raw[0]); free(raw[1]); free(arena); free(io); free(out); free(p);
+    free(raw[0]); free(raw[1]); free(index); free(arena); free(io); free(out); free(p);
 }
 /* A grouped probe must join its final SUM, not expose the aggregate's
  * internal input vectors as ordinary rows. */
@@ -853,6 +898,7 @@ int main(int argc,char **argv)
             test(run,join,20003,23,256,1,TEST_BUILD_PHASE);
         test(run,QP_INNER,31,50003,256,1,TEST_BUILD_PHASE);
         test(run,QP_LEFT,20003,23,256,1,TEST_HASH_GROUP);
+        test(run,QP_LEFT,20003,23,256,2,TEST_HASH_GROUP);
         multiple_groups(run,256,Q_SUM,0,test_workers);
         multiple_groups(run,256,Q_AVG,1,test_workers);
         multiple_groups(run,256,Q_COUNT,0,test_workers);
@@ -860,7 +906,8 @@ int main(int argc,char **argv)
         return 0;
     }
     assert(!cs_work_init(64*1024*1024));
-    probe_payload(run,1,0); probe_payload(run,2,0); probe_payload(run,2,1); grouped_probe(run);
+    probe_payload(run,1,0,0); probe_payload(run,2,0,0); probe_payload(run,2,1,0);
+    probe_payload(run,1,0,1); probe_payload(run,2,0,1); grouped_probe(run);
     test_scheduled=true;
     test(run,QP_INNER,20003,23,64,1,TEST_VECTOR_AGG);
     test(run,QP_INNER,0,23,64,1,TEST_VECTOR_AGG);
@@ -888,10 +935,16 @@ int main(int argc,char **argv)
     test(run,QP_INNER,31,50003,64,1,TEST_BUILD_PHASE);
     test(run,QP_ANTI,31,50003,4,1,TEST_BUILD_PHASE);
     test(run,QP_INNER,20003,23,64,2,TEST_INDEX_PIPELINE);
+    test(run,QP_INNER,20003,23,64,2,TEST_INDEX_HASH);
+    test(run,QP_INNER,20003,23,4,2,TEST_INDEX_HASH);
+    test(run,QP_INNER,20003,23,64,2,TEST_INDEX_CHAIN);
+    test(run,QP_INNER,20003,23,4,2,TEST_INDEX_CHAIN);
+    test(run,QP_LEFT,20003,23,4,2,TEST_HASH_GROUP);
     test(run,QP_INNER,120000,23,8,1,TEST_PARALLEL);
     test(run,QP_INNER,120000,23,8,1,TEST_LARGE_SCAN);
     test(run,QP_INNER,5170,23,64,1,TEST_COUNT_ROWS);
     test(run,QP_LEFT,23,23,64,1,TEST_WIDE_HASH);
+    test(run,QP_LEFT,23,23,64,2,TEST_WIDE_HASH);
     test(run,QP_LEFT,23,23,64,1,TEST_SIGNED_HASH);
     test(run,QP_LEFT,23,23,64,1,TEST_BIGINT_HASH);
     test(run,QP_LEFT,5170,23,4,1,TEST_HASH_GROUP);
