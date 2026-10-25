@@ -51,7 +51,7 @@ struct qs_join {
     unsigned nattrs;
     int build_key, probe_key, predicate;
     int build_key2, probe_key2; /* Optional second integer equality key. */
-    int semi; /* 1: evaluate EXISTS here; -1: the native-Plan consumer confirms a match. */
+    int semi; /* 1: local EXISTS; -1: scalar consumer confirms; -2: column consumer confirms per key round. */
     int left_pad; /* Emit one NULL-build row per probe row (left join count). */
     int residual; /* Joined-row predicate index + 1; 0 means no residual. */
     uint64_t rows, work_mem_bytes;

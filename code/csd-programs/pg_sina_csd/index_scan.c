@@ -328,7 +328,7 @@ int64_t qs_index_probe(unsigned stage,struct qs_chunk *c,const struct qs_plan *p
             }
             if(!cursor->count) break;
         }
-        unsigned done=0;
+        unsigned done=0,candidates=0;
         for(unsigned k=0;k<cursor->count;++k) {
             struct lookup *key=&cursor->keys[k];
             while(key->phase!=4) {
@@ -382,12 +382,20 @@ int64_t qs_index_probe(unsigned stage,struct qs_chunk *c,const struct qs_plan *p
                     }
                     ++task->index_tuples; key->phase=j->semi>0?4:2;
                     qs_selection(out)[dest]=dest; ++out->rows; ++out->selected;
-                    if(j->semi<0 || out->rows==out->capacity) { int64_t status=flush(stage,out,p,task,control,a,cursor,0); if(status) return status; }
+                    if(j->semi==-1 || out->rows==out->capacity) { int64_t status=flush(stage,out,p,task,control,a,cursor,0); if(status) return status; }
+                    /* Let each unresolved key contribute one candidate per
+                     * round. The consumer can filter them together, then
+                     * qs_index_skip stops only keys with an accepted match. */
+                    if(j->semi==-2) { ++candidates; break; }
                 }
             }
             done+=key->phase==4;
         }
+        if(j->semi==-2 && out->rows) {
+            int64_t status=flush(stage,out,p,task,control,a,cursor,0); if(status) return status;
+        }
         if(done==cursor->count) { cursor->count=0; continue; }
+        if(candidates && !task->index_nreads) continue;
         if(!task->index_nreads) return -2;
         cursor->waiting=1; task->index_pending=1; task->index_pages+=task->index_nreads;
         return QS_INDEX_WAIT;

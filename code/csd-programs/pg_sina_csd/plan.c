@@ -2023,7 +2023,6 @@ static int64_t aggregate_next(struct execution *s,unsigned id,struct qs_cell *ro
 static void index_projection_init(struct execution *s,unsigned id)
 {
     const struct qp_node *n=&s->plan->nodes[id],*right=&s->plan->nodes[n->right];
-    if(n->join_type==QP_SEMI || n->join_type==QP_ANTI) return;
     int useful=right->expr.predicate>=0;
     for(unsigned i=0;i<right->expr.nout;++i)
         useful|=right->expr.exprs[right->expr.outputs[i].index].op!=Q_COLUMN;
@@ -2135,9 +2134,9 @@ int64_t qs_join_consume(unsigned stage,struct qs_chunk *chunk,const struct qs_pl
         }
     }
     if(n->join_type==QP_SEMI || n->join_type==QP_ANTI) qs_index_skip(&o->index_control,0,o->index_matches);
-    /* SEMI callbacks inspect one candidate at a time so they can skip its
-     * remaining matches. Gather the accepted left rows until the lookup batch
-     * finishes, rather than running the vector DAG for every single match. */
+    /* SEMI candidates arrive in rounds over unresolved lookup keys. Gather
+     * accepted left rows until the lookup batch finishes, preserving its
+     * early match skip without running the output DAG per candidate. */
     unsigned rows=b?b->input_count:o->index_output->rows;
     if(rows && (!b || n->join_type!=QP_SEMI)) {
         o->index_flush=1; return QP_INDEX_YIELD;
@@ -2157,7 +2156,7 @@ static int64_t index_next(struct execution *s,unsigned id,struct qs_cell *row,st
         p->work_mem_parent=(uintptr_t)s->context;
         p->join=right->expr.join; p->join.relid=right->expr.relid; p->join.relfilenode=right->expr.relfilenode;
         p->join.nattrs=right->expr.nattrs;
-        p->join.semi=n->join_type==QP_SEMI || n->join_type==QP_ANTI?-1:0;
+        p->join.semi=n->join_type==QP_SEMI || n->join_type==QP_ANTI?(b?-2:-1):0;
         p->join.probe_key=0; p->join.predicate=-1; p->join.work_mem_bytes=QS_INDEX_WORK_BYTES;
         ++p->join.build_key;
         p->cols[0]=(struct qs_column){.slot=0,.type=Q_INTEGER,.length=8,.align=8};
