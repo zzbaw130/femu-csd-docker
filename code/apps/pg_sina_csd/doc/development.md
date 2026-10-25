@@ -495,6 +495,14 @@ NativePlan与8/16/64 CU测试通过，覆盖多层Index/Hash、NULL外连接、�
 
 Q18 customer构建profile墙钟846.351→338.897ms、累计CPU2935.097→1186.894ms；workmem峰值完全相同且无spill，确认改善来自竞争减少。没有改PG/SNIA/FEMU接口、预算或FDM容量。当前普通延迟和原始记录见performance.md，字典spill及其他逐行边界仍未完成。
 
+## 分组计数预约与缓存行隔离（2026-10-25）
+
+共享分组新键用原子fetch_add预约，超出原7/8容量阈值时fetch_sub归还，释放当前空桶后返回未消费输入，不改变扩容或spill边界。计数器从容量/步长附近移至查询根context的一次128字节申请中，按本机64字节缓存行对齐，避免各CU写计数时反复干扰只读表元数据。计数区及指针状态计入查询workmem，resize保持同一计数器，flush在原屏障后归零，关闭context统一回收。
+
+原生和8/16/64 CU四项CTest、ASan/UBSan/LeakSanitizer两项检查通过，含低估基数、满表接续、4MiB spill、五聚合与清理。已重编部署pg-sina-plan.so，不改PG/SNIA/固件、公开接口或FDM。规范Q2/Q18修改前后各三次独立冷启动profile中，Q18分组sink CPU中位3733.645→1859.809ms，总CPU6791.659→5024.531ms，查询树1972.253→1778.588ms；内存峰值只增加数KiB，均无spill。
+
+关闭profile的规范Q2/Q18/Q12冷启动均正确、完整卸载且快于同轮host，未重复完整22条。CPU计时包含争用开销，减少它可能降低平均活跃CU，不以忙等制造的CPU占比作为并行收益。当前原始记录与边界见performance.md。
+
 ## MIN/MAX并行哈希分组（2026-10-25）
 
 参考DuckDB MIN/MAX忽略NULL、保留极值并合并部分状态的方式，扩展既有分组值/count状态。SUM/AVG仍累加，MIN/MAX用同一PG比较原语选择极值；局部批次、共享表和spill归并统一调用更新函数。字符串保存查询字典ID，比较文本内容，最终输出才转换为文本，不新增状态布局、SNIA接口或固件SQL语义。私有能力检查允许MIN/MAX与SUM/AVG/COUNT组合，仍受原16列部分状态行宽限制。

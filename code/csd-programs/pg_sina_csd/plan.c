@@ -132,7 +132,7 @@ struct operator_state {
     struct external_hash *external;
     struct compact_group *groups;
     unsigned group_capacity,group_flush,group_phase,group_stride,group_integer;
-    atomic_uint group_count;
+    atomic_uint *group_count;
     struct set_key *set;
     unsigned set_capacity,set_count;
     int set_null,set_ready;
@@ -1625,14 +1625,15 @@ retry_bucket:
                 memory_order_acquire,memory_order_relaxed)) goto retry_bucket;
         }
         if(!old) {
-            unsigned count=atomic_load_explicit(&o->group_count,memory_order_relaxed);
-            do {
-                if(count>=o->group_capacity*7/8) {
-                    if(shared) atomic_store_explicit(&g->occupied,0,memory_order_release);
-                    return 0;
-                }
-            } while(!atomic_compare_exchange_weak_explicit(&o->group_count,&count,count+1,
-                memory_order_relaxed,memory_order_relaxed));
+            /* Reserve once instead of making independent bucket creators
+             * retry CAS on the same cache line. Failed reservations are
+             * returned before the CU reports its unconsumed input. */
+            unsigned count=atomic_fetch_add_explicit(o->group_count,1,memory_order_relaxed);
+            if(count>=o->group_capacity*7/8) {
+                atomic_fetch_sub_explicit(o->group_count,1,memory_order_relaxed);
+                if(shared) atomic_store_explicit(&g->occupied,0,memory_order_release);
+                return 0;
+            }
             g->key=wide?(int64_t)hash:key.isnull?0:key.value;
             for(unsigned a=0;a<n->expr.naggs;++a) g->values[a].sum.isnull=1;
             if(wide && o->group_integer) {
@@ -1784,6 +1785,15 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
     if(!qp_hash_aggregate_supported(n)) { n->hash=0; return aggregate_next(s,id,row); }
     int wide=n->nkeys!=1 || n->expr.exprs[n->expr.keys[0]].type!=Q_INTEGER;
     if(!o->group_capacity) {
+        /* Keep the insertion counter away from read-mostly capacity/stride
+         * fields. The root context owns this small aligned allocation until
+         * query close; table resize does not move it or change its count. */
+        if(!o->group_count) {
+            void *storage=cs_work_alloc(s->context,128);
+            if(!storage) { n->hash=0; return aggregate_next(s,id,row); }
+            o->group_count=(void *)(((uintptr_t)storage+63)&~(uintptr_t)63);
+            atomic_init(o->group_count,0);
+        }
         struct cs_work_context_stats memory;
         if(cs_work_get_context_stats(s->context,&memory)) return -4;
         size_t available=memory.limit_bytes-memory.used_bytes,reserve=group_reserve(s,n);
@@ -1889,7 +1899,8 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
                 o->group_phase=2;
             } else {
                 memset(o->groups,0,(size_t)o->group_capacity*o->group_stride);
-                o->group_count=o->group_flush=0; o->group_phase=0;
+                atomic_store_explicit(o->group_count,0,memory_order_relaxed);
+                o->group_flush=0; o->group_phase=0;
             }
             continue;
         }
