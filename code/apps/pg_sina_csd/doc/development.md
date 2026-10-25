@@ -495,6 +495,14 @@ NativePlan与8/16/64 CU测试通过，覆盖多层Index/Hash、NULL外连接、�
 
 Q18 customer构建profile墙钟846.351→338.897ms、累计CPU2935.097→1186.894ms；workmem峰值完全相同且无spill，确认改善来自竞争减少。没有改PG/SNIA/FEMU接口、预算或FDM容量。当前普通延迟和原始记录见performance.md，字典spill及其他逐行边界仍未完成。
 
+## 多聚合并行哈希分组（2026-10-25）
+
+参照DuckDB分组条目内按实际聚合数排列状态的做法，将原固定单SUM/count条目改为分组头、多个SUM/count、必要的分组键。单聚合整数键条目仍为64字节；所有状态、增长的新旧表及spill区都计入原查询workmem。一次定位和短锁更新全部聚合，列批次分别导入参数，COUNT(*)不读取参数，nullable COUNT不累计NULL，AVG只在最终输出时除法。
+
+spill行保存分组键及各聚合的SUM/count，沿用原有排序归并、重入和回收；不回写原始明细。PG与设备共用私有能力检查，保证分组键数加两倍聚合数不超出16列中间行容量。PG允许多个SUM/AVG/COUNT的Hash Group，验证全部AGGREF，保留原连接树与聚合后排序；MIN/MAX、复杂DISTINCT及过宽组合保留原路径。SNIA与固件无SQL变化。
+
+新增三聚合测试覆盖多键、NULL、SUM/AVG、两种COUNT、增长、4MiB spill和清理，并断言并行查询的实际workmem峰值不超过预算。NativePlan与8/16/64 CU、Guest布局测试通过；ASan/UBSan/LeakSanitizer原生及8CU测试通过，同时修正两处测试夹具对齐。已部署PG扩展与pg-sina-plan.so，规范Q12/Q22/Q18冷启动正确、完整卸载且快于同轮host。本阶段未重复完整TPC-H，计时与边界见performance.md。
+
 ## 文本表达式接入融合列批次（2026-10-25）
 
 参照DuckDB在Join匹配批次上继续执行投影和选择表达式的路径，计划执行器不再拒绝向量引擎已实现的LIKE、三参数SUBSTRING和字符串有序比较。导入SUBSTRING的长度依赖，复用原字典常量绑定、文本视图、按分支活跃行执行及逐行错误标记。没有新增参数、缓冲管理机制或固件SQL逻辑，设备向量工作区仍计入查询workmem。

@@ -613,7 +613,7 @@ static bool group_output(struct qs_plan *p,int index,struct qp_node *n,bool reta
         p->keys[p->nkeys++]=index; n->left_keys[n->nkeys++]=x->column;
         return true;
     }
-    if(x->op==Q_AGGREF) return x->column==0;
+    if(x->op==Q_AGGREF) return x->column>=0 && (unsigned)x->column<p->naggs;
     if(x->op==QP_PARAMETER) return true;
     if(x->op==Q_NOT || x->op==Q_IS_NULL || x->op==Q_IS_NOT_NULL)
         return group_output(p,x->left,n,retain);
@@ -976,17 +976,15 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
     }
     /* Keep PG HashAggregate or replace grouping-only sorting with bounded
      * states. Required output order is reapplied above the aggregate. */
-    if(n->kind==QP_AGGREGATE && n->nkeys && p->naggs==1 && !n->distinct && !n->distinct_aggs &&
+    if(n->kind==QP_AGGREGATE && qp_hash_aggregate_supported(n) && !n->distinct && !n->distinct_aggs &&
        p->having<0 && n->left>=0 && (tree->nodes[n->left].kind==QP_SORT ||
         (!ordered && IsA(native,Agg) && ((Agg *)native)->aggstrategy==AGG_HASHED))) {
         bool remove_sort=tree->nodes[n->left].kind==QP_SORT;
         int sort_id=n->left,input=remove_sort?tree->nodes[sort_id].left:n->left;
-        unsigned kind=p->aggs[0].kind;
         /* Hash and Index joins both expose resumable column input to the sink. */
         bool supported=input>=0 && (!remove_sort || tree->nodes[input].kind==QP_JOIN ||
             tree->nodes[input].kind==QP_INDEX_JOIN ||
-            (tree->nodes[input].kind==QP_SCAN && !tree->nodes[input].ordered_index)) &&
-            (kind==Q_COUNT_STAR || ((kind==Q_SUM || kind==Q_AVG || kind==Q_COUNT) && p->aggs[0].expr>=0));
+            (tree->nodes[input].kind==QP_SCAN && !tree->nodes[input].ordered_index));
         const struct qs_plan *sorted=&tree->nodes[n->left].expr;
         if(remove_sort && input>=0) {
             if(sorted->nout!=tree->nodes[input].expr.nout) supported=false;
@@ -1090,12 +1088,11 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
      * serializing an unfiltered Heap scan through a non-covering index.
      * Keep PG's join tree and the input target list; use bounded Hash Group. */
     if(n->kind==QP_AGGREGATE && !ordered && n->sorted_input && n->nkeys &&
-       p->naggs==1 && !n->distinct && !n->distinct_aggs && p->having<0 && n->left>=0) {
+       qp_hash_aggregate_supported(n) && !n->distinct && !n->distinct_aggs && p->having<0 && n->left>=0) {
         struct qp_node *input=&tree->nodes[n->left];
-        unsigned kind=p->aggs[0].kind;
         bool sorting=input->kind==QP_SORT && input->expr.limit<0 && !input->expr.offset;
         bool index=input->kind==QP_SCAN && input->ordered_index && !(input->ordered_index&4) && input->expr.predicate<0;
-        bool supported=(sorting || index) && (kind==Q_SUM || kind==Q_AVG || kind==Q_COUNT || kind==Q_COUNT_STAR);
+        bool supported=sorting || index;
         unsigned keys=n->nkeys,plan_keys=p->nkeys;
         /* PG has already validated that non-aggregate output attributes are
          * functionally dependent on the grouping keys. Retain them as extra
@@ -1104,6 +1101,7 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
         for(unsigned i=0;supported && i<p->nout;++i)
             supported=group_output(p,p->outputs[i].index,n,sorting);
         if(supported && p->predicate>=0) supported=group_output(p,p->predicate,n,sorting);
+        if(supported) supported=qp_hash_aggregate_supported(n);
         if(supported) {
             if(sorting) { input->kind=QP_PROJECT; input->expr.norder=0; }
             else { input->ordered_index=0; memset(&input->expr.join,0,sizeof(input->expr.join)); }

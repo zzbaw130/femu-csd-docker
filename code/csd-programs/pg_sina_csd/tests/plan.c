@@ -692,6 +692,7 @@ static void probe_payload(function run,unsigned limit,int strings,int indexed)
     for(unsigned i=2;i<4;++i) {
         struct qp_node *n=&p->nodes[i]; n->bytes=sizes[i-2]; n->input_offset=bytes; bytes+=QP_SCAN_BYTES;
         n->vector_offset=bytes; bytes+=qs_chunk_bytes(QP_SCAN_BYTES/24,2);
+        bytes=(bytes+7)&~(size_t)7;
     }
     if(indexed) {
         j->input_offset=bytes; bytes+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE;
@@ -760,6 +761,7 @@ static void grouped_probe(function run)
     for(unsigned i=3;i<5;++i) {
         struct qp_node *n=&p->nodes[i]; n->bytes=sizes[i-3]; n->input_offset=bytes; bytes+=QP_SCAN_BYTES;
         n->vector_offset=bytes; bytes+=qs_chunk_bytes(QP_SCAN_BYTES/24,2);
+        bytes=(bytes+7)&~(size_t)7;
     }
     unsigned char *arena=calloc(1,bytes),*io=calloc(1,QS_SORT_IO_BYTES); assert(arena && io);
     *(struct qs_dict *)arena=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
@@ -786,7 +788,7 @@ static int multi_order(const void *ap,const void *bp)
     if(a->b==17 || b->b==17) return (a->b==17)-(b->b==17);
     return (a->b<b->b)-(a->b>b->b);
 }
-static void multiple_groups(function run,unsigned memory,unsigned kind,int integer_keys,unsigned workers)
+static void multiple_group_aggregates(function run,unsigned memory,unsigned kind,int integer_keys,unsigned workers,int counts)
 {
     unsigned scan_bytes=workers>4?QS_PAGE:QP_SCAN_BYTES;
     unsigned rows=50003,total=1022*18,groups=0; size_t raw_bytes;
@@ -844,10 +846,25 @@ static void multiple_groups(function run,unsigned memory,unsigned kind,int integ
         a->left=3; a->expr.aggs[0].expr=1;
         a->expr.outputs[2].type_oid=20; a->expr.exprs[2].type=Q_INTEGER;
     }
+    if(counts) {
+        assert(kind==Q_SUM || kind==Q_AVG);
+        /* One key lookup updates SUM/AVG, nullable COUNT and COUNT(*).
+         * Their independent counts must survive both growth and spill. */
+        a->expr.naggs=3; a->expr.nout=5; a->expr.nexprs=7;
+        a->expr.aggs[1]=(struct qs_agg){.kind=Q_COUNT,.expr=4};
+        a->expr.aggs[2]=(struct qs_agg){.kind=Q_COUNT_STAR,.expr=-1};
+        for(unsigned i=0;i<2;++i) {
+            a->expr.exprs[5+i]=(struct qs_expr){.op=Q_AGGREF,.type=Q_INTEGER,.column=1+i};
+            a->expr.outputs[3+i]=(struct qs_output){.index=5+(int)i,.type_oid=20};
+        }
+    }
     struct qp_node *sort=&p->nodes[0]; sort->kind=QP_SORT; sort->left=1; sort->right=-1;
-    sort->expr=a->expr; sort->expr.nexprs=3; sort->expr.nattrs=3; sort->expr.naggs=0;
+    sort->expr=a->expr; sort->expr.nexprs=sort->expr.nattrs=a->expr.nout; sort->expr.naggs=0;
     sort->expr.work_mem_bytes=(uint64_t)memory*1024*1024; sort->expr.limit=-1;
-    for(unsigned i=0;i<3;++i) { sort->expr.exprs[i].op=Q_COLUMN; sort->expr.exprs[i].column=i; }
+    for(unsigned i=0;i<sort->expr.nout;++i) {
+        sort->expr.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.column=i,.type=a->expr.exprs[a->expr.outputs[i].index].type};
+        sort->expr.outputs[i].index=i;
+    }
     sort->expr.norder=2; sort->expr.order[0]=(struct qs_order){.output=0}; sort->expr.order[1]=(struct qs_order){.output=1,.descending=1};
     p->workers=workers;
     if(workers) {
@@ -910,6 +927,10 @@ static void multiple_groups(function run,unsigned memory,unsigned kind,int integ
             if(w->b!=17) assert(v[1].value==(int)w->b-8);
             if(kind==Q_COUNT) { assert(!v[2].isnull && v[2].value==!!w->count); continue; }
             assert(v[2].isnull==!w->count);
+            if(counts) {
+                assert(!v[3].isnull && v[3].value==w->count);
+                assert(!v[4].isnull && v[4].value==w->rows);
+            }
             if(w->count) {
                 struct qs_cell sum={.value=w->sum,.scale=2,.dscale=2}; int cmp;
                 if(kind==Q_AVG) assert(!qs_average(sum,w->count,&sum));
@@ -924,11 +945,14 @@ static void multiple_groups(function run,unsigned memory,unsigned kind,int integ
         assert(p->pipelines[2].sink_ns<=p->pipelines[2].worker_ns);
     }
     assert(seen==groups && (memory==4?ntokens>0:ntokens==0));
+    if(counts && workers) assert(out->metrics.work_peak && out->metrics.work_peak<=(uint64_t)memory*1024*1024);
     for(unsigned i=0;i<ntokens;++i) assert(!tokens[i]);
     free(controls); free(tokens); free(raw); free(expected); free(p); free(arena); free(io); free(out);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
 }
 #undef control
+static void multiple_groups(function run,unsigned memory,unsigned kind,int integer_keys,unsigned workers)
+{ multiple_group_aggregates(run,memory,kind,integer_keys,workers,0); }
 struct dictionary_test { struct qs_dict *dictionary; unsigned worker; };
 static void *dictionary_worker(void *arg)
 {
@@ -1003,6 +1027,8 @@ int main(int argc,char **argv)
         multiple_groups(run,256,Q_SUM,0,test_workers);
         multiple_groups(run,256,Q_AVG,1,test_workers);
         multiple_groups(run,256,Q_COUNT,0,test_workers);
+        multiple_group_aggregates(run,256,Q_SUM,0,test_workers,1);
+        multiple_group_aggregates(run,256,Q_AVG,1,test_workers,1);
         printf("PASS %u CU slots: parallel build/probe, exact SUM/AVG, global DISTINCT, cleanup\n",test_workers);
         return 0;
     }
@@ -1073,5 +1099,8 @@ int main(int argc,char **argv)
     multiple_groups(run,64,Q_SUM,0,4); multiple_groups(run,64,Q_AVG,1,4);
     multiple_groups(run,64,Q_COUNT,0,4); multiple_groups(run,4,Q_SUM,1,4);
     multiple_groups(run,4,Q_AVG,0,4); multiple_groups(run,4,Q_COUNT,1,4);
+    multiple_group_aggregates(run,4,Q_SUM,0,0,1);
+    multiple_group_aggregates(run,64,Q_AVG,1,4,1);
+    multiple_group_aggregates(run,4,Q_AVG,1,4,1);
     puts("PASS native Plan joins, NULL/duplicate keys, MIN/MAX/AVG, spill and cleanup");
 }

@@ -81,7 +81,8 @@ struct external_hash {
     unsigned phase,partition,direct;
 };
 struct accumulator { struct qs_cell sum,extreme,last; uint64_t count; int has_last; };
-struct compact_group { struct qs_cell sum; int64_t key; uint64_t count; atomic_uint occupied; };
+struct group_value { struct qs_cell sum; uint64_t count; };
+struct compact_group { int64_t key; atomic_uint occupied; struct group_value values[]; };
 struct set_key { int64_t value; unsigned occupied; };
 /* Private per-CU expression state; referenced input columns stay in AFDM. */
 struct projection_batch {
@@ -93,7 +94,7 @@ struct projection_batch {
     int64_t error;
     unsigned error_node;
     int joined,keep_window,lazy_text;
-    int group_keys[QS_KEYS],group_value;
+    int group_keys[QS_KEYS],group_values[QS_AGGS];
 };
 struct hash_probe_batch {
     uint32_t matches[QS_VECTOR_ROWS];
@@ -1161,7 +1162,7 @@ static int projection_init(struct execution *s,unsigned id)
     const struct qp_node *root=&s->plan->nodes[id];
     int aggregate=root->kind==QP_AGGREGATE;
     if(aggregate && (root->distinct || root->distinct_aggs || root->left<0 ||
-        (root->nkeys && (!root->hash || root->expr.naggs!=1)))) return 0;
+        (root->nkeys && (!root->hash || !qp_hash_aggregate_supported(root))))) return 0;
     int grouped=aggregate && root->nkeys;
     int scan=aggregate?root->left:(int)id;
     while(s->plan->nodes[scan].kind==QP_PROJECT) {
@@ -1188,11 +1189,12 @@ static int projection_init(struct execution *s,unsigned id)
             if(index<0 || qs_vector_require(&b->plan,index,b->needed)) { cs_work_free(s->context,b); return 0; }
             b->group_keys[k]=index;
         }
-        b->group_value=-1;
-        if(root->expr.aggs[0].kind!=Q_COUNT_STAR) {
-            int index=projection_import(&import,id,root->expr.aggs[0].expr);
+        for(unsigned a=0;a<root->expr.naggs;++a) {
+            b->group_values[a]=-1;
+            if(root->expr.aggs[a].kind==Q_COUNT_STAR) continue;
+            int index=projection_import(&import,id,root->expr.aggs[a].expr);
             if(index<0 || qs_vector_require(&b->plan,index,b->needed)) { cs_work_free(s->context,b); return 0; }
-            b->group_value=index;
+            b->group_values[a]=index;
         }
     }
     for(unsigned i=0;i<b->plan.nout;++i) {
@@ -1499,7 +1501,7 @@ static int accumulate(struct execution *s,const struct qp_node *n,struct operato
     return 0;
 }
 static int64_t aggregate_next(struct execution *,unsigned,struct qs_cell *);
-static int group_add(struct compact_group *g,struct qs_cell v,uint64_t count,unsigned kind)
+static int group_add(struct group_value *g,struct qs_cell v,uint64_t count,unsigned kind)
 {
     if(count && (kind==Q_SUM || kind==Q_AVG)) {
         if(!g->count) g->sum=v;
@@ -1516,10 +1518,12 @@ static struct compact_group *group_at(struct operator_state *o,unsigned slot)
 { return (void *)((unsigned char *)o->groups+(size_t)slot*o->group_stride); }
 static void group_keys(const struct qp_node *n,const struct operator_state *o,const struct compact_group *g,struct qs_cell *keys)
 {
-    if(o->group_stride>sizeof(*g) && o->group_integer) {
-        const int64_t *values=(const void *)(g+1);
+    int wide=n->nkeys!=1 || n->expr.exprs[n->expr.keys[0]].type!=Q_INTEGER;
+    const void *stored=g->values+n->expr.naggs;
+    if(wide && o->group_integer) {
+        const int64_t *values=stored;
         for(unsigned k=0;k<n->nkeys;++k) keys[k]=(struct qs_cell){.value=values[k],.isnull=!!(g->occupied&(2U<<k))};
-    } else if(o->group_stride>sizeof(*g)) memcpy(keys,g+1,n->nkeys*sizeof(*keys));
+    } else if(wide) memcpy(keys,stored,n->nkeys*sizeof(*keys));
     else keys[0]=(struct qs_cell){.value=g->key,.isnull=g->occupied==2};
 }
 static uint64_t group_hash(const struct qp_node *n,const struct qs_cell *keys)
@@ -1542,19 +1546,23 @@ static int group_equal(struct execution *s,const struct qp_node *n,const struct 
     }
     return 1;
 }
-static int group_result(struct execution *s,const struct qp_node *n,struct compact_group *g,
+static int group_result(struct execution *s,const struct qp_node *n,const struct group_value *groups,
     const struct qs_cell *keys,struct qs_cell *row)
 {
-    struct qs_cell input[QS_COLS],value={.isnull=!g->count};
+    struct qs_cell input[QS_COLS],values[QS_AGGS];
     for(unsigned i=0;i<QS_COLS;++i) input[i]=(struct qs_cell){.isnull=1};
     for(unsigned k=0;k<n->nkeys;++k) input[n->left_keys[k]]=keys[k];
-    unsigned kind=n->expr.aggs[0].kind;
-    if(kind==Q_COUNT || kind==Q_COUNT_STAR) value=(struct qs_cell){.value=g->count};
-    else if(g->count) {
-        value=g->sum;
-        if(kind==Q_AVG && qs_average(value,g->count,&value)) return -5;
+    for(unsigned a=0;a<n->expr.naggs;++a) {
+        const struct group_value *g=&groups[a]; unsigned kind=n->expr.aggs[a].kind;
+        struct qs_cell value={.isnull=!g->count};
+        if(kind==Q_COUNT || kind==Q_COUNT_STAR) value=(struct qs_cell){.value=g->count};
+        else if(g->count) {
+            value=g->sum;
+            if(kind==Q_AVG && qs_average(value,g->count,&value)) return -5;
+        }
+        values[a]=value;
     }
-    int status=project(s,n,input,&value,row);
+    int status=project(s,n,input,values,row);
     return status<0?status:status?2:0;
 }
 /* Published keys stay immutable throughout a CU wave. Probe them without
@@ -1565,11 +1573,10 @@ static int group_result(struct execution *s,const struct qp_node *n,struct compa
  * rows in the ordinary AFDM buffer for that existing bounded spill path. */
 #define GROUP_LOCK (1U<<31)
 static int group_sink_values(struct execution *s,unsigned id,struct operator_state *o,
-    const struct qs_cell *keys,struct qs_cell value,uint64_t count,int shared)
+    const struct qs_cell *keys,const struct group_value *values,int shared)
 {
     const struct qp_node *n=&s->plan->nodes[id];
-    unsigned kind=n->expr.aggs[0].kind;
-    int wide=o->group_stride>sizeof(*o->groups);
+    int wide=n->nkeys!=1 || n->expr.exprs[n->expr.keys[0]].type!=Q_INTEGER;
     struct qs_cell key=keys[0];
     if(!wide && !key.isnull && (key.scale || key.value<INT64_MIN || key.value>INT64_MAX)) return -5;
     unsigned occupied=key.isnull?2:1;
@@ -1593,10 +1600,10 @@ retry_bucket:
         unsigned old=state&~GROUP_LOCK;
         int equal=!old;
         if(old && wide && o->group_integer) {
-            const int64_t *values=(const void *)(g+1); equal=old==occupied;
+            const int64_t *key_values=(const void *)(g->values+n->expr.naggs); equal=old==occupied;
             for(unsigned k=0;equal && k<n->nkeys;++k)
-                if(!keys[k].isnull && values[k]!=(int64_t)keys[k].value) equal=0;
-        } else if(old) equal=wide?group_equal(s,n,keys,(struct qs_cell *)(g+1)):
+                if(!keys[k].isnull && key_values[k]!=(int64_t)keys[k].value) equal=0;
+        } else if(old) equal=wide?group_equal(s,n,keys,(struct qs_cell *)(g->values+n->expr.naggs)):
             old==occupied && (key.isnull || g->key==(int64_t)key.value);
         if(equal<0) return equal;
         if(!equal) continue;
@@ -1614,13 +1621,16 @@ retry_bucket:
                 }
             } while(!atomic_compare_exchange_weak_explicit(&o->group_count,&count,count+1,
                 memory_order_relaxed,memory_order_relaxed));
-            g->key=wide?(int64_t)hash:key.isnull?0:key.value; g->sum.isnull=1;
+            g->key=wide?(int64_t)hash:key.isnull?0:key.value;
+            for(unsigned a=0;a<n->expr.naggs;++a) g->values[a].sum.isnull=1;
             if(wide && o->group_integer) {
-                int64_t *values=(void *)(g+1);
-                for(unsigned k=0;k<n->nkeys;++k) values[k]=keys[k].isnull?0:(int64_t)keys[k].value;
-            } else if(wide) memcpy(g+1,keys,n->nkeys*sizeof(*keys));
+                int64_t *key_values=(void *)(g->values+n->expr.naggs);
+                for(unsigned k=0;k<n->nkeys;++k) key_values[k]=keys[k].isnull?0:(int64_t)keys[k].value;
+            } else if(wide) memcpy(g->values+n->expr.naggs,keys,n->nkeys*sizeof(*keys));
         }
-        int status=group_add(g,value,count,kind);
+        int status=0;
+        for(unsigned a=0;a<n->expr.naggs && !status;++a)
+            status=group_add(&g->values[a],values[a].sum,values[a].count,n->expr.aggs[a].kind);
         atomic_store_explicit(&g->occupied,occupied,shared?memory_order_release:memory_order_relaxed);
         return status?status:1;
     }
@@ -1629,14 +1639,22 @@ static int group_sink_row(struct execution *s,unsigned id,struct operator_state 
     const struct qs_cell *row,int shared)
 {
     const struct qp_node *n=&s->plan->nodes[id];
-    struct qs_cell keys[QS_KEYS],value={.value=1};
+    struct qs_cell keys[QS_KEYS]; struct group_value values[QS_AGGS];
     for(unsigned k=0;k<n->nkeys;++k) keys[k]=row[n->left_keys[k]];
-    if(n->expr.aggs[0].kind!=Q_COUNT_STAR) {
-        int index=n->expr.aggs[0].expr;
-        if(n->expr.exprs[index].op==Q_COLUMN) value=row[n->expr.exprs[index].column];
-        else { struct qs_eval eval; init_eval(&eval,&n->expr,row,NULL); if(evaluate(s,&eval,index,&value)) return -5; }
+    struct qs_eval eval; int initialized=0;
+    for(unsigned a=0;a<n->expr.naggs;++a) {
+        struct qs_cell value={.value=1};
+        if(n->expr.aggs[a].kind!=Q_COUNT_STAR) {
+            int index=n->expr.aggs[a].expr;
+            if(n->expr.exprs[index].op==Q_COLUMN) value=row[n->expr.exprs[index].column];
+            else {
+                if(!initialized) { init_eval(&eval,&n->expr,row,NULL); initialized=1; }
+                if(evaluate(s,&eval,index,&value)) return -5;
+            }
+        }
+        values[a]=(struct group_value){.sum=value,.count=!value.isnull};
     }
-    return group_sink_values(s,id,o,keys,value,!value.isnull,shared);
+    return group_sink_values(s,id,o,keys,values,shared);
 }
 /* Keep keys and aggregate arguments in vectors. Only rows rejected by a full
  * shared table enter the existing AFDM adapter, so its owner can grow/spill
@@ -1646,7 +1664,6 @@ static int group_sink_vectors(struct execution *s,unsigned id,struct qs_result *
     struct projection_batch *b=s->nodes[id].projection;
     const struct qp_node *n=&s->plan->nodes[id];
     struct operator_state *o=&s->owner->nodes[id];
-    unsigned kind=n->expr.aggs[0].kind;
     /* Unclustered keys would pay for comparisons without saving updates.
      * Inspect at most 16 adjacent rows before choosing local run combine. */
     int combine=0;
@@ -1670,7 +1687,8 @@ static int group_sink_vectors(struct execution *s,unsigned id,struct qs_result *
         }
         /* Combine adjacent equal keys locally before touching the shared
          * table. This needs only one partial state, not a table per CU. */
-        struct compact_group partial={.sum={.isnull=1}};
+        struct group_value partial[QS_AGGS];
+        for(unsigned a=0;a<n->expr.naggs;++a) partial[a]=(struct group_value){.sum={.isnull=1}};
         do {
             if(end!=first) {
                 struct qs_cell next[QS_KEYS];
@@ -1681,15 +1699,17 @@ static int group_sink_vectors(struct execution *s,unsigned id,struct qs_result *
                 int equal=group_equal(s,n,keys,next); if(equal<0) return equal;
                 if(!equal) break;
             }
-            struct qs_cell value={.value=1};
-            if(b->group_value>=0) {
-                int index=b->group_value; if(b->vectors[index].errors[end]) return -5;
-                value=qs_vector_cell(&b->plan,b->vectors,index,end);
+            for(unsigned a=0;a<n->expr.naggs;++a) {
+                struct qs_cell value={.value=1};
+                if(b->group_values[a]>=0) {
+                    int index=b->group_values[a]; if(b->vectors[index].errors[end]) return -5;
+                    value=qs_vector_cell(&b->plan,b->vectors,index,end);
+                }
+                int status=group_add(&partial[a],value,!value.isnull,n->expr.aggs[a].kind); if(status) return status;
             }
-            int status=group_add(&partial,value,!value.isnull,kind); if(status) return status;
             ++end;
         } while(combine && end<b->count && end-first<capacity-out->rows);
-        int added=group_sink_values(s,id,o,keys,partial.sum,partial.count,1); if(added<0) return added;
+        int added=group_sink_values(s,id,o,keys,partial,1); if(added<0) return added;
         if(!added) {
             for(unsigned r=first;r<end;++r) {
                 struct qs_cell *row=(struct qs_cell *)out->data+(size_t)out->rows*b->plan.nout;
@@ -1748,7 +1768,8 @@ static int group_input_pending(const struct execution *s,int id)
 static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct qs_cell *row)
 {
     struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
-    struct sorted_rows *sort=&o->left_sort; unsigned kind=n->expr.aggs[0].kind;
+    struct sorted_rows *sort=&o->left_sort;
+    if(!qp_hash_aggregate_supported(n)) { n->hash=0; return aggregate_next(s,id,row); }
     int wide=n->nkeys!=1 || n->expr.exprs[n->expr.keys[0]].type!=Q_INTEGER;
     if(!o->group_capacity) {
         struct cs_work_context_stats memory;
@@ -1761,14 +1782,15 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
             unsigned type=n->expr.exprs[n->expr.keys[k]].type;
             if(type!=Q_INTEGER && type!=Q_STRING) o->group_integer=0;
         }
-        o->group_stride=sizeof(*o->groups)+(wide?n->nkeys*(o->group_integer?sizeof(int64_t):sizeof(struct qs_cell)):0);
+        o->group_stride=sizeof(*o->groups)+n->expr.naggs*sizeof(struct group_value)+
+            (wide?n->nkeys*(o->group_integer?sizeof(int64_t):sizeof(struct qs_cell)):0);
         o->group_stride=(o->group_stride+15)&~15U;
         unsigned capacity=128;
         /* PG's pre-HAVING group estimate is distinct from output cardinality.
          * Use it for wide tables too, within the real remaining budget and
          * spill/worker reserve, instead of serializing waves from 128 buckets.
          * Legacy plans without that estimate retain the conservative path. */
-        int key_only=kind==Q_COUNT_STAR && n->expr.nout==n->nkeys;
+        int key_only=n->expr.aggs[0].kind==Q_COUNT_STAR && n->expr.nout==n->nkeys;
         for(unsigned i=0;key_only && i<n->expr.nout;++i)
             if(n->expr.exprs[n->expr.outputs[i].index].op!=Q_COLUMN) key_only=0;
         double groups=n->estimated_groups>0?n->estimated_groups:n->estimated_rows;
@@ -1823,11 +1845,14 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
         if(o->group_phase==1) {
             if(o->input_done && !o->hash_fallback) { o->group_phase=3; continue; }
             o->hash_fallback=1;
-            struct qs_plan partial={.nout=n->nkeys+2}; int columns[QS_KEYS];
+            struct qs_plan partial={.nout=n->nkeys+2*n->expr.naggs}; int columns[QS_KEYS];
             for(unsigned k=0;k<n->nkeys;++k) {
                 columns[k]=k; partial.outputs[k]=s->plan->nodes[n->left].expr.outputs[n->left_keys[k]];
             }
-            partial.outputs[n->nkeys].type_oid=1700; partial.outputs[n->nkeys+1].type_oid=20;
+            for(unsigned a=0;a<n->expr.naggs;++a) {
+                partial.outputs[n->nkeys+2*a].type_oid=1700;
+                partial.outputs[n->nkeys+2*a+1].type_oid=20;
+            }
             int64_t status=sort_init(s,sort,&partial,n->nkeys,columns,NULL); if(status) return status;
             if(sort->input_pending) {
                 status=sort_call(s,sort,0); if(status) return status;
@@ -1837,7 +1862,10 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
                 struct compact_group *g=group_at(o,o->group_flush++); if(!g->occupied) continue;
                 struct qs_cell *out=sort->input->data[sort->input->rows++].cells;
                 group_keys(n,o,g,out);
-                out[n->nkeys]=g->sum; out[n->nkeys+1]=(struct qs_cell){.value=g->count};
+                for(unsigned a=0;a<n->expr.naggs;++a) {
+                    out[n->nkeys+2*a]=g->values[a].sum;
+                    out[n->nkeys+2*a+1]=(struct qs_cell){.value=g->values[a].count};
+                }
             }
             if(sort->input->rows) { sort->input_pending=1; continue; }
             if(o->input_done) {
@@ -1855,7 +1883,7 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
             while(o->group_flush<o->group_capacity) {
                 struct compact_group *g=group_at(o,o->group_flush++); if(!g->occupied) continue;
                 struct qs_cell keys[QS_KEYS]; group_keys(n,o,g,keys);
-                int64_t result=group_result(s,n,g,keys,row); if(result) return result;
+                int64_t result=group_result(s,n,g->values,keys,row); if(result) return result;
             }
             cs_work_free(s->context,o->groups); o->groups=NULL; o->finished=1; return 0;
         }
@@ -1866,22 +1894,30 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
                 sort->position=0; sort->drained=sort->output->finished;
             }
             if(sort->position<sort->output->rows) {
-                memcpy(o->right,sort->output->data[sort->position++].cells,(n->nkeys+2)*sizeof(*o->right)); o->have_right=1;
+                memcpy(o->right,sort->output->data[sort->position++].cells,(n->nkeys+2*n->expr.naggs)*sizeof(*o->right)); o->have_right=1;
             } else o->group_ready=1;
         }
         if(!o->phase) {
             if(!o->have_right) { cs_work_free(s->context,sort->output); sort->output=NULL; o->finished=1; return 0; }
             memcpy(o->keys,o->right,n->nkeys*sizeof(*o->keys));
-            memset(&o->accum[0],0,sizeof(o->accum[0])); o->accum[0].sum.isnull=1; o->phase=1;
+            memset(o->accum,0,sizeof(o->accum));
+            for(unsigned a=0;a<n->expr.naggs;++a) o->accum[a].sum.isnull=1;
+            o->phase=1;
         }
-        struct compact_group g={.sum=o->accum[0].sum,.count=o->accum[0].count};
+        struct group_value groups[QS_AGGS];
+        for(unsigned a=0;a<n->expr.naggs;++a)
+            groups[a]=(struct group_value){.sum=o->accum[a].sum,.count=o->accum[a].count};
         int equal=o->have_right?group_equal(s,n,o->right,o->keys):0; if(equal<0) return equal;
         if(equal) {
-            int status=group_add(&g,o->right[n->nkeys],o->right[n->nkeys+1].value,kind); if(status) return status;
-            o->accum[0].sum=g.sum; o->accum[0].count=g.count; o->have_right=0; continue;
+            for(unsigned a=0;a<n->expr.naggs;++a) {
+                int status=group_add(&groups[a],o->right[n->nkeys+2*a],o->right[n->nkeys+2*a+1].value,n->expr.aggs[a].kind);
+                if(status) return status;
+                o->accum[a].sum=groups[a].sum; o->accum[a].count=groups[a].count;
+            }
+            o->have_right=0; continue;
         }
         o->phase=0;
-        int64_t result=group_result(s,n,&g,o->keys,row); if(result) return result;
+        int64_t result=group_result(s,n,groups,o->keys,row); if(result) return result;
     }
 }
 static int64_t hash_aggregate_next(struct execution *s,unsigned id,struct qs_cell *row)
@@ -2159,7 +2195,7 @@ static int aggregate_combine(struct execution *s,unsigned id,const struct operat
             if(cmp==INT_MIN) return -5;
             if(!b->count || (kind==Q_MIN?cmp<0:cmp>0)) b->extreme=a->extreme;
         }
-        struct compact_group partial={.sum=b->sum,.count=b->count};
+        struct group_value partial={.sum=b->sum,.count=b->count};
         int status=group_add(&partial,a->sum,a->count,kind); if(status) return status;
         b->sum=partial.sum; b->count=partial.count;
     }
