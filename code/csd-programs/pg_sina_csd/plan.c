@@ -1116,7 +1116,7 @@ static int projection_import(struct projection_import *in,unsigned node,int inde
     struct qs_plan *p=&in->batch->plan;
     for(unsigned i=0;i<p->nexprs;++i) if(in->nodes[i]==node && in->expressions[i]==(unsigned)index) return i;
     struct qs_expr e=n->expr.exprs[index];
-    if(e.op>Q_CASE && e.op!=Q_YEAR) return -1;
+    if(e.op>Q_CASE && e.op!=Q_YEAR && e.op!=Q_LIKE && e.op!=Q_SUBSTRING) return -1;
     if(e.op==Q_COLUMN && (n->kind==QP_PROJECT || n->kind==QP_AGGREGATE)) {
         const struct qp_node *child=&in->execution->plan->nodes[n->left];
         if(e.column<0 || (unsigned)e.column>=child->expr.nout) return -1;
@@ -1124,13 +1124,12 @@ static int projection_import(struct projection_import *in,unsigned node,int inde
     }
     if(e.op!=Q_COLUMN && e.op!=Q_CONST) {
         if(e.left<0 || e.left>=index) return -1;
-        if(e.op>=Q_LT && e.op<=Q_GE && n->expr.exprs[e.left].type==Q_STRING) return -1;
         e.left=projection_import(in,node,e.left); if(e.left<0) return -1;
         if(e.op!=Q_NOT && e.op!=Q_IS_NULL && e.op!=Q_IS_NOT_NULL && e.op!=Q_YEAR) {
             if(e.right<0 || e.right>=index) return -1;
             e.right=projection_import(in,node,e.right); if(e.right<0) return -1;
         }
-        if(e.op==Q_CASE) {
+        if(e.op==Q_CASE || e.op==Q_SUBSTRING) {
             if(e.otherwise<0 || e.otherwise>=index) return -1;
             e.otherwise=projection_import(in,node,e.otherwise); if(e.otherwise<0) return -1;
         }

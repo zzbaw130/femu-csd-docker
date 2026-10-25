@@ -651,6 +651,26 @@ static void probe_payload(function run,unsigned limit,int strings,int indexed)
     j->expr.exprs[1].type=strings?Q_STRING:Q_DECIMAL; j->expr.outputs[1].type_oid=strings?25:1700;
     struct qp_node *top=&p->nodes[0]; top->kind=QP_LIMIT; top->left=1; top->right=-1;
     top->expr=j->expr; top->expr.limit=limit; top->expr.work_mem_bytes=64U*1024*1024;
+    if(strings>=2) {
+        /* Joined text expressions share column vectors and literal IDs. The
+         * second row has a negative substring length: CASE can suppress it,
+         * and LIMIT must not observe it before requesting that row. */
+        struct qs_plan *e=&j->expr; e->nexprs=12; e->nstrings=2;
+        e->strings[0]=(struct qs_string){.length=4,.bytes="skip"};
+        e->strings[1]=(struct qs_string){.length=strings==2?2:1,.bytes="k%"};
+        if(strings==3) e->strings[1].bytes[0]='%';
+        e->exprs[2]=(struct qs_expr){.op=Q_CONST,.type=Q_STRING,.constant=0};
+        e->exprs[3]=(struct qs_expr){.op=Q_LT,.type=Q_BOOLEAN,.left=1,.right=2};
+        e->exprs[4]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=2};
+        e->exprs[5]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=-1};
+        e->exprs[6]=(struct qs_expr){.op=Q_CASE,.type=Q_INTEGER,.left=3,.right=4,.otherwise=5};
+        e->exprs[7]=(struct qs_expr){.op=Q_SUBSTRING,.type=Q_STRING,.left=1,.right=4,.otherwise=6};
+        e->exprs[8]=(struct qs_expr){.op=Q_CONST,.type=Q_STRING,.constant=1};
+        e->exprs[9]=(struct qs_expr){.op=Q_LIKE,.type=Q_BOOLEAN,.left=1,.right=8};
+        e->exprs[10]=(struct qs_expr){.op=Q_CONST,.type=Q_STRING,.isnull=1};
+        e->exprs[11]=(struct qs_expr){.op=Q_CASE,.type=Q_STRING,.left=9,.right=7,.otherwise=10};
+        e->outputs[1].index=11;
+    }
     if(indexed) {
         /* The right projection fails only after the first valid index match.
          * LIMIT must consume that prefix before observing the later error. */
@@ -666,6 +686,7 @@ static void probe_payload(function run,unsigned limit,int strings,int indexed)
     if(indexed) for(unsigned r=0;r<2;++r) w32(raw[0]+QS_PAGE-(r+1)*40+24,r+1);
     if(strings) for(unsigned r=0;r<2;++r) {
         unsigned char *tuple=raw[0]+QS_PAGE-(r+1)*40;
+        if(strings>=2) w32(tuple+24,0);
         tuple[28]=(5U<<1)|1U; memcpy(tuple+29,r?"skip":"keep",4);
     }
     for(unsigned i=2;i<4;++i) {
@@ -698,7 +719,13 @@ static void probe_payload(function run,unsigned limit,int strings,int indexed)
             memcpy(arena+n->input_offset,raw[control.node-2]+control.offset,control.bytes); control.ready=1;
         }
     } while(!out->finished);
-    if(strings) {
+    if(strings==3 && limit>1) { assert(status==-5); control.close=1; assert(!run(&args)); }
+    else if(strings>=2) {
+        assert(!status && out->rows==(limit==1?1:2));
+        assert(qs_cell_string(&out->data[0].cells[1])==2);
+        assert(!memcmp(qs_cell_string_bytes(&out->data[0].cells[1]),"ee",2));
+        if(out->rows==2) assert(out->data[1].cells[1].isnull);
+    } else if(strings) {
         assert(!status && out->rows==1 && qs_cell_string(&out->data[0].cells[1])==4);
         assert(!memcmp(qs_cell_string_bytes(&out->data[0].cells[1]),"keep",4));
         assert(out->metrics.dictionary_entries==1); /* unmatched "skip" was never interned */
@@ -982,6 +1009,7 @@ int main(int argc,char **argv)
     assert(!cs_work_init(64*1024*1024));
     dictionary_growth();
     probe_payload(run,1,0,0); probe_payload(run,2,0,0); probe_payload(run,2,1,0);
+    probe_payload(run,2,2,0); probe_payload(run,1,3,0); probe_payload(run,2,3,0);
     probe_payload(run,1,0,1); probe_payload(run,2,0,1); grouped_probe(run);
     test_scheduled=true;
     test(run,QP_INNER,20003,23,64,1,TEST_VECTOR_AGG);

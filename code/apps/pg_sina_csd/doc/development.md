@@ -495,6 +495,12 @@ NativePlan与8/16/64 CU测试通过，覆盖多层Index/Hash、NULL外连接、�
 
 Q18 customer构建profile墙钟846.351→338.897ms、累计CPU2935.097→1186.894ms；workmem峰值完全相同且无spill，确认改善来自竞争减少。没有改PG/SNIA/FEMU接口、预算或FDM容量。当前普通延迟和原始记录见performance.md，字典spill及其他逐行边界仍未完成。
 
+## 文本表达式接入融合列批次（2026-10-25）
+
+参照DuckDB在Join匹配批次上继续执行投影和选择表达式的路径，计划执行器不再拒绝向量引擎已实现的LIKE、三参数SUBSTRING和字符串有序比较。导入SUBSTRING的长度依赖，复用原字典常量绑定、文本视图、按分支活跃行执行及逐行错误标记。没有新增参数、缓冲管理机制或固件SQL逻辑，设备向量工作区仍计入查询workmem。
+
+新增Hash Join文本输出用例检查CASE抑制负长度分支、NULL、LIMIT错误时机和清理；NativePlan及8/16/64 CU共4项CTest通过。已重编部署pg-sina-plan.so，规范Q7/Q13/Q22冷启动均结果正确、完整卸载且快于同轮host。Q22 profile累计CPU未明显下降，不以接续覆盖代替性能收益证明；Index右侧谓词、多聚合分组和跨请求推进仍未完成。本阶段未重复完整22条，当前记录见performance.md。
+
 ## SNIA异步请求复用线程（2026-10-25）
 
 SNIA公共请求层保留原请求快照、64个在途请求名额、取消和event/callback完成规则，将逐次创建线程替换为进程内按需创建、空闲复用的工作线程。同步请求不排队；不持工作队列锁执行请求或callback。callback可能等待异步子请求，因此不把工作线程数固定为设备CU数；库卸载时停止接收请求并等待工作线程退出。PG、设备SQL程序、FEMU和插件契约未修改。
