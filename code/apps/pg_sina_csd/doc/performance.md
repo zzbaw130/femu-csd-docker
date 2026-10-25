@@ -52,6 +52,36 @@ PG把已有Heap/Index extent映射随计划输入一次性上传，设备SQL程�
 
 完整查询正确性与本轮性能指标已达标。总改造仍保留Index单行/SEMI/ANTI、Merge Join、复杂DISTINCT及部分排序边界的逐行适配，以及共享字典容量和通用I/O推进优化项，见文末；因此没有宣称总目标全部完成。现有证据不要求扩大FDM。
 
+## 按已完成Source的实际行数准备Hash Build容量
+
+Q17聚合后的20万条记录进入Hash Build时，父表仍从128行逐级增长。虽然输入已并行，只有140732条由CU共享Sink写入，另59268条由协调端插入并触发扩容。参考DuckDB `JoinHashTable::AllocatePointerTable()`按实际`Count()`准备容量，设备SQL程序现在等子聚合完成后，若仅经过无过滤投影，按实际分组数调整空构建表，再启动CU。分配前扣除CU私有状态和两份排序额度；空间不足或分配失败保留原增长路径。HAVING、投影过滤和连接输入不按过滤前分组数预分配。PG、SNIA和FEMU接口不变，SQL状态继续只在设备SQL程序内。
+
+8 CU / 256MiB workmem / 64MiB FDM，旧/新版各三次规范Q17冷启动及profile，[逐次数据](../../../../results/source-reserve/q17.csv)：
+
+| 指标中位数 | 逐级增长 | 按实际行数准备 |
+| --- | ---: | ---: |
+| Source→Hash Build阶段wall ms | 59.434 | 22.738 |
+| 该阶段平均活跃CU | 3.01 | 6.16 |
+| CU直接构建行数 | 140732 | 200000 |
+| Hash Build协调CPU ms | 35.546 | 6.663 |
+| profile查询树wall ms | 935.227 | 882.704 |
+| 普通冷启动 ms | 1257.691 | 897.075 |
+
+容量准备发生在流水线计时开始前；Hash Build协调CPU包括此准备，因此不能只看流水线内接近零的协调时间。普通样本旧版为1257.691/1636.718/969.345ms，新版为870.319/1039.767/897.075ms；整条查询波动明显，不将其中位数降幅当作稳定收益。该构建阶段三次均变快，且完整profile查询树中位数只降约6%，说明剩余大扫描/聚合仍占主要时间。Q17 workmem峰值保持28981584字节，AFDM保持46047552字节，无spill；六次普通结果均与规范host一致。
+
+最终[Q2/Q11/Q17/Q18/Q20/Q21冷启动回归](../../../../results/tpch.1Ht8Gf/timings.csv)全部结果一致、完整卸载且快于同轮host：
+
+| 查询 | host ms | CSD ms |
+| --- | ---: | ---: |
+| Q2 | 934.329 | 347.790 |
+| Q11 | 405.639 | 283.731 |
+| Q17 | 4587.226 | 1059.617 |
+| Q18 | 7982.583 | 1141.311 |
+| Q20 | 3717.377 | 630.439 |
+| Q21 | 2766.378 | 903.988 |
+
+NativePlan与8/16/64 CU四项测试通过，覆盖全量键Probe计数、所有构建行进入共享Sink，以及HAVING筛选后的结果；NativePlan和8 CU两项ASan/UBSan/LeakSanitizer检查也通过。本轮未运行完整22条。
+
 ## 驻留Hash Aggregate Source驱动后续并行流水线
 
 参考DuckDB `physical_hash_aggregate.cpp`的Global/Local Source State，已让驻留Hash聚合结果驱动后续投影、Hash或Index链。PG保留原选定Join树，依据HAVING前的分组量标记Source边界，并让AFDM布局在该边界停止；不同阶段复用原工作槽。设备SQL程序`pg-sina-plan.so`先完成聚合，再将只读表发布给CU工作状态；每个CU原子领取64个槽位，处理后继续领取，跨I/O和输出保存自身位置。所有读者结束后释放原表，没有新增物化副本。SNIA和FEMU的通用图、CU、I/O接口未修改，固件不识别聚合状态。
