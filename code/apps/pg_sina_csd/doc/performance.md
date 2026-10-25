@@ -1,6 +1,31 @@
 # 当前性能与未完成项（2026-10-25）
 
-## 当前：页请求自动续交与加载完成标志
+## 当前：并行聚合归一化保留结果排序
+
+参照DuckDB先更新分组哈希状态、再向下游交付分组结果的路径，修正PG计划归一化：原生Finalize GroupAggregate → Gather Merge → Sort → Partial HashAggregate被合并后，使用Hash Aggregate → Sort分组结果，保留原排序操作符、collation和NULL位置。此前丢失Gather Merge顺序，使Q15主路径为满足有序下游而退回明细排序。本阶段只修改PG计划转换，复用设备已有哈希聚合和排序，不改变SNIA、FEMU或资源容量。
+
+[规范Q15/Q3/Q18冷启动回归](../../../../results/tpch.dPhaTL/timings.csv)结果一致、整条卸载且快于同轮host；没有重复完整TPC-H。
+
+| 查询 | host ms | CSD ms |
+| --- | ---: | ---: |
+| Q15 | 2615.810 | 878.550 |
+| Q3 | 2581.968 | 1496.805 |
+| Q18 | 6971.519 | 1972.070 |
+
+Q15单独冷启动profile：[修改前](../../../../results/aggregate-order/q15-before.log)、[修改后](../../../../results/aggregate-order/q15-after.log)。两次均8 CU、256MiB workmem、64MiB FDM、无spill。
+
+| 指标 | 修改前 | 修改后 |
+| --- | ---: | ---: |
+| Sort Sink累计CPU | 58.170ms | 0.619ms |
+| Sort Source累计CPU | 63.792ms | 2.662ms |
+| 查询workmem峰值 | 25250832字节 | 4943968字节 |
+| 排序run数 | 21 | 2 |
+
+profile树墙钟2397.166→1084.822ms，但前序扫描/续交也有波动，不能把总差值都归于排序。普通延迟采用上方关闭profile的成绩；排序CPU和内存下降是本阶段直接证据，仍未证明持续8CU满载。
+
+Guest构建及布局CTest通过。临时分组SQL额外检查ASC/DESC、NULLS FIRST与host逐行一致，两个计划均完整卸载（[计划](../../../../results/aggregate-order/order-plan.log)）；这些仅检查排序语义，不替代规范TPC-H验收，临时SQL已删除。
+
+## 页请求自动续交与加载完成标志
 
 PG扩展复用已有SNIA callback：独立worker完成后，回调读取页请求元数据、按固定extent映射构建LOAD→计算batch；有输出、EOF或共享表维护需求时交给协调端。回调只调用libc/SNIA，不调用PG API。主线程复用回调已读的完成记录，取消时停止续交并等待在途回调结束。SNIA仍只执行标准请求，FEMU没有SQL语义。
 

@@ -495,6 +495,12 @@ NativePlan与8/16/64 CU测试通过，覆盖多层Index/Hash、NULL外连接、�
 
 Q18 customer构建profile墙钟846.351→338.897ms、累计CPU2935.097→1186.894ms；workmem峰值完全相同且无spill，确认改善来自竞争减少。没有改PG/SNIA/FEMU接口、预算或FDM容量。当前普通延迟和原始记录见performance.md，字典spill及其他逐行边界仍未完成。
 
+## 并行聚合后的分组结果排序（2026-10-25）
+
+参照DuckDB哈希聚合先生成分组结果的路径，修正PG Finalize GroupAggregate与Partial HashAggregate合并时丢失Gather Merge顺序的问题。归一化在完成聚合上方保留原排序，按表达式映射分组输出位置，保留排序操作符、collation和NULL位置；无法映射时不编译该树。随后复用现有哈希聚合和Sort，不为有序下游排序全部明细。计划副本的父子指针可替换，原生PG执行计划不变。
+
+Q15主路径由明细排序聚合变成Hash Aggregate → Sort分组结果；profile排序累计CPU121.962→3.281ms，workmem峰值25250832→4943968字节，均无spill。规范Q15/Q3/Q18冷启动结果一致、整条卸载且快于同轮host，Guest构建及布局CTest通过。临时分组用例检查ASC/DESC、NULLS FIRST均匹配host且完整卸载，临时SQL已删除。本阶段未改SNIA/FEMU或运行完整22条，普通成绩与profile边界见performance.md。
+
 ## 页请求回调续交与输入完成标志（2026-10-25）
 
 PG把独立worker的namespace页请求延续到已有SNIA回调：读取控制快照，使用查询开始前准备好的extent映射构建LOAD→计算batch。有输出、EOF或共享表维护需求时仍返回协调端；回调不调用PG API。LOAD构建改用普通分配/状态返回，主线程和回调复用同一实现；跨线程累计的LOAD时间/次数及控制读取次数使用原子计数，控制快照不再重复读取。

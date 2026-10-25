@@ -453,12 +453,52 @@ static TargetEntry *matching_entry(List *list,Expr *expr)
     foreach(c,list) { TargetEntry *t=lfirst(c); if(equal(t->expr,expr)) return t; }
     return NULL;
 }
-static bool normalize_parallel_aggregate(Plan *plan)
+/* Gather Merge orders partial states, not raw input. After collapsing the
+ * parallel aggregate, preserve that order above the completed groups so an
+ * ordered consumer does not force a sort of every input row. */
+static Sort *aggregate_output_sort(Plan *aggregate)
 {
+    Plan *input=aggregate->lefttree;
+    while(input && !IsA(input,GatherMerge) && !IsA(input,Sort)) input=input->lefttree;
+    if(!input) return NULL;
+    Sort *sort=makeNode(Sort);
+    AttrNumber *columns;
+    if(IsA(input,GatherMerge)) {
+        GatherMerge *merge=(GatherMerge *)input;
+        sort->numCols=merge->numCols; columns=merge->sortColIdx;
+        sort->sortOperators=merge->sortOperators; sort->collations=merge->collations;
+        sort->nullsFirst=merge->nullsFirst;
+    } else {
+        Sort *old=(Sort *)input;
+        sort->numCols=old->numCols; columns=old->sortColIdx;
+        sort->sortOperators=old->sortOperators; sort->collations=old->collations;
+        sort->nullsFirst=old->nullsFirst;
+    }
+    sort->sortColIdx=palloc(sizeof(*columns)*sort->numCols);
+    for(int i=0;i<sort->numCols;++i) {
+        TargetEntry *key=get_tle_by_resno(input->targetlist,columns[i]);
+        TargetEntry *output=key?matching_entry(aggregate->targetlist,key->expr):NULL;
+        if(!output) return NULL;
+        sort->sortColIdx[i]=output->resno;
+    }
+    sort->plan.targetlist=copyObject(aggregate->targetlist);
+    sort->plan.plan_rows=aggregate->plan_rows;
+    sort->plan.plan_width=aggregate->plan_width;
+    sort->plan.lefttree=aggregate;
+    return sort;
+}
+static bool normalize_parallel_aggregate(Plan **slot)
+{
+    Plan *plan=*slot;
     if(!plan) return true;
+    Sort *output_sort=NULL;
     if(IsA(plan,Agg) && DO_AGGSPLIT_COMBINE(((Agg *)plan)->aggsplit)) {
         Agg *agg=(Agg *)plan; Plan *partial=partial_input(plan->lefttree);
         if(!partial) return false;
+        if(agg->aggstrategy==AGG_SORTED && ((Agg *)partial)->aggstrategy==AGG_HASHED) {
+            output_sort=aggregate_output_sort(plan);
+            if(!output_sort) return false;
+        }
         for(int i=0;i<agg->numCols;++i) {
             TargetEntry *old=get_tle_by_resno(plan->lefttree->targetlist,agg->grpColIdx[i]);
             TargetEntry *next=old?matching_entry(partial->lefttree->targetlist,old->expr):NULL;
@@ -468,8 +508,10 @@ static bool normalize_parallel_aggregate(Plan *plan)
         plan->lefttree=partial->lefttree; agg->aggsplit=AGGSPLIT_SIMPLE;
         agg->aggstrategy=((Agg *)partial)->aggstrategy;
     }
-    if(IsA(plan,SubqueryScan) && !normalize_parallel_aggregate(((SubqueryScan *)plan)->subplan)) return false;
-    return normalize_parallel_aggregate(plan->lefttree) && normalize_parallel_aggregate(plan->righttree);
+    if(IsA(plan,SubqueryScan) && !normalize_parallel_aggregate(&((SubqueryScan *)plan)->subplan)) return false;
+    if(!normalize_parallel_aggregate(&plan->lefttree) || !normalize_parallel_aggregate(&plan->righttree)) return false;
+    if(output_sort) *slot=(Plan *)output_sort;
+    return true;
 }
 struct required_columns {
     Plan *plan,*left,*right;
@@ -545,7 +587,7 @@ static bool prune_columns(Plan *plan,Bitmapset *keep,bool all)
 static int compile_tree(PlannerInfo *root,Plan *native,struct qp_plan *tree)
 {
     Plan *copy=copyObject(native);
-    if(!normalize_parallel_aggregate(copy) || !prune_columns(copy,NULL,true)) return -1;
+    if(!normalize_parallel_aggregate(&copy) || !prune_columns(copy,NULL,true)) return -1;
     return compile_node(root,copy,tree,root->parse->sortClause!=NIL);
 }
 static Node *heap_index_var(Node *node,List *tlist)
