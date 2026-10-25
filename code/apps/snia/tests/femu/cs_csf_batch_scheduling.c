@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include "batch_sort.h"
 static atomic_uint checks;
@@ -98,6 +99,16 @@ static void requeue_batch(void *context, CS_STATUS status, u64 value)
         b->resumed = 1;
         atomic_fetch_add(&requeue_entered, 1);
         while (!atomic_load(&requeue_release)) usleep(100);
+        /* All workers can be inside callbacks. Both a synchronous request and
+         * an asynchronous child waited here must still be able to progress. */
+        OK(csQueueCopyMemRequest(&b->entry.u.CopyMem,NULL,NULL,NULL,NULL,NULL));
+        CS_EVT_HANDLE event; OK(csCreateEvent(&event));
+        CHECK(csQueueCopyMemRequest(&b->entry.u.CopyMem,NULL,NULL,event,NULL,NULL)==CS_QUEUED);
+        CS_STATUS child=CS_NOT_DONE;
+        for(unsigned i=0;i<5000 && child==CS_NOT_DONE;++i) {
+            child=csPollEvent(event,NULL,NULL); if(child==CS_NOT_DONE) usleep(100);
+        }
+        CHECK(child==CS_SUCCESS); OK(csDeleteEvent(event));
         OK(csConfigureBatchEntry(b->batch, CS_BATCH_RECONFIG, &b->entry, b->index, 0, NULL));
         CHECK(csQueueBatchRequest(b->batch, b, requeue_batch, NULL, NULL, NULL) == CS_QUEUED);
         return;
@@ -125,6 +136,39 @@ static void test_batch_callback_requeue(CS_MEM_HANDLE memory)
         CHECK(atomic_load(&slots[i].done));
         OK(csFreeBatchRequest(slots[i].batch));
     }
+}
+static atomic_uint sequence_threads;
+static _Thread_local bool sequence_thread_seen;
+struct callback_sequence {
+    CsCopyMemRequest request;
+    atomic_bool done;
+    unsigned calls;
+    int result;
+};
+static void continue_copy(void *context,CS_STATUS status,u64 value)
+{
+    struct callback_sequence *sequence=context;
+    CHECK(status==CS_SUCCESS && value==sizeof(sequence->result) && sequence->result==9);
+    if(!sequence_thread_seen) { sequence_thread_seen=true; atomic_fetch_add(&sequence_threads,1); }
+    if(++sequence->calls<512) {
+        CHECK(csQueueCopyMemRequest(&sequence->request,sequence,continue_copy,NULL,NULL,NULL)==CS_QUEUED);
+    } else atomic_store(&sequence->done,true);
+}
+static void test_callback_sequence(CS_MEM_HANDLE memory)
+{
+    struct callback_sequence sequence={0}; atomic_init(&sequence.done,false);
+    sequence.request=(CsCopyMemRequest){.Type=CS_COPY_FROM_DEVICE,.DevMem={memory,0},
+        .u.HostVAddress=&sequence.result,.Bytes=sizeof(sequence.result)};
+    struct timespec begin,end; clock_gettime(CLOCK_MONOTONIC,&begin);
+    CHECK(csQueueCopyMemRequest(&sequence.request,&sequence,continue_copy,NULL,NULL,NULL)==CS_QUEUED);
+    for(unsigned i=0;i<50000 && !atomic_load(&sequence.done);++i) usleep(100);
+    CHECK(atomic_load(&sequence.done) && sequence.calls==512);
+    /* TLS is initialized for each new thread lifetime, even if its OS thread
+     * ID is recycled. One continuation chain must reuse execution threads. */
+    CHECK(atomic_load(&sequence_threads)<64);
+    clock_gettime(CLOCK_MONOTONIC,&end);
+    printf("callback sequence: calls=%u thread_lifetimes=%u wall_ms=%.3f\n",sequence.calls,
+        atomic_load(&sequence_threads),(end.tv_sec-begin.tv_sec)*1000.0+(end.tv_nsec-begin.tv_nsec)/1000000.0);
 }
 int main(void)
 {
@@ -220,6 +264,7 @@ int main(void)
     CHECK(csQueueCopyMemRequest(&write, (void *)123, callback, NULL, NULL, NULL) == CS_QUEUED);
     for (int i = 0; i < 3000 && !atomic_load(&callback_done); ++i) usleep(1000);
     CHECK(atomic_load(&callback_done));
+    test_callback_sequence(a);
     test_batch_callback_requeue(a);
     CS_EVT_HANDLE event;
     OK(csCreateEvent(&event));

@@ -1,5 +1,6 @@
 // 各类 queue API 共用的请求快照、句柄绑定和同步/异步执行。
 #include "cs_internal.hpp"
+#include <deque>
 using namespace snia;
 namespace {
 template<class T> void *bind(PreparedRequest &request, void *handle, CS_STATUS invalid)
@@ -49,6 +50,61 @@ void runRequest(const std::shared_ptr<Request> &request)
     }
     if (request->callback)
         apiCall([&] { request->callback(request->context, status, value); return CS_SUCCESS; });
+}
+// Reuse process-local threads across requests, including callback continuations.
+// Grow on demand rather than fixing the worker count: a callback may wait for
+// another asynchronous request while its own worker is still occupied.
+class RequestWorkers final {
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::deque<std::shared_ptr<Request>> requests;
+    std::vector<std::thread> workers;
+    unsigned idle = 0;
+    bool stopping = false;
+    void work()
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        for (;;) {
+            ++idle;
+            ready.wait(lock, [&] { return stopping || !requests.empty(); });
+            --idle;
+            if (requests.empty()) return;
+            auto request = std::move(requests.front());
+            requests.pop_front();
+            lock.unlock();
+            runRequest(request);
+            request.reset();
+            lock.lock();
+        }
+    }
+public:
+    ~RequestWorkers()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        ready.notify_all();
+        for (auto &worker : workers) worker.join();
+    }
+    void submit(const std::shared_ptr<Request> &request)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (stopping) throw CS_ERROR_IN_EXECUTION;
+        requests.push_back(request);
+        try {
+            if (requests.size() > idle) workers.emplace_back([this] { work(); });
+        } catch (...) {
+            requests.pop_back();
+            throw;
+        }
+        ready.notify_one();
+    }
+};
+RequestWorkers &requestWorkers()
+{
+    static RequestWorkers workers;
+    return workers;
 }
 } // namespace
 
@@ -152,7 +208,7 @@ CS_STATUS submitRequest(std::shared_ptr<PreparedRequest> task, std::shared_ptr<B
     try {
         auto handle = publishHandle(request);
         if (out) *out = handle;
-        std::thread([request] { runRequest(request); }).detach();
+        requestWorkers().submit(request);
     } catch (...) {
         std::lock_guard<std::mutex> lock(handlesMutex);
         handles.erase(request->id);

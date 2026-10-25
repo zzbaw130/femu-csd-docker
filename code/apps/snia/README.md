@@ -139,6 +139,8 @@ FEMU 在设备图节点内自动处理整个循环，直到得到普通结果才
 
 异步请求完成并释放请求快照后，SNIA 再调用标准 callback；此时已归还该请求的并发名额。应用可在 callback 中用 SNIA API 重配已完成的 batch 并续交下一块，包括已有 64 路请求时。应用自行保证缓冲可复用，并在取消或释放上下文前停止续交、等待回调结束；callback 不应调用所属应用中只允许主线程使用的接口。
 
+公共库按需创建应用进程内的异步工作线程，空闲时等待并复用，库卸载时停止并等待线程结束；不为每个请求反复创建线程。同步请求仍在调用线程直接执行。工作线程数量不固定为CU数：callback可能等待另一个异步请求，公共层须允许其继续执行；设备CU配额仍由适配器和设备管理。64是在途异步请求的当前实现上限，并非SNIA规定的CU数。
+
 设备编译可参考 `code/csd-programs/examples/CMakeLists.txt`；根 CMakeLists.txt 的 add_csd_program 统一输出位置、头文件和 workmem 链接。完整可执行重入示例见 [merge-sort.cpp](../../csd-programs/examples/merge-sort.cpp)。
 
 ## spill 区与资源生命周期

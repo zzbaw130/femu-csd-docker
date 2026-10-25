@@ -1,6 +1,24 @@
 # 当前性能与未完成项（2026-10-25）
 
-## 当前：索引根页保留与连续LOAD
+## 当前：SNIA异步请求复用工作线程
+
+参照DuckDB工作线程持续取任务的方向，SNIA公共请求执行器改为应用进程内按需创建、复用线程；同步请求仍直接执行。工作队列不持锁执行请求或callback，所有线程忙于callback时仍可为新请求创建线程，支持callback等待异步子请求。公开API、插件契约、64个在途请求上限及取消/完成生命周期不变；不修改PG、设备SQL程序或固件。
+
+[SNIA六项CTest记录](../../../../results/request-workers/unit-tests.log)覆盖C头文件、发现、两个设备插件路由、分配失败重试、batch与event生命周期和设备图布局。新增512次连续callback检查实际线程生命周期（不依赖可能复用的OS线程ID）：[两次mock微测](../../../../results/request-workers/callback-sequence.csv)从512个线程/27.535ms变为26个线程/7.071ms；它只证明线程复用及该微测开销下降，不代表查询加速比例。另有64个callback同时运行后执行同步请求、等待异步子请求、重配batch并续交的检查。
+
+Guest libsnia.so已重编安装。[规范Q4/Q14/Q21冷启动回归](../../../../results/tpch.pRqPXw/timings.csv)均正确、整条卸载且快于同轮host，仍为8 CU / 256MiB workmem / 64MiB FDM，未重复完整TPC-H。
+
+| 查询 | host ms | CSD ms |
+| --- | ---: | ---: |
+| Q4 | 2233.724 | 631.993 |
+| Q14 | 1512.872 | 477.839 |
+| Q21 | 2242.094 | 1081.191 |
+
+[Q21取消与恢复](../../../../results/request-workers/cancel-recovery.log)：300ms超时后，同一连接、不重启PG/Guest再次执行规范Q21，100行全部匹配host；恢复查询不计入冷启动性能成绩，临时SQL已删除。
+
+[Q4独立profile](../../../../results/request-workers/q4-profile.log)树墙钟966.777ms，worker累计CPU606.603ms、workmem峰值2561232字节、无spill；与前阶段相近。仍有2588次回调续交、2598次控制读取，续交前平均548.635μs，平均活跃CU约0.67。因此线程复用没有消除同步控制读取和跨请求往返，不宣称这些等待已解决或8 CU持续满载。
+
+## 索引根页保留与连续LOAD
 
 参照DuckDB缓冲管理保留反复访问页的方向，在设备SQL程序的既有每游标128页缓存中保留B-tree根页，其余页继续轮转，待LOAD的目标槽位不淘汰。不增加缓存页、AFDM或接口；游标仍满足原4KiB预算。PG、SNIA和固件无需修改。
 
