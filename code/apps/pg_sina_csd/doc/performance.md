@@ -1,6 +1,25 @@
 # 当前性能与未完成项（2026-10-25）
 
-## 当前：并行聚合归一化保留结果排序
+## 当前：Index Join接入并行哈希聚合
+
+移除计划转换中排除Index Join的旧限制。它已有可接续列批次，现在与Hash Join一样，可以将分组排序移到聚合结果上方，直接进入现有并行Hash Aggregate sink。不新增设备算子、局部表或接口，不改变PG选定的索引连接和排序语义。
+
+[规范Q4/Q13冷启动回归](../../../../results/tpch.1kdWx8/timings.csv)均正确、整条卸载且快于同轮host，8 CU / 256MiB workmem / 64MiB FDM不变。Q4 host 2822.046ms、CSD 689.592ms；Q13 host 1204.663ms、CSD 448.802ms。本阶段只修改PG计划转换并重新编译安装扩展，未重复完整TPC-H。
+
+Q4单独冷启动profile：[原排序聚合](../../../../results/group-vector-local/q4-before.log)、[Index Join → Hash Aggregate → Sort分组结果](../../../../results/group-vector-local/q4-hash.log)。均无spill。
+
+| 指标 | 原路径 | 哈希聚合路径 |
+| --- | ---: | ---: |
+| 排序累计CPU（sink＋source） | 84.217ms | 0.054ms |
+| 查询workmem峰值 | 4649040字节 | 2561104字节 |
+| 控制写入次数 | 553 | 1 |
+| 控制写入累计墙钟 | 372.462ms | 0.054ms |
+| worker累计CPU | 600.665ms | 617.476ms |
+| pipeline墙钟 | 1432.989ms | 583.051ms |
+
+共享聚合消化Index匹配结果后，worker不再为每批明细返回协调端，既有callback可以连续推进，因此不仅消除了明细排序，也减少了协调结果的控制写入。profile查询树1545.556→639.268ms，存在运行波动，不作为固定加速比例。新的聚合sink累计CPU20.511ms，平均活跃CU约1.06；索引读取与任务推进仍有等待，本轮不据此引入新的每CU局部表，也不宣称8 CU持续满载。
+
+## 并行聚合归一化保留结果排序
 
 参照DuckDB先更新分组哈希状态、再向下游交付分组结果的路径，修正PG计划归一化：原生Finalize GroupAggregate → Gather Merge → Sort → Partial HashAggregate被合并后，使用Hash Aggregate → Sort分组结果，保留原排序操作符、collation和NULL位置。此前丢失Gather Merge顺序，使Q15主路径为满足有序下游而退回明细排序。本阶段只修改PG计划转换，复用设备已有哈希聚合和排序，不改变SNIA、FEMU或资源容量。
 

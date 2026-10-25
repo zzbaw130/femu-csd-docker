@@ -495,6 +495,12 @@ NativePlan与8/16/64 CU测试通过，覆盖多层Index/Hash、NULL外连接、�
 
 Q18 customer构建profile墙钟846.351→338.897ms、累计CPU2935.097→1186.894ms；workmem峰值完全相同且无spill，确认改善来自竞争减少。没有改PG/SNIA/FEMU接口、预算或FDM容量。当前普通延迟和原始记录见performance.md，字典spill及其他逐行边界仍未完成。
 
+## Index Join接入并行哈希聚合（2026-10-25）
+
+参照DuckDB Join输出批次直接进入聚合sink的路径，移除PG计划转换中排除Index Join输入的旧限制；复用现有列输入、共享分组状态、满表接续和spill。Q4保留PG索引连接，将排序从匹配明细移到分组结果之后，worker可以经既有callback连续推进，无需按每批明细返回协调端。
+
+规范Q4/Q13冷启动均正确、完整卸载且快于同轮host；已重新编译安装PG扩展，不改SNIA、FEMU或设备程序。Q4 profile排序累计CPU84.217→0.054ms、控制写入553→1次、workmem峰值4649040→2561104字节，前后无spill。当前聚合sink仅20.511ms累计CPU，平均活跃CU约1.06，因此没有额外增加每CU局部表，后续仍需优化索引读取与任务推进。本阶段未重复完整22条，原始记录见performance.md。
+
 ## 并行聚合后的分组结果排序（2026-10-25）
 
 参照DuckDB哈希聚合先生成分组结果的路径，修正PG Finalize GroupAggregate与Partial HashAggregate合并时丢失Gather Merge顺序的问题。归一化在完成聚合上方保留原排序，按表达式映射分组输出位置，保留排序操作符、collation和NULL位置；无法映射时不编译该树。随后复用现有哈希聚合和Sort，不为有序下游排序全部明细。计划副本的父子指针可替换，原生PG执行计划不变。

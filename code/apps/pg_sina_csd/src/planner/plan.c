@@ -982,7 +982,9 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
         bool remove_sort=tree->nodes[n->left].kind==QP_SORT;
         int sort_id=n->left,input=remove_sort?tree->nodes[sort_id].left:n->left;
         unsigned kind=p->aggs[0].kind;
+        /* Hash and Index joins both expose resumable column input to the sink. */
         bool supported=input>=0 && (!remove_sort || tree->nodes[input].kind==QP_JOIN ||
+            tree->nodes[input].kind==QP_INDEX_JOIN ||
             (tree->nodes[input].kind==QP_SCAN && !tree->nodes[input].ordered_index)) &&
             (kind==Q_COUNT_STAR || ((kind==Q_SUM || kind==Q_AVG || kind==Q_COUNT) && p->aggs[0].expr>=0));
         const struct qs_plan *sorted=&tree->nodes[n->left].expr;
