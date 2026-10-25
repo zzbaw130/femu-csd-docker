@@ -231,7 +231,16 @@ static inline int qs_dict_insert(struct qs_dict *dict,const char *bytes,unsigned
 {
     int id=qs_dict_find(dict,bytes,length);
     if(id) return id;
-    while(__sync_lock_test_and_set(&dict->lock,1U)) { }
+    /* Wait with shared reads while another CU inserts or grows the table;
+     * repeatedly exchanging a locked cache line makes all CUs contend with
+     * the owner even though none of those writes can acquire the lock. */
+    while(__atomic_exchange_n(&dict->lock,1U,__ATOMIC_ACQUIRE)) {
+        while(__atomic_load_n(&dict->lock,__ATOMIC_RELAXED)) {
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#endif
+        }
+    }
     id=qs_dict_find(dict,bytes,length);
     if(!id) {
         unsigned count=dict->count,used=dict->bytes;
@@ -255,7 +264,7 @@ static inline int qs_dict_insert(struct qs_dict *dict,const char *bytes,unsigned
             }
         }
     }
-    __sync_lock_release(&dict->lock);
+    __atomic_store_n(&dict->lock,0U,__ATOMIC_RELEASE);
     return id;
 }
 static inline int qs_dict_get(const struct qs_dict *dict,unsigned id,const char **bytes,unsigned *length)

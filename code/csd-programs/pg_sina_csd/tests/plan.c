@@ -66,9 +66,9 @@ static void dictionary_growth(void)
     int first=qs_dict_insert(&dict,"held",4); assert(first>0);
     const char *held; unsigned length; assert(!qs_dict_get(&dict,first,&held,&length) && length==4);
     struct qs_dict *original=qs_dict_storage(&dict);
-    pthread_t threads[4];
-    for(unsigned i=0;i<4;++i) assert(!pthread_create(&threads[i],NULL,dictionary_insert_worker,&dict));
-    for(unsigned i=0;i<4;++i) assert(!pthread_join(threads[i],NULL));
+    pthread_t threads[8];
+    for(unsigned i=0;i<8;++i) assert(!pthread_create(&threads[i],NULL,dictionary_insert_worker,&dict));
+    for(unsigned i=0;i<8;++i) assert(!pthread_join(threads[i],NULL));
     assert(dict.count==4097 && dict.bytes==4+4096*80 && qs_dict_storage(&dict)!=original);
     assert(!memcmp(held,"held",4)); /* A byte view borrowed before all growth. */
     struct cs_work_context_stats memory; assert(!cs_work_get_context_stats(context,&memory));
