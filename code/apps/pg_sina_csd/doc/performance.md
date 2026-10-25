@@ -52,6 +52,43 @@ PG把已有Heap/Index extent映射随计划输入一次性上传，设备SQL程�
 
 完整查询正确性与本轮性能指标已达标。总改造仍保留Index单行/SEMI/ANTI、Merge Join、复杂DISTINCT及部分排序边界的逐行适配，以及共享字典容量和通用I/O推进优化项，见文末；因此没有宣称总目标全部完成。现有证据不要求扩大FDM。
 
+## 驻留Hash Aggregate Source驱动后续并行流水线
+
+参考DuckDB `physical_hash_aggregate.cpp`的Global/Local Source State，已让驻留Hash聚合结果驱动后续投影、Hash或Index链。PG保留原选定Join树，依据HAVING前的分组量标记Source边界，并让AFDM布局在该边界停止；不同阶段复用原工作槽。设备SQL程序`pg-sina-plan.so`先完成聚合，再将只读表发布给CU工作状态；每个CU原子领取64个槽位，处理后继续领取，跨I/O和输出保存自身位置。所有读者结束后释放原表，没有新增物化副本。SNIA和FEMU的通用图、CU、I/O接口未修改，固件不识别聚合状态。
+
+准备阶段在第一行输出前停止。实际spill、Hash算法降级或并行状态分配失败时，保留设备内原串行消费/归并路径，避免丢失首行。原查询workmem总预算继续约束共享表与所有CU私有状态。四项设备CTest（NativePlan及8/16/64 CU）、两项ASan/UBSan/LeakSanitizer和Guest布局检查通过：覆盖四类连接、空输入、嵌套扫描→聚合→Source、Source→并行Hash Build→逐键Probe的全量计数，以及4MiB下实际spill回退。估计输出仅1行、但HAVING前分组估计达到阈值的用例也会启用并行。
+
+8 CU / 256MiB workmem / 64MiB FDM下，成对切换旧/新PG扩展与设备SO，对规范Q20分别执行三次普通冷启动和三次profile；六次普通结果均与host一致。[逐次延迟](../../../../results/group-source/cold-timings.csv)、[逐次profile](../../../../results/group-source/profiles.csv)，以下为各项中位数：
+
+| 指标 | 聚合后串行消费 | 并行Source |
+| --- | ---: | ---: |
+| 普通冷启动 ms | 1297.519 | 663.649 |
+| profile查询树墙钟 ms | 1234.693 | 601.279 |
+| CSF累计CPU ms | 1512.817 | 1691.383 |
+| Heap行数 | 6211240 | 6211240 |
+| 索引候选Tuple | 23856 | 23856 |
+| Index/Heap页加载 | 15807 | 16701 |
+| workmem峰值 字节 | 89112320 | 89868816 |
+| AFDM 字节 | 45007120 | 45007120 |
+| spill读/写 字节 | 0/0 | 0/0 |
+
+普通中位数约降49%，并非CPU工作量同步下降；任务分给各CU私有索引缓存后，页加载数也会变化。新版三次普通值为663.649/963.036/659.637ms，保留了中间异常值，不保证固定比例。新增Q20流水线5的wall为118～127ms，worker CPU约70～78ms，体现了I/O等待的重叠，不能据此宣称该段一直占满8个计算核心。原扫描/聚合流水线14继续运行，未省略输入计算或扩大FDM。
+
+规范Q17/Q18的独立profile也确认后续Hash Build已接入Source。Q18流水线8：wall=65.012ms、worker CPU=508.064ms、平均7.82 CU（97.7%）；这是接近用满8 CU的一个计算段，不代表整条查询。Q18 workmem峰值205422176字节、AFDM=55239192字节，均在现有上限内，且无spill。Q17流水线6仍有29.378ms协调CPU（wall=62.410ms），Q18扫描/聚合段也有明显协调时间，仍需进一步定位共享表增长与推进成本。
+
+最终[规范Q2/Q11/Q17/Q18/Q20/Q21回归](../../../../results/tpch.BQcivx/timings.csv)每次host/CSD前均冷启动，全部结果一致、完整卸载且快于同轮host；EXPLAIN确认8 CU及268435456字节查询总预算：
+
+| 查询 | host ms | CSD ms |
+| --- | ---: | ---: |
+| Q2 | 896.960 | 379.886 |
+| Q11 | 388.646 | 258.551 |
+| Q17 | 5070.832 | 990.200 |
+| Q18 | 7221.839 | 1270.547 |
+| Q20 | 3697.646 | 664.315 |
+| Q21 | 2274.168 | 929.137 |
+
+本轮未运行完整22条，不能代替上方全量基线。纯聚合Source直接输出、spill归并Source、Sort/Merge等阻塞边界及其余列化工作尚未全部并行化，完整目标继续推进。FDM无需扩容。
+
 ## 条件过滤后引用原列与选择向量
 
 参考DuckDB `DataChunk::Slice`和`Vector::Slice`引用原列、只保存选择位置的方式，INNER/LEFT Index Join在残余条件过滤后直接向输出表达式传递原候选列和存活位置，省去将存活值逐列复制到另一份输入缓冲。条件输入的列布局保留输出批次的slot编号；游标在输出消费完成前保留该批次，下一次推进才覆盖或释放。SEMI跨轮收集保留原缓冲，没有为了引用列而增加返回/续交次数。

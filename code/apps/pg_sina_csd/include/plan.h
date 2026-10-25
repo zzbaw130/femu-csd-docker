@@ -140,6 +140,26 @@ static inline int qp_probe_scan(const struct qp_plan *p,int id)
         return qp_probe_scan(p,n->left);
     return -1;
 }
+/* A finalized resident Hash Aggregate can feed a new pipeline without
+ * rescanning its input. Runtime spill still uses the serial merge source. */
+static inline int qp_pipeline_source(const struct qp_plan *p,int id)
+{
+    if(id<0) return -1;
+    const struct qp_node *n=&p->nodes[id];
+    if(n->kind==QP_SCAN) return n->ordered_index && !(n->ordered_index&8)?-1:id;
+    if(n->kind==QP_AGGREGATE && n->hash && !n->distinct && !n->distinct_aggs && qp_hash_aggregate_supported(n)) return id;
+    if(n->kind==QP_PROJECT || n->kind==QP_INDEX_JOIN || (n->kind==QP_JOIN && n->hash))
+        return qp_pipeline_source(p,n->left);
+    return -1;
+}
+static inline void qp_mark_parallel(struct qp_plan *p,int id)
+{
+    int source=qp_pipeline_source(p,id); if(source<0) return;
+    const struct qp_node *n=&p->nodes[source];
+    if((n->kind==QP_SCAN && n->bytes>=4*QP_SCAN_BYTES) ||
+       (source!=id && n->kind==QP_AGGREGATE &&
+        (n->estimated_groups>=QP_VECTOR_ROWS || n->estimated_rows>=QP_VECTOR_ROWS))) p->nodes[id].parallel=1;
+}
 /* Mark every independent scan/probe pipeline, including InitPlan scans.
  * Each phase reuses the same worker buffers after the previous phase drains. */
 static inline void qp_parallel_boundaries(struct qp_plan *p,int id)
@@ -147,12 +167,10 @@ static inline void qp_parallel_boundaries(struct qp_plan *p,int id)
     if(id<0) return;
     struct qp_node *n=&p->nodes[id]; int candidate=-1;
     if(n->kind==QP_SORT || (n->kind==QP_AGGREGATE && (!n->nkeys || !n->sorted_input))) candidate=n->left;
-    int scan=qp_probe_scan(p,candidate);
-    if(scan>=0 && p->nodes[scan].bytes>=4*QP_SCAN_BYTES) p->nodes[candidate].parallel=1;
+    qp_mark_parallel(p,candidate);
     qp_parallel_boundaries(p,n->left);
     if(n->kind==QP_JOIN && n->hash) {
-        scan=qp_probe_scan(p,n->right);
-        if(scan>=0 && p->nodes[scan].bytes>=4*QP_SCAN_BYTES) p->nodes[n->right].parallel=1;
+        qp_mark_parallel(p,n->right);
     }
     /* Merge inputs have independent blocking pipelines too. An index lookup
      * is driven by its left input and must not become a full parallel scan. */

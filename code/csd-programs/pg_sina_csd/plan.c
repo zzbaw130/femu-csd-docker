@@ -1666,7 +1666,7 @@ static int group_update(struct execution *s,const struct qp_node *n,unsigned agg
     }
     return group_add(g,value,count,a->kind);
 }
-static struct compact_group *group_at(struct operator_state *o,unsigned slot)
+static struct compact_group *group_at(const struct operator_state *o,unsigned slot)
 { return (void *)((unsigned char *)o->groups+(size_t)slot*o->group_stride); }
 static void group_keys(const struct qp_node *n,const struct operator_state *o,const struct compact_group *g,struct qs_cell *keys)
 {
@@ -1918,11 +1918,11 @@ static int group_input_pending(const struct execution *s,int id)
     if(n->kind==QP_MATERIALIZED) return 1;
     return group_input_pending(s,n->left) || group_input_pending(s,n->right);
 }
-static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct qs_cell *row)
+static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct qs_cell *row,int prepare)
 {
     struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
     struct sorted_rows *sort=&o->left_sort;
-    if(!qp_hash_aggregate_supported(n)) { n->hash=0; return aggregate_next(s,id,row); }
+    if(!qp_hash_aggregate_supported(n)) { n->hash=0; return prepare?3:aggregate_next(s,id,row); }
     int wide=n->nkeys!=1 || n->expr.exprs[n->expr.keys[0]].type!=Q_INTEGER;
     if(!o->group_capacity) {
         /* Keep the insertion counter away from read-mostly capacity/stride
@@ -1930,7 +1930,7 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
          * query close; table resize does not move it or change its count. */
         if(!o->group_count) {
             void *storage=cs_work_alloc(s->context,128);
-            if(!storage) { n->hash=0; return aggregate_next(s,id,row); }
+            if(!storage) { n->hash=0; return prepare?3:aggregate_next(s,id,row); }
             o->group_count=(void *)(((uintptr_t)storage+63)&~(uintptr_t)63);
             atomic_init(o->group_count,0);
         }
@@ -1966,7 +1966,7 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
             if(o->groups || capacity==128) break;
             capacity/=2;
         }
-        if(!o->groups) { n->hash=0; return aggregate_next(s,id,row); }
+        if(!o->groups) { n->hash=0; return prepare?3:aggregate_next(s,id,row); }
         o->group_capacity=capacity;
     }
     for(;;) {
@@ -2045,6 +2045,7 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
             continue;
         }
         if(o->group_phase==3) {
+            if(prepare) return 3;
             while(o->group_flush<o->group_capacity) {
                 struct compact_group *g=group_at(o,o->group_flush++); if(!g->occupied) continue;
                 struct qs_cell keys[QS_KEYS]; group_keys(n,o,g,keys);
@@ -2052,6 +2053,7 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
             }
             cs_work_free(s->context,o->groups); o->groups=NULL; o->finished=1; return 0;
         }
+        if(prepare) return 3;
         /* Merge partial value/count pairs; AVG is divided only for final output. */
         if(!o->have_right && !o->group_ready) {
             if((s->pending_sort==sort || sort->position==sort->output->rows) && !sort->drained) {
@@ -2088,10 +2090,10 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
 static int64_t hash_aggregate_next(struct execution *s,unsigned id,struct qs_cell *row)
 {
     /* Pure in-memory output is one call per group: leave it untimed. */
-    if(!s->profiling || s->nodes[id].group_phase==3) return hash_aggregate_next_impl(s,id,row);
+    if(!s->profiling || s->nodes[id].group_phase==3) return hash_aggregate_next_impl(s,id,row,0);
     unsigned op=s->nodes[id].group_phase==2?QS_AGG_SOURCE:QS_AGG_SINK;
     struct blocking_timer timer=blocking_begin(s);
-    int64_t status=hash_aggregate_next_impl(s,id,row); blocking_end(s,op,timer); return status;
+    int64_t status=hash_aggregate_next_impl(s,id,row,0); blocking_end(s,op,timer); return status;
 }
 static int64_t aggregate_next(struct execution *s,unsigned id,struct qs_cell *row)
 {
@@ -2459,6 +2461,21 @@ static int64_t next_row_impl(struct execution *s,unsigned id,struct qs_cell *row
     if(id>=s->plan->count) return -1;
     struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
     if(s->worker && (int)id==s->source_node) {
+        if(n->kind==QP_AGGREGATE && s->owner->partition_join<0) {
+            const struct operator_state *source=&s->owner->nodes[id];
+            for(;;) {
+                if(s->source_at==s->source_end) {
+                    s->source_at=atomic_fetch_add_explicit(&s->owner->next_offset,64,memory_order_relaxed);
+                    if(s->source_at>=source->group_capacity) return 0;
+                    s->source_end=s->source_at+64;
+                    if(s->source_end>source->group_capacity) s->source_end=source->group_capacity;
+                }
+                const struct compact_group *g=group_at(source,s->source_at++);
+                if(!g->occupied) continue;
+                struct qs_cell keys[QS_KEYS]; group_keys(n,source,g,keys);
+                int64_t status=group_result(s,n,g->values,keys,row); if(status) return status;
+            }
+        }
         unsigned bytes=hash_row_bytes(&n->expr),block_rows=QS_SORT_IO_BYTES/bytes;
         if(s->source_at==s->source_end) {
             s->source_at=atomic_fetch_add(&s->owner->next_offset,block_rows);
@@ -2568,8 +2585,10 @@ static int64_t parallel_next(struct execution *s,unsigned root,struct qs_cell *r
     struct qp_plan *p=s->plan;
 restart:
     if(!s->parallel_started || s->parallel_node!=root) {
+        int source=qp_pipeline_source(p,root);
+        if(source<0) { p->nodes[root].parallel=0; return next_row(s,root,row); }
         int builds[QP_NODES]; unsigned count=0;
-        for(int id=root;id>=0 && p->nodes[id].kind!=QP_SCAN;id=p->nodes[id].left)
+        for(int id=root;id>=0 && id!=source;id=p->nodes[id].left)
             if(p->nodes[id].kind==QP_JOIN) builds[count++]=id;
         /* Finish deeper build dependencies first. If a parent falls back to
          * Merge Join, its left input must not start another parallel phase
@@ -2590,6 +2609,18 @@ restart:
                 return next_row(s,root,row);
             }
         }
+        s->partition_join=-1;
+        for(unsigned i=0;i<count;++i)
+            if(s->nodes[builds[i]].external && !s->nodes[builds[i]].external->direct) { s->partition_join=builds[i]; break; }
+        if(p->nodes[source].kind==QP_AGGREGATE && s->partition_join<0) {
+            struct blocking_timer timer={0}; if(s->profiling) timer=blocking_begin(s);
+            int64_t status=hash_aggregate_next_impl(s,source,NULL,1);
+            if(s->profiling) blocking_end(s,QS_AGG_SINK,timer);
+            if(status!=3) return status;
+            if(s->nodes[source].group_phase!=3 || !s->nodes[source].groups) {
+                p->nodes[root].parallel=0; return next_row(s,root,row);
+            }
+        }
         unsigned hash_sink=0,group_sink=0,aggregate_sink=0;
         for(unsigned i=0;i<p->count;++i) {
             const struct qp_node *parent=&p->nodes[i];
@@ -2605,13 +2636,10 @@ restart:
             if(p->nodes[i].kind==QP_JOIN && p->nodes[i].right==(int)root &&
                s->nodes[i].hash_data && !s->nodes[i].hash_phase && !s->nodes[i].hash_fallback)
                 hash_sink=i+1;
-        s->partition_join=-1;
-        for(unsigned i=0;i<count;++i)
-            if(s->nodes[builds[i]].external && !s->nodes[builds[i]].external->direct) { s->partition_join=builds[i]; break; }
         for(unsigned w=0;w<p->workers;++w) {
             struct cs_work_context_stats stats;
             if(cs_work_get_context_stats(s->context,&stats)) return -4;
-            const struct qp_node *leaf=&p->nodes[qp_probe_scan(p,root)];
+            const struct qp_node *leaf=&p->nodes[source];
             size_t private_bytes=sizeof(*s)+p->count*sizeof(*s->nodes)+sizeof(struct qs_plan)+256;
             if(leaf->ordered_index) private_bytes+=QS_INDEX_WORK_BYTES+sizeof(struct qs_plan);
             size_t spill_reserve=0;
@@ -2639,6 +2667,7 @@ restart:
             e->io_bytes=QS_SORT_IO_BYTES;
             e->sort_limit=s->sort_limit; e->profiling=s->profiling; e->initializer=p->ninit;
             e->source_node=-1;
+            if(p->nodes[source].kind==QP_AGGREGATE) e->source_node=source;
             if(s->partition_join>=0) {
                 const struct external_hash *h=s->nodes[s->partition_join].external;
                 e->source_node=p->nodes[s->partition_join].left;
@@ -2658,7 +2687,7 @@ restart:
                 }
             }
             *e->control=(struct qp_control){.state=(uintptr_t)e}; s->workers[w]=e;
-            *(struct qs_chunk *)(s->arena+vector_offset(e,leaf))=
+            if(leaf->kind==QP_SCAN) *(struct qs_chunk *)(s->arena+vector_offset(e,leaf))=
                 (struct qs_chunk){.capacity=leaf->ordered_index?256:qp_scan_capacity(p,leaf),.ncols=leaf->expr.ncols};
         }
         s->parallel_node=root; s->parallel_done=0;
@@ -2711,12 +2740,17 @@ restart:
             }
         }
         close_workers(s);
+        int source=qp_pipeline_source(p,root);
+        if(source>=0 && p->nodes[source].kind==QP_AGGREGATE && s->partition_join<0) {
+            cs_work_free(s->context,s->nodes[source].groups); s->nodes[source].groups=NULL;
+            s->nodes[source].finished=1;
+        }
         s->parallel_started=0; s->control->parallel=0;
         if(s->partition_join>=0) {
             external_advance(s,s->partition_join); s->partition_join=-1;
             goto restart;
         }
-        for(int id=root;id>=0 && p->nodes[id].kind!=QP_SCAN;id=p->nodes[id].left) if(p->nodes[id].kind==QP_JOIN) {
+        for(int id=root;id>=0 && id!=source;id=p->nodes[id].left) if(p->nodes[id].kind==QP_JOIN) {
             cs_work_free(s->context,s->nodes[id].hash_data); s->nodes[id].hash_data=NULL;
         }
         s->nodes[root].finished=1; return 0;

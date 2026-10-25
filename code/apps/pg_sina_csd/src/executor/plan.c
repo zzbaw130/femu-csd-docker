@@ -207,8 +207,10 @@ static size_t layout_buffers(PlanStateCsd *s,const bool *indexed)
     size_t stride=0;
     if(s->workers>1) for(unsigned root=0;root<s->plan->count;++root) if(s->plan->nodes[root].parallel) {
         size_t end=arena;
+        int source=qp_pipeline_source(s->plan,root);
         for(int id=root;id>=0;id=s->plan->nodes[id].left) {
             struct qp_node *n=&s->plan->nodes[id];
+            if(id==source && n->kind!=QP_SCAN) break;
             if(n->kind==QP_SCAN) {
                 unsigned bytes=n->ordered_index?QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE:qp_scan_buffer_bytes(s->plan,n);
                 n->parallel_input=end; end+=bytes; n->parallel_vector=end;

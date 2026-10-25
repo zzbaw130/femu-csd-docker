@@ -13,7 +13,7 @@
 #include <stdatomic.h>
 #include <endian.h>
 typedef int64_t (*function)(struct femu_csd_args *);
-enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_INDEX_PIPELINE,TEST_INDEX_HASH,TEST_INDEX_CHAIN,TEST_INDEX_EXPR,TEST_DEVICE_IO,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL, TEST_VECTOR_AGG=-1,TEST_HASH_QUAL=-2 };
+enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_INDEX_PIPELINE,TEST_INDEX_HASH,TEST_INDEX_CHAIN,TEST_INDEX_EXPR,TEST_DEVICE_IO,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL, TEST_VECTOR_AGG=-1,TEST_HASH_QUAL=-2,TEST_GROUP_SOURCE=-3,TEST_GROUP_SOURCE_SPILL=-4,TEST_BUILD_GROUP_SOURCE=-5 };
 static unsigned test_workers=4;
 static bool test_scheduled;
 /* Reservations must cover physical input even when filters/NDV estimates
@@ -332,6 +332,25 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         j->expr.exprs[7]=(struct qs_expr){.op=Q_CASE,.type=Q_BOOLEAN,.left=5,.right=5,.otherwise=6};
         j->join_qual=7;
     }
+    if(parallel==TEST_GROUP_SOURCE || parallel==TEST_GROUP_SOURCE_SPILL || parallel==TEST_BUILD_GROUP_SOURCE) {
+        int build=parallel==TEST_BUILD_GROUP_SOURCE;
+        plan->count=build?6:5;
+        if(build) {
+            j->right=5;
+            plan->nodes[5]=(struct qp_node){.kind=QP_PROJECT,.left=4,.right=-1,.expr=plan->nodes[3].expr,.estimated_rows=right_rows};
+            plan->nodes[5].expr.outputs[1].type_oid=20;
+        } else j->left=4;
+        struct qp_node *g=&plan->nodes[4];
+        *g=(struct qp_node){.kind=QP_AGGREGATE,.left=build?3:2,.right=-1,.hash=1,.nkeys=1,
+            .estimated_rows=1,.estimated_groups=QP_VECTOR_ROWS,.expr=plan->nodes[2].expr};
+        g->expr.nexprs=3; g->expr.nkeys=g->expr.naggs=1; g->expr.keys[0]=0;
+        g->expr.aggs[0]=(struct qs_agg){.kind=Q_SUM,.expr=1};
+        g->expr.exprs[2]=(struct qs_expr){.op=Q_AGGREF,.type=Q_INTEGER,.column=0};
+        g->expr.outputs[1]=(struct qs_output){.index=2,.type_oid=20};
+        plan->nodes[build?3:2].parallel=1;
+        if(parallel==TEST_GROUP_SOURCE_SPILL) g->estimated_groups=g->estimated_rows=rows;
+        if(build) g->estimated_groups=g->estimated_rows=right_rows;
+    }
     if(parallel==TEST_HASH_QUAL) {
         j->expr.nexprs=8;
         j->expr.exprs[4]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=8};
@@ -399,7 +418,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         a->nkeys=a->expr.nkeys=0;
         a->expr.exprs[0]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER};
     }
-    if(parallel==TEST_COUNT_ROWS || parallel>=TEST_PARTITION) {
+    if(parallel==TEST_COUNT_ROWS || parallel==TEST_BUILD_GROUP_SOURCE || parallel>=TEST_PARTITION) {
         /* COUNT(*) needs row cardinality but no payload from the probe pipeline. */
         j->expr.nout=0; a->nkeys=a->expr.nkeys=a->expr.nattrs=0;
         a->expr.naggs=a->expr.nout=1; a->expr.aggs[0]=(struct qs_agg){.kind=Q_COUNT_STAR};
@@ -423,6 +442,12 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         plan->nodes[6]=plan->nodes[3];
     }
     size_t sizes[2]; unsigned char *raw[2]={heap(rows,0,&sizes[0]),heap(right_rows,1,&sizes[1])};
+    if(parallel==TEST_GROUP_SOURCE_SPILL) for(unsigned i=0;i<rows;++i)
+        if(i%17) w32(raw[0]+(size_t)(i/100)*QS_PAGE+QS_PAGE-(i%100+1)*40+24,(uint64_t)i*7919%rows);
+    if(parallel==TEST_BUILD_GROUP_SOURCE) for(unsigned i=0;i<right_rows;++i)
+        if(i%17) w32(raw[1]+(size_t)(i/100)*QS_PAGE+QS_PAGE-(i%100+1)*40+24,i);
+    if(parallel==TEST_BUILD_GROUP_SOURCE) for(unsigned i=0;i<rows;++i)
+        if(i%17) w32(raw[0]+(size_t)(i/100)*QS_PAGE+QS_PAGE-(i%100+1)*40+24,i);
     if(parallel==TEST_PARTITION_SKEW)
         for(unsigned side=0;side<2;++side) for(unsigned i=0;i<(side?right_rows:rows);++i)
             if(i%17) w32(raw[side]+(i/100)*QS_PAGE+QS_PAGE-(i%100+1)*40+24,1);
@@ -435,6 +460,14 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         plan->nodes[6].bytes=plan->nodes[3].bytes;
         plan->nodes[6].input_offset=plan->nodes[3].input_offset;
         plan->nodes[6].vector_offset=plan->nodes[3].vector_offset;
+    }
+    if(parallel==TEST_GROUP_SOURCE || parallel==TEST_GROUP_SOURCE_SPILL) {
+        qp_parallel_boundaries(plan,0);
+        assert(plan->nodes[1].parallel && qp_pipeline_source(plan,1)==4 && qp_probe_scan(plan,1)<0);
+    }
+    if(parallel==TEST_BUILD_GROUP_SOURCE) {
+        qp_parallel_boundaries(plan,0);
+        assert(plan->nodes[5].parallel && qp_pipeline_source(plan,5)==4);
     }
     for(unsigned i=0;i<plan->count;++i) if(plan->nodes[i].kind==QP_INDEX_JOIN) {
         struct qp_node *indexed=&plan->nodes[i];
@@ -451,7 +484,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             indexed->parallel_input=parallel_bytes; parallel_bytes+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE;
             indexed->parallel_vector=parallel_bytes; parallel_bytes+=4096+((qs_chunk_bytes(256,4)+4095)&~(size_t)4095);
         }
-        if(parallel==TEST_BUILD_PHASE || parallel==TEST_BUILD_FALLBACK) {
+        if(parallel==TEST_BUILD_PHASE || parallel==TEST_BUILD_FALLBACK || parallel==TEST_BUILD_GROUP_SOURCE) {
             plan->nodes[3].parallel=1;
             plan->nodes[3].parallel_input=plan->nodes[2].parallel_input;
             plan->nodes[3].parallel_vector=plan->nodes[2].parallel_vector;
@@ -491,20 +524,34 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     args.cparam1=parallel==TEST_PARALLEL || parallel==TEST_BUILD_PHASE || parallel==TEST_HASH_GROUP || parallel==TEST_PARTITION || parallel==TEST_PARTITION_SKEW;
     void **tokens=NULL; size_t ntokens=0; unsigned got=0; unsigned char seen[12]={0};
     uint64_t counts[12]={0},sums[12]={0},mins[12]={0},maxs[12]={0};
-    for(unsigned l=0;l<rows;++l) {
-        unsigned key=parallel==TEST_PARTITION_SKEW?1:l%11; int matched=0;
-        for(unsigned r=0;r<right_rows;++r) if(l%17 && r%17 && key==(parallel==TEST_PARTITION_SKEW?1:r%7) &&
+    uint64_t source_sums[12]={0},source_counts[12]={0};
+    if(parallel==TEST_BUILD_GROUP_SOURCE) {
+        /* Probe every grouped key: missing/duplicate Source ranges must
+         * change the answer, including across shared Hash resize waves. */
+        unsigned common=rows<right_rows?rows:right_rows;
+        counts[0]=common-(common+16)/17;
+    }
+    if(parallel==TEST_GROUP_SOURCE) for(unsigned l=0;l<rows;++l) {
+        unsigned key=l%17?l%11:11; source_sums[key]+=l%19+1; ++source_counts[key];
+    }
+    for(unsigned l=0;l<(parallel==TEST_BUILD_GROUP_SOURCE?0:parallel==TEST_GROUP_SOURCE?12:rows);++l) {
+        if(parallel==TEST_GROUP_SOURCE && !source_counts[l]) continue;
+        unsigned key=parallel==TEST_PARTITION_SKEW?1:parallel==TEST_GROUP_SOURCE_SPILL?(uint64_t)l*7919%rows:l%11; int matched=0;
+        if(parallel==TEST_GROUP_SOURCE) key=l;
+        int valid=parallel==TEST_GROUP_SOURCE?key!=11:l%17!=0;
+        unsigned left_value=parallel==TEST_GROUP_SOURCE?source_sums[key]:l%19+1;
+        for(unsigned r=0;r<right_rows;++r) if(valid && r%17 && key==(parallel==TEST_PARTITION_SKEW?1:parallel==TEST_BUILD_GROUP_SOURCE?r:r%7) &&
             (parallel!=TEST_INDEX_EXPR || r%13+1>=8) &&
             (parallel!=TEST_HASH_QUAL || r%13+1>=8)) {
-            unsigned v=join==QP_SEMI?l%19+1:r%13+1; matched=1;
+            unsigned v=join==QP_SEMI?left_value:r%13+1; matched=1;
             if(join==QP_ANTI) continue;
             ++counts[key]; sums[key]+=v; if(!mins[key] || mins[key]>v) mins[key]=v; if(maxs[key]<v) maxs[key]=v;
             if(join==QP_SEMI) break;
         }
         if(join==QP_INNER || join==QP_SEMI) { if(matched) seen[key]=1; }
-        else if(join==QP_LEFT) seen[l%17?key:11]=1;
+        else if(join==QP_LEFT) seen[valid?key:11]=1;
         else if(!matched) {
-            key=l%17?key:11; unsigned v=l%19+1; seen[key]=1;
+            key=valid?key:11; unsigned v=left_value; seen[key]=1;
             ++counts[key]; sums[key]+=v; if(!mins[key] || mins[key]>v) mins[key]=v; if(maxs[key]<v) maxs[key]=v;
         }
     }
@@ -558,7 +605,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             for(unsigned w=0;w<plan->workers;++w) need_input[w]=true;
         }
         for(unsigned r=0;r<out->rows;++r) {
-            if(parallel==TEST_COUNT_ROWS || parallel>=TEST_PARTITION) {
+            if(parallel==TEST_COUNT_ROWS || parallel==TEST_BUILD_GROUP_SOURCE || parallel>=TEST_PARTITION) {
                 uint64_t expected=0; for(unsigned i=0;i<12;++i) expected+=counts[i];
                 assert(out->data[r].cells[0].value==expected); ++got; continue;
             }
@@ -596,8 +643,11 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     if(hash==2 && memory==4 && parallel==TEST_SERIAL) assert(ntokens); /* page-ready flag survives spill reentry */
     if(parallel==TEST_DEVICE_IO && memory==4) assert(ntokens); /* namespace and spill reentry share one CU I/O AFDM */
     if(parallel==TEST_HASH_QUAL && right_rows==150000) assert(ntokens);
+    if(parallel==TEST_GROUP_SOURCE_SPILL) assert(ntokens && !plan->nodes[1].parallel);
     if(test_workers>4 && parallel) assert(out->metrics.workers==test_workers && control.epoch);
-    assert(got); if(parallel!=TEST_COUNT_ROWS && parallel<TEST_PARTITION) for(unsigned i=0;i<12;++i) assert(!seen[i]);
+    if(parallel==TEST_GROUP_SOURCE && !rows) assert(!got); else assert(got);
+    if(parallel!=TEST_COUNT_ROWS && parallel!=TEST_BUILD_GROUP_SOURCE && parallel<TEST_PARTITION)
+        for(unsigned i=0;i<12;++i) assert(!seen[i]);
     if(args.cparam1&1) {
         uint64_t rounds=0;
         for(unsigned i=0;i<plan->count;++i) {
@@ -1366,6 +1416,12 @@ int main(int argc,char **argv)
         test(run,QP_INNER,31,50003,256,1,TEST_BUILD_PHASE);
         for(unsigned join=QP_INNER;join<=QP_ANTI;++join)
             test(run,join,31,5003,256,1,TEST_HASH_QUAL);
+        for(unsigned join=QP_INNER;join<=QP_ANTI;++join) {
+            test(run,join,20003,23,256,1,TEST_GROUP_SOURCE);
+            test(run,join,20003,23,256,2,TEST_GROUP_SOURCE);
+        }
+        test(run,QP_INNER,0,23,256,2,TEST_GROUP_SOURCE);
+        test(run,QP_INNER,50003,50003,256,1,TEST_BUILD_GROUP_SOURCE);
         test_scheduled=false;
         for(unsigned join=QP_INNER;join<=QP_ANTI;++join)
             test(run,join,20003,23,256,1,TEST_BUILD_PHASE);
@@ -1406,6 +1462,14 @@ int main(int argc,char **argv)
         parameter_projection(run,joined,1,1);
     }
     test_scheduled=true;
+    for(unsigned join=QP_INNER;join<=QP_ANTI;++join) {
+        test(run,join,20003,23,64,1,TEST_GROUP_SOURCE);
+        test(run,join,20003,23,64,2,TEST_GROUP_SOURCE);
+    }
+    test(run,QP_INNER,150000,23,4,2,TEST_GROUP_SOURCE_SPILL);
+    test(run,QP_INNER,0,23,64,1,TEST_GROUP_SOURCE);
+    test(run,QP_LEFT,0,23,64,2,TEST_GROUP_SOURCE);
+    test(run,QP_INNER,50003,50003,64,1,TEST_BUILD_GROUP_SOURCE);
     for(unsigned join=QP_INNER;join<=QP_ANTI;++join) {
         test(run,join,31,5003,64,1,TEST_HASH_QUAL);
         test(run,join,31,5003,4,1,TEST_HASH_QUAL);
