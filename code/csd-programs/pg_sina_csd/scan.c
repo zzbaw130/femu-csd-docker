@@ -1,0 +1,160 @@
+/* Projection-aware PG12 heap scan, producing compact typed column batches. */
+#include "femu-csd-kernel.h"
+#include "query.h"
+#include <string.h>
+#include "heap_numeric.h"
+static uint16_t read16(const unsigned char *p) { uint16_t v; memcpy(&v,p,2); return v; }
+static uint32_t read32(const unsigned char *p) { uint32_t v; memcpy(&v,p,4); return v; }
+/* Small '%' glob matcher for scan-level LIKE; '_' and escapes stay native. */
+static int glob_match(const char *pattern,unsigned plen,const char *text,unsigned tlen)
+{
+    if(!plen) return !tlen;
+    if(pattern[0]=='%') {
+        while(plen && pattern[0]=='%') { ++pattern; --plen; }
+        if(!plen) return 1;
+        for(unsigned i=0;i<=tlen;++i) if(glob_match(pattern,plen,text+i,tlen-i)) return 1;
+        return 0;
+    }
+    return tlen && pattern[0]==text[0] && glob_match(pattern+1,plen-1,text+1,tlen-1);
+}
+/* A batch carries independent offsets: variable-width fields depend on the
+ * preceding field of the same tuple, never on another tuple. Work by column
+ * so conversions and destination writes use one type and contiguous slots. */
+struct heap_tuple {
+    const unsigned char *data;
+    unsigned bytes,absolute,row,mask,off,first;
+};
+static int scan_tuples(const struct qs_plan *p,struct heap_tuple *tuples,unsigned count,struct qs_chunk *c,struct qs_dict *dict,int last,unsigned first,unsigned prefix)
+{
+    unsigned start=first;
+    for(unsigned i=0;i<count;++i) {
+        struct heap_tuple *t=&tuples[i]; const unsigned char *tuple=t->data;
+        unsigned mask=read16(tuple+20),off=tuple[22];
+        if((read16(tuple+18)&0x7ff)!=p->nattrs || off>t->bytes || off%8 ||
+            off<23+((mask&1)?(p->nattrs+7)/8:0) || (mask&8) || (mask&0x300)!=0x300 || !(mask&0x800)) return -2;
+        t->mask=mask; t->first=(mask&1)?0:first;
+        t->off=off+((mask&1)?0:prefix);
+        if(t->off>t->bytes) return -2;
+        if(mask&1) start=0;
+    }
+    for(int col=start;col<=last;++col) {
+        const struct qs_column *spec=&p->cols[col]; int slot=spec->slot;
+        int64_t *values=slot>=0?qs_values(c)+(size_t)slot*c->capacity:NULL;
+        uint8_t *scales=slot>=0?qs_dscales(c)+(size_t)slot*c->capacity:NULL;
+        uint8_t *nulls=slot>=0?qs_nulls(c)+(size_t)slot*((c->capacity+7)/8):NULL;
+        for(unsigned i=0;i<count;++i) {
+            struct heap_tuple *t=&tuples[i];
+            if((unsigned)col<t->first) continue;
+            const unsigned char *tuple=t->data;
+            unsigned mask=t->mask,off=t->off,len=t->bytes,row=t->row;
+            if((mask&1) && !(tuple[23+col/8]&(1U<<(col%8)))) {
+                if(slot>=0) { nulls[row/8]|=1U<<(row%8); values[row]=0; scales[row]=0; }
+                continue;
+            }
+            if(off>=len) return -2;
+            unsigned size,header=0; int compressed=0;
+            if(spec->length==-1) {
+                if(!tuple[off]) off=(off+spec->align-1)&~(spec->align-1U);
+                if(off>=len) return -2;
+                if(tuple[off]==1) { size=18; header=2; compressed=1; }
+                else if(tuple[off]&1) { size=tuple[off]>>1; header=1; }
+                else { if(len-off<4) return -2; size=read32(tuple+off)>>2; header=4; compressed=read32(tuple+off)&3; }
+            } else if(spec->length>0) { off=(off+spec->align-1)&~(spec->align-1U); size=spec->length; }
+            else return -2;
+            if(size<header || off>len || size>len-off) return -2;
+            if(slot>=0) {
+                int64_t value=0; unsigned dscale=0; const unsigned char *v=tuple+off+header;
+                if(compressed) return -3;
+                if(spec->deferred) {
+                    /* Reuse this value slot for the raw payload location.
+                     * Filter replaces it with a number only for survivors. */
+                    struct qs_heap_ref ref={t->absolute+off+header,size-header};
+                    memcpy(&value,&ref,sizeof(ref));
+                }
+                else if(spec->type==Q_STRING) {
+                    if(!dict) return -3;
+                    unsigned length=size-header;
+                    if(spec->trim_spaces) while(length && v[length-1]==' ') --length;
+                    int id=qs_dict_insert(dict,(const char *)v,length); if(id<0) return -3;
+                    value=id;
+                }
+                else if(spec->type==Q_DICTIONARY) {
+                    unsigned length=size-header;
+                    if(spec->trim_spaces) while(length && v[length-1]==' ') --length;
+                    for(unsigned s=0;s<p->nstrings;++s) {
+                        const struct qs_string *text=&p->strings[s];
+                        if(text->length>=sizeof(text->bytes)) return -3;
+                        if(text->column==col && text->length==length && !memcmp(v,text->bytes,length)) { value=s+1; break; }
+                    }
+                }
+                else if(spec->type==Q_PREFIX) { if(spec->prefix_len>sizeof(spec->prefix)) return -3; value=size-header>=spec->prefix_len && !memcmp(v,spec->prefix,spec->prefix_len); }
+                else if(spec->type==Q_PATTERN) {
+                    if(spec->prefix_len>sizeof(spec->prefix)) return -3;
+                    unsigned length=size-header;
+                    if(spec->trim_spaces) while(length && v[length-1]==' ') --length;
+                    value=glob_match(spec->prefix,spec->prefix_len,(const char *)v,length);
+                }
+                else if(spec->type==Q_DECIMAL) { if(qs_numeric_cents(v,size-header,&value,&dscale)) return -3; }
+                else if(spec->type==Q_CHAR) { if(size-header!=1 || *v>=128) return -3; value=*v; }
+                else if(size==8) memcpy(&value,v,8);
+                else if(size==4) value=(int32_t)read32(v);
+                else if(size==2) value=(int16_t)read16(v);
+                else if(size==1) value=*v;
+                else return -3;
+                values[row]=value;
+                scales[row]=dscale;
+            }
+            t->off=off+size;
+        }
+    }
+    return 0;
+}
+/* Index scans retain the same tuple decoder and visibility checks. */
+int qs_scan_tuple(const struct qs_plan *p,const unsigned char *raw,unsigned offset,unsigned len,unsigned page,struct qs_chunk *c,unsigned row,struct qs_dict *dict)
+{
+    int last=-1; for(unsigned i=0;i<p->nattrs;++i) if(p->cols[i].slot>=0) last=i;
+    struct heap_tuple tuple={.data=raw+offset,.bytes=len,.absolute=page+offset,.row=row};
+    return scan_tuples(p,&tuple,1,c,dict,last,0,0);
+}
+int64_t pg_sina_scan(struct femu_csd_args *a)
+{
+    if(!a || (a->numr!=4 && a->numr!=5) || a->mr_len[1]<(long long)sizeof(struct qs_plan) || a->mr_len[3]<(long long)sizeof(struct qs_task)) return -1;
+    const struct qs_plan *p=a->mr_addr[1]; struct qs_chunk *c=a->mr_addr[2];
+    struct qs_dict *dict=a->numr==5?a->mr_addr[4]:NULL;
+    unsigned bytes=((struct qs_task *)a->mr_addr[3])->input_bytes;
+    if(p->nattrs>QS_COLS || p->ncols>p->nattrs || p->nstrings>QS_STRINGS || a->mr_len[2]<(long long)sizeof(*c) ||
+        c->ncols!=p->ncols || qs_chunk_bytes(c->capacity,c->ncols)>(uint64_t)a->mr_len[2] ||
+        bytes%QS_PAGE || bytes>(uint64_t)a->mr_len[0]) return -1;
+    c->rows=c->selected=0; memset(qs_nulls(c),0,((c->capacity+7)/8)*(size_t)c->ncols);
+    int last=-1; for(unsigned i=0;i<p->nattrs;++i) if(p->cols[i].slot>=0) last=i;
+    unsigned first=0,prefix=0;
+    while((int)first<=last && p->cols[first].slot<0 && p->cols[first].length>0) {
+        const struct qs_column *spec=&p->cols[first++];
+        prefix=((prefix+spec->align-1)&~(spec->align-1U))+spec->length;
+    }
+    for(unsigned page=0;page<bytes;page+=QS_PAGE) {
+        const unsigned char *raw=(unsigned char *)a->mr_addr[0]+page;
+        unsigned lower=read16(raw+12),upper=read16(raw+14);
+        if(lower<24 || (lower-24)%4 || lower>upper || upper>QS_PAGE ||
+            read16(raw+16)!=QS_PAGE || read16(raw+18)!=(QS_PAGE|4) || !(read16(raw+10)&4)) return -2;
+        struct heap_tuple tuples[64]; unsigned count=0;
+        for(unsigned i=0;i<(lower-24)/4;++i) {
+            uint32_t lp=read32(raw+24+4*i); unsigned offset=lp&0x7fff,flags=(lp>>15)&3,len=lp>>17;
+            if(flags!=1) continue;
+            if(offset<upper || offset>QS_PAGE || len<23 || len>QS_PAGE-offset || c->rows+count>=c->capacity) return -2;
+            tuples[count]=(struct heap_tuple){.data=raw+offset,.bytes=len,.absolute=page+offset,.row=c->rows+count};
+            ++count;
+            if(count==64) {
+                int status=scan_tuples(p,tuples,count,c,dict,last,first,prefix); if(status) return status;
+                for(unsigned j=0;j<count;++j) qs_selection(c)[c->rows+j]=c->rows+j;
+                c->rows+=count; count=0;
+            }
+        }
+        if(count) {
+            int status=scan_tuples(p,tuples,count,c,dict,last,first,prefix); if(status) return status;
+            for(unsigned j=0;j<count;++j) qs_selection(c)[c->rows+j]=c->rows+j;
+            c->rows+=count;
+        }
+    }
+    c->selected=c->rows; return 0;
+}

@@ -261,19 +261,20 @@ write_files:
       GRUB_SERIAL_COMMAND="serial --unit=0 --speed=115200"
       GRUB_TIMEOUT=1
       GRUB_TIMEOUT_STYLE=menu
+
   # The virtio-9p transport has to be loaded before local-fs, otherwise the
   # mounts below run while the virtio-9p devices are still being probed and
   # fail with "9pnet_virtio: no channels available for device X".
   - path: /etc/modules-load.d/femu-9p.conf
     content: |
       9pnet_virtio
-  # The virtio-9p shares run-csd.sh exports (the mounted apps, results, scripts
-  # and tests directories). nofail keeps a boot without -virtfs working, and
-  # _netdev defers the mounts until the devices are up.
+  # The virtio-9p shares run-csd.sh exports. nofail keeps a boot without 
+  #-virtfs working, and _netdev defers the mounts until the devices are up.
   - path: /etc/fstab
     append: true
     content: |
       apps /home/femu/apps 9p trans=virtio,version=9p2000.L,nofail,_netdev,msize=1048576 0 0
+      data /home/femu/data 9p trans=virtio,version=9p2000.L,nofail,_netdev,msize=1048576 0 0
       results /home/femu/results 9p trans=virtio,version=9p2000.L,nofail,_netdev,msize=1048576 0 0
       scripts /home/femu/scripts 9p trans=virtio,version=9p2000.L,nofail,_netdev,msize=1048576 0 0
       tests /home/femu/tests 9p trans=virtio,version=9p2000.L,nofail,_netdev,msize=1048576 0 0
@@ -281,10 +282,11 @@ runcmd:
   - [ update-grub ]
   - [ systemctl, disable, systemd-networkd-wait-online.service ]
   - [ touch, /etc/cloud/cloud-init.disabled ]
-  # # mount points of the four shares (apps, results, scripts, tests)
-  # /bin/sh is dash here and does not expand {a,b} braces, so list every path.
-  - [ mkdir, -p, /home/femu/apps, /home/femu/results, /home/femu/scripts, /home/femu/tests ]
-  - [ chown, femu:femu, /home/femu/apps, /home/femu/results, /home/femu/scripts, /home/femu/tests ]
+
+  # 9p mount points of the shares
+  - [ mkdir, -p,        /home/femu/apps, /home/femu/data, /home/femu/results, /home/femu/scripts, /home/femu/tests ]
+  - [ chown, femu:femu, /home/femu/apps, /home/femu/data, /home/femu/results, /home/femu/scripts, /home/femu/tests ]
+
   - [ sh, -c, 'if command -v nvme && command -v fio; then echo $READY_MARK > /dev/ttyS0; else echo $FAIL_MARK > /dev/ttyS0; fi' ]
 power_state:
   mode: poweroff

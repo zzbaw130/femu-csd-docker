@@ -22,6 +22,7 @@ enum {
     CSD_CMD_ALLOC_FDM    = 0xb0,
     CSD_CMD_DEALLOC_AFDM = 0xc0,
     CSD_CMD_NVM_TO_AFDM  = 0xd0,
+    CSD_CMD_AFDM_TO_NVM  = 0xd1,
     CSD_CMD_EXEC         = 0xe1,
     CSD_CMD_READ_AFDM    = 0xf2,
     CSD_CMD_WRITE_AFDM   = 0xf5,
@@ -115,10 +116,11 @@ static void usage(const char *prog)
             "  %s /dev/nvmeX admin-delete-mrs <rsid>\n"
             "  %s /dev/nvmeXnY write <id> <offset> <string>\n"
             "  %s /dev/nvmeXnY read <id> <offset> <bytes>\n"
-            "  %s /dev/nvmeXnY nvm-to-afdm <id> <offset> <slba> <nlb>\n",
+            "  %s /dev/nvmeXnY nvm-to-afdm <id> <offset> <slba> <nlb>\n"
+            "  %s /dev/nvmeXnY afdm-to-nvm <id> <offset> <slba> <nlb>\n",
             prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog,
             prog, prog, prog, prog, prog, prog,
-            prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+            prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 static uint64_t monotonic_ns(void)
@@ -502,11 +504,11 @@ static void csd_read(int fd, uint32_t id, uint64_t offset, void *buf,
     }
 }
 
-static void csd_nvm_to_afdm(int fd, uint32_t id, uint64_t offset,
-                            uint64_t slba, uint16_t nlb)
+static void csd_nvm_copy(int fd, uint8_t opcode, uint32_t id, uint64_t offset,
+                         uint64_t slba, uint16_t nlb)
 {
     struct nvme_passthru_cmd cmd = {
-        .opcode = CSD_CMD_NVM_TO_AFDM,
+        .opcode = opcode,
         .nsid = 1,
         .cdw10 = (uint32_t)slba,
         .cdw11 = (uint32_t)(slba >> 32),
@@ -519,6 +521,12 @@ static void csd_nvm_to_afdm(int fd, uint32_t id, uint64_t offset,
     if (submit(fd, &cmd)) {
         exit(EXIT_FAILURE);
     }
+}
+
+static void csd_nvm_to_afdm(int fd, uint32_t id, uint64_t offset,
+                            uint64_t slba, uint16_t nlb)
+{
+    csd_nvm_copy(fd, CSD_CMD_NVM_TO_AFDM, id, offset, slba, nlb);
 }
 
 static void dump_hex(const uint8_t *buf, size_t size)
@@ -1494,15 +1502,16 @@ int main(int argc, char **argv)
                  parse_u64(argv[4], "offset"), buf, size);
         dump_hex(buf, size);
         free(buf);
-    } else if (!strcmp(op, "nvm-to-afdm")) {
+    } else if (!strcmp(op, "nvm-to-afdm") || !strcmp(op, "afdm-to-nvm")) {
         if (argc != 7) {
             usage(argv[0]);
             return EXIT_FAILURE;
         }
-        csd_nvm_to_afdm(fd, (uint32_t)parse_u64(argv[3], "id"),
-                        parse_u64(argv[4], "offset"),
-                        parse_u64(argv[5], "slba"),
-                        (uint16_t)parse_u64(argv[6], "nlb"));
+        csd_nvm_copy(fd, !strcmp(op, "afdm-to-nvm") ? CSD_CMD_AFDM_TO_NVM : CSD_CMD_NVM_TO_AFDM,
+                     (uint32_t)parse_u64(argv[3], "id"),
+                     parse_u64(argv[4], "offset"),
+                     parse_u64(argv[5], "slba"),
+                     (uint16_t)parse_u64(argv[6], "nlb"));
     } else {
         usage(argv[0]);
         return EXIT_FAILURE;

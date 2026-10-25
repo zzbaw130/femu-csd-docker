@@ -1,0 +1,4 @@
+CSD_WORKMEM_1.0 {
+    global: cs_work_*;
+    local: *;
+};

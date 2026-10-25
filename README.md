@@ -1,241 +1,170 @@
-# FEMU CSD 实验环境（Docker）
+> 当前 `pg_sina_csd_dev` 从 `sina-femu-csd` 标签开始开发
+> [pg_sina_csd 扩展](code/apps/pg_sina_csd/README.md)，通过 SNIA 调用设备算子。
+> 当前已实现冻结 heap 映射、host/csd 路径选择及 Q1/Q3/Q4/Q5/Q6/Q7/Q8/Q9/Q10/Q12/Q13/Q14/Q19 完整数据算子卸载；TPC-H 测试统一冷启动。
 
-在 Docker 里构建并运行 [FEMU](https://github.com/MoatLab/FEMU)（QEMU 10.1 基座）的
-**CSD（Computational Storage，`femu_mode=4`）** 模式：模拟盘、算子加载和程序执行都在
-宿主机的 QEMU 进程里，guest 里只跑应用，通过 virtio-9p 与宿主机共享目录。
+> `snia_csd_dev` 分支基于 `femu-csd-with-original-postgre` tag，新增独立的
+> [Computational Storage API 库](code/apps/snia/README.md)。Guest 应用包含
+> `cs.h` 并用 `-lsnia` 链接库即可使用规范 API；能力范围及软件 batch 说明见该目录文档。
 
-当前模拟设备（`code/FEMU/hw/femu/scripts/run-csd.sh` 顶部参数）：
+# FEMU CSD + PostgreSQL 实验环境
 
-| 项 | 值 | 说明 |
-| --- | --- | --- |
-| 暴露容量 `ssd_size` | 49152 MiB = 48 GiB | guest 里 `nvme list` 显示 51.54 GB |
-| NAND 原始容量 | 64 GiB | `blks_per_pl=1024`，其余 16 GiB 作 OP（占原始 25%） |
-| `fdm_size` | 4096 MiB | CSD 设备内存（guest 按需 Allocate） |
-| `nr_cu` / `csf_runtime_scale` | 8 / 1 | 8 个计算单元 |
-| guest 内存 | 8 GiB | `-m 8G` |
+在 Docker 里构建并运行 [FEMU](https://github.com/MoatLab/FEMU)（QEMU 10.1 基座）的 **CSD 模式**
+（`femu_mode=4`）：PostgreSQL 12（`code/apps/postgres`，REL_12_STABLE）跑在 guest 里，
+数据盘是 FEMU 模拟的 NVMe SSD —— NAND 时序、FTL、GC 全部是模拟的，用来做 CSD / 存储相关实验
+（TPC-H 等）。算子（`.so`）在容器里编译，由宿主机的 FEMU 进程加载执行。
 
----
-
-## 1. 环境要求
-
-- x86_64 Linux，**必须有可用的 `/dev/kvm`**（FEMU 用 KVM 启动 guest）
-- Docker + docker compose v2
-- 内存：约 **60 GiB 空闲**（48 GiB 模拟盘 + 8 GiB guest + 最多 4 GiB FDM + 开销）
-- 磁盘：镜像约 2.8 GB，guest 镜像约 2.8 GB（都在 `images/`）
-- 网络：首次 `docker compose build` 需要联网（apt + QEMU configure 拉 subprojects）；
-  首次启动做 guest 镜像时需要联网下载 Ubuntu cloud image
-
-## 2. 从零构建并启动
+## 1. 构建并启动
 
 ```bash
-# 1) 构建镜像（编译 FEMU，首次约 3~5 分钟）
-docker compose build
-
-# 2) 启动：首次会自动制作 guest 镜像（下载 Ubuntu 24.04 cloud image + cloud-init
-#    provisioning，约 2~4 分钟），之后启动 CSD 模式的 VM
-docker compose up -d
-
-# 3) 观察启动过程 / 进串口控制台（Ctrl-C 只退出日志，Ctrl-A X 退出 QEMU）
-docker compose logs -f femu-csd
-
-# 4) 连接 guest
-./scripts/run-guest-ssh.sh
+./scripts/build.sh              # 重建容器镜像 + 启动 VM（保留已有 guest 镜像，不碰 postgres）
+./scripts/build.sh -i           # 额外删掉 guest 镜像 u20s.qcow2，重新做一遍 provisioning
+./scripts/build.sh -p           # 额外：初始化分区与 SNIA → 编译安装 PostgreSQL → 载数据启库
+./scripts/build.sh -ip          # 从零一条龙（首次构建用这个）
 ```
 
-**完全从零重建**（换参数、想重做 guest 镜像时）：
+| 步骤 | 默认 | `-i` | `-p` |
+| --- | :-: | :-: | :-: |
+| `docker compose down --rmi local` | ✓ | | |
+| 删 `images/u20s.qcow2`（强制重做 guest 镜像） | | ✓ | |
+| `docker compose build` 编译 FEMU | ✓ | | |
+| `docker compose up -d --wait` 启动 CSD VM（等 healthcheck：guest SSH 可用） | ✓ | | |
+| guest `init-csd-env.sh`：模拟盘 GPT 分区，80% ext4 挂到 `/data`、20% 预留 spill，编译安装 SNIA | | | ✓ |
+| guest `install-postgre.sh`：从 `~/apps/postgres` 编译安装 PostgreSQL 到 `~/opt/postgres/release` | | | ✓ |
+| guest `start-postgre.sh 0.01`：解压 `data/tpch_s0.01.tar` 到 `/data` 并启动 `tpch_s0.01` | | | ✓ |
+
+`images/u20s.qcow2` 不存在时（首次或用了 `-i`）会自动制作 guest 镜像：下载 Ubuntu 24.04 cloud image +
+cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,flex,cmake,parted`（guest 里编译 PG 需要），
+耗时几分钟。
+
+前置条件：x86_64 + **可用的 `/dev/kvm`**、docker compose v2、首次构建/首次启动需要联网；
+内存按第 5 节预留（默认约 32 GiB 模拟盘 + 8 GiB guest + FDM ≈ 45 GiB）。
+
+## 2. 快速验证
 
 ```bash
-docker compose down
-docker rmi femu-csd:latest
-rm -rf images            # 若报 Permission denied（目录属主是容器 root），改用下面这条
-# docker run --rm -v "$PWD:/w" alpine:3.20 rm -rf /w/images
-docker compose build     # 想连编译缓存一起清掉：docker compose build --no-cache
-docker compose up -d     # 重新 provisioning + 启动
+# CSD passthru smoke test
+# 编译passthru程序以及相关so算子
+./tests/passthru-test.sh build
+# 开启测试
+./tests/passthru-test.sh build <nvme dev> <options>
+
+# PostgreSQL host/CSD 冷启动对照，只使用 tests/guest/queries 的 22 条 SQL
+./tests/test-guest.sh tpch-test.sh
+
+# ssh到guest内部
+./scripts/ssh-guest.sh
 ```
 
-> 只改 `run-csd.sh` 里的 QEMU/设备参数 → 只需 `docker compose build` + 重启容器；
-> 改了 `make-guest-image.sh`（guest 侧挂载/目录）→ 必须先删 `images/u20s.qcow2` 再启动，
-> 否则新配置不会进 guest 镜像。
+想换数据规模：`./scripts/sh-guest.sh guest/start-postgre.sh -f 1`（`-f` 强制重新解压，SF 见 `data/`）。
 
 ## 3. 目录结构
 
-### 3.1 宿主机（本仓库）
+### 宿主机（本仓库）
 
 ```
 .
-├── Dockerfile                     # ubuntu:24.04 + 编译 FEMU + 启动时制作 guest 镜像
-├── docker-compose.yml             # /dev/kvm、memlock、8080、四个共享目录挂载
+├── Dockerfile / docker-compose.yml / .dockerignore
+├── scripts/
+│   ├── build.sh                     # 构建/启动（-i 重做 guest 镜像，-p 顺带装并启动 PostgreSQL）
+│   ├── sh-guest.sh                  # 在 guest 里执行 scripts/guest/<name>
+│   ├── ssh-guest.sh / scp-guest.sh  # 进 guest / 往 guest 传文件
+│   ├── gen-pgdata.sh                # 宿主机侧生成 data/tpch_s<SF>.tar（需要本机 duckdb + pg）
+│   ├── create-tables.sql / create-indexes.sql
+│   └── guest/                       # 只在 guest 内跑的脚本
+│       ├── init-csd-env.sh          # 初始化数据/spill 分区并安装 SNIA
+│       ├── install-postgre.sh       # 编译安装 PostgreSQL
+│       └── start-postgre.sh         # 解压数据 + 启库
+├── tests/
+│   ├── test-guest.sh                # 在 guest 里执行 tests/guest/<name>
+│   ├── passthru-test.sh             # CSD passthru smoke test
+│   └── guest/
+│       ├── tpch-test.sh             # 唯一 TPC-H 验收：host/CSD 冷启动对照
+│       └── queries/                 # 1..22 的 <n>.sql 与 <n>.explain.sql
 ├── code/
-│   ├── FEMU/                      # FEMU 源码（无 .git，直接由本仓库跟踪；在此改代码）
-│   ├── apps/csd-passthru/         # 运行在 guest 上的应用源码
-│   └── csd-programs/              # CSD 算子源码 + build.sh，在容器里编译成 .so
-├── scripts/run-guest-ssh.sh       # 快捷登录 guest
-├── tests/passthru-test.sh         # 快捷跑 smoke test
-├── results/                       # 实验输出（共享给 guest）
-└── images/                        # guest 镜像 u20s.qcow2、SSH 密钥、下载缓存（gitignore）
+│   ├── FEMU/                        # FEMU 源码（改这里，容器里编译）
+│   ├── apps/
+│   │   ├── postgres/                # PostgreSQL 12 源码（guest 里编译）
+│   │   ├── csd-passthru/            # guest 侧原生命令测试
+│   │   ├── snia/                    # guest SNIA API 库与完整 batch 示例
+│   │   └── pg_sina_csd/             # guest PG 扩展、TPC-H 卸载与 SNIA 编排
+│   └── csd-programs/                # 容器编译、FEMU CU 执行
+│       ├── CMakeLists.txt           # 统一构建、链接与输出
+│       ├── examples/                # 原生/SNIA 算子及 sort/avg 样例
+│       ├── csd-workmem/             # 共享工作内存库
+│       ├── pg_sina_csd/             # PG 设备算子
+│       └── build/                   # 统一 .so 输出目录（不入库）
+├── data/                            # TPC-H pgdata tar（tpch_s<SF>.tar，仓库只带 SF=0.01）
+├── results/                         # 实验结果（共享给 guest，按数据库名分子目录）
+└── images/                          # guest 镜像、SSH key、下载缓存（不入库）
 ```
 
-### 3.2 容器内部
+### 容器内
 
 ```
-/root/femu/                        # FEMU 源码及构建目录（COPY 进镜像）
-└── build-femu/                    # qemu-system-x86_64、run-csd.sh、make-guest-image.sh、log
-/root/workspace/                   # 共享目录的挂载点（来自 compose volumes）
-├── code/                          #   ← 宿主机 ./code
-│   ├── FEMU/                      #      只给容器编译用，不导出给 guest
-│   ├── apps/                      #      以 mount_tag=apps 导出
-│   └── csd-programs/              #      csd_program_dir：容器内 make 出 .so，guest 看不到
-├── scripts/                       #   ← 宿主机 ./scripts（同名 tag 导出）
-├── tests/                         #   ← 宿主机 ./tests
-└── results/                       #   ← 宿主机 ./results
-/root/images/                      #   ← 宿主机 ./images（guest 镜像 + SSH 密钥）
+/workspace/FEMU/                    # FEMU 源码 + build-femu/（qemu-system-x86_64、脚本副本）
+/workspace/{code,data,results,scripts,tests}/   # ← 同名宿主机目录（只有 code/apps 导出给 guest）
+/root/images/                       # ← ./images（guest 镜像 u20s.qcow2 + SSH key，落在宿主机）
 ```
 
-工作目录（`WORKDIR`）是 `/root/femu/build-femu`，`CMD` 会用相对路径执行
-`./make-guest-image.sh` 和 `./run-csd.sh`。
-
-### 3.3 guest 内部
+### guest 内（`/home/femu`）
 
 ```
-/home/femu/
-├── apps/        ← 9p: 宿主机 ./code/apps   （guest 侧应用：csd-passthru 等）
-├── scripts/     ← 9p: 宿主机 ./scripts
-├── tests/       ← 9p: 宿主机 ./tests
-└── results/     ← 9p: 宿主机 ./results
+apps/     ← 9p: 宿主机 code/apps      （postgres 源码、csd-passthru、snia）
+data/     ← 9p: 宿主机 data           （tpch_s<SF>.tar）
+results/  ← 9p: 宿主机 results        （实验结果直接落回宿主机）
+scripts/  ← 9p: 宿主机 scripts/guest  （guest 内脚本）
+tests/    ← 9p: 宿主机 tests/guest    （tpch-test.sh + queries/）
+/data                               # 模拟 SSD 数据分区（/dev/nvme0n1p1, ext4），PGDATA 在这里
 ```
 
-guest 里**没有** FEMU 源码，也**没有** `csd-programs`：算子 `.so` 由宿主机上的 QEMU
-进程从 `csd_program_dir` 加载（guest 只按文件名下发加载命令，不能给路径）。
+模拟盘的 `femu-data` 分区约占 80%，`femu-spill` 分区约占 20%，后者不格式化、不挂载。
+Guest 需安装 `parted`。首次运行或标签不匹配时会重新分区并格式化数据区，清除原有数据；
+标签匹配时复用已有布局。执行 `./scripts/sh-guest.sh scripts/guest/init-csd-env.sh` 即可。
+后续 SNIA 按 GPT `PARTLABEL=femu-spill` 查找 spill 分区，读取其起始位置和容量；
+分区序号不承担角色含义。SNIA 插件通过内部 D0/D1 处理 spill LOAD/STORE。
+该脚本同时编译 `/home/femu/apps/snia`，安装 `cs.h`、`libsnia.so` 和 FEMU 插件到 `/usr/local`，
+并运行 `ldconfig`。完成后应用可直接使用：
 
-## 4. 相对上游 FEMU 的脚本改动
-
-### 4.1 `code/FEMU/hw/femu/scripts/run-csd.sh`（启动脚本）
-
-| 项 | 上游默认 | 现在 | 说明 |
-| --- | --- | --- | --- |
-| `blks_per_pl` | 256 | **1024** | NAND 原始容量 16 GiB → 64 GiB |
-| `ssd_size`（`devsz_mb`） | 4096 | **49152** | 暴露 48 GiB，余 16 GiB 作 OP |
-| `fdm_size` | 64 | **4096** | CSD 设备内存 4 GiB |
-| `nr_cu` | 4 | **8** | 计算单元数 |
-| `csf_runtime_scale` | 3 | **1** | 程序运行时间缩放 |
-| guest 内存 | `-m 4G` | **`-m 8G`** | |
-| `csd_program_dir` | 不设置 | **`/root/workspace/code/csd-programs`** | 容器侧目录，**不共享**给 guest |
-| 9p 导出 | 无 | 新增 **4 条 `-virtfs`** | `apps`/`results`/`scripts`/`tests`，`security_model=mapped-xattr` |
-
-上游脚本没有任何 9p 导出，`csd_program_dir` 也未设置（只能跑内置 phantom 程序）；
-现在 4 个目录各自独立导出，guest 按 `mount_tag` 挂到 `/home/femu/<tag>`。
-
-### 4.2 `code/FEMU/hw/femu/scripts/make-guest-image.sh`（guest 镜像制作）
-
-cloud-init 的 user-data 里新增了三块内容：
-
-1. **`/etc/modules-load.d/femu-9p.conf`**：开机预加载 `9pnet_virtio`。
-   不加载的话，systemd 处理 fstab 时 virtio-9p 设备还没 probe 完，挂载会失败并打印
-   `9pnet_virtio: no channels available for device X`（有 `nofail`，是静默失败）。
-2. **`/etc/fstab` 追加 4 行 9p 挂载**（`nofail,_netdev,msize=1048576`）：
-   `apps`/`results`/`scripts`/`tests` → `/home/femu/<同名>`，开机自动挂载。
-   `nofail` 保证不带 `-virtfs` 启动时也能正常开机，`_netdev` 再推迟到设备就绪之后。
-3. **`runcmd` 里 `mkdir -p` + `chown femu:femu`** 这 4 个挂载点
-   （用显式路径列表，因为 Ubuntu 的 `/bin/sh` 是 dash，不支持 `{a,b}` 花括号展开）。
-
-### 4.3 `Dockerfile`
-
-- 依赖增加 `liblz4-dev`（编 `csd-original-kernels.so` 需要 `-llz4`）
-- `COPY code/FEMU /root/femu`，在 `/root/femu/build-femu` 里执行 `femu-compile.sh`
-- `CMD`：启动时若 `/root/images/u20s.qcow2` 不存在，先用
-  `make-guest-image.sh --packages build-essential` 制作（guest 里带 gcc 便于编 csd-passthru），
-  然后 `exec ./run-csd.sh`
-
-> 为什么不在 `docker build` 阶段做 guest 镜像：`RUN` 步骤**无法传入 `/dev/kvm`**，
-> 只能用 `--no-kvm`（TCG，10~30 分钟）；而且构建期做出的镜像会落在镜像的
-> `/root/images/`，运行时被 `./images` 挂载遮住。所以放在容器启动时做（KVM，约 2 分钟）。
-
-## 5. 两个快捷脚本
-
-### `scripts/run-guest-ssh.sh` — 快捷登录 guest
-
-```bash
-./scripts/run-guest-ssh.sh          # 进入 guest 的交互 shell（用户 femu，自带密钥）
+```sh
+cc application.c -lsnia -o application
 ```
 
-内容就是 `docker compose exec femu-csd ./run-guest-ssh.sh`。
-要执行单条命令（脚本本身不转发参数）用：
+脚本可重复执行；分区标签匹配时不会重新格式化数据区。
 
-```bash
-docker compose exec femu-csd ./run-guest-ssh.sh "uname -a"
-# 或从宿主机直连：
-ssh -i images/femu-guest-key -p 8080 femu@localhost "sudo nvme list"
-```
+## 4. 设计要点（相对上游 FEMU 的改动）
 
-### `tests/passthru-test.sh` — 快捷跑 smoke test
+- **编译分层**：`Dockerfile` 把「基本不变的 FEMU 源码」和「频繁改的脚本」分成两层 ——
+  FEMU 用主 context 编译，`hw/femu/scripts` 与 `femu-scripts` 通过 compose 的
+  `additional_contexts` 单独 COPY（`.dockerignore` 里把这两个目录从主 context 排除）。
+  改脚本只重跑最后两层，**不再重编 FEMU**。
+- **`run-csd.sh`**：设备参数全部改成读环境变量（见第 5 节）；新增 5 条 `-virtfs`
+  导出（`apps/data/results/scripts/tests`，`security_model=passthrough`）；
+  `csd_program_dir` 指向容器内的 `code/csd-programs/build`（guest 看不到算子目录）。
+- **`make-guest-image.sh`**：cloud-init 里预加载 `9pnet_virtio`（否则开机挂载会和
+  virtio-9p 设备 probe 竞争，报 `no channels available`），`/etc/fstab` 追加 5 条 9p 挂载
+  （`nofail,_netdev`），并建好/授权对应挂载点。
+- **compose**：`healthcheck` 保证 `up -d --wait` 真的等到 guest 可用；`ulimits: memlock: -1`
+  让 FEMU 能锁住设备内存。
 
-```bash
-# 共享库算子：vadd
-./tests/passthru-test.sh /dev/nvme0n1 smoke-so csd-vadd.so
-# 原始 CEMU 算子集合：knn / sql / grep / lz4
-./tests/passthru-test.sh /dev/nvme0n1 smoke-so-all csd-original-kernels.so
-# 内置 phantom 程序（不需要 .so）
-./tests/passthru-test.sh /dev/nvme0n1 smoke
-```
+## 5. 可调参数（docker-compose.yml 的 `environment`）
 
-它依次做三件事，参数（设备 + 子命令 + 参数）原样透传给 `csd-passthru`：
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `FEMU_SMP` | 8 | guest vCPU 数 |
+| `FEMU_MEM` | 8G | guest 内存 |
+| `CSD_NVM_SIZE` | 16384 | **暴露给 guest 的SSD容量**（MB）。NAND 原始容量固定 64 GB；由于需要有25% OP，因此size最大为49152MB |
+| `CSD_FDM_SIZE` | 64 | CSF 输入输出缓冲 FDM（MiB） |
+| `CSD_NR_CU` | 4 | CSD 计算单元数（≤64） |
+| `CSD_CSF_RUNTIME_SCALE` | 1 | 程序运行时间缩放 |
+| `CSD_WORKMEM_SIZE_MB` | `64` | 所有协作式 CSF 共享的工作内存池，与 FDM 独立 |
+| `CSD_PROGRAM_DIR` | `/workspace/code/csd-programs/build` | 容器内算子目录（`csd_program_dir`） |
 
-1. 容器里 `make -C /root/workspace/code/csd-programs`（编译算子 `.so`）
-2. guest 里 `make -C /home/femu/apps/csd-passthru`（编译应用）
-3. guest 里 `sudo /home/femu/apps/csd-passthru/csd-passthru <你的参数>`
+最大内存需求 ≈ `CSD_NVM_SIZE`（MB）+ `FEMU_MEM`（GB） + `CSD_FDM_SIZE`（MB）+ `CSD_WORKMEM_SIZE_MB`（MiB）+ 约 1 GiB。
 
-子命令与算子 ABI 见 `code/csd-programs/README.md`（FEMU 自带的 CSD 测试说明）。
+## 6. 容易踩的坑
 
-## 6. 常用操作
-
-```bash
-# 改算子源码后重新编译（产物在宿主机 code/csd-programs/*.so）
-./code/csd-programs/build.sh
-
-# 改 FEMU 源码后重新编译（容器内增量编译）
-docker compose exec femu-csd bash -c 'cd /root/femu/build-femu && make -j$(nproc)'
-
-# 改了脚本/依赖后重建镜像
-docker compose build
-
-# 停止（模拟盘在内存里，没有数据需要保存）
-docker compose down
-```
-
-退出 VM：guest 内 `sudo poweroff`，或在串口控制台按 `Ctrl-A X`。
-
-## 7. 注意事项
-
-1. **`/dev/kvm` 必需**：compose 里已声明 `devices: /dev/kvm`；没有 KVM 时 FEMU 起不来，
-   guest 镜像也无法制作（`docker build` 阶段同样拿不到 KVM）。
-2. **删 `images/` 前先 `docker compose down`**：`./images` 是 bind mount，运行中删除会把
-   目录从容器脚下抽走，provisioning 会以 `qemu-img: Could not open ... No such file or directory`
-   失败，容器随后退出（表现就是「ssh 连不上」，因为 8080 没人监听）。
-3. **改 `make-guest-image.sh` 必须重做 guest 镜像**：`docker compose build` →
-   删 `images/u20s.qcow2` → `docker compose up -d`。
-4. **guest 里写共享目录**：9p 用 `security_model=mapped-xattr`，宿主机文件属主/权限不变，
-   guest 里的属主记在 xattr 上。若 `femu` 用户写不进去（目录在宿主机属于 root），
-   一次性执行 `sudo chown -R femu:femu /home/femu/apps`（只影响 guest 看到的属主）。
-5. **宿主机直连 ssh 的私钥**：`images/femu-guest-key` 由容器 root 生成（0600），宿主机上
-   可能读不了（`Load key ... Permission denied`）。一次性修：
-   `docker run --rm -v "$PWD/images:/x" alpine:3.20 chown "$(id -u):$(id -g)" /x/femu-guest-key`；
-   不想管就用 `./scripts/run-guest-ssh.sh`。
-6. **内存与 mlock**：48 GiB 盘 + 8 GiB guest，运行前确认空闲内存约 60 GiB；
-   compose 的 `ulimits: memlock: -1` 让 FEMU 能把设备内存 `mlock` 住（否则会打印
-   `cannot pin the ... memory backend`，时延会抖动）。
-7. **挂载自检**：guest 里 `mount | grep 9p` 应该有 4 行；没有的话看
-   `sudo dmesg | grep 9p`（fstab 用 `nofail`，失败不会阻塞开机）。
-8. **算子安全性**：`.so` 会在宿主机的 QEMU 进程内以 root 执行，`csd_programs` 目录里
-   只放自己编译/信任的程序。
-
-## 8. 验证过的状态
-
-```
-[FEMU] Log: vCSD0,CSD mode initialized: fdm=4096MB, nr_cu=8, nr_thread=4
-guest: sudo nvme list → /dev/nvme0n1  vCSD0  FEMU Computational Storage Controller  51.54 GB
-guest: /home/femu → apps  results  scripts  tests（4 个 9p 挂载齐备）
-./tests/passthru-test.sh /dev/nvme0n1 smoke-so csd-vadd.so
-    → loaded shared-library CSF id=1 / shared-library smoke passed
-./tests/passthru-test.sh /dev/nvme0n1 smoke-so-all csd-original-kernels.so
-    → knn / sql / grep / lz4 shared-library smoke passed
-```
+1. **删除 `images/` 前需要先 `docker compose down`**：`./images` 是 bind mount，运行中删除会让
+   provisioning 半途失败（`qemu-img: Could not open ...`），容器随后退出、8080 无人监听。
+2. **改了 `make-guest-image.sh` 必须重建 guest 镜像**：`./scripts/build.sh -i`（= `docker compose build`
+   后删掉 `images/u20s.qcow2` 再 `up -d`）；只改 `run-csd.sh` 的环境变量/QEMU 参数用默认的
+   `./scripts/build.sh` 即可，guest 镜像会复用。

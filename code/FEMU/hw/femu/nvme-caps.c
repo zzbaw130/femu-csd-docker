@@ -79,7 +79,10 @@ static const uint32_t nvme_mode_io_csd[256] = {
     [NVME_CMD_CSD_ALLOC_FDM]        = NVME_CMD_EFF_CSUPP,
     [NVME_CMD_CSD_DEALLOC_AFDM]     = NVME_CMD_EFF_CSUPP,
     [NVME_CMD_CSD_NVM_TO_AFDM]      = NVME_CMD_EFF_CSUPP,
+    [NVME_CMD_CSD_AFDM_TO_NVM]      = NVME_CMD_EFF_CSUPP | NVME_CMD_EFF_LBCC,
     [NVME_CMD_CSD_EXEC]             = NVME_CMD_EFF_CSUPP,
+    [FEMU_CSD_EXEC_GRAPH]           = NVME_CMD_EFF_CSUPP | NVME_CMD_EFF_LBCC,
+    [FEMU_CSD_GRAPH_SESSION]        = NVME_CMD_EFF_CSUPP,
     [NVME_CMD_CSD_READ_AFDM]        = NVME_CMD_EFF_CSUPP,
     [NVME_CMD_CSD_WRITE_AFDM]       = NVME_CMD_EFF_CSUPP,
     [NVME_CMD_CSD_CREATE_GROUP]     = NVME_CMD_EFF_CSUPP,
@@ -114,6 +117,7 @@ static uint32_t nvme_mode_admin_effects(FemuCtrl *n, uint8_t opc)
         return opc == NVME_ADM_CMD_FEMU_FLIP ? NVME_CMD_EFF_CSUPP : 0;
     case FEMU_CSD_MODE:
         switch (opc) {
+        case NVME_ADM_CMD_CSD_GET_INFO:
         case NVME_ADM_CMD_CSD_MRS_MGMT:
         case NVME_ADM_CMD_CSD_COMPUTE_LOAD:
         case NVME_ADM_CMD_CSD_COMPUTE_ACTIVATE:

@@ -1,18 +1,45 @@
 services:
   femu-csd:
-    build: .
     image: femu-csd
+    command:
+      - /bin/bash
+      - -ec
+      - |
+        if [ ! -f /root/images/u20s.qcow2 ]; then
+          ./make-guest-image.sh --packages build-essential,zlib1g-dev,libreadline-dev,bison,flex,cmake,parted
+        fi
+        exec /workspace/code/FEMU/hw/femu/scripts/run-csd.sh
+    build: 
+      context: .
+      additional_contexts:
+        hw-femu-scripts: ./code/FEMU/hw/femu/scripts
+        femu-scripts: ./code/FEMU/femu-scripts
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /root/images/u20s.qcow2 && ./run-guest-ssh.sh echo GUESTOK | grep -q GUESTOK"]
+      interval: 10s
+      timeout: 5s
+      retries: 60        # 60*10s = 10分钟，覆盖构建+启动
     devices:
       - /dev/kvm                  # FEMU boots its guest with KVM
     ports:
       - "8080:8080"               # guest SSH, forwarded by run-csd.sh
+    stdin_open: true              # -nographic serial console
+    tty: true
     ulimits:
       memlock: -1                 # FEMU pins its device memory with mlock
     volumes:
       - ./images:/root/images     # guest image + SSH key, kept on the host
-      - ./code:/root/workspace/code
-      - ./scripts:/root/workspace/scripts
-      - ./tests:/root/workspace/tests
-      - ./results:/root/workspace/results
-    stdin_open: true              # -nographic serial console
-    tty: true
+      - ./code:/workspace/code
+      - ./data:/workspace/data
+      - ./results:/workspace/results
+      - ./scripts:/workspace/scripts
+      - ./tests:/workspace/tests
+    environment:
+      FEMU_SMP: 8
+      FEMU_MEM: 8G
+      CSD_WORKMEM_SIZE_MB: 256    # shared CSF work arena, independent of FDM
+      CSD_FDM_SIZE: 64            # in megabytes, MAX=48GB=49152, with 25%(16GB) op
+      CSD_NVM_SIZE: 16384         # in megabytes           
+      CSD_NR_CU: 8                # max 64
+      CSD_CSF_RUNTIME_SCALE: 1
+      CSD_PROGRAM_DIR: /workspace/code/csd-programs/build

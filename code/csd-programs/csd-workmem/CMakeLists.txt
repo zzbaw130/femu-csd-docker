@@ -1,0 +1,8 @@
+add_library(cs-workmem SHARED cs_workmem.c)
+target_include_directories(cs-workmem PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(cs-workmem PRIVATE Threads::Threads)
+target_link_options(cs-workmem PRIVATE "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports.map")
+set_property(TARGET cs-workmem APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/exports.map")
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()

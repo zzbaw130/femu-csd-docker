@@ -1,0 +1,5 @@
+code/FEMU/femu-scripts/make-guest-image.sh
+code/FEMU/femu-scripts/run-*.sh
+
+code/FEMU/hw/femu/scripts/make-guest-image.sh
+code/FEMU/hw/femu/scripts/run-*.sh

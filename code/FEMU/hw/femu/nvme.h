@@ -2196,6 +2196,7 @@ typedef struct ZNSCtrlParams {
 
 typedef struct CsdCtrlParams {
     uint64_t fdm_size_mb;
+    uint64_t spill_size_mb;
     uint8_t  nr_cu;
     uint8_t  nr_thread;
     uint64_t time_slice;

@@ -10,6 +10,7 @@
 
 #include "./nvme.h"
 #include "./bbssd/ftl.h"
+#include "./csd/csd.h"
 #include "./nand/onfi.h"
 #include "./femu-props.h"
 #include "./femu-query.h"
@@ -1974,6 +1975,10 @@ static uint64_t femu_ftl_process_req(FemuCtrl *n, NvmeRequest *req)
         return femu_cxl_nvme_ops->ftl(n, ns, req);
     }
 
+    if (NS_CSD(ns) && csd_ftl_storage(n, ns, req, &lat)) {
+        return lat;
+    }
+
     if (n->power_loss) {
         if (req->status != NVME_SUCCESS) {
             return 0;
@@ -2025,6 +2030,16 @@ static void *femu_ftl_thread(void *arg)
             n->ftl_in_sweep = false;
             usleep(100);
             continue;
+        }
+
+        /* Graph I/O shares this sole FTL owner with ordinary namespace I/O. */
+        if (n->csd_ctrl_state) {
+            n->ftl_in_sweep = true;
+            smp_mb();
+            if (n->dataplane_started) {
+                femu_csd_graph_poll(n);
+            }
+            n->ftl_in_sweep = false;
         }
 
         /* A state query, served between two requests like one of them. */
@@ -3484,6 +3499,7 @@ static const Property femu_props[] = {
      */
     DEFINE_PROP_UINT8("learly_reset", FemuCtrl, params.oc20.early_reset, 0),
     DEFINE_PROP_UINT64("fdm_size", FemuCtrl, csd_params.fdm_size_mb, 0),
+    DEFINE_PROP_UINT64("csd_spill_size_mb", FemuCtrl, csd_params.spill_size_mb, 0),
     DEFINE_PROP_UINT8("nr_cu", FemuCtrl, csd_params.nr_cu, 4),
     DEFINE_PROP_UINT8("nr_thread", FemuCtrl, csd_params.nr_thread, 4),
     DEFINE_PROP_UINT64("time_slice", FemuCtrl, csd_params.time_slice, 200000),

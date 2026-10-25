@@ -114,9 +114,9 @@ namespace; see the [BlackBox guide](blackbox.md#configuration).
   configurations still start. They have no effect, and a value other than
   the default prints a warning at realize.
 
-A copy from the namespace into device memory costs one `pg_rd_lat`,
-whatever its size, when any page of the range has been written, and nothing
-otherwise. See the
+Namespace/AFDM copies in both directions use the BlackBox FTL's NAND,
+cache, LUN/channel scheduling and GC timing. AFDM-to-NVM writes use FUA.
+See the
 [timing model](../concepts/timing-model.md#kv-and-csd).
 
 ### Program types
@@ -156,6 +156,7 @@ I/O commands on the namespace:
 | 0xb0 | Allocate device memory |
 | 0xc0 | Free device memory |
 | 0xd0 | Copy namespace data into device memory |
+| 0xd1 | Copy device memory into the namespace (FUA, no Guest data payload) |
 | 0xe1 | Execute a program |
 | 0xf2 | Read device memory |
 | 0xf5 | Write device memory |
@@ -301,3 +302,12 @@ please also cite:
   and program ABI
 - [BlackBox SSD](blackbox.md): the FTL under the namespace
 - [Timing model: KV and CSD](../concepts/timing-model.md#kv-and-csd)
+
+## Resource discovery
+
+Generic vendor GET_INFO (admin `0xc0`) reports the FDM capacity/current
+allocation, CU capacity, ABI version and supported feature bits. Execute
+returns all 64 bits of the native program result. See the
+[wire details](../design/csd.md#generic-resource-queries-and-64-bit-results).
+These commands do not implement an application graph or require a SNIA
+specific firmware runtime.

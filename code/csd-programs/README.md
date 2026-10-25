@@ -1,185 +1,90 @@
-# FEMU CSD Passthrough Tests
+# CSD 设备程序
 
-This directory contains lightweight guest-side tools for validating FEMU CSD
-vendor commands without `linux-cemu`, FDMFS, or a fixed VM image.
+本目录的 native `.so` 在容器内编译，在 FEMU CU 线程执行，逻辑上属于 CSD CPU。Guest 应用源码在 `code/apps`；Guest 中的 SNIA 库、设备适配插件与这里的设备算子是不同产物。
 
-Build inside a normal Linux guest:
-
-```bash
-make
+```text
+csd-programs/
+├── CMakeLists.txt       # 公共编译、workmem 链接和输出规则
+├── pg_sina_csd/         # PG12 heap 设备算子，通过 SNIA batch 调用
+├── examples/            # 原生 vadd/kernels、merge-sort、avg
+│   ├── CMakeLists.txt
+│   └── tests/           # 排序、重入和归并测试
+├── csd-workmem/
+│   ├── cs_workmem.h/.c  # 共享工作内存接口与实现
+│   ├── exports.map      # 限定公共导出符号
+│   ├── CMakeLists.txt
+│   └── tests/           # 分配、共享配额、设备客户端与探针
+└── build/               # CMake 生成文件、所有 .so 和本地测试程序
 ```
 
-Run a basic AFDM smoke test against a namespace device:
+## 编译
 
-```bash
-sudo ./csd-passthru /dev/nvme0n1 smoke
+需要 C/C++ 编译器、CMake 3.16+、pthread 和 liblz4 开发包。在容器内构建全部程序：
+
+```sh
+docker compose exec -T femu-csd sh -c \
+  'cmake -S /workspace/code/csd-programs -B /workspace/code/csd-programs/build -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build /workspace/code/csd-programs/build -j2'
 ```
 
-The smoke test sends AFDM commands through `NVME_IOCTL_IO_CMD` and uses the
-original CEMU-style admin lifecycle commands through `NVME_IOCTL_ADMIN_CMD`:
+也可以在宿主编译；宿主产物用于本地测试，实际设备程序应在运行 FEMU 的容器内编译，避免系统库版本不一致：
 
-- allocate AFDM
-- write AFDM
-- read AFDM
-- load and activate a phantom CSF
-- execute the phantom CSF
-- deactivate and unload the phantom CSF
-- deallocate AFDM
-
-Build also produces `csd-vadd.so`, a minimal shared-library CSF used by the
-shared-library smoke path. The program load payload follows the original CEMU
-descriptor format: a PRP data buffer containing `path\0symbol\0`.
-
-The QEMU process on the host loads the program, so the file must be on the
-host, in the directory named by the `csd_program_dir` property. The `path` in
-the descriptor is a file name in that directory: FEMU refuses a name that
-contains `/` or resolves outside the directory, and refuses every shared-library
-and uBPF load when `csd_program_dir` is unset. `run-csd.sh` does not set it.
-
-Build the programs on the host and copy them into one directory
-(`csd-original-kernels.so` needs the lz4 development package):
-
-```bash
-cd hw/femu/tests/csd                 # in the FEMU source tree on the host
-make csd-vadd.so csd-original-kernels.so
-mkdir -p ~/csd-programs
-cp csd-vadd.so csd-original-kernels.so ~/csd-programs/
+```sh
+cmake -S code/csd-programs -B /tmp/csd-programs-check -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build /tmp/csd-programs-check -j2
+ctest --test-dir /tmp/csd-programs-check --output-on-failure
 ```
 
-Start FEMU with `csd_program_dir` pointing at that directory. With
-`run-csd.sh`, add this line after the other `FEMU_OPTIONS` lines:
+所有 SO 直接输出到指定构建目录顶层。Compose 的 `CSD_PROGRAM_DIR` 为 `/workspace/code/csd-programs/build`；加载时只传 `merge-sort.so` 等文件名。可选 BPF 用 `cmake --build code/csd-programs/build --target csd-vadd-bpf`，需要 clang BPF 后端。
 
-```bash
-FEMU_OPTIONS=${FEMU_OPTIONS}",csd_program_dir=$HOME/csd-programs"
+## 新增算子
+
+每个程序使用自己的目录和 CMakeLists.txt，并在根 CMakeLists.txt 加入 `add_subdirectory(my-program)`。子目录只需：
+
+```cmake
+add_csd_program(my-operator operator.c)
 ```
 
-Then pass the file name alone in the guest:
+根目录的 `add_csd_program` 统一设置原生参数头路径、共享分配器依赖、pthread 以及 `$ORIGIN` 搜索路径。产物为 `my-operator.so`，不会额外增加 lib 前缀。算子不自行复制分配器实现。
 
-```bash
-sudo ./csd-passthru /dev/nvme0n1 smoke-so csd-vadd.so
-```
+## 统一内存规范
 
-`make` also builds `csd-original-kernels.so`, which contains small
-shared-library ports of the original CEMU `knn`, `sql`, `grep`, and `lz4`
-kernels. These tests exercise the same CSD program lifecycle and inline memory
-range interface as the vadd test:
+**所有 native CSF SO 都动态链接同一个 libcs-workmem.so，即使当前没有动态工作区。** 公共构建函数保留此依赖；分配器自身和 BPF 对象不适用。
 
-```bash
-sudo ./csd-passthru /dev/nvme0n1 smoke-so-all csd-original-kernels.so
-```
-
-FDMFS-free MRS is available through the original CEMU memory range set
-management command layout (`0x21`). The passthrough helper creates an MRS from
-AFDM-backed memory range descriptors and executes a CSF by `rsid`:
-
-```bash
-sudo ./csd-passthru /dev/nvme0n1 smoke-mrs csd-vadd.so
-sudo ./csd-passthru /dev/nvme0n1 vadd-example csd-vadd.so
-```
-
-The migrated sync-breakdown check measures NVM-to-AFDM copy, CSF execution, and
-AFDM read as separate stages:
-
-```bash
-sudo ./csd-passthru /dev/nvme0n1 sync-breakdown csd-vadd.so 4096 16
-```
-
-The indirect vadd smoke keeps the original indirect CSF ABI shape and uses an
-AFDM-backed MRS instead of FDMFS files:
-
-```bash
-sudo ./csd-passthru /dev/nvme0n1 indirect-vadd csd-vadd.so
-```
-
-A compact benchmark entry covers vadd plus the original kernel smoke set:
-
-```bash
-sudo ./csd-passthru /dev/nvme0n1 benchmark-kernels csd-vadd.so csd-original-kernels.so 1
-```
-
-The shared-library CSF ABI is:
+动态算法工作区包含 `cs_workmem.h`，使用 `cs_work_alloc/calloc/realloc/free`；为任务创建 context，可跨重入保留，结束或失败时调用 `cs_work_end`。Hash 表、排序缓冲和输入规模相关的大数组不得绕过分配器使用 malloc/new/mmap、VLA 或 alloca。C++ 大型 STL 容器需要接入相应分配器，不能默认向系统堆申请。
 
 ```c
-int64_t kernel(struct femu_csd_args *args);
+#include "femu-csd-kernel.h"
+#include "cs_workmem.h"
+int64_t operator_main(struct femu_csd_args *args)
+{
+    (void)args;
+    cs_work_context *ctx = cs_work_begin();
+    if (!ctx) return -1;
+    void *buffer = cs_work_alloc(ctx, 4096);
+    if (!buffer) { cs_work_end(ctx); return -2; }
+    /* 使用工作区，将输出写入约定的 AFDM。 */
+    cs_work_end(ctx);
+    return 0;
+}
 ```
 
-The execute command uses a CEMU-style program execute command body:
-`pind`, `numr`, `dlen`, `cparam1`, `cparam2`, `group`, and `runtime` are sent
-in the command. Because this lightweight test path intentionally avoids MRS and
-FDMFS, it sends inline memory ranges in the PRP data buffer. In those test
-ranges, `nsid=0` means AFDM, `sb` is the AFDM id, and `len=0` means the full
-AFDM allocation. The CSF ABI then sees `args->mr_addr[0]` as the output AFDM
-and `args->mr_addr[1]` as the input AFDM.
+AFDM 保存输入、输出和交接数据；私有算法状态使用工作内存。全部 CU/不同 SO 在同一个 FEMU 进程内共享预算。禁止将 cs_workmem.c 或静态副本链接到各算子，也不要用独立 dlmopen namespace 加载多份分配器。
 
-Other useful command-level checks:
+`CSD_WORKMEM_SIZE_MB=64` 与 `CSD_FDM_SIZE=64` 独立配置。链接不会拦截 malloc/new；固定 CU 栈、代码、少量有界临时变量，以及未接入的第三方运行库内部申请不计入工作池。原生 kernels 中的 thread/vector/LZ4 保留原有行为，不能据此宣称其全部内存已受配额限制。
 
-```bash
-sudo ./csd-passthru /dev/nvme0n1 alloc 4096
-sudo ./csd-passthru /dev/nvme0n1 create-group 5 0 0
-sudo ./csd-passthru /dev/nvme0n1 set-qos <group-id> 6 0 0
-sudo ./csd-passthru /dev/nvme0n1 exec <pind> <in-afdm-id> <out-afdm-id> 0 <group-id> <cparam1> <cparam2>
-sudo ./csd-passthru /dev/nvme0n1 delete-group <group-id>
-sudo ./csd-passthru /dev/nvme0n1 nvm-to-afdm <afdm-id> 0 0 0
-sudo ./csd-passthru /dev/nvme0n1 bench 4096 32
-sudo ./csd-passthru /dev/nvme0n1 bench 65536 16
-```
+## 多 CU 调用
 
-The `bench` command reports wall-clock average latency for AFDM write, AFDM
-read, and NVM-to-AFDM copy. It is intended as a regression check for the CSD
-command path, not a final paper-level benchmark harness.
+同一程序 ID 的多个 E1 请求可以在不同 CU 同时执行，无需重复注册算子。设备按请求入队顺序分派，最多同时执行 `nr_cu` 个请求；完成顺序由各请求实际耗时决定。Guest 应用通过 SNIA 的 SERIAL、PARALLEL 或 HYBRID batch 明确安排依赖，设备不会自动拆分一次 CSF 调用。
 
-FEMU CSD also accepts the original CEMU program lifecycle admin command
-layouts for load/unload (`0x22`) and activate/deactivate (`0x23`). The
-lightweight passthrough helper sends those commands to the controller device
-without the CEMU kernel driver:
+每次执行的 `femu_csd_args`、MR 指针数组和附加参数缓冲独立，但 MR 指向的 AFDM 内容、SO 的全局变量和参数中传入的私有状态不会自动复制。并行任务应使用独立的输出 AFDM 和任务状态；只读输入可以共享。需要共享可变状态时，由算子同步访问，或由主机用依赖保证串行。共享 workmem 分配器已有锁，所有 CU 的工作区仍共用一份总预算。
 
-```bash
-sudo ./csd-passthru /dev/nvme0 admin-load-phantom 1 1000
-sudo ./csd-passthru /dev/nvme0 admin-load-so 1 csd-vadd.so csd_vadd
-sudo ./csd-passthru /dev/nvme0 admin-load-ubpf 1 csd-vadd.bpf.o csd_vadd_bpf 0
-sudo ./csd-passthru /dev/nvme0 admin-activate 1
-sudo ./csd-passthru /dev/nvme0 admin-deactivate 1
-sudo ./csd-passthru /dev/nvme0 admin-unload 1
-sudo ./csd-passthru /dev/nvme0 admin-create-mrs <out-afdm-id> <in-afdm-id>
-sudo ./csd-passthru /dev/nvme0 admin-delete-mrs <rsid>
-```
+当前示例 sort 的同一个 `sort_handle` 必须串行调用：它记录 run 列表、归并位置和待完成的 spill。取消程序 ID 限制并不使这些状态自动支持并发。当前示例让四个独立状态并行生成 run，再由一个 source 接管四组 run 进行全局归并；不能把同一状态的 `sort_sink` 请求直接改成 PARALLEL。
 
-The tool assumes FEMU was started with CSD mode enabled, for example:
+## 示例与测试入口
 
-```bash
--device femu,femu_mode=4,fdm_size=64,csd_program_dir=/path/to/csd-programs
-```
-
-It intentionally does not depend on CEMU's modified kernel driver or FDMFS. CSD
-mode still uses FEMU's device-side BBSSD FTL path for normal NVM read/write
-requests; the passthrough commands validate the additional computational
-storage interface.
-
-Shared-library CSF support is enabled in the default FEMU build. uBPF support
-is optional because it depends on an external `ubpf` library. If `ubpf` is
-installed through pkg-config, build FEMU with:
-
-```bash
-./femu-compile.sh --enable-csd-ubpf
-```
-
-If you use the `ubpf-cemu` source tree directly, pass its path explicitly:
-
-```bash
-./femu-compile.sh --enable-csd-ubpf=/home/<user>/CEMU-FEMU/ubpf-cemu
-```
-
-The guest helper does not build BPF objects by default. Build the BPF test
-program on the host with Clang BPF support and copy it into `csd_program_dir`:
-
-```bash
-make bpf                             # on the host
-cp csd-vadd.bpf.o ~/csd-programs/
-```
-
-Then, in the guest:
-
-```bash
-sudo ./csd-passthru /dev/nvme0n1 smoke-ubpf csd-vadd.bpf.o 0
-sudo ./csd-passthru /dev/nvme0n1 smoke-ubpf csd-vadd.bpf.o 1
-```
+- [原生和 SNIA 设备示例](examples/README.md)。
+- [分配器使用规范](csd-workmem/README.md)。
+- `bash tests/snia-test.sh unit`：本地设备程序与 SNIA 测试。
+- `bash tests/snia-test.sh build`：容器设备程序与 Guest SDK。
+- `bash tests/snia-test.sh example`：Guest 256MiB 文件完整排序后分批计算平均值。
+- `bash tests/csd-workmem-test.sh unit|build|live`：工作内存模拟或真实设备测试。

@@ -1,0 +1,28 @@
+add_csd_program(csd-vadd csd-vadd.c)
+add_csd_program(csd-original-kernels csd-original-kernels.cc)
+target_link_libraries(csd-original-kernels PRIVATE lz4)
+find_program(CLANG_EXECUTABLE clang)
+if(CLANG_EXECUTABLE)
+    add_custom_target(csd-vadd-bpf
+        COMMAND "${CLANG_EXECUTABLE}" -target bpf -O2 -g -c
+            "${CMAKE_CURRENT_SOURCE_DIR}/csd-vadd.bpf.c" -o "${CMAKE_BINARY_DIR}/csd-vadd.bpf.o"
+        DEPENDS csd-vadd.bpf.c femu-csd-kernel.h)
+endif()
+add_csd_program(merge-sort merge-sort.cpp)
+add_csd_program(cs-example-avg avg.c)
+target_include_directories(merge-sort PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/snia/examples")
+target_include_directories(cs-example-avg PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/snia/examples")
+# Independent Guest CPU benchmark, sharing only the allocator and run-sort code.
+add_executable(read-merge-sort-avg tests/read_merge_sort_avg.c)
+target_include_directories(read-merge-sort-avg PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/snia/examples")
+target_link_libraries(read-merge-sort-avg PRIVATE cs-workmem Threads::Threads)
+if(BUILD_TESTING)
+    add_executable(sort-spill-merge tests/sort_spill_merge.cpp)
+    target_include_directories(sort-spill-merge PRIVATE "${CSD_FEMU_INCLUDE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/snia/examples")
+    target_compile_options(sort-spill-merge PRIVATE -UNDEBUG)
+    target_link_libraries(sort-spill-merge PRIVATE cs-workmem Threads::Threads ${CMAKE_DL_LIBS})
+    add_dependencies(sort-spill-merge merge-sort cs-example-avg)
+    add_test(NAME sortSpillMergeAverage COMMAND sort-spill-merge $<TARGET_FILE:merge-sort> $<TARGET_FILE:cs-example-avg>)
+    add_test(NAME sortParallelSinkMergeAverage COMMAND sort-spill-merge $<TARGET_FILE:merge-sort> $<TARGET_FILE:cs-example-avg> --parallel)
+endif()

@@ -2,11 +2,13 @@
 #define FEMU_CSD_H
 
 #include "../nvme.h"
+#include "csd-graph.h"
 
 enum FemuCsdIoCommands {
     NVME_CMD_CSD_ALLOC_FDM      = 0xb0,
     NVME_CMD_CSD_DEALLOC_AFDM   = 0xc0,
     NVME_CMD_CSD_NVM_TO_AFDM    = 0xd0,
+    NVME_CMD_CSD_AFDM_TO_NVM    = 0xd1,
     NVME_CMD_CSD_EXEC           = 0xe1,
     NVME_CMD_CSD_READ_AFDM      = 0xf2,
     NVME_CMD_CSD_WRITE_AFDM     = 0xf5,
@@ -16,11 +18,23 @@ enum FemuCsdIoCommands {
 };
 
 enum FemuCsdAdminCommands {
+    NVME_ADM_CMD_CSD_GET_INFO         = 0xc0,
     NVME_ADM_CMD_CSD_MRS_MGMT         = 0x21,
     NVME_ADM_CMD_CSD_COMPUTE_LOAD     = 0x22,
     NVME_ADM_CMD_CSD_COMPUTE_ACTIVATE = 0x23,
     NVME_ADM_CMD_CSD_COMPUTE_LOAD_DATA = 0x25,
 };
+
+/* GET_INFO: CDW10 selects a scalar, returned in CQE DW0/DW1 (no DMA). */
+enum FemuCsdInfo {
+    NVME_CSD_INFO_VERSION = 0,
+    NVME_CSD_INFO_FDM_BYTES = 1,
+    NVME_CSD_INFO_FDM_USED = 2,
+    NVME_CSD_INFO_NR_CU = 3,
+    NVME_CSD_INFO_FEATURES = 4,
+};
+#define NVME_CSD_FEATURE_STORE (1ULL << 0)
+#define NVME_CSD_FEATURE_RESULT64 (1ULL << 1)
 
 #define NVME_CSD_MR_AFDM_NSID 0
 
@@ -100,6 +114,7 @@ typedef struct QEMU_PACKED NvmeCsdDeallocAfdmCmd {
     uint32_t    rsvd11[5];
 } NvmeCsdDeallocAfdmCmd;
 
+/* D0/D1 share this layout and carry no Guest data payload. NLB is zero-based. */
 typedef struct QEMU_PACKED NvmeCsdNvmToAfdmCmd {
     uint8_t     opcode;
     uint8_t     flags;
@@ -114,6 +129,14 @@ typedef struct QEMU_PACKED NvmeCsdNvmToAfdmCmd {
     uint32_t    id;
     uint64_t    offset;
 } NvmeCsdNvmToAfdmCmd;
+
+typedef NvmeCsdNvmToAfdmCmd NvmeCsdAfdmToNvmCmd;
+
+/* Called by the controller FTL thread for internal namespace/AFDM copies. */
+bool csd_ftl_storage(FemuCtrl *n, NvmeNamespace *ns, NvmeRequest *req,
+                     uint64_t *lat);
+/* Called only by the FTL thread, inside its dataplane pause guard. */
+void femu_csd_graph_poll(FemuCtrl *n);
 
 typedef struct QEMU_PACKED NvmeCsdExecCmd {
     uint8_t     opcode;
