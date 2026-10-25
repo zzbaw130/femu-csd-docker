@@ -666,3 +666,22 @@ PG保留原选定Join树，做有语义条件的局部rewrite；SQL程序执行H
 字典迁移阶段21项相关设备CTest及Guest布局CTest通过：并发字典增长/重复插入/旧字节视图/失败后读取与回收，预编码ID导入，4MiB总预算spill，NativePlan和8/16/64 CU，表达式、Filter、Scan、聚合、Sort/Hash/Index Join。PG及共享布局涉及的全部设备SO已重新构建部署。
 
 Index单行/SEMI/ANTI路径与Join残余条件、Merge Join、复杂DISTINCT和过宽聚合状态及排序边界仍有逐行适配；页请求虽可由回调续交，仍需读取元数据和主机extent映射；部分阻塞推进仍依赖协调端。共享字典保留原容量上限，自身尚无spill；真正耗尽预算或上限会返回错误，不能宣称任意大小字符串查询及低内存形态全部覆盖。共享字典串行写入、全链路列化和整体CU利用率仍有优化空间，完整基线22条加速不代表这些基础改造已全部完成。当前证据不要求扩容FDM。
+
+## 排序输入直接消费 CU 批次
+
+`aba553858` 中的设备执行器保留未消费的 CU 输出，直接交给 Sort Sink；spill 重入结束后才归还槽。原先逐行取出、填充定长中间行再写入 run 的过程改为批量复制。排序算法及协调端执行位置不变，PG、SNIA 和固件接口不变。
+
+Q16 使用标准 SQL，在 8 CU、256MiB workmem、64MiB FDM 下分别测量三次，每次重启 PG 并清除 Guest page cache。六次普通查询结果均与验收 host 输出一致。普通查询和独立 profile 的中位数如下；原始记录位于 [sort-batch](../../../../results/sort-batch/)。
+
+| 指标 | 修改前 | 批次直传 |
+| --- | ---: | ---: |
+| 普通查询 | 390.709ms | 387.171ms |
+| profile 查询树 | 326.202ms | 331.367ms |
+| Sort Sink 累计 CPU | 36.033ms | 35.846ms |
+| Sort Source 累计 CPU | 10.044ms | 12.376ms |
+| 排序输入流水线墙钟 | 40.521ms | 40.041ms |
+| 其中协调端 CPU | 37.189ms | 35.906ms |
+
+总延迟基本持平，不能宣称显著加速；Source 的样本 CPU 还有上升。两组均无 spill，AFDM 为 40697840 字节、Heap 行数 1010000、内部读取 53370880 字节，workmem 峰值约 29.3–29.6MiB。主要排序 CPU 仍在协调端，因此下一步应让 CU 完成局部 Sort Sink 和未满 run 的收尾，再交给统一 Source 归并。
+
+本阶段 [8 条相关标准查询](../../../../results/tpch.D5qwGm/timings.csv)（Q2/3/10/11/13/16/18/21）均结果一致、完整卸载且快于 host。这是针对性回归，不能替代最终版本的 22 条验收。设备 9 项相关 CTest 及 ASan/UBSan/LeakSanitizer 的 NativePlan、8 CU、ExternalSort 通过；另增加真实并行 Scan→Sort 的 8MiB 预算测试，强制在尚持有 CU 输出时 STORE，检查全部 50003 行、重入后继续消费、token 和 workmem 回收，并通过原生及 8 CU 内存检查。

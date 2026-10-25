@@ -59,6 +59,8 @@ Source也可直接作为Hash Build、外层聚合或Sort的输入，不要求中
 
 正常完成或提前 Limit 后释放私有 context；取消/错误时 Guest 再提交 close，随后关闭当前 SNIA 会话，释放仍存活的临时 token。没有后台代理或独立设备执行进程。
 
+通用树的 Sort Sink 可以直接消费 CU 输出的紧凑行批次：`qs_plan.ordered_rows=3`，`qs_result.begin` 指向本批尚未消费的位置；`ordered_rows=2` 仍表示普通定长行布局。这是设备 SQL 程序内部的布局约定，不是 SNIA 或固件协议。协调端保留生产 CU 的输出，直到 Sort Sink 完成，包括 STORE/LOAD 重入，然后才将该槽交还生产者。无界排序将连续行直接复制到 run；TopN 继续逐个维护堆。当前 Sort Sink 计算仍在协调端，批次直传本身不代表并行排序。
+
 ## 单表列向量快路径和独立入口
 
 原有实现保留供单表聚合及独立算子使用：
