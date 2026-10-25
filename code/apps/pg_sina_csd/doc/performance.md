@@ -52,6 +52,36 @@ PG把已有Heap/Index extent映射随计划输入一次性上传，设备SQL程�
 
 完整查询正确性与本轮性能指标已达标。总改造仍保留Index单行/SEMI/ANTI、Merge Join、复杂DISTINCT及部分排序边界的逐行适配，以及共享字典容量和通用I/O推进优化项，见文末；因此没有宣称总目标全部完成。现有证据不要求扩大FDM。
 
+## Index Join残余条件批量求值
+
+Join残余条件是PG的Join Filter：等值键匹配后仍需判断的条件。参考DuckDB `ScanStructure::ResolvePredicates`按候选选择向量执行条件，Index Join的列批次消费端现在复用已有表达式向量引擎，只保存条件与后续投影需要的列；右侧过滤后仍有效的候选才参与求值。Hash/Index条件共用初始化代码，没有增加SNIA API、设备协议或固件SQL逻辑。
+
+每行的右侧过滤/投影错误和条件错误仍按消费顺序报告，保留LIMIT、SEMI/ANTI提前停止语义以及int128、scale/dscale、文本和NULL。批次状态计入原查询总预算，结束时释放；单候选、不支持的表达式或实际分配失败使用原路径。NativePlan及8/16/64 CU四项CTest、NativePlan与8 CU两项ASan/UBSan/LeakSanitizer均通过，新增覆盖NULL残余条件、已过滤的错误行、宽numeric和文本输出、未来错误不越过LIMIT、4MiB实际spill及资源回收。
+
+在8 CU / 256MiB workmem / 64MiB FDM下，交替切换旧/新设备SO，对规范Q21分别执行三次profile及三次普通冷启动。六次普通结果均与host一致，最终SO已恢复并核对哈希。以下均为每项各自中位数，[逐次profile](../../../../results/index-residual-vectors/profiles.csv)与[普通延迟](../../../../results/index-residual-vectors/cold-timings.csv)保留全部样本：
+
+| 指标 | 原路径 | 残余条件列批次 |
+| --- | ---: | ---: |
+| 普通冷启动 ms | 869.811 | 877.583 |
+| CSF累计CPU ms | 2755.719 | 2732.365 |
+| profile查询树墙钟 ms | 891.788 | 862.934 |
+| 索引候选Tuple | 278497 | 278497 |
+| Index/Heap页加载 | 47686 | 47964 |
+| workmem峰值 字节 | 8047584 | 9024736 |
+| spill读/写 字节 | 0/0 | 0/0 |
+
+普通延迟和CPU差异均不足1%，没有证明稳定加速；不能把profile墙钟的变化直接归因于向量化。候选数相同，额外状态约954KiB，峰值约8.6MiB，并非物理workmem不足。列批次路径仍需收集条件输入并将存活值交给输出批次，减少这些搬运仍是后续优化项，本轮不宣称该改造解决了Q21的主要瓶颈。
+
+最终部署后的[规范Q4/Q19/Q21回归](../../../../results/tpch.UNVv8n/timings.csv)每次host/CSD前均冷启动，全部结果一致、完整卸载且快于同轮host；设备和查询总预算均为268435456字节、8 CU：
+
+| 查询 | host ms | CSD ms |
+| --- | ---: | ---: |
+| Q4 | 2373.099 | 488.012 |
+| Q19 | 1753.380 | 628.845 |
+| Q21 | 2404.735 | 939.040 |
+
+本阶段没有把单候选、Merge Join或复杂DISTINCT等剩余边界全部改成向量执行，完整目标仍未完成；FDM保持64MiB。
+
 ## Hash Join重复键链的残余条件批量求值
 
 参考DuckDB `ScanStructure::ResolvePredicates`仅引用条件所需列并批量判断候选的方式，设备Hash Join将同一Probe行的多个等值匹配收集为有界列批次，复用已有表达式向量引擎。候选行号与消费位置保存在该CU的查询workmem中，一批输入可分多次输出；返回上层Index节点时，不将仍有候选的状态误判为扫描窗口已耗尽。

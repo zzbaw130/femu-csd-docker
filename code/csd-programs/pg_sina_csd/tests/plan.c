@@ -321,14 +321,16 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     for(unsigned i=0;i<4;++i) j->expr.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER,.column=i};
     for(unsigned i=0;i<3;++i) j->expr.outputs[i]=(struct qs_output){.index=i==2?3:(int)i,.type_oid=23};
     if(join==QP_SEMI || join==QP_ANTI) j->expr.outputs[2].index=1;
-    if(parallel==TEST_INDEX_EXPR && (join==QP_SEMI || join==QP_ANTI)) {
+    if(parallel==TEST_INDEX_EXPR) {
         /* Reject initial candidates by both the right filter and a residual
          * Join condition. A match stops only its own key, not its neighbors;
          * NULL keys and never-matching keys must survive ANTI correctly. */
-        j->expr.nexprs=6;
+        j->expr.nexprs=8;
         j->expr.exprs[4]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=-16};
         j->expr.exprs[5]=(struct qs_expr){.op=Q_LE,.type=Q_BOOLEAN,.left=3,.right=4};
-        j->join_qual=5;
+        j->expr.exprs[6]=(struct qs_expr){.op=Q_CONST,.type=Q_BOOLEAN,.isnull=1};
+        j->expr.exprs[7]=(struct qs_expr){.op=Q_CASE,.type=Q_BOOLEAN,.left=5,.right=5,.otherwise=6};
+        j->join_qual=7;
     }
     if(parallel==TEST_HASH_QUAL) {
         j->expr.nexprs=8;
@@ -492,7 +494,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     for(unsigned l=0;l<rows;++l) {
         unsigned key=parallel==TEST_PARTITION_SKEW?1:l%11; int matched=0;
         for(unsigned r=0;r<right_rows;++r) if(l%17 && r%17 && key==(parallel==TEST_PARTITION_SKEW?1:r%7) &&
-            (parallel!=TEST_INDEX_EXPR || r%13+1>=((join==QP_SEMI || join==QP_ANTI)?8:5)) &&
+            (parallel!=TEST_INDEX_EXPR || r%13+1>=8) &&
             (parallel!=TEST_HASH_QUAL || r%13+1>=8)) {
             unsigned v=join==QP_SEMI?l%19+1:r%13+1; matched=1;
             if(join==QP_ANTI) continue;
@@ -811,6 +813,14 @@ static void probe_payload(function run,unsigned limit,int strings,int indexed,in
         left->nexprs=2; left->outputs[1]=(struct qs_output){.index=1,.type_oid=23};
         j->kind=QP_INDEX_JOIN; j->hash=0; j->expr.exprs[1].column=3;
         p->nodes[3].expr.join=(struct qs_join){.indexid=1,.indexroot=1,.index_key_bytes=4,.build_key=0};
+        if(indexed==2 || indexed==3) {
+            /* Keep exact wide numeric/text outputs while the residual only
+             * reads a left column. Rejected right rows must remain inactive. */
+            j->expr.nexprs=4;
+            j->expr.exprs[2]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=1};
+            j->expr.exprs[3]=(struct qs_expr){.op=Q_GE,.type=Q_BOOLEAN,.left=0,.right=2};
+            j->join_qual=3;
+        }
         if(indexed>=4) {
             /* Only a duplicate of an already accepted key overflows. SEMI
              * and ANTI must stop that key before evaluating its next match. */
@@ -821,12 +831,13 @@ static void probe_payload(function run,unsigned limit,int strings,int indexed,in
         }
     }
     if(residual) {
-        assert(!strings && !indexed);
+        assert(!strings);
+        if(indexed) scan(&p->nodes[3]); /* Keep a plain indexed payload; test errors in Join Filter itself. */
         left->nexprs=2; left->outputs[1]=(struct qs_output){.index=1,.type_oid=23};
         struct qs_plan *e=&j->expr; e->nexprs=10;
-        e->exprs[1].type=Q_INTEGER;
+        e->exprs[1].type=Q_INTEGER; e->exprs[1].column=1;
         e->exprs[2]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER,.column=3};
-        e->exprs[3]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=-474};
+        e->exprs[3]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=indexed?-498:-474};
         e->exprs[4]=(struct qs_expr){.op=Q_EQ,.type=Q_BOOLEAN,.left=2,.right=3};
         e->exprs[5]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=INT64_MAX};
         e->exprs[6]=(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=5,.right=5};
@@ -849,8 +860,15 @@ static void probe_payload(function run,unsigned limit,int strings,int indexed,in
     size_t sizes[2],bytes=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
     unsigned char *raw[2]={heap(2,2,&sizes[0]),heap(indexed || residual?3:1,2,&sizes[1])};
     if(residual) for(unsigned r=0;r<3;++r) w32(raw[1]+QS_PAGE-(r+1)*40+24,0);
-    unsigned char *index=indexed?index_page(indexed>=4?4:3):NULL;
+    unsigned char *index=indexed?index_page(indexed>=4 || residual?4:3):NULL;
     if(indexed) for(unsigned r=0;r<2;++r) w32(raw[0]+QS_PAGE-(r+1)*40+24,r+1);
+    if(indexed && residual) {
+        for(unsigned r=0;r<2;++r) w32(raw[0]+QS_PAGE-(r+1)*40+24,r);
+        for(unsigned r=0;r<3;++r) {
+            unsigned char *leaf=index+QS_PAGE; uint32_t lp; memcpy(&lp,leaf+24+r*4,4);
+            unsigned char *entry=leaf+(lp&32767); w32(entry+8,0); w16(entry+4,r+1);
+        }
+    }
     if(indexed>=4) for(unsigned r=0;r<3;++r) {
         unsigned char *leaf=index+QS_PAGE; uint32_t lp; memcpy(&lp,leaf+24+r*4,4);
         unsigned char *entry=leaf+(lp&32767); w32(entry+8,r==2?2:1);
@@ -1379,6 +1397,8 @@ int main(int argc,char **argv)
     probe_payload(run,1,0,0,1); probe_payload(run,2,0,0,1);
     probe_payload(run,2,0,0,2); probe_payload(run,2,0,0,3);
     probe_payload(run,2,0,0,4); probe_payload(run,2,0,0,5);
+    probe_payload(run,1,0,1,1); probe_payload(run,2,0,1,1);
+    probe_payload(run,2,0,1,2); probe_payload(run,2,0,1,3);
     namespace_reentry(run);
     for(int joined=0;joined<2;++joined) {
         parameter_projection(run,joined,0,0);
