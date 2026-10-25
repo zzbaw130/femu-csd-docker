@@ -1,6 +1,22 @@
 # 当前性能与未完成项（2026-10-25）
 
-## 当前：共享分组计数预约与缓存行隔离
+## 当前：InitPlan参数接入列批次投影
+
+参考DuckDB参数表达式引用绑定值的方式，Scan和Hash/Index Join后的投影复用现有参数向量入口；不再因包含QP_PARAMETER而退回逐行投影。导入表达式时使用实际参数的scale/dscale，再推导父表达式精度；保留int128和NULL，不为参数增加新的协议、缓冲或配置。
+
+同时修复PG输出表达式仍引用已交给设备的InitPlan、导致规划报错的问题。设备计划先按原表达式编译，PG输出描述中的参数才替换为同类型占位表达式；PG setrefs将其映射到设备结果列。占位表达式不参与计算，EXPLAIN VERBOSE的Output可能显示NULL::numeric，实际参数仍由设备初始化节点计算。普通列、输出名称/类型、重复列和顺序保留。
+
+[4项设备CTest](../../../../results/parameter-vectors/device-tests.log)、[两项ASan/UBSan/LeakSanitizer检查](../../../../results/parameter-vectors/sanitizer-tests.log)和Guest布局CTest通过。新增Scan/Hash Join参数用例覆盖20003行、多批接续、宽numeric、运行时精度、NULL及资源回收。临时真实SQL覆盖20万行参数投影、空子查询和重复输出列，与host完全一致且全部卸载；EXPLAIN ANALYZE VERBOSE通过，临时SQL已删除。前两例CU峰值8、平均约2.70/2.56，无spill，不能宣称持续用满8CU。
+
+[规范Q11/Q15/Q22冷启动回归](../../../../results/tpch.Ib2jKm/timings.csv)均正确、完整卸载且快于同轮host，资源保持8 CU / 256MiB workmem / 64MiB FDM。本阶段未运行完整TPC-H，也未做修改前后重复计时，以下不是本次改动的固定收益。
+
+| 查询 | host ms | CSD ms |
+| --- | ---: | ---: |
+| Q11 | 409.739 | 233.852 |
+| Q15 | 2455.111 | 843.473 |
+| Q22 | 688.561 | 345.636 |
+
+## 共享分组计数预约与缓存行隔离
 
 分组新条目不再CAS重试全局计数，改为一次原子预约；超出原7/8阈值时归还名额，再保留未消费输入，沿用原扩容/spill路径。计数器原本紧邻各CU反复读取的容量、步长等字段；现在由查询根context申请128字节，在其中按本机64字节缓存行对齐放置计数器，避免插入时干扰只读元数据。表增长不移动计数器，flush只在原CU屏障后归零，查询关闭时由context回收。申请与指针状态都计入原workmem预算，没有新增每CU哈希表、FDM或接口。
 

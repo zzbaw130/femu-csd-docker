@@ -525,6 +525,14 @@ spill行保存分组键及各聚合的SUM/count，沿用原有排序归并、重
 
 新增Hash Join文本输出用例检查CASE抑制负长度分支、NULL、LIMIT错误时机和清理；NativePlan及8/16/64 CU共4项CTest通过。已重编部署pg-sina-plan.so，规范Q7/Q13/Q22冷启动均结果正确、完整卸载且快于同轮host。Q22 profile累计CPU未明显下降，不以接续覆盖代替性能收益证明；Index右侧谓词、多聚合分组和跨请求推进仍未完成。本阶段未重复完整22条，当前记录见performance.md。
 
+## InitPlan参数接入列批次投影（2026-10-25）
+
+参考DuckDB绑定参数表达式，投影导入支持现有QP_PARAMETER，按实际绑定值传播numeric精度；Scan及Join列批次传入查询参数，不再因此回退逐行。参数在初始化后查询内只读，继续使用现有workmem和向量执行入口，不改SNIA或固件。
+
+修复PG CustomScan输出描述保留已移交设备的InitPlan引用所造成的规划错误：设备先编译原表达式，PG输出描述再移除这些参数依赖，由setrefs映射到设备结果列；保留类型、列名、顺序与重复列。VERBOSE显示的NULL参数占位只属于输出描述，实际计算使用设备参数。
+
+4项设备CTest、两项ASan/UBSan/LeakSanitizer检查和Guest布局CTest通过；新增Scan/Hash Join的宽numeric、NULL、多批和回收测试，临时真实SQL及VERBOSE检查通过，临时SQL已删除。规范Q11/Q15/Q22逐查询冷启动均匹配host、完整卸载且更快；不重复完整22条，不将同轮host/CSD差值当作本次改动收益。成绩及边界见performance.md。
+
 ## SNIA异步请求复用线程（2026-10-25）
 
 SNIA公共请求层保留原请求快照、64个在途请求名额、取消和event/callback完成规则，将逐次创建线程替换为进程内按需创建、空闲复用的工作线程。同步请求不排队；不持工作队列锁执行请求或callback。callback可能等待异步子请求，因此不把工作线程数固定为设备CU数；库卸载时停止接收请求并等待工作线程退出。PG、设备SQL程序、FEMU和插件契约未修改。

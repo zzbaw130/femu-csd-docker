@@ -738,6 +738,78 @@ static void probe_payload(function run,unsigned limit,int strings,int indexed)
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
     free(raw[0]); free(raw[1]); free(index); free(arena); free(io); free(out); free(p);
 }
+/* InitPlan parameters remain batch constants with their runtime precision,
+ * both over a Heap scan and over retained Hash Join payload columns. */
+static void parameter_projection(function run,int joined,int wide,int null_parameter)
+{
+    unsigned rows=20003,leaf=joined?3:1;
+    struct qp_plan *p=calloc(1,sizeof(*p)); assert(p);
+    p->count=joined?5:3; p->scan_bytes=QP_SCAN_BYTES; p->nparams=p->ninit=1;
+    p->init_nodes[0]=2; p->init_params[0]=0;
+    scan(&p->nodes[leaf]);
+    if(joined) {
+        scan(&p->nodes[4]);
+        struct qp_node *join=&p->nodes[1];
+        *join=(struct qp_node){.kind=QP_JOIN,.left=3,.right=4,.hash=1,.join_type=QP_INNER,
+            .join_qual=-1,.nkeys=1,.expr=p->nodes[3].expr};
+        join->expr.nattrs=4;
+    }
+    struct qp_node *root=&p->nodes[0];
+    *root=(struct qp_node){.kind=QP_PROJECT,.left=1,.right=-1,.expr=p->nodes[leaf].expr};
+    root->expr.work_mem_bytes=64U*1024*1024; root->expr.nexprs=4;
+    root->expr.exprs[2]=(struct qs_expr){.op=QP_PARAMETER,.type=Q_DECIMAL,.column=0};
+    root->expr.exprs[3]=(struct qs_expr){.op=Q_ADD,.type=Q_DECIMAL,.left=1,.right=2};
+    root->expr.outputs[1]=(struct qs_output){.index=3,.type_oid=1700,.typmod=-1};
+    struct qp_node *init=&p->nodes[2];
+    *init=(struct qp_node){.kind=QP_PROJECT,.left=-1,.right=-1};
+    init->expr.predicate=init->expr.having=-1; init->expr.nexprs=wide?2:1; init->expr.nout=1;
+    init->expr.exprs[0]=(struct qs_expr){.op=Q_CONST,.type=Q_DECIMAL,.constant=wide?INT64_MAX:12345,
+        .scale=2,.dscale=3,.isnull=null_parameter};
+    init->expr.exprs[1]=(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=0,.right=0};
+    init->expr.outputs[0]=(struct qs_output){.index=wide?1:0,.type_oid=1700};
+    size_t sizes[2],bytes=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
+    unsigned char *raw[]={heap(rows,2,&sizes[0]),NULL};
+    if(joined) {
+        raw[1]=heap(1,2,&sizes[1]);
+        for(unsigned r=0;r<rows;++r) w32(raw[0]+(r/100)*QS_PAGE+QS_PAGE-(r%100+1)*40+24,0);
+    }
+    for(unsigned i=0;i<(joined?2U:1U);++i) {
+        struct qp_node *n=&p->nodes[i?4:leaf]; n->bytes=sizes[i]; n->estimated_rows=i?1:rows;
+        n->input_offset=bytes; bytes+=QP_SCAN_BYTES; n->vector_offset=bytes;
+        bytes=(bytes+qs_chunk_bytes(QP_VECTOR_ROWS,2)+4095)&~(size_t)4095;
+    }
+    unsigned char *arena=calloc(1,bytes),*io=calloc(1,QS_SORT_IO_BYTES); assert(arena && io);
+    *(struct qs_dict *)arena=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
+    for(unsigned i=0;i<(joined?2U:1U);++i) {
+        struct qp_node *n=&p->nodes[i?4:leaf];
+        *(struct qs_chunk *)(arena+n->vector_offset)=(struct qs_chunk){.capacity=qp_scan_capacity(p,n),.ncols=2};
+    }
+    struct qp_control control={0}; struct qs_result *out=calloc(1,sizeof(*out)); assert(out);
+    void *mr[]={p,&control,out,arena,io};
+    long long lengths[]={sizeof(*p),sizeof(control),sizeof(*out),bytes,QS_SORT_IO_BYTES};
+    struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=lengths};
+    __int128 parameter=wide?(__int128)INT64_MAX*INT64_MAX:12345; unsigned seen=0;
+    while(!out->finished) {
+        assert(!run(&args));
+        for(unsigned r=0;r<out->rows;++r) {
+            struct qs_cell *v=out->data[r].cells;
+            assert(seen<rows && v[0].value==(joined?0:seen) && v[1].isnull==null_parameter);
+            if(!null_parameter) {
+                int value=(int)((uint64_t)seen*1009%997)-498;
+                assert(v[1].value==parameter+(__int128)value*(wide?10000:100));
+                assert(v[1].scale==(wide?4:2) && v[1].dscale==(wide?6:3));
+            }
+            ++seen;
+        }
+        if(control.bytes && !control.ready) {
+            unsigned source=control.node==leaf?0:1; assert(!source || joined);
+            memcpy(arena+p->nodes[control.node].input_offset,raw[source]+control.offset,control.bytes); control.ready=1;
+        }
+    }
+    assert(seen==rows);
+    free(raw[0]); free(raw[1]); free(arena); free(io); free(out); free(p);
+    struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
+}
 /* A grouped probe must join its final SUM, not expose the aggregate's
  * internal input vectors as ordinary rows. */
 static void grouped_probe(function run)
@@ -1096,6 +1168,11 @@ int main(int argc,char **argv)
     probe_payload(run,1,0,0); probe_payload(run,2,0,0); probe_payload(run,2,1,0);
     probe_payload(run,2,2,0); probe_payload(run,1,3,0); probe_payload(run,2,3,0);
     probe_payload(run,1,0,1); probe_payload(run,2,0,1); grouped_probe(run);
+    for(int joined=0;joined<2;++joined) {
+        parameter_projection(run,joined,0,0);
+        parameter_projection(run,joined,1,0);
+        parameter_projection(run,joined,1,1);
+    }
     test_scheduled=true;
     test(run,QP_INNER,20003,23,64,1,TEST_VECTOR_AGG);
     test(run,QP_INNER,0,23,64,1,TEST_VECTOR_AGG);

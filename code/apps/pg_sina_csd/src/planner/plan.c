@@ -1111,6 +1111,21 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
     return id;
 }
 
+/* These expressions describe device output slots, not host computation.
+ * A relabelled NULL keeps parameter type metadata and remains a non-Const
+ * expression that setrefs will replace by the matching output slot. */
+static Node *device_output_expression(Node *node,void *context)
+{
+    if(!node) return NULL;
+    if(IsA(node,Param)) {
+        Param *param=(Param *)node;
+        return (Node *)makeRelabelType((Expr *)makeNullConst(param->paramtype,
+            param->paramtypmod,param->paramcollid),param->paramtype,
+            param->paramtypmod,param->paramcollid,COERCE_IMPLICIT_CAST);
+    }
+    return expression_tree_mutator(node,device_output_expression,context);
+}
+
 Plan *pg_sina_rewrite_plan(PlannerInfo *root,Plan *native)
 {
     struct qp_plan *tree=palloc0(sizeof(*tree));
@@ -1161,7 +1176,9 @@ Plan *pg_sina_rewrite_plan(PlannerInfo *root,Plan *native)
     scan->scan.plan=*native; NodeSetTag(scan,T_CustomScan);
     scan->scan.plan.lefttree=scan->scan.plan.righttree=NULL;
     scan->scan.plan.qual=NIL; scan->scan.plan.initPlan=NIL; scan->scan.plan.parallel_aware=false; scan->scan.plan.parallel_safe=false;
-    scan->custom_scan_tlist=copyObject(native->targetlist);
+    /* PG projects device results; it must not retain removed InitPlan deps. */
+    scan->scan.plan.targetlist=(List *)device_output_expression((Node *)native->targetlist,NULL);
+    scan->custom_scan_tlist=copyObject(scan->scan.plan.targetlist);
     scan->custom_private=list_make1(makeConst(BYTEAOID,-1,InvalidOid,-1,PointerGetDatum(bytes),false,false));
     scan->methods=&pg_sina_plan_methods;
     return (Plan *)scan;

@@ -1118,13 +1118,18 @@ static int projection_import(struct projection_import *in,unsigned node,int inde
     struct qs_plan *p=&in->batch->plan;
     for(unsigned i=0;i<p->nexprs;++i) if(in->nodes[i]==node && in->expressions[i]==(unsigned)index) return i;
     struct qs_expr e=n->expr.exprs[index];
-    if(e.op>Q_CASE && e.op!=Q_YEAR && e.op!=Q_LIKE && e.op!=Q_SUBSTRING) return -1;
+    if(e.op>Q_CASE && e.op!=Q_YEAR && e.op!=Q_LIKE && e.op!=Q_SUBSTRING && e.op!=QP_PARAMETER) return -1;
     if(e.op==Q_COLUMN && (n->kind==QP_PROJECT || n->kind==QP_AGGREGATE)) {
         const struct qp_node *child=&in->execution->plan->nodes[n->left];
         if(e.column<0 || (unsigned)e.column>=child->expr.nout) return -1;
         return projection_import(in,n->left,child->expr.outputs[e.column].index);
     }
-    if(e.op!=Q_COLUMN && e.op!=Q_CONST) {
+    if(e.op==QP_PARAMETER) {
+        if(e.column<0 || e.column>=QP_PARAMS) return -1;
+        e.scale=in->execution->params[e.column].scale;
+        e.dscale=in->execution->params[e.column].dscale;
+    }
+    if(e.op!=Q_COLUMN && e.op!=Q_CONST && e.op!=QP_PARAMETER) {
         if(e.left<0 || e.left>=index) return -1;
         e.left=projection_import(in,node,e.left); if(e.left<0) return -1;
         if(e.op!=Q_NOT && e.op!=Q_IS_NULL && e.op!=Q_IS_NOT_NULL && e.op!=Q_YEAR) {
@@ -1281,7 +1286,8 @@ static int64_t projection_join_fill(struct execution *s,struct projection_batch 
     }
 evaluate_batch:
     b->count=b->input_count; b->input_count=b->position=0;
-    struct qs_vector_input input={.cells=b->cells,.dictionary=s->dictionary};
+    struct qs_vector_input input={.cells=b->cells,.dictionary=s->dictionary,
+        .parameters=s->params,.nparameters=QP_PARAMS};
     /* COUNT(*) can have no payload columns; it still consumes cardinality. */
     if(b->plan.nexprs && qs_vector_execute_input(&b->plan,NULL,NULL,0,b->count,b->needed,b->vectors,input)) return -5;
     return 2;
@@ -1314,7 +1320,9 @@ static int64_t projection_fill(struct execution *s,unsigned id)
                 for(unsigned col=0;col<b->plan.nattrs;++col) if(b->plan.cols[col].type==Q_STRING)
                     b->plan.cols[col].deferred=scan->scan_filter?scan->scan_filter->cols[col].deferred:QS_EAGER;
             const void *raw=scan->scan_raw_bytes?s->arena+input_offset(s,source)+scan->scan_raw:NULL;
-            if(qs_vector_execute_raw_dict(&b->plan,chunk,qs_selection(chunk),scan->scan_position,b->count,b->needed,b->vectors,raw,scan->scan_raw_bytes,s->dictionary)) return -5;
+            struct qs_vector_input input={.raw=raw,.raw_bytes=scan->scan_raw_bytes,.dictionary=s->dictionary,
+                .parameters=s->params,.nparameters=QP_PARAMS};
+            if(qs_vector_execute_input(&b->plan,chunk,qs_selection(chunk),scan->scan_position,b->count,b->needed,b->vectors,input)) return -5;
             scan->scan_position+=b->count; b->position=0;
         }
         /* A retained output must outlive this vector's byte views. Predicates
