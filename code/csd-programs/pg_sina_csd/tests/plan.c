@@ -1398,6 +1398,15 @@ static void merge_input_parallelism(void)
     qp_parallel_boundaries(p,0); assert(!p->nodes[3].parallel);
     free(p);
 }
+/* Reused allocator storage is not zeroed. Exercise first-use initialization
+ * against nonzero payloads, including NULL aggregates and empty slots. */
+static void poison_workmem(void)
+{
+    struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes);
+    cs_work_context *ctx=cs_work_begin(); assert(ctx);
+    void *data=cs_work_alloc(ctx,stats.capacity_bytes-4096); assert(data);
+    memset(data,0xa5,stats.capacity_bytes-4096); assert(!cs_work_end(ctx));
+}
 int main(int argc,char **argv)
 {
     dictionary_size();
@@ -1418,6 +1427,7 @@ int main(int argc,char **argv)
     if(argc==4) {
         assert(!strcmp(argv[2],"--workers")); test_workers=strtoul(argv[3],NULL,10);
         assert(test_workers && test_workers<=QS_WORKERS && !cs_work_init(256*1024*1024));
+        poison_workmem();
         test_scheduled=true;
         test(run,QP_INNER,20003,23,256,1,TEST_VECTOR_AGG);
         test(run,QP_INNER,0,23,256,1,TEST_VECTOR_AGG);
@@ -1455,6 +1465,7 @@ int main(int argc,char **argv)
         return 0;
     }
     assert(!cs_work_init(64*1024*1024));
+    poison_workmem();
     dictionary_growth();
     probe_payload(run,1,0,0,0); probe_payload(run,2,0,0,0); probe_payload(run,2,1,0,0);
     probe_payload(run,2,2,0,0); probe_payload(run,1,3,0,0); probe_payload(run,2,3,0,0);

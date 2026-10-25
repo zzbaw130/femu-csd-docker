@@ -84,7 +84,9 @@ struct external_hash {
 struct accumulator { struct qs_cell sum,extreme,last; uint64_t count; int has_last; };
 /* sum holds the total for SUM/AVG, or the selected value for MIN/MAX. */
 struct group_value { struct qs_cell sum; uint64_t count; };
-struct compact_group { int64_t key; atomic_uint occupied; struct group_value values[]; };
+struct compact_group { int64_t key; unsigned key_flags; struct group_value values[]; };
+/* Hash slots publish indices into dense records, not whole aggregate states. */
+struct group_entry { atomic_uint state; unsigned row; };
 struct set_key { int64_t value; unsigned occupied; };
 /* Private per-CU expression state; referenced input columns stay in AFDM. */
 struct projection_batch {
@@ -148,6 +150,7 @@ struct operator_state {
     int hash_qual_checked,hash_qual_rejected;
     struct external_hash *external;
     struct compact_group *groups;
+    struct group_entry *group_entries;
     unsigned group_capacity,group_flush,group_phase,group_stride,group_integer;
     atomic_uint *group_count;
     struct set_key *set;
@@ -1674,9 +1677,9 @@ static void group_keys(const struct qp_node *n,const struct operator_state *o,co
     const void *stored=g->values+n->expr.naggs;
     if(wide && o->group_integer) {
         const int64_t *values=stored;
-        for(unsigned k=0;k<n->nkeys;++k) keys[k]=(struct qs_cell){.value=values[k],.isnull=!!(g->occupied&(2U<<k))};
+        for(unsigned k=0;k<n->nkeys;++k) keys[k]=(struct qs_cell){.value=values[k],.isnull=!!(g->key_flags&(2U<<k))};
     } else if(wide) memcpy(keys,stored,n->nkeys*sizeof(*keys));
-    else keys[0]=(struct qs_cell){.value=g->key,.isnull=g->occupied==2};
+    else keys[0]=(struct qs_cell){.value=g->key,.isnull=g->key_flags==2};
 }
 static uint64_t group_hash(const struct qp_node *n,const struct qs_cell *keys)
 {
@@ -1742,14 +1745,15 @@ static int group_sink_values(struct execution *s,unsigned id,struct operator_sta
     uint64_t hash=wide?group_hash(n,keys):mix_hash(key.isnull?0:(uint64_t)key.value);
     unsigned mask=o->group_capacity-1,at=hash&mask;
     for(;;at=(at+1)&mask) {
-        struct compact_group *g=group_at(o,at);
+        struct group_entry *entry=&o->group_entries[at];
 retry_bucket:
         ;
-        unsigned state=atomic_load_explicit(&g->occupied,shared?memory_order_acquire:memory_order_relaxed);
+        unsigned state=atomic_load_explicit(&entry->state,shared?memory_order_acquire:memory_order_relaxed);
         /* A creator has not published its keys yet. An updater keeps the
          * occupied bits, so other probes can already compare immutable keys. */
         if(state==GROUP_LOCK) goto retry_bucket;
         unsigned old=state&~GROUP_LOCK;
+        struct compact_group *g=old?group_at(o,entry->row):NULL;
         int equal=!old;
         if(old && wide && o->group_integer) {
             const int64_t *key_values=(const void *)(g->values+n->expr.naggs); equal=old==occupied;
@@ -1761,7 +1765,7 @@ retry_bucket:
         if(!equal) continue;
         if(shared) {
             if(state&GROUP_LOCK) goto retry_bucket;
-            if(!atomic_compare_exchange_weak_explicit(&g->occupied,&state,state|GROUP_LOCK,
+            if(!atomic_compare_exchange_weak_explicit(&entry->state,&state,state|GROUP_LOCK,
                 memory_order_acquire,memory_order_relaxed)) goto retry_bucket;
         }
         if(!old) {
@@ -1769,13 +1773,15 @@ retry_bucket:
              * retry CAS on the same cache line. Failed reservations are
              * returned before the CU reports its unconsumed input. */
             unsigned count=atomic_fetch_add_explicit(o->group_count,1,memory_order_relaxed);
-            if(count>=o->group_capacity*7/8) {
+            if(count>=o->group_capacity-o->group_capacity/8) {
                 atomic_fetch_sub_explicit(o->group_count,1,memory_order_relaxed);
-                if(shared) atomic_store_explicit(&g->occupied,0,memory_order_release);
+                if(shared) atomic_store_explicit(&entry->state,0,memory_order_release);
                 return 0;
             }
+            entry->row=count; g=group_at(o,count);
             g->key=wide?(int64_t)hash:key.isnull?0:key.value;
-            for(unsigned a=0;a<n->expr.naggs;++a) g->values[a].sum.isnull=1;
+            for(unsigned a=0;a<n->expr.naggs;++a) g->values[a]=(struct group_value){.sum={.isnull=1}};
+            g->key_flags=occupied;
             if(wide && o->group_integer) {
                 int64_t *key_values=(void *)(g->values+n->expr.naggs);
                 for(unsigned k=0;k<n->nkeys;++k) key_values[k]=keys[k].isnull?0:(int64_t)keys[k].value;
@@ -1784,7 +1790,7 @@ retry_bucket:
         int status=0;
         for(unsigned a=0;a<n->expr.naggs && !status;++a)
             status=group_update(s,n,a,&g->values[a],values[a].sum,values[a].count);
-        atomic_store_explicit(&g->occupied,occupied,shared?memory_order_release:memory_order_relaxed);
+        atomic_store_explicit(&entry->state,occupied,shared?memory_order_release:memory_order_relaxed);
         return status?status:1;
     }
 }
@@ -1956,14 +1962,21 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
         for(unsigned i=0;key_only && i<n->expr.nout;++i)
             if(n->expr.exprs[n->expr.outputs[i].index].op!=Q_COLUMN) key_only=0;
         double groups=n->estimated_groups>0?n->estimated_groups:n->estimated_rows;
+        size_t bytes_per_slot=o->group_stride-o->group_stride/8+sizeof(struct group_entry);
         while(!group_input_pending(s,n->left) &&
               (!wide || n->estimated_groups>0 || s->plan->nodes[n->left].kind==QP_SCAN ||
               (key_only && s->plan->nodes[n->left].parallel)) && capacity<groups*8/7 &&
-              (size_t)capacity*2*o->group_stride<=available && capacity<UINT_MAX/2)
+              (size_t)capacity*2*bytes_per_slot<=available && capacity<UINT_MAX/2)
             capacity*=2;
         for(;;) {
-            o->groups=cs_work_calloc(s->context,capacity,o->group_stride);
-            if(o->groups || capacity==128) break;
+            /* Only the compact lookup array needs clearing. New dense
+             * records are initialized by the CU that publishes each key.
+             * The 7/8 load limit also bounds the number of stored records. */
+            o->groups=cs_work_alloc(s->context,(size_t)(capacity-capacity/8)*o->group_stride);
+            o->group_entries=o->groups?cs_work_calloc(s->context,capacity,sizeof(*o->group_entries)):NULL;
+            if(o->group_entries) break;
+            cs_work_free(s->context,o->groups); o->groups=NULL;
+            if(capacity==128) break;
             capacity/=2;
         }
         if(!o->groups) { n->hash=0; return prepare?3:aggregate_next(s,id,row); }
@@ -1984,22 +1997,33 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
                 struct cs_work_context_stats m;
                 if(cs_work_get_context_stats(s->context,&m)) return -4;
                 size_t available=m.limit_bytes-m.used_bytes,reserve=group_reserve(s,n);
+                /* Keep spill/worker space after replacing the old buffers.
+                 * Realloc may grow in place; the allocator, rather than a
+                 * pessimistic quota, enforces the actual transient peak. */
+                size_t bytes_per_slot=o->group_stride-o->group_stride/8+sizeof(struct group_entry);
+                size_t released=(size_t)o->group_capacity*bytes_per_slot;
+                available+=released;
                 available=available>reserve?available-reserve:0;
-                void *larger=capacity>o->group_capacity && (size_t)capacity*o->group_stride<=available?
-                    cs_work_calloc(s->context,capacity,o->group_stride):NULL;
+                struct group_entry *entries=capacity>o->group_capacity &&
+                    (size_t)capacity*bytes_per_slot<=available?
+                    cs_work_calloc(s->context,capacity,sizeof(*entries)):NULL;
+                void *larger=entries?cs_work_realloc(s->context,o->groups,(size_t)(capacity-capacity/8)*o->group_stride):NULL;
                 if(larger) {
-                    struct compact_group *old=o->groups; unsigned previous=o->group_capacity;
+                    struct group_entry *old=o->group_entries;
                     o->groups=larger; o->group_capacity=capacity;
-                    for(unsigned i=0;i<previous;++i) {
-                        struct compact_group *v=(void *)((unsigned char *)old+(size_t)i*o->group_stride);
-                        if(!v->occupied) continue;
-                        uint64_t hash=wide?(uint64_t)v->key:mix_hash(v->occupied==2?0:(uint64_t)v->key);
+                    o->group_entries=entries;
+                    unsigned rows=atomic_load_explicit(o->group_count,memory_order_relaxed);
+                    for(unsigned i=0;i<rows;++i) {
+                        const struct compact_group *v=group_at(o,i);
+                        uint64_t hash=wide?(uint64_t)v->key:mix_hash(v->key_flags==2?0:(uint64_t)v->key);
                         unsigned slot=hash&(capacity-1);
-                        while(group_at(o,slot)->occupied) slot=(slot+1)&(capacity-1);
-                        memcpy(group_at(o,slot),v,o->group_stride);
+                        while(atomic_load_explicit(&entries[slot].state,memory_order_relaxed)) slot=(slot+1)&(capacity-1);
+                        entries[slot].row=i;
+                        atomic_store_explicit(&entries[slot].state,v->key_flags,memory_order_relaxed);
                     }
                     cs_work_free(s->context,old); continue;
                 }
+                cs_work_free(s->context,entries);
                 o->group_phase=1; continue;
             }
             o->have_left=0; continue;
@@ -2022,8 +2046,9 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
                 status=sort_call(s,sort,0); if(status) return status;
                 sort->input_pending=0; sort->input->rows=0;
             }
-            while(o->group_flush<o->group_capacity && sort->input->rows<QS_RESULT_ROWS) {
-                struct compact_group *g=group_at(o,o->group_flush++); if(!g->occupied) continue;
+            while(o->group_flush<atomic_load_explicit(o->group_count,memory_order_relaxed) && sort->input->rows<QS_RESULT_ROWS) {
+                unsigned slot=o->group_flush++;
+                struct compact_group *g=group_at(o,slot);
                 struct qs_cell *out=sort->input->data[sort->input->rows++].cells;
                 group_keys(n,o,g,out);
                 for(unsigned a=0;a<n->expr.naggs;++a) {
@@ -2034,11 +2059,12 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
             if(sort->input->rows) { sort->input_pending=1; continue; }
             if(o->input_done) {
                 cs_work_free(s->context,o->groups); o->groups=NULL;
+                cs_work_free(s->context,o->group_entries); o->group_entries=NULL;
                 sort->complete=1; sort->group.count=1; sort->group.states[0]=sort->task.state;
                 cs_work_free(s->context,sort->input); sort->input=NULL;
                 o->group_phase=2;
             } else {
-                memset(o->groups,0,(size_t)o->group_capacity*o->group_stride);
+                memset(o->group_entries,0,(size_t)o->group_capacity*sizeof(*o->group_entries));
                 atomic_store_explicit(o->group_count,0,memory_order_relaxed);
                 o->group_flush=0; o->group_phase=0;
             }
@@ -2046,12 +2072,14 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
         }
         if(o->group_phase==3) {
             if(prepare) return 3;
-            while(o->group_flush<o->group_capacity) {
-                struct compact_group *g=group_at(o,o->group_flush++); if(!g->occupied) continue;
+            while(o->group_flush<atomic_load_explicit(o->group_count,memory_order_relaxed)) {
+                unsigned slot=o->group_flush++;
+                struct compact_group *g=group_at(o,slot);
                 struct qs_cell keys[QS_KEYS]; group_keys(n,o,g,keys);
                 int64_t result=group_result(s,n,g->values,keys,row); if(result) return result;
             }
-            cs_work_free(s->context,o->groups); o->groups=NULL; o->finished=1; return 0;
+            cs_work_free(s->context,o->groups); o->groups=NULL;
+            cs_work_free(s->context,o->group_entries); o->group_entries=NULL; o->finished=1; return 0;
         }
         if(prepare) return 3;
         /* Merge partial value/count pairs; AVG is divided only for final output. */
@@ -2466,12 +2494,13 @@ static int64_t next_row_impl(struct execution *s,unsigned id,struct qs_cell *row
             for(;;) {
                 if(s->source_at==s->source_end) {
                     s->source_at=atomic_fetch_add_explicit(&s->owner->next_offset,64,memory_order_relaxed);
-                    if(s->source_at>=source->group_capacity) return 0;
+                    unsigned rows=atomic_load_explicit(source->group_count,memory_order_relaxed);
+                    if(s->source_at>=rows) return 0;
                     s->source_end=s->source_at+64;
-                    if(s->source_end>source->group_capacity) s->source_end=source->group_capacity;
+                    if(s->source_end>rows) s->source_end=rows;
                 }
-                const struct compact_group *g=group_at(source,s->source_at++);
-                if(!g->occupied) continue;
+                unsigned slot=s->source_at++;
+                const struct compact_group *g=group_at(source,slot);
                 struct qs_cell keys[QS_KEYS]; group_keys(n,source,g,keys);
                 int64_t status=group_result(s,n,g->values,keys,row); if(status) return status;
             }
@@ -2769,6 +2798,7 @@ restart:
         int source=qp_pipeline_source(p,root);
         if(source>=0 && p->nodes[source].kind==QP_AGGREGATE && s->partition_join<0) {
             cs_work_free(s->context,s->nodes[source].groups); s->nodes[source].groups=NULL;
+            cs_work_free(s->context,s->nodes[source].group_entries); s->nodes[source].group_entries=NULL;
             s->nodes[source].finished=1;
         }
         s->parallel_started=0; s->control->parallel=0;
