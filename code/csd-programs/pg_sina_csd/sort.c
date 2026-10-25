@@ -332,7 +332,7 @@ static int row_init(struct qs_task *task,const struct qs_plan *p,struct row_sort
     s->run_rows=(bytes/QS_SORT_IO_BYTES)*s->block_rows;
     s->vectors=cs_work_alloc(context,p->nexprs*sizeof(*s->vectors));
     if(p->nexprs && !s->vectors) { cs_work_end(context); return -4; }
-    for(unsigned i=0;i<p->nout && p->ordered_rows!=2;++i)
+    for(unsigned i=0;i<p->nout && p->ordered_rows<2;++i)
         if(qs_vector_require(p,p->outputs[i].index,s->needed)) { cs_work_end(context); return -1; }
     if(p->limit>=0 && (uint64_t)p->limit<=UINT64_MAX-(uint64_t)p->offset) {
         s->topn=(uint64_t)p->limit+(uint64_t)p->offset;
@@ -347,16 +347,19 @@ int64_t pg_sina_sort_sink(struct femu_csd_args *a)
         a->mr_len[2]<(long long)sizeof(struct qs_task) || a->mr_len[3]<QS_SORT_IO_BYTES) return -1;
     struct qs_chunk *c=a->mr_addr[0]; struct qs_result *rows=a->mr_addr[0];
     const struct qs_plan *p=a->mr_addr[1]; struct qs_task *task=a->mr_addr[2];
-    int row_input=p->ordered_rows==2;
+    /* 3 is the SQL executor's packed CU batch; begin retains a partially
+     * consumed producer position. Both layouts contain evaluated cells. */
+    int packed=p->ordered_rows==3,row_input=p->ordered_rows==2 || packed;
     if(!p->nout || p->nout>QS_OUT || p->nexprs>QS_EXPRS || p->norder>QS_OUT ||
-        (row_input?(a->mr_len[0]<(long long)sizeof(*rows) || rows->rows>QS_RESULT_ROWS):
+        (row_input?(a->mr_len[0]<(long long)sizeof(*rows) ||
+          rows->rows>(packed?QS_RESULT_ROWS*QS_OUT/p->nout:QS_RESULT_ROWS) || (packed && rows->begin>rows->rows)):
          (a->mr_len[0]<(long long)sizeof(*c) || c->selected>c->rows || c->rows>c->capacity ||
           qs_chunk_bytes(c->capacity,c->ncols)>(uint64_t)a->mr_len[0]))) return -1;
-    unsigned selected=row_input?rows->rows:c->selected;
+    unsigned selected=row_input?rows->rows-(packed?rows->begin:0):c->selected;
     struct row_sort *s=(void *)(uintptr_t)task->state;
     if(!s) { int status=row_init(task,p,&s); if(status) return status; }
     if(!csIsReentry(a)) {
-        s->input_position=0; s->metrics.scanned+=row_input?rows->rows:c->rows; s->metrics.matched+=selected;
+        s->input_position=0; s->metrics.scanned+=row_input?selected:c->rows; s->metrics.matched+=selected;
         s->metrics.input_bytes+=task->input_bytes; ++s->metrics.chunks;
     }
     int64_t status=row_resume(s,a); if(status) return status;
@@ -393,9 +396,17 @@ int64_t pg_sina_sort_sink(struct femu_csd_args *a)
         if(count>QS_VECTOR_ROWS) count=QS_VECTOR_ROWS;
         if(!s->bounded && count>s->run_rows-r->rows) count=s->run_rows-r->rows;
         if(!row_input && qs_vector_execute(p,c,qs_selection(c),s->input_position,count,s->needed,s->vectors)) return -5;
+        if(row_input && !s->bounded) {
+            if(packed) memcpy(run_row(s,r,r->rows),(struct qs_cell *)rows->data+
+                (size_t)(rows->begin+s->input_position)*p->nout,(size_t)count*s->row_bytes);
+            else for(unsigned i=0;i<count;++i)
+                memcpy(run_row(s,r,r->rows+i),rows->data[s->input_position+i].cells,s->row_bytes);
+            r->rows+=count;
+        } else
         for(unsigned i=0;i<count;++i) {
             struct qs_cell row[QS_OUT];
-            if(row_input) memcpy(row,rows->data[s->input_position+i].cells,s->row_bytes);
+            if(row_input) memcpy(row,packed?(struct qs_cell *)rows->data+
+                (size_t)(rows->begin+s->input_position+i)*p->nout:rows->data[s->input_position+i].cells,s->row_bytes);
             else for(unsigned col=0;col<p->nout;++col) {
                 unsigned expr=p->outputs[col].index;
                 if(s->vectors[expr].errors[i]) return -5;

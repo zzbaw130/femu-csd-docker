@@ -42,13 +42,15 @@ static int host_order(const void *left,const void *right)
     if((a%11==0)!=(b%11==0)) return a%11==0?-1:1;
     return a%11==0?(a<b)-(a>b):(a>b)-(a<b);
 }
-static void check(function sink,function source,unsigned rows,int64_t limit,int64_t offset,int cancel,int profile)
+static void check(function sink,function source,unsigned rows,int64_t limit,int64_t offset,int cancel,int profile,int packed)
 {
     next_token=1; stored=loaded=0;
     unsigned *expected=malloc((rows?rows:1)*sizeof(*expected)); assert(expected);
     for(unsigned i=0;i<rows;++i) expected[i]=i;
     qsort(expected,rows,sizeof(*expected),host_order);
     struct qs_plan p={.having=-1,.nattrs=3,.ncols=3,.nexprs=3,.nout=3,.norder=2,.ordered_rows=1,.work_mem_bytes=budget/workers,.predicate=-1,.limit=limit,.offset=offset};
+    struct qs_result *input=packed?calloc(1,sizeof(*input)):NULL;
+    if(packed) { assert(input); p.ordered_rows=3; input->begin=7; }
     for(unsigned i=0;i<3;++i) {
         p.cols[i]=(struct qs_column){.slot=i,.type=i==1?Q_DECIMAL:Q_INTEGER,.scale=i==1?2:0};
         p.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.column=i,.type=p.cols[i].type,.scale=p.cols[i].scale};
@@ -70,12 +72,20 @@ static void check(function sink,function source,unsigned rows,int64_t limit,int6
             qs_dscales(c)[2*c->capacity+i]=key%5;
             if(key%11==0) qs_nulls(c)[i/8]|=1U<<(i%8);
             qs_selection(c)[i]=i;
+            if(packed) {
+                struct qs_cell *v=(struct qs_cell *)input->data+(size_t)(input->begin+i)*3;
+                v[0]=(struct qs_cell){.value=key,.isnull=key%11==0};
+                v[1]=(struct qs_cell){.value=(int64_t)key*123,.scale=2,.dscale=key%3};
+                v[2]=(struct qs_cell){.value=-(int64_t)key,.dscale=key%5};
+            }
         }
+        if(packed) input->rows=n+input->begin;
         unsigned worker=chunk++%workers; tasks[worker].workers=workers; tasks[worker].input_bytes=n*24;
-        void *mr[]={c,&p,&tasks[worker],profile?(void *)&counters[worker]:io,io};
-        long long len[]={bytes,sizeof(p),sizeof(tasks[0]),profile?sizeof(counters[0]):QS_SORT_IO_BYTES,QS_SORT_IO_BYTES};
+        void *mr[]={packed?(void *)input:c,&p,&tasks[worker],profile?(void *)&counters[worker]:io,io};
+        long long len[]={packed?sizeof(*input):bytes,sizeof(p),sizeof(tasks[0]),profile?sizeof(counters[0]):QS_SORT_IO_BYTES,QS_SORT_IO_BYTES};
         struct femu_csd_args a={.numr=profile?5:4,.mr_addr=mr,.mr_len=len,.cparam1=profile};
         assert(!run(sink,&a));
+        if(packed) assert(input->begin==7 && input->rows==n+7);
     }
     struct qs_group group={.count=workers};
     for(unsigned i=0;i<workers;++i) group.states[i]=tasks[i].state;
@@ -122,7 +132,7 @@ static void check(function sink,function source,unsigned rows,int64_t limit,int6
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats));
     assert(!stats.used_bytes && !stats.active_contexts && stats.peak_used_bytes<=budget && stats.peak_used_bytes<=capacity);
     printf("rows=%u pool=%zu budget=%zu peak=%zu store=%u load=%u\n",rows,capacity,budget,stats.peak_used_bytes,stored,loaded);
-    free(out); free(io); free(c); free(expected);
+    free(input); free(out); free(io); free(c); free(expected);
 }
 int main(int argc,char **argv)
 {
@@ -135,14 +145,18 @@ int main(int argc,char **argv)
     assert(capacity && budget && !cs_work_init(capacity));
     void *so=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(so);
     function sink=(function)dlsym(so,"pg_sina_sort_sink"),source=(function)dlsym(so,"pg_sina_sort_source"); assert(sink && source);
-    check(sink,source,0,-1,0,0,0);
-    check(sink,source,5003,-1,0,0,0);
-    check(sink,source,262147,-1,0,0,1);
-    check(sink,source,262147,17,5,0,1);
-    check(sink,source,262147,-1,0,1,0);
-    check(sink,source,262147,-1,0,2,0);
-    check(sink,source,1048583,-1,0,0,0); /* Merge read buffers exceed workmem. */
-    check(sink,source,5003,INT64_MAX,INT64_MAX,0,0);
+    check(sink,source,0,-1,0,0,0,0);
+    check(sink,source,5003,-1,0,0,0,0);
+    check(sink,source,262147,-1,0,0,1,0);
+    check(sink,source,262147,17,5,0,1,0);
+    check(sink,source,262147,-1,0,1,0,0);
+    check(sink,source,262147,-1,0,2,0,0);
+    check(sink,source,1048583,-1,0,0,0,0); /* Merge read buffers exceed workmem. */
+    check(sink,source,5003,INT64_MAX,INT64_MAX,0,0,0);
+    check(sink,source,0,-1,0,0,0,1);
+    check(sink,source,262147,-1,0,0,1,1);
+    check(sink,source,262147,17,5,0,1,1);
+    check(sink,source,262147,-1,0,1,0,1);
     dlclose(so);
     puts("PASS external row sort, multiple sinks, memory pressure/reentry, NULL/precision, chunked output, TopN/OFFSET and abort cleanup");
     return 0;

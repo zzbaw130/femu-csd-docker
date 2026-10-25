@@ -1144,6 +1144,84 @@ static int multi_order(const void *ap,const void *bp)
     return (a->b<b->b)-(a->b>b->b);
 }
 enum group_test_mode { GROUP_SINGLE,GROUP_COUNTS,GROUP_NUMERIC_EXTREMES,GROUP_TEXT_EXTREMES };
+/* A live CU output must stay owned by Sort while a full run is stored.
+ * Verify every row after multiple reentries, not just a standalone buffer. */
+static void parallel_sort_spill(function run,unsigned workers)
+{
+    const unsigned rows=50003; size_t raw_bytes;
+    unsigned char *raw=heap(rows,2,&raw_bytes);
+    struct qp_plan *p=calloc(1,sizeof(*p)); assert(p);
+    p->count=2; p->workers=workers; p->scan_bytes=QP_SCAN_BYTES;
+    struct qp_node *leaf=&p->nodes[1]; scan(leaf); leaf->bytes=raw_bytes; leaf->parallel=1;
+    size_t config=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
+    size_t vector=(qs_chunk_bytes(QP_VECTOR_ROWS,2)+4095)&~(size_t)4095;
+    leaf->input_offset=config; leaf->vector_offset=config+p->scan_bytes;
+    size_t base=leaf->vector_offset+vector;
+    leaf->parallel_input=base; leaf->parallel_vector=base+p->scan_bytes;
+    p->parallel_stride=p->scan_bytes+vector;
+    size_t bytes=base+(workers-1)*p->parallel_stride;
+    struct qp_node *sort=&p->nodes[0];
+    *sort=(struct qp_node){.kind=QP_SORT,.left=1,.right=-1,.expr=leaf->expr};
+    sort->expr.norder=1; sort->expr.order[0]=(struct qs_order){.output=0,.descending=1};
+    sort->expr.work_mem_bytes=8U*1024*1024; sort->expr.limit=-1;
+    unsigned char *arena=calloc(1,bytes),*io=calloc(workers+1,QS_SORT_IO_BYTES);
+    struct qp_control *controls=calloc(workers+1,sizeof(*controls));
+    struct qs_result *out=calloc(workers+1,sizeof(*out)); assert(arena && io && controls && out);
+    *(struct qs_dict *)arena=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
+    *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=QP_VECTOR_ROWS,.ncols=2};
+    struct qp_control *c=&controls[0];
+    void *mr[]={p,c,out,arena,io};
+    long long len[]={sizeof(*p),(workers+1)*sizeof(*controls),(workers+1)*sizeof(*out),bytes,(workers+1)*QS_SORT_IO_BYTES};
+    struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=len,.cparam1=1};
+    uint64_t available=0,done=0; unsigned epoch=0,seen=0,held_stores=0;
+    atomic_uint_fast64_t offset=0; bool need_input[QS_WORKERS]={0};
+    void **tokens=NULL; unsigned ntokens=0;
+    while(!out->finished) {
+        if(c->parallel && !csIsReentry(&args)) {
+            pthread_t threads[QS_WORKERS]; struct probe_test tasks[QS_WORKERS]; uint64_t started=0;
+            for(unsigned w=0;w<workers;++w) if(!((available|done)&(UINT64_C(1)<<w))) {
+                tasks[w]=(struct probe_test){run,args,p,&controls[w+1],&out[w+1],arena,raw,raw,NULL,w+1,tokens,ntokens,&offset,&need_input[w],c->scan_node};
+                tasks[w].args.cparam1=((w+1)<<1)|1;
+                assert(c->scan_node==2 && !pthread_create(&threads[w],NULL,probe_worker,&tasks[w])); started|=UINT64_C(1)<<w;
+            }
+            for(unsigned w=0;w<workers;++w) if(started&(UINT64_C(1)<<w)) {
+                assert(!pthread_join(threads[w],NULL)); available|=UINT64_C(1)<<w;
+                if(out[w+1].finished) done|=UINT64_C(1)<<w;
+            }
+            c->available=available;
+        }
+        int64_t status=run(&args); assert(status>=0);
+        uint64_t op=(uint64_t)status>>60,id=(uint64_t)status&CS_IO_VALUE_MASK;
+        if(op) {
+            if(op==1) {
+                if(c->parallel) {
+                    unsigned held=0;
+                    for(unsigned w=0;w<workers;++w) if((c->available&(UINT64_C(1)<<w)) &&
+                        !(c->drained&(UINT64_C(1)<<w)) && out[w+1].rows>out[w+1].begin) ++held;
+                    assert(held); ++held_stores;
+                }
+                tokens=realloc(tokens,(ntokens+1)*sizeof(*tokens)); assert(tokens);
+                tokens[ntokens]=malloc(id); assert(tokens[ntokens]); memcpy(tokens[ntokens],io,id); args.cparam2=++ntokens;
+            } else if(op==2) { assert(id && id<=ntokens && tokens[id-1]); memcpy(io,tokens[id-1],QS_SORT_IO_BYTES); args.cparam2=id; }
+            else { assert(op==3 && id && id<=ntokens && tokens[id-1]); free(tokens[id-1]); tokens[id-1]=NULL; args.cparam2=id; }
+            continue;
+        }
+        args.cparam2=0; available&=~c->drained;
+        if(c->epoch!=epoch) {
+            epoch=c->epoch; available=done=0; atomic_store(&offset,0);
+            for(unsigned w=0;w<workers;++w) need_input[w]=true;
+        }
+        for(unsigned r=0;r<out->rows;++r) {
+            unsigned key=rows-1-seen++; struct qs_cell *v=out->data[r].cells;
+            assert(seen<=rows && !v[0].isnull && v[0].value==key);
+            assert(v[1].value==(int)((uint64_t)key*1009%997)-498);
+        }
+    }
+    assert(seen==rows && held_stores && out->metrics.workers==workers && out->metrics.work_peak<=8U*1024*1024);
+    for(unsigned i=0;i<ntokens;++i) assert(!tokens[i]);
+    struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
+    free(tokens); free(raw); free(p); free(arena); free(io); free(controls); free(out);
+}
 static void multiple_group_aggregates(function run,unsigned memory,unsigned kind,int integer_keys,unsigned workers,enum group_test_mode mode)
 {
     int counts=mode!=GROUP_SINGLE,extremes=mode>=GROUP_NUMERIC_EXTREMES,text=mode==GROUP_TEXT_EXTREMES;
@@ -1456,6 +1534,7 @@ int main(int argc,char **argv)
         test(run,QP_INNER,50003,50003,256,1,TEST_BUILD_GROUP_DIRECT);
         test(run,QP_INNER,31,23,256,1,TEST_BUILD_GROUP_DIRECT);
         test(run,QP_INNER,31,0,256,1,TEST_BUILD_GROUP_DIRECT);
+        if(test_workers<=8) parallel_sort_spill(run,test_workers);
         test_scheduled=false;
         for(unsigned join=QP_INNER;join<=QP_ANTI;++join)
             test(run,join,20003,23,256,1,TEST_BUILD_PHASE);
@@ -1509,6 +1588,7 @@ int main(int argc,char **argv)
     test(run,QP_INNER,50003,50003,64,1,TEST_BUILD_GROUP_DIRECT);
     test(run,QP_INNER,31,23,64,1,TEST_BUILD_GROUP_DIRECT);
     test(run,QP_INNER,31,0,64,1,TEST_BUILD_GROUP_DIRECT);
+    parallel_sort_spill(run,test_workers);
     for(unsigned join=QP_INNER;join<=QP_ANTI;++join) {
         test(run,join,31,5003,64,1,TEST_HASH_QUAL);
         test(run,join,31,5003,4,1,TEST_HASH_QUAL);

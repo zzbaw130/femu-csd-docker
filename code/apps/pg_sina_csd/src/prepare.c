@@ -108,7 +108,10 @@ Datum pg_sina_csd_prepare(PG_FUNCTION_ARGS)
     RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
     total = (uint64)pages * BLCKSZ;
     base = relpathperm(relation->rd_node, MAIN_FORKNUM);
-    if (stat(device, &raw) || !S_ISBLK(raw.st_mode) || stat(base, &data))
+    char fullpath[MAXPGPATH];
+    if (base[0]=='/') snprintf(fullpath,sizeof(fullpath),"%s",base);
+    else snprintf(fullpath,sizeof(fullpath),"%s/%s",DataDir,base);
+    if (stat(device, &raw) || !S_ISBLK(raw.st_mode) || stat(fullpath, &data))
         ereport(ERROR, (errmsg("cannot identify the heap or namespace: %m")));
     snprintf(sysfs,sizeof(sysfs),"/sys/dev/block/%u:%u/queue/logical_block_size",major(raw.st_rdev),minor(raw.st_rdev));
     lba = number(sysfs);
@@ -151,7 +154,7 @@ Datum pg_sina_csd_prepare(PG_FUNCTION_ARGS)
             CharGetDatum(a->attalign),BoolGetDatum(a->attnotnull),ObjectIdGetDatum(a->attcollation)};
         execute("INSERT INTO sina_csd.columns VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",9,types,values);
     }
-    save_extents(relid,base,total,data.st_dev,partition,lba,namespace_bytes);
+    save_extents(relid,fullpath,total,data.st_dev,partition,lba,namespace_bytes);
     /* Map eligible native indexes once, alongside the frozen heap. This stores
      * file extents and metadata only, never a copy of index keys or tuples. */
     List *indexes=RelationGetIndexList(relation); ListCell *cell;
@@ -169,14 +172,16 @@ Datum pg_sina_csd_prepare(PG_FUNCTION_ARGS)
         BTMetaPageData meta=*BTPageGetMeta(BufferGetPage(buffer)); UnlockReleaseBuffer(buffer);
         if(meta.btm_magic!=BTREE_MAGIC || meta.btm_version!=4) { relation_close(idx,AccessShareLock); continue; }
         Oid iid=RelationGetRelid(idx); uint64 size=(uint64)RelationGetNumberOfBlocks(idx)*BLCKSZ;
-        char *path=relpathperm(idx->rd_node,MAIN_FORKNUM); struct stat index_stat;
-        if(stat(path,&index_stat) || index_stat.st_dev!=data.st_dev) elog(ERROR,"index is not on the heap filesystem");
+        char *path=relpathperm(idx->rd_node,MAIN_FORKNUM); char ipath[MAXPGPATH];
+        if(path[0]=='/') snprintf(ipath,sizeof(ipath),"%s",path); else snprintf(ipath,sizeof(ipath),"%s/%s",DataDir,path);
+        struct stat index_stat;
+        if(stat(ipath,&index_stat) || index_stat.st_dev!=data.st_dev) elog(ERROR,"index is not on the heap filesystem");
         Datum value[]={ObjectIdGetDatum(iid)};
         execute("DELETE FROM sina_csd.relations WHERE relid=$1",1,id_type,value);
         relation_values[0]=ObjectIdGetDatum(iid); relation_values[1]=ObjectIdGetDatum(idx->rd_node.relNode);
         relation_values[5]=Int64GetDatum(size); relation_values[6]=Int32GetDatum(RelationGetDescr(idx)->natts);
         execute("INSERT INTO sina_csd.relations(relid,relfilenode,device,namespace_id,lba_bytes,bytes,nattrs,boot_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",8,relation_types,relation_values);
-        save_extents(iid,path,size,data.st_dev,partition,lba,namespace_bytes);
+        save_extents(iid,ipath,size,data.st_dev,partition,lba,namespace_bytes);
         Oid types[]={OIDOID,OIDOID,INT2OID,INT8OID,INT2OID};
         Datum values[]={ObjectIdGetDatum(iid),ObjectIdGetDatum(relid),Int16GetDatum(info->indkey.values[0]),Int64GetDatum(meta.btm_root),Int16GetDatum(key->attlen)};
         execute("INSERT INTO sina_csd.indexes VALUES($1,$2,$3,$4,$5)",5,types,values);

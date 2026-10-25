@@ -60,6 +60,8 @@ struct sorted_rows {
     struct qs_task task;
     struct qs_group group;
     struct qs_result *input,*output;
+    struct qs_result *batch; /* Borrowed CU output, retained across spill. */
+    unsigned batch_worker;
     unsigned position;
     int initialized, complete, drained, input_pending;
     unsigned char *prefix;
@@ -366,7 +368,8 @@ static int64_t sort_call(struct execution *s,struct sorted_rows *sort,int source
         mr[0]=&sort->group; len[0]=sizeof(sort->group);
         mr[1]=sort->output; len[1]=sizeof(*sort->output); mr[2]=s->io; len[2]=s->io_bytes;
     } else {
-        mr[0]=sort->input; len[0]=sizeof(*sort->input); mr[1]=&sort->plan; len[1]=sizeof(sort->plan);
+        sort->plan.ordered_rows=sort->batch?3:2; /* Packed CU rows or padded scalar rows. */
+        mr[0]=sort->batch?sort->batch:sort->input; len[0]=sizeof(*sort->input); mr[1]=&sort->plan; len[1]=sizeof(sort->plan);
         mr[2]=&sort->task; len[2]=sizeof(sort->task); mr[3]=s->io; len[3]=s->io_bytes;
     }
     if(s->pending_sort==sort) { a.cparam2=s->args->cparam2; s->pending_sort=NULL; }
@@ -410,12 +413,37 @@ static int64_t sorted_input(struct execution *s,struct sorted_rows *sort,unsigne
             status=sort_call(s,sort,0); if(status) return status;
             sort->input_pending=0; sort->input->rows=0;
         }
+        if(sort->batch) {
+            status=sort_call(s,sort,0); if(status) return status;
+            s->parallel_position[sort->batch_worker]=sort->batch->rows;
+            sort->batch=NULL; continue;
+        }
+        if(sort->prefix && sort->prefix_position==sort->prefix_rows) {
+            cs_work_free(s->context,sort->prefix); sort->prefix=NULL;
+        }
+        if(!s->worker && s->plan->workers>1 && !sort->input->rows && sort->prefix_position==sort->prefix_rows &&
+           input->parallel && !s->nodes[child].finished) {
+            /* Do not drain/requeue this slot until Sort has consumed it,
+             * including any STORE/LOAD reentry. Prefix fallback rows keep
+             * their existing scalar adapter. */
+            status=parallel_next(s,child,NULL);
+            if(status<0 || status>3 || status==QP_WAIT) return status;
+            if(status==2) {
+                for(unsigned w=0;w<s->plan->workers;++w)
+                    if((s->control->available&(UINT64_C(1)<<w)) && s->parallel_position[w]<s->outputs[w+1].rows) {
+                        sort->batch=&s->outputs[w+1]; sort->batch_worker=w;
+                        sort->batch->begin=s->parallel_position[w]; break;
+                    }
+                if(!sort->batch) return -1;
+                continue;
+            }
+            /* 3 means this producer selected its ordinary scalar fallback. */
+        }
         if(sort->prefix_position<sort->prefix_rows) {
             hash_load(sort->input->data[sort->input->rows].cells,
                 sort->prefix+(size_t)sort->prefix_position++*hash_row_bytes(&input->expr),&input->expr);
             status=2;
         } else {
-            if(sort->prefix) { cs_work_free(s->context,sort->prefix); sort->prefix=NULL; }
             status=next_row(s,child,sort->input->data[sort->input->rows].cells);
         }
         if(status<0 || status>2) return status;
@@ -2615,7 +2643,7 @@ static int64_t parallel_next(struct execution *s,unsigned root,struct qs_cell *r
 restart:
     if(!s->parallel_started || s->parallel_node!=root) {
         int source=qp_pipeline_source(p,root);
-        if(source<0) { p->nodes[root].parallel=0; return next_row(s,root,row); }
+        if(source<0) { p->nodes[root].parallel=0; return row?next_row(s,root,row):3; }
         int builds[QP_NODES]; unsigned count=0;
         for(int id=root;id>=0 && id!=source;id=p->nodes[id].left)
             if(p->nodes[id].kind==QP_JOIN) builds[count++]=id;
@@ -2635,7 +2663,7 @@ restart:
             }
             if(s->nodes[id].hash_fallback==1) {
                 p->nodes[root].parallel=0;
-                return next_row(s,root,row);
+                return row?next_row(s,root,row):3;
             }
         }
         s->partition_join=-1;
@@ -2647,12 +2675,12 @@ restart:
             if(s->profiling) blocking_end(s,QS_AGG_SINK,timer);
             if(status!=3) return status;
             if(s->nodes[source].group_phase!=3 || !s->nodes[source].groups) {
-                p->nodes[root].parallel=0; return next_row(s,root,row);
+                p->nodes[root].parallel=0; return row?next_row(s,root,row):3;
             }
             /* A direct Source has no expensive probe chain to distribute.
              * Base its task count on real groups, not a large PG estimate. */
             if(source==(int)root && atomic_load(s->nodes[source].group_count)<QP_VECTOR_ROWS) {
-                p->nodes[root].parallel=0; return next_row(s,root,row);
+                p->nodes[root].parallel=0; return row?next_row(s,root,row):3;
             }
         }
         unsigned hash_sink=0,group_sink=0,aggregate_sink=0;
@@ -2711,7 +2739,7 @@ restart:
              * otherwise a successful launch can fail on its first page. */
             if(stats.limit_bytes-stats.used_bytes<(p->workers-w)*private_bytes+spill_reserve) {
                 close_workers(s); p->workers=1;
-                return next_row(s,root,row);
+                return row?next_row(s,root,row):3;
             }
             cs_work_context *context=cs_work_begin_child(s->context,stats.limit_bytes);
             struct execution *e=context?cs_work_calloc(context,1,sizeof(*e)):NULL;
@@ -2719,7 +2747,7 @@ restart:
             if(!e || !e->nodes) {
                 if(context) cs_work_end(context);
                 close_workers(s); p->nodes[root].parallel=0;
-                return next_row(s,root,row);
+                return row?next_row(s,root,row):3;
             }
             e->context=context; e->plan=p; e->owner=s; e->worker=w+1; e->root=root;
             e->hash_sink=hash_sink; e->group_sink=group_sink; e->aggregate_sink=aggregate_sink;
@@ -2765,6 +2793,7 @@ restart:
     for(unsigned w=0;w<p->workers;++w) if(s->control->available&(UINT64_C(1)<<w)) {
         struct qs_result *out=&s->outputs[w+1];
         if(s->parallel_position[w]<out->rows) {
+            if(!row) return 2; /* Borrow this batch without advancing it. */
             unsigned cols=p->nodes[root].expr.nout;
             memcpy(row,(struct qs_cell *)out->data+(size_t)s->parallel_position[w]++*cols,cols*sizeof(*row));
             return 2;
