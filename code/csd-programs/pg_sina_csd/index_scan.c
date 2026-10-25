@@ -15,7 +15,7 @@ struct lookup { unsigned row, block, item, heap_block, heap_item, phase; int64_t
 struct index_cursor {
     struct page_tag tags[QS_INDEX_CACHE];
     struct lookup keys[INDEX_KEYS];
-    unsigned position, count, hand, waiting, pending, last_slot;
+    unsigned position, count, hand, waiting, pending, last_slot, root;
     const unsigned char *heap_window;
     uint32_t heap_first,heap_pages;
     struct lookup scan;
@@ -30,7 +30,10 @@ struct index_join { cs_work_context *context; struct qs_plan scan; struct index_
 static struct index_cursor *index_cursor(struct index_join *h,unsigned slot)
 {
     if(slot>=QS_WORKERS) return NULL;
-    if(!h->cursors[slot]) h->cursors[slot]=cs_work_calloc(h->context,1,sizeof(*h->cursors[slot]));
+    if(!h->cursors[slot]) {
+        h->cursors[slot]=cs_work_calloc(h->context,1,sizeof(*h->cursors[slot]));
+        if(h->cursors[slot]) h->cursors[slot]->root=h->scan.join.indexroot;
+    }
     return h->cursors[slot];
 }
 static uint16_t u16(const unsigned char *p) { uint16_t x; memcpy(&x,p,2); return x; }
@@ -89,7 +92,10 @@ static const unsigned char *page_at(struct index_cursor *c,struct qs_task *task,
     if(task->index_nreads==QS_INDEX_READS) return NULL;
     for(unsigned n=0;n<QS_INDEX_CACHE;++n) {
         unsigned slot=c->hand++%QS_INDEX_CACHE;
-        if(c->tags[slot].state==2) continue;
+        const struct page_tag *tag=&c->tags[slot];
+        /* Every lookup batch revisits the root. Keep its one existing slot;
+         * rotate the rest so LOAD destinations remain mostly contiguous. */
+        if(tag->state==2 || (tag->state && !tag->heap && tag->block==c->root)) continue;
         c->tags[slot]=(struct page_tag){block,heap,2};
         task->index_reads[task->index_nreads++]=(struct qs_index_read){block,slot,heap};
         return NULL;

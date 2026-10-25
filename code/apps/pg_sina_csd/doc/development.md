@@ -495,6 +495,14 @@ NativePlan与8/16/64 CU测试通过，覆盖多层Index/Hash、NULL外连接、�
 
 Q18 customer构建profile墙钟846.351→338.897ms、累计CPU2935.097→1186.894ms；workmem峰值完全相同且无spill，确认改善来自竞争减少。没有改PG/SNIA/FEMU接口、预算或FDM容量。当前普通延迟和原始记录见performance.md，字典spill及其他逐行边界仍未完成。
 
+## 索引缓存保留根页（2026-10-25）
+
+参考DuckDB缓冲管理对重复访问页的保留，在设备SQL程序每个索引游标的原128页缓存中保留根页，其他页仍按轮转次序复用。根页与待LOAD槽位不被覆盖，不增加AFDM页数；游标元数据仍在原4KiB预算内。保留连续槽位复用，使现有LOAD批次可以合并目标地址，不为页缓存增加新的协议、查询参数或PG/SNIA调度逻辑。
+
+现有索引压力测试新增根页读取断言：513个查找、466次Heap读取，根页读取4→1次，恢复18→15次。索引、NativePlan和8/16/64 CU共6项CTest通过，含4MiB spill、重复键、NULL、HOT重定向及取消清理。已重编部署pg-sina-plan.so与pg-sina-join.so，PG/SNIA/固件未修改。
+
+规范Q4/Q17/Q21冷启动均正确、整条卸载且快于同轮host。Q4 profile页加载62619→62175、续交3036→2582、LOAD请求3494→3047，但墙钟受推进等待波动影响，本阶段仅确认减少重复I/O和请求，不宣称固定延迟收益或充分利用8 CU。当前成绩见performance.md，未重复完整TPC-H。
+
 ## Index Join接入并行哈希聚合（2026-10-25）
 
 参照DuckDB Join输出批次直接进入聚合sink的路径，移除PG计划转换中排除Index Join输入的旧限制；复用现有列输入、共享分组状态、满表接续和spill。Q4保留PG索引连接，将排序从匹配明细移到分组结果之后，worker可以经既有callback连续推进，无需按每批明细返回协调端。

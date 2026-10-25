@@ -90,13 +90,14 @@ static void check(function build,function probe,function close,function source,i
     if(retained_window) heap_window(&control,test_slot,heap[retained_window==2?1:0],retained_window==2?1:0,retained_window==2?1:large_index?256:2);
     void *args[]={c,&p,&task,&control,out,io}; long long sizes[]={len[0],sizeof(p),sizeof(task),sizeof(control),qs_chunk_bytes(256,3),io_bytes};
     a=(struct femu_csd_args){.numr=6,.mr_addr=args,.mr_len=sizes};
-    unsigned resumes=0; int failed=0;
+    unsigned resumes=0,root_reads=0,heap_reads=0; int failed=0;
     do {
         int64_t value=probe(&a);
         if(value) { assert(cancel==2 && value==-2); failed=1; break; }
         if(cancel==1) break;
         for(unsigned i=0;i<task.index_nreads;++i) {
             const struct qs_index_read *r=&task.index_reads[i];
+            root_reads+=!r->heap && r->block==1; heap_reads+=r->heap!=0;
             if(retained_window) assert(!r->heap || (retained_window==2 && r->block==0));
             assert(r->slot<QS_INDEX_CACHE && r->block<(r->heap?(large_index?256:2):4));
             unsigned char *dest=(void *)((char *)io+QS_SORT_IO_BYTES+(size_t)r->slot*QS_PAGE);
@@ -106,6 +107,12 @@ static void check(function build,function probe,function close,function source,i
         assert(++resumes<5000);
     } while(task.index_pending);
     assert(cancel!=2 || failed);
+    if(large_index && !cancel && !retained_window) {
+        /* More heap pages than cache slots, but the root is reused every
+         * lookup batch and must stay resident across those streaming reads. */
+        assert(root_reads==1);
+        printf("index cache: filtered=%d root_reads=%u heap_reads=%u resumes=%u\n",filtered,root_reads,heap_reads,resumes);
+    }
     struct qs_group group={.count=1,.states={task.state}};
     struct qs_result *result=calloc(1,sizeof(*result));
     void *sm[]={&group,result}; long long sl[]={sizeof(group),sizeof(*result)};
