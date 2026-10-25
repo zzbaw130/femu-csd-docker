@@ -81,6 +81,7 @@ struct external_hash {
     unsigned phase,partition,direct;
 };
 struct accumulator { struct qs_cell sum,extreme,last; uint64_t count; int has_last; };
+/* sum holds the total for SUM/AVG, or the selected value for MIN/MAX. */
 struct group_value { struct qs_cell sum; uint64_t count; };
 struct compact_group { int64_t key; atomic_uint occupied; struct group_value values[]; };
 struct set_key { int64_t value; unsigned occupied; };
@@ -1514,6 +1515,17 @@ static int group_add(struct group_value *g,struct qs_cell v,uint64_t count,unsig
     }
     return __builtin_add_overflow(g->count,count,&g->count)?-5:0;
 }
+static int group_update(struct execution *s,const struct qp_node *n,unsigned aggregate,
+    struct group_value *g,struct qs_cell value,uint64_t count)
+{
+    const struct qs_agg *a=&n->expr.aggs[aggregate];
+    if(count && (a->kind==Q_MIN || a->kind==Q_MAX)) {
+        int cmp=g->count?compare_cell(s,value,g->sum,n->expr.exprs[a->expr].type):0;
+        if(cmp==INT_MIN) return -5;
+        if(!g->count || (a->kind==Q_MIN?cmp<0:cmp>0)) g->sum=value;
+    }
+    return group_add(g,value,count,a->kind);
+}
 static struct compact_group *group_at(struct operator_state *o,unsigned slot)
 { return (void *)((unsigned char *)o->groups+(size_t)slot*o->group_stride); }
 static void group_keys(const struct qp_node *n,const struct operator_state *o,const struct compact_group *g,struct qs_cell *keys)
@@ -1630,7 +1642,7 @@ retry_bucket:
         }
         int status=0;
         for(unsigned a=0;a<n->expr.naggs && !status;++a)
-            status=group_add(&g->values[a],values[a].sum,values[a].count,n->expr.aggs[a].kind);
+            status=group_update(s,n,a,&g->values[a],values[a].sum,values[a].count);
         atomic_store_explicit(&g->occupied,occupied,shared?memory_order_release:memory_order_relaxed);
         return status?status:1;
     }
@@ -1705,7 +1717,7 @@ static int group_sink_vectors(struct execution *s,unsigned id,struct qs_result *
                     int index=b->group_values[a]; if(b->vectors[index].errors[end]) return -5;
                     value=qs_vector_cell(&b->plan,b->vectors,index,end);
                 }
-                int status=group_add(&partial[a],value,!value.isnull,n->expr.aggs[a].kind); if(status) return status;
+                int status=group_update(s,n,a,&partial[a],value,!value.isnull); if(status) return status;
             }
             ++end;
         } while(combine && end<b->count && end-first<capacity-out->rows);
@@ -1738,7 +1750,7 @@ static int group_sink_batch(struct execution *s,struct qs_result *out)
     out->rows=kept; return 0;
 }
 /* Retain the compact integer-key path. Other keys add only their actual cell
- * count and grow from a small table; spill SUM/count states, never raw rows. */
+ * count and grow from a small table; spill value/count states, never raw rows. */
 static size_t group_reserve(const struct execution *s,const struct qp_node *n)
 {
     size_t reserve=2*s->sort_limit;
@@ -1850,6 +1862,8 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
                 columns[k]=k; partial.outputs[k]=s->plan->nodes[n->left].expr.outputs[n->left_keys[k]];
             }
             for(unsigned a=0;a<n->expr.naggs;++a) {
+                /* Internal values, including canonical text IDs, stay cells;
+                 * final output alone converts string IDs to exported text. */
                 partial.outputs[n->nkeys+2*a].type_oid=1700;
                 partial.outputs[n->nkeys+2*a+1].type_oid=20;
             }
@@ -1887,7 +1901,7 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
             }
             cs_work_free(s->context,o->groups); o->groups=NULL; o->finished=1; return 0;
         }
-        /* Merge partial SUM/count pairs; AVG is divided only for final output. */
+        /* Merge partial value/count pairs; AVG is divided only for final output. */
         if(!o->have_right && !o->group_ready) {
             if((s->pending_sort==sort || sort->position==sort->output->rows) && !sort->drained) {
                 int64_t status=sort_call(s,sort,1); if(status) return status;
@@ -1910,7 +1924,7 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
         int equal=o->have_right?group_equal(s,n,o->right,o->keys):0; if(equal<0) return equal;
         if(equal) {
             for(unsigned a=0;a<n->expr.naggs;++a) {
-                int status=group_add(&groups[a],o->right[n->nkeys+2*a],o->right[n->nkeys+2*a+1].value,n->expr.aggs[a].kind);
+                int status=group_update(s,n,a,&groups[a],o->right[n->nkeys+2*a],o->right[n->nkeys+2*a+1].value);
                 if(status) return status;
                 o->accum[a].sum=groups[a].sum; o->accum[a].count=groups[a].count;
             }

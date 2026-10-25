@@ -1,6 +1,33 @@
 # 当前性能与未完成项（2026-10-25）
 
-## 当前：多聚合并行哈希分组
+## 当前：MIN/MAX接入并行哈希分组
+
+参照DuckDB MIN/MAX以已见非NULL值保存极值的做法，设备分组状态复用原值/count布局：SUM/AVG保存和，MIN/MAX保存当前极值，count记录非NULL数。局部状态、共享表更新与spill归并调用同一比较逻辑；numeric保留完整值和scale/dscale，文本按字典内容比较，ID保持到最终输出。PG按原分组和连接树选择Hash Group，不为MIN/MAX增加新协议、配置或FDM缓冲。
+
+原生及8/16/64 CU共4项CTest、Guest布局CTest通过；[ASan/UBSan/LeakSanitizer两项检查](../../../../results/extreme-groups/sanitizer-tests.log)通过。测试扩展到五聚合组合，使用组内变化值、负数、全NULL组、反向文本字典ID、增长、4MiB spill、实际预算断言和回收。文本输入采用Heap varlena，验证比较文本内容，而非按字典ID取极值。
+
+PG扩展及pg-sina-plan.so已重编部署。[规范Q2/Q12/Q22冷启动回归](../../../../results/tpch.9Yk79n/timings.csv)均正确、完整卸载且快于同轮host，8 CU / 256MiB workmem / 64MiB FDM不变；本阶段未重复完整TPC-H。
+
+| 查询 | host ms | CSD ms |
+| --- | ---: | ---: |
+| Q2 | 955.920 | 455.572 |
+| Q12 | 2838.675 | 671.009 |
+| Q22 | 724.358 | 295.639 |
+
+Q2将MIN前的明细排序替换为Hash Aggregate，最终SQL排序保留。独立冷启动profile：[原路径](../../../../results/extreme-groups/q2-before.log)、[哈希MIN](../../../../results/extreme-groups/q2-after.log)，均无spill。
+
+| 指标 | 原路径 | 哈希MIN |
+| --- | ---: | ---: |
+| 排序累计CPU（ms） | 65.847 | 1.312 |
+| 聚合输入流水线平均活跃CU | 2.07 | 5.51 |
+| 协调端控制写入次数 | 56 | 16 |
+| CSF累计CPU（ms） | 611.594 | 689.924 |
+| workmem峰值（字节） | 30126448 | 36035504 |
+| 查询树墙钟（ms） | 500.313 | 314.959 |
+
+消除排序和逐批回传改善了并行推进，但哈希更新增加了累计CPU及约5.64MiB workmem；仍远低于256MiB预算，不能称为CPU工作量下降，也不把单次墙钟差值当作固定加速比例。共享分组状态竞争、复杂DISTINCT和跨请求往返仍需优化，文本字典自身的容量/spill限制未解决。
+
+## 多聚合并行哈希分组
 
 参照DuckDB同一分组保存多个聚合状态的布局，设备Hash Aggregate按实际聚合数保存SUM/count；一次定位、锁定分组后更新各聚合。列批次导入各聚合参数，局部合并、扩容、spill和最终归并共用原查询workmem预算。AVG只在最终输出时除以自身非NULL计数，COUNT(列)与COUNT(*)分别计数。单聚合整数键条目仍为64字节；不为每个CU复制完整哈希表。
 
@@ -249,4 +276,4 @@ PG保留原选定Join树，做有语义条件的局部rewrite；SQL程序执行H
 
 字典迁移阶段21项相关设备CTest及Guest布局CTest通过：并发字典增长/重复插入/旧字节视图/失败后读取与回收，预编码ID导入，4MiB总预算spill，NativePlan和8/16/64 CU，表达式、Filter、Scan、聚合、Sort/Hash/Index Join。PG及共享布局涉及的全部设备SO已重新构建部署。
 
-Index右侧投影与Join条件、Merge Join、含MIN/MAX或复杂DISTINCT的分组及排序边界仍有逐行适配；页请求虽可由回调续交，仍需读取元数据和主机extent映射；部分阻塞推进仍依赖协调端。共享字典保留原容量上限，自身尚无spill；真正耗尽预算或上限会返回错误，不能宣称任意大小字符串查询及低内存形态全部覆盖。共享字典串行写入、全链路列化和整体CU利用率仍有优化空间，完整基线22条加速不代表这些基础改造已全部完成。当前证据不要求扩容FDM。
+Index右侧投影与Join条件、Merge Join、复杂DISTINCT和过宽聚合状态及排序边界仍有逐行适配；页请求虽可由回调续交，仍需读取元数据和主机extent映射；部分阻塞推进仍依赖协调端。共享字典保留原容量上限，自身尚无spill；真正耗尽预算或上限会返回错误，不能宣称任意大小字符串查询及低内存形态全部覆盖。共享字典串行写入、全链路列化和整体CU利用率仍有优化空间，完整基线22条加速不代表这些基础改造已全部完成。当前证据不要求扩容FDM。

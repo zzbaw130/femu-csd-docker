@@ -63,14 +63,15 @@ struct qp_control {
     unsigned output_rows, peak_cus;
     struct qs_index_read index_reads[QS_INDEX_READS];
 };
-/* Each spilled group carries its keys and one SUM/count pair per aggregate.
+/* Each spilled group carries its keys and one value/count pair per aggregate.
  * Keep planner eligibility and the device's bounded row format in agreement. */
 static inline int qp_hash_aggregate_supported(const struct qp_node *n)
 {
     if(!n->nkeys || !n->expr.naggs || n->expr.naggs>QS_AGGS || n->nkeys+2*n->expr.naggs>QS_OUT) return 0;
     for(unsigned i=0;i<n->expr.naggs;++i) {
         const struct qs_agg *a=&n->expr.aggs[i];
-        if(a->kind!=Q_COUNT_STAR && ((a->kind!=Q_SUM && a->kind!=Q_AVG && a->kind!=Q_COUNT) || a->expr<0)) return 0;
+        if(a->kind!=Q_COUNT_STAR && ((a->kind!=Q_SUM && a->kind!=Q_AVG && a->kind!=Q_COUNT &&
+            a->kind!=Q_MIN && a->kind!=Q_MAX) || a->expr<0)) return 0;
     }
     return 1;
 }

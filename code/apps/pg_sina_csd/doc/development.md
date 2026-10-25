@@ -495,6 +495,14 @@ NativePlan与8/16/64 CU测试通过，覆盖多层Index/Hash、NULL外连接、�
 
 Q18 customer构建profile墙钟846.351→338.897ms、累计CPU2935.097→1186.894ms；workmem峰值完全相同且无spill，确认改善来自竞争减少。没有改PG/SNIA/FEMU接口、预算或FDM容量。当前普通延迟和原始记录见performance.md，字典spill及其他逐行边界仍未完成。
 
+## MIN/MAX并行哈希分组（2026-10-25）
+
+参考DuckDB MIN/MAX忽略NULL、保留极值并合并部分状态的方式，扩展既有分组值/count状态。SUM/AVG仍累加，MIN/MAX用同一PG比较原语选择极值；局部批次、共享表和spill归并统一调用更新函数。字符串保存查询字典ID，比较文本内容，最终输出才转换为文本，不新增状态布局、SNIA接口或固件SQL语义。私有能力检查允许MIN/MAX与SUM/AVG/COUNT组合，仍受原16列部分状态行宽限制。
+
+五聚合测试使用组内变化的numeric和Heap文本、负值、全NULL组；文本字典ID按反向顺序建立，避免错误的ID比较通过。覆盖增长、4MiB spill、8/16/64 CU、实际预算与资源回收。四项原生/并行CTest、Guest布局及两项ASan/UBSan/LeakSanitizer检查通过。
+
+已部署PG扩展和pg-sina-plan.so，规范Q2/Q12/Q22冷启动均正确、完整卸载且快于同轮host。Q2去掉MIN前排序，profile排序累计CPU65.847→1.312ms、控制写入56→16次、聚合输入平均活跃CU2.07→5.51；哈希更新的累计CPU及workmem峰值有所增加，仍无spill且不超预算。当前记录与边界见performance.md，未重复完整TPC-H。
+
 ## 多聚合并行哈希分组（2026-10-25）
 
 参照DuckDB分组条目内按实际聚合数排列状态的做法，将原固定单SUM/count条目改为分组头、多个SUM/count、必要的分组键。单聚合整数键条目仍为64字节；所有状态、增长的新旧表及spill区都计入原查询workmem。一次定位和短锁更新全部聚合，列批次分别导入参数，COUNT(*)不读取参数，nullable COUNT不累计NULL，AVG只在最终输出时除法。
