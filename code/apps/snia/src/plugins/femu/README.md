@@ -33,7 +33,7 @@ include/csd-graph.h 是设备私有线格式，与 FEMU 同名头保持一致，
 
 设备先复制并验证整批记录，再沿原I/O完成事件队列逐范围读取；描述区可以与目标区重叠，不会影响已复制的后续记录。全部完成后在原CSF上重入，cparam2为本批count。CSF应在自己的workmem状态中记录正在等待namespace读取，入口使用csIsReentry判断并接续；不能把count误当作spill token。不同MR、namespace越界、目标越界、零块或保留字段非零均拒绝。原NEED_STORE/LOAD/FREE含义不变。
 
-现阶段FEMU编译和mock批次协议测试通过，生产Guest尚未切换此固件，PG尚未接入；不能把协议测试当作真实设备I/O时序或查询性能验证。[测试CSF](../../../tests/femu/cs_nvm_read.c)连续两次请求读取，覆盖描述区重叠及非法范围。
+FEMU编译、mock批次协议及真实Guest设备测试通过。PG设备程序已接入映射转换，固件不解析extent；具体查询验证见pg_sina_csd的performance.md。mock不能作为真实设备I/O时序或查询性能验证。[测试CSF](../../../tests/femu/cs_nvm_read.c)连续两次请求读取，覆盖描述区重叠及非法范围。
 
 ## 性能诊断
 

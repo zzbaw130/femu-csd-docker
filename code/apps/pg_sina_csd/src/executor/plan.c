@@ -243,6 +243,16 @@ static void start(PlanStateCsd *s)
     }
     if(!device) elog(ERROR,"CSD PG Plan has no prepared relation");
     pg_sina_read_resources(device);
+    size_t plan_bytes=sizeof(*s->plan);
+    for(unsigned i=0;i<s->plan->count;++i) {
+        const struct qs_request *files[]={&s->files[i],&s->indexes[i]};
+        struct qp_file_mapping *maps[]={&s->plan->files[i],&s->plan->indexes[i]};
+        for(unsigned k=0;k<2;++k) if(files[k]->nextents) {
+            *maps[k]=(struct qp_file_mapping){.offset=plan_bytes,.nsid=files[k]->nsid,
+                .lba_bytes=files[k]->lba_bytes,.count=files[k]->nextents};
+            plan_bytes+=(size_t)files[k]->nextents*sizeof(struct qs_extent);
+        }
+    }
     s->profiling=pg_sina_profile; s->start_ns=clock_ns(); s->load_ns=s->load_calls=0;
     atomic_store(&s->stopping,false);
     s->poll_ns=s->completion_copy_ns=s->submit_ns=s->queue_ns=s->control_write_ns=0;
@@ -272,7 +282,7 @@ static void start(PlanStateCsd *s)
     size_t arena;
     for(;;) {
         arena=layout_buffers(s,indexed);
-        size_t needed=arena+sizeof(*s->plan)+(s->workers+1)*(sizeof(struct qp_control)+sizeof(*s->result)+QS_SORT_IO_BYTES)+65536;
+        size_t needed=arena+plan_bytes+(s->workers+1)*(sizeof(struct qp_control)+sizeof(*s->result)+QS_SORT_IO_BYTES)+65536;
         if(capacity && needed>capacity) {
             if(s->plan->scan_bytes>QP_SCAN_BYTES) { s->plan->scan_bytes/=2; continue; }
             if(s->workers>1) { if(--s->workers==1) s->workers=0; continue; }
@@ -280,13 +290,19 @@ static void start(PlanStateCsd *s)
         break;
     }
     CsMemFlags flags={.FDMId=1};
-    size_t sizes[]={sizeof(*s->plan),(s->workers+1)*sizeof(struct qp_control),(s->workers+1)*sizeof(*s->result),arena,QS_SORT_IO_BYTES};
+    size_t sizes[]={plan_bytes,(s->workers+1)*sizeof(struct qp_control),(s->workers+1)*sizeof(*s->result),arena,QS_SORT_IO_BYTES};
     s->fdm_bytes=s->workers*QS_SORT_IO_BYTES;
     for(unsigned i=0;i<5;++i) s->fdm_bytes+=sizes[i];
     for(unsigned i=0;i<5;++i) checked(csAllocMem(s->device,sizes[i],&flags,&s->memory[i],NULL),"allocate AFDM");
     for(unsigned w=0;w<s->workers;++w)
         checked(csAllocMem(s->device,QS_SORT_IO_BYTES,&flags,&s->worker_io[w],NULL),"allocate worker spill AFDM");
     checked(transfer(s->memory[0],0,s->plan,sizeof(*s->plan),true),"copy plan");
+    for(unsigned i=0;i<s->plan->count;++i) {
+        if(s->plan->files[i].count) checked(transfer(s->memory[0],s->plan->files[i].offset,s->extents[i],
+            (size_t)s->plan->files[i].count*sizeof(struct qs_extent),true),"copy heap mapping");
+        if(s->plan->indexes[i].count) checked(transfer(s->memory[0],s->plan->indexes[i].offset,s->index_extents[i],
+            (size_t)s->plan->indexes[i].count*sizeof(struct qs_extent),true),"copy index mapping");
+    }
     checked(transfer(s->memory[1],0,&s->slots[0].control,sizeof(s->slots[0].control),true),"initialize control");
     struct qs_dict dictionary={.entries=entries,.capacity=entries,.data=data};
     checked(transfer(s->memory[3],0,&dictionary,sizeof(dictionary),true),"initialize strings");

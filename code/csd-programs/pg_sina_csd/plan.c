@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <endian.h>
 
 extern int64_t pg_sina_scan_impl(struct femu_csd_args *);
 extern int64_t pg_sina_filter_impl(struct femu_csd_args *);
@@ -152,6 +153,7 @@ struct execution {
     struct spool *pending_spool;
     unsigned pending_block;
     int pending_store;
+    unsigned pending_nvm;
     struct qs_metrics metrics;
     struct qs_profile profile;
     uint64_t local_profile_cpu, pipeline_start, pipeline_tick;
@@ -2545,6 +2547,72 @@ int64_t pg_sina_workmem_capacity(struct femu_csd_args *a)
  * NEED_STORE/LOAD is handled entirely by the existing SNIA batch scheduler. */
 static void *dictionary_allocate(void *context,size_t bytes)
 { return cs_work_alloc(context,bytes); }
+/* Translate this SQL program's immutable file mapping into generic device
+ * reads. Neither FEMU nor SNIA sees the file/extent interpretation. */
+static int namespace_ranges(struct execution *s,const struct qp_file_mapping *map,
+    uint64_t at,uint64_t bytes,uint64_t target,unsigned *count)
+{
+    if(!map->count) return 0;
+    if(!map->nsid || !map->lba_bytes || map->reserved || map->offset<sizeof(*s->plan) ||
+       map->offset>(uint64_t)s->args->mr_len[0] ||
+       map->count>((uint64_t)s->args->mr_len[0]-map->offset)/sizeof(struct qs_extent) ||
+       bytes>UINT64_MAX-at) return -1;
+    const struct qs_extent *extents=(void *)((unsigned char *)s->plan+map->offset);
+    struct femu_graph_read *reads=s->io;
+    unsigned lo=0,hi=map->count;
+    while(lo<hi) {
+        unsigned mid=lo+(hi-lo)/2;
+        if(extents[mid].logical+extents[mid].bytes<=at) lo=mid+1; else hi=mid;
+    }
+    uint64_t end=at+bytes;
+    for(unsigned i=lo;i<map->count && at<end;++i) {
+        const struct qs_extent *e=&extents[i];
+        if(e->logical>at || e->bytes>UINT64_MAX-e->logical) return -1;
+        uint64_t n=end<e->logical+e->bytes?end-at:e->logical+e->bytes-at;
+        if(!n || (at-e->logical)%map->lba_bytes || n%map->lba_bytes || n/map->lba_bytes>UINT32_MAX) return -1;
+        uint64_t lba=e->lba+(at-e->logical)/map->lba_bytes;
+        struct femu_graph_read *last=*count?&reads[*count-1]:NULL;
+        if(last && le32toh(last->nsid)==map->nsid &&
+            le64toh(last->lba)+le32toh(last->blocks)==lba &&
+            le64toh(last->offset)+(uint64_t)le32toh(last->blocks)*map->lba_bytes==target &&
+            n/map->lba_bytes<=UINT32_MAX-le32toh(last->blocks))
+            last->blocks=htole32(le32toh(last->blocks)+n/map->lba_bytes);
+        else {
+            if(*count==FEMU_CSD_GRAPH_MAX_NODES) return 0;
+            reads[(*count)++]=(struct femu_graph_read){.nsid=htole32(map->nsid),.blocks=htole32(n/map->lba_bytes),
+                .afdm_index=htole32(3),.lba=htole64(lba),.offset=htole64(target)};
+        }
+        at+=n; target+=n;
+    }
+    return at==end?1:-1;
+}
+static int64_t namespace_wait(struct execution *s)
+{
+    struct qp_control *c=s->control;
+    if(c->ready || (!c->bytes && !c->index_nreads)) return 0;
+    if(c->node>=s->plan->count) return -1;
+    const struct qp_node *n=&s->plan->nodes[c->node];
+    unsigned count=0; int status;
+    if(c->index_nreads) {
+        if(c->index_nreads>QS_INDEX_READS || (n->kind!=QP_INDEX_JOIN && !n->ordered_index)) return -1;
+        unsigned leaf=n->ordered_index?c->node:(unsigned)n->right;
+        if(leaf>=s->plan->count) return -1;
+        for(unsigned i=0;i<c->index_nreads;++i) {
+            const struct qs_index_read *r=&c->index_reads[i];
+            if(r->heap>1 || r->slot>=QS_INDEX_CACHE) return -1;
+            const struct qp_file_mapping *map=r->heap?&s->plan->files[leaf]:&s->plan->indexes[leaf];
+            status=namespace_ranges(s,map,(uint64_t)r->block*QS_PAGE,QS_PAGE,
+                input_offset(s,n)+QS_SORT_IO_BYTES+(size_t)r->slot*QS_PAGE,&count);
+            if(status<=0) return status;
+        }
+    } else {
+        status=namespace_ranges(s,&s->plan->files[c->node],c->offset,c->bytes,input_offset(s,n),&count);
+        if(status<=0) return status;
+    }
+    s->pending_nvm=count;
+    return csNeedNvmRead(count);
+}
+
 int64_t pg_sina_plan(struct femu_csd_args *a)
 {
     if(!a || a->numr!=5 || a->mr_len[0]<(long long)sizeof(struct qp_plan) ||
@@ -2610,6 +2678,10 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
     /* SNIA may invoke us repeatedly inside one batch submission for spill.
      * PG only observes completion once, so retain all consumed-buffer bits. */
     if(!csIsReentry(a)) control->drained=0;
+    if(s->pending_nvm) {
+        if(!csIsReentry(a) || csReentryValue(a)!=s->pending_nvm) return -1;
+        s->pending_nvm=0; control->ready=1;
+    }
     if(s->pending_spool) {
         if(!csIsReentry(a)) return -1;
         struct spool *p=s->pending_spool;
@@ -2716,6 +2788,9 @@ produced:
         /* A direct sink can consume another output batch from the same input
          * without asking PG to submit another compute request. */
         if(s->host_scan && !out->rows && status==2) goto produce;
+    }
+    if(status==QP_WAIT) {
+        int64_t request=namespace_wait(s); if(request) status=request;
     }
     if(s->profiling) {
         struct qs_timing *t=&s->profile.operators[QS_JOIN_PROBE];

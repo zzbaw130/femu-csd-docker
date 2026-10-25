@@ -11,8 +11,9 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+#include <endian.h>
 typedef int64_t (*function)(struct femu_csd_args *);
-enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_INDEX_PIPELINE,TEST_INDEX_HASH,TEST_INDEX_CHAIN,TEST_INDEX_EXPR,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL, TEST_VECTOR_AGG=-1 };
+enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_INDEX_PIPELINE,TEST_INDEX_HASH,TEST_INDEX_CHAIN,TEST_INDEX_EXPR,TEST_DEVICE_IO,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL, TEST_VECTOR_AGG=-1 };
 static unsigned test_workers=4;
 static bool test_scheduled;
 /* Reservations must cover physical input even when filters/NDV estimates
@@ -143,6 +144,70 @@ struct probe_test {
     bool *need_input;
     unsigned scan_node;
 };
+/* Independent linear physical-range oracle; source extents deliberately use
+ * separated LBAs above 32 bits and split the first Heap page in half. */
+static void namespace_read(struct femu_csd_args *a,unsigned count,const unsigned char *left,
+    const unsigned char *right,const unsigned char *index)
+{
+    struct qp_plan *p=a->mr_addr[0]; struct femu_graph_read reads[FEMU_CSD_GRAPH_MAX_NODES];
+    assert(count && count<=FEMU_CSD_GRAPH_MAX_NODES);
+    memcpy(reads,a->mr_addr[4],count*sizeof(*reads));
+    for(unsigned r=0;r<count;++r) {
+        struct femu_graph_read *read=&reads[r]; unsigned found=0;
+        uint64_t lba=le64toh(read->lba),bytes=(uint64_t)le32toh(read->blocks)*512,offset=le64toh(read->offset);
+        assert(le32toh(read->nsid)==1 && le32toh(read->afdm_index)==3 &&
+            offset<=(uint64_t)a->mr_len[3] && bytes<=(uint64_t)a->mr_len[3]-offset);
+        for(unsigned n=2;n<4;++n) for(unsigned k=0;k<2;++k) {
+            const struct qp_file_mapping *map=k?&p->indexes[n]:&p->files[n];
+            const struct qs_extent *extents=(void *)((unsigned char *)p+map->offset);
+            for(unsigned e=0;e<map->count;++e) if(lba>=extents[e].lba &&
+                lba-extents[e].lba<=extents[e].bytes/512 && bytes<=extents[e].bytes-(lba-extents[e].lba)*512) {
+                const unsigned char *source=k?index:n==2?left:right;
+                memcpy((unsigned char *)a->mr_addr[3]+offset,source+extents[e].logical+(lba-extents[e].lba)*512,bytes);
+                ++found;
+            }
+        }
+        assert(found==1);
+    }
+    a->cparam2=count;
+}
+static void namespace_reentry(function run)
+{
+    size_t plan_bytes=sizeof(struct qp_plan)+sizeof(struct qs_extent),raw_bytes;
+    struct qp_plan *p=calloc(1,plan_bytes); assert(p);
+    p->count=1; p->scan_bytes=QP_SCAN_BYTES; scan(&p->nodes[0]);
+    struct qp_node *n=&p->nodes[0]; n->bytes=QS_PAGE; n->expr.work_mem_bytes=4U*1024*1024;
+    n->input_offset=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
+    n->vector_offset=n->input_offset+QP_SCAN_BYTES;
+    p->files[0]=(struct qp_file_mapping){.offset=sizeof(*p),.nsid=1,.lba_bytes=512,.count=1};
+    *(struct qs_extent *)(p+1)=(struct qs_extent){.lba=4096,.bytes=QS_PAGE};
+    size_t arena_bytes=n->vector_offset+qs_chunk_bytes(QS_PAGE/24,2);
+    unsigned char *raw=heap(1,2,&raw_bytes),*arena=calloc(1,arena_bytes),*io=calloc(1,QS_SORT_IO_BYTES);
+    struct qs_result *out=calloc(1,sizeof(*out)); assert(arena && io && out);
+    struct qp_control c={0};
+    void *mr[]={p,&c,out,arena,io};
+    long long len[]={plan_bytes,sizeof(c),sizeof(*out),arena_bytes,QS_SORT_IO_BYTES};
+    for(unsigned trial=0;trial<3;++trial) {
+        c=(struct qp_control){0}; memset(out,0,sizeof(*out));
+        *(struct qs_dict *)arena=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
+        *(struct qs_chunk *)(arena+n->vector_offset)=(struct qs_chunk){.capacity=QS_PAGE/24,.ncols=2};
+        struct femu_csd_args a={.numr=5,.mr_addr=mr,.mr_len=len};
+        assert((uint64_t)run(&a)==(CS_NEED_NVM_READ|1));
+        const struct femu_graph_read *read=(void *)io;
+        assert(le64toh(read->lba)==4096 && le32toh(read->blocks)==QS_PAGE/512 &&
+            le32toh(read->afdm_index)==3 && le64toh(read->offset)==n->input_offset);
+        if(trial==1) {
+            a.cparam2=2; assert(run(&a)==-1); /* mismatched completion */
+        } else if(trial==2) {
+            memcpy(arena+n->input_offset,raw,raw_bytes); a.cparam2=1;
+            assert(!run(&a) && out->finished && out->rows==1 &&
+                out->data[0].cells[0].value==0 && out->data[0].cells[1].value==-498);
+        }
+        c.close=1; a.cparam2=0; assert(!run(&a));
+        struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
+    }
+    free(raw); free(arena); free(io); free(out); free(p);
+}
 static void *probe_worker(void *arg)
 {
     struct probe_test *t=arg;
@@ -163,7 +228,8 @@ static void *probe_worker(void *arg)
             memcpy(t->arena+input,((t->scan_node-1==3 || t->scan_node-1==6)?t->heap:t->raw)+offset,bytes);
             t->args.cparam1|=QP_SCAN_INPUT | ((offset/QS_PAGE)<<QP_SCAN_PAGE_SHIFT);
             *t->need_input=false;
-        } else if(!t->next_offset && (c->index_nreads || c->bytes) && !c->ready) {
+        } else if(!t->next_offset && !csIsReentry(&t->args) && (c->index_nreads || c->bytes) && !c->ready) {
+            assert(!t->plan->files[2].count); /* mapped workers must continue without host LOADs */
             const struct qp_node *n=&t->plan->nodes[c->node];
             size_t offset=t->worker>1?n->parallel_input+(t->worker-2)*t->plan->parallel_stride:n->input_offset;
             if(c->index_nreads) {
@@ -185,6 +251,7 @@ static void *probe_worker(void *arg)
         assert(status>=0);
         if((uint64_t)status>>60) {
             uint64_t op=(uint64_t)status>>60,id=(uint64_t)status&CS_IO_VALUE_MASK;
+            if(op==4) { namespace_read(&t->args,id,t->raw,t->heap,t->index); continue; }
             assert(op==2 && id && id<=t->ntokens && t->tokens[id-1]);
             memcpy(t->args.mr_addr[4],t->tokens[id-1],QS_SORT_IO_BYTES);
             t->args.cparam2=id; continue;
@@ -379,7 +446,21 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     struct qs_result *out=calloc(plan->workers+1,sizeof(*out)); assert(out);
     for(unsigned w=0;w<plan->workers;++w)
         *(struct qs_chunk *)(arena+plan->nodes[2].parallel_vector+w*plan->parallel_stride)=(struct qs_chunk){.capacity=plan->scan_bytes/24,.ncols=2};
-    void *mr[]={plan,&control,out,arena,io}; long long len[]={sizeof(*plan),(plan->workers+1)*sizeof(*controls),(plan->workers+1)*sizeof(*out),bytes,(plan->workers+1)*QS_SORT_IO_BYTES};
+    size_t plan_bytes=sizeof(*plan);
+    if(parallel==TEST_DEVICE_IO) {
+        plan=realloc(plan,plan_bytes+5*sizeof(struct qs_extent)); assert(plan);
+        for(unsigned i=2;i<4;++i) {
+            struct qp_file_mapping *map=&plan->files[i];
+            *map=(struct qp_file_mapping){.offset=plan_bytes,.nsid=1,.lba_bytes=512,.count=2};
+            struct qs_extent *e=(void *)((unsigned char *)plan+plan_bytes); plan_bytes+=2*sizeof(*e);
+            e[0]=(struct qs_extent){.logical=0,.lba=i*100000,.bytes=QS_PAGE/2};
+            e[1]=(struct qs_extent){.logical=QS_PAGE/2,.lba=UINT64_C(0x100000000)+i*100000,.bytes=plan->nodes[i].bytes-QS_PAGE/2};
+        }
+        plan->indexes[3]=(struct qp_file_mapping){.offset=plan_bytes,.nsid=1,.lba_bytes=512,.count=1};
+        *(struct qs_extent *)((unsigned char *)plan+plan_bytes)=(struct qs_extent){.lba=UINT64_C(0x200000000),.bytes=2*QS_PAGE};
+        plan_bytes+=sizeof(struct qs_extent);
+    }
+    void *mr[]={plan,&control,out,arena,io}; long long len[]={plan_bytes,(plan->workers+1)*sizeof(*controls),(plan->workers+1)*sizeof(*out),bytes,(plan->workers+1)*QS_SORT_IO_BYTES};
     struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=len};
     args.cparam1=parallel==TEST_PARALLEL || parallel==TEST_BUILD_PHASE || parallel==TEST_HASH_GROUP || parallel==TEST_PARTITION || parallel==TEST_PARTITION_SKEW;
     void **tokens=NULL; size_t ntokens=0; unsigned got=0; unsigned char seen[12]={0};
@@ -437,6 +518,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         if(status<0) { fprintf(stderr,"native plan status=%lld join=%u row=%u state=%llu\n",(long long)status,join,rows,(unsigned long long)control.state); abort(); }
         uint64_t op=(uint64_t)status>>60,id=(uint64_t)status&CS_IO_VALUE_MASK;
         if(op) {
+            if(op==4) { namespace_read(&args,id,raw[0],raw[1],index); continue; }
             if(op==1) { tokens=realloc(tokens,(ntokens+1)*sizeof(*tokens)); assert(tokens); tokens[ntokens]=malloc(id); assert(tokens[ntokens]); memcpy(tokens[ntokens],io,id); args.cparam2=++ntokens; }
             else if(op==2) { assert(id && id<=ntokens && tokens[id-1]); memcpy(io,tokens[id-1],QS_SORT_IO_BYTES); args.cparam2=id; }
             else { assert(op==3 && id && id<=ntokens && tokens[id-1]); free(tokens[id-1]); tokens[id-1]=NULL; args.cparam2=id; }
@@ -468,6 +550,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             }
         }
         if(control.index_nreads && !control.ready) {
+            assert(parallel!=TEST_DEVICE_IO);
             assert(hash==2 && control.node==1);
             for(unsigned i=0;i<control.index_nreads;++i) {
                 struct qs_index_read *r=&control.index_reads[i];
@@ -477,12 +560,14 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             }
             args.cparam1|=QP_PAGES_INPUT;
         } else if(control.bytes && !control.ready) {
+            assert(parallel!=TEST_DEVICE_IO);
             assert((control.node>=2 && control.node<4) || control.node==6);
             struct qp_node *n=&plan->nodes[control.node];
             memcpy(arena+n->input_offset,raw[control.node==2?0:1]+control.offset,control.bytes); control.ready=1;
         }
     }
     if(hash==2 && memory==4 && parallel==TEST_SERIAL) assert(ntokens); /* page-ready flag survives spill reentry */
+    if(parallel==TEST_DEVICE_IO && memory==4) assert(ntokens); /* namespace and spill reentry share one CU I/O AFDM */
     if(test_workers>4 && parallel) assert(out->metrics.workers==test_workers && control.epoch);
     assert(got); if(parallel!=TEST_COUNT_ROWS && parallel<TEST_PARTITION) for(unsigned i=0;i<12;++i) assert(!seen[i]);
     if(args.cparam1&1) {
@@ -1187,6 +1272,7 @@ int main(int argc,char **argv)
         test(run,QP_LEFT,20003,23,256,1,TEST_HASH_GROUP);
         test(run,QP_LEFT,20003,23,256,2,TEST_HASH_GROUP);
         test(run,QP_LEFT,20003,23,256,2,TEST_INDEX_EXPR);
+        test(run,QP_LEFT,20003,23,256,2,TEST_DEVICE_IO);
         multiple_groups(run,256,Q_SUM,0,test_workers);
         multiple_groups(run,256,Q_AVG,1,test_workers);
         multiple_groups(run,256,Q_COUNT,0,test_workers);
@@ -1204,6 +1290,7 @@ int main(int argc,char **argv)
     probe_payload(run,1,0,1); probe_payload(run,2,0,1); grouped_probe(run);
     probe_payload(run,2,0,2);
     probe_payload(run,2,0,3);
+    namespace_reentry(run);
     for(int joined=0;joined<2;++joined) {
         parameter_projection(run,joined,0,0);
         parameter_projection(run,joined,1,0);
@@ -1244,6 +1331,7 @@ int main(int argc,char **argv)
     test(run,QP_LEFT,20003,23,4,2,TEST_HASH_GROUP);
     test(run,QP_INNER,20003,23,4,2,TEST_INDEX_EXPR);
     test(run,QP_LEFT,20003,23,64,2,TEST_INDEX_EXPR);
+    test(run,QP_LEFT,20003,23,4,2,TEST_DEVICE_IO);
     test(run,QP_INNER,120000,23,8,1,TEST_PARALLEL);
     test(run,QP_INNER,120000,23,8,1,TEST_LARGE_SCAN);
     test(run,QP_INNER,5170,23,64,1,TEST_COUNT_ROWS);

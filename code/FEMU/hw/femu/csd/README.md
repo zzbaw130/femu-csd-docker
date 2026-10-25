@@ -68,7 +68,7 @@ header 后紧跟 count 个 node，其后存放 MR、I/O range 和附加字节。
 3. 入口通过 csIsReentry 判断、csReentryValue 取得 token。自己的工作内存保存 pending 操作，知道这次确认的是哪一步。
 4. 需要写出时返回 csNeedStore(bytes)。设备分配隐藏区段、写入最后一个 MR 的指定字节；完成后令 cparam2=新 token，重新排队调用同一入口。
 5. 返回 csNeedLoad(token) 时，设备读取创建时记录的精确字节数；csNeedFree(token) 时回收映射。两者完成后均以 cparam2=原 token 重入。其余 MR、cparam1、data_buffer 保持原内容。
-6. 普通非负完成值结束节点，负值表示执行失败。高4位为1/2/3的结果保留给 NEED_*，低60位表示长度或 token。这不是新增 CS_STATUS。
+6. 普通非负完成值结束节点，负值表示执行失败。高4位为1/2/3/4的结果保留给 NEED_*，低60位表示长度、token或请求数量。这不是新增 CS_STATUS。
 
 ```text
 EXEC(sort_sink)
@@ -80,6 +80,8 @@ EXEC(sort_sink)
 ```
 
 token 只表示隐藏区段，不包含算子的 run 列表或 workmem 状态。成功图保留 token；显式 FREE、图失败回收或关闭会话释放。算子私有工作内存仍由算子清理入口释放，设备不知道其内部结构。单独原生 E1 或 SNIA csQueueComputeRequest 保持单次执行行为，只有设备图自动处理内部重入。
+
+CSF也可在最后一个MR开头写入1～64个小端femu_graph_read记录，返回csNeedNvmRead(count)（高4位为4）。记录指定当前namespace的LBA/块数，以及本次调用的目标MR下标和字节偏移。设备先复制并验证整批描述，再通过既有FTL/AFDM复制及I/O完成事件逐范围读取；全部完成后以cparam2=count重入原CSF。描述区可以与目标区重叠，未通过验证不会发起部分读取。这里只处理物理范围，不认识文件、extent或SQL；与隐藏spill token互不混淆，CSF须自行记录正在等待哪类I/O。
 
 ## 隐藏空间配置
 

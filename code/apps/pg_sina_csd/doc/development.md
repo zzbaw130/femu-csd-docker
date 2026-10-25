@@ -525,11 +525,21 @@ spill行保存分组键及各聚合的SUM/count，沿用原有排序归并、重
 
 新增Hash Join文本输出用例检查CASE抑制负长度分支、NULL、LIMIT错误时机和清理；NativePlan及8/16/64 CU共4项CTest通过。已重编部署pg-sina-plan.so，规范Q7/Q13/Q22冷启动均结果正确、完整卸载且快于同轮host。Q22 profile累计CPU未明显下降，不以接续覆盖代替性能收益证明；Index右侧谓词、多聚合分组和跨请求推进仍未完成。本阶段未重复完整22条，当前记录见performance.md。
 
+## 设备图自主namespace读取：PG接入与部署（2026-10-25）
+
+PG把原已准备并覆盖验证过的Heap/Index extent数组附在计划输入AFDM之后，布局计算计入映射字节，不增加FDM容量。设备SQL程序二分定位相交extent，将原页请求转成通用namespace读取记录；读取完成后在原workmem状态接续，保留列批次、索引游标和并行sink。连续源/目标合并后至多64个物理范围的请求可在设备内完成，缺少映射或过碎范围仍保留原主机LOAD路径。固件与SNIA不解释文件映射。私有qp_plan布局已变化，PG扩展与相关设备SO必须一起重新构建部署。
+
+本机PG12.22扩展构建、布局CTest及设备NativePlan/8/16/64 CU四项回归通过。映射用例覆盖超过32位LBA、第一页跨extent、无宿主LOAD续交、4MiB实际spill与namespace重入交替；补充正常读取后输出、错误完成值拒绝、读取未完成即关闭及workmem回收检查，NativePlan再次通过。
+
+ASan/UBSan/LeakSanitizer两项检查已通过。保存停库数据快照后切换新固件、配套部署PG/SO并恢复原数据库，八张表重新prepare及映射检查通过。真实设备测试验证连续两次内部读取、描述区重叠及六类非法范围拒绝，结果与裸namespace读取一致。Q21取消后同一连接恢复执行，完整结果与host一致。
+
+完整规范22条逐查询冷启动验收均结果一致、完整卸载且快于host，资源为8 CU / 256MiB workmem / 64MiB FDM。总时间54343.477→16212.109ms。同一数据的Q21映射开/关各三轮profile中位数947.836→812.689ms，主机LOAD及callback续交均降为0；平均活跃CU为3.63，不宣称满载8CU。临时对照构建及测试SQL已清理，生产使用当前实现。原始成绩和剩余边界见performance.md；全链路向量化及通用I/O推进仍有未完成项，总目标保持进行中。
+
 ## 设备图自主namespace读取：协议实现（2026-10-25）
 
 为消除索引页请求返回PG再提交的边界，先补齐通用CSF请求namespace读取的设备能力。CSF将物理NVM范围和目标MR/偏移写入最后一个MR，返回csNeedNvmRead(count)；设备复制、验证整批记录，经既有FTL、AFDM复制和I/O完成事件继续执行，完成后用cparam2=count重入同一CSF。它不识别表、extent或SQL，不改SNIA标准API、原spill token含义或femu_csd_args布局。描述快照允许读取覆盖描述区，验证全部通过后才发起I/O；MR和namespace越界、零块和保留字段错误会失败。
 
-FEMU已在容器实际源码目录编译通过，SNIA相关6项CTest通过，覆盖两次设备重入、描述区重叠、非法范围、失败后的内存释放及线格式副本一致性。mock仅验证协议，不证明真实固件执行或时序。生产Guest仍运行此前固件，PG尚未传入extent映射或接入该请求；下一阶段需部署并验证实际设备，再减少PG续交。尚无新的TPC-H成绩，不将此阶段视为往返瓶颈已解决，也未扩大FDM。
+FEMU在容器实际源码目录编译通过，SNIA相关6项CTest通过，覆盖两次设备重入、描述区重叠、非法范围、失败后的内存释放及线格式副本一致性。mock仅验证协议；真实固件部署、PG接入与查询验证已由上一节完成，不把mock计时当作设备性能，也未扩大FDM。
 
 ## PG页请求构建（2026-10-25）
 

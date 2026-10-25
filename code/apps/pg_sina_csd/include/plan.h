@@ -40,6 +40,12 @@ struct qp_pipeline_profile {
     /* Shared Hash/aggregate sink work is a subset of worker_ns. */
     uint64_t sink_ns,sink_rows;
 };
+/* PG appends immutable extent arrays after qp_plan in its input AFDM.
+ * Offsets are relative to that AFDM; only the SQL program interprets them. */
+struct qp_file_mapping {
+    uint64_t offset;
+    uint32_t nsid,lba_bytes,count,reserved;
+};
 struct qp_plan {
     unsigned count, root, nparams, ninit;
     unsigned workers, scan_bytes;
@@ -47,6 +53,7 @@ struct qp_plan {
     int param_nodes[QP_PARAMS],cte_nodes[QP_PARAMS],init_nodes[QP_PARAMS],init_params[QP_PARAMS];
     struct qp_node nodes[QP_NODES];
     struct qp_pipeline_profile pipelines[QP_NODES];
+    struct qp_file_mapping files[QP_NODES],indexes[QP_NODES];
 };
 /* Only page addresses and lifecycle state cross to PG during execution. */
 struct qp_control {
