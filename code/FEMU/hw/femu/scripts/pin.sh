@@ -4,8 +4,9 @@
 # Pin a running FEMU VM's threads to host CPUs, one thread per CPU: the vCPUs
 # first, then FEMU's pollers and FTL threads (femu-poller, FEMU-FTL-Thread, and
 # for a CXL SSD femu-cxl-ftl and femu-cxl-cca), starting at FIRST_CPU. The
-# other QEMU threads (main loop, I/O, CSD compute units) go to the CPUs after
-# those.
+# other QEMU threads (main loop, I/O) go to the CPUs after those. In CSD mode,
+# group compute units with the poller/FTL first, then vCPUs. Choose FIRST_CPU
+# so the device group fits one NUMA node; consecutive IDs are host-dependent.
 #
 # Threads are found by name, which Linux shows only when QEMU runs with
 # -name NAME,debug-threads=on (the run-*.sh launchers pass it). The pollers
@@ -44,7 +45,7 @@ vcpus=$(ps -T -p "$pid" -o tid=,comm= |
         sort -n | awk '{print $2}')
 femu=$(ps -T -p "$pid" -o tid=,comm= |
        awk '$2 == "femu-poller" || $2 == "FEMU-FTL-Thread" ||
-            $2 == "femu-cxl-ftl" || $2 == "femu-cxl-cca" {print $1}')
+            $2 == "femu-csd-cu" || $2 == "femu-cxl-ftl" || $2 == "femu-cxl-cca" {print $1}')
 
 [[ -n $vcpus ]] ||
     die "no 'CPU N/...' threads in $pid; start QEMU with -name NAME,debug-threads=on"
@@ -69,7 +70,11 @@ else
 fi
 
 cpu=$first
-for tid in "${vcpu_tids[@]}" "${femu_tids[@]}"; do
+ordered_tids=("${vcpu_tids[@]}" "${femu_tids[@]}")
+if ps -T -p "$pid" -o comm= | awk '$1 == "femu-csd-cu" {f = 1} END {exit !f}'; then
+    ordered_tids=("${femu_tids[@]}" "${vcpu_tids[@]}")
+fi
+for tid in "${ordered_tids[@]}"; do
     "${sudo[@]}" taskset -pc "$cpu" "$tid" > /dev/null
     echo "$(cat "/proc/$pid/task/$tid/comm") (tid $tid) -> CPU $cpu"
     cpu=$(( cpu + 1 ))

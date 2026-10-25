@@ -6,6 +6,8 @@ SNIA 应用仍包含 `cs.h`、链接 `-lsnia`。Guest 中的 FEMU 插件将纯�
 
 ## 执行流程
 
+手动测试CPU亲和性时，可使用同级`scripts/pin.sh`：`QEMU_PID=<pid> bash pin.sh <FIRST_CPU>`。CSD模式会先依次绑定CU、FTL和poller，再绑定Guest vCPU，其余QEMU线程使用剩余CPU。应先查看宿主CPU/NUMA拓扑，选择能容纳设备线程组的起点；连续CPU编号不保证属于同一NUMA节点。脚本不在启动时自动执行，绑核收益需要单独测量。
+
 ```text
 Guest 应用 -> libsnia -> FEMU 插件 -> 一条 E9 EXEC_GRAPH
                                        |
