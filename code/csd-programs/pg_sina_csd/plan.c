@@ -2649,6 +2649,11 @@ restart:
             if(s->nodes[source].group_phase!=3 || !s->nodes[source].groups) {
                 p->nodes[root].parallel=0; return next_row(s,root,row);
             }
+            /* A direct Source has no expensive probe chain to distribute.
+             * Base its task count on real groups, not a large PG estimate. */
+            if(source==(int)root && atomic_load(s->nodes[source].group_count)<QP_VECTOR_ROWS) {
+                p->nodes[root].parallel=0; return next_row(s,root,row);
+            }
         }
         unsigned hash_sink=0,group_sink=0,aggregate_sink=0;
         for(unsigned i=0;i<p->count;++i) {

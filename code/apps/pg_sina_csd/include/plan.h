@@ -157,7 +157,7 @@ static inline void qp_mark_parallel(struct qp_plan *p,int id)
     int source=qp_pipeline_source(p,id); if(source<0) return;
     const struct qp_node *n=&p->nodes[source];
     if((n->kind==QP_SCAN && n->bytes>=4*QP_SCAN_BYTES) ||
-       (source!=id && n->kind==QP_AGGREGATE &&
+       (n->kind==QP_AGGREGATE &&
         (n->estimated_groups>=QP_VECTOR_ROWS || n->estimated_rows>=QP_VECTOR_ROWS))) p->nodes[id].parallel=1;
 }
 /* Mark every independent scan/probe pipeline, including InitPlan scans.
