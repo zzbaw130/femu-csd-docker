@@ -52,6 +52,27 @@ PG把已有Heap/Index extent映射随计划输入一次性上传，设备SQL程�
 
 完整查询正确性与本轮性能指标已达标。总改造仍保留Index单行/SEMI/ANTI、Merge Join、复杂DISTINCT及部分排序边界的逐行适配，以及共享字典容量和通用I/O推进优化项，见文末；因此没有宣称总目标全部完成。现有证据不要求扩大FDM。
 
+## Hash Join重复键链的残余条件批量求值
+
+参考DuckDB `ScanStructure::ResolvePredicates`仅引用条件所需列并批量判断候选的方式，设备Hash Join将同一Probe行的多个等值匹配收集为有界列批次，复用已有表达式向量引擎。候选行号与消费位置保存在该CU的查询workmem中，一批输入可分多次输出；返回上层Index节点时，不将仍有候选的状态误判为扫描窗口已耗尽。
+
+INNER/LEFT每批至多256个候选。SEMI/ANTI先按原路径判断首候选，被拒绝后才以至多64个候选批量判断；命中立即丢弃余下候选。错误按消费顺序检查，LIMIT或EXISTS未消费的未来错误不提前报告。单候选、不支持的表达式和实际分配失败保留逐行求值；所有批次内存计入原查询总预算，普通和外部分区连接结束时均释放。固件、SNIA和PG计划接口不变，没有扩大FDM。
+
+这一步覆盖重复键链的残余条件；不同Probe行之间的单候选残余条件、Index残余条件及Merge Join仍未全部向量化，不能据此宣称全链路改造完成。
+
+NativePlan及8/16/64 CU共4项CTest通过，NativePlan与8 CU两项ASan/UBSan/LeakSanitizer检查通过。新增用例覆盖所有四种连接、NULL残余条件、超过256个重复键候选、4MiB下实际spill重入、Index→Hash→Index窗口接续、LIMIT未消费的未来错误、EXISTS首候选命中及首候选拒绝后在批次中命中时跳过后续错误。关闭后无存活workmem context或分配。
+
+设备SO已部署。以下[规范查询回归](../../../../results/tpch.GmLXsy/timings.csv)每次host/CSD前均冷启动，全部结果一致、完整卸载、快于同轮host；EXPLAIN确认8 CU、设备与查询总预算均为268435456字节，FDM保持64MiB。
+
+| 查询 | host ms | CSD ms |
+| --- | ---: | ---: |
+| Q7 | 2962.056 | 722.464 |
+| Q13 | 1132.812 | 353.602 |
+| Q19 | 1716.919 | 586.890 |
+| Q20 | 3460.008 | 1268.107 |
+
+PG原生Q7/Q19计划包含Join Filter，Q13覆盖LEFT连接，Q20覆盖混合阻塞节点；这些是相关回归，不替代上方完整22条基线。本轮未进行版本间A/B，不将与此前单次耗时的差异归因于本次优化，也没有宣称这四条查询都能触发重复键批量路径。
+
 ## Index SEMI/ANTI按候选轮次执行右侧向量过滤
 
 参考DuckDB `join_hashtable.cpp`中SEMI/ANTI对一批未命中输入执行条件、标记命中并只推进剩余输入的方式，Index列批次路径每轮让每个键提供至多一个候选，再共同执行右侧Filter/Project。已命中的键立即停止，未命中键继续下探；不把同一个键的多个候选提前解码，以保留EXISTS的停止语义。向量临时区使用原查询workmem分配器，分配失败沿用逐行路径；没有增加固件SQL逻辑、SNIA接口或FDM容量。
