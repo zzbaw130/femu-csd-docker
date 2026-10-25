@@ -14,11 +14,11 @@
 
 这里的“设备执行树”只是 `include/plan.h` 定义的本应用参数，由 `pg-sina-plan.so` 解释；FEMU 和 SNIA 不解释 SQL，也没有新增设备 runtime。
 
-通用树中可并行的 Heap 顺序扫描由 PG 按当前空闲槽动态分配互不重叠的输入块，通过现有 batch 提交 `LOAD→计算`。计算任务从 CompValue 返回“有输出/输入块耗尽/worker 完成”，PG 无需逐块读取控制记录或写回 ready。下游尚未消费输出缓冲时不加载下一块；共享 Hash/聚合表需要扩容时仍保留原有暂停边界。索引读取、临时分区读取及串行路径继续按需返回页请求。各 worker 之间可并行 LOAD/计算，同一个 worker 仍先 LOAD 后计算，本次没有增加双缓冲预读。
+通用树中可并行的 Heap 顺序扫描由 PG 按当前空闲槽动态分配互不重叠的输入块，通过现有 batch 提交 `LOAD→计算`。计算任务从 CompValue 返回“有输出/输入块耗尽/worker 完成”，PG 无需逐块读取控制记录或写回 ready。下游尚未消费输出缓冲时不加载下一块；共享 Hash/聚合表需要扩容时仍保留原有暂停边界。索引和串行namespace读取继续按需返回页请求；独立worker可由回调续交，协调端仍在PG线程处理。临时token的LOAD/STORE继续由设备图内部推进。各 worker 之间可并行 LOAD/计算，同一个 worker 仍先 LOAD 后计算，本次没有增加双缓冲预读。
 
 Heap 的 I/O 块与列向量容量分别计算：一个已加载块可包含多个至多 2048 行的向量，按整页填入并逐批交给下游，消费完后才释放该输入块。无需为整块数据的最坏行数预留列向量；`CSD AFDM` 显示本次申请的总字节数，`CSD Scan Vector Capacity` 显示 Heap 向量的行数上限，索引批次仍保持原容量。通用树的运行时字符串字典在查询 workmem 中按需增长，AFDM 只保留一页配置，不再清零大字典桶。增长前后的存储都计入同一预算，查询结束统一释放，已有字符串 ID 和字节引用保持有效。`CSD Dictionary Entries/Bytes` 报告实际内容；`CSD Dictionary AFDM` 只表示配置页。
 
-异步 batch 使用 SNIA 标准 callback 返回状态和 CompValue。对提前安排的 Heap 输入，若当前块已耗尽、没有未消费输出且 worker 尚未结束，回调直接领取下一块，重新配置该槽的 `LOAD→计算` batch 并异步续交。输入缓冲仍每槽一份，不增加预读或双缓冲。有输出、需要共享表维护、索引页请求及阶段结束时仍返回 PG 调度。回调仅使用普通内存分配、已有 extent 映射及 SNIA，不调用 PG API；PG 取消时先禁止续交，再等待所有在途回调结束后释放状态。
+异步 batch 使用 SNIA 标准 callback 返回状态和 CompValue。对提前安排的 Heap 输入，若当前块已耗尽、没有未消费输出且 worker 尚未结束，回调直接领取下一块，重新配置该槽的 `LOAD→计算` batch 并异步续交。输入缓冲仍每槽一份，不增加预读或双缓冲。索引及其他未提前分配输入的worker，回调读一次页请求元数据，按已准备的extent构建下一批LOAD→计算；计算参数标记输入已加载，不再单独写回ready。已有输出、需要共享表维护及阶段结束时仍交给PG协调端。回调仅使用普通内存分配、已有 extent 映射及 SNIA，不调用 PG API；PG 取消时先禁止续交，再等待所有在途回调结束后释放状态。
 
 开启 `pg_sina_csd.profile=on` 后，通用执行树的 EXPLAIN ANALYZE 还输出 `CSD Pipeline <节点号>`：每个并行输入流水线的轮次、墙钟、协调端 CPU、worker 累计 CPU、平均计算 CU 数和 CPU 利用率。墙钟包含该流水线输入及消费期间的内部 LOAD/调度等待；平均 CU 数为两端 CPU 之和除以墙钟，利用率再除以设备 CU 数，不能把峰值 4 当作全程满载。Hash 构建/Hash 聚合协调端 CPU 单独记录，扣除已计时的子扫描、排序和嵌套阻塞计算，仍包含协调端接收输入行的处理成本。计时在 CSF、阻塞调用及流水线边界进行，普通输入行不逐条读时钟；关闭 profile 时不采集，完成后只额外读取一次阶段记录。`sink` 是该流水线 worker 写入共享 Hash/聚合表的累计 CPU，已经包含在 `workers` 中；`sink_rows` 是直接在 worker 消费、无需交回协调端逐行处理的行数。
 

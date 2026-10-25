@@ -8,9 +8,11 @@
 #define QP_SCAN_BYTES (1024U*1024)
 #define QP_VECTOR_ROWS 2048U
 /* cparam1: profile bit 0, CU slot bits 1..7. A scheduled heap input uses
- * bit 8 and its page number in bits 9..63; cparam2 stays reserved for spill. */
+ * bit 8 and its page number in bits 9..63. With bit 8 clear, bit 9 marks
+ * completion of the previous requested page LOAD; cparam2 stays for spill. */
 #define QP_SCAN_INPUT (UINT64_C(1)<<8)
 #define QP_SCAN_PAGE_SHIFT 9
+#define QP_PAGES_INPUT (UINT64_C(1)<<9)
 /* Ordinary CompValue bits for a host-scheduled scan, below SNIA spill bits. */
 #define QP_OUTPUT_READY 1U
 #define QP_INPUT_DRAINED 2U

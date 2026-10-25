@@ -2444,6 +2444,8 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
         s->profiling=a->cparam1&1; s->outputs=a->mr_addr[2]; control->state=(uintptr_t)s;
     }
     s->args=a;
+    if(!csIsReentry(a) && ((uint64_t)a->cparam1&QP_PAGES_INPUT) && !((uint64_t)a->cparam1&QP_SCAN_INPUT))
+        control->ready=1;
     if(((uint64_t)a->cparam1&QP_SCAN_INPUT) && !csIsReentry(a)) {
         int id=qp_probe_scan(plan,s->root);
         uint64_t page=(uint64_t)a->cparam1>>QP_SCAN_PAGE_SHIFT;

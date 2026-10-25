@@ -153,7 +153,7 @@ static void *probe_worker(void *arg)
     for(unsigned iteration=0;;++iteration) {
         assert(iteration<1000000);
         struct qp_control *c=t->control;
-        t->args.cparam1=(t->worker<<1)|(t->args.cparam1&1);
+        if(!csIsReentry(&t->args)) t->args.cparam1=(t->worker<<1)|(t->args.cparam1&1);
         if(t->next_offset && *t->need_input && !csIsReentry(&t->args)) {
             const struct qp_node *n=&t->plan->nodes[t->scan_node-1];
             uint64_t offset=atomic_fetch_add(t->next_offset,t->plan->scan_bytes);
@@ -172,8 +172,11 @@ static void *probe_worker(void *arg)
                     memcpy(t->arena+offset+QS_SORT_IO_BYTES+(size_t)r->slot*QS_PAGE,
                         (r->heap?t->heap:t->index)+(size_t)r->block*QS_PAGE,QS_PAGE);
                 }
-            } else memcpy(t->arena+offset,((c->node==3 || c->node==6)?t->heap:t->raw)+c->offset,c->bytes);
-            c->ready=1;
+                t->args.cparam1|=QP_PAGES_INPUT;
+            } else {
+                memcpy(t->arena+offset,((c->node==3 || c->node==6)?t->heap:t->raw)+c->offset,c->bytes);
+                c->ready=1;
+            }
         }
         int64_t status=t->run(&t->args);
         if(status<0) fprintf(stderr,"worker %u status=%lld node=%u kind=%d ready=%u bytes=%u offset=%llu\n",
@@ -429,7 +432,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             else { assert(op==3 && id && id<=ntokens && tokens[id-1]); free(tokens[id-1]); tokens[id-1]=NULL; args.cparam2=id; }
             continue;
         }
-        args.cparam2=0; available&=~control.drained;
+        args.cparam2=0; args.cparam1&=~QP_PAGES_INPUT; available&=~control.drained;
         if(control.epoch!=epoch) {
             epoch=control.epoch; available=done=0;
             atomic_store(&host_offset,0);
@@ -462,13 +465,14 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
                 assert((r->heap && !r->block) || (!r->heap && r->block==1));
                 memcpy(arena+j->input_offset+QS_SORT_IO_BYTES+(size_t)r->slot*QS_PAGE,page+(size_t)r->block*QS_PAGE,QS_PAGE);
             }
-            control.ready=1;
+            args.cparam1|=QP_PAGES_INPUT;
         } else if(control.bytes && !control.ready) {
             assert((control.node>=2 && control.node<4) || control.node==6);
             struct qp_node *n=&plan->nodes[control.node];
             memcpy(arena+n->input_offset,raw[control.node==2?0:1]+control.offset,control.bytes); control.ready=1;
         }
     }
+    if(hash==2 && memory==4 && parallel==TEST_SERIAL) assert(ntokens); /* page-ready flag survives spill reentry */
     if(test_workers>4 && parallel) assert(out->metrics.workers==test_workers && control.epoch);
     assert(got); if(parallel!=TEST_COUNT_ROWS && parallel<TEST_PARTITION) for(unsigned i=0;i<12;++i) assert(!seen[i]);
     if(args.cparam1&1) {
@@ -1006,6 +1010,7 @@ int main(int argc,char **argv)
     test(run,QP_INNER,31,50003,64,1,TEST_BUILD_PHASE);
     test(run,QP_ANTI,31,50003,4,1,TEST_BUILD_PHASE);
     test(run,QP_INNER,20003,23,64,2,TEST_INDEX_PIPELINE);
+    test(run,QP_INNER,20003,23,4,2,TEST_SERIAL);
     test(run,QP_INNER,20003,23,64,2,TEST_INDEX_HASH);
     test(run,QP_INNER,20003,23,4,2,TEST_INDEX_HASH);
     test(run,QP_INNER,20003,23,64,2,TEST_INDEX_CHAIN);

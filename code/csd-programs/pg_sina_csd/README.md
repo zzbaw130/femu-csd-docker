@@ -22,7 +22,7 @@
 
 通用树的共享字典由设备 SQL 程序在查询根 workmem 中建立，按需增长，所有 CU 引用同一组稳定 ID。旧存储保留到查询结束以保证借用的字节仍有效，增长的全部存储计入查询总预算；AFDM 中只传配置。已带字典 ID 的输入导入后保持原 ID。独立算子仍可接收原有平铺字典输入。字典本身尚不支持 spill，分配失败不会破坏旧数据，但会返回设备错误。
 
-索引、临时分区及串行 Scan 仍在需要数据页时写控制记录并正常返回，Guest 把地址转换为 `csQueueStorageRequest(NVM_TO_AFDM)` 再继续调用。扫描块由 Guest 根据 FDM 容量在 4/2/1 MiB 中选择，索引按需读取 8 KiB 页。原始数据不经过 Guest PG 缓冲。设备执行中发现 spill 需要时直接返回 `csNeedStore/Load/Free` 完成值，由已有 SNIA batch 调度器处理并重入，PG 不接收或解释中间行。
+索引及串行Scan需要namespace页时仍写控制记录并返回。Guest按extent转换成 `csQueueStorageRequest(NVM_TO_AFDM)`；独立worker由PG扩展的SNIA回调自动续交，协调端仍在PG线程处理。LOAD后的Compute通过已有cparam1中的QP_PAGES_INPUT标志，在入口设置就绪状态，省去一次独立FDM控制写入；标志不在spill重入时重复应用。它与QP_SCAN_INPUT的页号编码互斥，定义见私有plan.h，不改变FEMU/SNIA接口。临时token的加载仍由设备图内部处理。扫描块由 Guest 根据 FDM 容量在 4/2/1 MiB 中选择，索引按需读取 8 KiB 页。原始数据不经过 Guest PG 缓冲。设备执行中发现 spill 需要时直接返回 `csNeedStore/Load/Free` 完成值，由已有 SNIA batch 调度器处理并重入，PG 不接收或解释中间行。
 
 Heap 每次 LOAD 的块可包含多个列批次。通用树将列向量限制为至多 2048 行，扫描前用页内 line pointer 数保守选择能放入向量的完整页，再复用原 Scan/Filter ABI。页指针包含无效项时仍保守计数，单页始终容纳得下；实际页与 Tuple 校验继续由 Scan 完成。已加载字节数和解码进度保存在各扫描节点的 workmem 状态中，控制记录可同时供 Index Join 请求缺页；筛选后需要延迟解码的列始终引用当前这批页。该块的所有向量和输出消费完成后才接受下一块，没有新增读取或跨查询缓存。
 
