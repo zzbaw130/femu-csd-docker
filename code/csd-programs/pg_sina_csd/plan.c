@@ -115,6 +115,7 @@ struct operator_state {
     struct projection_batch *projection;
     int phase, have_left, have_right, input_done, group_ready, matched, finished;
     struct qs_plan *index_plan;
+    struct projection_batch *index_projection;
     struct qs_join_control index_control;
     struct qs_task index_task;
     struct qs_result *index_output;
@@ -2015,6 +2016,57 @@ static int64_t aggregate_next(struct execution *s,unsigned id,struct qs_cell *ro
     }
 }
 
+/* Import the indexed side's expressions once, with columns referencing the
+ * decoded match chunk (its first two slots are lookup key and source row). */
+static void index_projection_init(struct execution *s,unsigned id)
+{
+    const struct qp_node *n=&s->plan->nodes[id],*right=&s->plan->nodes[n->right];
+    if(n->join_type==QP_SEMI || n->join_type==QP_ANTI) return;
+    int useful=right->expr.predicate>=0;
+    for(unsigned i=0;i<right->expr.nout;++i)
+        useful|=right->expr.exprs[right->expr.outputs[i].index].op!=Q_COLUMN;
+    if(!useful) return;
+    struct projection_batch *b=cs_work_calloc(s->context,1,sizeof(*b)); if(!b) return;
+    b->plan=right->expr; b->plan.nexprs=0; b->plan.predicate=-1; b->plan.ncols+=2;
+    for(unsigned i=0;i<b->plan.nattrs;++i) if(b->plan.cols[i].slot>=0) b->plan.cols[i].slot+=2;
+    struct projection_import import={.execution=s,.batch=b};
+    for(unsigned i=0;i<b->plan.nout;++i) {
+        int index=projection_import(&import,n->right,right->expr.outputs[i].index);
+        if(index<0 || qs_vector_require(&b->plan,index,b->needed)) goto fallback;
+        b->plan.outputs[i].index=index;
+    }
+    /* Initialize output dependencies but evaluate them only for survivors. */
+    for(unsigned i=0;i<b->plan.nexprs;++i) b->needed[i]&=1;
+    if(right->expr.predicate>=0) {
+        int index=projection_import(&import,n->right,right->expr.predicate);
+        if(index<0 || qs_vector_require(&b->plan,index,b->needed)) goto fallback;
+        b->plan.predicate=index;
+    }
+    b->vectors=cs_work_alloc(s->context,b->plan.nexprs*sizeof(*b->vectors));
+    if(!b->vectors) goto fallback;
+    s->nodes[id].index_projection=b; return;
+fallback:
+    cs_work_free(s->context,b);
+}
+static int index_project_batch(struct execution *s,struct projection_batch *b,struct qs_chunk *chunk)
+{
+    struct qs_vector_input input={.dictionary=s->dictionary,.parameters=s->params,.nparameters=QP_PARAMS};
+    if(qs_vector_execute_input(&b->plan,chunk,qs_selection(chunk),0,chunk->selected,b->needed,b->vectors,input)) return -5;
+    uint16_t active[QS_VECTOR_ROWS]; unsigned count=0;
+    for(unsigned r=0;r<chunk->selected;++r) {
+        int index=b->plan.predicate;
+        if(index>=0) {
+            if(b->vectors[index].errors[r]) continue;
+            struct qs_cell keep=qs_vector_cell(&b->plan,b->vectors,index,r);
+            if(keep.isnull || !keep.value) continue;
+        }
+        active[count++]=r;
+    }
+    input.plan=&b->plan; input.vectors=b->vectors; input.count=chunk->selected;
+    for(unsigned i=0;i<b->plan.nout;++i)
+        if(qs_vector_evaluate(&input,b->plan.outputs[i].index,active,count)) return -5;
+    return 0;
+}
 /* index_scan.c calls this consumer with a batch of decoded heap matches.
  * Only the lookup key is narrowed to int64; left payloads keep 128-bit cells. */
 int64_t qs_join_consume(unsigned stage,struct qs_chunk *chunk,const struct qs_plan *unused,
@@ -2027,18 +2079,42 @@ int64_t qs_join_consume(unsigned stage,struct qs_chunk *chunk,const struct qs_pl
     struct projection_batch *b=index_columns;
     if(o->index_flush) { o->index_flush=0; return 0; }
     if(!b) { o->index_output->rows=0; o->index_position=0; }
+    struct projection_batch *projected=chunk->selected>1?o->index_projection:NULL;
+    if(projected) {
+        int status=index_project_batch(s,projected,chunk); if(status) return status;
+    }
     for(unsigned r=0;r<chunk->selected;++r) {
         unsigned at=qs_selection(chunk)[r]; struct qs_cell raw[QS_COLS],values[QS_COLS];
         unsigned source=qs_values(chunk)[chunk->capacity+at];
         if(source>=o->index_count) return -1;
         memcpy(values,o->index_left+(size_t)source*ln,ln*sizeof(*values));
-        for(unsigned col=0;col<right->expr.nattrs;++col) if(right->expr.cols[col].slot>=0) {
-            unsigned slot=2+right->expr.cols[col].slot;
-            raw[col]=(struct qs_cell){.value=qs_values(chunk)[(size_t)slot*chunk->capacity+at],
-                .scale=right->expr.cols[col].scale,.dscale=qs_dscales(chunk)[(size_t)slot*chunk->capacity+at],
-                .isnull=(qs_nulls(chunk)[(size_t)slot*((chunk->capacity+7)/8)+at/8]>>(at%8))&1};
+        if(projected) {
+            int predicate=projected->plan.predicate;
+            if(predicate>=0) {
+                if(projected->vectors[predicate].errors[r]) return -5;
+                struct qs_cell keep=qs_vector_cell(&projected->plan,projected->vectors,predicate,r);
+                if(keep.isnull || !keep.value) continue;
+            }
+            for(unsigned i=0;i<right->expr.nout;++i) {
+                unsigned index=projected->plan.outputs[i].index;
+                const struct qs_vector *v=&projected->vectors[index];
+                if(v->errors[r]) return -5;
+                values[ln+i]=qs_vector_cell(&projected->plan,projected->vectors,index,r);
+                if(v->kind==QS_TEXT && !values[ln+i].isnull) {
+                    int text=qs_dict_insert(s->dictionary,v->strings[r].data,v->strings[r].length);
+                    if(text<0) return -3;
+                    values[ln+i].value=text;
+                }
+            }
+        } else {
+            for(unsigned col=0;col<right->expr.nattrs;++col) if(right->expr.cols[col].slot>=0) {
+                unsigned slot=2+right->expr.cols[col].slot;
+                raw[col]=(struct qs_cell){.value=qs_values(chunk)[(size_t)slot*chunk->capacity+at],
+                    .scale=right->expr.cols[col].scale,.dscale=qs_dscales(chunk)[(size_t)slot*chunk->capacity+at],
+                    .isnull=(qs_nulls(chunk)[(size_t)slot*((chunk->capacity+7)/8)+at/8]>>(at%8))&1};
+            }
+            int status=project(s,right,raw,NULL,values+ln); if(status<0) return status; if(!status) continue;
         }
-        int status=project(s,right,raw,NULL,values+ln); if(status<0) return status; if(!status) continue;
         struct qs_eval e; init_eval(&e,&n->expr,values,NULL); struct qs_cell match={.value=1};
         if(n->join_qual>=0 && evaluate(s,&e,n->join_qual,&match)) return -5;
         if(match.isnull || !match.value) continue;
@@ -2051,7 +2127,7 @@ int64_t qs_join_consume(unsigned stage,struct qs_chunk *chunk,const struct qs_pl
              * index cursor retains the decoded chunk until this batch drains. */
             projection_append(b,values);
         } else {
-            status=project(s,n,values,NULL,o->index_output->data[o->index_output->rows].cells);
+            int status=project(s,n,values,NULL,o->index_output->data[o->index_output->rows].cells);
             if(status<0) return status;
             if(status) ++o->index_output->rows;
         }
@@ -2090,6 +2166,7 @@ static int64_t index_next(struct execution *s,unsigned id,struct qs_cell *row,st
         }
         int status=qs_index_init(p,&o->index_control); if(status) return status;
         qs_index_dictionary(&o->index_control,s->dictionary);
+        index_projection_init(s,id);
         struct qs_chunk *input=(void *)(s->arena+vector_offset(s,n)),*output=(void *)(s->arena+vector_offset(s,n)+4096);
         *input=(struct qs_chunk){.capacity=64,.ncols=2};
         *output=(struct qs_chunk){.capacity=256,.ncols=p->ncols};

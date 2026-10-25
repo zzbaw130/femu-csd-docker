@@ -525,6 +525,12 @@ spill行保存分组键及各聚合的SUM/count，沿用原有排序归并、重
 
 新增Hash Join文本输出用例检查CASE抑制负长度分支、NULL、LIMIT错误时机和清理；NativePlan及8/16/64 CU共4项CTest通过。已重编部署pg-sina-plan.so，规范Q7/Q13/Q22冷启动均结果正确、完整卸载且快于同轮host。Q22 profile累计CPU未明显下降，不以接续覆盖代替性能收益证明；Index右侧谓词、多聚合分组和跨请求推进仍未完成。本阶段未重复完整22条，当前记录见performance.md。
 
+## 索引匹配侧批次表达式（2026-10-25）
+
+参考DuckDB连接中间批次及选择向量，Index Join多行匹配的右侧过滤和计算投影复用现有表达式向量；先筛选，再计算存活行的投影，直接引用索引解码列。文本在消费时物化，保留宽numeric、NULL和错误的消费顺序。纯列投影、单行、SEMI/ANTI及不支持的表达式保留原路径，私有批次状态计入原查询workmem，不增加AFDM或SQL固件接口。
+
+4项设备CTest及两项ASan/UBSan/LeakSanitizer检查通过，扩展多CU负数投影/过滤、外连接、文本/NULL、4MiB预算和LIMIT/筛选错误测试。已部署pg-sina-plan.so，规范Q3/Q17/Q21冷启动均匹配host、完整卸载且更快。Q21计算CPU变化很小，仍受大量索引页读取与续交限制，不宣称固定收益；Q17当前计划没有索引页加载，仅作为回归对照。未运行完整22条，计时与剩余边界见performance.md。
+
 ## InitPlan参数接入列批次投影（2026-10-25）
 
 参考DuckDB绑定参数表达式，投影导入支持现有QP_PARAMETER，按实际绑定值传播numeric精度；Scan及Join列批次传入查询参数，不再因此回退逐行。参数在初始化后查询内只读，继续使用现有workmem和向量执行入口，不改SNIA或固件。

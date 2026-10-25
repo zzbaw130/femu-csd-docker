@@ -1,6 +1,22 @@
 # 当前性能与未完成项（2026-10-25）
 
-## 当前：InitPlan参数接入列批次投影
+## 当前：索引匹配侧的批次过滤与投影
+
+参考DuckDB连接算子对中间DataChunk执行表达式并保留选择向量的方式，设备Index Join的多行匹配复用现有向量引擎，先筛选右侧行，再计算存活行的输出表达式；输入直接引用原解码列。文本输出在消费时转为字典ID，错误按消费顺序报告，保留LIMIT可提前停止的语义。纯列投影、单行匹配、SEMI/ANTI及不支持的表达式沿用原路径；没有在固件或SNIA增加SQL状态。
+
+[4项设备CTest](../../../../results/index-projection/device-tests.log)与[两项ASan/UBSan/LeakSanitizer检查](../../../../results/index-projection/sanitizer-tests.log)通过。覆盖多CU索引筛选和负数投影、外连接未匹配行、宽numeric、文本/NULL、4MiB预算，以及被过滤行的溢出不报错、LIMIT之后的错误延迟报告。pg-sina-plan.so已重编部署，PG/SNIA/固件不变。
+
+[规范Q3/Q17/Q21冷启动回归](../../../../results/tpch.nfpLm3/timings.csv)均正确、完整卸载且快于同轮host，保持8 CU / 256MiB workmem / 64MiB FDM。本阶段未运行完整TPC-H。
+
+| 查询 | host ms | CSD ms |
+| --- | ---: | ---: |
+| Q3 | 3011.603 | 1086.213 |
+| Q17 | 4202.828 | 1161.130 |
+| Q21 | 2391.880 | 1015.818 |
+
+Q21独立冷启动[原路径](../../../../results/index-projection/q21-before.log)/[批次路径](../../../../results/index-projection/q21-after.log)累计CSF CPU为3004.382/2978.444ms，workmem峰值7387488/7687648字节，均无spill；新增约293KiB状态，CPU差异不足以证明显著收益。仍有47661次索引/Heap页加载，平均活跃CU约3.25；连接残余条件、SEMI/ANTI匹配和跨请求推进仍有逐行/协调边界。Q17该计划没有索引页加载，不应归因于本次索引改动；其前后墙钟也有波动，因此不以单次profile墙钟差值宣称固定加速。当前证据不要求扩容FDM。
+
+## InitPlan参数接入列批次投影
 
 参考DuckDB参数表达式引用绑定值的方式，Scan和Hash/Index Join后的投影复用现有参数向量入口；不再因包含QP_PARAMETER而退回逐行投影。导入表达式时使用实际参数的scale/dscale，再推导父表达式精度；保留int128和NULL，不为参数增加新的协议、缓冲或配置。
 
@@ -318,4 +334,4 @@ PG保留原选定Join树，做有语义条件的局部rewrite；SQL程序执行H
 
 字典迁移阶段21项相关设备CTest及Guest布局CTest通过：并发字典增长/重复插入/旧字节视图/失败后读取与回收，预编码ID导入，4MiB总预算spill，NativePlan和8/16/64 CU，表达式、Filter、Scan、聚合、Sort/Hash/Index Join。PG及共享布局涉及的全部设备SO已重新构建部署。
 
-Index右侧投影与Join条件、Merge Join、复杂DISTINCT和过宽聚合状态及排序边界仍有逐行适配；页请求虽可由回调续交，仍需读取元数据和主机extent映射；部分阻塞推进仍依赖协调端。共享字典保留原容量上限，自身尚无spill；真正耗尽预算或上限会返回错误，不能宣称任意大小字符串查询及低内存形态全部覆盖。共享字典串行写入、全链路列化和整体CU利用率仍有优化空间，完整基线22条加速不代表这些基础改造已全部完成。当前证据不要求扩容FDM。
+Index单行/SEMI/ANTI路径与Join残余条件、Merge Join、复杂DISTINCT和过宽聚合状态及排序边界仍有逐行适配；页请求虽可由回调续交，仍需读取元数据和主机extent映射；部分阻塞推进仍依赖协调端。共享字典保留原容量上限，自身尚无spill；真正耗尽预算或上限会返回错误，不能宣称任意大小字符串查询及低内存形态全部覆盖。共享字典串行写入、全链路列化和整体CU利用率仍有优化空间，完整基线22条加速不代表这些基础改造已全部完成。当前证据不要求扩容FDM。

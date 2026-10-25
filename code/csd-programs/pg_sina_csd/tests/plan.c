@@ -12,7 +12,7 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 typedef int64_t (*function)(struct femu_csd_args *);
-enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_INDEX_PIPELINE,TEST_INDEX_HASH,TEST_INDEX_CHAIN,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL, TEST_VECTOR_AGG=-1 };
+enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_INDEX_PIPELINE,TEST_INDEX_HASH,TEST_INDEX_CHAIN,TEST_INDEX_EXPR,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL, TEST_VECTOR_AGG=-1 };
 static unsigned test_workers=4;
 static bool test_scheduled;
 /* Reservations must cover physical input even when filters/NDV estimates
@@ -205,6 +205,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     struct qp_plan *plan=calloc(1,sizeof(*plan)); assert(plan); plan->count=4; plan->scan_bytes=parallel==TEST_LARGE_SCAN?QS_CHUNK:test_workers>4?QS_PAGE:QP_SCAN_BYTES;
     scan(&plan->nodes[2]); scan(&plan->nodes[3]);
     __int128 factor=parallel==TEST_WIDE_HASH?((__int128)1<<64):parallel==TEST_SIGNED_HASH?-1:parallel==TEST_BIGINT_HASH?INT64_C(1)<<32:1;
+    if(parallel==TEST_INDEX_EXPR) factor=-2;
     if(parallel==TEST_WIDE_HASH) {
         struct qs_plan *p=&plan->nodes[3].expr; p->nexprs=6;
         /* Constants are int64; two products create a genuine int128 payload. */
@@ -239,6 +240,14 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     if(hash==2) {
         j->kind=QP_INDEX_JOIN;
         plan->nodes[3].expr.join=(struct qs_join){.indexid=1,.indexroot=1,.index_key_bytes=4,.build_key=1};
+        if(parallel==TEST_INDEX_EXPR) {
+            struct qs_plan *p=&plan->nodes[3].expr; p->nexprs=6;
+            p->exprs[2]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=-2};
+            p->exprs[3]=(struct qs_expr){.op=Q_MUL,.type=Q_INTEGER,.left=1,.right=2};
+            p->exprs[4]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=5};
+            p->exprs[5]=(struct qs_expr){.op=Q_GE,.type=Q_BOOLEAN,.left=1,.right=4};
+            p->predicate=5; p->outputs[1].index=3;
+        }
     }
     j->nkeys=1; j->left_keys[0]=j->right_keys[0]=0; j->expr.predicate=-1; j->expr.nattrs=4; j->expr.nexprs=4; j->expr.nout=3;
     for(unsigned i=0;i<4;++i) j->expr.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER,.column=i};
@@ -377,7 +386,8 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     uint64_t counts[12]={0},sums[12]={0},mins[12]={0},maxs[12]={0};
     for(unsigned l=0;l<rows;++l) {
         unsigned key=parallel==TEST_PARTITION_SKEW?1:l%11; int matched=0;
-        for(unsigned r=0;r<right_rows;++r) if(l%17 && r%17 && key==(parallel==TEST_PARTITION_SKEW?1:r%7)) {
+        for(unsigned r=0;r<right_rows;++r) if(l%17 && r%17 && key==(parallel==TEST_PARTITION_SKEW?1:r%7) &&
+            (parallel!=TEST_INDEX_EXPR || r%13+1>=5)) {
             unsigned v=join==QP_SEMI?l%19+1:r%13+1; matched=1;
             if(join==QP_ANTI) continue;
             ++counts[key]; sums[key]+=v; if(!mins[key] || mins[key]>v) mins[key]=v; if(maxs[key]<v) maxs[key]=v;
@@ -676,6 +686,17 @@ static void probe_payload(function run,unsigned limit,int strings,int indexed)
          * LIMIT must consume that prefix before observing the later error. */
         assert(!strings); p->nodes[3].expr=*left;
         p->nodes[3].expr.exprs[2].constant=1;
+        if(indexed==2) p->nodes[3].expr.predicate=3; /* rejected row's output overflows */
+        if(indexed==3) {
+            struct qs_plan *right=&p->nodes[3].expr;
+            right->cols[1].length=-1; right->cols[1].type=right->exprs[1].type=Q_STRING;
+            right->exprs[4]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=2};
+            right->exprs[5]=(struct qs_expr){.op=Q_SUBSTRING,.type=Q_STRING,.left=1,.right=4,.otherwise=4};
+            right->exprs[6]=(struct qs_expr){.op=Q_CONST,.type=Q_STRING,.isnull=1};
+            right->exprs[7]=(struct qs_expr){.op=Q_CASE,.type=Q_STRING,.left=3,.right=5,.otherwise=6};
+            right->outputs[1].type_oid=j->expr.outputs[1].type_oid=top->expr.outputs[1].type_oid=25;
+            j->expr.exprs[1].type=top->expr.exprs[1].type=Q_STRING;
+        }
         left->nexprs=2; left->outputs[1]=(struct qs_output){.index=1,.type_oid=23};
         j->kind=QP_INDEX_JOIN; j->hash=0; j->expr.exprs[1].column=3;
         p->nodes[3].expr.join=(struct qs_join){.indexid=1,.indexroot=1,.index_key_bytes=4,.build_key=0};
@@ -684,6 +705,10 @@ static void probe_payload(function run,unsigned limit,int strings,int indexed)
     unsigned char *raw[2]={heap(2,2,&sizes[0]),heap(indexed?3:1,2,&sizes[1])};
     unsigned char *index=indexed?index_page(3):NULL;
     if(indexed) for(unsigned r=0;r<2;++r) w32(raw[0]+QS_PAGE-(r+1)*40+24,r+1);
+    if(indexed==3) for(unsigned r=0;r<3;++r) {
+        unsigned char *tuple=raw[1]+QS_PAGE-(r+1)*40;
+        tuple[28]=(5U<<1)|1U; memcpy(tuple+29,r==1?"keep":"skip",4);
+    }
     if(strings) for(unsigned r=0;r<2;++r) {
         unsigned char *tuple=raw[0]+QS_PAGE-(r+1)*40;
         if(strings>=2) w32(tuple+24,0);
@@ -720,7 +745,15 @@ static void probe_payload(function run,unsigned limit,int strings,int indexed)
             memcpy(arena+n->input_offset,raw[control.node-2]+control.offset,control.bytes); control.ready=1;
         }
     } while(!out->finished);
-    if(strings==3 && limit>1) { assert(status==-5); control.close=1; assert(!run(&args)); }
+    if(indexed==3) {
+        if(status || out->rows!=2 || qs_cell_string(&out->data[0].cells[1])!=2)
+            fprintf(stderr,"indexed text status=%lld rows=%u null=%u length=%u value=%lld\n",(long long)status,out->rows,
+                out->data[0].cells[1].isnull,qs_cell_string(&out->data[0].cells[1]),(long long)out->data[0].cells[1].value);
+        assert(!status && out->rows==2 && qs_cell_string(&out->data[0].cells[1])==2);
+        assert(!memcmp(qs_cell_string_bytes(&out->data[0].cells[1]),"ee",2));
+        assert(out->data[1].cells[1].isnull);
+    }
+    else if(strings==3 && limit>1) { assert(status==-5); control.close=1; assert(!run(&args)); }
     else if(strings>=2) {
         assert(!status && out->rows==(limit==1?1:2));
         assert(qs_cell_string(&out->data[0].cells[1])==2);
@@ -730,7 +763,7 @@ static void probe_payload(function run,unsigned limit,int strings,int indexed)
         assert(!status && out->rows==1 && qs_cell_string(&out->data[0].cells[1])==4);
         assert(!memcmp(qs_cell_string_bytes(&out->data[0].cells[1]),"keep",4));
         assert(out->metrics.dictionary_entries==1); /* unmatched "skip" was never interned */
-    } else if(limit==1) {
+    } else if(limit==1 || indexed==2) {
         assert(!status && out->rows==1 && out->data[0].cells[0].value==(indexed?1:0));
         assert(out->data[0].cells[1].value==(__int128)INT64_MAX*INT64_MAX);
     }
@@ -1153,6 +1186,7 @@ int main(int argc,char **argv)
         test(run,QP_INNER,31,50003,256,1,TEST_BUILD_PHASE);
         test(run,QP_LEFT,20003,23,256,1,TEST_HASH_GROUP);
         test(run,QP_LEFT,20003,23,256,2,TEST_HASH_GROUP);
+        test(run,QP_LEFT,20003,23,256,2,TEST_INDEX_EXPR);
         multiple_groups(run,256,Q_SUM,0,test_workers);
         multiple_groups(run,256,Q_AVG,1,test_workers);
         multiple_groups(run,256,Q_COUNT,0,test_workers);
@@ -1168,6 +1202,8 @@ int main(int argc,char **argv)
     probe_payload(run,1,0,0); probe_payload(run,2,0,0); probe_payload(run,2,1,0);
     probe_payload(run,2,2,0); probe_payload(run,1,3,0); probe_payload(run,2,3,0);
     probe_payload(run,1,0,1); probe_payload(run,2,0,1); grouped_probe(run);
+    probe_payload(run,2,0,2);
+    probe_payload(run,2,0,3);
     for(int joined=0;joined<2;++joined) {
         parameter_projection(run,joined,0,0);
         parameter_projection(run,joined,1,0);
@@ -1206,6 +1242,8 @@ int main(int argc,char **argv)
     test(run,QP_INNER,20003,23,64,2,TEST_INDEX_CHAIN);
     test(run,QP_INNER,20003,23,4,2,TEST_INDEX_CHAIN);
     test(run,QP_LEFT,20003,23,4,2,TEST_HASH_GROUP);
+    test(run,QP_INNER,20003,23,4,2,TEST_INDEX_EXPR);
+    test(run,QP_LEFT,20003,23,64,2,TEST_INDEX_EXPR);
     test(run,QP_INNER,120000,23,8,1,TEST_PARALLEL);
     test(run,QP_INNER,120000,23,8,1,TEST_LARGE_SCAN);
     test(run,QP_INNER,5170,23,64,1,TEST_COUNT_ROWS);
