@@ -93,6 +93,8 @@ struct projection_batch {
     uint8_t needed[QS_EXPRS];
     unsigned scan,count,position,input_count;
     struct qs_cell *cells;
+    const struct qs_cell *borrowed_cells;
+    const uint32_t *borrowed_selection;
     int64_t error;
     unsigned error_node;
     int joined,keep_window,lazy_text;
@@ -110,6 +112,7 @@ struct hash_qual_batch {
 struct index_qual_batch {
     struct projection_batch expr;
     int status[QS_VECTOR_ROWS];
+    uint32_t selection[QS_VECTOR_ROWS];
 };
 struct operator_state {
     struct sorted_rows left_sort,right_sort;
@@ -1216,8 +1219,9 @@ static int join_qual_init(struct execution *s,unsigned id,struct projection_batc
     int predicate=projection_import(&import,id,n->join_qual);
     if(predicate<0 || qs_vector_require(&b->plan,predicate,b->needed)) return -1;
     b->plan.predicate=predicate;
+    if(output) b->plan.ncols=output->plan.ncols;
     for(unsigned col=0;col<b->plan.nattrs;++col)
-        b->plan.cols[col].slot=output && output->plan.cols[col].slot>=0?(int)b->plan.ncols++:-1;
+        b->plan.cols[col].slot=output?output->plan.cols[col].slot:-1;
     for(unsigned i=0;i<b->plan.nexprs;++i) if(b->plan.exprs[i].op==Q_COLUMN) {
         int col=b->plan.exprs[i].column;
         if(col<0 || (unsigned)col>=b->plan.nattrs) return -1;
@@ -1370,6 +1374,7 @@ static int64_t projection_join_fill(struct execution *s,struct projection_batch 
     unsigned ln=s->plan->nodes[n->left].expr.nout;
     if(b->error) { s->control->error=b->error; s->control->error_node=b->error_node; return b->error; }
     if(n->kind==QP_INDEX_JOIN) {
+        b->borrowed_cells=NULL; b->borrowed_selection=NULL;
         int previous=s->control->error; unsigned previous_node=s->control->error_node;
         int64_t status=index_next(s,b->scan,NULL,b);
         if(status<0 && b->input_count) {
@@ -1412,10 +1417,11 @@ static int64_t projection_join_fill(struct execution *s,struct projection_batch 
     }
 evaluate_batch:
     b->count=b->input_count; b->input_count=b->position=0;
-    struct qs_vector_input input={.cells=b->cells,.dictionary=s->dictionary,
+    struct qs_vector_input input={.cells=b->borrowed_cells?b->borrowed_cells:b->cells,.dictionary=s->dictionary,
         .parameters=s->params,.nparameters=QP_PARAMS};
     /* COUNT(*) can have no payload columns; it still consumes cardinality. */
-    if(b->plan.nexprs && qs_vector_execute_input(&b->plan,NULL,NULL,0,b->count,b->needed,b->vectors,input)) return -5;
+    if(b->plan.nexprs && qs_vector_execute_input(&b->plan,NULL,b->borrowed_cells?b->borrowed_selection:NULL,
+        0,b->count,b->needed,b->vectors,input)) return -5;
     return 2;
 }
 /* Return 3 only for an internal scalar fallback, before consuming input. */
@@ -2289,6 +2295,9 @@ int64_t qs_join_consume(unsigned stage,struct qs_chunk *chunk,const struct qs_pl
         int status=index_qual_prepare(s,id,chunk,projected,b); if(status<0) return status;
         if(status) qualified=o->index_qual;
     }
+    /* The Index cursor retains this batch until the output is consumed.
+     * SEMI gathers across rounds, so it keeps its existing owned buffer. */
+    int borrow=qualified && !b->input_count && (n->join_type==QP_INNER || n->join_type==QP_LEFT);
     for(unsigned r=0;r<chunk->selected;++r) {
         unsigned at=qs_selection(chunk)[r]; struct qs_cell values[QS_COLS];
         unsigned source=qs_values(chunk)[chunk->capacity+at];
@@ -2300,7 +2309,7 @@ int64_t qs_join_consume(unsigned stage,struct qs_chunk *chunk,const struct qs_pl
             if(q->vectors[index].errors[r]) return -5;
             match=qs_vector_cell(&q->plan,q->vectors,index,r);
             if(match.isnull || !match.value) continue;
-            for(unsigned col=0;col<q->plan.nattrs;++col) {
+            for(unsigned col=0;!borrow && col<q->plan.nattrs;++col) {
                 int slot=q->plan.cols[col].slot;
                 if(slot>=0) values[col]=q->cells[(size_t)slot*QS_VECTOR_ROWS+r];
             }
@@ -2317,7 +2326,11 @@ int64_t qs_join_consume(unsigned stage,struct qs_chunk *chunk,const struct qs_pl
         if(b) {
             /* Keep only columns needed by the fused expression DAG. The
              * index cursor retains the decoded chunk until this batch drains. */
-            projection_append(b,values);
+            if(borrow) {
+                b->borrowed_cells=qualified->expr.cells;
+                b->borrowed_selection=qualified->selection;
+                qualified->selection[b->input_count++]=r;
+            } else projection_append(b,values);
         } else {
             int status=project(s,n,values,NULL,o->index_output->data[o->index_output->rows].cells);
             if(status<0) return status;

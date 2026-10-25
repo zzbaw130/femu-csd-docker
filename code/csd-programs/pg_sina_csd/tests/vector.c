@@ -21,20 +21,37 @@ static void materialized_columns(void)
         columns[r]=(struct qs_cell){.value=(r%2?-1:1)*(((__int128)1<<80)+r),.scale=r%5,.dscale=r%5,.isnull=r%7==0};
         columns[QS_VECTOR_ROWS+r]=(struct qs_cell){.value=r%2};
     }
+    columns[QS_VECTOR_ROWS-1]=(struct qs_cell){.value=3,.scale=2,.dscale=4};
+    columns[QS_VECTOR_ROWS-2]=(struct qs_cell){.value=(__int128)1<<126,.scale=2,.dscale=2};
     uint8_t needed[QS_EXPRS]={0};
     for(unsigned i=3;i<6;++i) assert(!qs_vector_require(&p,i,needed));
     struct qs_vector_input input={.cells=columns};
-    assert(!qs_vector_execute_input(&p,NULL,NULL,0,QS_VECTOR_ROWS,needed,vectors,input));
-    assert(vectors[0].kind==QS_CELLS && vectors[3].kind==QS_DYNAMIC && vectors[5].kind==QS_DYNAMIC);
-    for(unsigned r=0;r<QS_VECTOR_ROWS;++r) for(unsigned root=3;root<6;++root) {
-        struct qs_cell tuple[]={columns[r],columns[QS_VECTOR_ROWS+r]},expected;
-        struct qs_eval eval={.plan=&p,.tuple=tuple};
-        /* PG CASE retains the chosen value's actual scale. */
-        assert(!qs_evaluate(&eval,root==5?(tuple[1].value?3:0):(int)root,&expected));
-        struct qs_cell actual=qs_vector_cell(&p,vectors,root,r);
-        assert(!vectors[root].errors[r] && actual.isnull==expected.isnull);
-        if(!actual.isnull) assert(actual.value==expected.value && actual.scale==expected.scale && actual.dscale==expected.dscale);
+    uint32_t selected[QS_VECTOR_ROWS];
+    for(unsigned pass=0;pass<4;++pass) {
+        for(unsigned i=0;i<QS_VECTOR_ROWS;++i) selected[i]=pass==2?(i%3?0:QS_VECTOR_ROWS-1):QS_VECTOR_ROWS-1-i;
+        const uint32_t *selection=pass==1 || pass==2?selected:NULL;
+        unsigned first=pass==1?7:pass==2?31:pass==3?QS_VECTOR_ROWS-1:0;
+        unsigned count=pass==1?113:pass==2?63:pass==3?1:QS_VECTOR_ROWS;
+        assert(!qs_vector_execute_input(&p,NULL,selection,first,count,needed,vectors,input));
+        if(pass<2) assert(vectors[0].kind==QS_CELLS);
+        else assert(vectors[0].kind==QS_NARROW);
+        for(unsigned r=0;r<count;++r) for(unsigned root=3;root<6;++root) {
+            unsigned at=selection?selection[first+r]:first+r;
+            struct qs_cell tuple[]={columns[at],columns[QS_VECTOR_ROWS+at]},expected;
+            struct qs_eval eval={.plan=&p,.tuple=tuple};
+            /* PG CASE retains the chosen value's actual scale. */
+            int error=qs_evaluate(&eval,root==5?(tuple[1].value?3:0):(int)root,&expected);
+            assert(!!vectors[root].errors[r]==!!error);
+            if(error) continue;
+            struct qs_cell actual=qs_vector_cell(&p,vectors,root,r);
+            assert(!vectors[root].errors[r] && actual.isnull==expected.isnull);
+            if(!actual.isnull) assert(actual.value==expected.value && actual.scale==expected.scale && actual.dscale==expected.dscale);
+        }
     }
+    selected[0]=QS_VECTOR_ROWS;
+    assert(qs_vector_execute_input(&p,NULL,selected,0,1,needed,vectors,input));
+    assert(qs_vector_execute_input(&p,NULL,NULL,QS_VECTOR_ROWS,1,needed,vectors,input));
+    assert(!qs_vector_execute_input(&p,NULL,NULL,QS_VECTOR_ROWS,0,needed,vectors,input));
     free(columns); free(vectors);
 }
 static void string_views(void)
