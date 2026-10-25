@@ -1,6 +1,19 @@
 # 当前性能与未完成项（2026-10-25）
 
-## 当前：索引匹配侧的批次过滤与投影
+## 当前：减少PG的LOAD请求构建工作
+
+PG继续负责已有文件extent映射和SNIA batch编排。映射已按logical_offset排序并验证覆盖；页请求现在二分定位第一个相交extent，再遍历实际覆盖范围，不从文件开头重复查找。LOAD直接构造成CsBatchRequest交给SNIA快照，去掉中间CsStorageRequest到batch的再次分配、复制和释放；同步请求仍使用该对象内的StorageIo。SNIA接口、批次依赖、设备程序、固件、缓存和FDM布局保持原样。
+
+Guest重编安装及布局CTest通过。[规范Q4/Q21逐查询冷启动回归](../../../../results/tpch.3XaAzy/timings.csv)均正确、完整卸载且快于同轮host，8 CU / 256MiB workmem / 64MiB FDM不变，未运行完整TPC-H。
+
+| 查询 | host ms | CSD ms |
+| --- | ---: | ---: |
+| Q4 | 2428.248 | 572.397 |
+| Q21 | 2711.187 | 1008.216 |
+
+Q21修改前后三次独立冷启动profile保存在results/q21-request-boundary，原路径为q21-1/2/3.log，当前为q21-mapping-1/2/3.log。LOAD构建累计计时中位数80.349→75.919ms，CSF累计CPU 3050.377→3004.326ms；查询树墙钟存在明显波动，不能把其差值都归因于请求构建。当前仍约4187个LOAD请求、3847次callback续交（各自中位数），三次均无spill、workmem峰值约7.3MiB。主要问题仍是大量细碎页请求及跨请求推进，不是工作内存不足；批次中连续的目标AFDM地址是现有LOAD合并的必要条件，减少页数不能以增加碎片请求为代价。暂不扩容FDM。
+
+## 索引匹配侧的批次过滤与投影
 
 参考DuckDB连接算子对中间DataChunk执行表达式并保留选择向量的方式，设备Index Join的多行匹配复用现有向量引擎，先筛选右侧行，再计算存活行的输出表达式；输入直接引用原解码列。文本输出在消费时转为字典ID，错误按消费顺序报告，保留LIMIT可提前停止的语义。纯列投影、单行匹配、SEMI/ANTI及不支持的表达式沿用原路径；没有在固件或SNIA增加SQL状态。
 

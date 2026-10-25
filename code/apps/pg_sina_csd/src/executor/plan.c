@@ -326,8 +326,12 @@ static void start(PlanStateCsd *s)
 }
 static CS_STATUS append_ranges(CsBlockIo *io,const struct qs_request *file,const struct qs_extent *extents,uint64_t at,uint64_t end)
 {
-    for(unsigned e=0;e<file->nextents && at<end;++e) {
-        if(extents[e].logical+extents[e].bytes<=at) continue;
+    unsigned lo=0,hi=file->nextents;
+    while(lo<hi) {
+        unsigned mid=lo+(hi-lo)/2;
+        if(extents[mid].logical+extents[mid].bytes<=at) lo=mid+1; else hi=mid;
+    }
+    for(unsigned e=lo;e<file->nextents && at<end;++e) {
         if(extents[e].logical>at) return CS_INVALID_ARG;
         uint64_t n=Min(end,extents[e].logical+extents[e].bytes)-at;
         CSBlockRange range={file->nsid,extents[e].lba+(at-extents[e].logical)/file->lba_bytes,n/file->lba_bytes};
@@ -392,18 +396,14 @@ static CS_STATUS queue_scan(struct plan_slot *slot)
 done:
     free(compute); free(load); return status;
 }
-static CS_STATUS configure_load(PlanStateCsd *s,unsigned worker,CsStorageRequest *load)
+static CS_STATUS configure_load(PlanStateCsd *s,unsigned worker,CsBatchRequest *load)
 {
     struct plan_slot *slot=&s->slots[worker];
-    if(!slot->resume) return csQueueStorageRequest(load,NULL,NULL,NULL,NULL,NULL);
-    size_t bytes=sizeof(CsBatchRequest)+load->u.BlockIo.NumRanges*sizeof(CSBlockRange);
-    CsBatchRequest *request=calloc(1,bytes); if(!request) return CS_OUT_OF_RESOURCES;
-    request->ReqType=CS_STORAGE_IO;
-    memcpy(&request->u.StorageIo,load,sizeof(*load)+load->u.BlockIo.NumRanges*sizeof(CSBlockRange));
+    if(!slot->resume) return csQueueStorageRequest(&load->u.StorageIo,NULL,NULL,NULL,NULL,NULL);
     CS_BATCH_INDEX current;
-    CS_STATUS status=csConfigureBatchEntry(slot->resume,CS_BATCH_ADD,request,0,slot->previous,&current);
+    CS_STATUS status=csConfigureBatchEntry(slot->resume,CS_BATCH_ADD,load,0,slot->previous,&current);
     if(status==CS_SUCCESS) slot->previous=current;
-    free(request); return status;
+    return status;
 }
 /* Uses immutable mappings and SNIA only: it is also safe in a callback. */
 static CS_STATUS load_pages(PlanStateCsd *s,unsigned worker)
@@ -419,10 +419,11 @@ static CS_STATUS load_pages(PlanStateCsd *s,unsigned worker)
         for(unsigned j=0;j<c->index_nreads;) {
             unsigned first=j++; const struct qs_index_read *read=&c->index_reads[first];
             while(j<c->index_nreads && c->index_reads[j].slot==read->slot+j-first) ++j;
-            CsStorageRequest *load=calloc(1,sizeof(*load)+((j-first)*(max_extents+1))*sizeof(CSBlockRange));
+            CsBatchRequest *load=calloc(1,sizeof(*load)+((j-first)*(max_extents+1))*sizeof(CSBlockRange));
             if(!load) return CS_OUT_OF_RESOURCES;
-            load->Mode=CS_STORAGE_BLOCK_IO; load->DevHandle=s->device;
-            CsBlockIo *io=&load->u.BlockIo; io->Type=CS_STORAGE_LOAD_TYPE;
+            load->ReqType=CS_STORAGE_IO;
+            load->u.StorageIo.Mode=CS_STORAGE_BLOCK_IO; load->u.StorageIo.DevHandle=s->device;
+            CsBlockIo *io=&load->u.StorageIo.u.BlockIo; io->Type=CS_STORAGE_LOAD_TYPE;
             io->DevMem=(CsDevAFDM){s->memory[3],input+QS_SORT_IO_BYTES+(size_t)read->slot*QS_PAGE};
             CS_STATUS status=CS_SUCCESS;
             for(unsigned k=first;k<j;++k) {
@@ -439,10 +440,11 @@ static CS_STATUS load_pages(PlanStateCsd *s,unsigned worker)
     } else {
         if(c->offset>s->files[node].bytes || c->bytes>s->files[node].bytes-c->offset) return CS_INVALID_ARG;
         const struct qs_request *file=&s->files[node];
-        CsStorageRequest *load=calloc(1,sizeof(*load)+(file->nextents+1)*sizeof(CSBlockRange));
+        CsBatchRequest *load=calloc(1,sizeof(*load)+(file->nextents+1)*sizeof(CSBlockRange));
         if(!load) return CS_OUT_OF_RESOURCES;
-        load->Mode=CS_STORAGE_BLOCK_IO; load->DevHandle=s->device;
-        CsBlockIo *io=&load->u.BlockIo; io->Type=CS_STORAGE_LOAD_TYPE; io->DevMem=(CsDevAFDM){s->memory[3],input};
+        load->ReqType=CS_STORAGE_IO;
+        load->u.StorageIo.Mode=CS_STORAGE_BLOCK_IO; load->u.StorageIo.DevHandle=s->device;
+        CsBlockIo *io=&load->u.StorageIo.u.BlockIo; io->Type=CS_STORAGE_LOAD_TYPE; io->DevMem=(CsDevAFDM){s->memory[3],input};
         CS_STATUS status=append_ranges(io,file,s->extents[node],c->offset,c->offset+c->bytes);
         if(status==CS_SUCCESS) status=configure_load(s,worker,load);
         free(load); if(status!=CS_SUCCESS) return status;
