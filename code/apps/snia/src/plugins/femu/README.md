@@ -25,7 +25,15 @@
 
 仅含 LOAD/STORE/compute 的 batch 经 queueBatchRequest 编码为一条 E9，设备读取依赖图并自主推进。设备在内部解释 NEED_STORE/LOAD/FREE，使用隐藏临时空间，I/O 完成后重入同一 CSF；Guest 不逐节点处理完成值。含 Host↔AFDM 等复制的 batch 在任何节点执行前选择公共软件调度，其中每个 compute 仍用单节点设备图处理内部重入。finishBatchExecution 只负责混合批次失败时回收此前节点新建的 token。
 
-include/csd-graph.h 是设备私有线格式，与 FEMU 同名头保持一致，由针对性测试检查；它不安装为应用公开头文件。新插件要求支持 E9/EA 的新固件，公共插件操作表使用 ABI 3，须配套重新编译。
+include/csd-graph.h 是设备私有线格式，与 FEMU 同名头保持一致，由针对性测试检查；随设备程序头安装，不是主机应用的SNIA入口。主机应用仍只包含cs.h。新插件要求支持 E9/EA 的新固件，公共插件操作表使用 ABI 3，须配套重新编译。
+
+## CSF自主请求namespace读取
+
+这是FEMU设备图扩展，不是新增SNIA API或CS_STATUS。CSF在最后一个MR的开头写入1～64个`femu_graph_read`记录，然后返回`csNeedNvmRead(count)`。每个记录包含namespace ID、LBA、块数，以及本次调用的目标MR下标和MR内偏移，字段按小端写入。记录不包含文件名、表、SQL或extent；调用程序必须先取得物理地址。目标数据直接由NVM进入AFDM，不经Guest。
+
+设备先复制并验证整批记录，再沿原I/O完成事件队列逐范围读取；描述区可以与目标区重叠，不会影响已复制的后续记录。全部完成后在原CSF上重入，cparam2为本批count。CSF应在自己的workmem状态中记录正在等待namespace读取，入口使用csIsReentry判断并接续；不能把count误当作spill token。不同MR、namespace越界、目标越界、零块或保留字段非零均拒绝。原NEED_STORE/LOAD/FREE含义不变。
+
+现阶段FEMU编译和mock批次协议测试通过，生产Guest尚未切换此固件，PG尚未接入；不能把协议测试当作真实设备I/O时序或查询性能验证。[测试CSF](../../../tests/femu/cs_nvm_read.c)连续两次请求读取，覆盖描述区重叠及非法范围。
 
 ## 性能诊断
 

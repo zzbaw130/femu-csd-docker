@@ -211,6 +211,32 @@ int main(void)
     CS_CSF_ID sink = load(d, "merge-sort.so", "sort_sink", "sink", 201),
               source = load(d, "merge-sort.so", "sort_source", "source", 202),
               average = load(d, "cs-example-avg.so", "avg_int32", "avg", 203);
+    CS_CSF_ID reader=load(d,"cs-nvm-read-test-csf.so","cs_test_nvm_read","nvm-reader",204);
+    CS_MEM_HANDLE read_mem,read_io;
+    OK(csAllocMem(d,4096,&f,&read_mem,NULL)); OK(csAllocMem(d,4096,&f,&read_io,NULL));
+    CsBatchRequest *read=calloc(1,sizeof(*read)+3*sizeof(CsComputeArg)); CHECK(read);
+    read->ReqType=CS_QUEUE_COMPUTE;
+    read->u.Compute.CSFId=reader; read->u.Compute.NumArgs=3;
+    csHelperSetComputeArg(&read->u.Compute.Args[0],CS_AFDM_TYPE,read_mem,0UL);
+    csHelperSetComputeArg(&read->u.Compute.Args[1],CS_AFDM_TYPE,read_io,0UL);
+    csHelperSetComputeArg(&read->u.Compute.Args[2],CS_64BIT_VALUE_TYPE,(u64)0);
+    CS_BATCH_HANDLE read_batch; CS_BATCH_INDEX read_index;
+    OK(csAllocBatchRequest(CS_BATCH_SERIAL,1,&read_batch));
+    OK(csConfigureBatchEntry(read_batch,CS_BATCH_ADD,read,0,0,&read_index));
+    u64 read_value=0,graphs=mock_graph_commands();
+    OK(csQueueBatchRequest(read_batch,NULL,NULL,NULL,NULL,&read_value));
+    CHECK(read_value==0xbeef && mock_graph_commands()==graphs+1);
+    OK(copy(read_mem,buf,sizeof(buf),CS_COPY_FROM_DEVICE,512));
+    for(unsigned i=0;i<sizeof(buf);++i) CHECK(buf[i]==0xa5);
+    for(unsigned invalid=1;invalid<=6;++invalid) {
+        csHelperSetComputeArg(&read->u.Compute.Args[2],CS_64BIT_VALUE_TYPE,(u64)invalid);
+        OK(csConfigureBatchEntry(read_batch,CS_BATCH_RECONFIG,read,read_index,0,NULL));
+        CHECK(csQueueBatchRequest(read_batch,NULL,NULL,NULL,NULL,NULL)!=CS_SUCCESS);
+        OK(copy(read_io,buf,sizeof(buf),CS_COPY_FROM_DEVICE,0));
+        CHECK(buf[0]==1 && buf[4]==1); /* no read issued before all ranges validate */
+    }
+    OK(csFreeBatchRequest(read_batch)); free(read);
+    OK(csFreeMem(read_mem,&f)); OK(csFreeMem(read_io,&f));
     int n = 0;
     CHECK(csQueryDeviceProperties(d, CS_FDM_TYPE, &n, NULL) == CS_INVALID_LENGTH);
     CsProperties *props = calloc(1, n);
@@ -235,7 +261,7 @@ int main(void)
     CHECK(csQueryDeviceProperties(d, CS_CSF_TYPE, &n, NULL) == CS_INVALID_LENGTH);
     props = calloc(1, n);
     OK(csQueryDeviceProperties(d, CS_CSF_TYPE, &n, props));
-    CHECK(props->CSFDetails[0].NumCSFs == 3);
+    CHECK(props->CSFDetails[0].NumCSFs == 4);
     free(props);
     // A standard COPY batch exercises request snapshots and dependency edits without toy CSFs.
     uint32_t values[] = {9, 17}, copied_value = 0;

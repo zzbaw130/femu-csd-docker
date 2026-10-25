@@ -17,5 +17,5 @@ endfunction()
 set(FEMU_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 femu_plugin(cs-femu "${FEMU_DIR}/internal/femu_nvme_transport.c" "${PROJECT_BINARY_DIR}/snia")
 install(TARGETS cs-femu LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/snia)
-install(FILES include/femu-csd-kernel.h include/cs_csf.h
+install(FILES include/femu-csd-kernel.h include/cs_csf.h include/csd-graph.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/snia/femu)

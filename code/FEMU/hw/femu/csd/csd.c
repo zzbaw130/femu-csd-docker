@@ -120,6 +120,7 @@ typedef struct FemuCsdGraphNode {
     uint64_t deadline, result, transferred, range_blocks;
     uint64_t io_action, io_token, io_bytes;
     FemuCsdSpill *spill;
+    struct femu_graph_read *reads;
     uint16_t status;
     FemuCsdGraph *graph;
     uint64_t dependents;
@@ -1729,6 +1730,7 @@ static void csd_graph_destroy_locked(FemuCsdState *csd, FemuCsdGraph *g)
         qatomic_dec(&csd->ready_count);
     }
     for (unsigned i = 0; i < g->count; i++) {
+        g_free(g->nodes[i].reads);
         if (g->nodes[i].pos) { pqueue_remove(csd->graph_events, &g->nodes[i]); }
         if (g->nodes[i].job) {
             csd_job_free_locked(g->nodes[i].job);
@@ -2040,6 +2042,43 @@ static uint16_t csd_graph_spill_begin(FemuCsdState *csd, FemuCsdGraph *g,
     return NVME_SUCCESS;
 }
 
+static uint16_t csd_graph_read_begin(FemuCsdGraph *g, FemuCsdGraphNode *v)
+{
+    FemuCsdJob *job = v->job;
+    NvmeNamespace *ns = g->session->ns;
+    uint64_t count = v->result & GRAPH_IO_MASK, total = 0;
+    if (!job->args.numr || v->wire.cparam2 || !count ||
+        count > FEMU_CSD_GRAPH_MAX_NODES ||
+        count * sizeof(*v->reads) > job->args.mr_len[job->args.numr - 1]) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    struct femu_graph_read *reads = g_new(struct femu_graph_read, count);
+    memcpy(reads, job->args.mr_addr[job->args.numr - 1], count * sizeof(*reads));
+    /* Validate the whole snapshot before issuing I/O. In particular a target
+     * may overlap the descriptor MR without changing subsequent requests. */
+    for (unsigned i = 0; i < count; i++) {
+        struct femu_graph_read *r = &reads[i];
+        r->nsid = le32_to_cpu(r->nsid); r->blocks = le32_to_cpu(r->blocks);
+        r->afdm_index = le32_to_cpu(r->afdm_index); r->lba = le64_to_cpu(r->lba);
+        r->offset = le64_to_cpu(r->offset);
+        uint64_t bytes = (uint64_t)r->blocks << ns->lbaf.lbads;
+        if (r->reserved || r->nsid != ns->id || !r->blocks ||
+            r->afdm_index >= job->args.numr ||
+            r->lba > le64_to_cpu(ns->id_ns.nsze) ||
+            r->blocks > le64_to_cpu(ns->id_ns.nsze) - r->lba ||
+            r->offset > job->args.mr_len[r->afdm_index] ||
+            bytes > job->args.mr_len[r->afdm_index] - r->offset ||
+            bytes > UINT64_MAX - total) {
+            g_free(reads); return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        total += bytes;
+    }
+    v->reads = reads; v->range = 0; v->range_blocks = 0;
+    v->io_action = 4; v->io_token = count; v->io_bytes = total;
+    v->transferred = 0; v->state = GRAPH_IO;
+    return NVME_SUCCESS;
+}
+
 static void csd_graph_io(FemuCsdState *csd, FemuCsdGraph *g, FemuCsdGraphNode *v,
                           uint64_t now)
 {
@@ -2050,7 +2089,20 @@ static void csd_graph_io(FemuCsdState *csd, FemuCsdGraph *g, FemuCsdGraphNode *v
         qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : 0;
     uint16_t status;
     NvmeRequest req = { .ns = ns, .stime = now, .expire_time = now };
-    if (v->job) {
+    if (v->job && v->io_action == 4) {
+        const struct femu_graph_read *r = &v->reads[v->range];
+        uint32_t blocks = MIN((uint64_t)65536, r->blocks - v->range_blocks);
+        bytes = (uint64_t)blocks << ns->lbaf.lbads;
+        NvmeCsdNvmToAfdmCmd *copy = (void *)&req.cmd;
+        copy->opcode = NVME_CMD_CSD_NVM_TO_AFDM;
+        copy->slba = cpu_to_le64(r->lba + v->range_blocks);
+        copy->nlb = cpu_to_le16(blocks - 1);
+        copy->offset = cpu_to_le64(r->offset + (v->range_blocks << ns->lbaf.lbads));
+        status = csd_nvm_copy_locked(n, ns, &req, &lat, v->job->afdms[r->afdm_index]);
+        if (status) { g->status = status; return; }
+        v->transferred += bytes; v->range_blocks += blocks;
+        if (v->range_blocks == r->blocks) { v->range++; v->range_blocks = 0; }
+    } else if (v->job) {
         FemuCsdSpill *s = v->spill;
         if (v->io_action == 3) {
             s->busy--; v->spill = NULL;
@@ -2149,8 +2201,9 @@ void femu_csd_graph_poll(FemuCtrl *n)
                 g->status = v->status ? v->status : NVME_INTERNAL_DEV_ERROR;
                 g->result = v - g->nodes + 1;
                 csd_graph_node_done(csd, v);
-            } else if ((v->result >> 60) >= 1 && (v->result >> 60) <= 3) {
-                g->status = csd_graph_spill_begin(csd, g, v);
+            } else if ((v->result >> 60) >= 1 && (v->result >> 60) <= 4) {
+                g->status = (v->result >> 60) == 4 ? csd_graph_read_begin(g, v) :
+                    csd_graph_spill_begin(csd, g, v);
                 if (!g->status) { csd_graph_io(csd, g, v, now); }
                 if (g->status) { g->result = v - g->nodes + 1; csd_graph_node_done(csd, v); }
             } else { csd_graph_node_done(csd, v); }
@@ -2160,6 +2213,7 @@ void femu_csd_graph_poll(FemuCtrl *n)
                 csd_graph_io(csd, g, v, now);
                 if (g->status) { g->result = v - g->nodes + 1; csd_graph_node_done(csd, v); }
             } else if (v->job) {
+                g_free(v->reads); v->reads = NULL;
                 if (v->spill) { v->spill->busy--; v->spill = NULL; }
                 v->job->args.cparam2 = v->io_token; v->io_action = 0;
                 csd_graph_compute_ready(csd, v, now);

@@ -525,6 +525,12 @@ spill行保存分组键及各聚合的SUM/count，沿用原有排序归并、重
 
 新增Hash Join文本输出用例检查CASE抑制负长度分支、NULL、LIMIT错误时机和清理；NativePlan及8/16/64 CU共4项CTest通过。已重编部署pg-sina-plan.so，规范Q7/Q13/Q22冷启动均结果正确、完整卸载且快于同轮host。Q22 profile累计CPU未明显下降，不以接续覆盖代替性能收益证明；Index右侧谓词、多聚合分组和跨请求推进仍未完成。本阶段未重复完整22条，当前记录见performance.md。
 
+## 设备图自主namespace读取：协议实现（2026-10-25）
+
+为消除索引页请求返回PG再提交的边界，先补齐通用CSF请求namespace读取的设备能力。CSF将物理NVM范围和目标MR/偏移写入最后一个MR，返回csNeedNvmRead(count)；设备复制、验证整批记录，经既有FTL、AFDM复制和I/O完成事件继续执行，完成后用cparam2=count重入同一CSF。它不识别表、extent或SQL，不改SNIA标准API、原spill token含义或femu_csd_args布局。描述快照允许读取覆盖描述区，验证全部通过后才发起I/O；MR和namespace越界、零块和保留字段错误会失败。
+
+FEMU已在容器实际源码目录编译通过，SNIA相关6项CTest通过，覆盖两次设备重入、描述区重叠、非法范围、失败后的内存释放及线格式副本一致性。mock仅验证协议，不证明真实固件执行或时序。生产Guest仍运行此前固件，PG尚未传入extent映射或接入该请求；下一阶段需部署并验证实际设备，再减少PG续交。尚无新的TPC-H成绩，不将此阶段视为往返瓶颈已解决，也未扩大FDM。
+
 ## PG页请求构建（2026-10-25）
 
 对已排序且覆盖验证通过的extent映射使用二分定位，再追加实际相交范围；LOAD直接构建SNIA batch条目，删除中间请求的重复分配和复制。保留PG映射职责、SNIA请求快照/依赖规则及设备通用执行接口，不增加协议、配置或FDM。

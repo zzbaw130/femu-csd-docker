@@ -203,9 +203,41 @@ static CS_STATUS mock_graph(struct cs_device *d,struct nvme_passthru_cmd64 *c)
                     c->result=exec.result;
                     if((int64_t)exec.result<0) status=CS_ERROR_IN_EXECUTION;
                     uint64_t action=exec.result>>60,payload=exec.result&CS_IO_VALUE_MASK;
-                    if(status!=CS_SUCCESS || action<1 || action>3) break;
+                    if(status!=CS_SUCCESS || action<1 || action>4) break;
                     uint64_t mrid;
                     memcpy(&mrid,(void *)(uintptr_t)(exec.addr+(exec.cdw3-1)*32+8),8);
+                    if(action==4) {
+                        struct femu_graph_read reads[FEMU_CSD_GRAPH_MAX_NODES];
+                        uint64_t ids[FEMU_CSD_GRAPH_MAX_NODES];
+                        pthread_mutex_lock(&lock);
+                        if(!payload || payload>FEMU_CSD_GRAPH_MAX_NODES || payload*sizeof(*reads)>sizes[mrid]) status=CS_INVALID_LENGTH;
+                        else {
+                            memcpy(reads,memory[mrid],payload*sizeof(*reads));
+                            for(unsigned k=0;k<payload && status==CS_SUCCESS;++k) {
+                                struct femu_graph_read *r=&reads[k];
+                                unsigned target=le32toh(r->afdm_index),blocks=le32toh(r->blocks);
+                                uint64_t offset=le64toh(r->offset),lba=le64toh(r->lba);
+                                if(target>=exec.cdw3) { status=CS_INVALID_ARG; break; }
+                                memcpy(&ids[k],(void *)(uintptr_t)(exec.addr+target*32+8),8);
+                                if(r->reserved || le32toh(r->nsid)!=(unsigned)d->nsid || !blocks ||
+                                    lba>sizeof(nvm)/512 || blocks>sizeof(nvm)/512-lba ||
+                                    offset>sizes[ids[k]] || (uint64_t)blocks*512>sizes[ids[k]]-offset) status=CS_INVALID_LENGTH;
+                            }
+                        }
+                        pthread_mutex_unlock(&lock);
+                        for(unsigned k=0;k<payload && status==CS_SUCCESS;++k) {
+                            struct femu_graph_read *r=&reads[k];
+                            uint64_t lba=le64toh(r->lba),off=le64toh(r->offset),left=le32toh(r->blocks);
+                            while(left && status==CS_SUCCESS) {
+                                unsigned blocks=left>65536?65536:left;
+                                struct nvme_passthru_cmd64 io={.opcode=0xd0,.nsid=d->nsid,
+                                    .cdw10=lba,.cdw11=lba>>32,.cdw12=blocks-1,.cdw13=ids[k],.cdw14=off,.cdw15=off>>32};
+                                status=cs_io64(d,false,&io); lba+=blocks; off+=(uint64_t)blocks*512; left-=blocks;
+                            }
+                        }
+                        if(status!=CS_SUCCESS) break;
+                        exec.cdw12=payload; exec.cdw13=0; continue;
+                    }
                     pthread_mutex_lock(&lock);
                     unsigned token=payload;
                     if(action==1) {

@@ -26,4 +26,10 @@ struct femu_graph_node {
     uint32_t data_bytes, reserved;
 };
 struct femu_graph_range { uint32_t nsid, blocks; uint64_t lba; };
+/* CSF-requested namespace reads. Records occupy the last MR from offset zero;
+ * afdm_index selects another MR of that same invocation. All fields are LE. */
+struct femu_graph_read {
+    uint32_t nsid, blocks, afdm_index, reserved;
+    uint64_t lba, offset;
+};
 #endif
