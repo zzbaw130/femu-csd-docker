@@ -20,6 +20,8 @@
 
 并行 Heap 顺序扫描由 Guest 按空闲 worker 提前分配不重叠的数据块，提交 `LOAD→CSF`。CSF 的现有 cparam1 低位保留 profile 和 worker 编号，位 8 表示此次附带已安排的输入，位 9 以上为 Heap 页号；cparam2 仍仅用于 spill 重入。这是本应用的计算参数约定，不改变 SNIA/FEMU 接口。设备接收输入后连续执行当前算子链，CompValue 的低三位分别表示有输出、输入耗尽、worker 完成，省去每块数据的控制记录读取和 ready 写入；有输出尚未被下游消费时不覆盖缓冲。共享 Hash/聚合 Sink 能消费下一批时，在同一次 CSF 内继续处理当前输入块。
 
+其余worker（索引、聚合Source、Combine等）的普通完成同样使用CompValue的有输出/完成位；输入耗尽位仅用于主机分配的扫描块。位3表示仍有页请求需要主机读取控制记录并补交LOAD，已由设备图处理的读取不设置该位。PG可由完成值直接判断是否推进或等待协调端，无须每次读完整AFDM控制记录。新阶段的worker控制记录由设备初始化，PG只清空自己的副本，不读回设备私有state指针。该完成值约定只属于本SQL程序，PG扩展与pg-sina-plan.so须一起构建部署，不改变SNIA/FEMU协议。
+
 通用树的共享字典由设备 SQL 程序在查询根 workmem 中建立，按需增长，所有 CU 引用同一组稳定 ID。旧存储保留到查询结束以保证借用的字节仍有效，增长的全部存储计入查询总预算；AFDM 中只传配置。已带字典 ID 的输入导入后保持原 ID。独立算子仍可接收原有平铺字典输入。字典本身尚不支持 spill，分配失败不会破坏旧数据，但会返回设备错误。
 
 索引及串行Scan需要namespace页时，设备SQL程序根据PG预先提供的extent映射生成物理读取范围，返回 `csNeedNvmRead`，由FEMU通用设备图完成内部读取并重入同一CSF。映射缺失或一次读取范围超过设备上限时，才把控制记录交回Guest，由其提交 `csQueueStorageRequest(NVM_TO_AFDM)`；独立worker通过SNIA回调续交，协调端由PG线程续交。主机LOAD后的Compute使用已有cparam1中的QP_PAGES_INPUT标志设置就绪状态，省去独立FDM控制写入；该标志不在spill重入时重复应用，与QP_SCAN_INPUT的页号编码互斥，定义见私有plan.h。扫描块由Guest根据FDM容量在4/2/1MiB中选择，索引按需读取8KiB页。原始数据不经过Guest PG缓冲。spill需要时，设备SQL程序返回 `csNeedStore/Load/Free` 完成值，FEMU设备图在隐藏临时空间中执行并重入；SNIA保留非设备图请求的调度路径。PG不接收或解释中间行，FEMU和SNIA不解释表、索引或SQL语义。

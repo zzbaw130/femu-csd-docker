@@ -13,10 +13,12 @@
 #define QP_SCAN_INPUT (UINT64_C(1)<<8)
 #define QP_SCAN_PAGE_SHIFT 9
 #define QP_PAGES_INPUT (UINT64_C(1)<<9)
-/* Ordinary CompValue bits for a host-scheduled scan, below SNIA spill bits. */
+/* Worker completion bits, below SNIA spill bits. Only CONTROL_REQUIRED needs
+ * the full AFDM record to submit a page request not handled by device I/O. */
 #define QP_OUTPUT_READY 1U
 #define QP_INPUT_DRAINED 2U
 #define QP_WORKER_FINISHED 4U
+#define QP_CONTROL_REQUIRED 8U
 enum qp_kind { QP_SCAN, QP_PROJECT, QP_JOIN, QP_AGGREGATE, QP_SORT, QP_LIMIT, QP_INDEX_JOIN, QP_CTE_SCAN, QP_MATERIALIZED, QP_SET };
 enum qp_join { QP_INNER, QP_LEFT, QP_SEMI, QP_ANTI };
 enum qp_expr { QP_PARAMETER=Q_PARAMETER, QP_LIKE=Q_LIKE, QP_SUBSTRING=Q_SUBSTRING,

@@ -887,3 +887,30 @@ NativePlan及8/16/64 CU四项CTest、ASan/UBSan/LeakSanitizer原生与8CU两项�
 五条均逐字节匹配、完整卸载且快于同轮host；每次测量独立清除PG缓冲和Guest page cache。Q10另记录旧、新各一次冷启动profile：[旧版](../../../../results/sort-columns.bbZceW/10.before.profile.log)、[新版](../../../../results/sort-columns.bbZceW/10.after.profile.log)。总CSF CPU为4753.891/3945.241ms，workmem峰值204013456/203682160字节，两次均无spill。Sort Sink CPU为30.002/38.277ms：原先生产者侧的逐行复制未计入该项，新版直接写run已计入，因此这项不是相同计时边界；不能据此认定排序计算退化。扫描与调度也有变化，单次样本不足以把总CPU下降归因于本次改动，不宣称稳定延迟收益。
 
 本阶段去掉输入中间行，不改变run的行存储和串行归并。字符串字典spill、归并并行化及部分阻塞阶段主机续交继续保留为未完成项，本轮未重复全量22条。
+
+
+## worker完成值替代重复控制记录读取
+
+参照DuckDB PipelineExecutor分别初始化局部Source/Sink状态、根据完成状态推进的职责，PG不再读回设备刚清零的worker控制记录：设备私有state指针不参与PG编排。原顺序扫描使用的CompValue输出/完成位扩展到Index、聚合Source和Combine等worker；仅当namespace映射不能覆盖、需要主机补交页请求时设置位3，PG才读取完整AFDM控制记录。错误仍走原错误状态与控制记录。输入耗尽位只表示主机分配扫描块的消费完成，Combine不会继承上一阶段的耗尽标记。
+
+这是PG与设备SQL SO的私有完成值约定，须同步构建部署；没有修改SNIA API、通用设备图、CU策略或AFDM布局。共享表增长/spill所需屏障保持，FEMU不解释SQL阶段。四项原生/8/16/64 CU组件、两项ASan/UBSan/LeakSanitizer及Guest堆布局检查通过；worker测试同时核对完成值与AFDM实际输出、结束及待补交页请求，包括原无映射路径和设备内部I/O。
+
+[原始profile目录](../../../../results/worker-completion.RUbcOK)中Q10/Q13/Q21的旧、新版本各一次独立冷启动：
+
+| 查询 | 完成控制读取 旧→新 | 查询树墙钟ms 旧→新 |
+| --- | ---: | ---: |
+| Q10 | 27→11 | 1669.273→1870.334 |
+| Q13 | 64→6 | 304.320→297.772 |
+| Q21 | 37→5 | 899.962→1028.840 |
+
+新阶段初始worker记录的读取也已删除；它原来没有计入上述完成读取计数，不能重复加入降幅。单次profile延迟未一致下降，不宣称稳定加速或屏障被消除。部署后的[默认规范冷启动回归](../../../../results/tpch.pXmX0U/timings.csv)如下，均逐字节匹配、完整卸载且快于同轮host：
+
+| 查询 | host ms | CSD ms |
+| --- | ---: | ---: |
+| Q10 | 2613.187 | 968.483 |
+| Q13 | 1112.096 | 331.276 |
+| Q18 | 7457.041 | 1006.576 |
+| Q21 | 2085.847 | 965.011 |
+| Q22 | 613.821 | 329.884 |
+
+资源仍为8 CU、256MiB workmem、64MiB FDM，10次测量均有独立清缓存标记。另将规范Q21限制为150ms超时，确认取消后同一连接重新执行全部结果与规范host逐字节一致；日志为同profile目录的21.cancel-recover.log/.err，未新建测试SQL。整体CU利用率、部分阻塞阶段续交、归并并行化及字符串字典spill仍未完成；本轮未重复全量22条。

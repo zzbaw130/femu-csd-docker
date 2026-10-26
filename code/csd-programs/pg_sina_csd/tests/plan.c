@@ -271,10 +271,12 @@ static void *probe_worker(void *arg)
             t->args.cparam2=spill_request(t->spill,op,id,t->args.mr_addr[4]); continue;
         }
         t->args.cparam2=0;
+        assert((unsigned)status<=15);
+        assert(((status&QP_OUTPUT_READY)!=0)==(t->out->rows!=0));
+        assert(((status&QP_WORKER_FINISHED)!=0)==(t->out->finished!=0));
+        assert(((status&QP_CONTROL_REQUIRED)!=0)==(!c->ready && (c->bytes || c->index_nreads)));
         if(t->next_offset) {
             assert((unsigned)status<=7);
-            assert(((status&QP_OUTPUT_READY)!=0)==(t->out->rows!=0));
-            assert(((status&QP_WORKER_FINISHED)!=0)==(t->out->finished!=0));
             *t->need_input=(status&QP_INPUT_DRAINED)!=0;
         }
         if(t->out->rows || t->out->finished) return NULL;
@@ -1349,7 +1351,7 @@ static void local_group_merge(function run,int large_merge)
                 void *ranges[]={p,c,out,arena,io+(w+1)*QS_SORT_IO_BYTES};
                 long long lengths[]={len[0],len[1],len[2],len[3],QS_SORT_IO_BYTES};
                 struct femu_csd_args a={.numr=5,.mr_addr=ranges,.mr_len=lengths,.cparam1=((w+1)<<1)|1};
-                assert(!run(&a) && out[w+1].finished && !out[w+1].rows);
+                assert(run(&a)==QP_WORKER_FINISHED && out[w+1].finished && !out[w+1].rows);
             }
             c->available=qp_worker_mask(workers);
         }

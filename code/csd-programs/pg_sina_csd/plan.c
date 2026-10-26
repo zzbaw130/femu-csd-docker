@@ -4018,9 +4018,10 @@ combined:
     struct cs_work_context_stats memory;
     if(!cs_work_get_context_stats(s->context,&memory)) out->metrics.work_peak=memory.peak_used_bytes;
     if(status<0) return status;
-    if(worker && s->host_scan && status<=2)
-        return (out->rows?QP_OUTPUT_READY:0) | (s->scan_drained?QP_INPUT_DRAINED:0) |
-            (out->finished?QP_WORKER_FINISHED:0);
+    if(worker && status<=2)
+        return (out->rows?QP_OUTPUT_READY:0) | (s->host_scan && s->scan_drained?QP_INPUT_DRAINED:0) |
+            (out->finished?QP_WORKER_FINISHED:0) |
+            (!control->ready && (control->bytes || control->index_nreads)?QP_CONTROL_REQUIRED:0);
     if(out->finished && !worker) close_execution(s);
     return status==QP_WAIT?0:status>2?status:0;
 }

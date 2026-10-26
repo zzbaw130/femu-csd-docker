@@ -90,9 +90,15 @@ static void completed(void *context,CS_STATUS status,u64 value)
             if(value==QP_INPUT_DRAINED) next=queue_scan(slot);
         } else {
             PlanStateCsd *s=slot->owner;
-            status=transfer(s->memory[1],slot->worker*sizeof(struct qp_control),
-                &slot->control,sizeof(slot->control),false);
-            if(s->profiling) ++s->completion_reads;
+            if(value&QP_CONTROL_REQUIRED) {
+                status=transfer(s->memory[1],slot->worker*sizeof(struct qp_control),
+                    &slot->control,sizeof(slot->control),false);
+                if(s->profiling) ++s->completion_reads;
+            } else {
+                memset(&slot->control,0,sizeof(slot->control));
+                slot->control.output_rows=(value&QP_OUTPUT_READY)!=0;
+                slot->control.finished=(value&QP_WORKER_FINISHED)!=0;
+            }
             slot->control_copied=status==CS_SUCCESS;
             /* A full sink/output or EOF needs its coordinator. Pure input
              * waits and empty output batches can continue on this CU. */
@@ -574,7 +580,7 @@ static void fetch(PlanStateCsd *s)
                 s->pending_ns+=observed-slot->queued_ns; ++s->completions;
             }
             slot->pending=NULL;
-            if(w && slot->scan_node && status==CS_SUCCESS) {
+            if(w && slot->scan_node && status==CS_SUCCESS && !(value&QP_CONTROL_REQUIRED)) {
                 slot->control.output_rows=(value&QP_OUTPUT_READY)!=0;
                 slot->control.finished=(value&QP_WORKER_FINISHED)!=0;
                 slot->need_input=(value&QP_INPUT_DRAINED)!=0;
@@ -610,8 +616,9 @@ static void fetch(PlanStateCsd *s)
                     worker->ready=worker->done=false;
                     worker->scan_node=slot->control.scan_node;
                     worker->need_input=worker->scan_node!=0;
-                    if(worker->scan_node) memset(&worker->control,0,sizeof(worker->control));
-                    else checked(transfer(s->memory[1],i*sizeof(struct qp_control),&worker->control,sizeof(worker->control),false),"read worker state");
+                    /* The device initializes each phase's worker control to
+                     * zero except its private state pointer. PG never uses it. */
+                    memset(&worker->control,0,sizeof(worker->control));
                 }
             }
             if(s->result->rows>QS_RESULT_ROWS) elog(ERROR,"invalid CSD result page");
