@@ -37,13 +37,17 @@ static unsigned hash_row_bytes(const struct qs_plan *p)
     }
     return bytes;
 }
+static void hash_store_value(unsigned char *to,const struct qs_cell *value,unsigned bytes)
+{
+    memcpy(to,&value->value,bytes);
+    if(bytes<16) to[bytes]=value->isnull;
+    else { to[bytes]=value->scale; to[bytes+1]=value->dscale; to[bytes+2]=value->isnull; }
+}
 static void hash_store(unsigned char *to,const struct qs_cell *from,const struct qs_plan *p)
 {
     for(unsigned i=0;i<p->nout;++i) {
         unsigned bytes=hash_value_bytes(p,i);
-        memcpy(to,&from[i].value,bytes);
-        if(bytes<16) { to[bytes]=from[i].isnull; to+=bytes+1; }
-        else { to[bytes]=from[i].scale; to[bytes+1]=from[i].dscale; to[bytes+2]=from[i].isnull; to+=bytes+3; }
+        hash_store_value(to,&from[i],bytes); to+=bytes+(bytes<16?1:3);
     }
 }
 static void hash_load(struct qs_cell *to,const unsigned char *from,const struct qs_plan *p)
@@ -527,6 +531,19 @@ static void hash_reindex(struct execution *s,unsigned id)
         hash_link(n,o,right,o->right,at);
     }
 }
+/* Reserve a disjoint append range; leave one slot for the owner's next_row(). */
+static unsigned hash_reserve_rows(struct operator_state *o,unsigned rows,unsigned *at)
+{
+    *at=atomic_load_explicit(&o->hash_rows,memory_order_relaxed);
+    unsigned count;
+    do {
+        count=o->hash_capacity-1-*at;
+        if(count>rows) count=rows;
+        if(!count) return 0;
+    } while(!atomic_compare_exchange_weak_explicit(&o->hash_rows,at,*at+count,
+        memory_order_relaxed,memory_order_relaxed));
+    return count;
+}
 static void hash_sink_batch(struct execution *s,struct qs_result *out)
 {
     unsigned id=s->hash_sink-1;
@@ -534,14 +551,8 @@ static void hash_sink_batch(struct execution *s,struct qs_result *out)
     struct operator_state *o=&s->owner->nodes[id];
     const struct qs_plan *right=&s->plan->nodes[n->right].expr;
     if(!o->hash_data || o->hash_fallback) return;
-    unsigned at=atomic_load_explicit(&o->hash_rows,memory_order_relaxed),count;
-    do {
-        /* Leave one slot for the owner's pending next_row(). */
-        count=o->hash_capacity-1-at;
-        if(count>out->rows) count=out->rows;
-        if(!count) return;
-    } while(!atomic_compare_exchange_weak_explicit(&o->hash_rows,&at,at+count,
-        memory_order_relaxed,memory_order_relaxed));
+    unsigned at,count=hash_reserve_rows(o,out->rows,&at);
+    if(!count) return;
     unsigned rb=hash_row_bytes(right);
     for(unsigned i=0;i<count;++i) {
         const struct qs_cell *row=(struct qs_cell *)out->data+(size_t)i*right->nout;
@@ -1556,6 +1567,49 @@ static int64_t projection_next(struct execution *s,unsigned id,struct qs_cell *r
         row[i]=qs_vector_cell(&b->plan,b->vectors,index,b->position);
     }
     ++b->position; ++s->metrics.matched; return 2;
+}
+/* Reference the producer's expression columns, hash only its keys, then
+ * scatter directly into the compact build rows. No intermediate AFDM rows.
+ * A full table leaves the vector cursor for the existing growth/spill path. */
+static int hash_sink_vectors(struct execution *s,unsigned id)
+{
+    struct projection_batch *b=s->nodes[id].projection;
+    const struct qp_node *n=&s->plan->nodes[s->hash_sink-1];
+    struct operator_state *o=&s->owner->nodes[s->hash_sink-1];
+    const struct qs_plan *right=&s->plan->nodes[n->right].expr;
+    if(!o->hash_data || o->hash_fallback) return 0;
+    unsigned at,count=hash_reserve_rows(o,b->count-b->position,&at);
+    if(!count) return 0;
+    uint64_t hashes[QS_VECTOR_ROWS];
+    for(unsigned r=0;r<count;++r) hashes[r]=UINT64_C(0x9e3779b97f4a7c15);
+    for(unsigned k=0;k<n->nkeys;++k) {
+        int index=b->plan.outputs[n->right_keys[k]].index;
+        for(unsigned r=0;r<count;++r) {
+            unsigned row=b->position+r;
+            if(b->vectors[index].errors[row]) return -5;
+            hashes[r]=hash_key(hashes[r],qs_vector_cell(&b->plan,b->vectors,index,row));
+        }
+    }
+    unsigned stride=hash_row_bytes(right),offset=0;
+    for(unsigned col=0;col<right->nout;++col) {
+        int index=b->plan.outputs[col].index;
+        unsigned bytes=hash_value_bytes(right,col);
+        for(unsigned r=0;r<count;++r) {
+            unsigned row=b->position+r;
+            if(b->vectors[index].errors[row]) return -5;
+            struct qs_cell value=qs_vector_cell(&b->plan,b->vectors,index,row);
+            hash_store_value(o->hash_data+(size_t)(at+r)*stride+offset,&value,bytes);
+        }
+        offset+=bytes+(bytes<16?1:3);
+    }
+    uint32_t *next=(void *)(o->hash_data+(size_t)o->hash_capacity*stride);
+    uint32_t *buckets=next+o->hash_capacity;
+    for(unsigned r=0;r<count;++r) {
+        unsigned bucket=hashes[r]&(o->hash_buckets-1);
+        next[at+r]=__atomic_exchange_n(&buckets[bucket],at+r,__ATOMIC_RELAXED);
+    }
+    b->position+=count; s->metrics.matched+=count; s->metrics.build_rows+=count;
+    return 0;
 }
 /* Probe the bucket array as a batch, keeping column payloads borrowed until
  * a candidate needs them. Match-chain state remains in the join operator, so
@@ -3371,6 +3425,30 @@ produce:
     /* STORE reentry must finish consuming the retained output before the
      * producer overwrites it with another batch. */
     if(worker && s->sort_sink && s->pending_sort==s->sort_sink) goto produced;
+    /* A direct resident-group or spilled-partition Source has its own cursor;
+     * projection_init on that node would reopen its original input instead. */
+    if(worker && s->hash_sink && s->source_node!=(int)s->root && plan->nodes[s->root].kind!=QP_AGGREGATE) {
+        unsigned id=s->root;
+        status=projection_init(s,id); if(status<0) goto produced;
+        while(s->nodes[id].projection) {
+            status=projection_fill(s,id);
+            if(status!=2) {
+                if(!status) out->finished=control->finished=1;
+                if(status!=3) goto produced;
+                break;
+            }
+            struct projection_batch *b=s->nodes[id].projection;
+            unsigned before=b->position;
+            uint64_t tick=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
+            status=hash_sink_vectors(s,id);
+            if(s->profiling) { s->sink_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-tick; s->sink_rows+=b->position-before; }
+            if(status<0) goto produced;
+            /* The remaining rows must reach the coordinator before another
+             * input overwrites the vectors; next_row retains their cursor. */
+            if(b->position<b->count) break;
+        }
+        status=2;
+    }
     if(worker && s->group_sink) {
         unsigned id=s->group_sink-1;
         status=projection_init(s,id); if(status<0) goto produced;

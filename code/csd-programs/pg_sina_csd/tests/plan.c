@@ -284,6 +284,7 @@ static void *probe_worker(void *arg)
 static void test(function run,unsigned join,unsigned rows,unsigned right_rows,unsigned memory,int hash,int parallel)
 {
     int direct=parallel==TEST_BUILD_GROUP_DIRECT;
+    int wide_build=parallel==TEST_WIDE_HASH && hash==1;
     int grouped_build=parallel==TEST_BUILD_GROUP_SOURCE || parallel==TEST_BUILD_GROUP_HAVING || direct;
     struct qp_plan *plan=calloc(1,sizeof(*plan)); assert(plan); plan->count=4; plan->scan_bytes=parallel==TEST_LARGE_SCAN?QS_CHUNK:test_workers>4?QS_PAGE:QP_SCAN_BYTES;
     scan(&plan->nodes[2]); scan(&plan->nodes[3]);
@@ -312,6 +313,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         plan->count=5; j->right=4;
         struct qp_node *projection=&plan->nodes[4];
         projection->kind=QP_PROJECT; projection->left=3; projection->right=-1;
+        projection->parallel=wide_build;
         struct qs_plan *p=&projection->expr; p->predicate=-1; p->nattrs=p->nout=2; p->nexprs=4;
         p->exprs[0]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER,.column=0};
         p->exprs[1]=(struct qs_expr){.op=Q_COLUMN,.type=Q_DECIMAL,.column=1,.scale=2};
@@ -506,7 +508,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             indexed->parallel_input=parallel_bytes; parallel_bytes+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE;
             indexed->parallel_vector=parallel_bytes; parallel_bytes+=4096+((qs_chunk_bytes(256,4)+4095)&~(size_t)4095);
         }
-        if(parallel==TEST_BUILD_PHASE || parallel==TEST_BUILD_FALLBACK || grouped_build) {
+        if(parallel==TEST_BUILD_PHASE || parallel==TEST_BUILD_FALLBACK || grouped_build || wide_build) {
             plan->nodes[3].parallel=1;
             plan->nodes[3].parallel_input=plan->nodes[2].parallel_input;
             plan->nodes[3].parallel_vector=plan->nodes[2].parallel_vector;
@@ -543,7 +545,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     }
     void *mr[]={plan,&control,out,arena,io}; long long len[]={plan_bytes,(plan->workers+1)*sizeof(*controls),(plan->workers+1)*sizeof(*out),bytes,(plan->workers+1)*QS_SORT_IO_BYTES};
     struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=len};
-    args.cparam1=parallel==TEST_PARALLEL || parallel==TEST_BUILD_PHASE || parallel==TEST_HASH_GROUP || parallel==TEST_PARTITION || parallel==TEST_PARTITION_SKEW || grouped_build;
+    args.cparam1=parallel==TEST_PARALLEL || parallel==TEST_BUILD_PHASE || parallel==TEST_HASH_GROUP || parallel==TEST_PARTITION || parallel==TEST_PARTITION_SKEW || grouped_build || wide_build;
     struct test_spill spill={.mutex=PTHREAD_MUTEX_INITIALIZER}; unsigned got=0; unsigned char seen[12]={0};
     uint64_t counts[12]={0},sums[12]={0},mins[12]={0},maxs[12]={0};
     uint64_t source_sums[12]={0},source_counts[12]={0};
@@ -677,6 +679,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         }
         assert(rounds==control.epoch);
         if(parallel==TEST_BUILD_PHASE) assert(plan->pipelines[3].sink_rows);
+        if(wide_build) assert(plan->pipelines[4].sink_rows);
         /* With the exact resident Source count, every build row fits in
          * the shared sink; none should fall back to coordinator insertion. */
         if(parallel==TEST_BUILD_GROUP_SOURCE || (direct && right_rows>=QP_VECTOR_ROWS))
@@ -1690,6 +1693,7 @@ int main(int argc,char **argv)
         for(unsigned join=QP_INNER;join<=QP_ANTI;++join)
             test(run,join,20003,23,256,1,TEST_BUILD_PHASE);
         test(run,QP_INNER,31,50003,256,1,TEST_BUILD_PHASE);
+        test(run,QP_LEFT,31,5003,256,1,TEST_WIDE_HASH);
         for(unsigned join=QP_INNER;join<=QP_ANTI;++join)
             test(run,join,31,5003,256,1,TEST_HASH_QUAL);
         for(unsigned join=QP_INNER;join<=QP_ANTI;++join) {
@@ -1811,7 +1815,7 @@ int main(int argc,char **argv)
     test(run,QP_INNER,120000,23,8,1,TEST_PARALLEL);
     test(run,QP_INNER,120000,23,8,1,TEST_LARGE_SCAN);
     test(run,QP_INNER,5170,23,64,1,TEST_COUNT_ROWS);
-    test(run,QP_LEFT,23,23,64,1,TEST_WIDE_HASH);
+    test(run,QP_LEFT,31,5003,64,1,TEST_WIDE_HASH);
     test(run,QP_LEFT,23,23,64,2,TEST_WIDE_HASH);
     test(run,QP_LEFT,23,23,64,1,TEST_SIGNED_HASH);
     test(run,QP_LEFT,23,23,64,1,TEST_BIGINT_HASH);
