@@ -1500,6 +1500,15 @@ static void multiple_group_aggregates(function run,unsigned memory,unsigned kind
             a->expr.outputs[5+i]=(struct qs_output){.index=8+(int)i,.type_oid=text?25:1700};
         }
     }
+    if(kind==Q_AVG && counts) {
+        /* Final AVG has a runtime scale. Evaluate AVG + 0.75 after the
+         * Source boundary, including nullable multi-key groups and spill. */
+        unsigned constant=a->expr.nexprs++,output=a->expr.nexprs++;
+        a->expr.exprs[constant]=(struct qs_expr){.op=Q_CONST,.type=Q_DECIMAL,.constant=75,.scale=2,.dscale=2};
+        a->expr.exprs[output]=(struct qs_expr){.op=Q_ADD,.type=Q_DECIMAL,
+            .left=a->expr.outputs[2].index,.right=(int)constant};
+        a->expr.outputs[2].index=output;
+    }
     struct qp_node *sort=&p->nodes[0]; sort->kind=QP_SORT; sort->left=1; sort->right=-1;
     sort->expr=a->expr; sort->expr.nexprs=sort->expr.nattrs=a->expr.nout; sort->expr.naggs=0;
     sort->expr.work_mem_bytes=(uint64_t)memory*1024*1024; sort->expr.limit=-1;
@@ -1576,7 +1585,14 @@ static void multiple_group_aggregates(function run,unsigned memory,unsigned kind
             if(w->count) {
                 int64_t value=kind==Q_MIN?w->minimum:kind==Q_MAX?w->maximum:w->sum;
                 struct qs_cell sum={.value=value,.scale=2,.dscale=2}; int cmp;
-                if(kind==Q_AVG) assert(!qs_average(sum,w->count,&sum));
+                if(kind==Q_AVG) {
+                    assert(!qs_average(sum,w->count,&sum));
+                    if(counts) {
+                        unsigned scale=sum.scale>2?sum.scale:2; __int128 increment;
+                        assert(!qs_scale(sum.value,scale-sum.scale,&sum.value) && !qs_scale(75,scale-2,&increment));
+                        sum.value+=increment; sum.scale=scale;
+                    }
+                }
                 if(text) {
                     char want[8]; int n=snprintf(want,sizeof(want),"k%04u",(unsigned)value);
                     assert(qs_cell_string(&v[2])==(unsigned)n && !memcmp(qs_cell_string_bytes(&v[2]),want,n));

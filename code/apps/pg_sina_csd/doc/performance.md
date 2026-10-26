@@ -782,3 +782,11 @@ Q10两次独立冷启动profile：[修改前](../../../../results/tpch.AEpBsL/10
 部署后[Q5/Q9/Q10/Q17标准冷启动回归](../../../../results/tpch.InH6ZQ/timings.csv)均结果逐字节一致、完整卸载且快于同轮host，CSD为551.133/1019.687/1334.433/1012.551ms。资源继续为8 CU、256MiB workmem、64MiB FDM。
 
 为避免把单次Q10 profile的变化当作收益，另做三轮旧、新SO交替冷启动普通查询，SQL仍仅为标准Q10。六次结果均与同轮标准host结果逐字节一致，结束后恢复并核对新版SO。原始日志在同一结果目录的 `10.before.1.log` 至 `10.after.3.log`；旧版三次1393.426/981.694/979.090ms，新版959.722/1000.316/969.487ms，中位981.694→969.487ms，约1.2%。样本不足以证明明显加速，不宣称大幅延迟收益；本阶段确认的是去除构建端的中间行复制及其正确性。新版Q10 profile workmem峰值203995152字节（旧版203995136字节），均无spill，见[当前profile](../../../../results/tpch.InH6ZQ/10.profile.log)。其他算子间逐行适配及阶段边界仍需继续改造，本阶段未重复全量22条。
+
+## 驻留分组Source接入列批次
+
+参考DuckDB Hash Aggregate Source输出DataChunk再交给后续表达式/算子的方式，设备CU仍按原子游标领取64条只读分组记录，组装至多256行的键和最终聚合值列。SUM/AVG/COUNT/MIN/MAX复用同一最终值计算；Source的AGGREF与分组键绑定到这些列，不再下探原始输入。Source输出和后续无过滤Projection共用向量表达式DAG，直接Hash Build也消费该批列。动态scale、dscale、NULL及字典ID保留，分配全部计入原CU子context和查询总预算。Source自身带HAVING、表达式不支持、分配失败及已spill的Source保留原路径；没有修改PG/SNIA/FEMU协议或增加AFDM。
+
+扩展多键、多聚合测试，在最终AVG后计算AVG+0.75，验证运行时scale，继续覆盖NULL、文本MIN/MAX、增长、4MiB spill及清理。原生/8/16/64 CU四项CTest及ASan/UBSan/LeakSanitizer原生/8CU两项通过。已部署设备计划SO，资源为8 CU、256MiB workmem、64MiB FDM。[Q13/Q17/Q18/Q20标准冷启动回归](../../../../results/tpch.xOMj2Y/timings.csv)均结果一致、完整卸载且快于同轮host，CSD为384.616/977.925/1178.728/928.835ms。
+
+Q13与Q20另用旧、新SO各做一次独立冷启动profile，原始记录为同目录的 `13.before.profile.log`、`13.after.profile.log`、`20.before.profile.log`、`20.after.profile.log`，结束后已恢复并核对新版SO。Q13分组Source阶段累计worker CPU 332.052→318.676ms，workmem峰值154432496→154453408字节；Q20总CPU 1567.629→1585.668ms、峰值87805264→88302544字节。四次均无spill。Q20索引/Heap读取由1080647680变为1086980096字节，分组领取顺序改变可能影响CU页缓存复用；不能宣称减少I/O或固定延迟收益。当前确定的改进是Source表达式和后续无过滤投影不再逐组解释、直接Hash Build省掉中间行。带过滤的Projection仍会退回逐行，是下一处明确缺口；本阶段未重复全量22条。

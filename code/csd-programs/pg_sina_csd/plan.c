@@ -107,7 +107,7 @@ struct projection_batch {
     const uint32_t *borrowed_selection;
     int64_t error;
     unsigned error_node;
-    int joined,sorted,keep_window,lazy_text;
+    int joined,sorted,group_source,keep_window,lazy_text;
     int group_keys[QS_KEYS],group_values[QS_AGGS];
 };
 struct hash_probe_batch {
@@ -213,6 +213,9 @@ static size_t input_offset(const struct execution *s,const struct qp_node *n)
 static size_t vector_offset(const struct execution *s,const struct qp_node *n)
 { return s->worker>1?n->parallel_vector+(s->worker-2)*s->plan->parallel_stride:n->vector_offset; }
 static int64_t parallel_next(struct execution *,unsigned,struct qs_cell *);
+static int projection_init(struct execution *,unsigned);
+static int64_t projection_next(struct execution *,unsigned,struct qs_cell *);
+static int64_t projection_group_fill(struct execution *,struct projection_batch *);
 static int aggregate_sink_vectors(struct execution *,unsigned);
 static int64_t timed_call(struct execution *s,int64_t (*call)(struct femu_csd_args *),struct femu_csd_args *a,unsigned op)
 {
@@ -1216,8 +1219,8 @@ static int64_t scan_next(struct execution *s,unsigned id,struct qs_cell *row)
         if(count) { ++s->metrics.matched; return 2; }
     }
 }
-/* Translate a projection chain into one expression DAG over the original
- * scan columns. This preserves PG's tree and avoids row materialization
+/* Translate a projection chain into one expression DAG over its producer's
+ * columns. This preserves PG's tree and avoids row materialization
  * between adjacent projections. Unsupported expressions keep the old path. */
 struct projection_import {
     struct execution *execution;
@@ -1231,8 +1234,21 @@ static int projection_import(struct projection_import *in,unsigned node,int inde
     struct qs_plan *p=&in->batch->plan;
     for(unsigned i=0;i<p->nexprs;++i) if(in->nodes[i]==node && in->expressions[i]==(unsigned)index) return i;
     struct qs_expr e=n->expr.exprs[index];
+    if(in->batch->group_source && node==in->batch->scan) {
+        /* Source expressions reference finalized group keys and aggregate
+         * values, never the original aggregate input below this boundary. */
+        if(e.op==Q_AGGREF) {
+            if(e.column<0 || (unsigned)e.column>=n->expr.naggs) return -1;
+            e.op=Q_COLUMN; e.column+=n->nkeys;
+        } else if(e.op==Q_COLUMN) {
+            unsigned k=0; while(k<n->nkeys && n->left_keys[k]!=e.column) ++k;
+            if(k==n->nkeys) return -1;
+            e.column=k;
+        }
+    }
     if(e.op>Q_CASE && e.op!=Q_YEAR && e.op!=Q_LIKE && e.op!=Q_SUBSTRING && e.op!=QP_PARAMETER) return -1;
-    if(e.op==Q_COLUMN && (n->kind==QP_PROJECT || n->kind==QP_AGGREGATE)) {
+    if(e.op==Q_COLUMN && (n->kind==QP_PROJECT || n->kind==QP_AGGREGATE) &&
+       !(in->batch->group_source && node==in->batch->scan)) {
         const struct qp_node *child=&in->execution->plan->nodes[n->left];
         if(e.column<0 || (unsigned)e.column>=child->expr.nout) return -1;
         return projection_import(in,n->left,child->expr.outputs[e.column].index);
@@ -1362,7 +1378,7 @@ static int projection_init(struct execution *s,unsigned id)
     struct operator_state *o=&s->nodes[id]; if(o->projection_checked) return 0;
     o->projection_checked=1;
     const struct qp_node *root=&s->plan->nodes[id];
-    int aggregate=root->kind==QP_AGGREGATE;
+    int aggregate=root->kind==QP_AGGREGATE && !(s->worker && s->source_node==(int)id);
     if(aggregate && (root->distinct || root->distinct_aggs || root->left<0 ||
         (root->nkeys && (!root->hash || !qp_hash_aggregate_supported(root))))) return 0;
     int grouped=aggregate && root->nkeys;
@@ -1373,11 +1389,13 @@ static int projection_init(struct execution *s,unsigned id)
         scan=n->left;
     }
     const struct qp_node *leaf=&s->plan->nodes[scan];
+    int group_source=s->worker && s->source_node==scan && leaf->kind==QP_AGGREGATE &&
+        leaf->expr.predicate<0 && s->owner->partition_join<0 && s->owner->nodes[scan].group_phase==3;
     int joined=leaf->expr.predicate<0 &&
         (leaf->kind==QP_INDEX_JOIN || (leaf->kind==QP_JOIN && leaf->hash));
     int sorted=leaf->kind==QP_SORT && leaf->left>=0 && leaf->expr.predicate<0 &&
         leaf->expr.nattrs==s->plan->nodes[leaf->left].expr.nout;
-    if((leaf->kind!=QP_SCAN && !joined && !sorted) || (!s->worker && s->plan->workers>1 && leaf->parallel)) return 0;
+    if((leaf->kind!=QP_SCAN && !joined && !sorted && !group_source) || (!s->worker && s->plan->workers>1 && leaf->parallel)) return 0;
     if(!joined && !sorted && leaf->expr.predicate>=0) {
         if(leaf->ordered_index) return 0;
         int status=scan_filter_init(s,&leaf->expr,&s->nodes[scan]); if(status) return status;
@@ -1386,6 +1404,8 @@ static int projection_init(struct execution *s,unsigned id)
     struct projection_batch *b=cs_work_calloc(s->context,1,sizeof(*b)); if(!b) return 0;
     b->plan=leaf->expr; b->plan.nexprs=0; b->plan.nout=grouped?s->plan->nodes[root->left].expr.nout:
         aggregate?root->expr.naggs:root->expr.nout; b->scan=scan; b->joined=joined; b->sorted=sorted;
+    b->group_source=group_source;
+    if(group_source) b->plan.nattrs=leaf->nkeys+leaf->expr.naggs;
     if(sorted) {
         b->plan.ncols=b->plan.nattrs;
         for(unsigned col=0;col<b->plan.nattrs;++col) b->plan.cols[col].slot=col;
@@ -1413,7 +1433,7 @@ static int projection_init(struct execution *s,unsigned id)
         if(index<0 || qs_vector_require(&b->plan,index,b->needed)) { cs_work_free(s->context,b); return 0; }
         b->plan.outputs[i]=source->expr.outputs[i]; b->plan.outputs[i].index=index;
     }
-    if(joined) {
+    if(joined || group_source) {
         for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_INDEX_JOIN)
             for(int at=s->plan->nodes[i].left;at>=0;at=s->plan->nodes[at].left)
                 if(at==scan) { b->keep_window=1; break; }
@@ -1518,7 +1538,8 @@ static int64_t projection_fill(struct execution *s,unsigned id)
 {
     struct projection_batch *b=s->nodes[id].projection;
     if(b->position==b->count) {
-        int64_t status=b->sorted?projection_sort_fill(s,b):b->joined?projection_join_fill(s,b):scan_chunk_next(s,b->scan);
+        int64_t status=b->group_source?projection_group_fill(s,b):b->sorted?projection_sort_fill(s,b):
+            b->joined?projection_join_fill(s,b):scan_chunk_next(s,b->scan);
         if(status!=2) {
             if(!status || (b->joined && status==3)) {
                 cs_work_free(s->context,b->cells);
@@ -1528,11 +1549,11 @@ static int64_t projection_fill(struct execution *s,unsigned id)
             return status;
         }
         /* Filter may have fallen back after exhausting its scratch budget. */
-        if(!b->joined && !b->sorted && s->plan->nodes[b->scan].expr.predicate>=0 && !s->nodes[b->scan].scan_filter) {
+        if(!b->group_source && !b->joined && !b->sorted && s->plan->nodes[b->scan].expr.predicate>=0 && !s->nodes[b->scan].scan_filter) {
             cs_work_free(s->context,b->vectors); cs_work_free(s->context,b);
             s->nodes[id].projection=NULL; return 3;
         }
-        if(!b->joined && !b->sorted) {
+        if(!b->group_source && !b->joined && !b->sorted) {
             struct operator_state *scan=&s->nodes[b->scan];
             struct qs_chunk *chunk=(void *)(s->arena+vector_offset(s,&s->plan->nodes[b->scan]));
             b->count=chunk->selected-scan->scan_position; if(b->count>QS_VECTOR_ROWS) b->count=QS_VECTOR_ROWS;
@@ -1830,6 +1851,16 @@ static int group_equal(struct execution *s,const struct qp_node *n,const struct 
     }
     return 1;
 }
+static int group_final_value(const struct qs_agg *agg,const struct group_value *g,struct qs_cell *value)
+{
+    *value=(struct qs_cell){.isnull=!g->count};
+    if(agg->kind==Q_COUNT || agg->kind==Q_COUNT_STAR) *value=(struct qs_cell){.value=g->count};
+    else if(g->count) {
+        *value=g->sum;
+        if(agg->kind==Q_AVG && qs_average(*value,g->count,value)) return -5;
+    }
+    return 0;
+}
 static int group_result(struct execution *s,const struct qp_node *n,const struct group_value *groups,
     const struct qs_cell *keys,struct qs_cell *row)
 {
@@ -1837,17 +1868,55 @@ static int group_result(struct execution *s,const struct qp_node *n,const struct
     for(unsigned i=0;i<QS_COLS;++i) input[i]=(struct qs_cell){.isnull=1};
     for(unsigned k=0;k<n->nkeys;++k) input[n->left_keys[k]]=keys[k];
     for(unsigned a=0;a<n->expr.naggs;++a) {
-        const struct group_value *g=&groups[a]; unsigned kind=n->expr.aggs[a].kind;
-        struct qs_cell value={.isnull=!g->count};
-        if(kind==Q_COUNT || kind==Q_COUNT_STAR) value=(struct qs_cell){.value=g->count};
-        else if(g->count) {
-            value=g->sum;
-            if(kind==Q_AVG && qs_average(value,g->count,&value)) return -5;
-        }
-        values[a]=value;
+        int status=group_final_value(&n->expr.aggs[a],&groups[a],&values[a]); if(status) return status;
     }
     int status=project(s,n,input,values,row);
     return status<0?status:status?2:0;
+}
+static const struct compact_group *group_source_next(struct execution *s,unsigned id)
+{
+    const struct operator_state *source=&s->owner->nodes[id];
+    if(s->source_at==s->source_end) {
+        s->source_at=atomic_fetch_add_explicit(&s->owner->next_offset,64,memory_order_relaxed);
+        unsigned rows=atomic_load_explicit(source->group_count,memory_order_relaxed);
+        if(s->source_at>=rows) { s->source_end=s->source_at; return NULL; }
+        s->source_end=s->source_at+64;
+        if(s->source_end>rows) s->source_end=rows;
+    }
+    return group_at(source,s->source_at++);
+}
+/* Group keys and finalized values form input columns for one expression DAG.
+ * Workers claim immutable records; no projected row is passed between nodes. */
+static int64_t projection_group_fill(struct execution *s,struct projection_batch *b)
+{
+    const struct qp_node *n=&s->plan->nodes[b->scan];
+    if(b->error) { s->control->error=b->error; s->control->error_node=b->error_node; return b->error; }
+    b->count=b->position=0;
+    while(b->count<QS_VECTOR_ROWS) {
+        const struct compact_group *g=group_source_next(s,b->scan); if(!g) break;
+        struct qs_cell keys[QS_KEYS]; group_keys(n,&s->owner->nodes[b->scan],g,keys);
+        for(unsigned k=0;k<n->nkeys;++k) {
+            int slot=b->plan.cols[k].slot;
+            if(slot>=0) b->cells[(size_t)slot*QS_VECTOR_ROWS+b->count]=keys[k];
+        }
+        for(unsigned a=0;a<n->expr.naggs;++a) {
+            struct qs_cell value;
+            int status=group_final_value(&n->expr.aggs[a],&g->values[a],&value);
+            if(status) { b->error=status; b->error_node=b->scan; break; }
+            int slot=b->plan.cols[n->nkeys+a].slot;
+            if(slot>=0) b->cells[(size_t)slot*QS_VECTOR_ROWS+b->count]=value;
+        }
+        if(b->error) break;
+        ++b->count;
+    }
+    if(!b->count) {
+        if(b->error) { s->control->error=b->error; s->control->error_node=b->error_node; }
+        return b->error;
+    }
+    struct qs_vector_input input={.cells=b->cells,.dictionary=s->dictionary,
+        .parameters=s->params,.nparameters=QP_PARAMS};
+    if(qs_vector_execute_input(&b->plan,NULL,NULL,0,b->count,b->needed,b->vectors,input)) return -5;
+    return 2;
 }
 /* Published keys stay immutable throughout a CU wave. The bounded shared
  * table also accepts rows that do not fit a CU-local table. Only the owner
@@ -2731,18 +2800,12 @@ static int64_t next_row_impl(struct execution *s,unsigned id,struct qs_cell *row
     if(s->worker && (int)id==s->source_node) {
         if(n->kind==QP_AGGREGATE && s->owner->partition_join<0) {
             const struct operator_state *source=&s->owner->nodes[id];
+            int64_t status=projection_init(s,id); if(status) return status;
+            if(o->projection) return projection_next(s,id,row);
             for(;;) {
-                if(s->source_at==s->source_end) {
-                    s->source_at=atomic_fetch_add_explicit(&s->owner->next_offset,64,memory_order_relaxed);
-                    unsigned rows=atomic_load_explicit(source->group_count,memory_order_relaxed);
-                    if(s->source_at>=rows) return 0;
-                    s->source_end=s->source_at+64;
-                    if(s->source_end>rows) s->source_end=rows;
-                }
-                unsigned slot=s->source_at++;
-                const struct compact_group *g=group_at(source,slot);
+                const struct compact_group *g=group_source_next(s,id); if(!g) return 0;
                 struct qs_cell keys[QS_KEYS]; group_keys(n,source,g,keys);
-                int64_t status=group_result(s,n,g->values,keys,row); if(status) return status;
+                status=group_result(s,n,g->values,keys,row); if(status) return status;
             }
         }
         unsigned bytes=hash_row_bytes(&n->expr),block_rows=QS_SORT_IO_BYTES/bytes;
@@ -3425,9 +3488,9 @@ produce:
     /* STORE reentry must finish consuming the retained output before the
      * producer overwrites it with another batch. */
     if(worker && s->sort_sink && s->pending_sort==s->sort_sink) goto produced;
-    /* A direct resident-group or spilled-partition Source has its own cursor;
-     * projection_init on that node would reopen its original input instead. */
-    if(worker && s->hash_sink && s->source_node!=(int)s->root && plan->nodes[s->root].kind!=QP_AGGREGATE) {
+    /* A spilled-partition Source retains its original row cursor. Resident
+     * groups can now expose finalized columns without reopening their input. */
+    if(worker && s->hash_sink && (s->source_node!=(int)s->root || plan->nodes[s->root].kind==QP_AGGREGATE)) {
         unsigned id=s->root;
         status=projection_init(s,id); if(status<0) goto produced;
         while(s->nodes[id].projection) {
