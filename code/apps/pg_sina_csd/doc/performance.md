@@ -790,3 +790,15 @@ Q10两次独立冷启动profile：[修改前](../../../../results/tpch.AEpBsL/10
 扩展多键、多聚合测试，在最终AVG后计算AVG+0.75，验证运行时scale，继续覆盖NULL、文本MIN/MAX、增长、4MiB spill及清理。原生/8/16/64 CU四项CTest及ASan/UBSan/LeakSanitizer原生/8CU两项通过。已部署设备计划SO，资源为8 CU、256MiB workmem、64MiB FDM。[Q13/Q17/Q18/Q20标准冷启动回归](../../../../results/tpch.xOMj2Y/timings.csv)均结果一致、完整卸载且快于同轮host，CSD为384.616/977.925/1178.728/928.835ms。
 
 Q13与Q20另用旧、新SO各做一次独立冷启动profile，原始记录为同目录的 `13.before.profile.log`、`13.after.profile.log`、`20.before.profile.log`、`20.after.profile.log`，结束后已恢复并核对新版SO。Q13分组Source阶段累计worker CPU 332.052→318.676ms，workmem峰值154432496→154453408字节；Q20总CPU 1567.629→1585.668ms、峰值87805264→88302544字节。四次均无spill。Q20索引/Heap读取由1080647680变为1086980096字节，分组领取顺序改变可能影响CU页缓存复用；不能宣称减少I/O或固定延迟收益。当前确定的改进是Source表达式和后续无过滤投影不再逐组解释、直接Hash Build省掉中间行。带过滤的Projection仍会退回逐行，是下一处明确缺口；本阶段未重复全量22条。
+
+## 按存活行执行过滤链及当前版本22条验收
+
+验收提交 `92162c103`。参考DuckDB Filter用选择向量保留存活行的方式，Projection链、Hash/Index Join及Sort输出过滤、驻留分组Source的HAVING统一进入已有表达式向量DAG。按输入到输出的节点顺序执行各级条件；NULL/false行不参与后续条件和最终输出，COUNT(*)只累计最终保留的行。没有行被移除时直接保留布局，只有行数减少时压缩所需结果列，保持宽numeric、运行时scale/dscale、错误位及借用的文本视图。扫描/Sort的已消费位置按过滤前行数推进，全部被拒绝的批次继续读取。过滤错误保留在此前有效前缀之后，EOF不吞掉待报告错误；LIMIT未请求后续行时不提前报告。
+
+新增多层过滤测试覆盖被过滤行的int128溢出、全NULL/空批次、较高一级条件的短路、宽值与substring视图压缩；LIMIT 1正确返回前缀，LIMIT 2观察到后续过滤错误，关闭后资源回收。修正文本测试数据只使用当前字典能容纳的不同值，不改变设备字典上限。原生及8/16/64 CU四项CTest、ASan/UBSan/LeakSanitizer原生及8CU两项检查通过。只重编部署设备计划SO，未改PG、SNIA和固件接口。
+
+因本次扩大了多类过滤节点的向量化范围，直接运行一次完整标准22条替代局部性能回归。[当前原始成绩](../../../../results/tpch.jnirzE/timings.csv)均结果逐字节一致、完整卸载且快于同轮host。独立复核22份计划：顶层均为CSD Custom Scan，没有PG子执行节点、InitPlan或SubPlan；资源均为8 CU、268435456字节workmem、67108864字节FDM，查询总预算268435456字节。44份查询stderr均记录PG缓冲重置及Guest page cache清除；SQL只来自标准查询目录，性能测量关闭profile，没有并行运行构建或其他测试。
+
+host总延迟56740.096ms，CSD为15335.444ms，总时间比3.700倍；单条1.764倍（Q16）至9.214倍（Q18）。这是当前版本的一轮冷启动验收，不将它与历史样本相减作为某项改动收益，也不证明每个阶段都满载8CU。三层仍分别负责PG计划/映射/编排、SNIA通用请求适配、FEMU通用图与内部I/O；复核设备图的LOAD/EXEC/STORE记录、适配器转换及分配器父context计账，没有加入SQL固件语义或额外进程。
+
+原改造清单的当前证据：2048行扫描向量与4/2/1MiB读取块已分开；Scan/Filter/Projection、Hash/Index Join及聚合的主要路径消费列批次；构建、CU局部聚合和Combine分别管理局部/共享状态；namespace读取和spill在设备图内重入；CU子context共享查询实际总预算并使用设备查询资源；NULL、numeric、文本与错误边界由上述组件测试和22条结果校验覆盖。仍保留的边界是Merge/部分不支持表达式的行接口、已spill的Source与串行归并，以及部分阻塞阶段的主机续交。当前22条性能门槛已通过，不能据此宣称全部执行路径都已完全向量化，目标保持进行中。
