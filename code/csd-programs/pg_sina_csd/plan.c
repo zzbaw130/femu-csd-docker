@@ -110,7 +110,7 @@ struct projection_batch {
     const uint32_t *borrowed_selection;
     int64_t error;
     unsigned error_node;
-    int joined,sorted,group_source,keep_window,lazy_text;
+    int joined,sorted,group_source,keep_window,lazy_text,filtered_scan;
     int group_keys[QS_KEYS],group_values[QS_AGGS];
     struct { unsigned node; int expression; } filters[QP_NODES];
     unsigned nfilters;
@@ -301,6 +301,37 @@ static int compare_cell(struct execution *s,struct qs_cell a,struct qs_cell b,un
     }
     int cmp=0; return qs_compare(a,b,&cmp)?INT_MIN:cmp;
 }
+static inline struct qs_cell set_contains(const struct operator_state *set,struct qs_cell a)
+{
+    struct qs_cell v={0};
+    if(a.isnull) v.isnull=set->set_count || set->set_null;
+    else {
+        if(a.value<=INT64_MAX && a.value>=INT64_MIN && set->set_capacity) {
+            unsigned slot=mix_hash((uint64_t)a.value)&(set->set_capacity-1);
+            while(set->set[slot].occupied) {
+                if(set->set[slot].value==a.value) { v.value=1; break; }
+                slot=(slot+1)&(set->set_capacity-1);
+            }
+        }
+        if(!v.value) v.isnull=set->set_null;
+    }
+    return v;
+}
+static int inset_vectors(struct qs_vector_input *input,unsigned index,const uint16_t *rows,unsigned count)
+{
+    struct execution *s=input->set_state; const struct qs_expr *e=&input->plan->exprs[index];
+    if(e->column<0 || (unsigned)e->column>=s->plan->count || !s->nodes[e->column].set_ready) return -1;
+    const struct operator_state *set=&s->nodes[e->column];
+    const struct qs_vector *left=&input->vectors[e->left]; struct qs_vector *out=&input->vectors[index];
+    out->kind=QS_NARROW;
+    for(unsigned j=0;j<count;++j) {
+        unsigned i=rows[j]; struct qs_cell v={0}; unsigned error=left->errors[i];
+        if(!error) v=set_contains(set,qs_vector_cell(input->plan,input->vectors,e->left,i));
+        out->narrow[i]=v.value; out->nulls[i]=v.isnull; out->errors[i]=error; out->dscales[i]=0;
+        out->all_valid&=!error && !v.isnull;
+    }
+    return 0;
+}
 static int evaluate(struct execution *s,struct qs_eval *e,int index,struct qs_cell *out)
 {
     if(index<0 || (unsigned)index>=e->plan->nexprs) return -1;
@@ -308,20 +339,9 @@ static int evaluate(struct execution *s,struct qs_eval *e,int index,struct qs_ce
     const struct qs_expr *x=&e->plan->exprs[index]; struct qs_cell a={0},b={0},v={0};
     if(x->op==QP_PARAMETER) v=s->params[x->column];
     else if(x->op==QP_INSET) {
-        if(evaluate(s,e,x->left,&a)) return -5;
-        struct operator_state *set=&s->nodes[x->column];
-        if(!set->set_ready) return -1;
-        if(a.isnull) v.isnull=set->set_count || set->set_null;
-        else {
-            if(a.value<=INT64_MAX && a.value>=INT64_MIN && set->set_capacity) {
-                unsigned slot=mix_hash((uint64_t)a.value)&(set->set_capacity-1);
-                while(set->set[slot].occupied) {
-                    if(set->set[slot].value==a.value) { v.value=1; break; }
-                    slot=(slot+1)&(set->set_capacity-1);
-                }
-            }
-            if(!v.value) v.isnull=set->set_null;
-        }
+        if(x->column<0 || (unsigned)x->column>=s->plan->count || !s->nodes[x->column].set_ready ||
+            evaluate(s,e,x->left,&a)) return -5;
+        v=set_contains(&s->nodes[x->column],a);
     }
     else if(x->op==Q_CONST && x->type==Q_STRING && !x->isnull) {
         const struct qs_string *literal=&e->plan->strings[x->constant];
@@ -1164,6 +1184,7 @@ static int scan_filter_init(struct execution *s,const struct qs_plan *p,struct o
          * The original PG plan remains unchanged; this copy belongs to a CU. */
         for(unsigned i=0;i<filter->nexprs;++i) {
             struct qs_expr *e=&filter->exprs[i];
+            if(e->op==QP_INSET) goto scalar; /* Query-owned state is filtered by projection batches. */
             if(e->op==QP_PARAMETER) {
                 if(e->column<0 || e->column>=QP_PARAMS) goto scalar;
                 e->scale=s->params[e->column].scale; e->dscale=s->params[e->column].dscale;
@@ -1344,7 +1365,7 @@ static int projection_import(struct projection_import *in,unsigned node,int inde
             e.column=k;
         }
     }
-    if(e.op>Q_CASE && e.op!=Q_YEAR && e.op!=Q_LIKE && e.op!=Q_SUBSTRING && e.op!=QP_PARAMETER && e.op!=QP_COALESCE && e.op!=Q_DIV) return -1;
+    if(e.op>Q_CASE && e.op!=Q_YEAR && e.op!=Q_LIKE && e.op!=Q_SUBSTRING && e.op!=QP_PARAMETER && e.op!=QP_COALESCE && e.op!=Q_DIV && e.op!=QP_INSET) return -1;
     if(e.op==Q_COLUMN && (n->kind==QP_PROJECT || n->kind==QP_AGGREGATE) &&
        !(in->batch->group_source && node==in->batch->scan)) {
         const struct qp_node *child=&in->execution->plan->nodes[n->left];
@@ -1359,7 +1380,7 @@ static int projection_import(struct projection_import *in,unsigned node,int inde
     if(e.op!=Q_COLUMN && e.op!=Q_CONST && e.op!=QP_PARAMETER) {
         if(e.left<0 || e.left>=index) return -1;
         e.left=projection_import(in,node,e.left); if(e.left<0) return -1;
-        if(e.op!=Q_NOT && e.op!=Q_IS_NULL && e.op!=Q_IS_NOT_NULL && e.op!=Q_YEAR) {
+        if(e.op!=Q_NOT && e.op!=Q_IS_NULL && e.op!=Q_IS_NOT_NULL && e.op!=Q_YEAR && e.op!=QP_INSET) {
             if(e.right<0 || e.right>=index) return -1;
             e.right=projection_import(in,node,e.right); if(e.right<0) return -1;
         }
@@ -1458,7 +1479,7 @@ static int64_t merge_qual_next(struct execution *s,unsigned id,struct qs_cell *v
             }
         }
         struct qs_vector_input input={.cells=b->cells,.dictionary=s->dictionary,
-            .parameters=s->params,.nparameters=QP_PARAMS};
+            .parameters=s->params,.nparameters=QP_PARAMS,.inset=inset_vectors,.set_state=s};
         if(qs_vector_execute_input(&b->plan,NULL,NULL,0,count,b->needed,b->vectors,input)) return -5;
         b->count=count; b->position=0; o->position+=count;
     }
@@ -1514,7 +1535,7 @@ static int hash_qual_next(struct execution *s,unsigned id,uint32_t first,const u
             }
         }
         struct qs_vector_input input={.cells=b->cells,.dictionary=s->dictionary,
-            .parameters=s->params,.nparameters=QP_PARAMS};
+            .parameters=s->params,.nparameters=QP_PARAMS,.inset=inset_vectors,.set_state=s};
         if(qs_vector_execute_input(&b->plan,NULL,NULL,0,count,b->needed,b->vectors,input)) return -5;
         b->count=count; b->position=0; o->hash_match=cursor;
     }
@@ -1569,12 +1590,12 @@ static int projection_init(struct execution *s,unsigned id,int source)
     if(!group_source && !joined && !sorted && leaf->expr.predicate>=0) {
         if(leaf->ordered_index) return 0;
         int status=scan_filter_init(s,&leaf->expr,&s->nodes[scan]); if(status) return status;
-        if(!s->nodes[scan].scan_filter) return 0;
     }
     struct projection_batch *b=cs_work_calloc(s->context,1,sizeof(*b)); if(!b) return 0;
     b->plan=leaf->expr; b->plan.nexprs=0; b->plan.nout=grouped?s->plan->nodes[root->left].expr.nout:
         aggregate?root->expr.naggs:root->expr.nout; b->scan=scan; b->joined=joined; b->sorted=sorted;
     b->group_source=group_source;
+    b->filtered_scan=!joined && !sorted && !group_source && s->nodes[scan].scan_filter && leaf->expr.predicate>=0;
     if(group_source) b->plan.nattrs=leaf->nkeys+leaf->expr.naggs;
     if(sorted) {
         b->plan.ncols=b->plan.nattrs;
@@ -1585,7 +1606,7 @@ static int projection_init(struct execution *s,unsigned id,int source)
      * removes the row before any higher filter or projection is evaluated. */
     for(unsigned i=0;i<=nprojections;++i) {
         unsigned node=i?projections[nprojections-i]:(unsigned)scan;
-        if(!i && !group_source && !joined && !sorted) continue; /* Scan already filters. */
+        if(!i && b->filtered_scan) continue; /* Scan already filters. */
         int predicate=s->plan->nodes[node].expr.predicate;
         if(predicate<0) continue;
         int index=projection_import(&import,node,predicate);
@@ -1760,7 +1781,7 @@ static int64_t projection_join_fill(struct execution *s,struct projection_batch 
 evaluate_batch:
     b->count=b->input_count; b->input_count=b->position=0;
     struct qs_vector_input input={.cells=b->borrowed_cells?b->borrowed_cells:b->cells,.dictionary=s->dictionary,
-        .parameters=s->params,.nparameters=QP_PARAMS};
+        .parameters=s->params,.nparameters=QP_PARAMS,.inset=inset_vectors,.set_state=s};
     /* COUNT(*) can have no payload columns; it still consumes cardinality. */
     if(b->plan.nexprs && projection_execute(b,NULL,b->borrowed_cells?b->borrowed_selection:NULL,0,input)) return -5;
     return 2;
@@ -1777,7 +1798,7 @@ static int64_t projection_sort_fill(struct execution *s,struct projection_batch 
     if(b->count>QS_VECTOR_ROWS) b->count=QS_VECTOR_ROWS;
     struct qs_vector_input input={.cells=sort->output->data[sort->position].cells,
         .column_stride=1,.row_stride=QS_OUT,.dictionary=s->dictionary,
-        .parameters=s->params,.nparameters=QP_PARAMS};
+        .parameters=s->params,.nparameters=QP_PARAMS,.inset=inset_vectors,.set_state=s};
     unsigned consumed=b->count;
     if(projection_execute(b,NULL,NULL,0,input)) return -5;
     sort->position+=consumed;
@@ -1805,7 +1826,7 @@ static int64_t projection_fill(struct execution *s,unsigned id,int source)
             return status;
         }
         /* Filter may have fallen back after exhausting its scratch budget. */
-        if(!b->group_source && !b->joined && !b->sorted && s->plan->nodes[b->scan].expr.predicate>=0 && !s->nodes[b->scan].scan_filter) {
+        if(b->filtered_scan && !s->nodes[b->scan].scan_filter) {
             projection_clear(s,slot); return 3;
         }
         if(!b->group_source && !b->joined && !b->sorted) {
@@ -1818,7 +1839,7 @@ static int64_t projection_fill(struct execution *s,unsigned id,int source)
                     b->plan.cols[col].deferred=scan->scan_filter?scan->scan_filter->cols[col].deferred:QS_EAGER;
             const void *raw=scan->scan_raw_bytes?s->arena+input_offset(s,source)+scan->scan_raw:NULL;
             struct qs_vector_input input={.raw=raw,.raw_bytes=scan->scan_raw_bytes,.dictionary=s->dictionary,
-                .parameters=s->params,.nparameters=QP_PARAMS};
+                .parameters=s->params,.nparameters=QP_PARAMS,.inset=inset_vectors,.set_state=s};
             unsigned consumed=b->count;
             if(projection_execute(b,chunk,qs_selection(chunk),scan->scan_position,input)) return -5;
             scan->scan_position+=consumed; b->position=0;
@@ -2217,7 +2238,7 @@ static int64_t projection_group_fill(struct execution *s,struct projection_batch
         return b->error;
     }
     struct qs_vector_input input={.cells=b->cells,.dictionary=s->dictionary,
-        .parameters=s->params,.nparameters=QP_PARAMS};
+        .parameters=s->params,.nparameters=QP_PARAMS,.inset=inset_vectors,.set_state=s};
     if(projection_execute(b,NULL,NULL,0,input)) return -5;
     return 2;
 }
@@ -2894,7 +2915,7 @@ fallback:
 }
 static int index_project_batch(struct execution *s,struct projection_batch *b,struct qs_chunk *chunk)
 {
-    struct qs_vector_input input={.dictionary=s->dictionary,.parameters=s->params,.nparameters=QP_PARAMS};
+    struct qs_vector_input input={.dictionary=s->dictionary,.parameters=s->params,.nparameters=QP_PARAMS,.inset=inset_vectors,.set_state=s};
     if(qs_vector_execute_input(&b->plan,chunk,qs_selection(chunk),0,chunk->selected,b->needed,b->vectors,input)) return -5;
     uint16_t active[QS_VECTOR_ROWS]; unsigned count=0;
     for(unsigned r=0;r<chunk->selected;++r) {
@@ -2982,7 +3003,7 @@ static int index_qual_prepare(struct execution *s,unsigned id,struct qs_chunk *c
         if(status) active[count++]=r;
     }
     struct qs_vector_input input={.cells=b->cells,.dictionary=s->dictionary,
-        .parameters=s->params,.nparameters=QP_PARAMS};
+        .parameters=s->params,.nparameters=QP_PARAMS,.inset=inset_vectors,.set_state=s};
     if(qs_vector_execute_input(&b->plan,NULL,NULL,0,chunk->selected,b->needed,b->vectors,input)) return -5;
     input.plan=&b->plan; input.vectors=b->vectors; input.count=chunk->selected;
     if(qs_vector_evaluate(&input,b->plan.predicate,active,count)) return -5;

@@ -55,10 +55,10 @@ static inline int qs_vector_dependency(const struct qs_plan *p,int index,uint8_t
     if(index<0 || (unsigned)index>=p->nexprs) return -1;
     if(needed[index]) return 0;
     const struct qs_expr *e=&p->exprs[index];
-    if(e->op>Q_CASE && e->op!=Q_YEAR && e->op!=Q_LIKE && e->op!=Q_SUBSTRING && e->op!=Q_PARAMETER && e->op!=Q_COALESCE && e->op!=Q_DIV) return -1; /* AGGREF needs Source column rebinding. */
+    if(e->op>Q_CASE && e->op!=Q_YEAR && e->op!=Q_LIKE && e->op!=Q_SUBSTRING && e->op!=Q_PARAMETER && e->op!=Q_COALESCE && e->op!=Q_DIV && e->op!=Q_INSET) return -1; /* AGGREF needs Source column rebinding. */
     if(e->op!=Q_COLUMN && e->op!=Q_CONST && e->op!=Q_PARAMETER) {
         if(e->left<0 || e->left>=index || qs_vector_dependency(p,e->left,needed)) return -1;
-        if(e->op!=Q_NOT && e->op!=Q_IS_NULL && e->op!=Q_IS_NOT_NULL && e->op!=Q_YEAR &&
+        if(e->op!=Q_NOT && e->op!=Q_IS_NULL && e->op!=Q_IS_NOT_NULL && e->op!=Q_YEAR && e->op!=Q_INSET &&
            (e->right<0 || e->right>=index || qs_vector_dependency(p,e->right,needed))) return -1;
         if((e->op==Q_CASE || e->op==Q_SUBSTRING) && (e->otherwise<0 || e->otherwise>=index ||
             qs_vector_dependency(p,e->otherwise,needed))) return -1;
@@ -189,6 +189,10 @@ struct qs_vector_input {
     /* Defaults describe materialized columns. Sort output can be borrowed
      * directly with column_stride=1, row_stride=QS_OUT, without transposing. */
     unsigned column_stride, row_stride;
+    /* Only the native SQL executor owns InitPlan sets. One callback probes
+     * an active batch; standalone filter/aggregate CSFs leave it unset. */
+    int (*inset)(struct qs_vector_input *,unsigned,const uint16_t *,unsigned);
+    void *set_state;
 };
 /* The byte view borrows the retained LOAD buffer or immutable dictionary.
  * SUBSTRING counts UTF-8 characters using PG's positive/zero/negative-start
@@ -283,6 +287,10 @@ static int qs_vector_evaluate(struct qs_vector_input *input,unsigned index,const
     }
     if(qs_vector_evaluate(input,e->left,rows,n)) return -1;
     const struct qs_vector *left=&input->vectors[e->left],*right=NULL;
+    if(e->op==Q_INSET) {
+        if(!input->inset || input->inset(input,index,rows,n)) return -1;
+        out->done+=n; return 0;
+    }
     if(e->op==Q_YEAR) {
         for(unsigned j=0;j<n;++j) {
             unsigned i=rows[j]; int error=left->errors[i]; struct qs_cell a=qs_vector_cell(p,input->vectors,e->left,i);

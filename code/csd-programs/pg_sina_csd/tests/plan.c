@@ -1062,6 +1062,79 @@ static void probe_payload(function run,unsigned limit,int strings,int indexed,in
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
     free(raw[0]); free(raw[1]); free(index); free(arena); free(io); free(out); free(p);
 }
+/* IN/NOT IN use the same immutable InitPlan set in scalar and column paths.
+ * Check projected truth values and Scan predicates against a linear oracle. */
+static void set_projection(function run,unsigned variant,unsigned filter)
+{
+    unsigned rows=5007,set_rows=variant==0?0:variant==1?1:variant==2?5:6;
+    int32_t keys[]={-4,0,13,13,5001,0};
+    struct qp_plan *p=calloc(1,sizeof(*p)); assert(p);
+    p->count=3; p->scan_bytes=QP_SCAN_BYTES; p->ninit=1; p->init_nodes[0]=1; p->init_params[0]=-1;
+    scan(&p->nodes[0]); scan(&p->nodes[2]);
+    struct qp_node *n=&p->nodes[0]; n->expr.work_mem_bytes=4U*1024*1024;
+    n->expr.nexprs=4; n->expr.nout=3;
+    n->expr.exprs[2]=(struct qs_expr){.op=Q_INSET,.type=Q_BOOLEAN,.left=0,.column=1};
+    n->expr.exprs[3]=(struct qs_expr){.op=Q_NOT,.type=Q_BOOLEAN,.left=2};
+    n->expr.outputs[0]=(struct qs_output){.index=1,.type_oid=23};
+    n->expr.outputs[1]=(struct qs_output){.index=2,.type_oid=16};
+    n->expr.outputs[2]=(struct qs_output){.index=3,.type_oid=16};
+    n->expr.predicate=filter?(filter==1?2:3):-1;
+    p->nodes[2].expr.nout=1;
+    p->nodes[1]=(struct qp_node){.kind=QP_SET,.left=2,.right=-1,.expr=p->nodes[2].expr};
+    size_t sizes[2],bytes=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
+    unsigned char *raw[]={heap(rows,2,&sizes[0]),heap(set_rows,2,&sizes[1])};
+    for(unsigned i=0;i<rows;++i) {
+        unsigned char *t=raw[0]+(i/100)*QS_PAGE+QS_PAGE-(i%100+1)*40;
+        t[23]=i%7?3:2; w32(t+24,i%7?(int32_t)i-5:(int32_t)i); w32(t+28,i);
+    }
+    for(unsigned i=0;i<set_rows;++i) {
+        unsigned char *t=raw[1]+QS_PAGE-(i+1)*40;
+        t[23]=variant==1 || i==5?2:3; w32(t+24,keys[i]);
+    }
+    for(unsigned i=0;i<2;++i) {
+        struct qp_node *leaf=&p->nodes[i?2:0]; leaf->bytes=sizes[i];
+        leaf->input_offset=bytes; bytes+=QP_SCAN_BYTES; leaf->vector_offset=bytes;
+        bytes=(bytes+qs_chunk_bytes(qp_scan_capacity(p,leaf),2)+4095)&~(size_t)4095;
+    }
+    unsigned char *arena=calloc(1,bytes),*io=calloc(1,QS_SORT_IO_BYTES);
+    struct qs_result *out=calloc(1,sizeof(*out)); assert(arena && io && out);
+    *(struct qs_dict *)arena=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
+    for(unsigned i=0;i<2;++i) {
+        const struct qp_node *leaf=&p->nodes[i?2:0];
+        *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=qp_scan_capacity(p,leaf),.ncols=2};
+    }
+    struct qp_control c={0}; void *mr[]={p,&c,out,arena,io};
+    long long len[]={sizeof(*p),sizeof(c),sizeof(*out),bytes,QS_SORT_IO_BYTES};
+    struct femu_csd_args a={.numr=5,.mr_addr=mr,.mr_len=len}; unsigned seen=0,returned=0,expected=0;
+    for(unsigned at=0;at<rows;++at) {
+        int found=0; for(unsigned k=0;k<set_rows && variant!=1;++k)
+            if(k!=5 && at%7 && keys[k]==(int)at-5) found=1;
+        int unknown=at%7?(!found && (variant==1 || variant==3)):set_rows!=0;
+        expected+=!filter || (!unknown && (filter==1?found:!found));
+    }
+    while(!out->finished) {
+        assert(!run(&a));
+        for(unsigned r=0;r<out->rows;++r) {
+            unsigned at=out->data[r].cells[0].value; assert(at>=seen && at<rows);
+            if(!filter) assert(at==seen);
+            int found=0; for(unsigned k=0;k<set_rows && variant!=1;++k)
+                if(k!=5 && at%7 && keys[k]==(int)at-5) found=1;
+            int unknown=at%7?(!found && (variant==1 || variant==3)):set_rows!=0;
+            const struct qs_cell *v=out->data[r].cells;
+            assert(v[1].isnull==unknown && v[2].isnull==unknown);
+            if(!unknown) assert(v[1].value==found && v[2].value==!found);
+            if(filter) assert(!unknown && (filter==1?found:!found));
+            seen=at+1; ++returned;
+        }
+        if(c.bytes && !c.ready) {
+            unsigned source=c.node==2; memcpy(arena+p->nodes[c.node].input_offset,raw[source]+c.offset,c.bytes); c.ready=1;
+        }
+    }
+    assert(returned==expected);
+    if(!filter) assert(seen==rows);
+    struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
+    free(raw[0]); free(raw[1]); free(arena); free(io); free(out); free(p);
+}
 /* InitPlan parameters remain batch constants with their runtime precision,
  * both over a Heap scan and over retained Hash Join payload columns. */
 static void parameter_projection(function run,int joined,int wide,int null_parameter)
@@ -1909,6 +1982,7 @@ int main(int argc,char **argv)
     probe_payload(run,2,0,0,4,1); probe_payload(run,2,0,0,5,1);
     namespace_reentry(run);
     for(unsigned mode=0;mode<6;++mode) filtered_projection(run,mode);
+    for(unsigned variant=0;variant<4;++variant) for(unsigned filter=0;filter<3;++filter) set_projection(run,variant,filter);
     for(int joined=0;joined<2;++joined) {
         parameter_projection(run,joined,0,0);
         parameter_projection(run,joined,1,0);
