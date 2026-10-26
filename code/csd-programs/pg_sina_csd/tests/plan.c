@@ -13,7 +13,7 @@
 #include <stdatomic.h>
 #include <endian.h>
 typedef int64_t (*function)(struct femu_csd_args *);
-enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_INDEX_PIPELINE,TEST_INDEX_HASH,TEST_INDEX_CHAIN,TEST_INDEX_EXPR,TEST_DEVICE_IO,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL, TEST_VECTOR_AGG=-1,TEST_HASH_QUAL=-2,TEST_GROUP_SOURCE=-3,TEST_GROUP_SOURCE_SPILL=-4,TEST_BUILD_GROUP_SOURCE=-5,TEST_BUILD_GROUP_HAVING=-6,TEST_BUILD_GROUP_DIRECT=-7 };
+enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_INDEX_PIPELINE,TEST_INDEX_HASH,TEST_INDEX_CHAIN,TEST_INDEX_EXPR,TEST_DEVICE_IO,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL, TEST_VECTOR_AGG=-1,TEST_JOIN_QUAL=-2,TEST_GROUP_SOURCE=-3,TEST_GROUP_SOURCE_SPILL=-4,TEST_BUILD_GROUP_SOURCE=-5,TEST_BUILD_GROUP_HAVING=-6,TEST_BUILD_GROUP_DIRECT=-7 };
 static unsigned test_workers=4;
 static bool test_scheduled;
 /* Reservations must cover physical input even when filters/NDV estimates
@@ -375,7 +375,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             g->expr.exprs[4]=(struct qs_expr){.op=Q_LT,.type=Q_BOOLEAN,.left=0,.right=3};
         }
     }
-    if(parallel==TEST_HASH_QUAL) {
+    if(parallel==TEST_JOIN_QUAL) {
         j->expr.nexprs=8;
         j->expr.exprs[4]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=8};
         j->expr.exprs[5]=(struct qs_expr){.op=Q_GE,.type=Q_BOOLEAN,.left=3,.right=4};
@@ -464,6 +464,14 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         plan->nodes[5].expr.aggs[0].expr=1;
         plan->nodes[5].expr.outputs[1]=(struct qs_output){.index=3,.type_oid=20};
         plan->nodes[6]=plan->nodes[3];
+    }
+    if(!hash && (parallel==TEST_JOIN_QUAL || parallel==TEST_SERIAL)) {
+        /* Matching order must bypass a second Sort; descending input must
+         * still be resorted for this ascending Merge. Both keep exact NULLs. */
+        plan->count=5; j->right=4;
+        plan->nodes[4]=(struct qp_node){.kind=QP_SORT,.left=3,.right=-1,.expr=plan->nodes[3].expr};
+        plan->nodes[4].expr.norder=1; plan->nodes[4].expr.limit=-1;
+        plan->nodes[4].expr.order[0]=(struct qs_order){.output=0,.descending=parallel==TEST_SERIAL};
     }
     size_t sizes[2]; unsigned char *raw[2]={heap(rows,0,&sizes[0]),heap(right_rows,1,&sizes[1])};
     if(parallel==TEST_GROUP_SOURCE_SPILL) for(unsigned i=0;i<rows;++i)
@@ -567,7 +575,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         unsigned left_value=parallel==TEST_GROUP_SOURCE?source_sums[key]:l%19+1;
         for(unsigned r=0;r<right_rows;++r) if(valid && r%17 && key==(parallel==TEST_PARTITION_SKEW?1:grouped_build?r:r%7) &&
             (parallel!=TEST_INDEX_EXPR || r%13+1>=8) &&
-            (parallel!=TEST_HASH_QUAL || r%13+1>=8)) {
+            (parallel!=TEST_JOIN_QUAL || r%13+1>=8)) {
             unsigned v=join==QP_SEMI?left_value:r%13+1; matched=1;
             if(join==QP_ANTI) continue;
             ++counts[key]; sums[key]+=v; if(!mins[key] || mins[key]>v) mins[key]=v; if(maxs[key]<v) maxs[key]=v;
@@ -665,7 +673,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     }
     if(hash==2 && memory==4 && parallel==TEST_SERIAL) assert(spill.count); /* page-ready flag survives spill reentry */
     if(parallel==TEST_DEVICE_IO && memory==4) assert(spill.count); /* namespace and spill reentry share one CU I/O AFDM */
-    if(parallel==TEST_HASH_QUAL && right_rows==150000) assert(spill.count);
+    if(parallel==TEST_JOIN_QUAL && right_rows==150000) assert(spill.count);
     if(parallel==TEST_GROUP_SOURCE_SPILL) assert(spill.count && !plan->nodes[1].parallel);
     if(test_workers>4 && parallel) assert(out->metrics.workers==test_workers && control.epoch);
     if(parallel==TEST_GROUP_SOURCE && !rows) assert(!got); else assert(got);
@@ -842,7 +850,7 @@ static void nested_sort(function run,unsigned type,unsigned hash,unsigned kind)
 struct expected_multi { unsigned a,b,rows,count; int64_t sum,minimum,maximum; };
 /* Prehashed future rows must not raise errors past LIMIT, while an input
  * row actually requested must raise its payload error even if it cannot join. */
-static void probe_payload(function run,unsigned limit,int strings,int indexed,int residual)
+static void probe_payload(function run,unsigned limit,int strings,int indexed,int residual,int merge)
 {
     struct qp_plan *p=calloc(1,sizeof(*p)); assert(p); p->count=4; p->scan_bytes=QP_SCAN_BYTES;
     scan(&p->nodes[2]); scan(&p->nodes[3]);
@@ -858,7 +866,7 @@ static void probe_payload(function run,unsigned limit,int strings,int indexed,in
         left->nexprs=2; left->cols[1].length=-1; left->cols[1].type=Q_STRING;
         left->exprs[1].type=Q_STRING; left->outputs[1]=(struct qs_output){.index=1,.type_oid=25};
     }
-    struct qp_node *j=&p->nodes[1]; j->kind=QP_JOIN; j->left=2; j->right=3; j->hash=1;
+    struct qp_node *j=&p->nodes[1]; j->kind=QP_JOIN; j->left=2; j->right=3; j->hash=!merge;
     j->nkeys=1; j->join_type=QP_INNER; j->join_qual=-1;
     j->expr=p->nodes[3].expr; j->expr.nattrs=4;
     j->expr.exprs[1].type=strings?Q_STRING:Q_DECIMAL; j->expr.outputs[1].type_oid=strings?25:1700;
@@ -927,7 +935,7 @@ static void probe_payload(function run,unsigned limit,int strings,int indexed,in
         struct qs_plan *e=&j->expr; e->nexprs=10;
         e->exprs[1].type=Q_INTEGER; e->exprs[1].column=1;
         e->exprs[2]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER,.column=3};
-        e->exprs[3]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=indexed?-498:-474};
+        e->exprs[3]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=indexed || merge?-498:-474};
         e->exprs[4]=(struct qs_expr){.op=Q_EQ,.type=Q_BOOLEAN,.left=2,.right=3};
         e->exprs[5]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=INT64_MAX};
         e->exprs[6]=(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=5,.right=5};
@@ -1816,7 +1824,7 @@ int main(int argc,char **argv)
         test(run,QP_INNER,31,50003,256,1,TEST_BUILD_PHASE);
         test(run,QP_LEFT,31,5003,256,1,TEST_WIDE_HASH);
         for(unsigned join=QP_INNER;join<=QP_ANTI;++join)
-            test(run,join,31,5003,256,1,TEST_HASH_QUAL);
+            test(run,join,31,5003,256,1,TEST_JOIN_QUAL);
         for(unsigned join=QP_INNER;join<=QP_ANTI;++join) {
             test(run,join,20003,23,256,1,TEST_GROUP_SOURCE);
             test(run,join,20003,23,256,2,TEST_GROUP_SOURCE);
@@ -1857,17 +1865,19 @@ int main(int argc,char **argv)
     poison_workmem();
     local_group_merge(run,0); local_group_merge(run,1);
     dictionary_growth();
-    probe_payload(run,1,0,0,0); probe_payload(run,2,0,0,0); probe_payload(run,2,1,0,0);
-    probe_payload(run,2,2,0,0); probe_payload(run,1,3,0,0); probe_payload(run,2,3,0,0);
-    probe_payload(run,1,0,1,0); probe_payload(run,2,0,1,0); grouped_probe(run);
-    probe_payload(run,2,0,2,0);
-    probe_payload(run,2,0,3,0);
-    probe_payload(run,2,0,4,0); probe_payload(run,2,0,5,0);
-    probe_payload(run,1,0,0,1); probe_payload(run,2,0,0,1);
-    probe_payload(run,2,0,0,2); probe_payload(run,2,0,0,3);
-    probe_payload(run,2,0,0,4); probe_payload(run,2,0,0,5);
-    probe_payload(run,1,0,1,1); probe_payload(run,2,0,1,1);
-    probe_payload(run,2,0,1,2); probe_payload(run,2,0,1,3);
+    probe_payload(run,1,0,0,0,0); probe_payload(run,2,0,0,0,0); probe_payload(run,2,1,0,0,0);
+    probe_payload(run,2,2,0,0,0); probe_payload(run,1,3,0,0,0); probe_payload(run,2,3,0,0,0);
+    probe_payload(run,1,0,1,0,0); probe_payload(run,2,0,1,0,0); grouped_probe(run);
+    probe_payload(run,2,0,2,0,0);
+    probe_payload(run,2,0,3,0,0);
+    probe_payload(run,2,0,4,0,0); probe_payload(run,2,0,5,0,0);
+    probe_payload(run,1,0,0,1,0); probe_payload(run,2,0,0,1,0);
+    probe_payload(run,2,0,0,2,0); probe_payload(run,2,0,0,3,0);
+    probe_payload(run,2,0,0,4,0); probe_payload(run,2,0,0,5,0);
+    probe_payload(run,1,0,1,1,0); probe_payload(run,2,0,1,1,0);
+    probe_payload(run,2,0,1,2,0); probe_payload(run,2,0,1,3,0);
+    probe_payload(run,1,0,0,1,1); probe_payload(run,2,0,0,1,1);
+    probe_payload(run,2,0,0,2,1); probe_payload(run,2,0,0,3,1);
     namespace_reentry(run);
     for(unsigned mode=0;mode<6;++mode) filtered_projection(run,mode);
     for(int joined=0;joined<2;++joined) {
@@ -1893,10 +1903,10 @@ int main(int argc,char **argv)
     parallel_sort_spill(run,test_workers,8U*1024*1024,1);
     parallel_sort_spill(run,test_workers,4U*1024*1024,1);
     for(unsigned join=QP_INNER;join<=QP_ANTI;++join) {
-        test(run,join,31,5003,64,1,TEST_HASH_QUAL);
-        test(run,join,31,5003,4,1,TEST_HASH_QUAL);
+        test(run,join,31,5003,64,1,TEST_JOIN_QUAL);
+        test(run,join,31,5003,4,1,TEST_JOIN_QUAL);
     }
-    test(run,QP_INNER,31,150000,4,1,TEST_HASH_QUAL);
+    test(run,QP_INNER,31,150000,4,1,TEST_JOIN_QUAL);
     test(run,QP_INNER,20003,23,64,1,TEST_VECTOR_AGG);
     test(run,QP_INNER,0,23,64,1,TEST_VECTOR_AGG);
     test(run,QP_INNER,1,23,64,1,TEST_VECTOR_AGG);
@@ -1914,6 +1924,10 @@ int main(int argc,char **argv)
     test_scheduled=false;
     for(int hash=0;hash<3;++hash)
         for(unsigned join=QP_INNER;join<=QP_ANTI;++join) test(run,join,517,23,64,hash,TEST_SERIAL);
+    for(unsigned join=QP_INNER;join<=QP_ANTI;++join)
+        test(run,join,31,5003,64,0,TEST_JOIN_QUAL);
+    test(run,QP_LEFT,31,150000,4,0,TEST_JOIN_QUAL);
+    test(run,QP_LEFT,31,5003,64,0,TEST_WIDE_HASH);
     for(unsigned join=QP_INNER;join<=QP_ANTI;++join) {
         test(run,join,5170,23,64,1,TEST_PARALLEL);
         test(run,join,5170,23,64,1,TEST_BUILD_PHASE);

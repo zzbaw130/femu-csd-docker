@@ -802,3 +802,25 @@ Q13与Q20另用旧、新SO各做一次独立冷启动profile，原始记录为�
 host总延迟56740.096ms，CSD为15335.444ms，总时间比3.700倍；单条1.764倍（Q16）至9.214倍（Q18）。这是当前版本的一轮冷启动验收，不将它与历史样本相减作为某项改动收益，也不证明每个阶段都满载8CU。三层仍分别负责PG计划/映射/编排、SNIA通用请求适配、FEMU通用图与内部I/O；复核设备图的LOAD/EXEC/STORE记录、适配器转换及分配器父context计账，没有加入SQL固件语义或额外进程。
 
 原改造清单的当前证据：2048行扫描向量与4/2/1MiB读取块已分开；Scan/Filter/Projection、Hash/Index Join及聚合的主要路径消费列批次；构建、CU局部聚合和Combine分别管理局部/共享状态；namespace读取和spill在设备图内重入；CU子context共享查询实际总预算并使用设备查询资源；NULL、numeric、文本与错误边界由上述组件测试和22条结果校验覆盖。仍保留的边界是Merge/部分不支持表达式的行接口、已spill的Source与串行归并，以及部分阻塞阶段的主机续交。当前22条性能门槛已通过，不能据此宣称全部执行路径都已完全向量化，目标保持进行中。
+
+## Merge输出列批次、已有顺序复用与排序额度
+
+参考DuckDB Merge在算子状态保留匹配位置、输出DataChunk再继续处理的方式，将原Merge匹配与投影分开。排序输入、重复键组及SEMI/ANTI命中游标保留原状态；合格匹配的所需列组成至多256行的批次，交给既有过滤/投影向量，Hash构建退回Merge时也可继续该路径。匹配残余条件仍逐候选判断；不支持的表达式保留原适配器。I/O与STORE/LOAD重入保留部分批次，不重复匹配。未增加PG/SNIA/FEMU接口或FDM。
+
+真实Merge开发检查发现两次重复排序：Merge再次排序已由显式Sort排序的输入，流式Aggregate又排序已按分组键有序的Merge输出。设备现在沿直接保留键的Projection/过滤证明Sort或Merge的键前缀，Merge还校验方向及NULL顺序，流式聚合只要求相同键连续。方向不匹配、计算过的键、无法证明顺序或Hash回退的未排序前缀仍使用原排序路径，不从索引名称推断顺序。排序初始额度保留原公式，同时允许借用“当前根空闲减两份原排序保底余量”的空间，取更大值；所有动态分配仍受同一个根预算和物理池限制，不新增内存API或回收框架。
+
+原生及8/16/64 CU四项CTest、ASan/UBSan/LeakSanitizer原生及8CU两项通过。扩展Merge残余条件的INNER/LEFT/SEMI/ANTI、宽numeric、4MiB下重复键组spill、LIMIT后续错误、顺序匹配与降序不匹配用例，继续校验独立行循环结果和资源清理。原64MiB无spill及小预算实际spill边界仍通过。
+
+开发检查直接使用标准Q13及其EXPLAIN，仅在这些连接设置 `enable_hashjoin=off`、`enable_nestloop=off`、`enable_hashagg=off`，使PG选择需要保留顺序的Merge。它与默认性能验收分开；不修改SQL或持久PG配置。已验证设备计划中实际存在Merge Join、顶层完整卸载，修改前后及host输出逐字节一致。原始日志在[开发结果目录](../../../../results/merge-vectors/)，修复前为 `13.duplicate-sort.csd.log` / `13.duplicate-sort.profile.log`，修复后为 `13.csd.log` / `13.profile.log`。修复前后CSF均已使用本节列批次，因此以下比较主要反映重复排序和额度修正：
+
+| 指标 | 修复前 | 修复后 |
+| --- | ---: | ---: |
+| 普通CSD冷启动 | 6010.697ms | 1744.957ms |
+| profile spill读 / 写 | 各247660544字节 | 均0 |
+| profile workmem峰值 | 157403696字节 | 109349904字节 |
+| profile排序run数 | 291 | 100 |
+| profile累计CSF CPU | 5808.221ms | 2630.613ms |
+
+修复后同配置host冷启动2654.203ms，CSD为1744.957ms；资源保持8 CU、256MiB workmem、64MiB FDM，不能将修复前spill归因于物理内存不足。单次profile不代表固定加速比例。
+
+恢复默认连接选项后的[Q2/Q3/Q9/Q10/Q13/Q18标准冷启动回归](../../../../results/tpch.LLwvl0/timings.csv)均结果一致、完整卸载且快于同轮host；CSD分别344.990/754.113/882.068/940.994/360.823/1188.534ms。已部署当前设备SO，未重复全量22条；上一节22条成绩属于此前提交，不与本节开发检查混用。匹配残余条件、流式分组及spill Source的部分行接口和阻塞阶段续交仍需继续处理。

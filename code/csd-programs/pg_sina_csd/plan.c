@@ -138,6 +138,7 @@ struct operator_state {
     int scan_filter_checked,projection_checked;
     struct projection_batch *projection;
     int phase, have_left, have_right, input_done, group_ready, matched, finished;
+    unsigned merge_ordered; /* left/right input order verified; bit 2 marks checked. */
     struct qs_plan *index_plan;
     struct projection_batch *index_projection;
     struct index_qual_batch *index_qual;
@@ -424,6 +425,8 @@ static int64_t sort_init(struct execution *s,struct sorted_rows *sort,const stru
         active+=o->right_sort.initialized && !o->right_sort.drained;
     }
     size_t available=(memory.limit_bytes-memory.used_bytes)/(active+2);
+    size_t free_bytes=memory.limit_bytes-memory.used_bytes,reserve=2*s->sort_limit;
+    if(free_bytes>reserve && free_bytes-reserve>available) available=free_bytes-reserve;
     if(available>sort->plan.work_mem_bytes) sort->plan.work_mem_bytes=available;
     sort->plan.work_mem_parent=(uintptr_t)s->context;
     memcpy(sort->plan.outputs,input->outputs,input->nout*sizeof(input->outputs[0]));
@@ -973,17 +976,55 @@ static int key_compare(struct execution *s,const struct qp_node *n,const struct 
 }
 static int keys_null(const struct qp_node *n,const struct qs_cell *left)
 { for(unsigned i=0;i<n->nkeys;++i) if(left[n->left_keys[i]].isnull) return 1; return 0; }
-static int64_t join_next(struct execution *s,unsigned id,struct qs_cell *row)
+/* Prove a Sort/Merge key prefix through key-preserving projections/filters.
+ * A NULL order accepts either direction, as required by streaming grouping. */
+static int input_ordered(const struct qp_plan *p,unsigned child,unsigned count,
+    const int *columns,const struct qs_order *order)
+{
+    int keys[QS_KEYS]; memcpy(keys,columns,count*sizeof(*keys));
+    for(;;) {
+        const struct qp_node *n=&p->nodes[child];
+        int merge=n->kind==QP_JOIN && !n->hash;
+        if((n->kind!=QP_PROJECT && n->kind!=QP_SORT && !merge) || n->left<0) return 0;
+        for(unsigned k=0;k<count;++k) {
+            if(keys[k]<0 || (unsigned)keys[k]>=n->expr.nout) return 0;
+            int index=n->expr.outputs[keys[k]].index;
+            if(index<0 || (unsigned)index>=n->expr.nexprs || n->expr.exprs[index].op!=Q_COLUMN) return 0;
+            keys[k]=n->expr.exprs[index].column;
+        }
+        if(n->kind==QP_SORT || merge) {
+            if((merge?n->nkeys:n->expr.norder)<count) return 0;
+            for(unsigned k=0;k<count;++k) {
+                const struct qs_order *found=n->expr.norder?&n->expr.order[k]:NULL;
+                if(keys[k]!=(merge?n->left_keys[k]:found->output)) return 0;
+                if(order && (order[k].descending!=(found?found->descending:0) ||
+                    order[k].nulls_first!=(found?found->nulls_first:0))) return 0;
+            }
+            return 1;
+        }
+        child=n->left;
+    }
+}
+/* Keep duplicate-group and spill cursors here; projection consumes matching
+ * pairs separately, either as a column batch or through the scalar adapter. */
+static int64_t merge_match_next(struct execution *s,unsigned id,struct qs_cell *values)
 {
     const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
     unsigned ln=s->plan->nodes[n->left].expr.nout,rn=s->plan->nodes[n->right].expr.nout;
-    struct qs_order right_order[QS_KEYS];
-    for(unsigned i=0;i<n->expr.norder;++i) { right_order[i]=n->expr.order[i]; right_order[i].output=n->right_keys[i]; }
-    const struct qs_order *left_order=n->expr.norder?n->expr.order:NULL;
+    struct qs_order left_order[QS_KEYS],right_order[QS_KEYS];
+    for(unsigned i=0;i<n->nkeys;++i) {
+        left_order[i]=n->expr.norder?n->expr.order[i]:(struct qs_order){.output=n->left_keys[i]};
+        right_order[i]=left_order[i]; right_order[i].output=n->right_keys[i];
+    }
+    if(!o->merge_ordered) {
+        o->merge_ordered=4;
+        if(!o->left_sort.prefix && input_ordered(s->plan,n->left,n->nkeys,n->left_keys,left_order)) o->merge_ordered|=1;
+        if(!o->right_sort.prefix && input_ordered(s->plan,n->right,n->nkeys,n->right_keys,right_order)) o->merge_ordered|=2;
+    }
     for(;;) {
         int64_t status;
         if(o->phase==2) {
-            status=sorted_input(s,&o->left_sort,n->left,n->nkeys,n->left_keys,left_order,o->left);
+            status=o->merge_ordered&1?next_row(s,n->left,o->left):sorted_input(s,&o->left_sort,n->left,n->nkeys,n->left_keys,left_order,o->left);
             if(status!=2) return status;
             o->have_left=1; o->position=0; o->matched=0; o->phase=0;
             const struct qs_plan *types=&s->plan->nodes[n->left].expr;
@@ -997,13 +1038,14 @@ static int64_t join_next(struct execution *s,unsigned id,struct qs_cell *row)
             if(!same) { o->group_ready=0; o->group.rows=o->group.blocks=o->group.used=0; o->group.loaded=UINT_MAX; }
         }
         if(!o->have_left) {
-            status=sorted_input(s,&o->left_sort,n->left,n->nkeys,n->left_keys,left_order,o->left);
+            status=o->merge_ordered&1?next_row(s,n->left,o->left):sorted_input(s,&o->left_sort,n->left,n->nkeys,n->left_keys,left_order,o->left);
             if(status!=2) return status;
             o->have_left=1; o->position=0; o->matched=0;
         }
         if(!o->group_ready) {
             if(!o->have_right && !o->input_done) {
-                status=sorted_input(s,&o->right_sort,n->right,n->nkeys,n->right_keys,n->expr.norder?right_order:NULL,o->right);
+                status=o->merge_ordered&2?next_row(s,n->right,o->right):
+                    sorted_input(s,&o->right_sort,n->right,n->nkeys,n->right_keys,right_order,o->right);
                 if(status==QP_WAIT || status<0 || status>2) return status;
                 o->have_right=status==2; o->input_done=!status;
             }
@@ -1019,15 +1061,15 @@ static int64_t join_next(struct execution *s,unsigned id,struct qs_cell *row)
             else {
                 o->have_left=0;
                 if(n->join_type==QP_LEFT || n->join_type==QP_ANTI) {
-                    struct qs_cell values[QS_COLS]; memcpy(values,o->left,ln*sizeof(*values));
+                    memcpy(values,o->left,ln*sizeof(*values));
                     for(unsigned i=0;i<rn;++i) values[ln+i]=(struct qs_cell){.isnull=1};
-                    int count=project(s,n,values,NULL,row); if(count<0) return count; if(count) return 2;
+                    return 2;
                 }
                 continue;
             }
         }
         if(o->position<o->group.rows) {
-            struct qs_cell values[QS_COLS]; memcpy(values,o->left,ln*sizeof(*values));
+            memcpy(values,o->left,ln*sizeof(*values));
             status=spool_row(s,&o->group,o->position,rn,values+ln); if(status) return status;
             ++o->position;
             struct qs_eval e; init_eval(&e,&n->expr,values,NULL); struct qs_cell match={.value=1};
@@ -1036,18 +1078,26 @@ static int64_t join_next(struct execution *s,unsigned id,struct qs_cell *row)
             o->matched=1;
             if(n->join_type==QP_ANTI) { o->position=o->group.rows; continue; }
             if(n->join_type==QP_SEMI) o->position=o->group.rows;
-            int count=project(s,n,values,NULL,row); if(count<0) return count;
-            if(count) { ++s->metrics.join_rows; return 2; }
-            continue;
+            ++s->metrics.join_rows; return 2;
         }
         if(!o->matched && (n->join_type==QP_LEFT || n->join_type==QP_ANTI)) {
-            struct qs_cell values[QS_COLS]; memcpy(values,o->left,ln*sizeof(*values));
+            memcpy(values,o->left,ln*sizeof(*values));
             for(unsigned i=0;i<rn;++i) values[ln+i]=(struct qs_cell){.isnull=1};
             o->matched=1;
-            int count=project(s,n,values,NULL,row); if(count<0) return count; if(count) return 2;
+            return 2;
         }
         /* Keep the right duplicate group for another left row with this key. */
         memcpy(o->first,o->left,ln*sizeof(*o->first)); o->have_left=0; o->phase=2;
+    }
+}
+static int64_t join_next(struct execution *s,unsigned id,struct qs_cell *row)
+{
+    struct qs_cell values[QS_COLS];
+    for(;;) {
+        int64_t status=merge_match_next(s,id,values); if(status!=2) return status;
+        int count=project(s,&s->plan->nodes[id],values,NULL,row);
+        if(count<0) return count;
+        if(count) return 2;
     }
 }
 /* Filter retained Heap values by selection vectors. Byte views avoid interning
@@ -1395,7 +1445,7 @@ static int projection_init(struct execution *s,unsigned id)
     const struct qp_node *leaf=&s->plan->nodes[scan];
     int group_source=s->worker && s->source_node==scan && leaf->kind==QP_AGGREGATE &&
         s->owner->partition_join<0 && s->owner->nodes[scan].group_phase==3;
-    int joined=leaf->kind==QP_INDEX_JOIN || (leaf->kind==QP_JOIN && leaf->hash);
+    int joined=leaf->kind==QP_INDEX_JOIN || leaf->kind==QP_JOIN;
     int sorted=leaf->kind==QP_SORT && leaf->left>=0 &&
         leaf->expr.nattrs==s->plan->nodes[leaf->left].expr.nout;
     if((leaf->kind!=QP_SCAN && !joined && !sorted && !group_source) || (!s->worker && s->plan->workers>1 && leaf->parallel)) return 0;
@@ -1554,7 +1604,12 @@ static int64_t projection_join_fill(struct execution *s,struct projection_batch 
     }
     while(b->input_count<QS_VECTOR_ROWS) {
         int previous=s->control->error; unsigned previous_node=s->control->error_node;
-        int64_t status=hash_match_next(s,b->scan,b->keep_window && b->input_count);
+        int merge=!n->hash || o->hash_fallback==1;
+        struct qs_cell values[QS_COLS];
+        int64_t status=merge?merge_match_next(s,b->scan,values):hash_match_next(s,b->scan,b->keep_window && b->input_count);
+        /* Hash construction can choose the existing Merge fallback before
+         * producing rows. Keep this DAG and begin collecting Merge pairs. */
+        if(status==3 && !merge && o->hash_fallback==1) continue;
         if(status==QP_BATCH_END) break;
         if(status!=2) {
             /* The shared page request must be serviced before another
@@ -1569,6 +1624,7 @@ static int64_t projection_join_fill(struct execution *s,struct projection_batch 
             if(!b->input_count) return status;
             break;
         }
+        if(merge) { projection_append(b,values); continue; }
         for(unsigned col=0;col<b->plan.nattrs;++col) {
             int slot=b->plan.cols[col].slot; if(slot<0) continue;
             struct qs_cell value;
@@ -2501,6 +2557,8 @@ static int64_t aggregate_next(struct execution *s,unsigned id,struct qs_cell *ro
 {
     const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
     if(n->hash) return hash_aggregate_next(s,id,row);
+    if(n->nkeys && n->left>=0 && !n->sorted_input && !n->distinct && !o->phase && !o->emitted &&
+       input_ordered(s->plan,n->left,n->nkeys,n->left_keys,NULL)) s->plan->nodes[id].sorted_input=1;
     /* Initialize before starting the child pipeline: parallel workers combine
      * their local states here before the first (and only) output row. */
     if(!n->nkeys && !o->phase && !o->emitted) {
@@ -2900,7 +2958,7 @@ static int64_t next_row_impl(struct execution *s,unsigned id,struct qs_cell *row
     }
     if(o->finished && (!o->projection || (o->projection->position==o->projection->count && !o->projection->error))) return 0;
     if(!s->worker && s->plan->workers>1 && n->parallel) return parallel_next(s,id,row);
-    if(n->kind==QP_SCAN || n->kind==QP_SORT || (n->kind==QP_PROJECT && n->left>=0) || (n->kind==QP_JOIN && n->hash) || n->kind==QP_INDEX_JOIN) {
+    if(n->kind==QP_SCAN || n->kind==QP_SORT || (n->kind==QP_PROJECT && n->left>=0) || n->kind==QP_JOIN || n->kind==QP_INDEX_JOIN) {
         int status=projection_init(s,id); if(status) return status;
         if(o->projection) return projection_next(s,id,row);
     }
