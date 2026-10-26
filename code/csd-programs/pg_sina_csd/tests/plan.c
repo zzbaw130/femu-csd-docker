@@ -1081,10 +1081,10 @@ static void probe_payload(function run,unsigned limit,int strings,int indexed,in
 }
 /* IN/NOT IN use the same immutable InitPlan set in scalar and column paths.
  * Check projected truth values and Scan predicates against a linear oracle. */
-static void set_projection(function run,unsigned variant,unsigned filter)
+static void set_projection(function run,unsigned variant,unsigned filter,unsigned scalar)
 {
     int large=variant>=4,has_null=variant==1 || variant==3 || variant==4;
-    unsigned rows=5007,set_rows=large?150000+(variant==4):variant==0?0:variant==1?1:variant==2?5:6;
+    unsigned rows=scalar?1:5007,set_rows=large?150000+(variant==4):variant==0?0:variant==1?1:variant==2?5:6;
     int32_t keys[]={-4,0,13,13,5001,0};
     struct qp_plan *p=calloc(1,sizeof(*p)); assert(p);
     p->count=3; p->scan_bytes=QP_SCAN_BYTES; p->ninit=1; p->init_nodes[0]=1; p->init_params[0]=-1;
@@ -1100,6 +1100,11 @@ static void set_projection(function run,unsigned variant,unsigned filter)
         n->expr.nexprs=5; n->expr.nout=4;
         n->expr.exprs[4]=(struct qs_expr){.op=Q_INSET,.type=Q_BOOLEAN,.left=1,.column=1};
         n->expr.outputs[3]=(struct qs_output){.index=4,.type_oid=16};
+    }
+    if(scalar) {
+        n->kind=QP_PROJECT; n->left=-1; n->expr.nattrs=n->expr.ncols=0;
+        n->expr.exprs[0]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=scalar==1?13:14,.isnull=scalar==3};
+        n->expr.exprs[1]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=0};
     }
     n->expr.predicate=filter?(filter==1?2:3):-1;
     p->nodes[2].expr.nout=1;
@@ -1135,6 +1140,7 @@ static void set_projection(function run,unsigned variant,unsigned filter)
         if(!large) for(unsigned k=0;k<set_rows && variant!=1;++k)
             if(k!=5 && at%7 && keys[k]==(int)at-5) found=1;
         int unknown=at%7?(!found && has_null):set_rows!=0;
+        if(scalar) { found=scalar==1; unknown=scalar==3?set_rows!=0:!found && has_null; }
         expected+=!filter || (!unknown && (filter==1?found:!found));
     }
     struct test_spill spill={.mutex=PTHREAD_MUTEX_INITIALIZER}; int cancelled=0;
@@ -1165,6 +1171,7 @@ static void set_projection(function run,unsigned variant,unsigned filter)
             if(!large) for(unsigned k=0;k<set_rows && variant!=1;++k)
                 if(k!=5 && at%7 && keys[k]==(int)at-5) found=1;
             int unknown=at%7?(!found && has_null):set_rows!=0;
+            if(scalar) { found=scalar==1; unknown=scalar==3?set_rows!=0:!found && has_null; }
             const struct qs_cell *v=out->data[r].cells;
             assert(v[1].isnull==unknown && v[2].isnull==unknown);
             if(!unknown) assert(v[1].value==found && v[2].value==!found);
@@ -1189,6 +1196,120 @@ static void set_projection(function run,unsigned variant,unsigned filter)
     if(!filter) assert(seen==rows);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
     free(raw[0]); free(raw[1]); free(arena); free(io); free(out); free(p);
+}
+/* Spilled IN in residuals must keep the current candidate, including the
+ * scalar first-candidate fast path used by SEMI/ANTI joins. */
+static void set_join(function run,unsigned kind,int hash,int has_null)
+{
+    const unsigned outer_rows=31,right_rows=23,set_rows=150000+has_null;
+    struct qp_plan *p=calloc(1,sizeof(*p)); assert(p);
+    p->count=5; p->ninit=1; p->init_nodes[0]=1; p->init_params[0]=-1; p->scan_bytes=QP_SCAN_BYTES;
+    for(unsigned i=2;i<5;++i) scan(&p->nodes[i]);
+    p->nodes[2].expr.nout=1;
+    p->nodes[1]=(struct qp_node){.kind=QP_SET,.left=2,.right=-1,.expr=p->nodes[2].expr};
+    struct qp_node *n=&p->nodes[0];
+    *n=(struct qp_node){.kind=QP_JOIN,.left=3,.right=4,.join_type=kind,.join_qual=4,.nkeys=1,.hash=hash==1};
+    if(hash==2) {
+        n->kind=QP_INDEX_JOIN; n->index_bytes=2*QS_PAGE;
+        p->nodes[4].expr.join=(struct qs_join){.indexid=1,.indexroot=1,.index_key_bytes=4,.build_key=0};
+    }
+    n->expr=p->nodes[3].expr; n->expr.nattrs=n->expr.ncols=4; n->expr.nexprs=8; n->expr.nout=3;
+    n->expr.work_mem_bytes=4U*1024*1024;
+    for(unsigned i=0;i<4;++i) {
+        n->expr.cols[i]=(struct qs_column){.slot=i,.type=Q_INTEGER,.length=4,.align=4};
+        n->expr.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.column=i,.type=Q_INTEGER};
+    }
+    n->expr.exprs[4]=(struct qs_expr){.op=Q_INSET,.column=1,.left=3,.type=Q_BOOLEAN};
+    n->expr.exprs[5]=(struct qs_expr){.op=Q_INSET,.column=1,.left=0,.type=Q_BOOLEAN};
+    n->expr.exprs[6]=(struct qs_expr){.op=Q_NOT,.left=5,.type=Q_BOOLEAN};
+    n->expr.exprs[7]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER};
+    n->expr.outputs[0]=(struct qs_output){.index=1,.type_oid=23};
+    n->expr.outputs[1]=(struct qs_output){.index=5,.type_oid=16};
+    n->expr.outputs[2]=(struct qs_output){.index=6,.type_oid=16};
+    size_t sizes[3],bytes=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
+    unsigned char *raw[]={heap(set_rows,2,&sizes[0]),heap(outer_rows,2,&sizes[1]),heap(right_rows,2,&sizes[2])};
+    for(unsigned i=0;i<set_rows;++i) {
+        unsigned char *t=raw[0]+(i/100)*QS_PAGE+QS_PAGE-(i%100+1)*40;
+        t[23]=has_null && i+1==set_rows?2:3; w32(t+24,(int32_t)(i/2)*3-200000);
+    }
+    for(unsigned i=0;i<outer_rows;++i) {
+        unsigned char *t=raw[1]+QS_PAGE-(i+1)*40;
+        t[23]=i%7?3:2; w32(t+24,i%7?(int32_t)i-5:(int32_t)i); w32(t+28,i);
+    }
+    for(unsigned i=0;i<right_rows;++i) {
+        unsigned char *t=raw[2]+QS_PAGE-(i+1)*40;
+        t[23]=3; w32(t+24,13+i%5); w32(t+28,i);
+    }
+    for(unsigned i=2;i<5;++i) {
+        struct qp_node *leaf=&p->nodes[i]; leaf->bytes=sizes[i-2]; leaf->input_offset=bytes; bytes+=QP_SCAN_BYTES;
+        leaf->vector_offset=bytes; bytes=(bytes+qs_chunk_bytes(qp_scan_capacity(p,leaf),2)+4095)&~(size_t)4095;
+    }
+    unsigned char *index=NULL;
+    if(hash==2) {
+        n->input_offset=bytes; bytes+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE;
+        n->vector_offset=bytes; bytes+=4096+qs_chunk_bytes(256,4);
+        index=calloc(2,QS_PAGE); assert(index); unsigned char *leaf=index+QS_PAGE;
+        w16(leaf+12,24+right_rows*4); w16(leaf+14,QS_PAGE-16-right_rows*16);
+        w16(leaf+16,QS_PAGE-16); w16(leaf+18,QS_PAGE|4); w16(leaf+QS_PAGE-4,3);
+        unsigned item=0;
+        for(unsigned key=13;key<=17;++key) for(unsigned r=0;r<right_rows;++r) if(13+r%5==key) {
+            unsigned offset=QS_PAGE-16-(++item)*16; unsigned char *entry=leaf+offset;
+            w32(leaf+24+(item-1)*4,offset|(1U<<15)|(16U<<17));
+            w16(entry+2,0); w16(entry+4,r+1); w16(entry+6,16); w32(entry+8,key);
+        }
+        assert(item==right_rows);
+    }
+    unsigned char *arena=calloc(1,bytes),*io=calloc(1,QS_SORT_IO_BYTES);
+    struct qs_result *out=calloc(1,sizeof(*out)); assert(arena && io && out);
+    *(struct qs_dict *)arena=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
+    for(unsigned i=2;i<5;++i) {
+        const struct qp_node *leaf=&p->nodes[i];
+        *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=qp_scan_capacity(p,leaf),.ncols=2};
+    }
+    unsigned seen[31]={0},expected[31]={0};
+    for(unsigned i=0;i<outer_rows;++i) {
+        unsigned matches=0;
+        for(unsigned j=0;j<right_rows;++j) matches+=i%7 && (int)i-5==(int)(13+j%5) && (j+200000)%3==0;
+        expected[i]=kind==QP_INNER?matches:kind==QP_LEFT?(matches?matches:1):kind==QP_SEMI?!!matches:!matches;
+    }
+    struct qp_control c={0}; void *mr[]={p,&c,out,arena,io};
+    long long len[]={sizeof(*p),sizeof(c),sizeof(*out),bytes,QS_SORT_IO_BYTES};
+    struct femu_csd_args a={.numr=5,.mr_addr=mr,.mr_len=len}; struct test_spill spill={.mutex=PTHREAD_MUTEX_INITIALIZER};
+    while(!out->finished) {
+        int64_t status=run(&a); assert(status>=0);
+        unsigned op=(uint64_t)status>>60;
+        if(op) { a.cparam2=spill_request(&spill,op,(uint64_t)status&CS_IO_VALUE_MASK,io); continue; }
+        a.cparam2=0;
+        for(unsigned r=0;r<out->rows;++r) {
+            const struct qs_cell *v=out->data[r].cells; unsigned i=v[0].value;
+            assert(i<outer_rows && ++seen[i]<=expected[i]);
+            int found=i%7 && ((int)i-5+200000)%3==0,unknown=i%7?(!found && has_null):1;
+            assert(v[1].isnull==unknown && v[2].isnull==unknown);
+            if(!unknown) assert(v[1].value==found && v[2].value==!found);
+        }
+        if(c.index_nreads && !c.ready) {
+            assert(hash==2);
+            for(unsigned i=0;i<c.index_nreads;++i) {
+                const struct qs_index_read *r=&c.index_reads[i];
+                memcpy(arena+n->input_offset+QS_SORT_IO_BYTES+(size_t)r->slot*QS_PAGE,
+                    (r->heap?raw[2]:index)+(size_t)r->block*QS_PAGE,QS_PAGE);
+            }
+            c.ready=1;
+        } else if(c.bytes && !c.ready) {
+            assert(c.node>=2 && c.node<5);
+            memcpy(arena+p->nodes[c.node].input_offset,raw[c.node-2]+c.offset,c.bytes); c.ready=1;
+        }
+    }
+    for(unsigned i=0;i<outer_rows;++i) {
+        if(seen[i]!=expected[i]) fprintf(stderr,"set join kind=%u hash=%d nulls=%d row=%u got=%u expected=%u\n",kind,hash,has_null,i,seen[i],expected[i]);
+        assert(seen[i]==expected[i]);
+    }
+    assert(spill.stores && out->metrics.work_peak<=4U*1024*1024);
+    for(unsigned i=0;i<spill.count;++i) free(spill.tokens[i]);
+    free(spill.tokens); assert(!pthread_mutex_destroy(&spill.mutex));
+    struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
+    for(unsigned i=0;i<3;++i) free(raw[i]);
+    free(index); free(arena); free(io); free(out); free(p);
 }
 /* InitPlan parameters remain batch constants with their runtime precision,
  * both over a Heap scan and over retained Hash Join payload columns. */
@@ -2039,7 +2160,11 @@ int main(int argc,char **argv)
         test(run,join,31,5003,64,1,TEST_PACKED_KEYS);
     namespace_reentry(run);
     for(unsigned mode=0;mode<6;++mode) filtered_projection(run,mode);
-    for(unsigned variant=0;variant<6;++variant) for(unsigned filter=0;filter<3;++filter) set_projection(run,variant,filter);
+    for(unsigned variant=0;variant<6;++variant) for(unsigned filter=0;filter<3;++filter) set_projection(run,variant,filter,0);
+    for(unsigned variant=4;variant<6;++variant) for(unsigned filter=0;filter<3;++filter)
+        for(unsigned scalar=1;scalar<=3;++scalar) set_projection(run,variant,filter,scalar);
+    for(unsigned kind=QP_INNER;kind<=QP_ANTI;++kind) for(int hash=0;hash<=2;++hash)
+        for(int nulls=0;nulls<=1;++nulls) set_join(run,kind,hash,nulls);
     for(int joined=0;joined<2;++joined) {
         parameter_projection(run,joined,0,0);
         parameter_projection(run,joined,1,0);
