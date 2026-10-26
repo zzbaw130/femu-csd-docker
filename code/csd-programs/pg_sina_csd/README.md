@@ -26,7 +26,9 @@
 
 正在接入的 `dictionary.c` 将字符串、ID目录和哈希桶统一按64KiB换页。内部调用者创建一个字典、为每个CU建立独立访问状态；insert/pin返回 NEED_* 时保留输入，通过该CU的I/O AFDM完成后携token重调同一操作。pin成功返回的字符串在unpin之前不会被换出；另一个CU正在完成字典操作时返回内部BUSY，调用者需保留当前位置重试。close逐一释放token再释放字典workmem；异常取消需先停止相关CU，再abort并由所属SNIA请求回收其临时token。`scan.h` 的内部扫描入口保存当前页、列和tuple，复用原解码器；原CSF入口不变。扫描与下述排序入口已通过组件测试，但默认SQL执行树尚未切换，表达式、索引及结果输出的缺页恢复仍需补齐。
 
-`sort.c` 可通过内部 `qs_sort_paged_dictionary(state, dictionary)` 接入同一个查询字典，排序初始化后、输入数据前调用。比较保留左右字符串引用以及当前键，缺页后继续当前堆调整；排序run与字典使用同一个I/O AFDM，各自保存待完成操作。共享配额下分配失败时，排序也能请求字典归还一个未固定的缓存页。现已验证完整外排、分轮归并、列批次TopN及取消；默认SQL树仍未启用这些入口，表达式、索引和最终输出的接入尚未完成。
+`sort.c` 可通过内部 `qs_sort_paged_dictionary(state, dictionary)` 接入同一个查询字典，排序初始化后、输入数据前调用。比较保留左右字符串引用以及当前键，缺页后继续当前堆调整；排序run与字典使用同一个I/O AFDM，各自保存待完成操作。共享配额下分配失败时，排序也能请求字典归还一个未固定的缓存页。现已验证完整外排、分轮归并、列批次TopN及取消；默认SQL树仍未启用这些入口，标量表达式、索引和最终输出的接入尚未完成。
+
+向量表达式使用 `qs_dictionary_text_create` 创建每CU的文本访问状态，放入内部 `qs_vector_input.text`，I/O AFDM放入 `text_io`。首次执行不设置resume；需要I/O时保留同一批输入、选择行和向量，通过 `qs_dictionary_text_request` 取得NEED_*，完成后填入 `text_completion` 并设置resume重调。只继续未完成的行，每次比较至多固定两个字符串。表达式完成后再用 `qs_vector_materialize_text_paged` 分阶段将输出切片变为ID，该阶段保留自己的行位置，不能重新初始化向量。扫描、排序及向量表达式已分别验证换页恢复；默认SQL树仍待接入标量表达式、索引、最终输出和查询生命周期，尚未对完整查询启用新字典。
 
 索引及串行Scan需要namespace页时，设备SQL程序根据PG预先提供的extent映射生成物理读取范围，返回 `csNeedNvmRead`，由FEMU通用设备图完成内部读取并重入同一CSF。映射缺失或一次读取范围超过设备上限时，才把控制记录交回Guest，由其提交 `csQueueStorageRequest(NVM_TO_AFDM)`；独立worker通过SNIA回调续交，协调端由PG线程续交。主机LOAD后的Compute使用已有cparam1中的QP_PAGES_INPUT标志设置就绪状态，省去独立FDM控制写入；该标志不在spill重入时重复应用，与QP_SCAN_INPUT的页号编码互斥，定义见私有plan.h。扫描块由Guest根据FDM容量在4/2/1MiB中选择，索引按需读取8KiB页。原始数据不经过Guest PG缓冲。spill需要时，设备SQL程序返回 `csNeedStore/Load/Free` 完成值，FEMU设备图在隐藏临时空间中执行并重入；SNIA保留非设备图请求的调度路径。PG不接收或解释中间行，FEMU和SNIA不解释表、索引或SQL语义。
 

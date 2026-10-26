@@ -2,6 +2,7 @@
 #include "cs_csf.h"
 #include "scan.h"
 #include "query.h"
+#include "query_vector.h"
 #include <assert.h>
 #include <pthread.h>
 #include <sched.h>
@@ -280,12 +281,164 @@ static void heap_scan(void)
     check_budget(parent,limit); close_dictionary(d,&a,&s);
     assert(!cs_work_end(parent)); storage_end(&s); free(chunk); free(raw);
 }
+static void expression_text(char *bytes,unsigned id,unsigned length)
+{
+    char prefix[32]; int n=snprintf(prefix,sizeof(prefix),"猫%04u-tail-",id);
+    assert(n>0 && (unsigned)n<length);
+    memset(bytes,'a'+id%26,length); memcpy(bytes,prefix,n);
+}
+static void vector_expressions(void)
+{
+    enum { KEYS=2048, LENGTH=1200 };
+    size_t limit=768U*1024;
+    cs_work_context *parent=cs_work_begin_limit(limit); assert(parent);
+    struct qs_dictionary *d=qs_dictionary_create(parent); assert(d);
+    struct access a={.state=qs_dictionary_access_create(d)}; assert(a.state);
+    struct qs_dictionary_text *text=qs_dictionary_text_create(d); assert(text);
+    struct storage s={.mutex=PTHREAD_MUTEX_INITIALIZER};
+    struct qs_plan p={.nattrs=3,.ncols=3,.nexprs=12};
+    for(unsigned i=0;i<3;++i) p.cols[i].slot=i;
+    p.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.column=0,.type=Q_STRING};
+    p.exprs[1]=(struct qs_expr){.op=Q_CONST,.constant=2,.type=Q_INTEGER};
+    p.exprs[2]=(struct qs_expr){.op=Q_CONST,.constant=4,.type=Q_INTEGER};
+    p.exprs[3]=(struct qs_expr){.op=Q_SUBSTRING,.left=0,.right=1,.otherwise=2,.type=Q_STRING};
+    p.exprs[4]=(struct qs_expr){.op=Q_COLUMN,.column=1,.type=Q_STRING};
+    p.exprs[5]=(struct qs_expr){.op=Q_CONST,.type=Q_STRING};
+    p.exprs[6]=(struct qs_expr){.op=Q_LIKE,.left=3,.right=5,.type=Q_BOOLEAN};
+    p.exprs[7]=(struct qs_expr){.op=Q_LT,.left=0,.right=4,.type=Q_BOOLEAN};
+    p.exprs[8]=(struct qs_expr){.op=Q_COLUMN,.column=2,.type=Q_BOOLEAN};
+    p.exprs[9]=(struct qs_expr){.op=Q_CASE,.left=8,.right=3,.otherwise=0,.type=Q_STRING};
+    p.exprs[10]=(struct qs_expr){.op=Q_COALESCE,.left=0,.right=4,.type=Q_STRING};
+    p.exprs[11]=(struct qs_expr){.op=Q_AND,.left=8,.right=6,.type=Q_BOOLEAN};
+    struct qs_vector *vectors=cs_work_calloc(parent,p.nexprs,sizeof(*vectors)); assert(vectors);
+    uint32_t ids[KEYS]; char key[LENGTH],other[LENGTH];
+    for(unsigned i=0;i<KEYS;++i) { expression_text(key,i,LENGTH); ids[i]=insert(d,&a,&s,key,LENGTH); }
+    p.exprs[5].constant=insert(d,&a,&s,"0___",4);
+    struct qs_cell *cells=calloc(3*QS_VECTOR_ROWS,sizeof(*cells)); assert(cells);
+    uint32_t selection[QS_VECTOR_ROWS];
+    uint8_t needed[QS_EXPRS]={0};
+    const unsigned roots[]={3,6,7,9,10,11};
+    for(unsigned i=0;i<sizeof(roots)/sizeof(*roots);++i) assert(!qs_vector_require(&p,roots[i],needed));
+    for(unsigned pass=0;pass<4;++pass) {
+        for(unsigned row=0;row<QS_VECTOR_ROWS;++row) {
+            cells[row]=(struct qs_cell){.value=ids[(row*71+pass*131)%KEYS],.isnull=row%7==0};
+            cells[QS_VECTOR_ROWS+row]=(struct qs_cell){.value=ids[(row*79+17)%KEYS],.isnull=row%11==0};
+            cells[2*QS_VECTOR_ROWS+row]=(struct qs_cell){.value=row%3!=0,.isnull=row%19==0};
+            selection[row]=pass==2?row%9:QS_VECTOR_ROWS-1-row;
+        }
+        void *snapshot=malloc(3*QS_VECTOR_ROWS*sizeof(*cells)); assert(snapshot);
+        memcpy(snapshot,cells,3*QS_VECTOR_ROWS*sizeof(*cells));
+        unsigned first=pass==1?7:0,count=pass==1?113:QS_VECTOR_ROWS;
+        const uint32_t *selected=pass?selection:NULL;
+        struct qs_vector_input input={.cells=cells,.text=text,.text_io=a.io};
+        unsigned waits=0;
+        for(;;) {
+            int status=qs_vector_execute_input(&p,NULL,selected,first,count,needed,vectors,input);
+            if(!status) break;
+            int64_t request=qs_dictionary_text_request(text); assert(request>QS_DICTIONARY_BUSY);
+            input.text_completion=complete(&s,request,a.io); input.resume=1; assert(++waits<100000);
+        }
+        assert(waits); /* Real dictionary misses, not just vector references. */
+        for(unsigned i=0;i<count;++i) {
+            unsigned row=selected?selected[first+i]:first+i;
+            unsigned left=(row*71+pass*131)%KEYS,right=(row*79+17)%KEYS;
+            expression_text(key,left,LENGTH); expression_text(other,right,LENGTH);
+            for(unsigned r=0;r<sizeof(roots)/sizeof(*roots);++r) assert(!vectors[roots[r]].errors[i]);
+            assert(vectors[3].nulls[i]==(row%7==0));
+            struct qs_cell like=qs_vector_cell(&p,vectors,6,i),less=qs_vector_cell(&p,vectors,7,i);
+            assert(like.isnull==(row%7==0)); if(!like.isnull) assert(like.value==(left<1000));
+            assert(less.isnull==(row%7==0 || row%11==0)); if(!less.isnull) assert(less.value==(memcmp(key,other,LENGTH)<0));
+            struct qs_cell flag=cells[2*QS_VECTOR_ROWS+row];
+            int choose=!flag.isnull && flag.value;
+            assert(vectors[9].nulls[i]==(row%7==0));
+            if(row%7) { assert(vectors[9].strings[i].id==ids[left]); assert(vectors[9].strings[i].offset==(choose?3U:0U)); }
+            assert(vectors[10].nulls[i]==(row%7==0 && row%11==0));
+            struct qs_plan logic={.nattrs=2,.nexprs=3};
+            logic.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.column=0};
+            logic.exprs[1]=(struct qs_expr){.op=Q_COLUMN,.column=1};
+            logic.exprs[2]=(struct qs_expr){.op=Q_AND,.left=0,.right=1};
+            struct qs_cell tuple[]={flag,like},expected; struct qs_eval eval={.plan=&logic,.tuple=tuple};
+            assert(!qs_evaluate(&eval,2,&expected)); struct qs_cell actual=qs_vector_cell(&p,vectors,11,i);
+            assert(actual.isnull==expected.isnull); if(!actual.isnull) assert(actual.value==expected.value);
+        }
+        const unsigned outputs[]={3,9,10};
+        for(unsigned out=0;out<3;++out) {
+            unsigned index=outputs[out]; uint64_t completion=0;
+            for(;;) {
+                int64_t request=qs_vector_materialize_text_paged(&vectors[index],count,d,text,a.io,completion);
+                if(!request) break;
+                assert(request>QS_DICTIONARY_BUSY); completion=complete(&s,request,a.io);
+            }
+            assert(vectors[index].kind==QS_WIDE && vectors[index].materialized==count);
+            for(unsigned i=0;i<count;++i) {
+                if(vectors[index].nulls[i]) { assert(!vectors[index].values[i]); continue; }
+                unsigned row=selected?selected[first+i]:first+i,left=(row*71+pass*131)%KEYS,right=(row*79+17)%KEYS;
+                int slice=index==3 || (index==9 && !cells[2*QS_VECTOR_ROWS+row].isnull && cells[2*QS_VECTOR_ROWS+row].value);
+                expression_text(key,index==10 && !(row%7)?right:left,LENGTH);
+                unsigned length; const char *bytes=pin(d,&a,&s,(unsigned)vectors[index].values[i],&length);
+                assert(length==(slice?4U:LENGTH) && !memcmp(bytes,key+(slice?3:0),length));
+                qs_dictionary_unpin(a.state);
+            }
+        }
+        assert(!memcmp(snapshot,cells,3*QS_VECTOR_ROWS*sizeof(*cells))); free(snapshot);
+    }
+    /* A false LHS must not read even an invalid dictionary ID on the RHS. */
+    for(unsigned row=0;row<QS_VECTOR_ROWS;++row) {
+        cells[row]=(struct qs_cell){.value=UINT32_MAX};
+        cells[2*QS_VECTOR_ROWS+row]=(struct qs_cell){0};
+    }
+    memset(needed,0,sizeof(needed)); assert(!qs_vector_require(&p,11,needed));
+    struct qs_dictionary_stats before; qs_dictionary_get_stats(d,&before);
+    struct qs_vector_input short_input={.cells=cells,.text=text,.text_io=a.io};
+    assert(!qs_vector_execute_input(&p,NULL,NULL,0,QS_VECTOR_ROWS,needed,vectors,short_input));
+    for(unsigned i=0;i<QS_VECTOR_ROWS;++i) {
+        struct qs_cell result=qs_vector_cell(&p,vectors,11,i); assert(!result.isnull && !result.value);
+    }
+    struct qs_dictionary_stats stats; qs_dictionary_get_stats(d,&stats);
+    assert(stats.stores && stats.loads && stats.loads==before.loads && stats.stores==before.stores);
+    printf("vector text resume: %llu STORE, %llu LOAD\n",(unsigned long long)stats.stores,(unsigned long long)stats.loads);
+    assert(!qs_dictionary_text_release(text)); check_budget(parent,limit);
+    close_dictionary(d,&a,&s); cs_work_free(parent,vectors); assert(!cs_work_end(parent)); storage_end(&s); free(cells);
+}
+static void text_cancel(uint64_t operation)
+{
+    cs_work_context *parent=cs_work_begin_limit(384U*1024); assert(parent);
+    struct qs_dictionary *d=qs_dictionary_create(parent); assert(d);
+    struct access a={.state=qs_dictionary_access_create(d)}; assert(a.state);
+    struct qs_dictionary_text *text=qs_dictionary_text_create(d); assert(text);
+    struct storage s={.mutex=PTHREAD_MUTEX_INITIALIZER};
+    char key[65535];
+    for(unsigned i=0;i<2000;++i) { make_key(key,i,800); insert(d,&a,&s,key,800); }
+    int cancelled=0;
+    for(unsigned i=0;i<1000 && !cancelled;++i) {
+        uint32_t id=0; const char *bytes; unsigned length;
+        make_key(key,UINT32_MAX-i,sizeof(key));
+        int64_t request=operation==CS_NEED_STORE?
+            qs_dictionary_text_insert(text,key,sizeof(key),&id,a.io):
+            qs_dictionary_text_get(text,i+1,&bytes,&length,a.io);
+        while(request) {
+            assert(request>QS_DICTIONARY_BUSY);
+            uint64_t completion=complete(&s,request,a.io);
+            if(((uint64_t)request&~CS_IO_VALUE_MASK)==operation) { cancelled=1; break; }
+            request=qs_dictionary_text_resume(text,a.io,completion);
+        }
+        if(!cancelled) {
+            if(operation==CS_NEED_STORE) assert(!qs_dictionary_text_insert(text,key,sizeof(key),&id,a.io));
+            assert(!qs_dictionary_text_release(text));
+        }
+    }
+    assert(cancelled); qs_dictionary_abort(d);
+    cs_work_context_stats remaining; assert(!cs_work_get_context_stats(parent,&remaining));
+    assert(!remaining.used_bytes && !remaining.allocations);
+    storage_end(&s); assert(!cs_work_end(parent));
+}
 int main(void)
 {
     assert(!cs_work_init(64U*1024*1024));
     paging(10000,800,4U*1024*1024);
     paging(20000,17,384U*1024);
-    concurrent_insert(); cancel_pending(CS_NEED_STORE); cancel_pending(CS_NEED_LOAD); heap_scan();
+    concurrent_insert(); cancel_pending(CS_NEED_STORE); cancel_pending(CS_NEED_LOAD); heap_scan(); vector_expressions();
+    text_cancel(CS_NEED_STORE); text_cancel(CS_NEED_LOAD);
     cs_work_stats stats; assert(!cs_work_get_stats(&stats));
     assert(!stats.used_bytes && !stats.active_contexts && !stats.active_allocations);
     puts("dictionary paging, metadata, pins, concurrent IDs and cancellation passed");

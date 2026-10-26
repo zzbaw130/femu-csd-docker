@@ -38,6 +38,21 @@ struct qs_dictionary_access {
     struct entry entry;
     struct page *pinned;
 };
+struct text_reference {
+    struct qs_dictionary_access access;
+    const char *bytes;
+    uint32_t id;
+    unsigned length,ready;
+};
+struct qs_dictionary_text {
+    struct qs_dictionary *dictionary;
+    struct text_reference references[2];
+    struct qs_dictionary_access writer;
+    const char *key;
+    unsigned length,pending,insert_ready;
+    uint32_t inserted;
+    int64_t request;
+};
 
 struct qs_dictionary *qs_dictionary_create(cs_work_context *parent)
 {
@@ -251,7 +266,8 @@ int64_t qs_dictionary_insert(struct qs_dictionary *d,struct qs_dictionary_access
     case 7:
         rc=hash_page(d,HASH_FILE,a->bucket,1,&p,io); if(rc) return rc;
         *head_at(p,a->bucket)=a->id; p->dirty=1;
-        ++d->count; d->stats.strings=d->count; d->stats.bytes+=length;
+        __atomic_store_n(&d->count,d->count+1,__ATOMIC_RELEASE);
+        d->stats.strings=d->count; d->stats.bytes+=length;
         *id=a->id; done(d,a); return 0;
     /* Rehash by stable ID, not by the chains being rewritten. Every phase
      * copies its inputs before a possible miss, so no page must remain pinned. */
@@ -324,6 +340,8 @@ int64_t qs_dictionary_evict(struct qs_dictionary *d,struct qs_dictionary_access 
 }
 void qs_dictionary_get_stats(struct qs_dictionary *d,struct qs_dictionary_stats *out)
 { *out=d->stats; }
+int qs_dictionary_valid_id(const struct qs_dictionary *d,uint32_t id)
+{ return id && id<=__atomic_load_n(&d->count,__ATOMIC_ACQUIRE); }
 int64_t qs_dictionary_close(struct qs_dictionary *d,struct qs_dictionary_access *a,
     void *io,uint64_t completion)
 {
@@ -342,3 +360,63 @@ int64_t qs_dictionary_close(struct qs_dictionary *d,struct qs_dictionary_access 
 }
 void qs_dictionary_abort(struct qs_dictionary *d)
 { cs_work_end(d->context); }
+
+struct qs_dictionary_text *qs_dictionary_text_create(struct qs_dictionary *d)
+{
+    struct qs_dictionary_text *text=cs_work_calloc(d->context,1,sizeof(*text));
+    if(text) text->dictionary=d;
+    return text;
+}
+int64_t qs_dictionary_text_resume(struct qs_dictionary_text *t,void *io,uint64_t completion)
+{
+    if(!t->pending) return completion?-3:0;
+    int64_t status;
+    if(t->pending<=2) {
+        struct text_reference *r=&t->references[t->pending-1];
+        status=qs_dictionary_pin(t->dictionary,&r->access,r->id,&r->bytes,&r->length,io,completion);
+        if(!status) r->ready=1;
+    } else {
+        status=qs_dictionary_insert(t->dictionary,&t->writer,t->key,t->length,&t->inserted,io,completion);
+        if(!status) t->insert_ready=1;
+    }
+    t->request=status;
+    if(!status) t->pending=0;
+    return status;
+}
+int64_t qs_dictionary_text_get(struct qs_dictionary_text *t,uint32_t id,
+    const char **bytes,unsigned *length,void *io)
+{
+    for(unsigned i=0;i<2;++i) if(t->references[i].ready && t->references[i].id==id) {
+        *bytes=t->references[i].bytes; *length=t->references[i].length; return 0;
+    }
+    if(t->pending) return t->request;
+    for(unsigned i=0;i<2;++i) if(!t->references[i].ready) {
+        struct text_reference *r=&t->references[i];
+        r->id=id; t->pending=i+1;
+        int64_t status=qs_dictionary_text_resume(t,io,0);
+        if(!status) { *bytes=r->bytes; *length=r->length; }
+        return status;
+    }
+    return -4;
+}
+int64_t qs_dictionary_text_insert(struct qs_dictionary_text *t,const char *bytes,
+    unsigned length,uint32_t *id,void *io)
+{
+    if(!t->insert_ready) {
+        if(t->pending) return t->request;
+        t->key=bytes; t->length=length; t->pending=3;
+        int64_t status=qs_dictionary_text_resume(t,io,0); if(status) return status;
+    }
+    if(t->length!=length || (length && memcmp(t->key,bytes,length))) return -3;
+    *id=t->inserted; t->insert_ready=0; t->key=NULL; return 0;
+}
+int64_t qs_dictionary_text_request(const struct qs_dictionary_text *t)
+{ return t->request; }
+int qs_dictionary_text_release(struct qs_dictionary_text *t)
+{
+    if(t->pending || t->insert_ready) return -1;
+    for(unsigned i=0;i<2;++i) {
+        qs_dictionary_unpin(&t->references[i].access); t->references[i].ready=0;
+    }
+    t->request=0; return 0;
+}

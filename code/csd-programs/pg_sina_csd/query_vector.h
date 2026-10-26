@@ -6,6 +6,7 @@
 #include "query_eval.h"
 #include "heap_numeric.h"
 #include "cs_workmem.h"
+#include "dictionary.h"
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #endif
@@ -24,7 +25,7 @@ struct qs_vector {
         struct qs_text_view strings[QS_VECTOR_ROWS];
     };
     uint8_t nulls[QS_VECTOR_ROWS], dscales[QS_VECTOR_ROWS], errors[QS_VECTOR_ROWS], scales[QS_VECTOR_ROWS];
-    unsigned kind, done, all_valid;
+    unsigned kind, done, all_valid, materialized;
     struct qs_cell constant;
     const struct qs_cell *cells;
     const int64_t *column;
@@ -200,6 +201,13 @@ struct qs_vector_input {
      * an active batch; standalone filter/aggregate CSFs leave it unset. */
     int (*inset)(struct qs_vector_input *,unsigned,const uint16_t *,unsigned);
     void *set_state;
+    /* Device-private paged text access. On NEED_* retain this batch, pass the
+     * completion in text_completion and set resume; completed rows stay valid.
+     * Materialization is a separate phase and retains its own row cursor. */
+    struct qs_dictionary_text *text;
+    void *text_io;
+    uint64_t text_completion;
+    int resume;
 };
 /* The byte view borrows the retained LOAD buffer or immutable dictionary.
  * SUBSTRING counts UTF-8 characters using PG's positive/zero/negative-start
@@ -236,7 +244,13 @@ static inline int qs_text_intern(struct qs_dict *dictionary,struct qs_text_view 
 static int qs_vector_text(const struct qs_vector_input *input,unsigned index,unsigned row,const char **data,unsigned *bytes)
 {
     const struct qs_vector *v=&input->vectors[index];
-    return qs_text_resolve(input->dictionary,qs_vector_text_view(v,row),data,bytes);
+    struct qs_text_view view=qs_vector_text_view(v,row);
+    if(!input->text || !view.id) return qs_text_resolve(input->dictionary,view,data,bytes);
+    unsigned length;
+    if(qs_dictionary_text_get(input->text,view.id,data,&length,input->text_io) || view.offset>length) return -1;
+    unsigned available=length-view.offset;
+    if(view.length!=UINT_MAX && view.length>available) return -1;
+    *data+=view.offset; *bytes=view.length==UINT_MAX?available:view.length; return 0;
 }
 static inline int qs_vector_materialize_text(struct qs_vector *v,unsigned count,struct qs_dict *dictionary)
 {
@@ -248,6 +262,33 @@ static inline int qs_vector_materialize_text(struct qs_vector *v,unsigned count,
             id=qs_text_intern(dictionary,v->strings[i]); if(id<0) return -1;
         }
         v->values[i]=id;
+    }
+    v->kind=QS_WIDE; return 0;
+}
+static inline int64_t qs_vector_materialize_text_paged(struct qs_vector *v,unsigned count,
+    struct qs_dictionary *dictionary,struct qs_dictionary_text *text,void *io,uint64_t completion)
+{
+    int64_t status=qs_dictionary_text_resume(text,io,completion); if(status) return status;
+    if(v->kind!=QS_TEXT) return 0;
+    for(unsigned i=v->materialized;i<count;++i) {
+        uint32_t id=0;
+        if(!v->nulls[i] && !v->errors[i]) {
+            struct qs_text_view view=v->strings[i];
+            if(view.id && !view.offset && view.length==UINT_MAX) {
+                if(!qs_dictionary_valid_id(dictionary,view.id)) return -3;
+                id=view.id;
+            } else {
+                const char *bytes=view.data; unsigned length=view.length;
+                if(view.id) {
+                    status=qs_dictionary_text_get(text,view.id,&bytes,&length,io); if(status) return status;
+                    if(view.offset>length || (view.length!=UINT_MAX && view.length>length-view.offset)) return -3;
+                    bytes+=view.offset; length=view.length==UINT_MAX?length-view.offset:view.length;
+                }
+                status=qs_dictionary_text_insert(text,bytes,length,&id,io); if(status) return status;
+            }
+        }
+        if(qs_dictionary_text_release(text)) return -3;
+        v->values[i]=id; v->materialized=i+1;
     }
     v->kind=QS_WIDE; return 0;
 }
@@ -331,7 +372,7 @@ static int qs_vector_evaluate(struct qs_vector_input *input,unsigned index,const
     }
     if(e->op==Q_CASE || e->op==Q_COALESCE) {
         int coalesce=e->op==Q_COALESCE;
-        int text=e->type==Q_STRING && input->dictionary;
+        int text=e->type==Q_STRING && (input->dictionary || input->text);
         uint16_t false_rows[QS_VECTOR_ROWS]; unsigned nt=0,nf=0;
         for(unsigned j=0;j<n;++j) {
             unsigned i=rows[j]; if(left->errors[i]) continue;
@@ -396,6 +437,7 @@ static int qs_vector_evaluate(struct qs_vector_input *input,unsigned index,const
                 else {
                     const char *text; unsigned bytes;
                     error=qs_vector_text(input,e->left,i,&text,&bytes)!=0;
+                    if(input->text && qs_dictionary_text_request(input->text)) return -1;
                     if(!error) {
                         int64_t start=(int64_t)begin-1,end=start+(int64_t)length,character=0;
                         if(start<0) start=0;
@@ -413,8 +455,10 @@ static int qs_vector_evaluate(struct qs_vector_input *input,unsigned index,const
             }
             out->nulls[i]=isnull; out->errors[i]=error; out->dscales[i]=0;
             out->all_valid&=!error && !isnull;
+            if(input->text && qs_dictionary_text_release(input->text)) return -1;
+            ++out->done;
         }
-        out->kind=QS_TEXT; out->done+=n; return 0;
+        out->kind=QS_TEXT; return 0;
     }
     if(e->op==Q_DIV || ((e->op==Q_ADD || e->op==Q_SUB || e->op==Q_MUL) &&
         (left->kind==QS_CELLS || left->kind==QS_DYNAMIC || right->kind==QS_CELLS || right->kind==QS_DYNAMIC))) out->kind=QS_DYNAMIC;
@@ -434,9 +478,10 @@ static int qs_vector_evaluate(struct qs_vector_input *input,unsigned index,const
                 if(e->op==Q_OR && !b.isnull && b.value) v.isnull=0;
             } else if(!v.isnull && !error) {
                 if(e->op==Q_LIKE || (e->op>=Q_EQ && e->op<=Q_GE && p->exprs[e->left].type==Q_STRING &&
-                    (input->dictionary || left->kind==QS_TEXT || right->kind==QS_TEXT))) {
+                    (input->dictionary || input->text || left->kind==QS_TEXT || right->kind==QS_TEXT))) {
                     const char *a_text,*b_text; unsigned an,bn;
                     error=qs_vector_text(input,e->left,i,&a_text,&an) || qs_vector_text(input,e->right,i,&b_text,&bn);
+                    if(input->text && qs_dictionary_text_request(input->text)) return -1;
                     if(!error) {
                         if(e->op==Q_LIKE) { int match=qs_text_like(b_text,bn,a_text,an); error=match<0; v.value=match>0; }
                         else {
@@ -460,13 +505,16 @@ static int qs_vector_evaluate(struct qs_vector_input *input,unsigned index,const
         }
         out->values[i]=v.value; out->scales[i]=v.scale; out->nulls[i]=v.isnull; out->dscales[i]=v.dscale; out->errors[i]=error;
         out->all_valid&=!error && !v.isnull;
+        if(input->text && qs_dictionary_text_release(input->text)) return -1;
+        ++out->done;
     }
-    out->done+=n; return 0;
+    return 0;
 }
 static inline int qs_vector_execute_input(const struct qs_plan *p,struct qs_chunk *chunk,
     const uint32_t *selection,unsigned first,unsigned count,const uint8_t *needed,struct qs_vector *vectors,
     struct qs_vector_input input)
 {
+    if(input.text && qs_dictionary_text_resume(input.text,input.text_io,input.text_completion)) return -1;
     if(count>QS_VECTOR_ROWS) return -1;
     int column_input=chunk==NULL;
     if(column_input && ((p->ncols && !input.cells) || first>QS_VECTOR_ROWS || count>QS_VECTOR_ROWS-first)) return -1;
@@ -477,10 +525,10 @@ static inline int qs_vector_execute_input(const struct qs_plan *p,struct qs_chun
         if(row<low) low=row;
         if(row>high) high=row;
     }
-    for(unsigned index=0;index<p->nexprs;++index) {
+    for(unsigned index=0;!input.resume && index<p->nexprs;++index) {
         if(!needed[index]) continue;
         const struct qs_expr *e=&p->exprs[index]; struct qs_vector *out=&vectors[index];
-        out->kind=QS_WIDE; out->done=0; out->all_valid=1;
+        out->kind=QS_WIDE; out->done=out->materialized=0; out->all_valid=1;
         if(e->op==Q_COLUMN) {
             if(e->column<0 || (unsigned)e->column>=p->nattrs) return -1;
             const struct qs_column *col=&p->cols[e->column]; int slot=col->slot;
