@@ -1432,7 +1432,7 @@ static int projection_init(struct execution *s,unsigned id)
     const struct qp_node *root=&s->plan->nodes[id];
     int aggregate=root->kind==QP_AGGREGATE && !(s->worker && s->source_node==(int)id);
     if(aggregate && (root->distinct || root->distinct_aggs || root->left<0 ||
-        (root->nkeys && (!root->hash || !qp_hash_aggregate_supported(root))))) return 0;
+        (root->nkeys && ((!root->hash && !root->sorted_input) || !qp_hash_aggregate_supported(root))))) return 0;
     int grouped=aggregate && root->nkeys;
     int scan=aggregate?root->left:(int)id;
     unsigned projections[QP_NODES],nprojections=0;
@@ -2553,12 +2553,67 @@ static int64_t hash_aggregate_next(struct execution *s,unsigned id,struct qs_cel
     struct blocking_timer timer=blocking_begin(s);
     int64_t status=hash_aggregate_next_impl(s,id,row,0); blocking_end(s,op,timer); return status;
 }
+/* Consume a contiguous key range from expression columns. The next group's
+ * first row stays in the batch; the current accumulators survive I/O and
+ * vector boundaries. Return 2 for a completed group, 3 for scalar fallback. */
+static int64_t stream_group_vectors(struct execution *s,unsigned id)
+{
+    const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
+    for(;;) {
+        int64_t status=projection_fill(s,id);
+        if(status!=2) {
+            if(!status) { o->input_done=1; return o->phase?2:0; }
+            return status;
+        }
+        struct projection_batch *b=o->projection;
+        unsigned first=b->position,end=first;
+        while(end<b->count) {
+            struct qs_cell keys[QS_KEYS];
+            for(unsigned k=0;k<n->nkeys;++k) {
+                int index=b->group_keys[k]; if(b->vectors[index].errors[end]) return -5;
+                keys[k]=qs_vector_cell(&b->plan,b->vectors,index,end);
+            }
+            if(!o->phase) {
+                for(unsigned col=0;col<b->plan.nout;++col) {
+                    int index=b->plan.outputs[col].index; if(b->vectors[index].errors[end]) return -5;
+                    o->first[col]=qs_vector_cell(&b->plan,b->vectors,index,end);
+                }
+                memcpy(o->keys,keys,n->nkeys*sizeof(*keys));
+                memset(o->accum,0,sizeof(o->accum)); o->phase=1;
+            } else {
+                int equal=group_equal(s,n,keys,o->keys); if(equal<0) return equal;
+                if(!equal) break;
+            }
+            ++end;
+        }
+        if(end==first) return 2;
+        for(unsigned a=0;a<n->expr.naggs;++a) {
+            const struct qs_agg *agg=&n->expr.aggs[a];
+            if(agg->kind==Q_COUNT_STAR) { o->accum[a].count+=end-first; continue; }
+            int index=b->group_values[a];
+            if(agg->kind==Q_COUNT && b->vectors[index].all_valid) {
+                o->accum[a].count+=end-first; continue;
+            }
+            for(unsigned r=first;r<end;++r) {
+                if(b->vectors[index].errors[r]) return -5;
+                struct qs_cell value=qs_vector_cell(&b->plan,b->vectors,index,r);
+                if(!value.isnull) { int added=accumulate_value(s,n,agg,&o->accum[a],value); if(added) return added; }
+            }
+        }
+        b->position=end; s->metrics.matched+=end-first;
+        if(end<b->count) return 2;
+    }
+}
 static int64_t aggregate_next(struct execution *s,unsigned id,struct qs_cell *row)
 {
     const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
     if(n->hash) return hash_aggregate_next(s,id,row);
     if(n->nkeys && n->left>=0 && !n->sorted_input && !n->distinct && !o->phase && !o->emitted &&
        input_ordered(s->plan,n->left,n->nkeys,n->left_keys,NULL)) s->plan->nodes[id].sorted_input=1;
+    if(n->nkeys && n->sorted_input && !n->distinct && !n->distinct_aggs && !o->input_done && !o->have_left &&
+       n->left>=0 && !(!s->worker && s->plan->workers>1 && s->plan->nodes[n->left].parallel)) {
+        int status=projection_init(s,id); if(status) return status;
+    }
     /* Initialize before starting the child pipeline: parallel workers combine
      * their local states here before the first (and only) output row. */
     if(!n->nkeys && !o->phase && !o->emitted) {
@@ -2579,7 +2634,15 @@ static int64_t aggregate_next(struct execution *s,unsigned id,struct qs_cell *ro
         }
     }
     for(;;) {
-        if(!o->have_left && !o->input_done) {
+        int ready=0;
+        if(n->nkeys && o->projection) {
+            /* One call per output group: use CSF/enclosing sink timings,
+             * rather than adding clock reads for every small group. */
+            int64_t status=stream_group_vectors(s,id);
+            if(status!=2 && status!=3) return status;
+            ready=status==2;
+        }
+        if(!ready && !o->have_left && !o->input_done) {
             int64_t status;
             if(n->nkeys && (!n->sorted_input || n->distinct)) {
                 int keys[QS_KEYS+1]; memcpy(keys,n->left_keys,n->nkeys*sizeof(*keys)); unsigned count=n->nkeys;

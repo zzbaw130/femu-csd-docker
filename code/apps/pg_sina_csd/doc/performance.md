@@ -824,3 +824,13 @@ host总延迟56740.096ms，CSD为15335.444ms，总时间比3.700倍；单条1.76
 修复后同配置host冷启动2654.203ms，CSD为1744.957ms；资源保持8 CU、256MiB workmem、64MiB FDM，不能将修复前spill归因于物理内存不足。单次profile不代表固定加速比例。
 
 恢复默认连接选项后的[Q2/Q3/Q9/Q10/Q13/Q18标准冷启动回归](../../../../results/tpch.LLwvl0/timings.csv)均结果一致、完整卸载且快于同轮host；CSD分别344.990/754.113/882.068/940.994/360.823/1188.534ms。已部署当前设备SO，未重复全量22条；上一节22条成绩属于此前提交，不与本节开发检查混用。匹配残余条件、流式分组及spill Source的部分行接口和阻塞阶段续交仍需继续处理。
+
+## 有序输入的流式分组消费列批次
+
+参考DuckDB聚合先计算参数列、再更新局部聚合状态的分工，设备流式聚合在已按键有序、无DISTINCT且表达式受支持时，复用列批次计算键和聚合参数。按连续同键区间更新原SUM/AVG/COUNT/MIN/MAX状态，不建立Hash表；COUNT(*)按区间长度累计，COUNT(列)仅在整批无NULL/错误时走同一快速路径。当前组跨向量和Sort Source I/O保持状态，下一组首行留在批次中；EOF再输出最后一组。最终每组投影/HAVING和输出格式不变，无法使用向量的路径保留原游标与累加器。不新增协议、配置或FDM，临时列仍计入根查询workmem。
+
+新增多键流式用例覆盖AVG+0.75、COUNT与COUNT(*)、负值、NULL、反向字典ID的文本MIN/MAX，并在4MiB下让Sort Source发生实际spill，校验跨I/O累计及资源清理。原生及8/16/64 CU四项CTest通过，功能实现的ASan/UBSan/LeakSanitizer原生及8CU两项检查通过。移除过密的逐组计时后再次通过四项组件测试；流式输出每组一次，不另加clock调用，继续使用CSF及外层阻塞sink计时，避免profile本身为大量小组增加开销。
+
+仍用原始Q13，在开发连接关闭Hash/NestLoop/HashAggregate以保持同一Merge计划，不修改SQL或持久配置。[当前开发结果](../../../../results/stream-groups/)与host、上一阶段输出逐字节一致，完整卸载，无spill；普通冷启动host为2631.117ms，CSD为1588.991ms。对照上一阶段[profile](../../../../results/merge-vectors/13.profile.log)，[当前profile](../../../../results/stream-groups/13.profile.log)聚合协调端CPU 693.812→552.869ms，总CSF CPU 2630.613→2582.475ms，workmem峰值109349904→108647408字节。整体CPU只小幅下降，单次profile和普通查询样本不能证明固定加速比例，也不能把开发计划成绩替代默认验收。
+
+默认配置的[标准Q2/Q13/Q18冷启动回归](../../../../results/tpch.5lBaEJ/timings.csv)均结果一致、完整卸载且快于host，CSD分别353.989/364.555/1136.980ms。资源保持8 CU、256MiB workmem、64MiB FDM，只部署设备计划SO，未重复全量22条。流式分组的最终逐组输出、Merge匹配残余条件及spill Source等行接口仍是后续改造边界；本阶段只移除输入逐行解释与逐行更新COUNT的主要开销。

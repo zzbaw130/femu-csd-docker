@@ -1280,7 +1280,8 @@ static int multi_order(const void *ap,const void *bp)
     if(a->b==17 || b->b==17) return (a->b==17)-(b->b==17);
     return (a->b<b->b)-(a->b>b->b);
 }
-enum group_test_mode { GROUP_SINGLE,GROUP_COUNTS,GROUP_NUMERIC_EXTREMES,GROUP_TEXT_EXTREMES };
+enum group_test_mode { GROUP_SINGLE,GROUP_COUNTS,GROUP_NUMERIC_EXTREMES,GROUP_TEXT_EXTREMES,
+    GROUP_STREAM_COUNTS,GROUP_STREAM_TEXT_EXTREMES };
 /* Every CU gets a disjoint set that fits its local table. Their union forces
  * coordinator growth: partial SUM/count must survive that boundary. */
 static void local_group_merge(function run,int large_merge)
@@ -1505,7 +1506,9 @@ static void parallel_sort_spill(function run,unsigned workers,unsigned memory,in
 }
 static void multiple_group_aggregates(function run,unsigned memory,unsigned kind,int integer_keys,unsigned workers,enum group_test_mode mode)
 {
-    int counts=mode!=GROUP_SINGLE,extremes=mode>=GROUP_NUMERIC_EXTREMES,text=mode==GROUP_TEXT_EXTREMES;
+    int stream=mode==GROUP_STREAM_COUNTS || mode==GROUP_STREAM_TEXT_EXTREMES;
+    int text=mode==GROUP_TEXT_EXTREMES || mode==GROUP_STREAM_TEXT_EXTREMES;
+    int counts=mode!=GROUP_SINGLE,extremes=mode==GROUP_NUMERIC_EXTREMES || text;
     unsigned columns=extremes?3:2;
     unsigned scan_bytes=workers>4?QS_PAGE:QP_SCAN_BYTES;
     unsigned rows=50003,total=1022*18,groups=0; size_t raw_bytes;
@@ -1622,6 +1625,15 @@ static void multiple_group_aggregates(function run,unsigned memory,unsigned kind
             .left=a->expr.outputs[2].index,.right=(int)constant};
         a->expr.outputs[2].index=output;
     }
+    if(stream) {
+        /* Key ranges cross vectors and Sort Source I/O; streaming states
+         * must survive them without rebuilding a hash table or a second Sort. */
+        assert(kind!=Q_COUNT); p->count=4; a->hash=0; a->sorted_input=1; a->left=3;
+        p->nodes[3]=(struct qp_node){.kind=QP_SORT,.left=2,.right=-1,.expr=leaf->expr};
+        p->nodes[3].expr.limit=-1; p->nodes[3].expr.norder=2;
+        p->nodes[3].expr.order[0]=(struct qs_order){.output=0};
+        p->nodes[3].expr.order[1]=(struct qs_order){.output=1,.descending=1};
+    }
     struct qp_node *sort=&p->nodes[0]; sort->kind=QP_SORT; sort->left=1; sort->right=-1;
     sort->expr=a->expr; sort->expr.nexprs=sort->expr.nattrs=a->expr.nout; sort->expr.naggs=0;
     sort->expr.work_mem_bytes=(uint64_t)memory*1024*1024; sort->expr.limit=-1;
@@ -1728,7 +1740,7 @@ static void multiple_group_aggregates(function run,unsigned memory,unsigned kind
     }
     if(workers && memory>=64) {
         assert(out->metrics.workers==workers);
-        assert(p->pipelines[1].rounds>=1);
+        if(!stream) assert(p->pipelines[1].rounds>=1);
         if(kind==Q_COUNT) assert(p->pipelines[3].rounds>=1);
         assert(p->pipelines[2].sink_rows && p->pipelines[2].sink_ns);
         assert(p->pipelines[2].sink_ns<=p->pipelines[2].worker_ns);
@@ -1858,6 +1870,7 @@ int main(int argc,char **argv)
         multiple_group_aggregates(run,256,Q_AVG,1,test_workers,GROUP_COUNTS);
         multiple_group_aggregates(run,256,Q_AVG,1,test_workers,GROUP_NUMERIC_EXTREMES);
         multiple_group_aggregates(run,256,Q_MIN,0,test_workers,GROUP_TEXT_EXTREMES);
+        multiple_group_aggregates(run,256,Q_AVG,1,test_workers,GROUP_STREAM_COUNTS);
         printf("PASS %u CU slots: parallel build/probe, exact SUM/AVG, global DISTINCT, cleanup\n",test_workers);
         return 0;
     }
@@ -1984,5 +1997,7 @@ int main(int argc,char **argv)
     multiple_group_aggregates(run,4,Q_MAX,0,0,GROUP_TEXT_EXTREMES);
     multiple_group_aggregates(run,64,Q_AVG,1,4,GROUP_NUMERIC_EXTREMES);
     multiple_group_aggregates(run,4,Q_MIN,0,4,GROUP_TEXT_EXTREMES);
+    multiple_group_aggregates(run,64,Q_AVG,0,4,GROUP_STREAM_COUNTS);
+    multiple_group_aggregates(run,4,Q_MIN,0,0,GROUP_STREAM_TEXT_EXTREMES);
     puts("PASS native Plan joins, NULL/duplicate keys, MIN/MAX/AVG, spill and cleanup");
 }
