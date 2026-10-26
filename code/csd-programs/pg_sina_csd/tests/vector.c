@@ -142,9 +142,23 @@ static void string_views(void)
     for(unsigned i=0;i<6;++i) {
         const char *want=i==5?"23":prefixes[i];
         assert(v[15].kind==QS_TEXT && !v[15].errors[i] && !v[15].nulls[i]);
-        assert(v[15].strings[i].length==strlen(want) && !memcmp(v[15].strings[i].data,want,strlen(want)));
+        const char *text; unsigned length;
+        assert(!qs_vector_text(&input,15,i,&text,&length));
+        assert(length==strlen(want) && !memcmp(text,want,length));
         assert(v[11].errors[i]==2); /* COALESCE never needs the bad substring. */
     }
+    /* A dictionary-backed branch must survive moving its backing storage;
+     * raw Heap branches still point into the retained input. */
+    assert(sizeof(struct qs_text_view)==16 && v[15].strings[5].id==(unsigned)literal);
+    struct qs_dict *moved=malloc(qs_dict_bytes(16,512)); assert(moved);
+    memcpy(moved,dict,qs_dict_bytes(16,512)); memset(dict,0xa5,qs_dict_bytes(16,512)); free(dict);
+    dict=moved; input.dictionary=dict;
+    const char *text; unsigned length;
+    assert(!qs_vector_text(&input,15,5,&text,&length) && length==2 && !memcmp(text,"23",2));
+    struct qs_text_view slice={.id=(unsigned)literal,.offset=1,.length=1};
+    assert(!qs_text_resolve(dict,slice,&text,&length) && length==1 && *text=='3');
+    slice.offset=3; assert(qs_text_resolve(dict,slice,&text,&length));
+    assert(qs_text_intern(dict,(struct qs_text_view){.id=999,.length=UINT_MAX})<0);
     assert(!qs_vector_materialize_text(&v[15],6,dict));
     struct qs_heap_ref bad={sizeof(raw),1}; memcpy(qs_values(c)+2,&bad,sizeof(bad));
     assert(qs_vector_execute_raw_dict(&p,c,NULL,0,6,needed,v,raw,used,dict));

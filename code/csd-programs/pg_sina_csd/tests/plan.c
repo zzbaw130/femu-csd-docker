@@ -1083,7 +1083,8 @@ static void probe_payload(function run,unsigned limit,int strings,int indexed,in
  * Check projected truth values and Scan predicates against a linear oracle. */
 static void set_projection(function run,unsigned variant,unsigned filter)
 {
-    unsigned rows=5007,set_rows=variant==0?0:variant==1?1:variant==2?5:6;
+    int large=variant>=4,has_null=variant==1 || variant==3 || variant==4;
+    unsigned rows=5007,set_rows=large?150000+(variant==4):variant==0?0:variant==1?1:variant==2?5:6;
     int32_t keys[]={-4,0,13,13,5001,0};
     struct qp_plan *p=calloc(1,sizeof(*p)); assert(p);
     p->count=3; p->scan_bytes=QP_SCAN_BYTES; p->ninit=1; p->init_nodes[0]=1; p->init_params[0]=-1;
@@ -1095,6 +1096,11 @@ static void set_projection(function run,unsigned variant,unsigned filter)
     n->expr.outputs[0]=(struct qs_output){.index=1,.type_oid=23};
     n->expr.outputs[1]=(struct qs_output){.index=2,.type_oid=16};
     n->expr.outputs[2]=(struct qs_output){.index=3,.type_oid=16};
+    if(large) {
+        n->expr.nexprs=5; n->expr.nout=4;
+        n->expr.exprs[4]=(struct qs_expr){.op=Q_INSET,.type=Q_BOOLEAN,.left=1,.column=1};
+        n->expr.outputs[3]=(struct qs_output){.index=4,.type_oid=16};
+    }
     n->expr.predicate=filter?(filter==1?2:3):-1;
     p->nodes[2].expr.nout=1;
     p->nodes[1]=(struct qp_node){.kind=QP_SET,.left=2,.right=-1,.expr=p->nodes[2].expr};
@@ -1105,8 +1111,9 @@ static void set_projection(function run,unsigned variant,unsigned filter)
         t[23]=i%7?3:2; w32(t+24,i%7?(int32_t)i-5:(int32_t)i); w32(t+28,i);
     }
     for(unsigned i=0;i<set_rows;++i) {
-        unsigned char *t=raw[1]+QS_PAGE-(i+1)*40;
-        t[23]=variant==1 || i==5?2:3; w32(t+24,keys[i]);
+        unsigned char *t=raw[1]+(i/100)*QS_PAGE+QS_PAGE-(i%100+1)*40;
+        t[23]=variant==1 || (large?has_null && i+1==set_rows:i==5)?2:3;
+        w32(t+24,large?(int32_t)(i/2)*3-200000:keys[i]);
     }
     for(unsigned i=0;i<2;++i) {
         struct qp_node *leaf=&p->nodes[i?2:0]; leaf->bytes=sizes[i];
@@ -1124,22 +1131,47 @@ static void set_projection(function run,unsigned variant,unsigned filter)
     long long len[]={sizeof(*p),sizeof(c),sizeof(*out),bytes,QS_SORT_IO_BYTES};
     struct femu_csd_args a={.numr=5,.mr_addr=mr,.mr_len=len}; unsigned seen=0,returned=0,expected=0;
     for(unsigned at=0;at<rows;++at) {
-        int found=0; for(unsigned k=0;k<set_rows && variant!=1;++k)
+        int found=large && at%7 && ((int)at-5+200000)%3==0;
+        if(!large) for(unsigned k=0;k<set_rows && variant!=1;++k)
             if(k!=5 && at%7 && keys[k]==(int)at-5) found=1;
-        int unknown=at%7?(!found && (variant==1 || variant==3)):set_rows!=0;
+        int unknown=at%7?(!found && has_null):set_rows!=0;
         expected+=!filter || (!unknown && (filter==1?found:!found));
     }
+    struct test_spill spill={.mutex=PTHREAD_MUTEX_INITIALIZER}; int cancelled=0;
     while(!out->finished) {
-        assert(!run(&a));
+        int64_t status=run(&a); assert(status>=0);
+        unsigned op=(uint64_t)status>>60;
+        if(op) {
+            a.cparam2=spill_request(&spill,op,(uint64_t)status&CS_IO_VALUE_MASK,io);
+            if(large && !filter && !cancelled && op==2) {
+                c.close=1; assert(!run(&a));
+                struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
+                /* Closing a SNIA session also releases its remaining tokens. */
+                for(unsigned i=0;i<spill.count;++i) { free(spill.tokens[i]); spill.tokens[i]=NULL; }
+                memset(&c,0,sizeof(c)); memset(out,0,sizeof(*out)); a.cparam2=0; cancelled=1;
+                seen=returned=0;
+                for(unsigned i=0;i<2;++i) {
+                    const struct qp_node *leaf=&p->nodes[i?2:0];
+                    *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=qp_scan_capacity(p,leaf),.ncols=2};
+                }
+            }
+            continue;
+        }
+        a.cparam2=0;
         for(unsigned r=0;r<out->rows;++r) {
             unsigned at=out->data[r].cells[0].value; assert(at>=seen && at<rows);
             if(!filter) assert(at==seen);
-            int found=0; for(unsigned k=0;k<set_rows && variant!=1;++k)
+            int found=large && at%7 && ((int)at-5+200000)%3==0;
+            if(!large) for(unsigned k=0;k<set_rows && variant!=1;++k)
                 if(k!=5 && at%7 && keys[k]==(int)at-5) found=1;
-            int unknown=at%7?(!found && (variant==1 || variant==3)):set_rows!=0;
+            int unknown=at%7?(!found && has_null):set_rows!=0;
             const struct qs_cell *v=out->data[r].cells;
             assert(v[1].isnull==unknown && v[2].isnull==unknown);
             if(!unknown) assert(v[1].value==found && v[2].value==!found);
+            if(large) {
+                int second=(at+200000)%3==0;
+                assert(v[3].isnull==(!second && has_null)); if(!v[3].isnull) assert(v[3].value==second);
+            }
             if(filter) assert(!unknown && (filter==1?found:!found));
             seen=at+1; ++returned;
         }
@@ -1148,6 +1180,12 @@ static void set_projection(function run,unsigned variant,unsigned filter)
         }
     }
     assert(returned==expected);
+    if(large) {
+        assert(spill.stores && out->metrics.spill_write_bytes && out->metrics.spill_read_bytes);
+        assert(out->metrics.work_peak<=4U*1024*1024);
+    }
+    for(unsigned i=0;i<spill.count;++i) free(spill.tokens[i]);
+    free(spill.tokens); assert(!pthread_mutex_destroy(&spill.mutex));
     if(!filter) assert(seen==rows);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
     free(raw[0]); free(raw[1]); free(arena); free(io); free(out); free(p);
@@ -2001,7 +2039,7 @@ int main(int argc,char **argv)
         test(run,join,31,5003,64,1,TEST_PACKED_KEYS);
     namespace_reentry(run);
     for(unsigned mode=0;mode<6;++mode) filtered_projection(run,mode);
-    for(unsigned variant=0;variant<4;++variant) for(unsigned filter=0;filter<3;++filter) set_projection(run,variant,filter);
+    for(unsigned variant=0;variant<6;++variant) for(unsigned filter=0;filter<3;++filter) set_projection(run,variant,filter);
     for(int joined=0;joined<2;++joined) {
         parameter_projection(run,joined,0,0);
         parameter_projection(run,joined,1,0);

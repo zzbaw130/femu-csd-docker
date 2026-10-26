@@ -99,6 +99,16 @@ struct compact_group { int64_t key; unsigned key_flags; struct group_value value
 /* Hash slots publish indices into dense records, not whole aggregate states. */
 struct group_entry { atomic_uint state; unsigned row; };
 struct set_key { int64_t value; unsigned occupied; };
+/* A spilled set is immutable after initialization. Each consumer owns its
+ * read cache and the active expression batch, while tokens/tail are shared. */
+struct set_probe {
+    struct set_probe *next;
+    const struct qs_expr *expression;
+    struct spool pages;
+    struct qs_cell keys[QS_VECTOR_ROWS],values[QS_VECTOR_ROWS];
+    unsigned rows[QS_VECTOR_ROWS],count,block;
+    int ready;
+};
 /* Private per-CU expression state; referenced input columns stay in AFDM. */
 struct projection_batch {
     struct qs_plan plan;
@@ -111,6 +121,11 @@ struct projection_batch {
     int64_t error;
     unsigned error_node;
     int joined,sorted,group_source,keep_window,lazy_text,filtered_scan;
+    int retry;
+    struct qs_vector_input retry_input;
+    struct qs_chunk *retry_chunk;
+    const uint32_t *retry_selection;
+    unsigned retry_first,retry_count;
     int group_keys[QS_KEYS],group_values[QS_AGGS];
     struct { unsigned node; int expression; } filters[QP_NODES];
     unsigned nfilters;
@@ -184,6 +199,10 @@ struct operator_state {
     struct set_key *set;
     unsigned set_capacity,set_count;
     int set_null,set_ready;
+    struct spool set_pages;
+    unsigned set_convert;
+    int set_external;
+    struct set_probe *set_probe;
 };
 struct execution {
     cs_work_context *context;
@@ -200,6 +219,7 @@ struct execution {
     struct spool *pending_spool;
     unsigned pending_block;
     int pending_store;
+    int expression_wait,expression_batch;
     unsigned pending_nvm;
     struct qs_metrics metrics;
     struct qs_profile profile;
@@ -265,7 +285,7 @@ static int64_t next_row_impl(struct execution *,unsigned,struct qs_cell *);
 static inline int64_t next_row(struct execution *s,unsigned id,struct qs_cell *row)
 {
     int64_t status=next_row_impl(s,id,row);
-    if(status<0 && !s->control->error) { s->control->error=status; s->control->error_node=id; }
+    if(status<0 && !s->expression_wait && !s->control->error) { s->control->error=status; s->control->error_node=id; }
     return status;
 }
 static int64_t join_next(struct execution *,unsigned,struct qs_cell *);
@@ -317,11 +337,64 @@ static inline struct qs_cell set_contains(const struct operator_state *set,struc
     }
     return v;
 }
+static int64_t spool_row_bytes(struct execution *,struct spool *,uint64_t,unsigned,void *);
+static int64_t external_set_probe(struct execution *s,unsigned id,const struct qs_expr *expression,
+    const struct qs_cell *keys,const unsigned *rows,unsigned count,struct qs_cell **values)
+{
+    struct operator_state *o=&s->nodes[id];
+    struct set_probe *p=o->set_probe;
+    while(p && p->expression!=expression) p=p->next;
+    if(!p) {
+        p=cs_work_calloc(s->context,1,sizeof(*p)); if(!p) return -4;
+        p->pages=o->set_pages; p->pages.cache=NULL; p->pages.loaded=UINT_MAX;
+        p->expression=expression; p->next=o->set_probe; o->set_probe=p;
+    }
+    int same=p->count==count;
+    for(unsigned i=0;same && i<count;++i)
+        same=p->rows[i]==rows[i] && p->keys[i].value==keys[i].value && p->keys[i].isnull==keys[i].isnull;
+    if(!same) {
+        p->count=count; p->block=0; p->ready=0;
+        for(unsigned i=0;i<count;++i) {
+            p->keys[i]=keys[i]; p->rows[i]=rows[i];
+            p->values[i]=(struct qs_cell){.isnull=keys[i].isnull?(o->set_count || o->set_null):o->set_null};
+        }
+    }
+    while(!p->ready && p->block<=p->pages.blocks) {
+        unsigned block=p->block,used=block<p->pages.blocks?QS_SORT_IO_BYTES/sizeof(int64_t):p->pages.used;
+        if(used) {
+            int64_t first;
+            int64_t status=spool_row_bytes(s,&p->pages,(uint64_t)block*(QS_SORT_IO_BYTES/sizeof(int64_t)),sizeof(first),&first);
+            if(status) return status;
+            const int64_t *data=(const void *)(block<p->pages.blocks?p->pages.cache:p->pages.tail);
+            for(unsigned i=0;i<count;++i) {
+                struct qs_cell key=keys[i];
+                if(key.isnull || p->values[i].value || key.value<INT64_MIN || key.value>INT64_MAX ||
+                   key.value<data[0] || key.value>data[used-1]) continue;
+                unsigned lo=0,hi=used;
+                while(lo<hi) { unsigned mid=lo+(hi-lo)/2; if(data[mid]<(int64_t)key.value) lo=mid+1; else hi=mid; }
+                if(lo<used && data[lo]==key.value) p->values[i]=(struct qs_cell){.value=1};
+            }
+        }
+        ++p->block;
+    }
+    p->ready=1; *values=p->values; return 0;
+}
 static int inset_vectors(struct qs_vector_input *input,unsigned index,const uint16_t *rows,unsigned count)
 {
     struct execution *s=input->set_state; const struct qs_expr *e=&input->plan->exprs[index];
     if(e->column<0 || (unsigned)e->column>=s->plan->count || !s->nodes[e->column].set_ready) return -1;
     const struct operator_state *set=&s->nodes[e->column];
+    if(set->set_external) {
+        if(!s->expression_batch) return -1;
+        struct qs_cell keys[QS_VECTOR_ROWS],*values; unsigned selection[QS_VECTOR_ROWS];
+        for(unsigned j=0;j<count;++j) { selection[j]=rows[j]; keys[j]=input->vectors[e->left].errors[rows[j]]?(struct qs_cell){.isnull=1}:qs_vector_cell(input->plan,input->vectors,e->left,rows[j]); }
+        int64_t status=external_set_probe(s,e->column,e,keys,selection,count,&values);
+        if(status) { s->expression_wait=status>2; return -1; }
+        struct qs_vector *out=&input->vectors[index]; out->kind=QS_NARROW;
+        for(unsigned j=0;j<count;++j) { unsigned i=rows[j]; out->narrow[i]=values[j].value; out->nulls[i]=values[j].isnull;
+            out->errors[i]=input->vectors[e->left].errors[i]; out->dscales[i]=0; out->all_valid&=!out->errors[i] && !values[j].isnull; }
+        return 0;
+    }
     const struct qs_vector *left=&input->vectors[e->left]; struct qs_vector *out=&input->vectors[index];
     out->kind=QS_NARROW;
     for(unsigned j=0;j<count;++j) {
@@ -341,6 +414,9 @@ static int evaluate(struct execution *s,struct qs_eval *e,int index,struct qs_ce
     else if(x->op==QP_INSET) {
         if(x->column<0 || (unsigned)x->column>=s->plan->count || !s->nodes[x->column].set_ready ||
             evaluate(s,e,x->left,&a)) return -5;
+        /* The column path retains an expression batch across spill I/O.
+         * Never silently treat an external set as an empty resident table. */
+        if(s->nodes[x->column].set_external) return -4;
         v=set_contains(&s->nodes[x->column],a);
     }
     else if(x->op==Q_CONST && x->type==Q_STRING && !x->isnull) {
@@ -1032,19 +1108,46 @@ static int64_t materialized_row(struct execution *s,unsigned id,uint64_t positio
     if(position==o->group.rows) return 0;
     int64_t status=spool_row(s,&o->group,position,cols,row); return status?status:2;
 }
+static int set_order(const void *a,const void *b)
+{ int64_t x=*(const int64_t *)a,y=*(const int64_t *)b; return (x>y)-(x<y); }
+static int64_t set_append(struct execution *s,struct operator_state *o,int64_t value)
+{
+    if(o->set_pages.used==QS_SORT_IO_BYTES/sizeof(value))
+        qsort(o->set_pages.tail,o->set_pages.used,sizeof(value),set_order);
+    return spool_append_bytes(s,&o->set_pages,&value,sizeof(value));
+}
 static int64_t build_set(struct execution *s,unsigned id)
 {
     struct operator_state *o=&s->nodes[id]; const struct qp_node *n=&s->plan->nodes[id];
     while(!o->set_ready) {
-        int64_t status=next_row(s,n->left,o->left);
-        if(status==QP_WAIT || status<0 || status>2) return status;
-        if(!status) { o->set_ready=1; return 0; }
+        if(o->set_external && o->set) {
+            while(o->set_convert<o->set_capacity) {
+                struct set_key *key=&o->set[o->set_convert];
+                if(key->occupied) { int64_t status=set_append(s,o,key->value); if(status) return status; }
+                ++o->set_convert;
+            }
+            cs_work_free(s->context,o->set); o->set=NULL; o->set_capacity=0;
+        }
+        if(!o->have_left) {
+            int64_t status=next_row(s,n->left,o->left);
+            if(status==QP_WAIT || status<0 || status>2) return status;
+            if(!status) {
+                if(o->set_external && o->set_pages.used) qsort(o->set_pages.tail,o->set_pages.used,sizeof(int64_t),set_order);
+                o->set_ready=1; return 0;
+            }
+            o->have_left=1;
+        }
         struct qs_cell v=o->left[0];
-        if(v.isnull) { o->set_null=1; continue; }
+        if(v.isnull) { o->set_null=1; o->have_left=0; continue; }
         if(v.value>INT64_MAX || v.value<INT64_MIN) return -5;
+        if(o->set_external) {
+            int64_t status=set_append(s,o,(int64_t)v.value); if(status) return status;
+            ++o->set_count; o->have_left=0; continue;
+        }
         if(!o->set_capacity || o->set_count*2>=o->set_capacity) {
             unsigned capacity=o->set_capacity?o->set_capacity*2:64;
-            struct set_key *next=cs_work_calloc(s->context,capacity,sizeof(*next)); if(!next) return -4;
+            struct set_key *next=cs_work_calloc(s->context,capacity,sizeof(*next));
+            if(!next) { o->set_external=1; continue; }
             for(unsigned i=0;i<o->set_capacity;++i) if(o->set[i].occupied) {
                 unsigned slot=mix_hash((uint64_t)o->set[i].value)&(capacity-1);
                 while(next[slot].occupied) slot=(slot+1)&(capacity-1);
@@ -1056,6 +1159,7 @@ static int64_t build_set(struct execution *s,unsigned id)
         unsigned slot=mix_hash((uint64_t)v.value)&(o->set_capacity-1);
         while(o->set[slot].occupied && o->set[slot].value!=v.value) slot=(slot+1)&(o->set_capacity-1);
         if(!o->set[slot].occupied) { o->set[slot]=(struct set_key){.value=v.value,.occupied=1}; ++o->set_count; }
+        o->have_left=0;
     }
     return 0;
 }
@@ -1721,7 +1825,7 @@ static void projection_select(struct projection_batch *b,const uint16_t *rows,un
             for(unsigned i=0;i<count;++i) {
                 unsigned row=rows[i],error=v->errors[row],null=error || qs_vector_null(v,row);
                 if(!null) v->strings[i]=v->strings[row];
-                else { v->strings[i].data=NULL; v->strings[i].length=0; }
+                else { v->strings[i]=(struct qs_text_view){0}; }
                 v->nulls[i]=null; v->errors[i]=error; v->all_valid&=!null;
             }
             v->done=count; continue;
@@ -1743,7 +1847,7 @@ static void projection_select(struct projection_batch *b,const uint16_t *rows,un
         }
     }
 }
-static int projection_execute(struct projection_batch *b,struct qs_chunk *chunk,
+static int projection_execute_impl(struct projection_batch *b,struct qs_chunk *chunk,
     const uint32_t *selection,unsigned first,struct qs_vector_input input)
 {
     unsigned count=b->count;
@@ -1770,6 +1874,19 @@ static int projection_execute(struct projection_batch *b,struct qs_chunk *chunk,
     for(unsigned i=0;i<b->plan.nexprs;++i) if((b->needed[i]&2) && kept && qs_vector_evaluate(&input,i,rows,kept)) return -5;
     if(kept!=count) projection_select(b,rows,kept);
     b->count=kept; return 0;
+}
+static int projection_execute(struct projection_batch *b,struct qs_chunk *chunk,
+    const uint32_t *selection,unsigned first,struct qs_vector_input input)
+{
+    b->retry_input=input; b->retry_chunk=chunk; b->retry_selection=selection;
+    b->retry_first=first; b->retry_count=b->count;
+    struct execution *s=input.set_state;
+    int previous=s?s->expression_batch:0;
+    if(s) s->expression_batch=1;
+    int status=projection_execute_impl(b,chunk,selection,first,input);
+    if(s) s->expression_batch=previous;
+    b->retry=status && s && s->expression_wait;
+    return status;
 }
 static int64_t projection_join_fill(struct execution *s,struct projection_batch *b)
 {
@@ -1861,6 +1978,15 @@ static int64_t projection_fill(struct execution *s,unsigned id,int source)
 {
     struct projection_batch **slot=source?&s->nodes[id].source_projection:&s->nodes[id].projection;
     struct projection_batch *b=*slot;
+    if(b->retry) {
+        b->count=b->retry_count;
+        if(projection_execute(b,b->retry_chunk,b->retry_selection,b->retry_first,b->retry_input)) return -5;
+        if(b->sorted) s->nodes[b->scan].left_sort.position+=b->retry_count;
+        else if(!b->group_source && !b->joined) s->nodes[b->scan].scan_position+=b->retry_count;
+        b->position=0;
+        for(unsigned o=0;!b->lazy_text && o<b->plan.nout;++o)
+            if(qs_vector_materialize_text(&b->vectors[b->plan.outputs[o].index],b->count,s->dictionary)) return -3;
+    }
     while(b->position==b->count) {
         if(b->error) { s->control->error=b->error; s->control->error_node=b->error_node; return b->error; }
         int64_t status=b->group_source?projection_group_fill(s,b):b->sorted?projection_sort_fill(s,b):
@@ -2081,7 +2207,7 @@ static int hash_left_cell(struct execution *s,unsigned id,unsigned col,struct qs
         if(v->kind==QS_TEXT) {
             struct qs_cell cell={.isnull=v->nulls[r]};
             if(!cell.isnull) {
-                int key=qs_dict_insert(s->dictionary,v->strings[r].data,v->strings[r].length); if(key<0) return -3;
+                int key=qs_text_intern(s->dictionary,v->strings[r]); if(key<0) return -3;
                 cell.value=key;
             }
             o->left[col]=cell;
@@ -3001,7 +3127,7 @@ static int index_join_values(struct execution *s,unsigned id,struct qs_chunk *ch
             if(v->errors[r]) return -5;
             values[ln+i]=qs_vector_cell(&projected->plan,projected->vectors,index,r);
             if(v->kind==QS_TEXT && !values[ln+i].isnull) {
-                int text=qs_dict_insert(s->dictionary,v->strings[r].data,v->strings[r].length);
+                int text=qs_text_intern(s->dictionary,v->strings[r]);
                 if(text<0) return -3;
                 values[ln+i].value=text;
             }
@@ -3628,6 +3754,7 @@ restart:
                 if(built->set_ready) {
                     local->set=built->set; local->set_capacity=built->set_capacity;
                     local->set_count=built->set_count; local->set_null=built->set_null; local->set_ready=1;
+                    local->set_pages=built->set_pages; local->set_external=built->set_external;
                 }
             }
             *e->control=(struct qp_control){.state=(uintptr_t)e}; s->workers[w]=e;
@@ -4063,6 +4190,10 @@ produced:
         if(s->host_scan && !out->rows && status==2) goto produce;
     }
 combined:
+    if(s->expression_wait && s->pending_spool) {
+        s->expression_wait=0;
+        status=csNeedLoad(s->pending_spool->tokens[s->pending_block]);
+    }
     if(status==QP_WAIT) {
         int64_t request=namespace_wait(s); if(request) status=request;
     }

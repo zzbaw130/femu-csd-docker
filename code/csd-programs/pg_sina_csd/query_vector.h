@@ -10,11 +10,18 @@
 #include <immintrin.h>
 #endif
 #define QS_VECTOR_ROWS 256
+/* Dictionary views retain IDs, never an address into a movable text block.
+ * Raw Heap views still borrow their retained input page. Keep the 16-byte
+ * layout: offset shares storage with data and is used only when id != 0. */
+struct qs_text_view {
+    union { const char *data; uintptr_t offset; };
+    unsigned length,id;
+};
 enum qs_vector_kind { QS_WIDE, QS_NARROW, QS_REFERENCE, QS_CONSTANT, QS_TEXT, QS_CELLS, QS_DYNAMIC };
 struct qs_vector {
     union {
         __int128 values[QS_VECTOR_ROWS]; int64_t narrow[QS_VECTOR_ROWS];
-        struct { const char *data; unsigned length; } strings[QS_VECTOR_ROWS];
+        struct qs_text_view strings[QS_VECTOR_ROWS];
     };
     uint8_t nulls[QS_VECTOR_ROWS], dscales[QS_VECTOR_ROWS], errors[QS_VECTOR_ROWS], scales[QS_VECTOR_ROWS];
     unsigned kind, done, all_valid;
@@ -203,11 +210,33 @@ static inline unsigned qs_text_character(const char *text,unsigned bytes)
     unsigned char c=*text; unsigned n=c<128?1:(c&0xe0)==0xc0?2:(c&0xf0)==0xe0?3:4;
     return n<=bytes?n:bytes;
 }
+static inline int qs_text_resolve(const struct qs_dict *dictionary,struct qs_text_view view,
+    const char **data,unsigned *bytes)
+{
+    if(!view.id) { *data=view.data; *bytes=view.length; return 0; }
+    unsigned length;
+    if(qs_dict_get(dictionary,view.id,data,&length) || view.offset>length) return -1;
+    unsigned available=length-view.offset;
+    if(view.length!=UINT_MAX && view.length>available) return -1;
+    *data+=view.offset; *bytes=view.length==UINT_MAX?available:view.length; return 0;
+}
+static inline struct qs_text_view qs_vector_text_view(const struct qs_vector *v,unsigned row)
+{
+    if(v->kind==QS_TEXT) return v->strings[row];
+    return (struct qs_text_view){.id=(unsigned)qs_vector_value(v,row),.length=UINT_MAX};
+}
+static inline int qs_text_intern(struct qs_dict *dictionary,struct qs_text_view view)
+{
+    if(view.id && !view.offset && view.length==UINT_MAX)
+        return dictionary && view.id<=__atomic_load_n(&dictionary->count,__ATOMIC_ACQUIRE)?(int)view.id:-1;
+    const char *bytes; unsigned length;
+    if(qs_text_resolve(dictionary,view,&bytes,&length)) return -1;
+    return qs_dict_insert(dictionary,bytes,length);
+}
 static int qs_vector_text(const struct qs_vector_input *input,unsigned index,unsigned row,const char **data,unsigned *bytes)
 {
     const struct qs_vector *v=&input->vectors[index];
-    if(v->kind==QS_TEXT) { *data=v->strings[row].data; *bytes=v->strings[row].length; return 0; }
-    return qs_dict_get(input->dictionary,(unsigned)qs_vector_value(v,row),data,bytes);
+    return qs_text_resolve(input->dictionary,qs_vector_text_view(v,row),data,bytes);
 }
 static inline int qs_vector_materialize_text(struct qs_vector *v,unsigned count,struct qs_dict *dictionary)
 {
@@ -216,7 +245,7 @@ static inline int qs_vector_materialize_text(struct qs_vector *v,unsigned count,
     for(unsigned i=0;i<count;++i) {
         int id=0;
         if(!v->nulls[i] && !v->errors[i]) {
-            id=qs_dict_insert(dictionary,v->strings[i].data,v->strings[i].length); if(id<0) return -1;
+            id=qs_text_intern(dictionary,v->strings[i]); if(id<0) return -1;
         }
         v->values[i]=id;
     }
@@ -268,7 +297,7 @@ static int qs_vector_evaluate(struct qs_vector_input *input,unsigned index,const
         for(unsigned j=0;j<n;++j) {
             unsigned i=rows[j],row=qs_vector_row(out,i),scale=0;
             out->errors[i]=0; out->nulls[i]=(out->column_nulls[row/8]>>(row%8))&1;
-            if(col->type==Q_STRING) { out->strings[i].data=NULL; out->strings[i].length=0; }
+            if(col->type==Q_STRING) { out->strings[i]=(struct qs_text_view){0}; }
             else out->narrow[i]=0;
             if(!out->nulls[i]) {
                 struct qs_heap_ref ref; memcpy(&ref,&out->column[row],sizeof(ref));
@@ -276,7 +305,7 @@ static int qs_vector_evaluate(struct qs_vector_input *input,unsigned index,const
                 if(col->type==Q_STRING) {
                     const char *text=(const char *)input->raw+ref.offset; unsigned length=ref.bytes;
                     if(col->trim_spaces) while(length && text[length-1]==' ') --length;
-                    out->strings[i].data=text; out->strings[i].length=length;
+                    out->strings[i]=(struct qs_text_view){.data=text,.length=length};
                 } else out->errors[i]=qs_numeric_cents(input->raw+ref.offset,ref.bytes,&out->narrow[i],&scale)!=0;
             }
             out->dscales[i]=scale;
@@ -321,7 +350,7 @@ static int qs_vector_evaluate(struct qs_vector_input *input,unsigned index,const
                     !qs_vector_null(left,i) && qs_vector_value(left,i)?e->right:e->otherwise;
                 v=qs_vector_cell(p,input->vectors,branch,i); error=input->vectors[branch].errors[i];
                 if(text && !v.isnull && !error) {
-                    error=qs_vector_text(input,branch,i,&out->strings[i].data,&out->strings[i].length)!=0;
+                    out->strings[i]=qs_vector_text_view(&input->vectors[branch],i);
                 } else if(!text && out->kind!=QS_DYNAMIC && !v.isnull) error|=v.scale>e->scale || qs_scale(v.value,e->scale-v.scale,&v.value);
             }
             if(!text) {
@@ -375,7 +404,10 @@ static int qs_vector_evaluate(struct qs_vector_input *input,unsigned index,const
                         while(first<bytes && character<start) { first+=qs_text_character(text+first,bytes-first); ++character; }
                         last=first;
                         while(last<bytes && character<end) { last+=qs_text_character(text+last,bytes-last); ++character; }
-                        out->strings[i].data=text+first; out->strings[i].length=last-first;
+                        out->strings[i]=qs_vector_text_view(left,i);
+                        if(out->strings[i].id) out->strings[i].offset+=first;
+                        else out->strings[i].data+=first;
+                        out->strings[i].length=last-first;
                     }
                 }
             }
