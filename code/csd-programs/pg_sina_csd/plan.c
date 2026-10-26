@@ -582,17 +582,54 @@ static void hash_link(const struct qp_node *n,struct operator_state *o,
     unsigned bucket=row_hash(n,row,1)&(o->hash_buckets-1);
     next[at]=__atomic_exchange_n(&buckets[bucket],at,__ATOMIC_RELAXED);
 }
+/* Keep allocator timing at table boundaries, never per build tuple. */
+static void *hash_memory(struct execution *s,unsigned id,void *old,size_t bytes)
+{
+    uint64_t started=s->profiling && !s->worker?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
+    void *data=old?cs_work_realloc(s->context,old,bytes):cs_work_alloc(s->context,bytes);
+    if(started) s->plan->pipelines[id].hash_memory_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-started;
+    return data;
+}
 static void hash_reindex(struct execution *s,unsigned id)
 {
+    uint64_t started=s->profiling && !s->worker?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
     const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
     const struct qs_plan *right=&s->plan->nodes[n->right].expr;
     unsigned rb=hash_row_bytes(right);
     uint32_t *next=(void *)(o->hash_data+(size_t)o->hash_capacity*rb);
     o->hash_buckets=2*o->hash_capacity;
     memset(next+o->hash_capacity,0xff,(size_t)o->hash_buckets*sizeof(uint32_t));
+    unsigned offsets[QS_KEYS],widths[QS_KEYS];
+    for(unsigned k=0;k<n->nkeys;++k) {
+        unsigned col=n->right_keys[k],offset=0;
+        for(unsigned c=0;c<col;++c) {
+            unsigned bytes=hash_value_bytes(right,c); offset+=bytes+(bytes<16?1:3);
+        }
+        offsets[k]=offset; widths[k]=hash_value_bytes(right,col);
+    }
+    uint32_t *buckets=next+o->hash_capacity;
+    /* Initial setup and growth run before CUs start or after their wave
+     * barrier. Only this owner writes buckets here; concurrent Sink inserts
+     * retain hash_link()'s atomic publication. Decode keys, not payloads. */
     for(unsigned at=0;at<o->hash_rows;++at) {
-        hash_load(o->right,o->hash_data+(size_t)at*rb,right);
-        hash_link(n,o,right,o->right,at);
+        const unsigned char *row=o->hash_data+(size_t)at*rb;
+        uint64_t hash=0x9e3779b97f4a7c15ULL;
+        for(unsigned k=0;k<n->nkeys;++k) {
+            const unsigned char *from=row+offsets[k]; unsigned bytes=widths[k];
+            struct qs_cell value={0};
+            if(bytes==4) { int32_t v; memcpy(&v,from,4); value.value=v; }
+            else if(bytes==8) { int64_t v; memcpy(&v,from,8); value.value=v; }
+            else { memcpy(&value.value,from,16); value.scale=from[16]; }
+            value.isnull=from[bytes+(bytes==16?2:0)];
+            hash=hash_key(hash,value);
+        }
+        unsigned bucket=hash&(o->hash_buckets-1);
+        next[at]=buckets[bucket]; buckets[bucket]=at;
+    }
+    if(started) {
+        struct qp_pipeline_profile *p=&s->plan->pipelines[id];
+        p->hash_reindex_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-started;
+        ++p->hash_reindexes; p->hash_reindexed_rows+=o->hash_rows;
     }
 }
 /* Reserve a disjoint append range; leave one slot for the owner's next_row(). */
@@ -648,14 +685,14 @@ static int64_t hash_build_impl(struct execution *s,unsigned id)
         unsigned max=1; while((size_t)max*2*stride<=hash_limit && max<UINT_MAX/4) max*=2;
         unsigned capacity=128; while(capacity<estimate && capacity<max) capacity*=2;
         if(capacity>max) capacity=max;
-        o->hash_data=cs_work_alloc(s->context,capacity*stride);
+        o->hash_data=hash_memory(s,id,NULL,capacity*stride);
         if(!o->hash_data) { o->hash_fallback=1; return 0; }
         o->hash_capacity=capacity; hash_reindex(s,id);
     }
     while(!o->hash_phase) {
         if(o->hash_rows==o->hash_capacity) {
             size_t bytes=(size_t)o->hash_capacity*2*stride;
-            void *data=bytes<=hash_limit?cs_work_realloc(s->context,o->hash_data,bytes):NULL;
+            void *data=bytes<=hash_limit?hash_memory(s,id,o->hash_data,bytes):NULL;
             if(!data) {
                 /* Preserve already-built projected rows. The fallback sorts
                  * this prefix plus the remaining child stream, never rereads
@@ -3527,7 +3564,7 @@ restart:
             unsigned capacity=o->hash_capacity;
             while(capacity<=rows && capacity<UINT_MAX/4 && (size_t)capacity*2*stride<=available) capacity*=2;
             if(!o->hash_rows && capacity>o->hash_capacity) {
-                void *data=cs_work_alloc(s->context,(size_t)capacity*stride);
+                void *data=hash_memory(s,hash_sink-1,NULL,(size_t)capacity*stride);
                 if(data) {
                     cs_work_free(s->context,o->hash_data); o->hash_data=data;
                     o->hash_capacity=capacity; hash_reindex(s,hash_sink-1);

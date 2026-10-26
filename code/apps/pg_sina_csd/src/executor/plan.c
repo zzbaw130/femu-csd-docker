@@ -776,6 +776,14 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
             for(unsigned i=0;i<lengthof(ops);++i) ExplainPropertyFloat(labels[i],"ms",s->result->profile.operators[ops[i]].cpu_ns/1e6,3,es);
             for(unsigned i=0;i<s->plan->count;++i) {
                 const struct qp_pipeline_profile *p=&s->plan->pipelines[i];
+                if(p->hash_reindexes || p->hash_memory_ns) {
+                    char label[64],value[256];
+                    snprintf(label,sizeof(label),"CSD Hash Table %u",i);
+                    snprintf(value,sizeof(value),"memory_cpu=%.3f ms reindex_cpu=%.3f ms reindexes=%llu rows=%llu (within Build)",
+                        p->hash_memory_ns/1e6,p->hash_reindex_ns/1e6,
+                        (unsigned long long)p->hash_reindexes,(unsigned long long)p->hash_reindexed_rows);
+                    ExplainPropertyText(label,value,es);
+                }
                 if(!p->rounds) continue;
                 double average=(double)(p->coordinator_ns+p->worker_ns)/p->wall_ns;
                 char label[64],value[256]; snprintf(label,sizeof(label),"CSD Pipeline %u",i);

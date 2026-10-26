@@ -41,6 +41,8 @@ struct qp_pipeline_profile {
     uint64_t wall_ns, coordinator_ns, worker_ns, rounds;
     /* Shared Hash/aggregate sink work is a subset of worker_ns. */
     uint64_t sink_ns,sink_rows;
+    /* Subintervals of coordinator Hash Build CPU, not additional time. */
+    uint64_t hash_memory_ns,hash_reindex_ns,hash_reindexes,hash_reindexed_rows;
 };
 /* PG appends immutable extent arrays after qp_plan in its input AFDM.
  * Offsets are relative to that AFDM; only the SQL program interprets them. */

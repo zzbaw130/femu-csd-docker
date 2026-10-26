@@ -13,7 +13,7 @@
 #include <stdatomic.h>
 #include <endian.h>
 typedef int64_t (*function)(struct femu_csd_args *);
-enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_INDEX_PIPELINE,TEST_INDEX_HASH,TEST_INDEX_CHAIN,TEST_INDEX_EXPR,TEST_DEVICE_IO,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL, TEST_VECTOR_AGG=-1,TEST_JOIN_QUAL=-2,TEST_GROUP_SOURCE=-3,TEST_GROUP_SOURCE_SPILL=-4,TEST_BUILD_GROUP_SOURCE=-5,TEST_BUILD_GROUP_HAVING=-6,TEST_BUILD_GROUP_DIRECT=-7 };
+enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_INDEX_PIPELINE,TEST_INDEX_HASH,TEST_INDEX_CHAIN,TEST_INDEX_EXPR,TEST_DEVICE_IO,TEST_PACKED_KEYS,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL, TEST_VECTOR_AGG=-1,TEST_JOIN_QUAL=-2,TEST_GROUP_SOURCE=-3,TEST_GROUP_SOURCE_SPILL=-4,TEST_BUILD_GROUP_SOURCE=-5,TEST_BUILD_GROUP_HAVING=-6,TEST_BUILD_GROUP_DIRECT=-7 };
 static unsigned test_workers=4;
 static bool test_scheduled;
 /* Reservations must cover physical input even when filters/NDV estimates
@@ -340,6 +340,19 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     for(unsigned i=0;i<4;++i) j->expr.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER,.column=i};
     for(unsigned i=0;i<3;++i) j->expr.outputs[i]=(struct qs_output){.index=i==2?3:(int)i,.type_oid=23};
     if(join==QP_SEMI || join==QP_ANTI) j->expr.outputs[2].index=1;
+    if(parallel==TEST_PACKED_KEYS) {
+        /* Rebuild three equivalent keys at distinct packed offsets/widths:
+         * numeric scale 2, int64, int32. Payload columns are not key columns. */
+        struct qs_plan *right=&plan->nodes[3].expr; right->nexprs=5; right->nout=4;
+        right->exprs[2]=(struct qs_expr){.op=Q_CONST,.type=Q_DECIMAL,.constant=100,.scale=2,.dscale=2};
+        right->exprs[3]=(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=0,.right=2,.scale=2};
+        right->exprs[4]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER,.column=0};
+        right->outputs[2]=(struct qs_output){.index=3,.type_oid=1700};
+        right->outputs[3]=(struct qs_output){.index=4,.type_oid=20};
+        j->nkeys=3; j->expr.nattrs=6;
+        j->right_keys[0]=2; j->right_keys[1]=3; j->right_keys[2]=0;
+        j->left_keys[0]=j->left_keys[1]=j->left_keys[2]=0;
+    }
     if(parallel==TEST_INDEX_EXPR) {
         /* Reject initial candidates by both the right filter and a residual
          * Join condition. A match stops only its own key, not its neighbors;
@@ -562,7 +575,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     }
     void *mr[]={plan,&control,out,arena,io}; long long len[]={plan_bytes,(plan->workers+1)*sizeof(*controls),(plan->workers+1)*sizeof(*out),bytes,(plan->workers+1)*QS_SORT_IO_BYTES};
     struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=len};
-    args.cparam1=parallel==TEST_PARALLEL || parallel==TEST_BUILD_PHASE || parallel==TEST_HASH_GROUP || parallel==TEST_PARTITION || parallel==TEST_PARTITION_SKEW || grouped_build || wide_build;
+    args.cparam1=parallel==TEST_PACKED_KEYS || parallel==TEST_PARALLEL || parallel==TEST_BUILD_PHASE || parallel==TEST_HASH_GROUP || parallel==TEST_PARTITION || parallel==TEST_PARTITION_SKEW || grouped_build || wide_build;
     struct test_spill spill={.mutex=PTHREAD_MUTEX_INITIALIZER}; unsigned got=0; unsigned char seen[12]={0};
     uint64_t counts[12]={0},sums[12]={0},mins[12]={0},maxs[12]={0};
     uint64_t source_sums[12]={0},source_counts[12]={0};
@@ -713,6 +726,10 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
              * itself must not launch another parallel Hash Build stage. */
             assert(!plan->nodes[j->right].parallel && !plan->pipelines[j->right].sink_rows);
         if(parallel==TEST_HASH_GROUP) assert(plan->pipelines[1].sink_rows);
+        if(parallel==TEST_PACKED_KEYS) {
+            assert(plan->pipelines[1].hash_reindexed_rows && plan->pipelines[1].hash_reindexes>1);
+            assert(plan->pipelines[1].hash_reindex_ns && plan->pipelines[1].hash_memory_ns);
+        }
         uint64_t children=0;
         for(unsigned op=0;op<QS_OPERATORS;++op) if(op!=QS_JOIN_PROBE) children+=out->profile.operators[op].cpu_ns;
         assert(out->profile.operators[QS_JOIN_PROBE].cpu_ns>=children);
@@ -1980,6 +1997,8 @@ int main(int argc,char **argv)
     /* Merge rejects its first candidate, accepts a vector candidate, then
      * must discard the later error in that same SEMI/ANTI candidate batch. */
     probe_payload(run,2,0,0,4,1); probe_payload(run,2,0,0,5,1);
+    for(unsigned join=QP_INNER;join<=QP_ANTI;++join)
+        test(run,join,31,5003,64,1,TEST_PACKED_KEYS);
     namespace_reentry(run);
     for(unsigned mode=0;mode<6;++mode) filtered_projection(run,mode);
     for(unsigned variant=0;variant<4;++variant) for(unsigned filter=0;filter<3;++filter) set_projection(run,variant,filter);

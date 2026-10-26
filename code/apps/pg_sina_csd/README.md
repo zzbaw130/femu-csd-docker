@@ -20,7 +20,7 @@ Heap 的 I/O 块与列向量容量分别计算：一个已加载块可包含多�
 
 异步 batch 使用 SNIA 标准 callback 返回状态和 CompValue。对提前安排的 Heap 输入，若当前块已耗尽、没有未消费输出且 worker 尚未结束，回调直接领取下一块，重新配置该槽的 `LOAD→计算` batch 并异步续交。输入缓冲仍每槽一份，不增加预读或双缓冲。索引及其他未提前分配输入的worker，回调读一次页请求元数据，按已准备的extent构建下一批LOAD→计算；计算参数标记输入已加载，不再单独写回ready。已有输出、需要共享表维护及阶段结束时仍交给PG协调端。回调仅使用普通内存分配、已有 extent 映射及 SNIA，不调用 PG API；PG 取消时先禁止续交，再等待所有在途回调结束后释放状态。
 
-开启 `pg_sina_csd.profile=on` 后，通用执行树的 EXPLAIN ANALYZE 还输出 `CSD Pipeline <节点号>`：每个并行输入流水线的轮次、墙钟、协调端 CPU、worker 累计 CPU、平均计算 CU 数和 CPU 利用率。墙钟包含该流水线输入及消费期间的内部 LOAD/调度等待；平均 CU 数为两端 CPU 之和除以墙钟，利用率再除以设备 CU 数，不能把峰值 4 当作全程满载。Hash 构建/Hash 聚合协调端 CPU 单独记录，扣除已计时的子扫描、排序和嵌套阻塞计算，仍包含协调端接收输入行的处理成本。计时在 CSF、阻塞调用及流水线边界进行，普通输入行不逐条读时钟；关闭 profile 时不采集，完成后只额外读取一次阶段记录。`sink` 是该流水线 worker 写入共享 Hash/聚合表的累计 CPU，已经包含在 `workers` 中；`sink_rows` 是直接在 worker 消费、无需交回协调端逐行处理的行数。
+开启 `pg_sina_csd.profile=on` 后，通用执行树的 EXPLAIN ANALYZE 还输出 `CSD Pipeline <节点号>`：每个并行输入流水线的轮次、墙钟、协调端 CPU、worker 累计 CPU、平均计算 CU 数和 CPU 利用率。墙钟包含该流水线输入及消费期间的内部 LOAD/调度等待；平均 CU 数为两端 CPU 之和除以墙钟，利用率再除以设备 CU 数，不能把活跃 CU 峰值当作全程满载。Hash 构建/Hash 聚合协调端 CPU 单独记录，扣除已计时的子扫描、排序和嵌套阻塞计算，仍包含协调端接收输入行的处理成本。计时在 CSF、阻塞调用及流水线边界进行，普通输入行不逐条读时钟；关闭 profile 时不采集，完成后只额外读取一次阶段记录。`sink` 是该流水线 worker 写入共享 Hash/聚合表的累计 CPU，已经包含在 `workers` 中；`sink_rows` 是直接在 worker 消费、无需交回协调端逐行处理的行数。
 
 ```text
 Guest PG：SQL → 安全去关联 → PG 选择 Plan → 转换 → CustomScan
@@ -129,6 +129,8 @@ sh /home/femu/tests/tpch-test.sh 7 9 13
 通用树的 profile 同时记录 PG 调度线程的墙钟：`CSD Host Completion Copy` 是请求完成后同步读取 AFDM 控制记录及结果头的时间，`CSD Host Submit` 是 PG 主线程准备和提交请求的时间，不包含 callback 续交。其中 `Queue`、`Control Write` 及已有的 `LOAD Preparation` 均包含在 Submit 中，不能再次相加。`Poll` 是检查完成标志的时间，`Idle Sleep` 是没有可推进任务时的休眠时间。`Pending Requests Sum` 累计各请求提交到 callback 的时间，最终返回 PG 的请求还包含完成观察等待；跨并发请求求和，不是查询延迟或纯 I/O 时间。Host Submissions/Completions 只计 PG 提交和观察的次数，Callback Submissions 另计自动续交次数。关闭 profile 时不采集这些计时。
 
 `CSD Host Assigned LOADs` 记录提前分配的顺序输入块数；开启 profile 时，`Completion Reads` 和 `Control Writes` 分别记录调度期间实际进行的控制记录读写次数，不包含初始化、结束清理和最终字符串结果复制。
+
+`CSD Hash Table <节点号>` 进一步分解协调端构建开销：`memory_cpu` 是表分配/增长的CPU，`reindex_cpu` 是清桶及重建桶链的CPU，`reindexes` 包括初次建空表和预留容量后的清桶，`rows` 是累计重新处理的已有行数。两项是 `CSD Hash Build Coordinator CPU` 的内部区间，不能再与它相加。仍只在表操作边界取时钟。该记录位于PG/设备SO私有计划结构，修改布局后必须同步编译部署PG扩展与pg-sina-plan.so，不改SNIA或固件。
 
 `CSD Setup Wall` 与 `Cleanup Wall` 分别记录设备执行前的准备和结束清理，已包含在 Tree Wall 中；准备不包含 SQL 规划、映射读取和首次资源发现。`Completion Notice` 记录 callback 发布完成到 PG 观察到的间隔，Average/Maximum 单位为微秒，Sum 是跨请求累计值，不能当成查询关键路径或设备空闲时间。
 
