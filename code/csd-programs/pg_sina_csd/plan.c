@@ -121,6 +121,10 @@ struct hash_qual_batch {
     struct projection_batch expr;
     uint32_t rows[QS_VECTOR_ROWS];
 };
+struct merge_qual_batch {
+    struct projection_batch expr;
+    uint64_t begin;
+};
 struct index_qual_batch {
     struct projection_batch expr;
     int status[QS_VECTOR_ROWS];
@@ -139,6 +143,8 @@ struct operator_state {
     struct projection_batch *projection;
     int phase, have_left, have_right, input_done, group_ready, matched, finished;
     unsigned merge_ordered; /* left/right input order verified; bit 2 marks checked. */
+    struct merge_qual_batch *merge_qual;
+    int merge_qual_checked;
     struct qs_plan *index_plan;
     struct projection_batch *index_projection;
     struct index_qual_batch *index_qual;
@@ -253,6 +259,8 @@ static inline int64_t next_row(struct execution *s,unsigned id,struct qs_cell *r
     return status;
 }
 static int64_t join_next(struct execution *,unsigned,struct qs_cell *);
+static int64_t merge_qual_next(struct execution *,unsigned,struct qs_cell *);
+static void merge_qual_close(struct execution *,struct operator_state *);
 static int64_t hash_probe_input(struct execution *,unsigned,const uint32_t *);
 static int hash_left_payload(struct execution *,unsigned);
 static int hash_left_cell(struct execution *,unsigned,unsigned,struct qs_cell *);
@@ -1025,7 +1033,7 @@ static int64_t merge_match_next(struct execution *s,unsigned id,struct qs_cell *
         int64_t status;
         if(o->phase==2) {
             status=o->merge_ordered&1?next_row(s,n->left,o->left):sorted_input(s,&o->left_sort,n->left,n->nkeys,n->left_keys,left_order,o->left);
-            if(status!=2) return status;
+            if(status!=2) { if(!status) merge_qual_close(s,o); return status; }
             o->have_left=1; o->position=0; o->matched=0; o->phase=0;
             const struct qs_plan *types=&s->plan->nodes[n->left].expr;
             int same=1;
@@ -1039,7 +1047,7 @@ static int64_t merge_match_next(struct execution *s,unsigned id,struct qs_cell *
         }
         if(!o->have_left) {
             status=o->merge_ordered&1?next_row(s,n->left,o->left):sorted_input(s,&o->left_sort,n->left,n->nkeys,n->left_keys,left_order,o->left);
-            if(status!=2) return status;
+            if(status!=2) { if(!status) merge_qual_close(s,o); return status; }
             o->have_left=1; o->position=0; o->matched=0;
         }
         if(!o->group_ready) {
@@ -1068,14 +1076,24 @@ static int64_t merge_match_next(struct execution *s,unsigned id,struct qs_cell *
                 continue;
             }
         }
-        if(o->position<o->group.rows) {
-            memcpy(values,o->left,ln*sizeof(*values));
-            status=spool_row(s,&o->group,o->position,rn,values+ln); if(status) return status;
-            ++o->position;
-            struct qs_eval e; init_eval(&e,&n->expr,values,NULL); struct qs_cell match={.value=1};
-            if(n->join_qual>=0 && evaluate(s,&e,n->join_qual,&match)) return -5;
-            if(match.isnull || !match.value) continue;
+        if(o->position<o->group.rows || (o->merge_qual && o->merge_qual->expr.position<o->merge_qual->expr.count)) {
+            int qualified=0;
+            if(n->join_qual>=0) {
+                status=merge_qual_next(s,id,values);
+                if(!status) continue;
+                if(status!=3) { if(status!=2) return status; qualified=1; }
+            }
+            if(!qualified) {
+                memcpy(values,o->left,ln*sizeof(*values));
+                status=spool_row(s,&o->group,o->position,rn,values+ln); if(status) return status;
+                ++o->position;
+                struct qs_eval e; init_eval(&e,&n->expr,values,NULL); struct qs_cell match={.value=1};
+                if(n->join_qual>=0 && evaluate(s,&e,n->join_qual,&match)) return -5;
+                if(match.isnull || !match.value) continue;
+            }
             o->matched=1;
+            if((n->join_type==QP_SEMI || n->join_type==QP_ANTI) && o->merge_qual)
+                o->merge_qual->expr.count=o->merge_qual->expr.position=0;
             if(n->join_type==QP_ANTI) { o->position=o->group.rows; continue; }
             if(n->join_type==QP_SEMI) o->position=o->group.rows;
             ++s->metrics.join_rows; return 2;
@@ -1367,6 +1385,67 @@ static int join_qual_init(struct execution *s,unsigned id,struct projection_batc
         cs_work_free(s->context,b->cells); cs_work_free(s->context,b->vectors); return -1;
     }
     return 0;
+}
+static void merge_qual_close(struct execution *s,struct operator_state *o)
+{
+    if(!o->merge_qual) return;
+    cs_work_free(s->context,o->merge_qual->expr.cells);
+    cs_work_free(s->context,o->merge_qual->expr.vectors);
+    cs_work_free(s->context,o->merge_qual); o->merge_qual=NULL;
+}
+/* Qualify consecutive candidates within one spool block. Retain the block
+ * until its selected payloads drain; no speculative load crosses its end. */
+static int64_t merge_qual_next(struct execution *s,unsigned id,struct qs_cell *values)
+{
+    const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
+    unsigned ln=s->plan->nodes[n->left].expr.nout,rn=s->plan->nodes[n->right].expr.nout;
+    struct merge_qual_batch *q=o->merge_qual;
+    if(!q || q->expr.position==q->expr.count) {
+        int semi=n->join_type==QP_SEMI || n->join_type==QP_ANTI;
+        if((o->merge_qual_checked && !q) || (semi && !o->position)) return 3;
+        unsigned block_rows=QS_SORT_IO_BYTES/(rn*sizeof(*values));
+        uint64_t remaining=o->group.rows-o->position;
+        unsigned count=semi?64:QS_VECTOR_ROWS;
+        if(remaining<count) count=remaining;
+        if(count>block_rows-o->position%block_rows) count=block_rows-o->position%block_rows;
+        if(count<2) return 3;
+        struct qs_cell right[QS_OUT];
+        int64_t status=spool_row(s,&o->group,o->position,rn,right);
+        if(status) {
+            if(status==-4 && q) { merge_qual_close(s,o); return 3; }
+            return status;
+        }
+        if(!q) {
+            o->merge_qual_checked=1;
+            q=cs_work_calloc(s->context,1,sizeof(*q)); if(!q) return 3;
+            if(join_qual_init(s,id,&q->expr,NULL)) { cs_work_free(s->context,q); return 3; }
+            o->merge_qual=q;
+        }
+        struct projection_batch *b=&q->expr; q->begin=o->position;
+        for(unsigned r=0;r<count;++r) {
+            if(r) { status=spool_row(s,&o->group,q->begin+r,rn,right); if(status) return status; }
+            for(unsigned col=0;col<b->plan.nattrs;++col) {
+                int slot=b->plan.cols[col].slot;
+                if(slot>=0) b->cells[(size_t)slot*QS_VECTOR_ROWS+r]=col<ln?o->left[col]:right[col-ln];
+            }
+        }
+        struct qs_vector_input input={.cells=b->cells,.dictionary=s->dictionary,
+            .parameters=s->params,.nparameters=QP_PARAMS};
+        if(qs_vector_execute_input(&b->plan,NULL,NULL,0,count,b->needed,b->vectors,input)) return -5;
+        b->count=count; b->position=0; o->position+=count;
+    }
+    struct projection_batch *b=&q->expr;
+    while(b->position<b->count) {
+        unsigned r=b->position,index=b->plan.predicate;
+        if(b->vectors[index].errors[r]) return -5;
+        struct qs_cell keep=qs_vector_cell(&b->plan,b->vectors,index,r);
+        if(!keep.isnull && keep.value) {
+            int64_t status=spool_row(s,&o->group,q->begin+r,rn,values+ln); if(status) return status;
+            memcpy(values,o->left,ln*sizeof(*values)); ++b->position; return 2;
+        }
+        ++b->position;
+    }
+    b->position=b->count=0; return 0;
 }
 /* Batch residual conditions over a duplicate-key chain. Single candidates
  * keep the scalar path; retained indices let one probe produce many output

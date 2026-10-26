@@ -834,3 +834,15 @@ host总延迟56740.096ms，CSD为15335.444ms，总时间比3.700倍；单条1.76
 仍用原始Q13，在开发连接关闭Hash/NestLoop/HashAggregate以保持同一Merge计划，不修改SQL或持久配置。[当前开发结果](../../../../results/stream-groups/)与host、上一阶段输出逐字节一致，完整卸载，无spill；普通冷启动host为2631.117ms，CSD为1588.991ms。对照上一阶段[profile](../../../../results/merge-vectors/13.profile.log)，[当前profile](../../../../results/stream-groups/13.profile.log)聚合协调端CPU 693.812→552.869ms，总CSF CPU 2630.613→2582.475ms，workmem峰值109349904→108647408字节。整体CPU只小幅下降，单次profile和普通查询样本不能证明固定加速比例，也不能把开发计划成绩替代默认验收。
 
 默认配置的[标准Q2/Q13/Q18冷启动回归](../../../../results/tpch.5lBaEJ/timings.csv)均结果一致、完整卸载且快于host，CSD分别353.989/364.555/1136.980ms。资源保持8 CU、256MiB workmem、64MiB FDM，只部署设备计划SO，未重复全量22条。流式分组的最终逐组输出、Merge匹配残余条件及spill Source等行接口仍是后续改造边界；本阶段只移除输入逐行解释与逐行更新COUNT的主要开销。
+
+## Merge重复键组的残余条件列批次
+
+参考DuckDB Merge收集候选匹配、用选择向量筛选后再发布结果的顺序，设备Merge对当前spill块内的连续候选收集条件所需列，复用已有条件向量引擎。INNER/LEFT至多256行，SEMI/ANTI先单独判断首候选，未命中才按至多64行处理；命中立即丢弃未消费的条件结果，之后的错误不提前报告。单候选、无法导入的表达式或实际分配失败保留原标量路径。
+
+批次不跨当前spool块边界：块装载完成后批量判断，所选右侧数据仍从同一块取出，不保存第二份完整右侧行，也不为提前取候选读取后续块。I/O等待及批次的未消费位置由原Merge状态接续；条件缓冲计入同一workmem，Merge EOF释放。缓存分配空间不足时先释放可选条件缓冲再退回原路径；LEFT补NULL和SEMI/ANTI停止状态保持不变。没有新增SNIA/FEMU协议、外部参数、进程或FDM。
+
+原生及8/16/64 CU四项CTest、ASan/UBSan/LeakSanitizer原生及8CU两项检查通过，包含4MiB重复键组spill、NULL、残余条件、LIMIT及资源清理。补充SEMI/ANTI先拒绝首候选、再接受向量候选、随后同批还有错误的用例，验证接受后不再观察该错误。
+
+真实设备开发检查只读已有冻结nation表，使用两个别名按region相等及nationkey小于匹配。临时SQL仅放Guest `/tmp`，执行完已删除，不创建表或另一套TPC-H SQL。关闭Hash/NestLoop/HashAggregate的连接选项仅用于这些开发检查，不写入持久配置。四份设备计划均实际使用Merge、顶层完整卸载，输出与host及独立计数预期一致，记录在[开发结果](../../../../results/merge-residual/)：每个region的INNER为10行，LEFT为11行且右侧非NULL计数10，SEMI为4行，ANTI为1行。该小数据检查只证明功能，不作为性能验收。
+
+默认选项下[标准Q2/Q13/Q21冷启动回归](../../../../results/tpch.ZBIAsy/timings.csv)均结果一致、完整卸载且快于host，CSD分别351.960/371.374/922.284ms。保持8 CU、256MiB workmem、64MiB FDM，只部署设备计划SO；未重复全量22条，也不宣称本次改动带来固定的查询延迟收益。流式分组最终逐组输出、spill Source与部分阻塞阶段续交仍待改造。

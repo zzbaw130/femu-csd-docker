@@ -1891,6 +1891,9 @@ int main(int argc,char **argv)
     probe_payload(run,2,0,1,2,0); probe_payload(run,2,0,1,3,0);
     probe_payload(run,1,0,0,1,1); probe_payload(run,2,0,0,1,1);
     probe_payload(run,2,0,0,2,1); probe_payload(run,2,0,0,3,1);
+    /* Merge rejects its first candidate, accepts a vector candidate, then
+     * must discard the later error in that same SEMI/ANTI candidate batch. */
+    probe_payload(run,2,0,0,4,1); probe_payload(run,2,0,0,5,1);
     namespace_reentry(run);
     for(unsigned mode=0;mode<6;++mode) filtered_projection(run,mode);
     for(int joined=0;joined<2;++joined) {
