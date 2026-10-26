@@ -914,3 +914,24 @@ NativePlan及8/16/64 CU四项CTest、ASan/UBSan/LeakSanitizer原生与8CU两项�
 | Q22 | 613.821 | 329.884 |
 
 资源仍为8 CU、256MiB workmem、64MiB FDM，10次测量均有独立清缓存标记。另将规范Q21限制为150ms超时，确认取消后同一连接重新执行全部结果与规范host逐字节一致；日志为同profile目录的21.cancel-recover.log/.err，未新建测试SQL。整体CU利用率、部分阻塞阶段续交、归并并行化及字符串字典spill仍未完成；本轮未重复全量22条。
+
+
+## COALESCE与numeric除法接入表达式列批次
+
+参考DuckDB execute_operator.cpp中COALESCE只将仍为NULL的行交给后续子表达式的方式，复用原CASE的选择向量与错误位。左值非NULL或已报错时不求右侧，嵌套COALESCE与CASE保持短路。numeric保留所选值的运行时scale/dscale，文本仍为字节视图，持久化消费者再转成字典ID。numeric除法接入原列批次，复用qs_divide的PG精度和舍入规则，各值保存最终精度；具体除法仍为精确逐值原语，不宣称SIMD除法。Projection导入允许这两种已有表达式，原标量路径仍保留，不改PG/SNIA/FEMU接口或增加工作缓冲。
+
+新增向量测试覆盖宽numeric、混合精度、反向/重复选择及尾批，比较标量结果与逐值错误；CASE/COALESCE抑制未选中的除零和非法substring，文本视图及NULL回退均正确。5项表达式/原生/8/16/64 CU组件、4项共享Filter/Aggregate/Profile组件、3项ASan/UBSan/LeakSanitizer通过；随后补充的InitPlan参数经COALESCE投影用例在原生回归通过，保持Hash Join与Heap输入上的NULL和动态精度。
+
+已重编部署受共享表达式头文件影响的设备SQL算子，资源保持8 CU、256MiB workmem、64MiB FDM。[规范冷启动回归](../../../../results/tpch.7AVkd9/timings.csv)：
+
+| 查询 | host ms | CSD ms |
+| --- | ---: | ---: |
+| Q1 | 4908.671 | 753.077 |
+| Q6 | 2363.784 | 847.366 |
+| Q8 | 2775.117 | 743.392 |
+| Q14 | 1453.644 | 416.220 |
+| Q17 | 4528.353 | 934.082 |
+
+五条均逐字节匹配、完整卸载且快于同轮host。额外开发小查询分别验证NULL numeric/文本回退、numeric除法和未选中的动态除零分支，[功能日志](../../../../results/null-division.GNnqbo)中host/CSD结果一致，两条均为完整CSD计划；临时SQL文件已删除，未作为TPC-H验收或性能成绩。该检查使用现有numeric表达式支持范围，不声称支持所有PG整数算术。
+
+本轮没有旧、新多轮对照，不将本轮延迟与历史值相减归因于某项向量化收益，也未重复完整22条。集合判断仍依赖设备集合状态，未因此进入普通表达式向量；字典spill、归并并行化和部分阻塞阶段续交继续待完成。

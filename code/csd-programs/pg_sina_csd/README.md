@@ -48,7 +48,7 @@ Source也可直接作为Hash Build、外层聚合或Sort的输入，不要求中
 
 ## 节点与内存
 
-- Scan/Projection：只解码父节点真正需要的列；投影、过滤、CASE、NULL 三值逻辑、短路、数值运算、LIKE、substring 和 year 在设备执行。仅用于 LIKE 的长字符串直接在扫描时判断，不先将所有文本放入字典。
+- Scan/Projection：只解码父节点真正需要的列；投影、过滤、CASE、NULL 三值逻辑、短路、数值运算、LIKE、substring 和 year 在设备执行。仅用于 LIKE 的长字符串直接在扫描时判断，不先将所有文本放入字典。COALESCE与numeric除法也进入现有表达式列批次：仅左值为NULL的存活行求COALESCE右侧，文本保留视图；除法复用精确numeric原语，按值保留实际scale/dscale和错误位，不使用近似SIMD除法。
   Projection链及Hash/Merge/Index Join、Sort、驻留分组Source上的输出过滤复用表达式向量，先维护存活行选择，再计算输出；全部被过滤的批次直接继续读取。无过滤或全部存活时保留原批次布局，只有行数减少时压缩所需结果列，不复制完整输入行。
 - Hash Join：按 PG 的左右输入 build/probe，支持 INNER/LEFT/SEMI/ANTI 和多键等值/剩余条件。表内按 PG 类型保存整数/date 的 4/8 字节值，numeric 保留完整 128 位，避免每列承担 32 字节的对齐填充。并行构建输入的 CU 按批预留行区并原子链接桶头，省去协调端逐行接收与再次构建桶链。表满时将未消费行保留在原 AFDM，协调端在本轮 CU 都暂停后扩容；阻塞子节点的父表仍从小容量开始，随实际输出增长。INNER 表扩容失败时，将已消费的前缀和后续输入按键分为四个分区，使用现有 SNIA spill 请求保存紧凑行；两侧 Heap 均只扫描一次。构建侧结束后重新检查实际空闲内存：若全部分区能驻留，按实际行数分配行区、单独为桶取二次幂容量，直接多 CU 扫描 Probe 侧，避免将它预先落盘；否则逐分区构建共享 Hash 表，各 CU 动态领取 Probe 块，偏斜分区超限时分批构建并重复读取该分区的 Probe 临时数据，不改用全表排序。其他不能采用此路径的形态保留原 Merge 回退。所有分配仍受查询根 context 和物理池约束。
   并行构建可直接引用Scan、Projection、Hash/Index Join、Sort及驻留分组Source输出的表达式列批次，按键批量计算Hash，再将各列写入紧凑构建行，不先生成AFDM中间行。满表时保留向量中的消费位置，将剩余行交给原协调端扩容/spill路径。已spill的分区Source和不支持的表达式仍使用已有行批次接口，保留各自的读取游标；不重新扫描源表。该路径复用原查询workmem和Hash布局，不增加AFDM或协议。

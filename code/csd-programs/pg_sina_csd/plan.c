@@ -1344,7 +1344,7 @@ static int projection_import(struct projection_import *in,unsigned node,int inde
             e.column=k;
         }
     }
-    if(e.op>Q_CASE && e.op!=Q_YEAR && e.op!=Q_LIKE && e.op!=Q_SUBSTRING && e.op!=QP_PARAMETER) return -1;
+    if(e.op>Q_CASE && e.op!=Q_YEAR && e.op!=Q_LIKE && e.op!=Q_SUBSTRING && e.op!=QP_PARAMETER && e.op!=QP_COALESCE && e.op!=Q_DIV) return -1;
     if(e.op==Q_COLUMN && (n->kind==QP_PROJECT || n->kind==QP_AGGREGATE) &&
        !(in->batch->group_source && node==in->batch->scan)) {
         const struct qp_node *child=&in->execution->plan->nodes[n->left];

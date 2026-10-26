@@ -1080,10 +1080,14 @@ static void parameter_projection(function run,int joined,int wide,int null_param
     }
     struct qp_node *root=&p->nodes[0];
     *root=(struct qp_node){.kind=QP_PROJECT,.left=1,.right=-1,.expr=p->nodes[leaf].expr};
-    root->expr.work_mem_bytes=64U*1024*1024; root->expr.nexprs=4;
+    root->expr.work_mem_bytes=64U*1024*1024; root->expr.nexprs=6;
     root->expr.exprs[2]=(struct qs_expr){.op=QP_PARAMETER,.type=Q_DECIMAL,.column=0};
     root->expr.exprs[3]=(struct qs_expr){.op=Q_ADD,.type=Q_DECIMAL,.left=1,.right=2};
-    root->expr.outputs[1]=(struct qs_output){.index=3,.type_oid=1700,.typmod=-1};
+    /* COALESCE must preserve an InitPlan value's runtime scale after its
+     * parameter and payload columns are imported into one projection DAG. */
+    root->expr.exprs[4]=(struct qs_expr){.op=Q_CONST,.type=Q_DECIMAL,.isnull=1};
+    root->expr.exprs[5]=(struct qs_expr){.op=Q_COALESCE,.type=Q_DECIMAL,.left=4,.right=3};
+    root->expr.outputs[1]=(struct qs_output){.index=5,.type_oid=1700,.typmod=-1};
     struct qp_node *init=&p->nodes[2];
     *init=(struct qp_node){.kind=QP_PROJECT,.left=-1,.right=-1};
     init->expr.predicate=init->expr.having=-1; init->expr.nexprs=wide?2:1; init->expr.nout=1;

@@ -1,6 +1,12 @@
 # 开发阶段与验证记录
 
-## 当前阶段：由worker完成值推进，减少控制记录读取
+## 当前阶段：COALESCE与numeric除法列批次
+
+复用CASE选择向量按需求COALESCE右侧，保留文本视图和运行时numeric精度。除法使用已有精确原语和逐值错误位，允许Projection导入，不新增接口、状态布局或工作缓冲。表达式、并行计划及共享算子9项组件、3项消毒器通过，补充的InitPlan COALESCE投影原生回归通过。
+
+部署后规范Q1/Q6/Q8/Q14/Q17冷启动正确、完整卸载且快于host；临时功能SQL核对numeric/文本回退及抑制除零，并确认完整CSD计划，SQL已清理。具体成绩、未覆盖形态及剩余工作见performance.md末节；未重复完整22条或宣称固定延迟收益。
+
+## 由worker完成值推进，减少控制记录读取
 
 新阶段worker控制记录在设备初始化，PG只清空本地副本。Index、聚合Source及Combine复用扫描已有的CompValue输出/完成位，只有需要主机补交页请求才读AFDM控制记录；输入耗尽位仅用于主机分配的扫描块，避免Combine复用旧标记。PG与pg-sina-plan.so同步部署，不改SNIA/固件或共享表安全屏障。
 

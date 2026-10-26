@@ -55,7 +55,7 @@ static inline int qs_vector_dependency(const struct qs_plan *p,int index,uint8_t
     if(index<0 || (unsigned)index>=p->nexprs) return -1;
     if(needed[index]) return 0;
     const struct qs_expr *e=&p->exprs[index];
-    if(e->op>Q_CASE && e->op!=Q_YEAR && e->op!=Q_LIKE && e->op!=Q_SUBSTRING && e->op!=Q_PARAMETER) return -1; /* AGGREF/DIV are scalar final expressions. */
+    if(e->op>Q_CASE && e->op!=Q_YEAR && e->op!=Q_LIKE && e->op!=Q_SUBSTRING && e->op!=Q_PARAMETER && e->op!=Q_COALESCE && e->op!=Q_DIV) return -1; /* AGGREF needs Source column rebinding. */
     if(e->op!=Q_COLUMN && e->op!=Q_CONST && e->op!=Q_PARAMETER) {
         if(e->left<0 || e->left>=index || qs_vector_dependency(p,e->left,needed)) return -1;
         if(e->op!=Q_NOT && e->op!=Q_IS_NULL && e->op!=Q_IS_NOT_NULL && e->op!=Q_YEAR &&
@@ -292,22 +292,25 @@ static int qs_vector_evaluate(struct qs_vector_input *input,unsigned index,const
         }
         out->done+=n; return 0;
     }
-    if(e->op==Q_CASE) {
+    if(e->op==Q_CASE || e->op==Q_COALESCE) {
+        int coalesce=e->op==Q_COALESCE;
         int text=e->type==Q_STRING && input->dictionary;
         uint16_t false_rows[QS_VECTOR_ROWS]; unsigned nt=0,nf=0;
         for(unsigned j=0;j<n;++j) {
             unsigned i=rows[j]; if(left->errors[i]) continue;
-            if(!qs_vector_null(left,i) && qs_vector_value(left,i)) rhs[nt++]=i;
+            if(coalesce) { if(qs_vector_null(left,i)) rhs[nt++]=i; }
+            else if(!qs_vector_null(left,i) && qs_vector_value(left,i)) rhs[nt++]=i;
             else false_rows[nf++]=i;
         }
         if(qs_vector_evaluate(input,e->right,rhs,nt) ||
-            qs_vector_evaluate(input,e->otherwise,false_rows,nf)) return -1;
-        if(!text && (input->vectors[e->right].kind==QS_CELLS || input->vectors[e->right].kind==QS_DYNAMIC ||
+            (!coalesce && qs_vector_evaluate(input,e->otherwise,false_rows,nf))) return -1;
+        if(!text && (coalesce || input->vectors[e->right].kind==QS_CELLS || input->vectors[e->right].kind==QS_DYNAMIC ||
             input->vectors[e->otherwise].kind==QS_CELLS || input->vectors[e->otherwise].kind==QS_DYNAMIC)) out->kind=QS_DYNAMIC;
         for(unsigned j=0;j<n;++j) {
             unsigned i=rows[j]; unsigned error=left->errors[i]; struct qs_cell v={0};
             if(!error) {
-                unsigned branch=!qs_vector_null(left,i) && qs_vector_value(left,i)?e->right:e->otherwise;
+                unsigned branch=coalesce?(qs_vector_null(left,i)?e->right:e->left):
+                    !qs_vector_null(left,i) && qs_vector_value(left,i)?e->right:e->otherwise;
                 v=qs_vector_cell(p,input->vectors,branch,i); error=input->vectors[branch].errors[i];
                 if(text && !v.isnull && !error) {
                     error=qs_vector_text(input,branch,i,&out->strings[i].data,&out->strings[i].length)!=0;
@@ -373,8 +376,8 @@ static int qs_vector_evaluate(struct qs_vector_input *input,unsigned index,const
         }
         out->kind=QS_TEXT; out->done+=n; return 0;
     }
-    if((e->op==Q_ADD || e->op==Q_SUB || e->op==Q_MUL) &&
-        (left->kind==QS_CELLS || left->kind==QS_DYNAMIC || right->kind==QS_CELLS || right->kind==QS_DYNAMIC)) out->kind=QS_DYNAMIC;
+    if(e->op==Q_DIV || ((e->op==Q_ADD || e->op==Q_SUB || e->op==Q_MUL) &&
+        (left->kind==QS_CELLS || left->kind==QS_DYNAMIC || right->kind==QS_CELLS || right->kind==QS_DYNAMIC))) out->kind=QS_DYNAMIC;
     for(unsigned j=0;j<n;++j) {
         unsigned i=rows[j]; struct qs_cell a=qs_vector_cell(p,input->vectors,e->left,i),b={0};
         struct qs_cell v={.scale=e->scale,.dscale=e->dscale}; unsigned error=left->errors[i];
@@ -401,7 +404,8 @@ static int qs_vector_evaluate(struct qs_vector_input *input,unsigned index,const
                             v.value=e->op==Q_EQ?cmp==0:e->op==Q_NE?cmp!=0:e->op==Q_LT?cmp<0:e->op==Q_LE?cmp<=0:e->op==Q_GT?cmp>0:cmp>=0;
                         }
                     }
-                } else if(e->op==Q_MUL) { error=__builtin_mul_overflow(a.value,b.value,&v.value); v.scale=a.scale+b.scale; v.dscale=a.dscale+b.dscale; }
+                } else if(e->op==Q_DIV) error=qs_divide(a,b,&v)!=0;
+                else if(e->op==Q_MUL) { error=__builtin_mul_overflow(a.value,b.value,&v.value); v.scale=a.scale+b.scale; v.dscale=a.dscale+b.dscale; }
                 else if(e->op==Q_ADD || e->op==Q_SUB) {
                     __int128 l,r;
                     v.scale=out->kind==QS_DYNAMIC?(a.scale>b.scale?a.scale:b.scale):e->scale;

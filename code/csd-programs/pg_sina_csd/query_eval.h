@@ -80,6 +80,10 @@ static inline int qs_evaluate(struct qs_eval *e, int index, struct qs_cell *out)
         if(!v.isnull) v.value=qs_pgdate_year((int32_t)a.value);
     } else {
         if(qs_evaluate(e,x->left,&a)) return -1;
+        if(x->op==Q_COALESCE) {
+            v=a; if(a.isnull && qs_evaluate(e,x->right,&v)) return -1;
+            e->valid[index]=1; e->cells[index]=v; *out=v; return 0;
+        }
         if(x->op==Q_CASE) {
             if(qs_evaluate(e,!a.isnull && a.value?x->right:x->otherwise,&v)) return -1;
             if(!v.isnull && (v.scale>x->scale || qs_scale(v.value,x->scale-v.scale,&v.value))) return -1;

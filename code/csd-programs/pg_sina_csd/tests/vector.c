@@ -7,7 +7,7 @@
 #include <stdlib.h>
 static void materialized_columns(unsigned row_stride)
 {
-    struct qs_plan p={.nattrs=2,.ncols=2,.nexprs=6};
+    struct qs_plan p={.nattrs=2,.ncols=2,.nexprs=9};
     p.cols[0].slot=0; p.cols[1].slot=1;
     p.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.column=0,.type=Q_DECIMAL,.scale=2};
     p.exprs[1]=(struct qs_expr){.op=Q_COLUMN,.column=1,.type=Q_BOOLEAN};
@@ -15,6 +15,9 @@ static void materialized_columns(unsigned row_stride)
     p.exprs[3]=(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=0,.right=2,.scale=4};
     p.exprs[4]=(struct qs_expr){.op=Q_ADD,.type=Q_DECIMAL,.left=0,.right=2,.scale=2};
     p.exprs[5]=(struct qs_expr){.op=Q_CASE,.type=Q_DECIMAL,.left=1,.right=3,.otherwise=0,.scale=4};
+    p.exprs[6]=(struct qs_expr){.op=Q_CONST,.type=Q_DECIMAL,.constant=-75,.scale=2,.dscale=2};
+    p.exprs[7]=(struct qs_expr){.op=Q_COALESCE,.type=Q_DECIMAL,.left=0,.right=6};
+    p.exprs[8]=(struct qs_expr){.op=Q_DIV,.type=Q_DECIMAL,.left=7,.right=2};
     struct qs_cell *columns=calloc(2*QS_VECTOR_ROWS,sizeof(*columns));
     struct qs_vector *vectors=calloc(p.nexprs,sizeof(*vectors)); assert(columns && vectors);
     for(unsigned r=0;r<QS_VECTOR_ROWS;++r) {
@@ -24,7 +27,7 @@ static void materialized_columns(unsigned row_stride)
     columns[QS_VECTOR_ROWS-1]=(struct qs_cell){.value=3,.scale=2,.dscale=4};
     columns[QS_VECTOR_ROWS-2]=(struct qs_cell){.value=(__int128)1<<126,.scale=2,.dscale=2};
     uint8_t needed[QS_EXPRS]={0};
-    for(unsigned i=3;i<6;++i) assert(!qs_vector_require(&p,i,needed));
+    for(unsigned i=3;i<9;++i) assert(!qs_vector_require(&p,i,needed));
     struct qs_vector_input input={.cells=columns};
     struct qs_cell *rows=NULL;
     if(row_stride) {
@@ -45,7 +48,7 @@ static void materialized_columns(unsigned row_stride)
         assert(!qs_vector_execute_input(&p,NULL,selection,first,count,needed,vectors,input));
         if(pass<2) assert(vectors[0].kind==QS_CELLS);
         else assert(vectors[0].kind==QS_NARROW);
-        for(unsigned r=0;r<count;++r) for(unsigned root=3;root<6;++root) {
+        for(unsigned r=0;r<count;++r) for(unsigned root=3;root<9;++root) {
             unsigned at=selection?selection[first+r]:first+r;
             struct qs_cell tuple[]={columns[at],columns[QS_VECTOR_ROWS+at]},expected;
             struct qs_eval eval={.plan=&p,.tuple=tuple};
@@ -131,6 +134,18 @@ static void string_views(void)
         assert(length==strlen(prefixes[i]) && !memcmp(text,prefixes[i],length));
     }
     assert(qs_vector_null(&v[13],5));
+    p.nexprs=16;
+    p.exprs[14]=(struct qs_expr){.op=Q_COALESCE,.left=3,.right=4,.type=Q_STRING};
+    p.exprs[15]=(struct qs_expr){.op=Q_COALESCE,.left=14,.right=11,.type=Q_STRING};
+    memset(needed,0,sizeof(needed)); assert(!qs_vector_require(&p,15,needed));
+    assert(!qs_vector_execute_raw_dict(&p,c,NULL,0,6,needed,v,raw,used,dict));
+    for(unsigned i=0;i<6;++i) {
+        const char *want=i==5?"23":prefixes[i];
+        assert(v[15].kind==QS_TEXT && !v[15].errors[i] && !v[15].nulls[i]);
+        assert(v[15].strings[i].length==strlen(want) && !memcmp(v[15].strings[i].data,want,strlen(want)));
+        assert(v[11].errors[i]==2); /* COALESCE never needs the bad substring. */
+    }
+    assert(!qs_vector_materialize_text(&v[15],6,dict));
     struct qs_heap_ref bad={sizeof(raw),1}; memcpy(qs_values(c)+2,&bad,sizeof(bad));
     assert(qs_vector_execute_raw_dict(&p,c,NULL,0,6,needed,v,raw,used,dict));
     free(v); free(dict); free(c);
@@ -269,7 +284,7 @@ static void arithmetic(void)
 typedef int64_t (*function)(struct femu_csd_args *);
 static void case_and_division(void)
 {
-    struct qs_plan p={.having=-1,.nattrs=2,.ncols=2,.nexprs=9};
+    struct qs_plan p={.having=-1,.nattrs=2,.ncols=2,.nexprs=13};
     p.cols[0]=(struct qs_column){.slot=0,.type=Q_BOOLEAN};
     p.cols[1]=(struct qs_column){.slot=1,.type=Q_DECIMAL,.scale=2};
     p.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.column=0,.type=Q_BOOLEAN};
@@ -281,6 +296,10 @@ static void case_and_division(void)
     p.exprs[6]=(struct qs_expr){.op=Q_MUL,.left=5,.right=4,.type=Q_DECIMAL};
     p.exprs[7]=(struct qs_expr){.op=Q_CONST,.type=Q_BOOLEAN};
     p.exprs[8]=(struct qs_expr){.op=Q_CASE,.left=7,.right=6,.otherwise=3,.type=Q_DECIMAL,.scale=2};
+    p.exprs[9]=(struct qs_expr){.op=Q_CONST,.type=Q_DECIMAL};
+    p.exprs[10]=(struct qs_expr){.op=Q_DIV,.left=4,.right=9,.type=Q_DECIMAL};
+    p.exprs[11]=(struct qs_expr){.op=Q_COALESCE,.left=1,.right=10,.type=Q_DECIMAL};
+    p.exprs[12]=(struct qs_expr){.op=Q_CASE,.left=0,.right=11,.otherwise=3,.type=Q_DECIMAL,.scale=2};
     struct qs_chunk *c=calloc(1,qs_chunk_bytes(257,2)); assert(c);
     c->capacity=c->rows=257; c->ncols=2;
     for(unsigned i=0;i<c->rows;++i) {
@@ -290,7 +309,7 @@ static void case_and_division(void)
         if(i%7==0) qs_nulls(c)[(c->capacity+7)/8+i/8]|=1U<<(i%8);
     }
     struct qs_vector *vectors=calloc(p.nexprs,sizeof(*vectors)); assert(vectors);
-    uint8_t needed[QS_EXPRS]={0}; assert(!qs_vector_require(&p,8,needed));
+    uint8_t needed[QS_EXPRS]={0}; assert(!qs_vector_require(&p,8,needed) && !qs_vector_require(&p,12,needed));
     for(unsigned first=0;first<c->rows;first+=QS_VECTOR_ROWS) {
         unsigned count=c->rows-first; if(count>QS_VECTOR_ROWS) count=QS_VECTOR_ROWS;
         assert(!qs_vector_execute(&p,c,qs_selection(c),first,count,needed,vectors));
@@ -300,6 +319,16 @@ static void case_and_division(void)
             assert(!vectors[8].errors[i] && got.isnull==want.isnull);
             if(!got.isnull) assert(got.value==want.value && got.scale==want.scale && got.dscale==want.dscale);
             assert(vectors[6].errors[i]==2); /* Unselected overflowing branch. */
+            struct qs_eval check={.plan=&p,.chunk=c,.row=qs_selection(c)[first+i]};
+            int error=qs_evaluate(&check,12,&want);
+            assert(!!vectors[12].errors[i]==!!error);
+            if(!error) {
+                got=qs_vector_cell(&p,vectors,12,i);
+                assert(got.isnull==want.isnull);
+                if(!got.isnull) assert(got.value==want.value && got.scale==want.scale && got.dscale==want.dscale);
+            }
+            unsigned at=qs_selection(c)[first+i];
+            assert(vectors[10].errors[i]==(at%2 && at%5 && at%7==0?1:2));
         }
     }
     struct qs_cell out;
