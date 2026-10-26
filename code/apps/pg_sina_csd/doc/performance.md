@@ -752,3 +752,13 @@ Sort Source 的归并、流式分组及 Merge Join 等仍有串行或逐行处�
 相同边界用例仍核对全部56000组的 SUM、COUNT、COUNT(*)、AVG、MIN/MAX、NULL及显示精度：现在 NVM STORE 为0，根峰值为29012784/67108864字节（约27.7/64MiB），并验证 token/context 回收和取消。部分4MiB单聚合也能不spill；测试不再把“4MiB”直接等同于“必须spill”，所有用例都检查结果和实际根峰值，较宽的多聚合用例仍要求触发既有spill并完成重入。
 
 原生和8/16/64 CU共4项CTest通过；ASan/UBSan/LeakSanitizer的原生及8 CU检查通过，见 [组件记录](../../../../results/live-sort-budget/component-tests.log)、[内存检查](../../../../results/live-sort-budget/sanitizer-tests.log)。仅重编部署设备计划SO，PG、SNIA和FEMU不变，FDM保持64MiB。[六条相关标准查询](../../../../results/tpch.BCBxwl/timings.csv)（Q2/3/10/13/16/18）均冷启动、结果一致、完整卸载且快于host；未运行全量22条，也不将这轮回归延迟与历史样本直接相减解释为加速。
+
+## 当前版本22条完整卸载验收（2026-10-26）
+
+验收代码为 `6381445df`，设备计划SO包含 `c3e140b41` 的排序额度调整。运行现有 `tests/guest/tpch-test.sh`，SQL及EXPLAIN仅来自 `tests/guest/queries/`；每条host/CSD查询前均重启PG并清除Guest page cache，性能测量关闭profile。脚本要求计划顶层为CSD Custom Scan，且不存在PG子执行节点、InitPlan或SubPlan，避免仅出现一个CSD节点就误判完整卸载。EXPLAIN新增设备FDM容量，区分物理容量和查询实际分配。
+
+[完整原始结果](../../../../results/tpch.AEpBsL/timings.csv)的22条查询均逐字节匹配host、完整卸载且更快。逐个检查22份计划，设备资源均为8 CU、268435456字节workmem、67108864字节FDM；查询总预算为268435456字节，没有提高FDM。host总延迟55731.221ms，CSD为16095.009ms，总时间比3.463倍；单条时间比为1.661倍（Q11）至8.258倍（Q18）。这是一轮当前版本冷启动验收，不用于证明相对历史版本的单项优化收益，也不证明每个阶段满载8个CU。
+
+三层边界保持：PG选择和改写原生计划、提供文件映射并编排；SNIA适配通用请求与设备图；FEMU执行通用CSF、依赖、CU及内部I/O，不识别SQL节点。此次检查FEMU CSD及SNIA FEMU插件未发现SQL计划类型引用。
+
+性能门槛通过后仍保留实现边界：整树组合及部分算子间适配使用逐行接口，Sort Source归并和部分低内存回退串行，阻塞阶段仍需主机续交，字符串字典尚无spill。当前已有2048行有界扫描向量、局部状态/并行Combine及根查询总内存限制；不能用22条通过替代这些路径后续改造的验证。
