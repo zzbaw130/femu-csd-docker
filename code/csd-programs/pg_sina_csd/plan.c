@@ -110,6 +110,23 @@ struct group_value { struct qs_cell sum; uint64_t count; };
 struct compact_group { int64_t key; unsigned key_flags; struct group_value values[]; };
 /* Hash slots publish indices into dense records, not whole aggregate states. */
 struct group_entry { atomic_uint state; unsigned row; };
+/* One unfinished hash update per CU. Never retain a bucket lock across I/O.
+ * The input and old/new values stay here until the complete update commits. */
+struct group_update_state {
+    struct operator_state *owner;
+    struct group_entry *entry;
+    struct compact_group *group;
+    struct group_value before[QS_AGGS],after[QS_AGGS],input[QS_AGGS];
+    uint64_t hash;
+    unsigned node,aggregate,occupied;
+    int active,shared;
+};
+struct group_batch_input {
+    struct group_value values[QS_AGGS];
+    struct qs_cell keys[QS_KEYS];
+    unsigned end,aggregate;
+    int phase;
+};
 struct set_key { int64_t value; unsigned occupied; };
 /* A spilled set is immutable after initialization. Each consumer owns its
  * read cache and the active expression batch, while tokens/tail are shared. */
@@ -128,6 +145,7 @@ struct projection_batch {
     uint8_t needed[QS_EXPRS];
     unsigned scan,count,position,input_count;
     unsigned aggregate_position,aggregate_row;
+    struct group_batch_input *group_input;
     struct qs_cell *cells;
     const struct qs_cell *borrowed_cells;
     const uint32_t *borrowed_selection;
@@ -230,6 +248,7 @@ struct execution {
     struct qp_control *control;
     struct qs_dict *dictionary;
     struct qs_dictionary_text *text;
+    struct group_update_state *group_update;
     int64_t text_wait;
     unsigned output_column;
     int output_pending;
@@ -1689,7 +1708,8 @@ static int join_qual_init(struct execution *s,unsigned id,struct projection_batc
     if(b->plan.ncols) b->cells=cs_work_alloc(s->context,(size_t)b->plan.ncols*QS_VECTOR_ROWS*sizeof(*b->cells));
     b->vectors=cs_work_alloc(s->context,b->plan.nexprs*sizeof(*b->vectors));
     if((b->plan.ncols && !b->cells) || !b->vectors) {
-        cs_work_free(s->context,b->cells); cs_work_free(s->context,b->vectors); return -1;
+        cs_work_free(s->context,b->cells); cs_work_free(s->context,b->vectors);
+    cs_work_free(s->context,b->group_input); return -1;
     }
     return 0;
 }
@@ -2345,7 +2365,8 @@ static struct aggregate_input *aggregate_input(struct execution *s,struct operat
     return o->aggregate_input;
 }
 /* active: 1 initializes group keys, 2 compares this row with the group,
- * 3 evaluates/accumulates arguments. Only one of these can wait per row. */
+ * 3 evaluates/accumulates arguments, 4 evaluates hash-aggregate arguments.
+ * Only one of these can wait per row. */
 static int initialize_group_keys(struct execution *s,const struct qp_node *n,struct operator_state *o)
 {
     struct qs_eval flat,*e=&flat; struct aggregate_input *input=NULL;
@@ -2610,10 +2631,63 @@ static uint64_t group_values_hash(const struct qp_node *n,const struct qs_cell *
     return n->nkeys!=1 || n->expr.exprs[n->expr.keys[0]].type!=Q_INTEGER?group_hash(n,keys):
         mix_hash(keys[0].isnull?0:(uint64_t)keys[0].value);
 }
+static int group_text_extreme(const struct execution *s,const struct qp_node *n)
+{
+    if(!s->text) return 0;
+    for(unsigned a=0;a<n->expr.naggs;++a) {
+        const struct qs_agg *agg=&n->expr.aggs[a];
+        if((agg->kind==Q_MIN || agg->kind==Q_MAX) && n->expr.exprs[agg->expr].type==Q_STRING) return 1;
+    }
+    return 0;
+}
+static void group_update_lock(struct group_update_state *u)
+{
+    if(!u->shared) return;
+    unsigned state=atomic_load_explicit(&u->entry->state,memory_order_acquire);
+    for(;;) {
+        if(!(state&GROUP_LOCK) && atomic_compare_exchange_weak_explicit(&u->entry->state,&state,state|GROUP_LOCK,
+            memory_order_acquire,memory_order_relaxed)) return;
+        state=atomic_load_explicit(&u->entry->state,memory_order_acquire);
+    }
+}
+static void group_update_unlock(struct group_update_state *u)
+{ atomic_store_explicit(&u->entry->state,u->occupied,u->shared?memory_order_release:memory_order_relaxed); }
+static int group_update_continue(struct execution *s,unsigned id)
+{
+    struct group_update_state *u=s->group_update;
+    if(!u || !u->active || u->node!=id) return -5;
+    const struct qp_node *n=&s->plan->nodes[id];
+    size_t bytes=n->expr.naggs*sizeof(*u->before);
+    for(;;) {
+        for(;u->aggregate<n->expr.naggs;++u->aggregate) {
+            unsigned a=u->aggregate;
+            int status=group_update(s,n,a,&u->after[a],u->input[a].sum,u->input[a].count);
+            if(status) return status;
+        }
+        group_update_lock(u);
+        /* Another CU may have committed while this one loaded a string.
+         * Rebase on that complete state, rather than overwrite its update. */
+        if(memcmp(u->before,u->group->values,bytes)) {
+            memcpy(u->before,u->group->values,bytes); memcpy(u->after,u->before,bytes);
+            u->aggregate=0; group_update_unlock(u); continue;
+        }
+        memcpy(u->group->values,u->after,bytes); group_update_unlock(u);
+        u->active=0; return 1;
+    }
+}
 static int group_sink_hashed_values(struct execution *s,unsigned id,struct operator_state *o,
     const struct qs_cell *keys,const struct group_value *values,int shared,uint64_t hash)
 {
     const struct qp_node *n=&s->plan->nodes[id];
+    int paged=group_text_extreme(s,n);
+    if(paged) {
+        if(!s->group_update) s->group_update=cs_work_calloc(s->context,1,sizeof(*s->group_update));
+        if(!s->group_update) return -4;
+        if(s->group_update->active) {
+            if(s->group_update->owner!=o || s->group_update->hash!=hash) return -5;
+            return group_update_continue(s,id);
+        }
+    }
     int wide=n->nkeys!=1 || n->expr.exprs[n->expr.keys[0]].type!=Q_INTEGER;
     struct qs_cell key=keys[0];
     if(!wide && !key.isnull && (key.scale || key.value<INT64_MIN || key.value>INT64_MAX)) return -5;
@@ -2649,7 +2723,7 @@ retry_bucket:
         if(!equal) continue;
         /* A partition owns matching values; new buckets still require
          * publication because probes from other partitions can collide. */
-        if(shared && (!old || shared==GROUP_SHARED)) {
+        if(shared && (!old || shared==GROUP_SHARED || paged)) {
             if(state&GROUP_LOCK) goto retry_bucket;
             if(!atomic_compare_exchange_weak_explicit(&entry->state,&state,state|GROUP_LOCK,
                 memory_order_acquire,memory_order_relaxed)) goto retry_bucket;
@@ -2673,6 +2747,15 @@ retry_bucket:
                 for(unsigned k=0;k<n->nkeys;++k) key_values[k]=keys[k].isnull?0:(int64_t)keys[k].value;
             } else if(wide) memcpy(g->values+n->expr.naggs,keys,n->nkeys*sizeof(*keys));
         }
+        if(paged) {
+            struct group_update_state *u=s->group_update;
+            u->owner=o; u->entry=entry; u->group=g; u->node=id; u->hash=hash;
+            u->shared=shared; u->occupied=occupied; u->aggregate=0; u->active=1;
+            size_t bytes=n->expr.naggs*sizeof(*values);
+            memcpy(u->before,g->values,bytes); memcpy(u->after,g->values,bytes); memcpy(u->input,values,bytes);
+            group_update_unlock(u);
+            return group_update_continue(s,id);
+        }
         int status=0;
         for(unsigned a=0;a<n->expr.naggs && !status;++a)
             status=group_update(s,n,a,&g->values[a],values[a].sum,values[a].count);
@@ -2695,15 +2778,44 @@ static struct operator_state *group_worker_local(struct execution *s,unsigned id
 static int group_worker_values(struct execution *s,unsigned id,struct operator_state *o,
     const struct qs_cell *keys,const struct group_value *values,int shared,uint64_t hash)
 {
+    if(s->group_update && s->group_update->active) return group_update_continue(s,id);
     struct operator_state *local=shared?group_worker_local(s,id):NULL;
     if(local) {
         int added=group_sink_hashed_values(s,id,local,keys,values,GROUP_LOCAL,hash); if(added) return added;
     }
     return group_sink_hashed_values(s,id,o,keys,values,shared,hash);
 }
+static int group_sink_row_paged(struct execution *s,unsigned id,struct operator_state *o,
+    const struct qs_cell *row,int shared)
+{
+    const struct qp_node *n=&s->plan->nodes[id];
+    struct aggregate_input *input=aggregate_input(s,&s->nodes[id]); if(!input) return -4;
+    if(s->group_update && s->group_update->active) {
+        int status=group_update_continue(s,id); if(status>=0) input->active=0;
+        return status;
+    }
+    if(!input->active) {
+        input->active=4; input->argument=0;
+        init_eval(&input->evaluation,&n->expr,row,NULL);
+    }
+    if(input->active!=4) return -5;
+    for(;input->argument<n->expr.naggs;++input->argument) {
+        unsigned a=input->argument; input->values[a]=(struct qs_cell){.value=1};
+        if(n->expr.aggs[a].kind!=Q_COUNT_STAR &&
+           evaluate(s,&input->evaluation,n->expr.aggs[a].expr,&input->values[a])) return -5;
+    }
+    struct qs_cell keys[QS_KEYS]; struct group_value values[QS_AGGS];
+    for(unsigned k=0;k<n->nkeys;++k) keys[k]=row[n->left_keys[k]];
+    for(unsigned a=0;a<n->expr.naggs;++a)
+        values[a]=(struct group_value){.sum=input->values[a],.count=!input->values[a].isnull};
+    int status=group_worker_values(s,id,o,keys,values,shared,group_values_hash(n,keys));
+    if(status>=0) input->active=0;
+    return status;
+}
 static int group_sink_row(struct execution *s,unsigned id,struct operator_state *o,
     const struct qs_cell *row,int shared)
 {
+    if(s->text) return group_sink_row_paged(s,id,o,row,shared);
     const struct qp_node *n=&s->plan->nodes[id];
     struct qs_cell keys[QS_KEYS]; struct group_value values[QS_AGGS];
     for(unsigned k=0;k<n->nkeys;++k) keys[k]=row[n->left_keys[k]];
@@ -2763,44 +2875,55 @@ static int group_sink_vectors(struct execution *s,unsigned id,struct qs_result *
         if(r<b->position+16) group_prefetch(local,hashes[r],0);
     }
     while(b->position<b->count && out->rows<capacity) {
-        unsigned first=b->position,end=first;
+        unsigned first=b->position;
+        struct group_batch_input stack,*input=&stack; stack.phase=0;
+        if(group_text_extreme(s,n)) {
+            if(!b->group_input) b->group_input=cs_work_calloc(s->context,1,sizeof(*b->group_input));
+            if(!b->group_input) return -4;
+            input=b->group_input;
+        }
+        if(!input->phase) {
+            input->end=first; input->aggregate=0;
+            for(unsigned k=0;k<n->nkeys;++k) {
+                int index=b->group_keys[k]; if(b->vectors[index].errors[first]) return -5;
+                input->keys[k]=qs_vector_cell(&b->plan,b->vectors,index,first);
+            }
+            for(unsigned a=0;a<n->expr.naggs;++a) input->values[a]=(struct group_value){.sum={.isnull=1}};
+            input->phase=1;
+        }
         if(prefetch) {
             if(first+16<b->count) group_prefetch(local,hashes[first+16],0);
             if(first+4<b->count) group_prefetch(local,hashes[first+4],1);
         }
-        struct qs_cell keys[QS_KEYS];
-        for(unsigned k=0;k<n->nkeys;++k) {
-            int index=b->group_keys[k]; if(b->vectors[index].errors[first]) return -5;
-            keys[k]=qs_vector_cell(&b->plan,b->vectors,index,first);
-        }
-        /* Combine adjacent equal keys locally before touching the shared
-         * table. This needs only one partial state, not a table per CU. */
-        struct group_value partial[QS_AGGS];
-        for(unsigned a=0;a<n->expr.naggs;++a) partial[a]=(struct group_value){.sum={.isnull=1}};
-        do {
-            if(end!=first) {
+        /* Keep this adjacent-key partial until its hash update commits. */
+        if(input->phase==1) do {
+            unsigned end=input->end;
+            if(end!=first && !input->aggregate) {
                 struct qs_cell next[QS_KEYS];
                 for(unsigned k=0;k<n->nkeys;++k) {
                     int index=b->group_keys[k]; if(b->vectors[index].errors[end]) return -5;
                     next[k]=qs_vector_cell(&b->plan,b->vectors,index,end);
                 }
-                int equal=group_equal(s,n,keys,next); if(equal<0) return equal;
+                int equal=group_equal(s,n,input->keys,next); if(equal<0) return equal;
                 if(!equal) break;
             }
-            for(unsigned a=0;a<n->expr.naggs;++a) {
+            for(;input->aggregate<n->expr.naggs;++input->aggregate) {
+                unsigned a=input->aggregate;
                 struct qs_cell value={.value=1};
                 if(b->group_values[a]>=0) {
                     int index=b->group_values[a]; if(b->vectors[index].errors[end]) return -5;
                     value=qs_vector_cell(&b->plan,b->vectors,index,end);
                 }
-                int status=group_update(s,n,a,&partial[a],value,!value.isnull); if(status) return status;
+                int status=group_update(s,n,a,&input->values[a],value,!value.isnull); if(status) return status;
             }
-            ++end;
-        } while(combine && end<b->count && end-first<capacity-out->rows);
-        int added=group_worker_values(s,id,o,keys,partial,GROUP_SHARED,prefetch?hashes[first]:group_values_hash(n,keys));
+            input->aggregate=0; ++input->end;
+        } while(combine && input->end<b->count && input->end-first<capacity-out->rows);
+        input->phase=2;
+        int added=group_worker_values(s,id,o,input->keys,input->values,GROUP_SHARED,
+            prefetch?hashes[first]:group_values_hash(n,input->keys));
         if(added<0) return added;
         if(!added) {
-            for(unsigned r=first;r<end;++r) {
+            for(unsigned r=first;r<input->end;++r) {
                 struct qs_cell *row=(struct qs_cell *)out->data+(size_t)out->rows*b->plan.nout;
                 for(unsigned col=0;col<b->plan.nout;++col) {
                     int index=b->plan.outputs[col].index; if(b->vectors[index].errors[r]) return -5;
@@ -2809,7 +2932,7 @@ static int group_sink_vectors(struct execution *s,unsigned id,struct qs_result *
                 ++out->rows;
             }
         }
-        s->metrics.matched+=end-first; b->position=end;
+        s->metrics.matched+=input->end-first; b->position=input->end; input->phase=0;
     }
     return 0;
 }
@@ -3076,12 +3199,13 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
             groups[a]=(struct group_value){.sum=o->accum[a].sum,.count=o->accum[a].count};
         int equal=o->have_right?group_equal(s,n,o->right,o->keys):0; if(equal<0) return equal;
         if(equal) {
-            for(unsigned a=0;a<n->expr.naggs;++a) {
+            for(;o->aggregate_position<n->expr.naggs;++o->aggregate_position) {
+                unsigned a=o->aggregate_position;
                 int status=group_update(s,n,a,&groups[a],o->right[n->nkeys+2*a],o->right[n->nkeys+2*a+1].value);
                 if(status) return status;
                 o->accum[a].sum=groups[a].sum; o->accum[a].count=groups[a].count;
             }
-            o->have_right=0; continue;
+            o->aggregate_position=0; o->have_right=0; continue;
         }
         o->phase=0;
         int64_t result=group_result(s,n,groups,o->keys,row,raw); if(result) return result;
@@ -3725,9 +3849,11 @@ static int64_t group_combine_local(struct execution *s)
     if(s->group_shard) {
         const struct qp_node *n=&s->plan->nodes[id];
         int wide=n->nkeys!=1 || n->expr.exprs[n->expr.keys[0]].type!=Q_INTEGER;
-        for(unsigned i=0;i<global->group_local_count;++i) {
-            local=global->group_locals[i]; unsigned rows=atomic_load(local->group_count);
-            for(unsigned r=0;r<rows;++r) {
+        struct operator_state *cursor=&s->nodes[id];
+        for(;cursor->group_local_slot<global->group_local_count;++cursor->group_local_slot) {
+            local=global->group_locals[cursor->group_local_slot]; unsigned rows=atomic_load(local->group_count);
+            for(;cursor->group_local_row<rows;++cursor->group_local_row) {
+                unsigned r=cursor->group_local_row;
                 struct compact_group *g=group_at(local,r);
                 uint64_t hash=wide?(uint64_t)g->key:mix_hash(g->key_flags==2?0:(uint64_t)g->key);
                 unsigned workers=s->plan->workers;
@@ -3737,6 +3863,7 @@ static int64_t group_combine_local(struct execution *s)
                 int added=group_sink_hashed_values(s,id,global,keys,g->values,GROUP_PARTITION,hash); if(added<0) return added;
                 if(!added) { s->group_merge_full=true; return 0; }
             }
+            cursor->group_local_row=0;
         }
         return 0;
     }
@@ -3762,7 +3889,8 @@ static void parallel_group_combine(struct execution *s,unsigned id)
     for(unsigned w=0;w<s->plan->workers;++w) {
         struct execution *e=s->workers[w];
         e->group_shard=s->group_shard; e->group_merge_full=false;
-        e->group_combine=id+1; e->host_scan=false; e->metrics=(struct qs_metrics){0};
+        e->group_combine=id+1; e->host_scan=false;
+        e->nodes[id].group_local_slot=e->nodes[id].group_local_row=0; e->metrics=(struct qs_metrics){0};
         e->profile=(struct qs_profile){0}; e->local_profile_cpu=e->sink_ns=e->sink_rows=0;
         for(unsigned i=0;i<s->plan->count;++i) e->nodes[i].index_task.index_pages=e->nodes[i].index_task.index_tuples=0;
         *e->control=(struct qp_control){.state=(uintptr_t)e};
