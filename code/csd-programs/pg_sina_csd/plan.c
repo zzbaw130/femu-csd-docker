@@ -402,6 +402,20 @@ static int64_t sort_init(struct execution *s,struct sorted_rows *sort,const stru
     if(!sort->input || !sort->output) return -4;
     sort->plan.nout=input->nout; sort->plan.ordered_rows=2; sort->plan.limit=-1;
     sort->plan.work_mem_bytes=s->sort_limit;
+    /* The plan depth supplies a conservative fallback reserve, not a fixed
+     * partition of all memory. Borrow from actual free query memory when
+     * fewer sorts are live, retaining workspace for consumers and merge. */
+    struct execution *owner=s->owner?s->owner:s;
+    struct cs_work_context_stats memory;
+    if(cs_work_get_context_stats(owner->context,&memory)) return -4;
+    unsigned active=0;
+    for(unsigned i=0;i<owner->plan->count;++i) {
+        const struct operator_state *o=&owner->nodes[i];
+        active+=o->left_sort.initialized && !o->left_sort.drained;
+        active+=o->right_sort.initialized && !o->right_sort.drained;
+    }
+    size_t available=(memory.limit_bytes-memory.used_bytes)/(active+2);
+    if(available>sort->plan.work_mem_bytes) sort->plan.work_mem_bytes=available;
     sort->plan.work_mem_parent=(uintptr_t)s->context;
     memcpy(sort->plan.outputs,input->outputs,input->nout*sizeof(input->outputs[0]));
     for(unsigned i=0;i<keys;++i) sort->plan.order[sort->plan.norder++]=order?order[i]:(struct qs_order){.output=columns[i]};

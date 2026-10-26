@@ -742,3 +742,13 @@ Sort Source 的归并、流式分组及 Merge Join 等仍有串行或逐行处�
 [8 条相关标准查询](../../../../results/tpch.qlReZc/timings.csv)（Q2/9/13/16/17/18/20/22）均结果一致、完整卸载且快于 host。原生和8/16/64 CU CTest、ASan/UBSan/LeakSanitizer 的原生及8 CU检查通过。新增三 CU 分离键集合验证局部表并集扩容、NULL、SUM/COUNT/AVG精度和取消；八 CU 六聚合用例验证目标满后的重启、已有中间排序配额触发的 STORE/LOAD/FREE，以及所有 token/context 回收。该配额用例用于验证重入，不能作为根查询物理内存耗尽的证据。
 
 局部表复制的内存开销仍较大；Combine 仍需扫描局部状态，目标满时保留串行增长/spill。中间排序额度、字典 spill、其他逐行适配及最终22条验收仍未完成。
+
+## 排序初始额度使用当前空闲内存
+
+此前所有中间排序沿用 `查询预算 / (计划最坏排序深度 + 2)`。64MiB 的八 CU、六聚合边界用例只有约22.2MiB的部分状态，却被约21.3MiB的单排序额度迫使 STORE；上一阶段已明确它不能证明根查询物理内存耗尽。
+
+设备计划执行器现在创建排序时读取根查询实际空闲内存、统计已初始化而未结束的排序，采用 `max(原保底额度, 当前空闲 / (活动排序数 + 2))`。保留消费/归并工作区，实际总分配仍由原根 context 和全局池限制。没有新增参数、协议或分配器接口，也没有改变 Hash、索引及 CU 的原预留。它只改进初始额度选择，尚不是跨算子的统一内存回收与动态再分配。
+
+相同边界用例仍核对全部56000组的 SUM、COUNT、COUNT(*)、AVG、MIN/MAX、NULL及显示精度：现在 NVM STORE 为0，根峰值为29012784/67108864字节（约27.7/64MiB），并验证 token/context 回收和取消。部分4MiB单聚合也能不spill；测试不再把“4MiB”直接等同于“必须spill”，所有用例都检查结果和实际根峰值，较宽的多聚合用例仍要求触发既有spill并完成重入。
+
+原生和8/16/64 CU共4项CTest通过；ASan/UBSan/LeakSanitizer的原生及8 CU检查通过，见 [组件记录](../../../../results/live-sort-budget/component-tests.log)、[内存检查](../../../../results/live-sort-budget/sanitizer-tests.log)。仅重编部署设备计划SO，PG、SNIA和FEMU不变，FDM保持64MiB。[六条相关标准查询](../../../../results/tpch.BCBxwl/timings.csv)（Q2/3/10/13/16/18）均冷启动、结果一致、完整卸载且快于host；未运行全量22条，也不将这轮回归延迟与历史样本直接相减解释为加速。

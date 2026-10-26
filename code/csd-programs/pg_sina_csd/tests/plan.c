@@ -1160,10 +1160,10 @@ static int multi_order(const void *ap,const void *bp)
 enum group_test_mode { GROUP_SINGLE,GROUP_COUNTS,GROUP_NUMERIC_EXTREMES,GROUP_TEXT_EXTREMES };
 /* Every CU gets a disjoint set that fits its local table. Their union forces
  * coordinator growth: partial SUM/count must survive that boundary. */
-static void local_group_merge(function run,int spill_merge)
+static void local_group_merge(function run,int large_merge)
 {
-    const unsigned workers=spill_merge?8:3,per_worker=spill_merge?7000:800;
-    const unsigned rows=workers*per_worker*2,memory=(spill_merge?64U:4U)*1024*1024,naggs=spill_merge?6:4;
+    const unsigned workers=large_merge?8:3,per_worker=large_merge?7000:800;
+    const unsigned rows=workers*per_worker*2,memory=(large_merge?64U:4U)*1024*1024,naggs=large_merge?6:4;
     size_t raw_bytes; unsigned char *raw=heap(rows,2,&raw_bytes);
     for(unsigned i=0;i<rows;++i) {
         unsigned key=i/(per_worker*2)*per_worker+i%per_worker;
@@ -1181,7 +1181,7 @@ static void local_group_merge(function run,int spill_merge)
     p->parallel_stride=p->scan_bytes+vector;
     size_t bytes=base+(workers-1)*p->parallel_stride;
     struct qp_node *agg=&p->nodes[0];
-    *agg=(struct qp_node){.kind=QP_AGGREGATE,.left=1,.right=-1,.hash=1,.nkeys=1,.estimated_groups=spill_merge?6000:700};
+    *agg=(struct qp_node){.kind=QP_AGGREGATE,.left=1,.right=-1,.hash=1,.nkeys=1,.estimated_groups=large_merge?6000:700};
     agg->expr=leaf->expr; agg->expr.nkeys=1; agg->expr.naggs=naggs; agg->expr.nout=naggs+1; agg->expr.nexprs=naggs+2;
     agg->expr.work_mem_bytes=memory; agg->expr.keys[0]=0;
     const unsigned kinds[]={Q_SUM,Q_COUNT,Q_COUNT_STAR,Q_AVG,Q_MIN,Q_MAX};
@@ -1241,14 +1241,18 @@ static void local_group_merge(function run,int spill_merge)
                 assert(!qs_average((struct qs_cell){.value=sum},n,&expected));
                 assert(!qs_compare(v[4],expected,&cmp) && !cmp && v[4].dscale==expected.dscale);
             }
-            if(spill_merge) {
+            if(large_merge) {
                 assert(v[5].isnull==!n && v[6].isnull==!n);
                 if(n) assert(v[5].value==minimum && v[6].value==maximum);
             }
         }
     }
     assert(count==workers*per_worker && out->metrics.work_peak<=memory);
-    if(spill_merge) assert(spill.stores);
+    if(large_merge) {
+        assert(!spill.stores);
+        printf("PASS local merge: %u groups, peak=%llu/%u bytes, no NVM stores\n",
+            count,(unsigned long long)out->metrics.work_peak,memory);
+    }
     for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i]);
     assert(!pthread_mutex_destroy(&spill.mutex));
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
@@ -1590,8 +1594,11 @@ static void multiple_group_aggregates(function run,unsigned memory,unsigned kind
         assert(p->pipelines[2].sink_rows && p->pipelines[2].sink_ns);
         assert(p->pipelines[2].sink_ns<=p->pipelines[2].worker_ns);
     }
-    assert(seen==groups && (memory==4?spill.count>0:spill.count==0));
-    if(counts && workers) assert(out->metrics.work_peak && out->metrics.work_peak<=(uint64_t)memory*1024*1024);
+    assert(seen==groups && out->metrics.work_peak && out->metrics.work_peak<=(uint64_t)memory*1024*1024);
+    if(memory>=64) assert(!spill.count);
+    /* A single aggregate can now fit without spilling at 4 MiB. Wider
+     * partial states still exceed that budget and exercise NVM reentry. */
+    if(memory==4 && counts) assert(spill.count);
     for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i]);
     assert(!pthread_mutex_destroy(&spill.mutex));
     free(controls); free(spill.tokens); free(raw); free(expected); free(p); free(arena); free(io); free(out);
