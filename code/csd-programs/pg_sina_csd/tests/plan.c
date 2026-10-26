@@ -369,7 +369,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         if(direct && g->estimated_groups<QP_VECTOR_ROWS) g->estimated_groups=QP_VECTOR_ROWS;
         if(parallel==TEST_BUILD_GROUP_HAVING) {
             g->expr.nexprs=5; g->expr.predicate=4;
-            g->expr.exprs[3]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=100};
+            g->expr.exprs[3]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=20003};
             g->expr.exprs[4]=(struct qs_expr){.op=Q_LT,.type=Q_BOOLEAN,.left=0,.right=3};
         }
     }
@@ -551,7 +551,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         /* Probe every grouped key: missing/duplicate Source ranges must
          * change the answer, including across shared Hash resize waves. */
         unsigned common=rows<right_rows?rows:right_rows;
-        if(parallel==TEST_BUILD_GROUP_HAVING && common>100) common=100;
+        if(parallel==TEST_BUILD_GROUP_HAVING && common>20003) common=20003;
         counts[0]=common-(common+16)/17;
     }
     if(parallel==TEST_GROUP_SOURCE) for(unsigned l=0;l<rows;++l) {
@@ -681,6 +681,13 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
          * the shared sink; none should fall back to coordinator insertion. */
         if(parallel==TEST_BUILD_GROUP_SOURCE || (direct && right_rows>=QP_VECTOR_ROWS))
             assert(plan->pipelines[j->right].sink_rows==right_rows-(right_rows+16)/17+1);
+        /* HAVING prevents use of the resident group's exact count. The PG
+         * estimate still avoids coordinator insertions while consuming the
+         * filtered Source, without counting rejected/NULL groups as output. */
+        if(parallel==TEST_BUILD_GROUP_HAVING) {
+            unsigned kept=right_rows<20003?right_rows:20003;
+            assert(plan->pipelines[j->right].sink_rows==kept-(kept+16)/17);
+        }
         if(direct && right_rows<QP_VECTOR_ROWS)
             /* Its local-table Combine can use CUs; the small resident Source
              * itself must not launch another parallel Hash Build stage. */

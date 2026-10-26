@@ -2986,15 +2986,15 @@ restart:
             if(p->nodes[i].kind==QP_JOIN && p->nodes[i].right==(int)root &&
                s->nodes[i].hash_data && !s->nodes[i].hash_phase && !s->nodes[i].hash_fallback)
                 hash_sink=i+1;
-        /* The blocking child has now finished. Like DuckDB's pointer-table
-         * allocation from Count(), size an empty build from its actual rows,
-         * rather than stopping CU waves to grow the original 128-row table.
-         * Only unfiltered projections preserve the resident group count. */
+        /* Build dependencies are now ready. Size the empty parent from PG's
+         * output estimate, or the exact group count when preserved, instead
+         * of stopping CU waves to grow the original 128-row table. DuckDB
+         * sizes its pointer table from Count() after collecting build rows;
+         * our streaming sink retains growth/spill for an underestimated size. */
         int counted=source;
         for(int id=root;id!=source;id=p->nodes[id].left)
             if(p->nodes[id].kind!=QP_PROJECT || p->nodes[id].expr.predicate>=0) { counted=-1; break; }
-        if(hash_sink && counted>=0 && p->nodes[source].kind==QP_AGGREGATE &&
-           p->nodes[source].expr.predicate<0 && s->partition_join<0) {
+        if(hash_sink && s->partition_join<0) {
             struct operator_state *o=&s->nodes[hash_sink-1];
             struct cs_work_context_stats m;
             if(cs_work_get_context_stats(s->context,&m)) return -4;
@@ -3002,7 +3002,10 @@ restart:
             size_t available=m.limit_bytes-m.used_bytes;
             available=available>reserve?available-reserve:0;
             size_t stride=hash_row_bytes(&p->nodes[root].expr)+3*sizeof(uint32_t);
-            unsigned rows=atomic_load(s->nodes[source].group_count),capacity=o->hash_capacity;
+            uint64_t rows=p->nodes[root].estimated_rows;
+            if(counted>=0 && p->nodes[source].kind==QP_AGGREGATE && p->nodes[source].expr.predicate<0)
+                rows=atomic_load(s->nodes[source].group_count);
+            unsigned capacity=o->hash_capacity;
             while(capacity<=rows && capacity<UINT_MAX/4 && (size_t)capacity*2*stride<=available) capacity*=2;
             if(!o->hash_rows && capacity>o->hash_capacity) {
                 void *data=cs_work_alloc(s->context,(size_t)capacity*stride);
