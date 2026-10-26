@@ -41,6 +41,12 @@ endforeach()
 add_csd_program(pg-sina-plan plan.c scan.c sort.c index_scan.c filter.c dictionary.c)
 target_include_directories(pg-sina-plan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
 if(BUILD_TESTING)
+    add_executable(pg-sina-scalar-dictionary-test tests/scalar_dictionary.c scan.c sort.c index_scan.c filter.c dictionary.c)
+    target_include_directories(pg-sina-scalar-dictionary-test PRIVATE "${CSD_FEMU_INCLUDE}" "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
+    target_compile_options(pg-sina-scalar-dictionary-test PRIVATE -UNDEBUG)
+    target_link_libraries(pg-sina-scalar-dictionary-test PRIVATE cs-workmem)
+    add_test(NAME pgSinaDictionaryScalarOutput COMMAND pg-sina-scalar-dictionary-test)
     add_executable(pg-sina-dictionary-test tests/dictionary.c dictionary.c scan.c)
     target_include_directories(pg-sina-dictionary-test PRIVATE "${CSD_FEMU_INCLUDE}" "${CMAKE_CURRENT_SOURCE_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")

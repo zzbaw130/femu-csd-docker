@@ -95,6 +95,7 @@ struct external_hash {
 struct pending_projection {
     struct qs_cell input[QS_COLS],aggregates[QS_AGGS];
     int has_input,has_aggregates,filtered,inline_only;
+    struct qs_eval evaluation; /* Completed subexpressions survive dictionary I/O. */
 };
 struct accumulator { struct qs_cell sum,extreme,last; uint64_t count; int has_last; };
 /* sum holds the total for SUM/AVG, or the selected value for MIN/MAX. */
@@ -218,6 +219,10 @@ struct execution {
     struct qp_plan *plan;
     struct qp_control *control;
     struct qs_dict *dictionary;
+    struct qs_dictionary_text *text;
+    int64_t text_wait;
+    unsigned output_column;
+    int output_pending;
     struct operator_state *nodes;
     struct qs_cell params[QP_PARAMS];
     unsigned char *arena;
@@ -418,6 +423,28 @@ static int inset_vectors(struct qs_vector_input *input,unsigned index,const uint
     }
     return 0;
 }
+/* Both scalar expressions and final output release borrowed bytes after
+ * completing their operation. A wait retains the same operands and memo. */
+static int text_status(struct execution *s,int64_t status)
+{
+    if(status>0) { s->text_wait=status; s->expression_wait=1; }
+    return status?-3:0;
+}
+static int text_get(struct execution *s,unsigned id,const char **bytes,unsigned *length)
+{
+    if(!s->text) return qs_dict_get(s->dictionary,id,bytes,length);
+    return text_status(s,qs_dictionary_text_get(s->text,id,bytes,length,s->io));
+}
+static int text_insert(struct execution *s,const char *bytes,unsigned length,unsigned *id)
+{
+    if(!s->text) {
+        int value=qs_dict_insert(s->dictionary,bytes,length); if(value<0) return -3;
+        *id=value; return 0;
+    }
+    return text_status(s,qs_dictionary_text_insert(s->text,bytes,length,id,s->io));
+}
+static int text_release(struct execution *s)
+{ return s->text?qs_dictionary_text_release(s->text):0; }
 static int evaluate(struct execution *s,struct qs_eval *e,int index,struct qs_cell *out)
 {
     if(index<0 || (unsigned)index>=e->plan->nexprs) return -1;
@@ -436,7 +463,7 @@ static int evaluate(struct execution *s,struct qs_eval *e,int index,struct qs_ce
     }
     else if(x->op==Q_CONST && x->type==Q_STRING && !x->isnull) {
         const struct qs_string *literal=&e->plan->strings[x->constant];
-        int id=qs_dict_insert(s->dictionary,literal->bytes,literal->length); if(id<0) return -3;
+        unsigned id; if(text_insert(s,literal->bytes,literal->length,&id) || text_release(s)) return -3;
         v.value=id;
     } else if(x->op==Q_COLUMN || x->op==Q_CONST || x->op==Q_AGGREF) return qs_evaluate(e,index,out);
     else {
@@ -457,12 +484,12 @@ static int evaluate(struct execution *s,struct qs_eval *e,int index,struct qs_ce
                (x->op>=Q_EQ && x->op<=Q_GE && e->plan->exprs[x->left].type==Q_STRING)) {
                 if(!v.isnull) {
                     const char *left,*right; unsigned ln,rn;
-                    if(qs_dict_get(s->dictionary,(unsigned)a.value,&left,&ln)) return -3;
                     if(x->op==QP_SUBSTRING) {
                         struct qs_cell length; if(evaluate(s,e,x->otherwise,&length)) return -5;
                         if(length.isnull) v.isnull=1;
                         else {
                             if(length.value<0 || b.value<INT_MIN || b.value>INT_MAX || length.value>INT_MAX) return -5;
+                            if(text_get(s,(unsigned)a.value,&left,&ln)) return -3;
                             int64_t begin=b.value-1,end=begin+length.value;
                             if(begin<0) begin=0;
                             if(end<begin) end=begin;
@@ -470,17 +497,19 @@ static int evaluate(struct execution *s,struct qs_eval *e,int index,struct qs_ce
                             while(first<ln && character<begin) { first+=qs_text_character(left+first,ln-first); ++character; }
                             last=first;
                             while(last<ln && character<end) { last+=qs_text_character(left+last,ln-last); ++character; }
-                            int id=qs_dict_insert(s->dictionary,left+first,last-first); if(id<0) return -3;
+                            unsigned id; if(text_insert(s,left+first,last-first,&id)) return -3;
                             v.value=id;
                         }
                     } else {
-                        if(qs_dict_get(s->dictionary,(unsigned)b.value,&right,&rn)) return -3;
+                        if(text_get(s,(unsigned)a.value,&left,&ln) ||
+                           text_get(s,(unsigned)b.value,&right,&rn)) return -3;
                         if(x->op==QP_LIKE) { int match=qs_text_like(right,rn,left,ln); if(match<0) return -5; v.value=match; }
                         else {
                             int cmp=memcmp(left,right,ln<rn?ln:rn); if(!cmp) cmp=(ln>rn)-(ln<rn);
                             v.value=x->op==Q_EQ?cmp==0:x->op==Q_NE?cmp!=0:x->op==Q_LT?cmp<0:x->op==Q_LE?cmp<=0:x->op==Q_GT?cmp>0:cmp>=0;
                         }
                     }
+                    if(text_release(s)) return -3;
                 }
             } else return qs_evaluate(e,index,out);
         }
@@ -488,19 +517,19 @@ static int evaluate(struct execution *s,struct qs_eval *e,int index,struct qs_ce
     e->valid[index]=1; e->cells[index]=v; *out=v; return 0;
 }
 static int project_filtered_impl(struct execution *s,const struct qp_node *n,const struct qs_cell *input,
-    const struct qs_cell *aggregates,struct qs_cell *row,int filtered)
+    const struct qs_cell *aggregates,struct qs_cell *row,int filtered,struct qs_eval *e)
 {
-    struct qs_eval e; struct qs_cell keep; int initialized=0;
+    struct qs_cell keep;
     if(!filtered && n->expr.predicate>=0) {
-        init_eval(&e,&n->expr,input,aggregates); initialized=1;
-        if(evaluate(s,&e,n->expr.predicate,&keep)) return -5;
+        if(!e->plan) init_eval(e,&n->expr,input,aggregates);
+        if(evaluate(s,e,n->expr.predicate,&keep)) return -5;
         if(keep.isnull || !keep.value) return 0;
     }
     for(unsigned i=0;i<n->expr.nout;++i) {
         int index=n->expr.outputs[i].index; const struct qs_expr *x=&n->expr.exprs[index];
         if(input && x->op==Q_COLUMN) { row[i]=input[x->column]; continue; }
-        if(!initialized) { init_eval(&e,&n->expr,input,aggregates); initialized=1; }
-        if(evaluate(s,&e,index,&row[i])) return -5;
+        if(!e->plan) init_eval(e,&n->expr,input,aggregates);
+        if(evaluate(s,e,index,&row[i])) return -5;
     }
     return 1;
 }
@@ -512,7 +541,8 @@ static int project_filtered(struct execution *s,const struct qp_node *n,const st
     struct operator_state *o=&s->nodes[n-s->plan->nodes];
     struct pending_projection *p=o->project_retry;
     if(p) { input=p->has_input?p->input:NULL; aggregates=p->has_aggregates?p->aggregates:NULL; filtered=p->filtered; }
-    int count=project_filtered_impl(s,n,input,aggregates,row,filtered);
+    struct qs_eval e; if(p) e=p->evaluation; else e.plan=NULL;
+    int count=project_filtered_impl(s,n,input,aggregates,row,filtered,&e);
     if(count<0 && s->expression_wait) {
         if(!p) {
             p=cs_work_calloc(s->context,1,sizeof(*p));
@@ -524,6 +554,8 @@ static int project_filtered(struct execution *s,const struct qp_node *n,const st
             if(aggregates) memcpy(p->aggregates,aggregates,n->expr.naggs*sizeof(*aggregates));
             o->project_retry=p;
         }
+        p->evaluation=e; p->evaluation.tuple=p->has_input?p->input:NULL;
+        p->evaluation.aggregates=p->has_aggregates?p->aggregates:NULL;
     } else if(p) { cs_work_free(s->context,p); o->project_retry=NULL; }
     return count;
 }
@@ -4024,6 +4056,28 @@ static int64_t namespace_wait(struct execution *s)
     return csNeedNvmRead(count);
 }
 
+/* A partially exported row remains in the existing result AFDM. Only
+ * completed columns contain text; the remaining ones still contain IDs. */
+static int export_row(struct execution *s,const struct qs_plan *root,struct qs_cell *row,struct qs_result *out)
+{
+    for(unsigned col=s->output_column;col<root->nout;++col) {
+        if(!row[col].isnull && root->exprs[root->outputs[col].index].type==Q_STRING) {
+            const char *bytes; unsigned length;
+            if(text_get(s,(unsigned)row[col].value,&bytes,&length)) {
+                s->output_column=col; s->output_pending=1; return -3;
+            }
+            if(length>255 || out->str_bytes+length>QS_RESULT_STRING_BYTES) { text_release(s); return -3; }
+            if(length<=QS_STRING_MAX) qs_cell_set_string(&row[col],bytes,length);
+            else {
+                memcpy(out->str_data+out->str_bytes,bytes,length);
+                qs_cell_set_string_ref(&row[col],out->str_bytes,length); out->str_bytes+=length;
+            }
+            if(text_release(s)) return -3;
+        }
+    }
+    s->output_column=0; s->output_pending=0; return 0;
+}
+
 int64_t pg_sina_plan(struct femu_csd_args *a)
 {
     if(!a || a->numr!=5 || a->mr_len[0]<(long long)sizeof(struct qp_plan) ||
@@ -4216,18 +4270,11 @@ produce:
     }
     while(status>=0 && status!=QP_WAIT && status<=2 && out->rows<capacity) {
         struct qs_cell *row=worker?(struct qs_cell *)out->data+(size_t)out->rows*columns:out->data[out->rows].cells;
-        status=next_row(s,worker?(int)s->root:(int)plan->root,row);
+        status=s->output_pending?2:next_row(s,worker?(int)s->root:(int)plan->root,row);
         if(status==QP_WAIT || status<0 || status>2) break;
         if(!status) { out->finished=control->finished=1; break; }
         const struct qs_plan *root=&plan->nodes[plan->root].expr;
-        for(unsigned col=0;!worker && col<root->nout;++col) if(!row[col].isnull && root->exprs[root->outputs[col].index].type==Q_STRING) {
-            const char *bytes; unsigned length;
-            if(qs_dict_get(s->dictionary,(unsigned)row[col].value,&bytes,&length) || length>255 || out->str_bytes+length>QS_RESULT_STRING_BYTES) return -3;
-            if(length<=QS_STRING_MAX) qs_cell_set_string(&row[col],bytes,length);
-            else {
-                memcpy(out->str_data+out->str_bytes,bytes,length); qs_cell_set_string_ref(&row[col],out->str_bytes,length); out->str_bytes+=length;
-            }
-        }
+        if(!worker && export_row(s,root,row,out)) { status=-3; break; }
         ++out->rows;
     }
 produced:
