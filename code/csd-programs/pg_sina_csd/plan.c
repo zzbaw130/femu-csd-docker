@@ -112,6 +112,8 @@ struct projection_batch {
     struct { unsigned node; int expression; } filters[QP_NODES];
     unsigned nfilters;
 };
+static int projection_pending(const struct projection_batch *b)
+{ return b && (b->position<b->count || b->input_count || b->error); }
 struct hash_probe_batch {
     uint32_t matches[QS_VECTOR_ROWS];
     uint8_t errors[QS_VECTOR_ROWS];
@@ -141,6 +143,9 @@ struct operator_state {
     struct qs_plan *scan_filter;
     int scan_filter_checked,projection_checked;
     struct projection_batch *projection;
+    struct projection_batch *source_projection;
+    int source_checked;
+    unsigned projection_deferred,source_deferred;
     int phase, have_left, have_right, input_done, group_ready, matched, finished;
     unsigned merge_ordered; /* left/right input order verified; bit 2 marks checked. */
     struct merge_qual_batch *merge_qual;
@@ -222,8 +227,8 @@ static size_t input_offset(const struct execution *s,const struct qp_node *n)
 static size_t vector_offset(const struct execution *s,const struct qp_node *n)
 { return s->worker>1?n->parallel_vector+(s->worker-2)*s->plan->parallel_stride:n->vector_offset; }
 static int64_t parallel_next(struct execution *,unsigned,struct qs_cell *);
-static int projection_init(struct execution *,unsigned);
-static int64_t projection_next(struct execution *,unsigned,struct qs_cell *);
+static int projection_init(struct execution *,unsigned,int);
+static int64_t projection_next(struct execution *,unsigned,struct qs_cell *,int);
 static int64_t projection_group_fill(struct execution *,struct projection_batch *);
 static int aggregate_sink_vectors(struct execution *,unsigned);
 static int64_t timed_call(struct execution *s,int64_t (*call)(struct femu_csd_args *),struct femu_csd_args *a,unsigned op)
@@ -1504,12 +1509,17 @@ scalar:
     hash_load(o->right,o->hash_data+(size_t)first*stride,&right->expr);
     return 3;
 }
-static int projection_init(struct execution *s,unsigned id)
+static int projection_init(struct execution *s,unsigned id,int source)
 {
-    struct operator_state *o=&s->nodes[id]; if(o->projection_checked) return 0;
-    o->projection_checked=1;
+    struct operator_state *o=&s->nodes[id];
+    struct projection_batch **slot=source?&o->source_projection:&o->projection;
+    int *checked=source?&o->source_checked:&o->projection_checked;
+    unsigned *deferred=source?&o->source_deferred:&o->projection_deferred;
+    if(*slot || (*checked && (!*deferred || s->plan->nodes[*deferred-1].parallel ||
+        projection_pending(s->nodes[*deferred-1].source_projection)))) return 0;
+    *checked=1; *deferred=0;
     const struct qp_node *root=&s->plan->nodes[id];
-    int aggregate=root->kind==QP_AGGREGATE && !(s->worker && s->source_node==(int)id);
+    int aggregate=root->kind==QP_AGGREGATE && !source;
     if(aggregate && (root->distinct || root->distinct_aggs || root->left<0 ||
         (root->nkeys && ((!root->hash && !root->sorted_input) || !qp_hash_aggregate_supported(root))))) return 0;
     int grouped=aggregate && root->nkeys;
@@ -1517,17 +1527,22 @@ static int projection_init(struct execution *s,unsigned id)
     unsigned projections[QP_NODES],nprojections=0;
     while(s->plan->nodes[scan].kind==QP_PROJECT) {
         const struct qp_node *n=&s->plan->nodes[scan];
-        if(n->left<0 || (!s->worker && s->plan->workers>1 && n->parallel)) return 0;
+        if(n->left<0) return 0;
+        if(!s->worker && s->plan->workers>1 && n->parallel) { *deferred=scan+1; return 0; }
         projections[nprojections++]=scan;
         scan=n->left;
     }
     const struct qp_node *leaf=&s->plan->nodes[scan];
-    int group_source=s->worker && s->source_node==scan && leaf->kind==QP_AGGREGATE &&
-        s->owner->partition_join<0 && s->owner->nodes[scan].group_phase==3;
+    int group_source=leaf->kind==QP_AGGREGATE && (!s->worker || (s->source_node==scan &&
+        s->owner->partition_join<0 && s->owner->nodes[scan].group_phase==3));
     int joined=leaf->kind==QP_INDEX_JOIN || leaf->kind==QP_JOIN;
     int sorted=leaf->kind==QP_SORT && leaf->left>=0 &&
         leaf->expr.nattrs==s->plan->nodes[leaf->left].expr.nout;
-    if((leaf->kind!=QP_SCAN && !joined && !sorted && !group_source) || (!s->worker && s->plan->workers>1 && leaf->parallel)) return 0;
+    if(leaf->kind!=QP_SCAN && !joined && !sorted && !group_source) return 0;
+    if(!s->worker && s->plan->workers>1 && leaf->parallel) { *deferred=scan+1; return 0; }
+    if(group_source && !s->worker && projection_pending(s->nodes[scan].source_projection)) {
+        *deferred=scan+1; return 0;
+    }
     if(!group_source && !joined && !sorted && leaf->expr.predicate>=0) {
         if(leaf->ordered_index) return 0;
         int status=scan_filter_init(s,&leaf->expr,&s->nodes[scan]); if(status) return status;
@@ -1593,7 +1608,7 @@ static int projection_init(struct execution *s,unsigned id)
     }
     if(b->plan.nexprs) b->vectors=cs_work_alloc(s->context,b->plan.nexprs*sizeof(*b->vectors));
     if(b->plan.nexprs && !b->vectors) { cs_work_free(s->context,b->cells); cs_work_free(s->context,b); return 0; }
-    o->projection=b; return 0;
+    *slot=b; return 0;
 }
 static void projection_append(struct projection_batch *b,const struct qs_cell *values)
 {
@@ -1745,26 +1760,30 @@ static int64_t projection_sort_fill(struct execution *s,struct projection_batch 
     sort->position+=consumed;
     return 2;
 }
-/* Return 3 only for an internal scalar fallback, before consuming input. */
-static int64_t projection_fill(struct execution *s,unsigned id)
+static void projection_clear(struct execution *s,struct projection_batch **slot)
 {
-    struct projection_batch *b=s->nodes[id].projection;
+    struct projection_batch *b=*slot; if(!b) return;
+    cs_work_free(s->context,b->cells); cs_work_free(s->context,b->vectors);
+    cs_work_free(s->context,b); *slot=NULL;
+}
+/* Return 3 only for an internal scalar fallback, before consuming input. */
+static int64_t projection_fill(struct execution *s,unsigned id,int source)
+{
+    struct projection_batch **slot=source?&s->nodes[id].source_projection:&s->nodes[id].projection;
+    struct projection_batch *b=*slot;
     while(b->position==b->count) {
         if(b->error) { s->control->error=b->error; s->control->error_node=b->error_node; return b->error; }
         int64_t status=b->group_source?projection_group_fill(s,b):b->sorted?projection_sort_fill(s,b):
             b->joined?projection_join_fill(s,b):scan_chunk_next(s,b->scan);
         if(status!=2) {
             if(!status || (b->joined && status==3)) {
-                cs_work_free(s->context,b->cells);
-                cs_work_free(s->context,b->vectors); cs_work_free(s->context,b);
-                s->nodes[id].projection=NULL;
+                projection_clear(s,slot);
             }
             return status;
         }
         /* Filter may have fallen back after exhausting its scratch budget. */
         if(!b->group_source && !b->joined && !b->sorted && s->plan->nodes[b->scan].expr.predicate>=0 && !s->nodes[b->scan].scan_filter) {
-            cs_work_free(s->context,b->vectors); cs_work_free(s->context,b);
-            s->nodes[id].projection=NULL; return 3;
+            projection_clear(s,slot); return 3;
         }
         if(!b->group_source && !b->joined && !b->sorted) {
             struct operator_state *scan=&s->nodes[b->scan];
@@ -1790,12 +1809,12 @@ static int64_t projection_fill(struct execution *s,unsigned id)
     }
     return 2;
 }
-static int64_t projection_next(struct execution *s,unsigned id,struct qs_cell *row)
+static int64_t projection_next(struct execution *s,unsigned id,struct qs_cell *row,int source)
 {
-    int64_t status=projection_fill(s,id);
+    int64_t status=projection_fill(s,id,source);
     if(status==3) return next_row_impl(s,id,row);
     if(status!=2) return status;
-    struct projection_batch *b=s->nodes[id].projection;
+    struct projection_batch *b=source?s->nodes[id].source_projection:s->nodes[id].projection;
     for(unsigned i=0;i<b->plan.nout;++i) {
         unsigned index=b->plan.outputs[i].index;
         if(b->vectors[index].errors[b->position]) return -5;
@@ -1808,7 +1827,8 @@ static int64_t projection_next(struct execution *s,unsigned id,struct qs_cell *r
  * A full table leaves the vector cursor for the existing growth/spill path. */
 static int hash_sink_vectors(struct execution *s,unsigned id)
 {
-    struct projection_batch *b=s->nodes[id].projection;
+    struct projection_batch *b=s->plan->nodes[id].kind==QP_AGGREGATE?
+        s->nodes[id].source_projection:s->nodes[id].projection;
     const struct qp_node *n=&s->plan->nodes[s->hash_sink-1];
     struct operator_state *o=&s->owner->nodes[s->hash_sink-1];
     const struct qs_plan *right=&s->plan->nodes[n->right].expr;
@@ -1854,25 +1874,26 @@ static int64_t hash_probe_input(struct execution *s,unsigned id,const uint32_t *
     const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
     o->hash_payload=0;
     const struct qp_node *left=&s->plan->nodes[n->left];
-    /* Aggregate projection state describes sink inputs, never final rows. */
-    int eligible=(left->kind==QP_SCAN || left->kind==QP_PROJECT || left->kind==QP_JOIN || left->kind==QP_INDEX_JOIN) &&
+    /* Aggregate Source columns are separate from its Sink input vectors. */
+    int source=left->kind==QP_AGGREGATE;
+    int eligible=(left->kind==QP_SCAN || left->kind==QP_PROJECT || left->kind==QP_JOIN || left->kind==QP_INDEX_JOIN || source) &&
         !o->external && s->source_node<0 && !(!s->worker && s->plan->workers>1 && left->parallel);
     if(eligible) {
-        int status=projection_init(s,n->left); if(status) return status;
-        struct projection_batch *b=s->nodes[n->left].projection;
+        int status=projection_init(s,n->left,source); if(status) return status;
+        struct projection_batch *b=source?s->nodes[n->left].source_projection:s->nodes[n->left].projection;
         if(b && !o->hash_probe) {
             o->hash_probe=cs_work_calloc(s->context,1,sizeof(*o->hash_probe));
             if(o->hash_probe) {
                 b->lazy_text=1;
                 const struct qp_node *source=&s->plan->nodes[b->scan];
-                if(!b->joined && !source->ordered_index && source->expr.predicate<0)
+                if(source->kind==QP_SCAN && !source->ordered_index && source->expr.predicate<0)
                     for(unsigned col=0;col<source->expr.nattrs;++col)
                         if(source->expr.cols[col].slot>=0 && source->expr.cols[col].type==Q_STRING)
                             s->nodes[b->scan].defer_strings=1;
             }
         }
         if(b && o->hash_probe) {
-            int64_t ready=projection_fill(s,n->left);
+            int64_t ready=projection_fill(s,n->left,source);
             if(ready!=2) {
                 if(ready!=3) {
                     if(!ready) { cs_work_free(s->context,o->hash_probe); o->hash_probe=NULL; }
@@ -1880,7 +1901,7 @@ static int64_t hash_probe_input(struct execution *s,unsigned id,const uint32_t *
                 }
                 cs_work_free(s->context,o->hash_probe); o->hash_probe=NULL;
             } else {
-                b=s->nodes[n->left].projection;
+                b=source?s->nodes[n->left].source_projection:s->nodes[n->left].projection;
                 struct hash_probe_batch *probe=o->hash_probe;
                 if(!b->position || !probe->ready) {
                     for(unsigned k=0;k<n->nkeys;++k) {
@@ -1935,7 +1956,9 @@ static int hash_left_cell(struct execution *s,unsigned id,unsigned col,struct qs
 {
     struct operator_state *o=&s->nodes[id];
     if(o->hash_payload&(1U<<col)) {
-        struct projection_batch *b=s->nodes[s->plan->nodes[id].left].projection;
+        unsigned left=s->plan->nodes[id].left;
+        struct projection_batch *b=s->plan->nodes[left].kind==QP_AGGREGATE?
+            s->nodes[left].source_projection:s->nodes[left].projection;
         unsigned r=b->position-1; int index=b->plan.outputs[col].index;
         const struct qs_vector *v=&b->vectors[index];
         if(v->errors[r]) return -5;
@@ -2009,6 +2032,7 @@ static int accumulate(struct execution *s,const struct qp_node *n,struct operato
     return 0;
 }
 static int64_t aggregate_next(struct execution *,unsigned,struct qs_cell *);
+static int64_t aggregate_next_impl(struct execution *,unsigned,struct qs_cell *,int);
 static int group_add(struct group_value *g,struct qs_cell v,uint64_t count,unsigned kind)
 {
     if(count && (kind==Q_SUM || kind==Q_AVG)) {
@@ -2076,13 +2100,17 @@ static int group_final_value(const struct qs_agg *agg,const struct group_value *
     return 0;
 }
 static int group_result(struct execution *s,const struct qp_node *n,const struct group_value *groups,
-    const struct qs_cell *keys,struct qs_cell *row)
+    const struct qs_cell *keys,struct qs_cell *row,int raw)
 {
     struct qs_cell input[QS_COLS],values[QS_AGGS];
     for(unsigned i=0;i<QS_COLS;++i) input[i]=(struct qs_cell){.isnull=1};
     for(unsigned k=0;k<n->nkeys;++k) input[n->left_keys[k]]=keys[k];
     for(unsigned a=0;a<n->expr.naggs;++a) {
         int status=group_final_value(&n->expr.aggs[a],&groups[a],&values[a]); if(status) return status;
+    }
+    if(raw) {
+        memcpy(row,keys,n->nkeys*sizeof(*row));
+        memcpy(row+n->nkeys,values,n->expr.naggs*sizeof(*row)); return 2;
     }
     int status=project(s,n,input,values,row);
     return status<0?status:status?2:0;
@@ -2099,30 +2127,42 @@ static const struct compact_group *group_source_next(struct execution *s,unsigne
     }
     return group_at(source,s->source_at++);
 }
-/* Group keys and finalized values form input columns for one expression DAG.
- * Workers claim immutable records; no projected row is passed between nodes. */
+/* Separate Source columns from the aggregate's input vectors. Read-only CU
+ * Sources claim records; serial/stream/spilled Sources advance their original
+ * group iterator. Retain partial batches while its I/O request is serviced. */
 static int64_t projection_group_fill(struct execution *s,struct projection_batch *b)
 {
     const struct qp_node *n=&s->plan->nodes[b->scan];
     if(b->error) { s->control->error=b->error; s->control->error_node=b->error_node; return b->error; }
-    b->count=b->position=0;
-    while(b->count<QS_VECTOR_ROWS) {
-        const struct compact_group *g=group_source_next(s,b->scan); if(!g) break;
-        struct qs_cell keys[QS_KEYS]; group_keys(n,&s->owner->nodes[b->scan],g,keys);
-        for(unsigned k=0;k<n->nkeys;++k) {
-            int slot=b->plan.cols[k].slot;
-            if(slot>=0) b->cells[(size_t)slot*QS_VECTOR_ROWS+b->count]=keys[k];
+    while(b->input_count<QS_VECTOR_ROWS) {
+        struct qs_cell values[QS_COLS]; int64_t status;
+        int previous=s->control->error; unsigned previous_node=s->control->error_node;
+        if(s->worker && s->source_node==(int)b->scan) {
+            const struct compact_group *g=group_source_next(s,b->scan);
+            status=g?2:0;
+            if(g) {
+                group_keys(n,&s->owner->nodes[b->scan],g,values);
+                for(unsigned a=0;a<n->expr.naggs;++a) {
+                    status=group_final_value(&n->expr.aggs[a],&g->values[a],&values[n->nkeys+a]);
+                    if(status) break;
+                    status=2;
+                }
+            }
+        } else status=s->nodes[b->scan].finished?0:aggregate_next_impl(s,b->scan,values,1);
+        if(status==QP_WAIT || status>2) return status;
+        if(status<0) {
+            b->error=status; b->error_node=s->control->error?s->control->error_node:b->scan;
+            s->control->error=previous; s->control->error_node=previous_node;
+            break;
         }
-        for(unsigned a=0;a<n->expr.naggs;++a) {
-            struct qs_cell value;
-            int status=group_final_value(&n->expr.aggs[a],&g->values[a],&value);
-            if(status) { b->error=status; b->error_node=b->scan; break; }
-            int slot=b->plan.cols[n->nkeys+a].slot;
-            if(slot>=0) b->cells[(size_t)slot*QS_VECTOR_ROWS+b->count]=value;
+        if(!status) { s->nodes[b->scan].finished=1; break; }
+        for(unsigned col=0;col<b->plan.nattrs;++col) {
+            int slot=b->plan.cols[col].slot;
+            if(slot>=0) b->cells[(size_t)slot*QS_VECTOR_ROWS+b->input_count]=values[col];
         }
-        if(b->error) break;
-        ++b->count;
+        ++b->input_count;
     }
+    b->count=b->input_count; b->input_count=b->position=0;
     if(!b->count) {
         if(b->error) { s->control->error=b->error; s->control->error_node=b->error_node; }
         return b->error;
@@ -2419,11 +2459,11 @@ static int group_input_pending(const struct execution *s,int id)
     if(n->kind==QP_MATERIALIZED) return 1;
     return group_input_pending(s,n->left) || group_input_pending(s,n->right);
 }
-static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct qs_cell *row,int prepare)
+static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct qs_cell *row,int prepare,int raw)
 {
     struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
     struct sorted_rows *sort=&o->left_sort;
-    if(!qp_hash_aggregate_supported(n)) { n->hash=0; return prepare?3:aggregate_next(s,id,row); }
+    if(!qp_hash_aggregate_supported(n)) { n->hash=0; return prepare?3:aggregate_next_impl(s,id,row,raw); }
     int wide=n->nkeys!=1 || n->expr.exprs[n->expr.keys[0]].type!=Q_INTEGER;
     if(!o->group_capacity) {
         /* Keep the insertion counter away from read-mostly capacity/stride
@@ -2431,7 +2471,7 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
          * query close; table resize does not move it or change its count. */
         if(!o->group_count) {
             void *storage=cs_work_alloc(s->context,128);
-            if(!storage) { n->hash=0; return prepare?3:aggregate_next(s,id,row); }
+            if(!storage) { n->hash=0; return prepare?3:aggregate_next_impl(s,id,row,raw); }
             o->group_count=(void *)(((uintptr_t)storage+63)&~(uintptr_t)63);
             atomic_init(o->group_count,0);
         }
@@ -2474,7 +2514,7 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
             if(capacity==128) break;
             capacity/=2;
         }
-        if(!o->groups) { n->hash=0; return prepare?3:aggregate_next(s,id,row); }
+        if(!o->groups) { n->hash=0; return prepare?3:aggregate_next_impl(s,id,row,raw); }
         o->group_capacity=capacity;
     }
     for(;;) {
@@ -2585,7 +2625,7 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
                 unsigned slot=o->group_flush++;
                 struct compact_group *g=group_at(o,slot);
                 struct qs_cell keys[QS_KEYS]; group_keys(n,o,g,keys);
-                int64_t result=group_result(s,n,g->values,keys,row); if(result) return result;
+                int64_t result=group_result(s,n,g->values,keys,row,raw); if(result) return result;
             }
             cs_work_free(s->context,o->groups); o->groups=NULL;
             cs_work_free(s->context,o->group_entries); o->group_entries=NULL; o->finished=1; return 0;
@@ -2621,16 +2661,16 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
             o->have_right=0; continue;
         }
         o->phase=0;
-        int64_t result=group_result(s,n,groups,o->keys,row); if(result) return result;
+        int64_t result=group_result(s,n,groups,o->keys,row,raw); if(result) return result;
     }
 }
-static int64_t hash_aggregate_next(struct execution *s,unsigned id,struct qs_cell *row)
+static int64_t hash_aggregate_next(struct execution *s,unsigned id,struct qs_cell *row,int raw)
 {
     /* Pure in-memory output is one call per group: leave it untimed. */
-    if(!s->profiling || s->nodes[id].group_phase==3) return hash_aggregate_next_impl(s,id,row,0);
+    if(!s->profiling || s->nodes[id].group_phase==3) return hash_aggregate_next_impl(s,id,row,0,raw);
     unsigned op=s->nodes[id].group_phase==2?QS_AGG_SOURCE:QS_AGG_SINK;
     struct blocking_timer timer=blocking_begin(s);
-    int64_t status=hash_aggregate_next_impl(s,id,row,0); blocking_end(s,op,timer); return status;
+    int64_t status=hash_aggregate_next_impl(s,id,row,0,raw); blocking_end(s,op,timer); return status;
 }
 /* Consume a contiguous key range from expression columns. The next group's
  * first row stays in the batch; the current accumulators survive I/O and
@@ -2639,7 +2679,7 @@ static int64_t stream_group_vectors(struct execution *s,unsigned id)
 {
     const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
     for(;;) {
-        int64_t status=projection_fill(s,id);
+        int64_t status=projection_fill(s,id,0);
         if(status!=2) {
             if(!status) { o->input_done=1; return o->phase?2:0; }
             return status;
@@ -2683,15 +2723,16 @@ static int64_t stream_group_vectors(struct execution *s,unsigned id)
         if(end<b->count) return 2;
     }
 }
-static int64_t aggregate_next(struct execution *s,unsigned id,struct qs_cell *row)
+static int64_t aggregate_next_impl(struct execution *s,unsigned id,struct qs_cell *row,int raw)
 {
     const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
-    if(n->hash) return hash_aggregate_next(s,id,row);
+    if(o->finished) return 0;
+    if(n->hash) return hash_aggregate_next(s,id,row,raw);
     if(n->nkeys && n->left>=0 && !n->sorted_input && !n->distinct && !o->phase && !o->emitted &&
        input_ordered(s->plan,n->left,n->nkeys,n->left_keys,NULL)) s->plan->nodes[id].sorted_input=1;
     if(n->nkeys && n->sorted_input && !n->distinct && !n->distinct_aggs && !o->input_done && !o->have_left &&
        n->left>=0 && !(!s->worker && s->plan->workers>1 && s->plan->nodes[n->left].parallel)) {
-        int status=projection_init(s,id); if(status) return status;
+        int status=projection_init(s,id,0); if(status) return status;
     }
     /* Initialize before starting the child pipeline: parallel workers combine
      * their local states here before the first (and only) output row. */
@@ -2700,9 +2741,9 @@ static int64_t aggregate_next(struct execution *s,unsigned id,struct qs_cell *ro
     }
     if(!n->nkeys && !n->distinct && !n->distinct_aggs && !o->input_done && !o->emitted && n->left>=0 &&
        !(!s->worker && s->plan->workers>1 && s->plan->nodes[n->left].parallel)) {
-        int64_t status=projection_init(s,id); if(status) return status;
+        int64_t status=projection_init(s,id,0); if(status) return status;
         while(o->projection) {
-            status=projection_fill(s,id);
+            status=projection_fill(s,id,0);
             if(!status) { o->input_done=1; break; }
             if(status==3) break; /* Existing scalar fallback retains its cursor. */
             if(status!=2) return status;
@@ -2760,10 +2801,16 @@ static int64_t aggregate_next(struct execution *s,unsigned id,struct qs_cell *ro
             values[i]=v;
         }
         o->phase=0; ++o->emitted;
+        if(raw) {
+            memcpy(row,o->keys,n->nkeys*sizeof(*row));
+            memcpy(row+n->nkeys,values,n->expr.naggs*sizeof(*row)); return 2;
+        }
         int count=project(s,n,o->first,values,row); if(count<0) return count;
         if(count) return 2;
     }
 }
+static int64_t aggregate_next(struct execution *s,unsigned id,struct qs_cell *row)
+{ return aggregate_next_impl(s,id,row,0); }
 
 /* Import the indexed side's expressions once, with columns referencing the
  * decoded match chunk (its first two slots are lookup key and source row). */
@@ -3079,12 +3126,12 @@ static int64_t next_row_impl(struct execution *s,unsigned id,struct qs_cell *row
     if(s->worker && (int)id==s->source_node) {
         if(n->kind==QP_AGGREGATE && s->owner->partition_join<0) {
             const struct operator_state *source=&s->owner->nodes[id];
-            int64_t status=projection_init(s,id); if(status) return status;
-            if(o->projection) return projection_next(s,id,row);
+            int64_t status=projection_init(s,id,1); if(status) return status;
+            if(o->source_projection) return projection_next(s,id,row,1);
             for(;;) {
                 const struct compact_group *g=group_source_next(s,id); if(!g) return 0;
                 struct qs_cell keys[QS_KEYS]; group_keys(n,source,g,keys);
-                status=group_result(s,n,g->values,keys,row); if(status) return status;
+                status=group_result(s,n,g->values,keys,row,0); if(status) return status;
             }
         }
         unsigned bytes=hash_row_bytes(&n->expr),block_rows=QS_SORT_IO_BYTES/bytes;
@@ -3098,16 +3145,22 @@ static int64_t next_row_impl(struct execution *s,unsigned id,struct qs_cell *row
         int64_t status=spool_row_bytes(s,&s->source,s->source_at,bytes,packed); if(status) return status;
         hash_load(row,packed,&n->expr); ++s->source_at; return 2;
     }
-    if(o->finished && (!o->projection || (o->projection->position==o->projection->count && !o->projection->error))) return 0;
+    if(o->finished && !projection_pending(o->projection) && !projection_pending(o->source_projection)) {
+        projection_clear(s,&o->projection); projection_clear(s,&o->source_projection); return 0;
+    }
     if(!s->worker && s->plan->workers>1 && n->parallel) return parallel_next(s,id,row);
     if(n->kind==QP_SCAN || n->kind==QP_SORT || (n->kind==QP_PROJECT && n->left>=0) || n->kind==QP_JOIN || n->kind==QP_INDEX_JOIN) {
-        int status=projection_init(s,id); if(status) return status;
-        if(o->projection) return projection_next(s,id,row);
+        int status=projection_init(s,id,0); if(status) return status;
+        if(o->projection) return projection_next(s,id,row,0);
     }
     if(n->kind==QP_SCAN) return scan_next(s,id,row);
     if(n->kind==QP_JOIN) return n->hash?hash_next(s,id,row):join_next(s,id,row);
     if(n->kind==QP_INDEX_JOIN) return index_next(s,id,row,NULL);
-    if(n->kind==QP_AGGREGATE) return aggregate_next(s,id,row);
+    if(n->kind==QP_AGGREGATE) {
+        int status=projection_init(s,id,1); if(status) return status;
+        if(o->source_projection) return projection_next(s,id,row,1);
+        return aggregate_next(s,id,row);
+    }
     if(n->kind==QP_PROJECT && n->left<0) {
         if(o->emitted++) return 0;
         int count=project(s,n,NULL,NULL,row);
@@ -3355,7 +3408,7 @@ restart:
             if(s->nodes[builds[i]].external && !s->nodes[builds[i]].external->direct) { s->partition_join=builds[i]; break; }
         if(p->nodes[source].kind==QP_AGGREGATE && s->partition_join<0) {
             struct blocking_timer timer={0}; if(s->profiling) timer=blocking_begin(s);
-            int64_t status=hash_aggregate_next_impl(s,source,NULL,1);
+            int64_t status=hash_aggregate_next_impl(s,source,NULL,1,0);
             if(s->profiling) blocking_end(s,QS_AGG_SINK,timer);
             if(status!=3) return status;
             if(s->nodes[source].group_phase!=3 || !s->nodes[source].groups) {
@@ -3770,16 +3823,16 @@ produce:
     /* A spilled-partition Source retains its original row cursor. Resident
      * groups can now expose finalized columns without reopening their input. */
     if(worker && s->hash_sink && (s->source_node!=(int)s->root || plan->nodes[s->root].kind==QP_AGGREGATE)) {
-        unsigned id=s->root;
-        status=projection_init(s,id); if(status<0) goto produced;
-        while(s->nodes[id].projection) {
-            status=projection_fill(s,id);
+        unsigned id=s->root; int source=plan->nodes[id].kind==QP_AGGREGATE;
+        status=projection_init(s,id,source); if(status<0) goto produced;
+        while(source?s->nodes[id].source_projection:s->nodes[id].projection) {
+            status=projection_fill(s,id,source);
             if(status!=2) {
                 if(!status) out->finished=control->finished=1;
                 if(status!=3) goto produced;
                 break;
             }
-            struct projection_batch *b=s->nodes[id].projection;
+            struct projection_batch *b=source?s->nodes[id].source_projection:s->nodes[id].projection;
             unsigned before=b->position;
             uint64_t tick=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
             status=hash_sink_vectors(s,id);
@@ -3793,9 +3846,9 @@ produce:
     }
     if(worker && s->group_sink) {
         unsigned id=s->group_sink-1;
-        status=projection_init(s,id); if(status<0) goto produced;
+        status=projection_init(s,id,0); if(status<0) goto produced;
         while(s->nodes[id].projection) {
-            status=projection_fill(s,id);
+            status=projection_fill(s,id,0);
             if(status!=2) {
                 if(!status) out->finished=control->finished=1;
                 if(status!=3) goto produced;
@@ -3816,9 +3869,9 @@ produce:
     }
     if(worker && s->aggregate_sink) {
         unsigned id=s->aggregate_sink-1;
-        status=projection_init(s,id); if(status<0) goto produced;
+        status=projection_init(s,id,0); if(status<0) goto produced;
         while(s->nodes[id].projection) {
-            status=projection_fill(s,id);
+            status=projection_fill(s,id,0);
             if(status!=2) {
                 if(!status) out->finished=control->finished=1;
                 if(status!=3) goto produced;

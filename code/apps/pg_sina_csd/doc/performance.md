@@ -846,3 +846,23 @@ host总延迟56740.096ms，CSD为15335.444ms，总时间比3.700倍；单条1.76
 真实设备开发检查只读已有冻结nation表，使用两个别名按region相等及nationkey小于匹配。临时SQL仅放Guest `/tmp`，执行完已删除，不创建表或另一套TPC-H SQL。关闭Hash/NestLoop/HashAggregate的连接选项仅用于这些开发检查，不写入持久配置。四份设备计划均实际使用Merge、顶层完整卸载，输出与host及独立计数预期一致，记录在[开发结果](../../../../results/merge-residual/)：每个region的INNER为10行，LEFT为11行且右侧非NULL计数10，SEMI为4行，ANTI为1行。该小数据检查只证明功能，不作为性能验收。
 
 默认选项下[标准Q2/Q13/Q21冷启动回归](../../../../results/tpch.ZBIAsy/timings.csv)均结果一致、完整卸载且快于host，CSD分别351.960/371.374/922.284ms。保持8 CU、256MiB workmem、64MiB FDM，只部署设备计划SO；未重复全量22条，也不宣称本次改动带来固定的查询延迟收益。流式分组最终逐组输出、spill Source与部分阻塞阶段续交仍待改造。
+
+## 串行、流式与spill聚合Source输出列批次
+
+参考DuckDB Hash Aggregate将Sink状态与Global/Local Source状态分开、Source返回DataChunk的组织方式，设备SQL程序现在分别保存聚合输入批次和输出批次。串行Hash、流式分组及spill后归并出的最终值，与原CU驻留Source共用至多256行的列输入；HAVING、输出表达式及相邻Projection复用已有向量DAG。直接Hash Probe和Hash Build选择聚合的输出批次，不引用其输入累加器。分组迭代和spill归并本身仍沿原游标推进，未改为并行归并。
+
+内部I/O等待保留未满批次；并行Source回退到串行后，先排空已有输出再允许父Projection直接读取最终值列，避免跳过已预取的组。结束标记不吞掉剩余输出或待报告错误，也不重新打开已结束的输入。列缓冲和向量均计入原查询workmem；无法导入表达式或分配失败仍保留原行接口，无新增PG、SNIA、固件接口或FDM。
+
+NativePlan及8/16/64 CU四项CTest、ASan/UBSan/LeakSanitizer原生与8CU两项通过。4MiB实际spill Source用例增加中间Projection，继续检查全量结果、重入及资源回收；原多键、NULL、AVG运行时精度、文本极值及流式分组用例通过。已部署设备计划SO，默认资源仍为8 CU、256MiB workmem、64MiB FDM。[规范查询冷启动回归](../../../../results/tpch.G7eavA/timings.csv)：
+
+| 查询 | host ms | CSD ms |
+| --- | ---: | ---: |
+| Q2 | 873.796 | 358.762 |
+| Q13 | 1540.938 | 400.653 |
+| Q17 | 4913.787 | 1005.188 |
+| Q18 | 7777.347 | 1173.752 |
+| Q20 | 3567.952 | 587.415 |
+
+五条均逐字节匹配、顶层CSD计划且没有PG子执行节点，并快于同轮host；10次测量均有独立冷启动标记。另以临时PGOPTIONS关闭hashjoin、nestloop、hashagg，仅用于开发检查规范Q13的实际Merge Join→流式Aggregate路径：[结果](../../../../results/tpch.xh9X7L/timings.csv)正确且完整卸载，host2535.057ms、CSD1627.360ms。该选项未写入配置，不替代默认验收。本轮未重跑完整22条，也未进行旧、新SO多轮对照，不将这些延迟当作本次改动的固定收益。
+
+字符串字典spill、排序及spill归并并行化和部分阻塞阶段主机续交仍未完成；本阶段补齐聚合输出的列批次接续，不代表整树所有边界均已向量化。

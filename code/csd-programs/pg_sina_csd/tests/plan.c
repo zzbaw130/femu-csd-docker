@@ -374,6 +374,13 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             g->expr.exprs[3]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=20003};
             g->expr.exprs[4]=(struct qs_expr){.op=Q_LT,.type=Q_BOOLEAN,.left=0,.right=3};
         }
+        if(parallel==TEST_GROUP_SOURCE_SPILL) {
+            /* A deferred projection must drain any existing Source output
+             * before switching to raw finalized columns after spill. */
+            plan->count=6; j->left=5;
+            plan->nodes[5]=(struct qp_node){.kind=QP_PROJECT,.left=4,.right=-1,.expr=plan->nodes[2].expr};
+            plan->nodes[5].expr.outputs[1].type_oid=20;
+        }
     }
     if(parallel==TEST_JOIN_QUAL) {
         j->expr.nexprs=8;

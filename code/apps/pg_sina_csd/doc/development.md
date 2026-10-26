@@ -1,5 +1,11 @@
 # 开发阶段与验证记录
 
+## 当前阶段：串行、流式与spill聚合输出列批次
+
+聚合节点分别保存输入累加批次和Source最终值批次，后者执行HAVING、输出表达式及相邻Projection；直接Hash消费者引用Source列。两类游标在设备SQL程序的查询workmem内接续，PG/SNIA/FEMU接口不变。I/O等待保留未满输出，串行回退先排空已预取结果；结束后不重开输入。4MiB实际spill用例增加Projection，检查切换时不遗漏分组及资源回收。
+
+NativePlan及8/16/64 CU四项、ASan/UBSan/LeakSanitizer原生及8CU两项通过。部署后规范Q2/Q13/Q17/Q18/Q20冷启动均正确、完整卸载且快于host，另以临时规划器选项验证规范Q13实际Merge与流式Aggregate路径。具体成绩及剩余边界见performance.md末节；本阶段未重复全量22条，不宣称归并已并行或固定延迟收益。
+
 > 以下旧阶段记录曾使用扩展目录的自建 SQL，其测试入口和 SQL 副本现已删除；不属于当前验收。当前只认 `tests/guest/queries/`，新规则和结果见文末。
 
 分支 pg_sina_csd_dev，基线 sina-femu-csd（f5a7df9dd）。每个可验收阶段单独提交。旧 pg_csd_dev 仅作实现参考，不移植其 Python 代理、AFDM 工作区或 FEMU SQL runtime。
