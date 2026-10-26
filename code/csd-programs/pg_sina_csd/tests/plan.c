@@ -682,7 +682,9 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         if(parallel==TEST_BUILD_GROUP_SOURCE || (direct && right_rows>=QP_VECTOR_ROWS))
             assert(plan->pipelines[j->right].sink_rows==right_rows-(right_rows+16)/17+1);
         if(direct && right_rows<QP_VECTOR_ROWS)
-            assert(!plan->nodes[j->right].parallel && !plan->pipelines[j->right].rounds);
+            /* Its local-table Combine can use CUs; the small resident Source
+             * itself must not launch another parallel Hash Build stage. */
+            assert(!plan->nodes[j->right].parallel && !plan->pipelines[j->right].sink_rows);
         if(parallel==TEST_HASH_GROUP) assert(plan->pipelines[1].sink_rows);
         uint64_t children=0;
         for(unsigned op=0;op<QS_OPERATORS;++op) if(op!=QS_JOIN_PROBE) children+=out->profile.operators[op].cpu_ns;
@@ -1156,6 +1158,105 @@ static int multi_order(const void *ap,const void *bp)
     return (a->b<b->b)-(a->b>b->b);
 }
 enum group_test_mode { GROUP_SINGLE,GROUP_COUNTS,GROUP_NUMERIC_EXTREMES,GROUP_TEXT_EXTREMES };
+/* Every CU gets a disjoint set that fits its local table. Their union forces
+ * coordinator growth: partial SUM/count must survive that boundary. */
+static void local_group_merge(function run,int spill_merge)
+{
+    const unsigned workers=spill_merge?8:3,per_worker=spill_merge?7000:800;
+    const unsigned rows=workers*per_worker*2,memory=(spill_merge?64U:4U)*1024*1024,naggs=spill_merge?6:4;
+    size_t raw_bytes; unsigned char *raw=heap(rows,2,&raw_bytes);
+    for(unsigned i=0;i<rows;++i) {
+        unsigned key=i/(per_worker*2)*per_worker+i%per_worker;
+        unsigned char *t=raw+(i/100)*QS_PAGE+QS_PAGE-(i%100+1)*40;
+        w32(t+24,key); if(key%37==0 || i%3==0) t[23]=1;
+    }
+    struct qp_plan *p=calloc(1,sizeof(*p)); assert(p);
+    p->count=2; p->workers=workers; p->scan_bytes=per_worker*2/100*QS_PAGE;
+    struct qp_node *leaf=&p->nodes[1]; scan(leaf); leaf->bytes=raw_bytes; leaf->parallel=1;
+    size_t config=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
+    size_t vector=(qs_chunk_bytes(QP_VECTOR_ROWS,2)+4095)&~(size_t)4095;
+    leaf->input_offset=config; leaf->vector_offset=config+p->scan_bytes;
+    size_t base=leaf->vector_offset+vector;
+    leaf->parallel_input=base; leaf->parallel_vector=base+p->scan_bytes;
+    p->parallel_stride=p->scan_bytes+vector;
+    size_t bytes=base+(workers-1)*p->parallel_stride;
+    struct qp_node *agg=&p->nodes[0];
+    *agg=(struct qp_node){.kind=QP_AGGREGATE,.left=1,.right=-1,.hash=1,.nkeys=1,.estimated_groups=spill_merge?6000:700};
+    agg->expr=leaf->expr; agg->expr.nkeys=1; agg->expr.naggs=naggs; agg->expr.nout=naggs+1; agg->expr.nexprs=naggs+2;
+    agg->expr.work_mem_bytes=memory; agg->expr.keys[0]=0;
+    const unsigned kinds[]={Q_SUM,Q_COUNT,Q_COUNT_STAR,Q_AVG,Q_MIN,Q_MAX};
+    for(unsigned i=0;i<naggs;++i) {
+        agg->expr.aggs[i]=(struct qs_agg){.kind=kinds[i],.expr=i==2?-1:1};
+        agg->expr.exprs[i+2]=(struct qs_expr){.op=Q_AGGREF,.column=i,.type=i==3?Q_DECIMAL:Q_INTEGER};
+        agg->expr.outputs[i+1]=(struct qs_output){.index=i+2,.type_oid=i==3?1700:20};
+    }
+    unsigned char *arena=calloc(1,bytes),*io=calloc(workers+1,QS_SORT_IO_BYTES);
+    struct qp_control *c=calloc(workers+1,sizeof(*c)); struct qs_result *out=calloc(workers+1,sizeof(*out));
+    unsigned char *seen=calloc(workers*per_worker,1); assert(arena && io && c && out && seen);
+    *(struct qs_dict *)arena=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
+    void *mr[]={p,c,out,arena,io};
+    long long len[]={sizeof(*p),(workers+1)*sizeof(*c),(workers+1)*sizeof(*out),bytes,(workers+1)*QS_SORT_IO_BYTES};
+    struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=len,.cparam1=1};
+    assert(!run(&args) && c->parallel);
+    for(unsigned w=0;w<workers;++w) {
+        size_t at=w?leaf->parallel_input+(w-1)*p->parallel_stride:leaf->input_offset;
+        memcpy(arena+at,raw+w*p->scan_bytes,p->scan_bytes);
+        void *ranges[]={p,c,out,arena,io+(w+1)*QS_SORT_IO_BYTES};
+        long long lengths[]={len[0],len[1],len[2],len[3],QS_SORT_IO_BYTES};
+        struct femu_csd_args a={.numr=5,.mr_addr=ranges,.mr_len=lengths,
+            .cparam1=((w+1)<<1)|1|QP_SCAN_INPUT|((uint64_t)(w*p->scan_bytes/QS_PAGE)<<QP_SCAN_PAGE_SHIFT)};
+        int64_t status=run(&a);
+        assert(status>=0 && status<=7 && (status&QP_INPUT_DRAINED) && !out[w+1].rows);
+        a.cparam1=((w+1)<<1)|1|QP_SCAN_INPUT|((uint64_t)(raw_bytes/QS_PAGE)<<QP_SCAN_PAGE_SHIFT);
+        status=run(&a); assert(status>=0 && status<=7 && out[w+1].finished && !out[w+1].rows);
+    }
+    c->available=qp_worker_mask(workers);
+    struct test_spill spill={.mutex=PTHREAD_MUTEX_INITIALIZER}; unsigned count=0;
+    while(!out->finished) {
+        if(c->parallel && !c->scan_node && !csIsReentry(&args)) {
+            for(unsigned w=0;w<workers;++w) {
+                void *ranges[]={p,c,out,arena,io+(w+1)*QS_SORT_IO_BYTES};
+                long long lengths[]={len[0],len[1],len[2],len[3],QS_SORT_IO_BYTES};
+                struct femu_csd_args a={.numr=5,.mr_addr=ranges,.mr_len=lengths,.cparam1=((w+1)<<1)|1};
+                assert(!run(&a) && out[w+1].finished && !out[w+1].rows);
+            }
+            c->available=qp_worker_mask(workers);
+        }
+        int64_t status=run(&args); assert(status>=0);
+        unsigned op=(uint64_t)status>>60; uint64_t id=(uint64_t)status&CS_IO_VALUE_MASK;
+        if(op) { args.cparam2=spill_request(&spill,op,id,io); continue; }
+        args.cparam2=0;
+        for(unsigned r=0;r<out->rows;++r) {
+            struct qs_cell *v=out->data[r].cells; unsigned key=v[0].value;
+            assert(!v[0].isnull && key<workers*per_worker && !seen[key]++); ++count;
+            unsigned first=key/per_worker*(2*per_worker)+key%per_worker,n=0; int64_t sum=0,minimum=INT64_MAX,maximum=INT64_MIN;
+            for(unsigned i=first;i<=first+per_worker;i+=per_worker)
+                if(key%37 && i%3) {
+                    int value=(int)((uint64_t)i*1009%997)-498;
+                    sum+=value; if(value<minimum) minimum=value; if(value>maximum) maximum=value; ++n;
+                }
+            assert(v[1].isnull==!n && v[2].value==n && v[3].value==2 && v[4].isnull==!n);
+            if(n) {
+                assert(v[1].value==sum); struct qs_cell expected; int cmp;
+                assert(!qs_average((struct qs_cell){.value=sum},n,&expected));
+                assert(!qs_compare(v[4],expected,&cmp) && !cmp && v[4].dscale==expected.dscale);
+            }
+            if(spill_merge) {
+                assert(v[5].isnull==!n && v[6].isnull==!n);
+                if(n) assert(v[5].value==minimum && v[6].value==maximum);
+            }
+        }
+    }
+    assert(count==workers*per_worker && out->metrics.work_peak<=memory);
+    if(spill_merge) assert(spill.stores);
+    for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i]);
+    assert(!pthread_mutex_destroy(&spill.mutex));
+    struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
+    memset(c,0,(workers+1)*sizeof(*c)); memset(out,0,(workers+1)*sizeof(*out)); args.cparam2=0;
+    assert(!run(&args) && c->parallel); c->close=1; assert(!run(&args));
+    assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
+    free(spill.tokens); free(raw); free(p); free(arena); free(io); free(c); free(out); free(seen);
+}
 /* Parallel local sinks and the serial adapter share one exact descending
  * oracle. Exercise real spill/reentry and cancellation of prepared CU runs. */
 static void parallel_sort_spill(function run,unsigned workers,unsigned memory,int average)
@@ -1484,8 +1585,8 @@ static void multiple_group_aggregates(function run,unsigned memory,unsigned kind
     }
     if(workers && memory>=64) {
         assert(out->metrics.workers==workers);
-        assert(p->pipelines[1].rounds==1);
-        if(kind==Q_COUNT) assert(p->pipelines[3].rounds==1);
+        assert(p->pipelines[1].rounds>=1);
+        if(kind==Q_COUNT) assert(p->pipelines[3].rounds>=1);
         assert(p->pipelines[2].sink_rows && p->pipelines[2].sink_ns);
         assert(p->pipelines[2].sink_ns<=p->pipelines[2].worker_ns);
     }
@@ -1567,6 +1668,7 @@ int main(int argc,char **argv)
         assert(!strcmp(argv[2],"--workers")); test_workers=strtoul(argv[3],NULL,10);
         assert(test_workers && test_workers<=QS_WORKERS && !cs_work_init(256*1024*1024));
         poison_workmem();
+        if(test_workers<=8) { local_group_merge(run,0); local_group_merge(run,1); }
         test_scheduled=true;
         test(run,QP_INNER,20003,23,256,1,TEST_VECTOR_AGG);
         test(run,QP_INNER,0,23,256,1,TEST_VECTOR_AGG);
@@ -1614,6 +1716,7 @@ int main(int argc,char **argv)
     }
     assert(!cs_work_init(64*1024*1024));
     poison_workmem();
+    local_group_merge(run,0); local_group_merge(run,1);
     dictionary_growth();
     probe_payload(run,1,0,0,0); probe_payload(run,2,0,0,0); probe_payload(run,2,1,0,0);
     probe_payload(run,2,2,0,0); probe_payload(run,1,3,0,0); probe_payload(run,2,3,0,0);

@@ -157,6 +157,9 @@ struct operator_state {
     struct group_entry *group_entries;
     unsigned group_capacity,group_flush,group_phase,group_stride,group_integer;
     atomic_uint *group_count;
+    struct operator_state *group_local,**group_locals;
+    unsigned group_local_count,group_local_slot,group_local_row;
+    int group_partial;
     struct set_key *set;
     unsigned set_capacity,set_count;
     int set_null,set_ready;
@@ -189,7 +192,8 @@ struct execution {
     int parallel_started;
     unsigned parallel_node, root, used_workers;
     /* One-based parent receiving rows directly from parallel workers. */
-    unsigned hash_sink,group_sink,aggregate_sink;
+    unsigned hash_sink,group_sink,aggregate_sink,group_combine;
+    bool group_shard,group_merge_full;
     atomic_uint_fast64_t next_offset;
     atomic_uint active_cus, peak_cus;
     struct execution *owner, *workers[QS_WORKERS];
@@ -1777,15 +1781,23 @@ static int group_result(struct execution *s,const struct qp_node *n,const struct
     int status=project(s,n,input,values,row);
     return status<0?status:status?2:0;
 }
-/* Published keys stay immutable throughout a CU wave. Probe them without
- * locking collisions; only publication and the matched aggregate are locked.
- * Tables are shared instead of replicated per CU: four copies of Q17's groups
- * would consume the entire device budget before scans and merge state. The
- * owner alone grows/flushes the table between CU waves; full tables leave raw
- * rows in the ordinary AFDM buffer for that existing bounded spill path. */
+/* Published keys stay immutable throughout a CU wave. The bounded shared
+ * table also accepts rows that do not fit a CU-local table. Only the owner
+ * grows/flushes it between CU waves; full tables retain the original rows. */
 #define GROUP_LOCK (1U<<31)
-static int group_sink_values(struct execution *s,unsigned id,struct operator_state *o,
-    const struct qs_cell *keys,const struct group_value *values,int shared)
+#define GROUP_TAG_MASK 0x7fff0000U
+enum { GROUP_LOCAL, GROUP_SHARED, GROUP_PARTITION };
+/* DuckDB's hash salts reject collisions in the compact lookup array before
+ * fetching a much larger aggregate record. Low bits retain NULL/key flags. */
+static unsigned group_entry_state(unsigned flags,uint64_t hash)
+{ return flags|(((unsigned)(hash>>48)&0x7fffU)<<16); }
+static uint64_t group_values_hash(const struct qp_node *n,const struct qs_cell *keys)
+{
+    return n->nkeys!=1 || n->expr.exprs[n->expr.keys[0]].type!=Q_INTEGER?group_hash(n,keys):
+        mix_hash(keys[0].isnull?0:(uint64_t)keys[0].value);
+}
+static int group_sink_hashed_values(struct execution *s,unsigned id,struct operator_state *o,
+    const struct qs_cell *keys,const struct group_value *values,int shared,uint64_t hash)
 {
     const struct qp_node *n=&s->plan->nodes[id];
     int wide=n->nkeys!=1 || n->expr.exprs[n->expr.keys[0]].type!=Q_INTEGER;
@@ -1799,7 +1811,7 @@ static int group_sink_values(struct execution *s,unsigned id,struct operator_sta
             if(keys[k].isnull) occupied|=2U<<k;
         }
     }
-    uint64_t hash=wide?group_hash(n,keys):mix_hash(key.isnull?0:(uint64_t)key.value);
+    unsigned flags=occupied; occupied=group_entry_state(occupied,hash);
     unsigned mask=o->group_capacity-1,at=hash&mask;
     for(;;at=(at+1)&mask) {
         struct group_entry *entry=&o->group_entries[at];
@@ -1810,6 +1822,7 @@ retry_bucket:
          * occupied bits, so other probes can already compare immutable keys. */
         if(state==GROUP_LOCK) goto retry_bucket;
         unsigned old=state&~GROUP_LOCK;
+        if(old && old!=occupied) continue;
         struct compact_group *g=old?group_at(o,entry->row):NULL;
         int equal=!old;
         if(old && wide && o->group_integer) {
@@ -1820,7 +1833,9 @@ retry_bucket:
             old==occupied && (key.isnull || g->key==(int64_t)key.value);
         if(equal<0) return equal;
         if(!equal) continue;
-        if(shared) {
+        /* A partition owns matching values; new buckets still require
+         * publication because probes from other partitions can collide. */
+        if(shared && (!old || shared==GROUP_SHARED)) {
             if(state&GROUP_LOCK) goto retry_bucket;
             if(!atomic_compare_exchange_weak_explicit(&entry->state,&state,state|GROUP_LOCK,
                 memory_order_acquire,memory_order_relaxed)) goto retry_bucket;
@@ -1838,7 +1853,7 @@ retry_bucket:
             entry->row=count; g=group_at(o,count);
             g->key=wide?(int64_t)hash:key.isnull?0:key.value;
             for(unsigned a=0;a<n->expr.naggs;++a) g->values[a]=(struct group_value){.sum={.isnull=1}};
-            g->key_flags=occupied;
+            g->key_flags=flags;
             if(wide && o->group_integer) {
                 int64_t *key_values=(void *)(g->values+n->expr.naggs);
                 for(unsigned k=0;k<n->nkeys;++k) key_values[k]=keys[k].isnull?0:(int64_t)keys[k].value;
@@ -1847,9 +1862,30 @@ retry_bucket:
         int status=0;
         for(unsigned a=0;a<n->expr.naggs && !status;++a)
             status=group_update(s,n,a,&g->values[a],values[a].sum,values[a].count);
-        atomic_store_explicit(&entry->state,occupied,shared?memory_order_release:memory_order_relaxed);
+        if(!old || shared!=GROUP_PARTITION)
+            atomic_store_explicit(&entry->state,occupied,shared?memory_order_release:memory_order_relaxed);
         return status?status:1;
     }
+}
+static int group_sink_values(struct execution *s,unsigned id,struct operator_state *o,
+    const struct qs_cell *keys,const struct group_value *values,int shared)
+{ return group_sink_hashed_values(s,id,o,keys,values,shared,group_values_hash(&s->plan->nodes[id],keys)); }
+static struct operator_state *group_worker_local(struct execution *s,unsigned id)
+{
+    struct operator_state *local=s->worker?s->nodes[id].group_local:NULL;
+    if(local && !local->phase) {
+        memset(local->group_entries,0,(size_t)local->group_capacity*sizeof(*local->group_entries)); local->phase=1;
+    }
+    return local;
+}
+static int group_worker_values(struct execution *s,unsigned id,struct operator_state *o,
+    const struct qs_cell *keys,const struct group_value *values,int shared,uint64_t hash)
+{
+    struct operator_state *local=shared?group_worker_local(s,id):NULL;
+    if(local) {
+        int added=group_sink_hashed_values(s,id,local,keys,values,GROUP_LOCAL,hash); if(added) return added;
+    }
+    return group_sink_hashed_values(s,id,o,keys,values,shared,hash);
 }
 static int group_sink_row(struct execution *s,unsigned id,struct operator_state *o,
     const struct qs_cell *row,int shared)
@@ -1870,7 +1906,17 @@ static int group_sink_row(struct execution *s,unsigned id,struct operator_state 
         }
         values[a]=(struct group_value){.sum=value,.count=!value.isnull};
     }
-    return group_sink_values(s,id,o,keys,values,shared);
+    return group_worker_values(s,id,o,keys,values,shared,group_values_hash(n,keys));
+}
+static void group_prefetch(struct operator_state *local,uint64_t hash,int payload)
+{
+    struct group_entry *entry=&local->group_entries[hash&(local->group_capacity-1)];
+    __builtin_prefetch(entry,1,1);
+    if(payload) {
+        unsigned state=atomic_load_explicit(&entry->state,memory_order_relaxed);
+        if(state && (state&GROUP_TAG_MASK)==(group_entry_state(0,hash)&GROUP_TAG_MASK))
+            __builtin_prefetch(group_at(local,entry->row),1,1);
+    }
 }
 /* Keep keys and aggregate arguments in vectors. Only rows rejected by a full
  * shared table enter the existing AFDM adapter, so its owner can grow/spill
@@ -1894,8 +1940,20 @@ static int group_sink_vectors(struct execution *s,unsigned id,struct qs_result *
         if(r) { combine=group_equal(s,n,previous,keys); if(combine<0) return combine; }
         memcpy(previous,keys,n->nkeys*sizeof(*keys));
     }
+    struct operator_state *local=group_worker_local(s,id);
+    int prefetch=local && !combine && n->nkeys==1 && n->expr.exprs[n->expr.keys[0]].type==Q_INTEGER;
+    uint64_t hashes[QS_VECTOR_ROWS];
+    if(prefetch) for(unsigned r=b->position;r<b->count;++r) {
+        struct qs_cell key=qs_vector_cell(&b->plan,b->vectors,b->group_keys[0],r);
+        hashes[r]=mix_hash(key.isnull?0:(uint64_t)key.value);
+        if(r<b->position+16) group_prefetch(local,hashes[r],0);
+    }
     while(b->position<b->count && out->rows<capacity) {
         unsigned first=b->position,end=first;
+        if(prefetch) {
+            if(first+16<b->count) group_prefetch(local,hashes[first+16],0);
+            if(first+4<b->count) group_prefetch(local,hashes[first+4],1);
+        }
         struct qs_cell keys[QS_KEYS];
         for(unsigned k=0;k<n->nkeys;++k) {
             int index=b->group_keys[k]; if(b->vectors[index].errors[first]) return -5;
@@ -1925,7 +1983,8 @@ static int group_sink_vectors(struct execution *s,unsigned id,struct qs_result *
             }
             ++end;
         } while(combine && end<b->count && end-first<capacity-out->rows);
-        int added=group_sink_values(s,id,o,keys,partial,1); if(added<0) return added;
+        int added=group_worker_values(s,id,o,keys,partial,GROUP_SHARED,prefetch?hashes[first]:group_values_hash(n,keys));
+        if(added<0) return added;
         if(!added) {
             for(unsigned r=first;r<end;++r) {
                 struct qs_cell *row=(struct qs_cell *)out->data+(size_t)out->rows*b->plan.nout;
@@ -1953,6 +2012,34 @@ static int group_sink_batch(struct execution *s,struct qs_result *out)
     }
     out->rows=kept; return 0;
 }
+static void group_drop_local(struct execution *s,struct operator_state *local)
+{
+    if(!local) return;
+    cs_work_free(s->context,local->groups); cs_work_free(s->context,local->group_entries);
+    cs_work_free(s->context,local);
+}
+/* Called only after the producing CUs have finished. Keep the current partial
+ * state until its merge succeeds, including across table growth and spill. */
+static struct compact_group *group_local_next(struct execution *s,struct operator_state *o)
+{
+    while(o->group_local_slot<o->group_local_count) {
+        struct operator_state *local=o->group_locals[o->group_local_slot];
+        unsigned rows=atomic_load_explicit(local->group_count,memory_order_relaxed);
+        if(o->group_local_row<local->group_flush) o->group_local_row=local->group_flush;
+        if(rows && !o->group_local_row && !atomic_load(o->group_count) &&
+           local->group_capacity==o->group_capacity) {
+            /* Transfer the first table instead of copying all its groups. */
+            cs_work_free(s->context,o->groups); cs_work_free(s->context,o->group_entries);
+            o->groups=local->groups; o->group_entries=local->group_entries;
+            local->groups=NULL; local->group_entries=NULL; atomic_store(o->group_count,rows);
+            o->group_local_row=rows;
+        }
+        if(o->group_local_row<rows) return group_at(local,o->group_local_row);
+        group_drop_local(s,local); o->group_locals[o->group_local_slot++]=NULL; o->group_local_row=0;
+    }
+    cs_work_free(s->context,o->group_locals); o->group_locals=NULL;
+    o->group_local_count=o->group_local_slot=0; return NULL;
+}
 /* Retain the compact integer-key path. Other keys add only their actual cell
  * count and grow from a small table; spill value/count states, never raw rows. */
 static size_t group_reserve(const struct execution *s,const struct qp_node *n)
@@ -1962,7 +2049,7 @@ static size_t group_reserve(const struct execution *s,const struct qp_node *n)
      * worker state too, or a small query budget can lose
      * all spill space as soon as the workers start. Active workers are already
      * charged to the parent and must not be counted a second time. */
-    if(s->plan->workers>1 && !s->parallel_started && s->plan->nodes[n->left].parallel) {
+    if(s->plan->workers>1 && !s->parallel_started && s->plan->nodes[n->left].parallel && !s->nodes[n->left].finished) {
         int leaf=qp_probe_scan(s->plan,n->left);
         size_t index=leaf>=0 && s->plan->nodes[leaf].ordered_index?QS_INDEX_WORK_BYTES+sizeof(struct qs_plan):0;
         reserve+=s->plan->workers*(sizeof(*s)+s->plan->count*sizeof(*s->nodes)+sizeof(struct qs_plan)+index+256);
@@ -2042,12 +2129,25 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
     for(;;) {
         if(o->group_phase==0) {
             if(!o->have_left) {
-                int64_t status=next_row(s,n->left,o->left);
-                if(status==QP_WAIT || status<0 || status>2) return status;
-                o->have_left=status==2;
-                if(!status) { o->input_done=1; o->group_phase=1; continue; }
+                if(o->group_locals && !s->parallel_started) {
+                    if(!group_local_next(s,o)) continue;
+                    o->have_left=o->group_partial=1;
+                } else {
+                    int64_t status=next_row(s,n->left,o->left);
+                    if(status==QP_WAIT || status<0 || status>2) return status;
+                    o->have_left=status==2;
+                    if(!status) {
+                        if(o->group_locals) continue;
+                        o->input_done=1; o->group_phase=1; continue;
+                    }
+                }
             }
-            int added=group_sink_row(s,id,o,o->left,0);
+            int added;
+            if(o->group_partial) {
+                struct operator_state *local=o->group_locals[o->group_local_slot];
+                struct compact_group *g=group_at(local,o->group_local_row); struct qs_cell keys[QS_KEYS];
+                group_keys(n,local,g,keys); added=group_sink_values(s,id,o,keys,g->values,0);
+            } else added=group_sink_row(s,id,o,o->left,0);
             if(added<0) return added;
             if(!added) {
                 unsigned capacity=o->group_capacity*2;
@@ -2076,13 +2176,14 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
                         unsigned slot=hash&(capacity-1);
                         while(atomic_load_explicit(&entries[slot].state,memory_order_relaxed)) slot=(slot+1)&(capacity-1);
                         entries[slot].row=i;
-                        atomic_store_explicit(&entries[slot].state,v->key_flags,memory_order_relaxed);
+                        atomic_store_explicit(&entries[slot].state,group_entry_state(v->key_flags,hash),memory_order_relaxed);
                     }
                     cs_work_free(s->context,old); continue;
                 }
                 cs_work_free(s->context,entries);
                 o->group_phase=1; continue;
             }
+            if(o->group_partial) { ++o->group_local_row; o->group_partial=0; }
             o->have_left=0; continue;
         }
         if(o->group_phase==1) {
@@ -2680,6 +2781,96 @@ static void close_workers(struct execution *s)
         e->control->state=0; cs_work_end(e->context); s->workers[w]=NULL;
     }
 }
+/* Local Hash Aggregate tables use the same layout/update functions as the
+ * shared table. Admission uses the query's actual free memory, retaining the
+ * existing spill reserve; no per-CU fraction is taken from the query limit. */
+static void parallel_group_begin(struct execution *s,unsigned id)
+{
+    struct operator_state *o=&s->nodes[id]; unsigned workers=s->plan->workers;
+    if(s->partition_join>=0) return;
+    if(!o->group_locals) {
+        struct cs_work_context_stats m;
+        if(cs_work_get_context_stats(s->context,&m)) return;
+        size_t data=(size_t)(o->group_capacity-o->group_capacity/8)*o->group_stride;
+        size_t entries=(size_t)o->group_capacity*sizeof(*o->group_entries);
+        size_t bytes=workers*(data+entries+sizeof(*o)+3*128+sizeof(o)); /* allocation/alignment headroom */
+        size_t available=m.limit_bytes-m.used_bytes,reserve=2*s->sort_limit;
+        if(available<reserve || bytes>available-reserve) return;
+        o->group_locals=cs_work_calloc(s->context,workers,sizeof(*o->group_locals));
+        if(!o->group_locals) return;
+        o->group_local_count=workers;
+        for(unsigned w=0;w<workers;++w) {
+            struct operator_state *local=cs_work_calloc(s->context,1,sizeof(*local));
+            o->group_locals[w]=local;
+            if(!local) goto fallback;
+            local->group_capacity=o->group_capacity; local->group_stride=o->group_stride; local->group_integer=o->group_integer;
+            local->group_count=&local->hash_rows; atomic_init(local->group_count,0);
+            local->groups=cs_work_alloc(s->context,data);
+            local->group_entries=cs_work_alloc(s->context,entries);
+            if(!local->groups || !local->group_entries) goto fallback;
+        }
+    }
+    if(o->group_local_count==workers)
+        for(unsigned w=0;w<workers;++w) s->workers[w]->nodes[id].group_local=o->group_locals[w];
+    return;
+fallback:
+    for(unsigned w=0;w<o->group_local_count;++w) group_drop_local(s,o->group_locals[w]);
+    cs_work_free(s->context,o->group_locals); o->group_locals=NULL; o->group_local_count=0;
+}
+static int64_t group_combine_local(struct execution *s)
+{
+    unsigned id=s->group_combine-1;
+    struct operator_state *local=s->nodes[id].group_local,*global=&s->owner->nodes[id];
+    if(s->group_shard) {
+        const struct qp_node *n=&s->plan->nodes[id];
+        int wide=n->nkeys!=1 || n->expr.exprs[n->expr.keys[0]].type!=Q_INTEGER;
+        for(unsigned i=0;i<global->group_local_count;++i) {
+            local=global->group_locals[i]; unsigned rows=atomic_load(local->group_count);
+            for(unsigned r=0;r<rows;++r) {
+                struct compact_group *g=group_at(local,r);
+                uint64_t hash=wide?(uint64_t)g->key:mix_hash(g->key_flags==2?0:(uint64_t)g->key);
+                unsigned workers=s->plan->workers;
+                unsigned partition=(workers&(workers-1))?hash%workers:hash&(workers-1);
+                if(partition!=s->worker-1) continue;
+                struct qs_cell keys[QS_KEYS]; group_keys(n,local,g,keys);
+                int added=group_sink_hashed_values(s,id,global,keys,g->values,GROUP_PARTITION,hash); if(added<0) return added;
+                if(!added) { s->group_merge_full=true; return 0; }
+            }
+        }
+        return 0;
+    }
+    unsigned rows=atomic_load_explicit(local->group_count,memory_order_relaxed);
+    while(local->group_flush<rows) {
+        struct compact_group *g=group_at(local,local->group_flush); struct qs_cell keys[QS_KEYS];
+        group_keys(&s->plan->nodes[id],local,g,keys);
+        int added=group_sink_values(s,id,global,keys,g->values,1); if(added<0) return added;
+        if(!added) break; /* The owner resumes this partial after growth/spill. */
+        ++local->group_flush;
+    }
+    return 0;
+}
+static void parallel_group_combine(struct execution *s,unsigned id)
+{
+    struct operator_state *o=&s->nodes[id];
+    /* With an empty target, each hash partition has one owning CU. Lookups
+     * share publication, but matching aggregate states need no update lock.
+     * Keep inputs immutable so a full target can restart through normal spill. */
+    s->group_shard=!atomic_load(o->group_count);
+    s->group_combine=id+1; s->parallel_done=0;
+    memset(s->parallel_position,0,sizeof(s->parallel_position));
+    for(unsigned w=0;w<s->plan->workers;++w) {
+        struct execution *e=s->workers[w];
+        e->group_shard=s->group_shard; e->group_merge_full=false;
+        e->group_combine=id+1; e->host_scan=false; e->metrics=(struct qs_metrics){0};
+        e->profile=(struct qs_profile){0}; e->local_profile_cpu=e->sink_ns=e->sink_rows=0;
+        for(unsigned i=0;i<s->plan->count;++i) e->nodes[i].index_task.index_pages=e->nodes[i].index_task.index_tuples=0;
+        *e->control=(struct qp_control){.state=(uintptr_t)e};
+        memset(&s->outputs[w+1],0,sizeof(s->outputs[w+1]));
+    }
+    s->control->parallel=2; s->control->scan_node=0; s->control->available=s->control->drained=0;
+    ++s->control->epoch;
+    if(s->profiling) { s->pipeline_start=now_ns(CLOCK_MONOTONIC); s->pipeline_tick=now_ns(CLOCK_THREAD_CPUTIME_ID); }
+}
 /* Like DuckDB's LocalSortState: local sinks own runs, while the coordinator
  * retains their handles for one merge Source. Allocate the first runs before
  * launching CUs, so every started sink can evict one of its own full runs. */
@@ -2861,6 +3052,7 @@ restart:
             if(leaf->kind==QP_SCAN) *(struct qs_chunk *)(s->arena+vector_offset(e,leaf))=
                 (struct qs_chunk){.capacity=leaf->ordered_index?256:qp_scan_capacity(p,leaf),.ncols=leaf->expr.ncols};
         }
+        if(group_sink) parallel_group_begin(s,group_sink-1);
         if(!hash_sink && !group_sink && !aggregate_sink) parallel_sort_begin(s,root);
         s->parallel_node=root; s->parallel_done=0;
         memset(s->parallel_position,0,sizeof(s->parallel_position)); atomic_store(&s->next_offset,0);
@@ -2886,7 +3078,7 @@ restart:
         s->parallel_position[w]=0; s->control->available&=~(UINT64_C(1)<<w); s->control->drained|=UINT64_C(1)<<w;
     }
     if(s->parallel_done==qp_worker_mask(p->workers)) {
-        struct qp_pipeline_profile *phase=&p->pipelines[root];
+        struct qp_pipeline_profile *phase=&p->pipelines[s->group_combine?s->group_combine-1:root];
         if(s->profiling) {
             phase->wall_ns+=now_ns(CLOCK_MONOTONIC)-s->pipeline_start;
             phase->coordinator_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-s->pipeline_tick; ++phase->rounds;
@@ -2912,7 +3104,20 @@ restart:
                 t->calls+=x->calls; t->wall_ns+=x->wall_ns; t->cpu_ns+=x->cpu_ns;
             }
         }
-        close_workers(s);
+        unsigned group=s->workers[0]->group_sink;
+        if(!s->group_combine && group && s->nodes[group-1].group_locals) {
+            parallel_group_combine(s,group-1); return QP_WAIT;
+        }
+        if(s->group_combine && s->group_shard) {
+            struct operator_state *o=&s->nodes[s->group_combine-1]; bool full=false;
+            for(unsigned w=0;w<p->workers;++w) full|=s->workers[w]->group_merge_full;
+            if(full) {
+                memset(o->group_entries,0,(size_t)o->group_capacity*sizeof(*o->group_entries));
+                atomic_store(o->group_count,0);
+            } else for(unsigned w=0;w<o->group_local_count;++w)
+                o->group_locals[w]->group_flush=atomic_load(o->group_locals[w]->group_count);
+        }
+        s->group_combine=0; s->group_shard=false; close_workers(s);
         int source=qp_pipeline_source(p,root);
         if(source>=0 && p->nodes[source].kind==QP_AGGREGATE && s->partition_join<0) {
             cs_work_free(s->context,s->nodes[source].groups); s->nodes[source].groups=NULL;
@@ -3139,6 +3344,13 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
      * pipeline fits 2048 rows in the same AFDM as 256 final sixteen-cell rows. */
     unsigned capacity=worker?QS_RESULT_ROWS*QS_OUT/(columns?columns:1):QS_RESULT_ROWS;
 produce:
+    if(worker && s->group_combine) {
+        uint64_t tick=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
+        status=group_combine_local(s);
+        if(s->profiling) s->sink_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-tick;
+        if(!status) out->finished=control->finished=1;
+        goto combined;
+    }
     /* STORE reentry must finish consuming the retained output before the
      * producer overwrites it with another batch. */
     if(worker && s->sort_sink && s->pending_sort==s->sort_sink) goto produced;
@@ -3236,13 +3448,14 @@ produced:
          * without asking PG to submit another compute request. */
         if(s->host_scan && !out->rows && status==2) goto produce;
     }
+combined:
     if(status==QP_WAIT) {
         int64_t request=namespace_wait(s); if(request) status=request;
     }
     if(s->profiling) {
         struct qs_timing *t=&s->profile.operators[QS_JOIN_PROBE];
         if(!worker && s->parallel_started)
-            plan->pipelines[s->parallel_node].coordinator_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-s->pipeline_tick;
+            plan->pipelines[s->group_combine?s->group_combine-1:s->parallel_node].coordinator_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-s->pipeline_tick;
         ++t->calls; t->wall_ns+=now_ns(CLOCK_MONOTONIC)-start; t->cpu_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-cpu;
         atomic_fetch_sub(&owner->active_cus,1); control->peak_cus=atomic_load(&owner->peak_cus);
     }
