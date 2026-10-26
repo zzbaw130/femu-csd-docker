@@ -131,6 +131,22 @@ static void scan(struct qp_node *n)
         n->expr.outputs[i]=(struct qs_output){.index=i,.type_oid=23};
     }
 }
+struct test_spill { pthread_mutex_t mutex; void **tokens; unsigned count,stores; };
+static uint64_t spill_request(struct test_spill *s,unsigned op,uint64_t id,void *io)
+{
+    assert(!pthread_mutex_lock(&s->mutex));
+    if(op==1) {
+        assert(id==QS_SORT_IO_BYTES);
+        s->tokens=realloc(s->tokens,(s->count+1)*sizeof(*s->tokens)); assert(s->tokens);
+        void *data=malloc(id); assert(data); memcpy(data,io,id);
+        s->tokens[s->count++]=data; id=s->count; ++s->stores;
+    } else {
+        assert(id && id<=s->count && s->tokens[id-1]);
+        if(op==2) memcpy(io,s->tokens[id-1],QS_SORT_IO_BYTES);
+        else { assert(op==3); free(s->tokens[id-1]); s->tokens[id-1]=NULL; }
+    }
+    assert(!pthread_mutex_unlock(&s->mutex)); return id;
+}
 struct probe_test {
     function run;
     struct femu_csd_args args;
@@ -139,11 +155,10 @@ struct probe_test {
     struct qs_result *out;
     unsigned char *arena,*raw,*heap,*index;
     unsigned worker;
-    void **tokens;
-    size_t ntokens;
     atomic_uint_fast64_t *next_offset;
     bool *need_input;
     unsigned scan_node;
+    struct test_spill *spill;
 };
 /* Independent linear physical-range oracle; source extents deliberately use
  * separated LBAs above 32 bits and split the first Heap page in half. */
@@ -253,9 +268,7 @@ static void *probe_worker(void *arg)
         if((uint64_t)status>>60) {
             uint64_t op=(uint64_t)status>>60,id=(uint64_t)status&CS_IO_VALUE_MASK;
             if(op==4) { namespace_read(&t->args,id,t->raw,t->heap,t->index); continue; }
-            assert(op==2 && id && id<=t->ntokens && t->tokens[id-1]);
-            memcpy(t->args.mr_addr[4],t->tokens[id-1],QS_SORT_IO_BYTES);
-            t->args.cparam2=id; continue;
+            t->args.cparam2=spill_request(t->spill,op,id,t->args.mr_addr[4]); continue;
         }
         t->args.cparam2=0;
         if(t->next_offset) {
@@ -531,7 +544,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     void *mr[]={plan,&control,out,arena,io}; long long len[]={plan_bytes,(plan->workers+1)*sizeof(*controls),(plan->workers+1)*sizeof(*out),bytes,(plan->workers+1)*QS_SORT_IO_BYTES};
     struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=len};
     args.cparam1=parallel==TEST_PARALLEL || parallel==TEST_BUILD_PHASE || parallel==TEST_HASH_GROUP || parallel==TEST_PARTITION || parallel==TEST_PARTITION_SKEW || grouped_build;
-    void **tokens=NULL; size_t ntokens=0; unsigned got=0; unsigned char seen[12]={0};
+    struct test_spill spill={.mutex=PTHREAD_MUTEX_INITIALIZER}; unsigned got=0; unsigned char seen[12]={0};
     uint64_t counts[12]={0},sums[12]={0},mins[12]={0},maxs[12]={0};
     uint64_t source_sums[12]={0},source_counts[12]={0};
     if(grouped_build) {
@@ -581,7 +594,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         if(control.parallel && !csIsReentry(&args)) {
             pthread_t threads[QS_WORKERS]; struct probe_test tasks[QS_WORKERS]; uint64_t started=0;
             for(unsigned w=0;w<plan->workers;++w) if(!((available|done)&(UINT64_C(1)<<w))) {
-                tasks[w]=(struct probe_test){run,args,plan,&controls[w+1],&out[w+1],arena,raw[0],raw[1],index,w+1,tokens,ntokens,NULL,NULL,0};
+                tasks[w]=(struct probe_test){run,args,plan,&controls[w+1],&out[w+1],arena,raw[0],raw[1],index,w+1,NULL,NULL,0,&spill};
                 tasks[w].args.cparam1=((w+1)<<1)|(args.cparam1&1);
                 if(test_scheduled && control.scan_node) {
                     tasks[w].next_offset=&host_offset; tasks[w].need_input=&need_input[w];
@@ -603,9 +616,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         uint64_t op=(uint64_t)status>>60,id=(uint64_t)status&CS_IO_VALUE_MASK;
         if(op) {
             if(op==4) { namespace_read(&args,id,raw[0],raw[1],index); continue; }
-            if(op==1) { tokens=realloc(tokens,(ntokens+1)*sizeof(*tokens)); assert(tokens); tokens[ntokens]=malloc(id); assert(tokens[ntokens]); memcpy(tokens[ntokens],io,id); args.cparam2=++ntokens; }
-            else if(op==2) { assert(id && id<=ntokens && tokens[id-1]); memcpy(io,tokens[id-1],QS_SORT_IO_BYTES); args.cparam2=id; }
-            else { assert(op==3 && id && id<=ntokens && tokens[id-1]); free(tokens[id-1]); tokens[id-1]=NULL; args.cparam2=id; }
+            args.cparam2=spill_request(&spill,op,id,io);
             continue;
         }
         args.cparam2=0; args.cparam1&=~QP_PAGES_INPUT; available&=~control.drained;
@@ -650,10 +661,10 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             memcpy(arena+n->input_offset,raw[control.node==2?0:1]+control.offset,control.bytes); control.ready=1;
         }
     }
-    if(hash==2 && memory==4 && parallel==TEST_SERIAL) assert(ntokens); /* page-ready flag survives spill reentry */
-    if(parallel==TEST_DEVICE_IO && memory==4) assert(ntokens); /* namespace and spill reentry share one CU I/O AFDM */
-    if(parallel==TEST_HASH_QUAL && right_rows==150000) assert(ntokens);
-    if(parallel==TEST_GROUP_SOURCE_SPILL) assert(ntokens && !plan->nodes[1].parallel);
+    if(hash==2 && memory==4 && parallel==TEST_SERIAL) assert(spill.count); /* page-ready flag survives spill reentry */
+    if(parallel==TEST_DEVICE_IO && memory==4) assert(spill.count); /* namespace and spill reentry share one CU I/O AFDM */
+    if(parallel==TEST_HASH_QUAL && right_rows==150000) assert(spill.count);
+    if(parallel==TEST_GROUP_SOURCE_SPILL) assert(spill.count && !plan->nodes[1].parallel);
     if(test_workers>4 && parallel) assert(out->metrics.workers==test_workers && control.epoch);
     if(parallel==TEST_GROUP_SOURCE && !rows) assert(!got); else assert(got);
     if(parallel!=TEST_COUNT_ROWS && !grouped_build && parallel<TEST_PARTITION)
@@ -678,12 +689,13 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         assert(out->profile.operators[QS_JOIN_PROBE].cpu_ns>=children);
     } else for(unsigned i=0;i<plan->count;++i) assert(!plan->pipelines[i].rounds);
     if(parallel>=TEST_PARTITION) {
-        assert(ntokens && !out->metrics.runs && out->metrics.workers==(parallel==TEST_PARTITION_SERIAL?1:4));
+        assert(spill.count && !out->metrics.runs && out->metrics.workers==(parallel==TEST_PARTITION_SERIAL?1:4));
         if(parallel==TEST_PARTITION_SERIAL) assert(!control.epoch);
         else assert(memory==8?control.epoch==1:control.epoch>1);
     }
-    for(size_t i=0;i<ntokens;++i) free(tokens[i]);
-    free(controls); free(tokens); free(raw[0]); free(raw[1]); free(index); free(plan); free(arena); free(io); free(out);
+    for(size_t i=0;i<spill.count;++i) free(spill.tokens[i]);
+    assert(!pthread_mutex_destroy(&spill.mutex));
+    free(controls); free(spill.tokens); free(raw[0]); free(raw[1]); free(index); free(plan); free(arena); free(io); free(out);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
 }
 #undef control
@@ -1144,9 +1156,9 @@ static int multi_order(const void *ap,const void *bp)
     return (a->b<b->b)-(a->b>b->b);
 }
 enum group_test_mode { GROUP_SINGLE,GROUP_COUNTS,GROUP_NUMERIC_EXTREMES,GROUP_TEXT_EXTREMES };
-/* A live CU output must stay owned by Sort while a full run is stored.
- * Verify every row after multiple reentries, not just a standalone buffer. */
-static void parallel_sort_spill(function run,unsigned workers)
+/* Parallel local sinks and the serial adapter share one exact descending
+ * oracle. Exercise real spill/reentry and cancellation of prepared CU runs. */
+static void parallel_sort_spill(function run,unsigned workers,unsigned memory)
 {
     const unsigned rows=50003; size_t raw_bytes;
     unsigned char *raw=heap(rows,2,&raw_bytes);
@@ -1163,7 +1175,7 @@ static void parallel_sort_spill(function run,unsigned workers)
     struct qp_node *sort=&p->nodes[0];
     *sort=(struct qp_node){.kind=QP_SORT,.left=1,.right=-1,.expr=leaf->expr};
     sort->expr.norder=1; sort->expr.order[0]=(struct qs_order){.output=0,.descending=1};
-    sort->expr.work_mem_bytes=8U*1024*1024; sort->expr.limit=-1;
+    sort->expr.work_mem_bytes=memory; sort->expr.limit=-1;
     unsigned char *arena=calloc(1,bytes),*io=calloc(workers+1,QS_SORT_IO_BYTES);
     struct qp_control *controls=calloc(workers+1,sizeof(*controls));
     struct qs_result *out=calloc(workers+1,sizeof(*out)); assert(arena && io && controls && out);
@@ -1175,12 +1187,12 @@ static void parallel_sort_spill(function run,unsigned workers)
     struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=len,.cparam1=1};
     uint64_t available=0,done=0; unsigned epoch=0,seen=0,held_stores=0;
     atomic_uint_fast64_t offset=0; bool need_input[QS_WORKERS]={0};
-    void **tokens=NULL; unsigned ntokens=0;
+    struct test_spill spill={.mutex=PTHREAD_MUTEX_INITIALIZER};
     while(!out->finished) {
         if(c->parallel && !csIsReentry(&args)) {
             pthread_t threads[QS_WORKERS]; struct probe_test tasks[QS_WORKERS]; uint64_t started=0;
             for(unsigned w=0;w<workers;++w) if(!((available|done)&(UINT64_C(1)<<w))) {
-                tasks[w]=(struct probe_test){run,args,p,&controls[w+1],&out[w+1],arena,raw,raw,NULL,w+1,tokens,ntokens,&offset,&need_input[w],c->scan_node};
+                tasks[w]=(struct probe_test){run,args,p,&controls[w+1],&out[w+1],arena,raw,raw,NULL,w+1,&offset,&need_input[w],c->scan_node,&spill};
                 tasks[w].args.cparam1=((w+1)<<1)|1;
                 assert(c->scan_node==2 && !pthread_create(&threads[w],NULL,probe_worker,&tasks[w])); started|=UINT64_C(1)<<w;
             }
@@ -1200,10 +1212,8 @@ static void parallel_sort_spill(function run,unsigned workers)
                         !(c->drained&(UINT64_C(1)<<w)) && out[w+1].rows>out[w+1].begin) ++held;
                     assert(held); ++held_stores;
                 }
-                tokens=realloc(tokens,(ntokens+1)*sizeof(*tokens)); assert(tokens);
-                tokens[ntokens]=malloc(id); assert(tokens[ntokens]); memcpy(tokens[ntokens],io,id); args.cparam2=++ntokens;
-            } else if(op==2) { assert(id && id<=ntokens && tokens[id-1]); memcpy(io,tokens[id-1],QS_SORT_IO_BYTES); args.cparam2=id; }
-            else { assert(op==3 && id && id<=ntokens && tokens[id-1]); free(tokens[id-1]); tokens[id-1]=NULL; args.cparam2=id; }
+            }
+            args.cparam2=spill_request(&spill,op,id,io);
             continue;
         }
         args.cparam2=0; available&=~c->drained;
@@ -1217,10 +1227,20 @@ static void parallel_sort_spill(function run,unsigned workers)
             assert(v[1].value==(int)((uint64_t)key*1009%997)-498);
         }
     }
-    assert(seen==rows && held_stores && out->metrics.workers==workers && out->metrics.work_peak<=8U*1024*1024);
-    for(unsigned i=0;i<ntokens;++i) assert(!tokens[i]);
+    assert(seen==rows && out->metrics.workers==workers && out->metrics.work_peak<=memory);
+    uint64_t sunk=0;
+    for(unsigned i=0;i<p->count;++i) sunk+=p->pipelines[i].sink_rows;
+    assert(sunk==rows || held_stores); /* local Sink or the spill-safe adapter */
+    if(memory==8U*1024*1024) assert(sunk==rows);
+    if(memory==4U*1024*1024) assert(spill.stores);
+    for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i]);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
-    free(tokens); free(raw); free(p); free(arena); free(io); free(controls); free(out);
+    memset(controls,0,(workers+1)*sizeof(*controls)); memset(out,0,(workers+1)*sizeof(*out)); args.cparam2=0;
+    assert(!run(&args) && c->parallel);
+    c->close=1; assert(!run(&args));
+    assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
+    assert(!pthread_mutex_destroy(&spill.mutex));
+    free(spill.tokens); free(raw); free(p); free(arena); free(io); free(controls); free(out);
 }
 static void multiple_group_aggregates(function run,unsigned memory,unsigned kind,int integer_keys,unsigned workers,enum group_test_mode mode)
 {
@@ -1362,12 +1382,12 @@ static void multiple_group_aggregates(function run,unsigned memory,unsigned kind
     uint64_t available=0,done=0; unsigned epoch=0;
     atomic_uint_fast64_t host_offset=0;
     bool need_input[QS_WORKERS]={0};
-    void **tokens=NULL; unsigned ntokens=0,seen=0;
+    struct test_spill spill={.mutex=PTHREAD_MUTEX_INITIALIZER}; unsigned seen=0;
     while(!out->finished) {
         if(control.parallel && !csIsReentry(&args)) {
             pthread_t threads[QS_WORKERS]; struct probe_test tasks[QS_WORKERS]; uint64_t started=0;
             for(unsigned w=0;w<p->workers;++w) if(!((available|done)&(UINT64_C(1)<<w))) {
-                tasks[w]=(struct probe_test){run,args,p,&controls[w+1],&out[w+1],arena,raw,raw,NULL,w+1,tokens,ntokens,NULL,NULL,0};
+                tasks[w]=(struct probe_test){run,args,p,&controls[w+1],&out[w+1],arena,raw,raw,NULL,w+1,NULL,NULL,0,&spill};
                 tasks[w].args.cparam1=((w+1)<<1)|1;
                 if(test_scheduled && control.scan_node) {
                     tasks[w].next_offset=&host_offset; tasks[w].need_input=&need_input[w];
@@ -1384,9 +1404,7 @@ static void multiple_group_aggregates(function run,unsigned memory,unsigned kind
         int64_t status=run(&args); assert(status>=0);
         uint64_t op=(uint64_t)status>>60,id=(uint64_t)status&CS_IO_VALUE_MASK;
         if(op) {
-            if(op==1) { tokens=realloc(tokens,(ntokens+1)*sizeof(*tokens)); assert(tokens); tokens[ntokens]=malloc(id); assert(tokens[ntokens]); memcpy(tokens[ntokens],io,id); args.cparam2=++ntokens; }
-            else if(op==2) { assert(id && id<=ntokens && tokens[id-1]); memcpy(io,tokens[id-1],QS_SORT_IO_BYTES); args.cparam2=id; }
-            else { assert(op==3 && id && id<=ntokens && tokens[id-1]); free(tokens[id-1]); tokens[id-1]=NULL; args.cparam2=id; }
+            args.cparam2=spill_request(&spill,op,id,io);
             continue;
         }
         args.cparam2=0; available&=~control.drained;
@@ -1438,10 +1456,11 @@ static void multiple_group_aggregates(function run,unsigned memory,unsigned kind
         assert(p->pipelines[2].sink_rows && p->pipelines[2].sink_ns);
         assert(p->pipelines[2].sink_ns<=p->pipelines[2].worker_ns);
     }
-    assert(seen==groups && (memory==4?ntokens>0:ntokens==0));
+    assert(seen==groups && (memory==4?spill.count>0:spill.count==0));
     if(counts && workers) assert(out->metrics.work_peak && out->metrics.work_peak<=(uint64_t)memory*1024*1024);
-    for(unsigned i=0;i<ntokens;++i) assert(!tokens[i]);
-    free(controls); free(tokens); free(raw); free(expected); free(p); free(arena); free(io); free(out);
+    for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i]);
+    assert(!pthread_mutex_destroy(&spill.mutex));
+    free(controls); free(spill.tokens); free(raw); free(expected); free(p); free(arena); free(io); free(out);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
 }
 #undef control
@@ -1534,7 +1553,10 @@ int main(int argc,char **argv)
         test(run,QP_INNER,50003,50003,256,1,TEST_BUILD_GROUP_DIRECT);
         test(run,QP_INNER,31,23,256,1,TEST_BUILD_GROUP_DIRECT);
         test(run,QP_INNER,31,0,256,1,TEST_BUILD_GROUP_DIRECT);
-        if(test_workers<=8) parallel_sort_spill(run,test_workers);
+        if(test_workers<=8) {
+            parallel_sort_spill(run,test_workers,8U*1024*1024);
+            parallel_sort_spill(run,test_workers,4U*1024*1024);
+        }
         test_scheduled=false;
         for(unsigned join=QP_INNER;join<=QP_ANTI;++join)
             test(run,join,20003,23,256,1,TEST_BUILD_PHASE);
@@ -1588,7 +1610,8 @@ int main(int argc,char **argv)
     test(run,QP_INNER,50003,50003,64,1,TEST_BUILD_GROUP_DIRECT);
     test(run,QP_INNER,31,23,64,1,TEST_BUILD_GROUP_DIRECT);
     test(run,QP_INNER,31,0,64,1,TEST_BUILD_GROUP_DIRECT);
-    parallel_sort_spill(run,test_workers);
+    parallel_sort_spill(run,test_workers,8U*1024*1024);
+    parallel_sort_spill(run,test_workers,4U*1024*1024);
     for(unsigned join=QP_INNER;join<=QP_ANTI;++join) {
         test(run,join,31,5003,64,1,TEST_HASH_QUAL);
         test(run,join,31,5003,4,1,TEST_HASH_QUAL);

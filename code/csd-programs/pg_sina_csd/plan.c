@@ -17,6 +17,8 @@ extern int64_t pg_sina_filter_impl(struct femu_csd_args *);
 extern int64_t pg_sina_sort_sink_impl(struct femu_csd_args *);
 extern int64_t pg_sina_sort_source_impl(struct femu_csd_args *);
 extern void qs_sort_dictionary(uint64_t,struct qs_dict *);
+extern int qs_sort_prepare(uint64_t);
+extern void qs_sort_finish_sink(uint64_t);
 #define QP_WAIT 1
 /* Store PG integer/date widths directly; numeric and other values retain all
  * 128 bits. Keep scale/dscale/NULL, and avoid unaligned integer accesses. */
@@ -63,7 +65,7 @@ struct sorted_rows {
     struct qs_result *batch; /* Borrowed CU output, retained across spill. */
     unsigned batch_worker;
     unsigned position;
-    int initialized, complete, drained, input_pending;
+    int initialized, complete, drained, input_pending, producer_status;
     unsigned char *prefix;
     unsigned prefix_rows,prefix_position;
     struct qs_metrics metrics;
@@ -170,6 +172,7 @@ struct execution {
     void *io;
     size_t io_bytes, sort_limit;
     struct sorted_rows *pending_sort;
+    struct sorted_rows *sort_sink; /* CU-local state; runs are owned by the query. */
     struct spool *pending_spool;
     unsigned pending_block;
     int pending_store;
@@ -451,7 +454,8 @@ static int64_t sorted_input(struct execution *s,struct sorted_rows *sort,unsigne
         /* next_row returns 2 for a row and 0 for EOF. */
         if(!status) {
             if(sort->input->rows) { sort->input_pending=1; continue; }
-            sort->complete=1; sort->group.count=1; sort->group.states[0]=sort->task.state;
+            sort->complete=1;
+            if(!sort->group.count) { sort->group.count=1; sort->group.states[0]=sort->task.state; }
             cs_work_free(s->context,sort->input); sort->input=NULL; break;
         }
         if(++sort->input->rows==QS_RESULT_ROWS) sort->input_pending=1;
@@ -2637,6 +2641,46 @@ static void close_workers(struct execution *s)
         e->control->state=0; cs_work_end(e->context); s->workers[w]=NULL;
     }
 }
+/* Like DuckDB's LocalSortState: local sinks own runs, while the coordinator
+ * retains their handles for one merge Source. Allocate the first runs before
+ * launching CUs, so every started sink can evict one of its own full runs. */
+static void parallel_sort_begin(struct execution *s,unsigned root)
+{
+    struct sorted_rows *sort=NULL;
+    for(unsigned i=0;i<s->plan->count;++i)
+        if(s->plan->nodes[i].kind==QP_SORT && s->plan->nodes[i].left==(int)root &&
+           s->nodes[i].left_sort.initialized) { sort=&s->nodes[i].left_sort; break; }
+    if(!sort || s->partition_join>=0) return;
+    sort->group.count=1; sort->group.states[0]=sort->task.state;
+    for(unsigned w=0;w<s->plan->workers;++w) {
+        struct execution *e=s->workers[w];
+        struct sorted_rows *local=cs_work_calloc(e->context,1,sizeof(*local));
+        if(!local) goto fallback;
+        e->sort_sink=local; local->plan=sort->plan; local->task.workers=1;
+        if(!w) local->task.state=sort->task.state;
+        else {
+            local->input=&s->outputs[w+1]; local->input->rows=local->input->begin=0;
+            if(sort_call(e,local,0)) goto fallback;
+            sort->group.states[sort->group.count++]=local->task.state;
+            qs_sort_dictionary(local->task.state,s->dictionary);
+        }
+        if(qs_sort_prepare(local->task.state)) goto fallback;
+    }
+    return;
+fallback:
+    /* Nothing has consumed input or spilled. Keep the original owner and
+     * the ordinary parallel-producer/serial-Sink path on allocation failure. */
+    for(unsigned w=1;w<sort->group.count;++w) {
+        struct qs_group group={.count=1,.states={sort->group.states[w]}};
+        void *mr[]={&group}; long long len[]={sizeof(group)};
+        struct femu_csd_args a={.numr=1,.mr_addr=mr,.mr_len=len}; pg_sina_sort_source_impl(&a);
+        sort->group.states[w]=0;
+    }
+    sort->group.count=1;
+    for(unsigned w=0;w<s->plan->workers;++w) {
+        struct execution *e=s->workers[w]; cs_work_free(e->context,e->sort_sink); e->sort_sink=NULL;
+    }
+}
 static int64_t parallel_next(struct execution *s,unsigned root,struct qs_cell *row)
 {
     struct qp_plan *p=s->plan;
@@ -2778,6 +2822,7 @@ restart:
             if(leaf->kind==QP_SCAN) *(struct qs_chunk *)(s->arena+vector_offset(e,leaf))=
                 (struct qs_chunk){.capacity=leaf->ordered_index?256:qp_scan_capacity(p,leaf),.ncols=leaf->expr.ncols};
         }
+        if(!hash_sink && !group_sink && !aggregate_sink) parallel_sort_begin(s,root);
         s->parallel_node=root; s->parallel_done=0;
         memset(s->parallel_position,0,sizeof(s->parallel_position)); atomic_store(&s->next_offset,0);
         s->control->parallel=hash_sink || group_sink?2:1; ++s->control->epoch; s->control->available=s->control->drained=0;
@@ -2856,7 +2901,8 @@ static unsigned sort_depth(const struct qp_plan *plan,unsigned id)
 static void drop_sort(struct sorted_rows *sort)
 {
     if(!sort->initialized || !sort->task.state || sort->drained) return;
-    struct qs_group group={.count=1,.states={sort->task.state}};
+    struct qs_group group=sort->group;
+    if(!group.count) { group.count=1; group.states[0]=sort->task.state; }
     void *mr[]={&group}; long long len[]={sizeof(group)};
     struct femu_csd_args a={.numr=1,.mr_addr=mr,.mr_len=len};
     pg_sina_sort_source_impl(&a); sort->task.state=0;
@@ -3054,6 +3100,9 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
      * pipeline fits 2048 rows in the same AFDM as 256 final sixteen-cell rows. */
     unsigned capacity=worker?QS_RESULT_ROWS*QS_OUT/(columns?columns:1):QS_RESULT_ROWS;
 produce:
+    /* STORE reentry must finish consuming the retained output before the
+     * producer overwrites it with another batch. */
+    if(worker && s->sort_sink && s->pending_sort==s->sort_sink) goto produced;
     if(worker && s->group_sink) {
         unsigned id=s->group_sink-1;
         status=projection_init(s,id); if(status<0) goto produced;
@@ -3112,6 +3161,31 @@ produce:
         ++out->rows;
     }
 produced:
+    if(worker && s->sort_sink && status>=0 && status<=2 &&
+       (out->rows || out->finished || s->pending_sort==s->sort_sink)) {
+        struct sorted_rows *local=s->sort_sink;
+        if(s->pending_sort!=local) local->producer_status=status;
+        local->batch=out; out->begin=0;
+        unsigned rows=out->rows;
+        uint64_t tick=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
+        status=sort_call(s,local,0);
+        if(!status) {
+            if(out->finished) {
+                uint64_t wall=s->profiling?now_ns(CLOCK_MONOTONIC):0;
+                uint64_t cpu=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
+                qs_sort_finish_sink(local->task.state);
+                if(s->profiling) {
+                    struct qs_timing *t=&s->profile.operators[QS_SORT_SINK];
+                    t->wall_ns+=now_ns(CLOCK_MONOTONIC)-wall; t->cpu_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-cpu;
+                }
+            }
+            local->batch=NULL; out->rows=0;
+            status=out->finished?0:local->producer_status;
+            if(s->profiling) s->sink_rows+=rows;
+        }
+        if(s->profiling) s->sink_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-tick;
+        if(s->host_scan && !out->rows && status==2) goto produce;
+    }
     if(worker && (s->hash_sink || s->group_sink || s->aggregate_sink) && status>=0 && status<=2) {
         uint64_t cpu=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
         unsigned rows=out->rows;

@@ -667,21 +667,26 @@ PG保留原选定Join树，做有语义条件的局部rewrite；SQL程序执行H
 
 Index单行/SEMI/ANTI路径与Join残余条件、Merge Join、复杂DISTINCT和过宽聚合状态及排序边界仍有逐行适配；页请求虽可由回调续交，仍需读取元数据和主机extent映射；部分阻塞推进仍依赖协调端。共享字典保留原容量上限，自身尚无spill；真正耗尽预算或上限会返回错误，不能宣称任意大小字符串查询及低内存形态全部覆盖。共享字典串行写入、全链路列化和整体CU利用率仍有优化空间，完整基线22条加速不代表这些基础改造已全部完成。当前证据不要求扩容FDM。
 
-## 排序输入直接消费 CU 批次
+## Sort Sink：CU 局部 run 与统一归并
 
-`aba553858` 中的设备执行器保留未消费的 CU 输出，直接交给 Sort Sink；spill 重入结束后才归还槽。原先逐行取出、填充定长中间行再写入 run 的过程改为批量复制。排序算法及协调端执行位置不变，PG、SNIA 和固件接口不变。
+设备 SQL 执行器直接将生产者的紧凑行批次交给排序，减少逐行取出、填充定长中间行再写入 run 的适配。参照仓库 DuckDB `physical_order.cpp` 的局部 Sink 状态及 Combine/Finalize 分工，Sort 直接消费并行流水线时，各 CU 在自身调用内生成有序 run，EOF 时排好最后一个未满 run，协调端只保留状态句柄，交给既有 Sort Source 统一归并。批次 STORE 重入结束前不覆盖输入，并保留生产者的等待 I/O 状态。
 
-Q16 使用标准 SQL，在 8 CU、256MiB workmem、64MiB FDM 下分别测量三次，每次重启 PG 并清除 Guest page cache。六次普通查询结果均与验收 host 输出一致。普通查询和独立 profile 的中位数如下；原始记录位于 [sort-batch](../../../../results/sort-batch/)。
+局部排序 context 挂在根查询 workmem 下，存活时间跨过工作 CU 状态的释放；每个局部状态沿用原排序上限，实际总占用仍受同一查询预算约束，不按 CU 数平分总预算。启动前实际分配各槽的首个 run，放不下时释放新增局部状态，保留原并行生产、协调端排序路径。空闲 CU 在结束时释放未使用的首个 run；正常输出、取消和错误清理都处理整组排序状态。临时 token 继续使用既有通用 spill 协议。PG、SNIA、FEMU 及共享参数布局均不变，没有新增设备命令或 SQL 固件逻辑。
 
-| 指标 | 修改前 | 批次直传 |
+Q16 使用标准 SQL，在 8 CU、256MiB workmem、64MiB FDM 下分别测量三次，每次重启 PG 并清除 Guest page cache；六次结果均与验收 host 输出一致。下表普通查询为三次中位数，阶段数据来自各一次独立 profile，不能将阶段差值当作稳定加速比例。原始记录见 [local-sort](../../../../results/local-sort/)。
+
+| 指标 | 协调端 Sort Sink | CU 局部 Sort Sink |
 | --- | ---: | ---: |
-| 普通查询 | 390.709ms | 387.171ms |
-| profile 查询树 | 326.202ms | 331.367ms |
-| Sort Sink 累计 CPU | 36.033ms | 35.846ms |
-| Sort Source 累计 CPU | 10.044ms | 12.376ms |
-| 排序输入流水线墙钟 | 40.521ms | 40.041ms |
-| 其中协调端 CPU | 37.189ms | 35.906ms |
+| 普通查询中位数 | 415.916ms | 396.465ms |
+| profile 查询树 | 345.048ms | 305.774ms |
+| 排序输入流水线墙钟 | 47.674ms | 15.887ms |
+| 其中协调端 CPU | 43.722ms | 0.032ms |
+| 平均 CU 数 | 1.03 | 3.50 |
+| CU Sink 消费行数 | 0 | 18134 |
+| Sort Sink 累计 CPU | 43.648ms | 47.468ms |
+| Sort Source 累计 CPU | 11.624ms | 12.921ms |
+| 查询 workmem 峰值 | 30797104 字节 | 30863680 字节 |
 
-总延迟基本持平，不能宣称显著加速；Source 的样本 CPU 还有上升。两组均无 spill，AFDM 为 40697840 字节、Heap 行数 1010000、内部读取 53370880 字节，workmem 峰值约 29.3–29.6MiB。主要排序 CPU 仍在协调端，因此下一步应让 CU 完成局部 Sort Sink 和未满 run 的收尾，再交给统一 Source 归并。
+普通查询中位数降低约 4.7%，排序阶段墙钟降低，但累计排序 CPU 增加；不能称为 CPU 工作量下降或持续用满 8 CU。两组均无 spill，AFDM 均为 40697840 字节，没有扩大 FDM。Sort Source 归并仍串行，隐式排序、分区 Hash 回退及无法建立局部状态的路径仍使用原适配；这一步没有覆盖所有阻塞算子的并行。
 
-本阶段 [8 条相关标准查询](../../../../results/tpch.D5qwGm/timings.csv)（Q2/3/10/11/13/16/18/21）均结果一致、完整卸载且快于 host。这是针对性回归，不能替代最终版本的 22 条验收。设备 9 项相关 CTest 及 ASan/UBSan/LeakSanitizer 的 NativePlan、8 CU、ExternalSort 通过；另增加真实并行 Scan→Sort 的 8MiB 预算测试，强制在尚持有 CU 输出时 STORE，检查全部 50003 行、重入后继续消费、token 和 workmem 回收，并通过原生及 8 CU 内存检查。
+本阶段 [8 条相关标准查询](../../../../results/tpch.FkJdLF/timings.csv)（Q2/3/10/11/13/16/18/21）均结果一致、完整卸载且快于 host，是针对性回归，不能替代最终版本的 22 条验收。设备 NativePlan、8/16/64 CU、ExternalSort、4MiB 排序及查询预算共 7 项 CTest 通过；ASan/UBSan/LeakSanitizer 检查覆盖原生计划、8 CU 和外部排序，最终清理改动另通过 8 CU 检查。Scan→Sort 的 4/8MiB 查询预算测试校验全部 50003 行、工作 CU 的 STORE 重入、Source 的 LOAD/FREE、局部 Sink 消费计数、token 和 workmem 回收，以及准备完局部 run 后取消的清理。

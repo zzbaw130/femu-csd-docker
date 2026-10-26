@@ -340,6 +340,44 @@ static int row_init(struct qs_task *task,const struct qs_plan *p,struct row_sort
     }
     task->state=(uintptr_t)s; *out=s; return 0;
 }
+/* Allocate a run without consuming input. Parallel SQL pipelines use this to
+ * establish each local sink before any worker starts producing rows. */
+static int row_reserve(struct row_sort *s)
+{
+    if(s->count==s->capacity) {
+        unsigned capacity=s->capacity?s->capacity*2:8;
+        void *runs=cs_work_realloc(s->context,s->runs,capacity*sizeof(*s->runs));
+        if(!runs) return -4;
+        s->runs=runs; s->capacity=capacity;
+    }
+    unsigned n=s->bounded?s->topn:s->run_rows;
+    struct cs_work_context_stats memory;
+    if(cs_work_get_context_stats(s->context,&memory) ||
+       memory.limit_bytes-memory.used_bytes<(size_t)n*s->row_bytes+QS_SORT_IO_BYTES+4096) return -4;
+    unsigned blocks=(n+s->block_rows-1)/s->block_rows;
+    size_t token_bytes=(blocks*sizeof(uint64_t)+_Alignof(struct qs_cell)-1)&~(size_t)(_Alignof(struct qs_cell)-1);
+    uint64_t *tokens=cs_work_calloc(s->context,1,token_bytes+s->row_bytes);
+    if(!tokens) return -4;
+    void *data=cs_work_alloc(s->context,(size_t)n*s->row_bytes);
+    if(!data) { cs_work_free(s->context,tokens); return -4; }
+    struct row_run *r=&s->runs[s->count++];
+    *r=(struct row_run){.data=data,.owner=s->context,.blocks=tokens,.nblocks=blocks,
+        .head=(void *)((char *)tokens+token_bytes)};
+    return 0;
+}
+/* Private SQL composition helpers; neither is a CSF/device command. */
+int qs_sort_prepare(uint64_t state)
+{ return row_reserve((void *)(uintptr_t)state); }
+void qs_sort_finish_sink(uint64_t state)
+{
+    struct row_sort *s=(void *)(uintptr_t)state;
+    for(unsigned i=0;i<s->count;++i) {
+        struct row_run *r=&s->runs[i];
+        if(r->rows) run_sort(s,r);
+        else { cs_work_free(r->owner,r->data); r->data=NULL; r->sorted=1; }
+    }
+    cs_work_free(s->context,s->vectors); s->vectors=NULL;
+}
 /* chunk, plan, task(handle output), spill I/O. Reentry resumes this input chunk. */
 int64_t pg_sina_sort_sink(struct femu_csd_args *a)
 {
@@ -367,30 +405,11 @@ int64_t pg_sina_sort_sink(struct femu_csd_args *a)
         if(s->bounded && !s->topn) { s->input_position=selected; break; }
         struct row_run *r=s->count?&s->runs[s->count-1]:NULL;
         if(!r || (!s->bounded && r->sorted)) {
-            if(s->count==s->capacity) {
-                unsigned capacity=s->capacity?s->capacity*2:8;
-                void *runs=cs_work_realloc(s->context,s->runs,capacity*sizeof(*s->runs));
-                if(!runs) return row_evict(s,s->context,a);
-                s->runs=runs; s->capacity=capacity;
-            }
-            unsigned n=s->bounded?s->topn:s->run_rows;
             /* Budget for the next run, not a fixed free-memory percentage.
              * Leave one I/O block plus allocation overhead for merge/metadata.
              * Allocation failure still handles fragmentation/global pressure. */
-            struct cs_work_context_stats memory;
-            if(cs_work_get_context_stats(s->context,&memory)) return -4;
-            if(memory.limit_bytes-memory.used_bytes<(size_t)n*s->row_bytes+QS_SORT_IO_BYTES+4096)
-                return row_evict(s,s->context,a);
-            unsigned blocks=(n+s->block_rows-1)/s->block_rows;
-            size_t token_bytes=(blocks*sizeof(uint64_t)+_Alignof(struct qs_cell)-1)&~(size_t)(_Alignof(struct qs_cell)-1);
-            /* Keep the merge head next to its token array, sized to the
-             * projected row rather than sixteen cells for every run. */
-            uint64_t *tokens=cs_work_calloc(s->context,1,token_bytes+s->row_bytes);
-            if(!tokens) return row_evict(s,s->context,a);
-            void *data=cs_work_alloc(s->context,(size_t)n*s->row_bytes);
-            if(!data) { cs_work_free(s->context,tokens); return row_evict(s,s->context,a); }
-            r=&s->runs[s->count++]; memset(r,0,sizeof(*r)); r->data=data; r->owner=s->context; r->blocks=tokens; r->nblocks=blocks;
-            r->head=(void *)((char *)tokens+token_bytes);
+            if(row_reserve(s)) return row_evict(s,s->context,a);
+            r=&s->runs[s->count-1];
         }
         unsigned count=selected-s->input_position;
         if(count>QS_VECTOR_ROWS) count=QS_VECTOR_ROWS;
