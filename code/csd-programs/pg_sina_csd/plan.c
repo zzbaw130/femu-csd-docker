@@ -19,6 +19,7 @@ extern int64_t pg_sina_sort_source_impl(struct femu_csd_args *);
 extern void qs_sort_dictionary(uint64_t,struct qs_dict *);
 extern int qs_sort_prepare(uint64_t);
 extern void qs_sort_finish_sink(uint64_t);
+extern int64_t qs_sort_sink_columns(struct femu_csd_args *,const struct qs_plan *,const struct qs_vector *,unsigned,unsigned);
 #define QP_WAIT 1
 /* Store PG integer/date widths directly; numeric and other values retain all
  * 128 bits. Keep scale/dscale/NULL, and avoid unaligned integer accesses. */
@@ -61,6 +62,7 @@ static void hash_load(struct qs_cell *to,const unsigned char *from,const struct 
         else { to[i].scale=from[bytes]; to[i].dscale=from[bytes+1]; to[i].isnull=from[bytes+2]; from+=bytes+3; }
     }
 }
+struct projection_batch;
 struct sorted_rows {
     struct qs_plan plan;
     struct qs_task task;
@@ -68,6 +70,7 @@ struct sorted_rows {
     struct qs_result *input,*output;
     struct qs_result *batch; /* Borrowed CU output, retained across spill. */
     unsigned batch_worker;
+    struct projection_batch *columns; /* Borrowed producer vectors, retained across spill. */
     unsigned position;
     int initialized, complete, drained, input_pending, producer_status;
     unsigned char *prefix;
@@ -229,6 +232,8 @@ static size_t vector_offset(const struct execution *s,const struct qp_node *n)
 static int64_t parallel_next(struct execution *,unsigned,struct qs_cell *);
 static int projection_init(struct execution *,unsigned,int);
 static int64_t projection_next(struct execution *,unsigned,struct qs_cell *,int);
+static int64_t projection_fill(struct execution *,unsigned,int);
+static int64_t sort_sink_columns(struct execution *,struct sorted_rows *,unsigned);
 static int64_t projection_group_fill(struct execution *,struct projection_batch *);
 static int aggregate_sink_vectors(struct execution *,unsigned);
 static int64_t timed_call(struct execution *s,int64_t (*call)(struct femu_csd_args *),struct femu_csd_args *a,unsigned op)
@@ -391,6 +396,11 @@ static int project_filtered(struct execution *s,const struct qp_node *n,const st
 static int project(struct execution *s,const struct qp_node *n,const struct qs_cell *input,
     const struct qs_cell *aggregates,struct qs_cell *row)
 { return project_filtered(s,n,input,aggregates,row,0); }
+static int64_t sort_columns_call(struct femu_csd_args *a)
+{
+    const struct projection_batch *b=a->mr_addr[0];
+    return qs_sort_sink_columns(a,&b->plan,b->vectors,b->position,b->count);
+}
 static int64_t sort_call(struct execution *s,struct sorted_rows *sort,int source)
 {
     void *mr[4]; long long len[4];
@@ -400,11 +410,14 @@ static int64_t sort_call(struct execution *s,struct sorted_rows *sort,int source
         mr[1]=sort->output; len[1]=sizeof(*sort->output); mr[2]=s->io; len[2]=s->io_bytes;
     } else {
         sort->plan.ordered_rows=sort->batch?3:2; /* Packed CU rows or padded scalar rows. */
-        mr[0]=sort->batch?sort->batch:sort->input; len[0]=sizeof(*sort->input); mr[1]=&sort->plan; len[1]=sizeof(sort->plan);
+        mr[0]=sort->columns?(void *)sort->columns:sort->batch?(void *)sort->batch:sort->input;
+        len[0]=sizeof(*sort->input); mr[1]=&sort->plan; len[1]=sizeof(sort->plan);
         mr[2]=&sort->task; len[2]=sizeof(sort->task); mr[3]=s->io; len[3]=s->io_bytes;
     }
     if(s->pending_sort==sort) { a.cparam2=s->args->cparam2; s->pending_sort=NULL; }
-    int64_t status=timed_call(s,source?pg_sina_sort_source_impl:pg_sina_sort_sink_impl,&a,source?QS_SORT_SOURCE:QS_SORT_SINK);
+    int64_t (*call)(struct femu_csd_args *)=source?pg_sina_sort_source_impl:
+        sort->columns?sort_columns_call:pg_sina_sort_sink_impl;
+    int64_t status=timed_call(s,call,&a,source?QS_SORT_SOURCE:QS_SORT_SINK);
     if(status>0) s->pending_sort=sort;
     if(source && !status) {
         const struct qs_metrics *m=&sort->output->metrics,*old=&sort->metrics;
@@ -485,6 +498,16 @@ static int64_t sorted_input(struct execution *s,struct sorted_rows *sort,unsigne
                 continue;
             }
             /* 3 means this producer selected its ordinary scalar fallback. */
+        }
+        if(!sort->input->rows && sort->prefix_position==sort->prefix_rows &&
+           !(!s->worker && s->plan->workers>1 && input->parallel)) {
+            status=sort_sink_columns(s,sort,child);
+            if(status!=3) {
+                if(status) return status;
+                sort->complete=1;
+                if(!sort->group.count) { sort->group.count=1; sort->group.states[0]=sort->task.state; }
+                cs_work_free(s->context,sort->input); sort->input=NULL; break;
+            }
         }
         if(sort->prefix_position<sort->prefix_rows) {
             hash_load(sort->input->data[sort->input->rows].cells,
@@ -1808,6 +1831,32 @@ static int64_t projection_fill(struct execution *s,unsigned id,int source)
         }
     }
     return 2;
+}
+/* Feed one producer's evaluated columns straight into the existing run
+ * storage. Keep the batch and cursor fixed until its spill request completes. */
+static int64_t sort_sink_columns(struct execution *s,struct sorted_rows *sort,unsigned id)
+{
+    int source=s->plan->nodes[id].kind==QP_AGGREGATE;
+    int status=projection_init(s,id,source); if(status) return status;
+    struct projection_batch **slot=source?&s->nodes[id].source_projection:&s->nodes[id].projection;
+    while(*slot) {
+        if(sort->columns) {
+            struct projection_batch *b=sort->columns; unsigned count=b->count-b->position;
+            /* Runs outlive this producer batch; retain text as dictionary IDs. */
+            for(unsigned col=0;col<b->plan.nout;++col)
+                if(qs_vector_materialize_text(&b->vectors[b->plan.outputs[col].index],b->count,s->dictionary)) return -3;
+            uint64_t tick=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
+            int64_t result=sort_call(s,sort,0);
+            if(s->profiling && s->worker) s->sink_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-tick;
+            if(result) return result;
+            b->position=b->count; sort->columns=NULL; s->metrics.matched+=count;
+            if(s->profiling && s->worker) s->sink_rows+=count;
+        }
+        int64_t ready=projection_fill(s,id,source);
+        if(ready!=2) return ready;
+        sort->columns=*slot;
+    }
+    return 3; /* Unsupported producer keeps its original row cursor. */
 }
 static int64_t projection_next(struct execution *s,unsigned id,struct qs_cell *row,int source)
 {
@@ -3819,7 +3868,7 @@ produce:
     }
     /* STORE reentry must finish consuming the retained output before the
      * producer overwrites it with another batch. */
-    if(worker && s->sort_sink && s->pending_sort==s->sort_sink) goto produced;
+    if(worker && s->sort_sink && s->pending_sort==s->sort_sink && !s->sort_sink->columns) goto produced;
     /* A spilled-partition Source retains its original row cursor. Resident
      * groups can now expose finalized columns without reopening their input. */
     if(worker && s->hash_sink && (s->source_node!=(int)s->root || plan->nodes[s->root].kind==QP_AGGREGATE)) {
@@ -3885,6 +3934,14 @@ produce:
         }
         status=2;
     }
+    if(worker && s->sort_sink) {
+        status=sort_sink_columns(s,s->sort_sink,s->root);
+        if(status!=3) {
+            if(!status) out->finished=control->finished=1;
+            goto produced;
+        }
+        status=2;
+    }
     while(status>=0 && status!=QP_WAIT && status<=2 && out->rows<capacity) {
         struct qs_cell *row=worker?(struct qs_cell *)out->data+(size_t)out->rows*columns:out->data[out->rows].cells;
         status=next_row(s,worker?(int)s->root:(int)plan->root,row);
@@ -3902,7 +3959,7 @@ produce:
         ++out->rows;
     }
 produced:
-    if(worker && s->sort_sink && status>=0 && status<=2 &&
+    if(worker && s->sort_sink && !s->sort_sink->columns && status>=0 && status<=2 &&
        (out->rows || out->finished || s->pending_sort==s->sort_sink)) {
         struct sorted_rows *local=s->sort_sink;
         if(s->pending_sort!=local) local->producer_status=status;

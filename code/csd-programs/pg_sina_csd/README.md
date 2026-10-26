@@ -60,7 +60,7 @@ Source也可直接作为Hash Build、外层聚合或Sort的输入，不要求中
 - Index Only Scan：冻结镜像中支持前两个整数索引列，直接输出键和 NULL 位图，不请求 Heap 页。需要索引顺序时沿叶链读取；无需顺序时各 CU 动态领取互不重叠的物理页范围，只处理叶页，跳过内部页和已删除页。每个 CU 使用私有游标、页缓存和列批次；不支持的覆盖列仍走回表或原回退路径。
 - Aggregate：扫描或等值连接输出上的 SUM/AVG/COUNT/MIN/MAX 可共同使用有界 Hash 表聚合，支持多键（包括字符串、numeric、NULL）及聚合参数的算术表达式；LEFT JOIN 补出的 NULL 不计入 COUNT(列)，COUNT(*) 则计入行数。每组按实际聚合数保存值/count（SUM/AVG 为精确和，MIN/MAX 为极值）；一次定位分组后更新所有聚合，AVG 在最终输出时才相除。spill 保存每个聚合的值/count，分组键数加两倍聚合数须不超过现有16列中间行容量，超出时保留排序聚合。整数和字符串字典 ID 按 64 位保存，NULL 使用位图；numeric 键保留完整精度。按 PG 分组估计和实际预算预留；阻塞子输入尚未完成或缺少合适估计时从 128 槽增长。并行输入可使用前述局部表和 Combine，预算不足时共享表保护并发更新；DISTINCT 仍对合并后的键精确去重，不能把各 CU 的 DISTINCT 计数相加。满表的原始行保留在 AFDM，当前 CU 都暂停后协调端扩容或 spill。聚合同时预留将启动的 worker 状态及 spill 空间；实际无法容纳时该段串行执行。需要 ORDER BY 时在聚合后排序；预算不足时归并部分状态，不重读明细。COUNT DISTINCT 的精确键投影先按“分组键＋参数”做 Hash 去重，再 COUNT 非 NULL 参数；不覆盖的形态保留排序去重。任意组合的 SUM/AVG/COUNT/MIN/MAX、分组和 HAVING 仍可走原有流式或外部排序聚合。
   已按键有序的输入可用列批次执行流式分组：先批量计算键和聚合参数，再按连续同键区间更新原累加器，不建立Hash表。COUNT(*)按区间长度累计，COUNT(列)仅在整批确认无NULL/错误时使用同一快速路径；其余情况逐值检查。当前组可跨向量、Sort Source及I/O等待继续累计，下一组首行保留在批次中。完成的组交给前述Source列批次执行HAVING和输出表达式，最终返回格式不变；DISTINCT、不支持的输入及尚未排序的形态保留原路径。所有新增临时列均计入查询workmem，不增加FDM或改变SNIA/固件协议。
-- Sort/Limit：source 跳过没有生成 run 的空闲槽，全空输入正常返回空结果；复用 `sort.c` 的有界工作内存 run 和分批归并，完整处理输入、OFFSET/LIMIT、提前结束与回收。
+- Sort/Limit：串行及CU局部Sink可直接读取生产者的表达式列批次，按列写入已有run，不再先逐行拷贝到中间结果缓冲。spill重入期间保留同一批次和输入位置，消费完成后才推进生产者；文本先保存为查询字典ID，宽numeric、动态精度和NULL保持不变。不支持的生产者继续使用原行输入，TopN沿用有界堆。source 跳过没有生成 run 的空闲槽，全空输入正常返回空结果；复用 `sort.c` 的有界工作内存 run 和分批归并，完整处理输入、OFFSET/LIMIT、提前结束与回收。
 - CTE/InitPlan：共享 CTE 在设备计算一次并暂存，读者各自持有游标；标量初始化结果保存在设备参数数组。整数 IN/NOT IN 集合保留 NULL 和空集合语义。
 
 所有动态算法状态从 `libcs-workmem` 分配。通用查询先建立受 `max_memory` 限制的根 context；排序、索引子 context 同时计入根配额和全局池。Hash 表、run、归并游标不能放入 AFDM 来绕开工作内存上限。

@@ -866,3 +866,24 @@ NativePlan及8/16/64 CU四项CTest、ASan/UBSan/LeakSanitizer原生与8CU两项�
 五条均逐字节匹配、顶层CSD计划且没有PG子执行节点，并快于同轮host；10次测量均有独立冷启动标记。另以临时PGOPTIONS关闭hashjoin、nestloop、hashagg，仅用于开发检查规范Q13的实际Merge Join→流式Aggregate路径：[结果](../../../../results/tpch.xh9X7L/timings.csv)正确且完整卸载，host2535.057ms、CSD1627.360ms。该选项未写入配置，不替代默认验收。本轮未重跑完整22条，也未进行旧、新SO多轮对照，不将这些延迟当作本次改动的固定收益。
 
 字符串字典spill、排序及spill归并并行化和部分阻塞阶段主机续交仍未完成；本阶段补齐聚合输出的列批次接续，不代表整树所有边界均已向量化。
+
+
+## 排序Sink直接消费表达式列批次
+
+参考DuckDB PhysicalOrder::Sink将DataChunk交给局部排序状态的方式，通用设备计划的串行及CU局部Sort Sink现在直接借用Scan、Projection、Join、Sort及Aggregate Source已有的表达式列批次，按列写入原run存储；不先调用逐行next_row填充中间结果缓冲，再复制到run。列入口只是设备SQL SO内部的函数，沿用原排序状态、TopN堆、spill及归并，没有新增NVMe命令、SNIA API或AFDM布局。文本在run保留前转成查询字典ID；源批次、位置及spill重入保持绑定，消费完才允许覆盖。不支持的生产者继续用原行输入。
+
+组件NativePlan及8/16/64 CU四项通过；排序7种配置均通过，新增列输入覆盖非零起点、步长引用、NULL、每值精度、TopN/OFFSET、实际spill和取消。ASan/UBSan/LeakSanitizer原生、8CU和4MiB排序三项通过；最终补充文本生命周期处理后，四项计划组件及8CU消毒器再次通过。所有用例继续断言预算与资源回收。
+
+只部署设备计划和排序SO，资源保持8 CU、256MiB workmem、64MiB FDM。[规范冷启动回归](../../../../results/tpch.t1h08k/timings.csv)：
+
+| 查询 | host ms | CSD ms |
+| --- | ---: | ---: |
+| Q3 | 3069.613 | 863.407 |
+| Q10 | 2497.916 | 1005.541 |
+| Q13 | 1183.502 | 345.357 |
+| Q18 | 7261.582 | 1093.595 |
+| Q21 | 2199.629 | 979.156 |
+
+五条均逐字节匹配、完整卸载且快于同轮host；每次测量独立清除PG缓冲和Guest page cache。Q10另记录旧、新各一次冷启动profile：[旧版](../../../../results/sort-columns.bbZceW/10.before.profile.log)、[新版](../../../../results/sort-columns.bbZceW/10.after.profile.log)。总CSF CPU为4753.891/3945.241ms，workmem峰值204013456/203682160字节，两次均无spill。Sort Sink CPU为30.002/38.277ms：原先生产者侧的逐行复制未计入该项，新版直接写run已计入，因此这项不是相同计时边界；不能据此认定排序计算退化。扫描与调度也有变化，单次样本不足以把总CPU下降归因于本次改动，不宣称稳定延迟收益。
+
+本阶段去掉输入中间行，不改变run的行存储和串行归并。字符串字典spill、归并并行化及部分阻塞阶段主机续交继续保留为未完成项，本轮未重复全量22条。

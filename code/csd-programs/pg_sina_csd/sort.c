@@ -379,7 +379,8 @@ void qs_sort_finish_sink(uint64_t state)
     cs_work_free(s->context,s->vectors); s->vectors=NULL;
 }
 /* chunk, plan, task(handle output), spill I/O. Reentry resumes this input chunk. */
-int64_t pg_sina_sort_sink(struct femu_csd_args *a)
+static int64_t row_sink(struct femu_csd_args *a,const struct qs_plan *columns,
+    const struct qs_vector *vectors,unsigned begin,unsigned end)
 {
     if(!a || a->numr!=4 || a->mr_len[1]<(long long)sizeof(struct qs_plan) ||
         a->mr_len[2]<(long long)sizeof(struct qs_task) || a->mr_len[3]<QS_SORT_IO_BYTES) return -1;
@@ -389,15 +390,16 @@ int64_t pg_sina_sort_sink(struct femu_csd_args *a)
      * consumed producer position. Both layouts contain evaluated cells. */
     int packed=p->ordered_rows==3,row_input=p->ordered_rows==2 || packed;
     if(!p->nout || p->nout>QS_OUT || p->nexprs>QS_EXPRS || p->norder>QS_OUT ||
-        (row_input?(a->mr_len[0]<(long long)sizeof(*rows) ||
+        (!columns && (row_input?(a->mr_len[0]<(long long)sizeof(*rows) ||
           rows->rows>(packed?QS_RESULT_ROWS*QS_OUT/p->nout:QS_RESULT_ROWS) || (packed && rows->begin>rows->rows)):
          (a->mr_len[0]<(long long)sizeof(*c) || c->selected>c->rows || c->rows>c->capacity ||
-          qs_chunk_bytes(c->capacity,c->ncols)>(uint64_t)a->mr_len[0]))) return -1;
-    unsigned selected=row_input?rows->rows-(packed?rows->begin:0):c->selected;
+          qs_chunk_bytes(c->capacity,c->ncols)>(uint64_t)a->mr_len[0])))) return -1;
+    if(columns && (columns->nout!=p->nout || begin>end || end>QS_VECTOR_ROWS)) return -1;
+    unsigned selected=columns?end-begin:row_input?rows->rows-(packed?rows->begin:0):c->selected;
     struct row_sort *s=(void *)(uintptr_t)task->state;
     if(!s) { int status=row_init(task,p,&s); if(status) return status; }
     if(!csIsReentry(a)) {
-        s->input_position=0; s->metrics.scanned+=row_input?selected:c->rows; s->metrics.matched+=selected;
+        s->input_position=0; s->metrics.scanned+=columns || row_input?selected:c->rows; s->metrics.matched+=selected;
         s->metrics.input_bytes+=task->input_bytes; ++s->metrics.chunks;
     }
     int64_t status=row_resume(s,a); if(status) return status;
@@ -414,8 +416,18 @@ int64_t pg_sina_sort_sink(struct femu_csd_args *a)
         unsigned count=selected-s->input_position;
         if(count>QS_VECTOR_ROWS) count=QS_VECTOR_ROWS;
         if(!s->bounded && count>s->run_rows-r->rows) count=s->run_rows-r->rows;
-        if(!row_input && qs_vector_execute(p,c,qs_selection(c),s->input_position,count,s->needed,s->vectors)) return -5;
-        if(row_input && !s->bounded) {
+        if(!columns && !row_input && qs_vector_execute(p,c,qs_selection(c),s->input_position,count,s->needed,s->vectors)) return -5;
+        if(columns && !s->bounded) {
+            for(unsigned col=0;col<p->nout;++col) {
+                unsigned expr=columns->outputs[col].index;
+                for(unsigned i=0;i<count;++i) {
+                    unsigned at=begin+s->input_position+i;
+                    if(vectors[expr].errors[at]) return -5;
+                    run_row(s,r,r->rows+i)[col]=qs_vector_cell(columns,vectors,expr,at);
+                }
+            }
+            r->rows+=count;
+        } else if(row_input && !s->bounded) {
             if(packed) memcpy(run_row(s,r,r->rows),(struct qs_cell *)rows->data+
                 (size_t)(rows->begin+s->input_position)*p->nout,(size_t)count*s->row_bytes);
             else for(unsigned i=0;i<count;++i)
@@ -424,7 +436,13 @@ int64_t pg_sina_sort_sink(struct femu_csd_args *a)
         } else
         for(unsigned i=0;i<count;++i) {
             struct qs_cell row[QS_OUT];
-            if(row_input) memcpy(row,packed?(struct qs_cell *)rows->data+
+            if(columns) {
+                for(unsigned col=0;col<p->nout;++col) {
+                    unsigned expr=columns->outputs[col].index,at=begin+s->input_position+i;
+                    if(vectors[expr].errors[at]) return -5;
+                    row[col]=qs_vector_cell(columns,vectors,expr,at);
+                }
+            } else if(row_input) memcpy(row,packed?(struct qs_cell *)rows->data+
                 (size_t)(rows->begin+s->input_position+i)*p->nout:rows->data[s->input_position+i].cells,s->row_bytes);
             else for(unsigned col=0;col<p->nout;++col) {
                 unsigned expr=p->outputs[col].index;
@@ -450,6 +468,13 @@ int64_t pg_sina_sort_sink(struct femu_csd_args *a)
     }
     return 0;
 }
+int64_t pg_sina_sort_sink(struct femu_csd_args *a)
+{ return row_sink(a,NULL,NULL,0,0); }
+/* Private same-SO composition: already evaluated columns, not a new MR layout
+ * or CSF entry. The producer retains these vectors through spill reentry. */
+int64_t qs_sort_sink_columns(struct femu_csd_args *a,const struct qs_plan *columns,
+    const struct qs_vector *vectors,unsigned begin,unsigned end)
+{ return row_sink(a,columns,vectors,begin,end); }
 static int heap_compare(const struct row_sort *s,unsigned a,unsigned b)
 { return row_compare(s->heap[a]->head,s->heap[b]->head,&s->plan,s->dictionary); }
 

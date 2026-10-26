@@ -91,7 +91,7 @@ endif()
 
 if(BUILD_TESTING)
     add_executable(pg-sina-sort-test tests/sort.c)
-    target_include_directories(pg-sina-sort-test PRIVATE "${CSD_FEMU_INCLUDE}"
+    target_include_directories(pg-sina-sort-test PRIVATE "${CSD_FEMU_INCLUDE}" "${CMAKE_CURRENT_SOURCE_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
     target_compile_options(pg-sina-sort-test PRIVATE -UNDEBUG)
     target_link_libraries(pg-sina-sort-test PRIVATE cs-workmem ${CMAKE_DL_LIBS})

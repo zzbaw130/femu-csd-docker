@@ -3,13 +3,25 @@
 #include "femu-csd-kernel.h"
 #include "cs_csf.h"
 #include "cs_workmem.h"
-#include "query.h"
+#include "query_vector.h"
 #include <assert.h>
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 typedef int64_t (*function)(struct femu_csd_args *);
+typedef int64_t (*columns_function)(struct femu_csd_args *,const struct qs_plan *,const struct qs_vector *,unsigned,unsigned);
+static columns_function columns_sink;
+/* Borrow evaluated cells with a nonzero begin and a column stride. The
+ * operator must retain input_position while this same batch spills. */
+static int64_t sink_columns(struct femu_csd_args *a)
+{
+    const struct qs_plan *p=a->mr_addr[1]; const struct qs_result *in=a->mr_addr[0];
+    struct qs_vector vectors[3]={0};
+    for(unsigned col=0;col<3;++col)
+        vectors[col]=(struct qs_vector){.kind=QS_CELLS,.cells=(const struct qs_cell *)in->data+col,.cell_stride=3};
+    return columns_sink(a,p,vectors,in->begin,in->rows);
+}
 static void *blocks[8192];
 static unsigned next_token=1,stored,loaded,workers=4;
 static size_t capacity=8U*1024*1024,budget=8U*1024*1024;
@@ -61,9 +73,9 @@ static void check(function sink,function source,unsigned rows,int64_t limit,int6
     c->capacity=1001; c->ncols=3;
     void *io=calloc(1,QS_SORT_IO_BYTES); assert(io);
     struct qs_task tasks[QS_WORKERS]={{0}}; struct qs_profile counters[QS_WORKERS]={0};
-    unsigned chunk=0;
-    for(unsigned first=0;first<rows;first+=1001) {
-        unsigned n=rows-first; if(n>1001) n=1001;
+    unsigned chunk=0,chunk_rows=packed==2?QS_VECTOR_ROWS-7:1001;
+    for(unsigned first=0;first<rows;first+=chunk_rows) {
+        unsigned n=rows-first; if(n>chunk_rows) n=chunk_rows;
         memset(qs_nulls(c),0,((c->capacity+7)/8)*3); c->rows=c->selected=n;
         for(unsigned i=0;i<n;++i) {
             unsigned key=(uint64_t)(rows-1-first-i)*1009%rows; qs_values(c)[i]=key;
@@ -145,6 +157,10 @@ int main(int argc,char **argv)
     assert(capacity && budget && !cs_work_init(capacity));
     void *so=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(so);
     function sink=(function)dlsym(so,"pg_sina_sort_sink"),source=(function)dlsym(so,"pg_sina_sort_source"); assert(sink && source);
+    columns_sink=(columns_function)dlsym(so,"qs_sort_sink_columns"); assert(columns_sink);
+    check(sink_columns,source,262147,-1,0,0,0,2);
+    check(sink_columns,source,262147,17,5,0,0,2);
+    check(sink_columns,source,262147,-1,0,1,0,2);
     check(sink,source,0,-1,0,0,0,0);
     check(sink,source,5003,-1,0,0,0,0);
     check(sink,source,262147,-1,0,0,1,0);
