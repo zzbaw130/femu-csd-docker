@@ -154,6 +154,12 @@ if(BUILD_TESTING)
 endif()
 
 if(BUILD_TESTING)
+    add_executable(pg-sina-index-dictionary-test tests/index_dictionary.c index_scan.c scan.c dictionary.c)
+    target_include_directories(pg-sina-index-dictionary-test PRIVATE "${CSD_FEMU_INCLUDE}" "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
+    target_compile_options(pg-sina-index-dictionary-test PRIVATE -UNDEBUG)
+    target_link_libraries(pg-sina-index-dictionary-test PRIVATE cs-workmem)
+    add_test(NAME pgSinaDictionaryIndex COMMAND pg-sina-index-dictionary-test)
     add_executable(pg-sina-index-scan-test tests/index_scan.c)
     target_include_directories(pg-sina-index-scan-test PRIVATE "${CSD_FEMU_INCLUDE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
     target_compile_options(pg-sina-index-scan-test PRIVATE -UNDEBUG)

@@ -6,6 +6,7 @@
 #include "cs_csf.h"
 #include "index_scan.h"
 #include "query_eval.h"
+#include "scan.h"
 #include <limits.h>
 #include <string.h>
 extern int64_t pg_sina_filter_impl(struct femu_csd_args *);
@@ -22,9 +23,19 @@ struct index_cursor {
     uint64_t *scan_tids;
     int scan_started,scan_done;
     unsigned scan_end;
+    struct qs_scan_cursor *decoder;
+    void *spill_io;
+    uint64_t dictionary_completion;
+    unsigned dictionary_pending,dictionary_key;
 };
 _Static_assert(sizeof(struct index_cursor)<=4096,"index cursor must fit its per-CU budget");
-struct index_join { cs_work_context *context; struct qs_plan scan; struct index_cursor *cursors[QS_WORKERS]; struct qs_dict *dictionary; };
+struct index_join {
+    cs_work_context *context;
+    struct qs_plan scan;
+    struct index_cursor *cursors[QS_WORKERS];
+    struct qs_dict *dictionary;
+    struct qs_dictionary *paged_dictionary;
+};
 /* Each CU owns one slot. Allocate its cursor on first use, rather than
  * charging all possible CUs to a single-CU scan's workmem context. */
 static struct index_cursor *index_cursor(struct index_join *h,unsigned slot)
@@ -32,7 +43,15 @@ static struct index_cursor *index_cursor(struct index_join *h,unsigned slot)
     if(slot>=QS_WORKERS) return NULL;
     if(!h->cursors[slot]) {
         h->cursors[slot]=cs_work_calloc(h->context,1,sizeof(*h->cursors[slot]));
-        if(h->cursors[slot]) h->cursors[slot]->root=h->scan.join.indexroot;
+        if(h->cursors[slot]) {
+            h->cursors[slot]->root=h->scan.join.indexroot;
+            if(h->paged_dictionary) {
+                h->cursors[slot]->decoder=qs_scan_cursor_create(h->context,h->paged_dictionary);
+                if(!h->cursors[slot]->decoder) {
+                    cs_work_free(h->context,h->cursors[slot]); h->cursors[slot]=NULL;
+                }
+            }
+        }
     }
     return h->cursors[slot];
 }
@@ -80,6 +99,32 @@ void qs_index_close(struct qs_join_control *control)
 }
 void qs_index_dictionary(struct qs_join_control *control,struct qs_dict *dictionary)
 { ((struct index_join *)(uintptr_t)control->state)->dictionary=dictionary; }
+int qs_index_paged_dictionary(struct qs_join_control *control,struct qs_dictionary *dictionary)
+{
+    struct index_join *h=(void *)(uintptr_t)control->state;
+    if(!h || !dictionary || (h->paged_dictionary && h->paged_dictionary!=dictionary)) return -1;
+    h->paged_dictionary=dictionary;
+    for(unsigned i=0;i<QS_WORKERS;++i) if(h->cursors[i] && !h->cursors[i]->decoder) {
+        h->cursors[i]->decoder=qs_scan_cursor_create(h->context,dictionary);
+        if(!h->cursors[i]->decoder) return -4;
+    }
+    return 0;
+}
+int qs_index_dictionary_pending(const struct qs_join_control *control,unsigned slot)
+{
+    const struct index_join *h=(void *)(uintptr_t)control->state;
+    return h && slot<QS_WORKERS && h->cursors[slot] && h->cursors[slot]->dictionary_pending;
+}
+static int64_t decode_tuple(struct index_join *h,struct index_cursor *c,const unsigned char *page,
+    unsigned offset,unsigned length,struct qs_chunk *out,unsigned row)
+{
+    if(!h->paged_dictionary) return qs_scan_tuple(&h->scan,page,offset,length,0,out,row,h->dictionary);
+    if(!c->decoder || !c->spill_io) return -1;
+    int64_t status=qs_scan_tuple_paged(c->decoder,&h->scan,page,offset,length,0,out,row,
+        c->spill_io,c->dictionary_completion);
+    c->dictionary_completion=0; c->dictionary_pending=status>0;
+    return status;
+}
 static const unsigned char *page_at(struct index_cursor *c,struct qs_task *task,void *io,unsigned block,unsigned heap)
 {
     if(heap && block>=c->heap_first && block-c->heap_first<c->heap_pages)
@@ -269,8 +314,8 @@ int64_t qs_index_scan(struct qs_chunk *out,struct qs_task *task,struct qs_join_c
             }
             unsigned len=0; const unsigned char *t=item_at(page,item,&len);
             if(!t || len<23) return -2;
-            if(!out->rows) memset(qs_nulls(out),0,((out->capacity+7)/8)*(size_t)out->ncols);
-            int status=qs_scan_tuple(&h->scan,page,t-page,len,0,out,out->rows,h->dictionary);
+            if(!out->rows && !c->dictionary_pending) memset(qs_nulls(out),0,((out->capacity+7)/8)*(size_t)out->ncols);
+            int64_t status=decode_tuple(h,c,page,t-page,len,out,out->rows);
             if(status) return status;
             qs_selection(out)[out->rows]=out->rows; ++out->rows; ++out->selected;
             ++task->index_tuples; ++c->position;
@@ -285,6 +330,17 @@ wait:
     if(!task->index_nreads) return -2;
     c->waiting=task->index_pending=1; task->index_pages+=task->index_nreads;
     return QS_INDEX_WAIT;
+}
+int64_t qs_index_scan_paged(struct qs_chunk *out,struct qs_task *task,struct qs_join_control *control,
+    void *io,unsigned heap_pages,unsigned index_pages,int flags,struct femu_csd_args *a)
+{
+    if(!a || !a->numr || a->mr_len[a->numr-1]<QS_SORT_IO_BYTES) return -1;
+    struct index_join *h=(void *)(uintptr_t)control->state;
+    if(!h || !h->paged_dictionary) return -1;
+    struct index_cursor *c=h->cursors[0];
+    c->spill_io=a->mr_addr[a->numr-1];
+    c->dictionary_completion=c->dictionary_pending?csReentryValue(a):0;
+    return qs_index_scan(out,task,control,io,heap_pages,index_pages,flags);
 }
 static int64_t flush(unsigned stage,struct qs_chunk *out,const struct qs_plan *p,struct qs_task *task,
     struct qs_join_control *control,struct femu_csd_args *a,struct index_cursor *cursor,int resume)
@@ -307,11 +363,15 @@ int64_t qs_index_probe(unsigned stage,struct qs_chunk *c,const struct qs_plan *p
     struct index_cursor *cursor=index_cursor(h,task->slot); if(!cursor) return -4;
     struct qs_chunk *out=(void *)((unsigned char *)a->mr_addr[4]+stage*qs_join_chunk_stride(p));
     if(a->numr!=6 || a->mr_len[5]<QS_SORT_IO_BYTES+(long long)QS_INDEX_CACHE*QS_PAGE) return -1;
+    if(h->paged_dictionary) {
+        cursor->spill_io=a->mr_addr[5];
+        cursor->dictionary_completion=cursor->dictionary_pending?csReentryValue(a):0;
+    }
     if(cursor->waiting) {
         for(unsigned i=0;i<QS_INDEX_CACHE;++i) if(cursor->tags[i].state==2) cursor->tags[i].state=1;
         cursor->waiting=0; task->index_pending=task->index_nreads=0;
     }
-    if(!resume) {
+    if(!resume && !cursor->dictionary_pending) {
         cursor->position=cursor->count=cursor->pending=0; out->rows=out->selected=0;
     } else if(cursor->pending) {
         int64_t status=flush(stage,out,p,task,control,a,cursor,csIsReentry(a)); if(status) return status;
@@ -328,8 +388,8 @@ int64_t qs_index_probe(unsigned stage,struct qs_chunk *c,const struct qs_plan *p
             }
             if(!cursor->count) break;
         }
-        unsigned done=0,candidates=0;
-        for(unsigned k=0;k<cursor->count;++k) {
+        unsigned done=0,candidates=0,first=cursor->dictionary_pending?cursor->dictionary_key:0;
+        for(unsigned k=first;k<cursor->count;++k) {
             struct lookup *key=&cursor->keys[k];
             while(key->phase!=4) {
                 int heap=key->phase==3;
@@ -365,8 +425,9 @@ int64_t qs_index_probe(unsigned stage,struct qs_chunk *c,const struct qs_plan *p
                     unsigned len=0; const unsigned char *tuple=item_at(page,item,&len);
                     if(!tuple || len<23) return -2;
                     unsigned dest=out->rows;
-                    if(!dest) memset(qs_nulls(out),0,((out->capacity+7)/8)*(size_t)out->ncols);
-                    int status=qs_scan_tuple(&h->scan,page,tuple-page,len,0,out,dest,h->dictionary); if(status) return status;
+                    if(!dest && !cursor->dictionary_pending) memset(qs_nulls(out),0,((out->capacity+7)/8)*(size_t)out->ncols);
+                    cursor->dictionary_key=k;
+                    int64_t status=decode_tuple(h,cursor,page,tuple-page,len,out,dest); if(status) return status;
                     if(j->semi>0) {
                         struct qs_eval eval={.plan=p,.chunk=out,.row=dest}; struct qs_cell match;
                         if(j->predicate<0 || qs_evaluate(&eval,j->predicate,&match) || match.isnull || !match.value) {
@@ -395,6 +456,7 @@ int64_t qs_index_probe(unsigned stage,struct qs_chunk *c,const struct qs_plan *p
             int64_t status=flush(stage,out,p,task,control,a,cursor,0); if(status) return status;
         }
         if(done==cursor->count) { cursor->count=0; continue; }
+        if(first) continue; /* Revisit earlier keys only after the retained tuple completes. */
         if(candidates && !task->index_nreads) continue;
         if(!task->index_nreads) return -2;
         cursor->waiting=1; task->index_pending=1; task->index_pages+=task->index_nreads;

@@ -148,6 +148,20 @@ int qs_scan_tuple(const struct qs_plan *p,const unsigned char *raw,unsigned offs
     struct heap_tuple tuple={.data=raw+offset,.bytes=len,.absolute=page+offset,.row=row};
     return scan_tuples(p,&tuple,1,c,dict,last,0,0,NULL);
 }
+int64_t qs_scan_tuple_paged(struct qs_scan_cursor *cursor,const struct qs_plan *p,
+    const unsigned char *raw,unsigned offset,unsigned len,unsigned page,struct qs_chunk *c,
+    unsigned row,void *io,uint64_t completion)
+{
+    if(!cursor->active) {
+        cursor->tuples[0]=(struct heap_tuple){.data=raw+offset,.bytes=len,.absolute=page+offset,.row=row};
+        cursor->active=1; cursor->decoding=0;
+    } else if(cursor->tuples[0].data!=raw+offset || cursor->tuples[0].bytes!=len || cursor->tuples[0].row!=row) return -1;
+    cursor->io=io; cursor->completion=completion;
+    int last=-1; for(unsigned i=0;i<p->nattrs;++i) if(p->cols[i].slot>=0) last=i;
+    int64_t status=scan_tuples(p,cursor->tuples,1,c,NULL,last,0,0,cursor);
+    if(!status) cursor->active=0;
+    return status;
+}
 static int64_t scan_columns(struct femu_csd_args *a,struct qs_scan_cursor *cursor)
 {
     if(!a || (a->numr!=4 && a->numr!=5) || a->mr_len[1]<(long long)sizeof(struct qs_plan) || a->mr_len[3]<(long long)sizeof(struct qs_task)) return -1;
