@@ -706,6 +706,7 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     PlanStateCsd *s=(void *)node;
     ExplainPropertyText("Execution Path","csd",es);
     ExplainPropertyInteger("CSD Device CUs",NULL,pg_sina_resources.cus,es);
+    ExplainPropertyInteger("CSD Device FDM","bytes",pg_sina_resources.fdm_bytes,es);
     ExplainPropertyInteger("CSD Device Workmem","bytes",pg_sina_resources.workmem_bytes,es);
     ExplainPropertyInteger("CSD Query Memory Limit","bytes",s->plan->nodes[s->plan->root].expr.work_mem_bytes,es);
     ExplainPropertyText("CSD Plan Source","PostgreSQL selected Plan; original join tree",es);

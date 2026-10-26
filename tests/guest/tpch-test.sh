@@ -32,7 +32,8 @@ for query in "$@"; do
         if psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
             -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path=csd" \
             -f "$QUERIES/$query.explain.sql" > "$RESULTS/$query.plan.log" 2> "$RESULTS/$query.plan.err" &&
-            grep -q 'Custom Scan (SniaCsd' "$RESULTS/$query.plan.log"; then offloaded=yes; else failed=1; fi
+            grep -q '^Custom Scan (SniaCsd' "$RESULTS/$query.plan.log" &&
+            ! grep -Eq '^[[:space:]]*(->|InitPlan|SubPlan)[[:space:]]' "$RESULTS/$query.plan.log"; then offloaded=yes; else failed=1; fi
         performance=not_slower
         if awk -v h="$host" -v c="$csd" 'BEGIN {exit !(c>h)}'; then
             # Spill alone never proves physical memory exhaustion. A slower
