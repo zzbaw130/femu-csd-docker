@@ -3,6 +3,7 @@
 #include "query.h"
 #include <string.h>
 #include "heap_numeric.h"
+#include "scan.h"
 static uint16_t read16(const unsigned char *p) { uint16_t v; memcpy(&v,p,2); return v; }
 static uint32_t read32(const unsigned char *p) { uint32_t v; memcpy(&v,p,4); return v; }
 /* Small '%' glob matcher for scan-level LIKE; '_' and escapes stay native. */
@@ -24,10 +25,27 @@ struct heap_tuple {
     const unsigned char *data;
     unsigned bytes,absolute,row,mask,off,first;
 };
-static int scan_tuples(const struct qs_plan *p,struct heap_tuple *tuples,unsigned count,struct qs_chunk *c,struct qs_dict *dict,int last,unsigned first,unsigned prefix)
+struct qs_scan_cursor {
+    struct qs_dictionary *dictionary;
+    struct qs_dictionary_access *access;
+    struct heap_tuple tuples[64];
+    unsigned active,page,line,count,column,tuple,decoding;
+    void *io;
+    uint64_t completion;
+};
+struct qs_scan_cursor *qs_scan_cursor_create(cs_work_context *context,struct qs_dictionary *dictionary)
+{
+    struct qs_scan_cursor *cursor=cs_work_calloc(context,1,sizeof(*cursor));
+    if(!cursor) return NULL;
+    cursor->dictionary=dictionary;
+    cursor->access=qs_dictionary_access_create(dictionary);
+    if(!cursor->access) { cs_work_free(context,cursor); return NULL; }
+    return cursor;
+}
+static int64_t scan_tuples(const struct qs_plan *p,struct heap_tuple *tuples,unsigned count,struct qs_chunk *c,struct qs_dict *dict,int last,unsigned first,unsigned prefix,struct qs_scan_cursor *cursor)
 {
     unsigned start=first;
-    for(unsigned i=0;i<count;++i) {
+    for(unsigned i=0;(!cursor || !cursor->decoding) && i<count;++i) {
         struct heap_tuple *t=&tuples[i]; const unsigned char *tuple=t->data;
         unsigned mask=read16(tuple+20),off=tuple[22];
         if((read16(tuple+18)&0x7ff)!=p->nattrs || off>t->bytes || off%8 ||
@@ -37,12 +55,13 @@ static int scan_tuples(const struct qs_plan *p,struct heap_tuple *tuples,unsigne
         if(t->off>t->bytes) return -2;
         if(mask&1) start=0;
     }
-    for(int col=start;col<=last;++col) {
+    for(int col=cursor && cursor->decoding?(int)cursor->column:(int)start;col<=last;++col) {
         const struct qs_column *spec=&p->cols[col]; int slot=spec->slot;
         int64_t *values=slot>=0?qs_values(c)+(size_t)slot*c->capacity:NULL;
         uint8_t *scales=slot>=0?qs_dscales(c)+(size_t)slot*c->capacity:NULL;
         uint8_t *nulls=slot>=0?qs_nulls(c)+(size_t)slot*((c->capacity+7)/8):NULL;
-        for(unsigned i=0;i<count;++i) {
+        unsigned begin=cursor && cursor->decoding && (unsigned)col==cursor->column?cursor->tuple:0;
+        for(unsigned i=begin;i<count;++i) {
             struct heap_tuple *t=&tuples[i];
             if((unsigned)col<t->first) continue;
             const unsigned char *tuple=t->data;
@@ -72,11 +91,23 @@ static int scan_tuples(const struct qs_plan *p,struct heap_tuple *tuples,unsigne
                     memcpy(&value,&ref,sizeof(ref));
                 }
                 else if(spec->type==Q_STRING) {
-                    if(!dict) return -3;
+                    if(!dict && !cursor) return -3;
                     unsigned length=size-header;
                     if(spec->trim_spaces) while(length && v[length-1]==' ') --length;
-                    int id=qs_dict_insert(dict,(const char *)v,length); if(id<0) return -3;
-                    value=id;
+                    if(cursor) {
+                        uint32_t id=0;
+                        int64_t status=qs_dictionary_insert(cursor->dictionary,cursor->access,
+                            (const char *)v,length,&id,cursor->io,cursor->completion);
+                        cursor->completion=0;
+                        if(status) {
+                            cursor->column=col; cursor->tuple=i; cursor->decoding=1;
+                            return status;
+                        }
+                        value=id;
+                    } else {
+                        int id=qs_dict_insert(dict,(const char *)v,length); if(id<0) return -3;
+                        value=id;
+                    }
                 }
                 else if(spec->type==Q_DICTIONARY) {
                     unsigned length=size-header;
@@ -107,6 +138,7 @@ static int scan_tuples(const struct qs_plan *p,struct heap_tuple *tuples,unsigne
             t->off=off+size;
         }
     }
+    if(cursor) cursor->decoding=0;
     return 0;
 }
 /* Index scans retain the same tuple decoder and visibility checks. */
@@ -114,9 +146,9 @@ int qs_scan_tuple(const struct qs_plan *p,const unsigned char *raw,unsigned offs
 {
     int last=-1; for(unsigned i=0;i<p->nattrs;++i) if(p->cols[i].slot>=0) last=i;
     struct heap_tuple tuple={.data=raw+offset,.bytes=len,.absolute=page+offset,.row=row};
-    return scan_tuples(p,&tuple,1,c,dict,last,0,0);
+    return scan_tuples(p,&tuple,1,c,dict,last,0,0,NULL);
 }
-int64_t pg_sina_scan(struct femu_csd_args *a)
+static int64_t scan_columns(struct femu_csd_args *a,struct qs_scan_cursor *cursor)
 {
     if(!a || (a->numr!=4 && a->numr!=5) || a->mr_len[1]<(long long)sizeof(struct qs_plan) || a->mr_len[3]<(long long)sizeof(struct qs_task)) return -1;
     const struct qs_plan *p=a->mr_addr[1]; struct qs_chunk *c=a->mr_addr[2];
@@ -125,36 +157,61 @@ int64_t pg_sina_scan(struct femu_csd_args *a)
     if(p->nattrs>QS_COLS || p->ncols>p->nattrs || p->nstrings>QS_STRINGS || a->mr_len[2]<(long long)sizeof(*c) ||
         c->ncols!=p->ncols || qs_chunk_bytes(c->capacity,c->ncols)>(uint64_t)a->mr_len[2] ||
         bytes%QS_PAGE || bytes>(uint64_t)a->mr_len[0]) return -1;
-    c->rows=c->selected=0; memset(qs_nulls(c),0,((c->capacity+7)/8)*(size_t)c->ncols);
+    if(!cursor || !cursor->active) {
+        c->rows=c->selected=0; memset(qs_nulls(c),0,((c->capacity+7)/8)*(size_t)c->ncols);
+        if(cursor) { cursor->active=1; cursor->page=cursor->line=cursor->count=cursor->decoding=0; }
+    }
     int last=-1; for(unsigned i=0;i<p->nattrs;++i) if(p->cols[i].slot>=0) last=i;
     unsigned first=0,prefix=0;
     while((int)first<=last && p->cols[first].slot<0 && p->cols[first].length>0) {
         const struct qs_column *spec=&p->cols[first++];
         prefix=((prefix+spec->align-1)&~(spec->align-1U))+spec->length;
     }
-    for(unsigned page=0;page<bytes;page+=QS_PAGE) {
+    for(unsigned page=cursor?cursor->page:0;page<bytes;page+=QS_PAGE) {
         const unsigned char *raw=(unsigned char *)a->mr_addr[0]+page;
         unsigned lower=read16(raw+12),upper=read16(raw+14);
         if(lower<24 || (lower-24)%4 || lower>upper || upper>QS_PAGE ||
             read16(raw+16)!=QS_PAGE || read16(raw+18)!=(QS_PAGE|4) || !(read16(raw+10)&4)) return -2;
-        struct heap_tuple tuples[64]; unsigned count=0;
-        for(unsigned i=0;i<(lower-24)/4;++i) {
+        struct heap_tuple local[64];
+        struct heap_tuple *tuples=cursor?cursor->tuples:local;
+        unsigned count=cursor?cursor->count:0;
+        if(cursor && cursor->decoding) {
+            int64_t status=scan_tuples(p,tuples,count,c,dict,last,first,prefix,cursor);
+            if(status) return status;
+            for(unsigned j=0;j<count;++j) qs_selection(c)[c->rows+j]=c->rows+j;
+            c->rows+=count; count=cursor->count=0;
+        }
+        for(unsigned i=cursor?cursor->line:0;i<(lower-24)/4;++i) {
             uint32_t lp=read32(raw+24+4*i); unsigned offset=lp&0x7fff,flags=(lp>>15)&3,len=lp>>17;
             if(flags!=1) continue;
             if(offset<upper || offset>QS_PAGE || len<23 || len>QS_PAGE-offset || c->rows+count>=c->capacity) return -2;
             tuples[count]=(struct heap_tuple){.data=raw+offset,.bytes=len,.absolute=page+offset,.row=c->rows+count};
             ++count;
+            if(cursor) { cursor->page=page; cursor->line=i+1; cursor->count=count; }
             if(count==64) {
-                int status=scan_tuples(p,tuples,count,c,dict,last,first,prefix); if(status) return status;
+                int64_t status=scan_tuples(p,tuples,count,c,dict,last,first,prefix,cursor); if(status) return status;
                 for(unsigned j=0;j<count;++j) qs_selection(c)[c->rows+j]=c->rows+j;
-                c->rows+=count; count=0;
+                c->rows+=count; count=0; if(cursor) cursor->count=0;
             }
         }
         if(count) {
-            int status=scan_tuples(p,tuples,count,c,dict,last,first,prefix); if(status) return status;
+            int64_t status=scan_tuples(p,tuples,count,c,dict,last,first,prefix,cursor); if(status) return status;
             for(unsigned j=0;j<count;++j) qs_selection(c)[c->rows+j]=c->rows+j;
             c->rows+=count;
         }
+        if(cursor) { cursor->page=page+QS_PAGE; cursor->line=cursor->count=0; }
     }
+    if(cursor) cursor->active=0;
     c->selected=c->rows; return 0;
+}
+int64_t pg_sina_scan(struct femu_csd_args *a)
+{ return scan_columns(a,NULL); }
+int64_t qs_scan_columns(struct qs_scan_cursor *cursor,struct femu_csd_args *a,uint64_t completion)
+{
+    if(!cursor || !a || a->numr!=5 || a->mr_len[4]<QS_DICTIONARY_PAGE_BYTES) return -1;
+    /* In this private call the fifth MR is I/O, not a flat dictionary. */
+    void *mrs[]={a->mr_addr[0],a->mr_addr[1],a->mr_addr[2],a->mr_addr[3]};
+    struct femu_csd_args input=*a; input.numr=4; input.mr_addr=mrs;
+    cursor->io=a->mr_addr[4]; cursor->completion=completion;
+    return scan_columns(&input,cursor);
 }
