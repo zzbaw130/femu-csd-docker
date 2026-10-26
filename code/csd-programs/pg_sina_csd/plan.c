@@ -103,7 +103,7 @@ struct projection_batch {
     const uint32_t *borrowed_selection;
     int64_t error;
     unsigned error_node;
-    int joined,keep_window,lazy_text;
+    int joined,sorted,keep_window,lazy_text;
     int group_keys[QS_KEYS],group_values[QS_AGGS];
 };
 struct hash_probe_batch {
@@ -205,6 +205,7 @@ static size_t input_offset(const struct execution *s,const struct qp_node *n)
 static size_t vector_offset(const struct execution *s,const struct qp_node *n)
 { return s->worker>1?n->parallel_vector+(s->worker-2)*s->plan->parallel_stride:n->vector_offset; }
 static int64_t parallel_next(struct execution *,unsigned,struct qs_cell *);
+static int aggregate_sink_vectors(struct execution *,unsigned);
 static int64_t timed_call(struct execution *s,int64_t (*call)(struct femu_csd_args *),struct femu_csd_args *a,unsigned op)
 {
     if(!s->profiling) return call(a);
@@ -465,6 +466,7 @@ static int64_t sorted_input(struct execution *s,struct sorted_rows *sort,unsigne
         sort->position=0; sort->drained=sort->output->finished;
     }
     if(sort->position<sort->output->rows) {
+        if(!row) return 2; /* Borrow the remaining Source batch. */
         memcpy(row,sort->output->data[sort->position++].cells,input->expr.nout*sizeof(*row)); return 2;
     }
     if(sort->drained) { cs_work_free(s->context,sort->output); sort->output=NULL; }
@@ -1344,15 +1346,21 @@ static int projection_init(struct execution *s,unsigned id)
     const struct qp_node *leaf=&s->plan->nodes[scan];
     int joined=leaf->expr.predicate<0 &&
         (leaf->kind==QP_INDEX_JOIN || (leaf->kind==QP_JOIN && leaf->hash));
-    if((leaf->kind!=QP_SCAN && !joined) || (!s->worker && s->plan->workers>1 && leaf->parallel)) return 0;
-    if(!joined && leaf->expr.predicate>=0) {
+    int sorted=leaf->kind==QP_SORT && leaf->left>=0 && leaf->expr.predicate<0 &&
+        leaf->expr.nattrs==s->plan->nodes[leaf->left].expr.nout;
+    if((leaf->kind!=QP_SCAN && !joined && !sorted) || (!s->worker && s->plan->workers>1 && leaf->parallel)) return 0;
+    if(!joined && !sorted && leaf->expr.predicate>=0) {
         if(leaf->ordered_index) return 0;
         int status=scan_filter_init(s,&leaf->expr,&s->nodes[scan]); if(status) return status;
         if(!s->nodes[scan].scan_filter) return 0;
     }
     struct projection_batch *b=cs_work_calloc(s->context,1,sizeof(*b)); if(!b) return 0;
     b->plan=leaf->expr; b->plan.nexprs=0; b->plan.nout=grouped?s->plan->nodes[root->left].expr.nout:
-        aggregate?root->expr.naggs:root->expr.nout; b->scan=scan; b->joined=joined;
+        aggregate?root->expr.naggs:root->expr.nout; b->scan=scan; b->joined=joined; b->sorted=sorted;
+    if(sorted) {
+        b->plan.ncols=b->plan.nattrs;
+        for(unsigned col=0;col<b->plan.nattrs;++col) b->plan.cols[col].slot=col;
+    }
     struct projection_import import={.execution=s,.batch=b};
     if(grouped) {
         for(unsigned k=0;k<root->nkeys;++k) {
@@ -1459,12 +1467,29 @@ evaluate_batch:
         0,b->count,b->needed,b->vectors,input)) return -5;
     return 2;
 }
+/* A Sort Source already produces evaluated cells in complete batches. Keep
+ * its buffer alive until the dependent expression vectors have been consumed. */
+static int64_t projection_sort_fill(struct execution *s,struct projection_batch *b)
+{
+    const struct qp_node *n=&s->plan->nodes[b->scan];
+    struct sorted_rows *sort=&s->nodes[b->scan].left_sort;
+    int64_t status=sorted_input(s,sort,n->left,n->expr.norder,NULL,n->expr.order,NULL);
+    if(status!=2) return status;
+    b->count=sort->output->rows-sort->position; b->position=0;
+    if(b->count>QS_VECTOR_ROWS) b->count=QS_VECTOR_ROWS;
+    struct qs_vector_input input={.cells=sort->output->data[sort->position].cells,
+        .column_stride=1,.row_stride=QS_OUT,.dictionary=s->dictionary,
+        .parameters=s->params,.nparameters=QP_PARAMS};
+    if(qs_vector_execute_input(&b->plan,NULL,NULL,0,b->count,b->needed,b->vectors,input)) return -5;
+    sort->position+=b->count;
+    return 2;
+}
 /* Return 3 only for an internal scalar fallback, before consuming input. */
 static int64_t projection_fill(struct execution *s,unsigned id)
 {
     struct projection_batch *b=s->nodes[id].projection;
     if(b->position==b->count) {
-        int64_t status=b->joined?projection_join_fill(s,b):scan_chunk_next(s,b->scan);
+        int64_t status=b->sorted?projection_sort_fill(s,b):b->joined?projection_join_fill(s,b):scan_chunk_next(s,b->scan);
         if(status!=2) {
             if(!status || (b->joined && status==3)) {
                 cs_work_free(s->context,b->cells);
@@ -1474,11 +1499,11 @@ static int64_t projection_fill(struct execution *s,unsigned id)
             return status;
         }
         /* Filter may have fallen back after exhausting its scratch budget. */
-        if(!b->joined && s->plan->nodes[b->scan].expr.predicate>=0 && !s->nodes[b->scan].scan_filter) {
+        if(!b->joined && !b->sorted && s->plan->nodes[b->scan].expr.predicate>=0 && !s->nodes[b->scan].scan_filter) {
             cs_work_free(s->context,b->vectors); cs_work_free(s->context,b);
             s->nodes[id].projection=NULL; return 3;
         }
-        if(!b->joined) {
+        if(!b->joined && !b->sorted) {
             struct operator_state *scan=&s->nodes[b->scan];
             struct qs_chunk *chunk=(void *)(s->arena+vector_offset(s,&s->plan->nodes[b->scan]));
             b->count=chunk->selected-scan->scan_position; if(b->count>QS_VECTOR_ROWS) b->count=QS_VECTOR_ROWS;
@@ -2164,6 +2189,20 @@ static int64_t aggregate_next(struct execution *s,unsigned id,struct qs_cell *ro
     if(!n->nkeys && !o->phase && !o->emitted) {
         memset(o->accum,0,sizeof(o->accum)); o->phase=1;
     }
+    if(!n->nkeys && !n->distinct && !n->distinct_aggs && !o->input_done && !o->emitted && n->left>=0 &&
+       !(!s->worker && s->plan->workers>1 && s->plan->nodes[n->left].parallel)) {
+        int64_t status=projection_init(s,id); if(status) return status;
+        while(o->projection) {
+            status=projection_fill(s,id);
+            if(!status) { o->input_done=1; break; }
+            if(status==3) break; /* Existing scalar fallback retains its cursor. */
+            if(status!=2) return status;
+            struct blocking_timer timer={0}; if(s->profiling) timer=blocking_begin(s);
+            status=aggregate_sink_vectors(s,id);
+            if(s->profiling) blocking_end(s,QS_AGG_SINK,timer);
+            if(status) return status;
+        }
+    }
     for(;;) {
         if(!o->have_left && !o->input_done) {
             int64_t status;
@@ -2550,7 +2589,7 @@ static int64_t next_row_impl(struct execution *s,unsigned id,struct qs_cell *row
     }
     if(o->finished && (!o->projection || o->projection->position==o->projection->count)) return 0;
     if(!s->worker && s->plan->workers>1 && n->parallel) return parallel_next(s,id,row);
-    if(n->kind==QP_SCAN || (n->kind==QP_PROJECT && n->left>=0) || (n->kind==QP_JOIN && n->hash) || n->kind==QP_INDEX_JOIN) {
+    if(n->kind==QP_SCAN || n->kind==QP_SORT || (n->kind==QP_PROJECT && n->left>=0) || (n->kind==QP_JOIN && n->hash) || n->kind==QP_INDEX_JOIN) {
         int status=projection_init(s,id); if(status) return status;
         if(o->projection) return projection_next(s,id,row);
     }

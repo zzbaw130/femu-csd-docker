@@ -63,6 +63,8 @@ Source也可直接作为Hash Build、外层聚合或Sort的输入，不要求中
 
 当 Sort 直接消费并行流水线时，每个 CU 保存局部 Sort Sink，在自己的调用内生成有序 run，EOF 时排好最后一个未满 run；统一 Source 归并各 CU 的 run。局部排序 context 属于根查询，工作 CU 状态释放后仍然有效，实际总占用受同一查询 workmem 约束。启动前分配各槽的首个 run，分配失败则保留并行生产、协调端排序路径；此时协调端仍会保留生产 CU 输出至 STORE/LOAD 重入完成。空闲 CU 结束时释放未使用的 run，取消时清理整组 context。隐式排序和分区 Hash 回退仍使用原协调端路径；排序 Source 归并仍串行。
 
+Sort Source 的结果以至多 256 行为一批交给投影及普通无分组聚合，不再为每行重新进入排序接口。向量表达式直接引用该批所需列；内部 `qs_vector_input` 的 `column_stride`/`row_stride` 表示相邻列/行之间的 cell 数，默认是列布局，也能读取排序结果的行布局，不需要先转置完整批次。可安全窄化的值放入连续向量以使用 SIMD，宽 numeric 和混合 scale 保留原值视图。整批消费完才允许 Source 覆盖或释放结果；STORE/LOAD 重入保留游标。普通 SUM/AVG/COUNT/MIN/MAX 的累计复用已有向量 Sink，AVG 保留 sum/count，最终输出时相除。DISTINCT、不支持的表达式及流式分组仍保留原路径。这些结构只在设备 SQL SO 内使用，不改变 SNIA、固件和 AFDM 布局。
+
 ## 单表列向量快路径和独立入口
 
 原有实现保留供单表聚合及独立算子使用：

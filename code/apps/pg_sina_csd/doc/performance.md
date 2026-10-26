@@ -690,3 +690,22 @@ Q16 使用标准 SQL，在 8 CU、256MiB workmem、64MiB FDM 下分别测量三�
 普通查询中位数降低约 4.7%，排序阶段墙钟降低，但累计排序 CPU 增加；不能称为 CPU 工作量下降或持续用满 8 CU。两组均无 spill，AFDM 均为 40697840 字节，没有扩大 FDM。Sort Source 归并仍串行，隐式排序、分区 Hash 回退及无法建立局部状态的路径仍使用原适配；这一步没有覆盖所有阻塞算子的并行。
 
 本阶段 [8 条相关标准查询](../../../../results/tpch.FkJdLF/timings.csv)（Q2/3/10/11/13/16/18/21）均结果一致、完整卸载且快于 host，是针对性回归，不能替代最终版本的 22 条验收。设备 NativePlan、8/16/64 CU、ExternalSort、4MiB 排序及查询预算共 7 项 CTest 通过；ASan/UBSan/LeakSanitizer 检查覆盖原生计划、8 CU 和外部排序，最终清理改动另通过 8 CU 检查。Scan→Sort 的 4/8MiB 查询预算测试校验全部 50003 行、工作 CU 的 STORE 重入、Source 的 LOAD/FREE、局部 Sink 消费计数、token 和 workmem 回收，以及准备完局部 run 后取消的清理。
+
+## Sort Source 接入下游向量执行
+
+参照 DuckDB `Sort::GetData` 向下游返回 DataChunk 的方式，设备投影直接引用 Sort Source 的整批结果。内部向量增加行/列步长，既能引用原列缓冲，也能引用排序的定长行缓冲；只导入后续表达式需要的列，不先构造一份转置副本。原有窄化和 SIMD 路径继续使用，宽整数、每值 scale/dscale、NULL 和选择位置保留。普通无分组聚合也复用已有向量累计；不能导入的表达式和 DISTINCT 保留原路径。Source 缓冲直到批次消费结束才复用，spill 重入不会重复累计。
+
+所有向量和状态仍计入查询 workmem。设备 SQL 相关的 5 个 SO 已重编部署，SNIA/FEMU、AFDM 和共享参数布局不变。PG 只将 Explain 中的 `CSD Hash Aggregate Coordinator CPU` 更名为 `CSD Aggregate Sink Coordinator CPU`：既有 QS_AGG_SINK 计时现在同时覆盖 Hash Aggregate 和普通聚合累计，不能再把它只解释为 Hash 表开销。
+
+8 CU、256MiB workmem、64MiB FDM 下使用标准 SQL，每次冷启动。Q16 在修改前后各测三次；Q17 因单次 profile 有波动，额外交替加载旧、新设备程序各测三次，结束后恢复新版。十二次普通查询结果均与验收 host 输出一致，见 [原始记录](../../../../results/sort-source-vectors/)。
+
+| 普通查询 | 原版本中位数 | 当前中位数 | 解释 |
+| --- | ---: | ---: | --- |
+| Q16 | 418.564ms | 392.836ms | 本组样本降低约 6.1%，仍有波动 |
+| Q17 | 1123.180ms | 1080.529ms | 两组范围重叠，未证实稳定收益或持续回退 |
+
+Q16 的独立 profile 查询树为 309.115→297.949ms，但 Sort Source 自身 CPU 为 12.140→13.907ms，并未下降；累计 CSF CPU 为 831.218→911.287ms，也不能称为 CPU 工作量减少。归并算法没有变化，这一步完成批次接口和表达式执行覆盖，不证明串行归并瓶颈已经解决。Q16 workmem 峰值 30798544→30896000 字节，AFDM 均为 40697840 字节；Q17 峰值均为 28985952 字节，AFDM 均为 46047552 字节。两组 profile 都无 spill，Q17 的扫描量和内部读取量相同，没有以扩容 FDM 或减少输入换取结果。
+
+[10 条相关标准查询](../../../../results/tpch.Z5WcmM/timings.csv)（Q2/3/6/11/14/16/17/18/20/21）均结果一致、完整卸载且快于 host；这是针对性回归，最终全量验收仍待后续阶段完成。设备 10 项相关 CTest 通过，覆盖原生计划、8/16/64 CU、表达式、Filter、聚合、Sort/Hash 的查询预算；ASan/UBSan/LeakSanitizer 的 NativePlan、8 CU、BatchExpressions 均通过。新增 Scan→Sort→数值投影→AVG/COUNT/MIN/MAX/SUM 在 4/8MiB 预算下校验全部 50003 行、精确结果与显示精度、重入和回收；向量用例覆盖列布局、紧凑/定长行布局、非连续/重复选择、NULL、混合 scale、宽数溢出和输入不被修改。
+
+Sort Source 的归并、流式分组及 Merge Join 等仍有串行或逐行处理；字典自身 spill 和整体 CU 持续利用率仍未完成。这些限制不能因为本轮查询通过就视为已解决。

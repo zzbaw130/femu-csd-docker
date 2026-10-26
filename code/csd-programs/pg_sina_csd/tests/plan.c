@@ -1158,13 +1158,14 @@ static int multi_order(const void *ap,const void *bp)
 enum group_test_mode { GROUP_SINGLE,GROUP_COUNTS,GROUP_NUMERIC_EXTREMES,GROUP_TEXT_EXTREMES };
 /* Parallel local sinks and the serial adapter share one exact descending
  * oracle. Exercise real spill/reentry and cancellation of prepared CU runs. */
-static void parallel_sort_spill(function run,unsigned workers,unsigned memory)
+static void parallel_sort_spill(function run,unsigned workers,unsigned memory,int average)
 {
     const unsigned rows=50003; size_t raw_bytes;
     unsigned char *raw=heap(rows,2,&raw_bytes);
     struct qp_plan *p=calloc(1,sizeof(*p)); assert(p);
-    p->count=2; p->workers=workers; p->scan_bytes=QP_SCAN_BYTES;
-    struct qp_node *leaf=&p->nodes[1]; scan(leaf); leaf->bytes=raw_bytes; leaf->parallel=1;
+    unsigned leaf_id=average?3:1,sort_id=average?2:0;
+    p->count=leaf_id+1; p->workers=workers; p->scan_bytes=QP_SCAN_BYTES;
+    struct qp_node *leaf=&p->nodes[leaf_id]; scan(leaf); leaf->bytes=raw_bytes; leaf->parallel=1;
     size_t config=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
     size_t vector=(qs_chunk_bytes(QP_VECTOR_ROWS,2)+4095)&~(size_t)4095;
     leaf->input_offset=config; leaf->vector_offset=config+p->scan_bytes;
@@ -1172,10 +1173,28 @@ static void parallel_sort_spill(function run,unsigned workers,unsigned memory)
     leaf->parallel_input=base; leaf->parallel_vector=base+p->scan_bytes;
     p->parallel_stride=p->scan_bytes+vector;
     size_t bytes=base+(workers-1)*p->parallel_stride;
-    struct qp_node *sort=&p->nodes[0];
-    *sort=(struct qp_node){.kind=QP_SORT,.left=1,.right=-1,.expr=leaf->expr};
+    struct qp_node *sort=&p->nodes[sort_id];
+    *sort=(struct qp_node){.kind=QP_SORT,.left=leaf_id,.right=-1,.expr=leaf->expr};
     sort->expr.norder=1; sort->expr.order[0]=(struct qs_order){.output=0,.descending=1};
     sort->expr.work_mem_bytes=memory; sort->expr.limit=-1;
+    if(average) {
+        struct qp_node *project=&p->nodes[1],*agg=&p->nodes[0];
+        *project=(struct qp_node){.kind=QP_PROJECT,.left=sort_id,.right=-1,.expr=leaf->expr};
+        project->expr.nexprs=4;
+        project->expr.exprs[2]=(struct qs_expr){.op=Q_CONST,.type=Q_DECIMAL,.constant=125,.scale=2,.dscale=2};
+        project->expr.exprs[3]=(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=1,.right=2,.scale=2,.dscale=2};
+        project->expr.outputs[1]=(struct qs_output){.index=3,.type_oid=1700};
+        *agg=(struct qp_node){.kind=QP_AGGREGATE,.left=1,.right=-1};
+        agg->expr=(struct qs_plan){.nattrs=2,.ncols=2,.nexprs=7,.nout=6,.naggs=6,.predicate=-1,.work_mem_bytes=memory};
+        agg->expr.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.column=1,.type=Q_DECIMAL,.scale=2,.dscale=2};
+        const unsigned kinds[]={Q_AVG,Q_COUNT_STAR,Q_COUNT,Q_MIN,Q_MAX,Q_SUM};
+        for(unsigned i=0;i<6;++i) {
+            unsigned type=i==1 || i==2?Q_INTEGER:Q_DECIMAL;
+            agg->expr.exprs[i+1]=(struct qs_expr){.op=Q_AGGREF,.column=i,.type=type};
+            agg->expr.aggs[i]=(struct qs_agg){.kind=kinds[i],.expr=i==1?-1:0};
+            agg->expr.outputs[i]=(struct qs_output){.index=i+1,.type_oid=type==Q_INTEGER?20:1700};
+        }
+    }
     unsigned char *arena=calloc(1,bytes),*io=calloc(workers+1,QS_SORT_IO_BYTES);
     struct qp_control *controls=calloc(workers+1,sizeof(*controls));
     struct qs_result *out=calloc(workers+1,sizeof(*out)); assert(arena && io && controls && out);
@@ -1194,7 +1213,7 @@ static void parallel_sort_spill(function run,unsigned workers,unsigned memory)
             for(unsigned w=0;w<workers;++w) if(!((available|done)&(UINT64_C(1)<<w))) {
                 tasks[w]=(struct probe_test){run,args,p,&controls[w+1],&out[w+1],arena,raw,raw,NULL,w+1,&offset,&need_input[w],c->scan_node,&spill};
                 tasks[w].args.cparam1=((w+1)<<1)|1;
-                assert(c->scan_node==2 && !pthread_create(&threads[w],NULL,probe_worker,&tasks[w])); started|=UINT64_C(1)<<w;
+                assert(c->scan_node==leaf_id+1 && !pthread_create(&threads[w],NULL,probe_worker,&tasks[w])); started|=UINT64_C(1)<<w;
             }
             for(unsigned w=0;w<workers;++w) if(started&(UINT64_C(1)<<w)) {
                 assert(!pthread_join(threads[w],NULL)); available|=UINT64_C(1)<<w;
@@ -1222,12 +1241,26 @@ static void parallel_sort_spill(function run,unsigned workers,unsigned memory)
             for(unsigned w=0;w<workers;++w) need_input[w]=true;
         }
         for(unsigned r=0;r<out->rows;++r) {
+            if(average) {
+                struct qs_cell *v=out->data[r].cells,expected[6]; int64_t sum=0,minimum=INT64_MAX,maximum=INT64_MIN;
+                for(unsigned i=0;i<rows;++i) {
+                    int64_t value=((int)((uint64_t)i*1009%997)-498)*125;
+                    sum+=value; if(value<minimum) minimum=value; if(value>maximum) maximum=value;
+                }
+                expected[5]=(struct qs_cell){.value=sum,.scale=2,.dscale=2};
+                assert(!qs_average(expected[5],rows,&expected[0]));
+                expected[1]=expected[2]=(struct qs_cell){.value=rows};
+                expected[3]=(struct qs_cell){.value=minimum,.scale=2,.dscale=2};
+                expected[4]=(struct qs_cell){.value=maximum,.scale=2,.dscale=2};
+                for(unsigned i=0;i<6;++i) { int cmp; assert(!v[i].isnull && !qs_compare(v[i],expected[i],&cmp) && !cmp && v[i].dscale==expected[i].dscale); }
+                assert(!seen++); continue;
+            }
             unsigned key=rows-1-seen++; struct qs_cell *v=out->data[r].cells;
             assert(seen<=rows && !v[0].isnull && v[0].value==key);
             assert(v[1].value==(int)((uint64_t)key*1009%997)-498);
         }
     }
-    assert(seen==rows && out->metrics.workers==workers && out->metrics.work_peak<=memory);
+    assert(seen==(average?1:rows) && out->metrics.workers==workers && out->metrics.work_peak<=memory);
     uint64_t sunk=0;
     for(unsigned i=0;i<p->count;++i) sunk+=p->pipelines[i].sink_rows;
     assert(sunk==rows || held_stores); /* local Sink or the spill-safe adapter */
@@ -1554,8 +1587,10 @@ int main(int argc,char **argv)
         test(run,QP_INNER,31,23,256,1,TEST_BUILD_GROUP_DIRECT);
         test(run,QP_INNER,31,0,256,1,TEST_BUILD_GROUP_DIRECT);
         if(test_workers<=8) {
-            parallel_sort_spill(run,test_workers,8U*1024*1024);
-            parallel_sort_spill(run,test_workers,4U*1024*1024);
+            parallel_sort_spill(run,test_workers,8U*1024*1024,0);
+            parallel_sort_spill(run,test_workers,4U*1024*1024,0);
+            parallel_sort_spill(run,test_workers,8U*1024*1024,1);
+            parallel_sort_spill(run,test_workers,4U*1024*1024,1);
         }
         test_scheduled=false;
         for(unsigned join=QP_INNER;join<=QP_ANTI;++join)
@@ -1610,8 +1645,10 @@ int main(int argc,char **argv)
     test(run,QP_INNER,50003,50003,64,1,TEST_BUILD_GROUP_DIRECT);
     test(run,QP_INNER,31,23,64,1,TEST_BUILD_GROUP_DIRECT);
     test(run,QP_INNER,31,0,64,1,TEST_BUILD_GROUP_DIRECT);
-    parallel_sort_spill(run,test_workers,8U*1024*1024);
-    parallel_sort_spill(run,test_workers,4U*1024*1024);
+    parallel_sort_spill(run,test_workers,8U*1024*1024,0);
+    parallel_sort_spill(run,test_workers,4U*1024*1024,0);
+    parallel_sort_spill(run,test_workers,8U*1024*1024,1);
+    parallel_sort_spill(run,test_workers,4U*1024*1024,1);
     for(unsigned join=QP_INNER;join<=QP_ANTI;++join) {
         test(run,join,31,5003,64,1,TEST_HASH_QUAL);
         test(run,join,31,5003,4,1,TEST_HASH_QUAL);

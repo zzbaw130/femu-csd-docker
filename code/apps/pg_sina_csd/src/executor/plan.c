@@ -764,7 +764,7 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
             ExplainPropertyInteger("CSD Active CUs Peak",NULL,s->slots[0].control.peak_cus,es);
             static const unsigned ops[]={QS_SCAN,QS_FILTER,QS_SORT_SINK,QS_SORT_SOURCE,QS_JOIN_BUILD,QS_AGG_SINK,QS_AGG_SOURCE};
             static const char *labels[]={"CSD Scan Decode CPU","CSD Vector Filter CPU","CSD Sort Sink CPU","CSD Sort Source CPU",
-                "CSD Hash Build Coordinator CPU","CSD Hash Aggregate Coordinator CPU","CSD Aggregate Merge Coordinator CPU"};
+                "CSD Hash Build Coordinator CPU","CSD Aggregate Sink Coordinator CPU","CSD Aggregate Merge Coordinator CPU"};
             for(unsigned i=0;i<lengthof(ops);++i) ExplainPropertyFloat(labels[i],"ms",s->result->profile.operators[ops[i]].cpu_ns/1e6,3,es);
             for(unsigned i=0;i<s->plan->count;++i) {
                 const struct qp_pipeline_profile *p=&s->plan->pipelines[i];

@@ -23,7 +23,7 @@ struct qs_vector {
     const int64_t *column;
     const uint8_t *column_nulls, *column_scales;
     const uint32_t *selection;
-    unsigned first;
+    unsigned first, cell_stride;
 };
 /* Filter scratch is temporary but can coexist with a retained sink state on
  * every slot. Keep its charged allocation (including allocator metadata) out
@@ -72,9 +72,11 @@ static inline int qs_vector_require(const struct qs_plan *p,int index,uint8_t *n
 }
 static inline unsigned qs_vector_row(const struct qs_vector *v,unsigned i)
 { return v->selection?v->selection[v->first+i]:v->first+i; }
+static inline struct qs_cell qs_vector_input_cell(const struct qs_vector *v,unsigned i)
+{ return v->cells[(size_t)qs_vector_row(v,i)*(v->cell_stride?v->cell_stride:1)]; }
 static inline __int128 qs_vector_value(const struct qs_vector *v,unsigned i)
 {
-    if(v->kind==QS_CELLS) return v->cells[qs_vector_row(v,i)].value;
+    if(v->kind==QS_CELLS) return qs_vector_input_cell(v,i).value;
     if(v->kind==QS_TEXT) return 0; /* Text stays a byte view until materialized. */
     if(v->kind==QS_REFERENCE) return v->column[qs_vector_row(v,i)];
     if(v->kind==QS_CONSTANT) return v->constant.value;
@@ -82,15 +84,15 @@ static inline __int128 qs_vector_value(const struct qs_vector *v,unsigned i)
 }
 static inline unsigned qs_vector_null(const struct qs_vector *v,unsigned i)
 {
-    if(v->kind==QS_CELLS) return v->cells[qs_vector_row(v,i)].isnull;
+    if(v->kind==QS_CELLS) return qs_vector_input_cell(v,i).isnull;
     if(v->kind==QS_REFERENCE) { unsigned row=qs_vector_row(v,i); return (v->column_nulls[row/8]>>(row%8))&1; }
     return v->kind==QS_CONSTANT?v->constant.isnull:v->nulls[i];
 }
 static inline unsigned qs_vector_dscale(const struct qs_vector *v,unsigned i)
-{ return v->kind==QS_CELLS?v->cells[qs_vector_row(v,i)].dscale:v->kind==QS_REFERENCE?v->column_scales[qs_vector_row(v,i)]:v->kind==QS_CONSTANT?v->constant.dscale:v->dscales[i]; }
+{ return v->kind==QS_CELLS?qs_vector_input_cell(v,i).dscale:v->kind==QS_REFERENCE?v->column_scales[qs_vector_row(v,i)]:v->kind==QS_CONSTANT?v->constant.dscale:v->dscales[i]; }
 static inline struct qs_cell qs_vector_cell(const struct qs_plan *p,const struct qs_vector *v,unsigned index,unsigned row)
 {
-    if(v[index].kind==QS_CELLS) return v[index].cells[qs_vector_row(&v[index],row)];
+    if(v[index].kind==QS_CELLS) return qs_vector_input_cell(&v[index],row);
     if(v[index].kind==QS_CONSTANT) return v[index].constant;
     return (struct qs_cell){.value=qs_vector_value(&v[index],row),.scale=v[index].kind==QS_DYNAMIC?v[index].scales[row]:p->exprs[index].scale,
         .dscale=qs_vector_dscale(&v[index],row),.isnull=qs_vector_null(&v[index],row)};
@@ -183,7 +185,10 @@ struct qs_vector_input {
     struct qs_dict *dictionary;
     const struct qs_cell *parameters;
     unsigned nparameters;
-    const struct qs_cell *cells; /* Materialized columns, QS_VECTOR_ROWS cells per slot. */
+    const struct qs_cell *cells;
+    /* Defaults describe materialized columns. Sort output can be borrowed
+     * directly with column_stride=1, row_stride=QS_OUT, without transposing. */
+    unsigned column_stride, row_stride;
 };
 /* The byte view borrows the retained LOAD buffer or immutable dictionary.
  * SUBSTRING counts UTF-8 characters using PG's positive/zero/negative-start
@@ -437,11 +442,12 @@ static inline int qs_vector_execute_input(const struct qs_plan *p,struct qs_chun
             const struct qs_column *col=&p->cols[e->column]; int slot=col->slot;
             if(column_input) {
                 if(slot<0 || (unsigned)slot>=p->ncols) return -1;
-                out->cells=input.cells+(size_t)slot*QS_VECTOR_ROWS;
+                out->cells=input.cells+(size_t)slot*(input.column_stride?input.column_stride:QS_VECTOR_ROWS);
+                out->cell_stride=input.row_stride?input.row_stride:1;
                 out->selection=selection; out->first=first;
                 out->kind=QS_NARROW; out->done=count;
                 for(unsigned i=0;i<count;++i) {
-                    struct qs_cell v=out->cells[qs_vector_row(out,i)];
+                    struct qs_cell v=qs_vector_input_cell(out,i);
                     out->narrow[i]=v.isnull?0:(int64_t)v.value; out->nulls[i]=v.isnull; out->dscales[i]=v.dscale;
                     out->all_valid&=!v.isnull;
                     if(!v.isnull && (v.scale!=e->scale || v.value<INT64_MIN || v.value>INT64_MAX)) out->kind=QS_CELLS;

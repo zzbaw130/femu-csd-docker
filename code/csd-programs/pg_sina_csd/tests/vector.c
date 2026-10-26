@@ -5,7 +5,7 @@
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
-static void materialized_columns(void)
+static void materialized_columns(unsigned row_stride)
 {
     struct qs_plan p={.nattrs=2,.ncols=2,.nexprs=6};
     p.cols[0].slot=0; p.cols[1].slot=1;
@@ -26,6 +26,16 @@ static void materialized_columns(void)
     uint8_t needed[QS_EXPRS]={0};
     for(unsigned i=3;i<6;++i) assert(!qs_vector_require(&p,i,needed));
     struct qs_vector_input input={.cells=columns};
+    struct qs_cell *rows=NULL;
+    if(row_stride) {
+        rows=calloc(QS_VECTOR_ROWS*row_stride,sizeof(*rows)); assert(rows);
+        for(unsigned r=0;r<QS_VECTOR_ROWS;++r) {
+            rows[(size_t)r*row_stride]=columns[r]; rows[(size_t)r*row_stride+1]=columns[QS_VECTOR_ROWS+r];
+        }
+        input.cells=rows; input.column_stride=1; input.row_stride=row_stride;
+    }
+    size_t bytes=(row_stride?row_stride:2)*QS_VECTOR_ROWS*sizeof(*columns);
+    void *snapshot=malloc(bytes); assert(snapshot); memcpy(snapshot,input.cells,bytes);
     uint32_t selected[QS_VECTOR_ROWS];
     for(unsigned pass=0;pass<4;++pass) {
         for(unsigned i=0;i<QS_VECTOR_ROWS;++i) selected[i]=pass==2?(i%3?0:QS_VECTOR_ROWS-1):QS_VECTOR_ROWS-1-i;
@@ -52,7 +62,8 @@ static void materialized_columns(void)
     assert(qs_vector_execute_input(&p,NULL,selected,0,1,needed,vectors,input));
     assert(qs_vector_execute_input(&p,NULL,NULL,QS_VECTOR_ROWS,1,needed,vectors,input));
     assert(!qs_vector_execute_input(&p,NULL,NULL,QS_VECTOR_ROWS,0,needed,vectors,input));
-    free(columns); free(vectors);
+    assert(!memcmp(snapshot,input.cells,bytes));
+    free(snapshot); free(rows); free(columns); free(vectors);
 }
 static void string_views(void)
 {
@@ -336,6 +347,7 @@ static void aggregates(const char *path)
 }
 int main(int argc,char **argv)
 {
-    assert(argc==2); materialized_columns(); string_views(); wide_parameters(); expressions(); arithmetic(); case_and_division(); aggregates(argv[1]);
+    assert(argc==2); materialized_columns(0); materialized_columns(2); materialized_columns(QS_OUT);
+    string_views(); wide_parameters(); expressions(); arithmetic(); case_and_division(); aggregates(argv[1]);
     puts("PASS batch expressions vs scalar, NULL/short-circuit/overflow, selection tails and shared aggregate states"); return 0;
 }
