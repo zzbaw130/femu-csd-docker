@@ -160,6 +160,134 @@ struct probe_test {
     unsigned scan_node;
     struct test_spill *spill;
 };
+/* Exercise the public native-plan entry, not a manually bound dictionary.
+ * Unique heap strings exceed the entire query budget; Sort must revisit them
+ * for lexical comparisons and final result encoding after eviction. */
+static void *probe_worker(void *arg);
+static void dictionary_plan(function run,unsigned cancel,unsigned workers)
+{
+    enum { per_page=32, width=160, tuple_bytes=192 };
+    unsigned rows=workers?65536:32768;
+    const size_t budget=(workers?8U:4U)*1024*1024,raw_bytes=(rows/per_page)*QS_PAGE;
+    struct qp_plan *p=calloc(1,sizeof(*p)); assert(p);
+    p->count=2; p->scan_bytes=QP_SCAN_BYTES;
+    struct qp_node *leaf=&p->nodes[1]; scan(leaf);
+    leaf->bytes=raw_bytes;
+    leaf->expr.cols[0]=(struct qs_column){.length=-1,.align=4,.slot=0,.type=Q_STRING};
+    leaf->expr.exprs[0].type=Q_STRING; leaf->expr.outputs[0].type_oid=25;
+    leaf->input_offset=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
+    leaf->vector_offset=leaf->input_offset+p->scan_bytes;
+    struct qp_node *root=&p->nodes[0];
+    *root=(struct qp_node){.kind=QP_SORT,.left=1,.right=-1,.expr=leaf->expr};
+    root->expr.cols[0].length=4; root->expr.work_mem_bytes=budget;
+    root->expr.norder=2; root->expr.order[0]=(struct qs_order){.output=0};
+    root->expr.order[1]=(struct qs_order){.output=1}; root->expr.limit=-1;
+    size_t vector=(qs_chunk_bytes(QP_VECTOR_ROWS,2)+4095)&~(size_t)4095;
+    size_t bytes=leaf->vector_offset+vector;
+    if(workers) {
+        p->workers=workers; leaf->parallel=1;
+        leaf->parallel_input=bytes; leaf->parallel_vector=bytes+p->scan_bytes;
+        p->parallel_stride=p->scan_bytes+vector; bytes+=(workers-1)*p->parallel_stride;
+    }
+    unsigned char *raw=calloc(1,raw_bytes),*arena=calloc(1,bytes),*io=calloc(workers+1,QS_SORT_IO_BYTES);
+    struct qs_result *out=calloc(workers+1,sizeof(*out)); assert(raw && arena && io && out);
+    unsigned *expected=malloc(rows*sizeof(*expected)); assert(expected);
+    for(unsigned r=0;r<rows;++r) {
+        unsigned key=(r*1009)%rows; expected[key]=r;
+        unsigned char *page=raw+(r/per_page)*QS_PAGE;
+        unsigned off=QS_PAGE-(r%per_page+1)*tuple_bytes; unsigned char *t=page+off;
+        w16(page+10,4); w16(page+12,24+per_page*4); w16(page+14,QS_PAGE-per_page*tuple_bytes);
+        w16(page+16,QS_PAGE); w16(page+18,QS_PAGE|4);
+        w32(page+24+(r%per_page)*4,off|(1U<<15)|(tuple_bytes<<17));
+        w16(t+18,2); w16(t+20,0xb01); t[22]=24; t[23]=r%97?3:2;
+        unsigned at=24;
+        if(r%97) {
+            w32(t+at,(width+4)<<2); at+=4;
+            char prefix[16]; int n=snprintf(prefix,sizeof(prefix),"key-%05u-",key);
+            memcpy(t+at,prefix,n); memset(t+at+n,'a'+key%26,width-n); at+=width;
+        }
+        w32(t+at,r);
+    }
+    *(struct qs_dict *)arena=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
+    *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=QP_VECTOR_ROWS,.ncols=2};
+    struct qp_control *controls=calloc(workers+1,sizeof(*controls)); assert(controls);
+    struct qp_control *c=&controls[0]; void *mr[]={p,c,out,arena,io};
+    long long lengths[]={sizeof(*p),(workers+1)*sizeof(*c),(workers+1)*sizeof(*out),bytes,(workers+1)*QS_SORT_IO_BYTES};
+    struct femu_csd_args a={.numr=5,.mr_addr=mr,.mr_len=lengths,.cparam1=1};
+    struct test_spill spill={.mutex=PTHREAD_MUTEX_INITIALIZER};
+    unsigned seen=0,key=0,null_row=0,loads=0,epoch=0; uint64_t peak=0,available=0,done=0; int cancelled=0;
+    atomic_uint_fast64_t offset=0; bool need_input[QS_WORKERS]={0};
+    while(!out->finished) {
+        if(c->parallel && !csIsReentry(&a)) {
+            pthread_t threads[QS_WORKERS]; struct probe_test tasks[QS_WORKERS]; uint64_t started=0;
+            for(unsigned w=0;w<workers;++w) if(!((available|done)&(UINT64_C(1)<<w))) {
+                tasks[w]=(struct probe_test){run,a,p,&controls[w+1],&out[w+1],arena,raw,raw,NULL,w+1,&offset,&need_input[w],c->scan_node,&spill};
+                tasks[w].args.cparam1=((w+1)<<1)|1;
+                assert(c->scan_node==2 && !pthread_create(&threads[w],NULL,probe_worker,&tasks[w])); started|=UINT64_C(1)<<w;
+            }
+            for(unsigned w=0;w<workers;++w) if(started&(UINT64_C(1)<<w)) {
+                assert(!pthread_join(threads[w],NULL)); available|=UINT64_C(1)<<w;
+                if(out[w+1].finished) done|=UINT64_C(1)<<w;
+            }
+            c->available=available;
+        }
+        int64_t status=run(&a);
+        if(status<0) fprintf(stderr,"dictionary plan status=%lld seen=%u node=%u error=%d stores=%u loads=%u\n",
+            (long long)status,seen,c->error_node,c->error,spill.stores,loads);
+        assert(status>=0);
+        unsigned op=(uint64_t)status>>60;
+        if(op) {
+            loads+=op==2; a.cparam2=spill_request(&spill,op,(uint64_t)status&CS_IO_VALUE_MASK,io);
+            if(cancel==op) {
+                /* Device I/O completed, but the CSF has not acknowledged its
+                 * token. PG quiesces CUs before closing; SNIA session close
+                 * then reclaims all remaining temporary extents. */
+                c->close=1; a.cparam2=0; assert(!run(&a)); cancelled=1; break;
+            }
+            continue;
+        }
+        a.cparam2=0; available&=~c->drained;
+        if(c->epoch!=epoch) {
+            epoch=c->epoch; available=done=0; atomic_store(&offset,0);
+            for(unsigned w=0;w<workers;++w) need_input[w]=true;
+        }
+        for(unsigned r=0;r<out->rows;++r) {
+            struct qs_cell *v=out->data[r].cells; assert(seen<rows);
+            while(key<rows && expected[key]%97==0) ++key;
+            if(key<rows) {
+                char want[width],prefix[16]; int n=snprintf(prefix,sizeof(prefix),"key-%05u-",key);
+                memcpy(want,prefix,n); memset(want+n,'a'+key%26,width-n);
+                assert(!v[0].isnull && qs_cell_string(v)==width && qs_cell_is_string_ref(v));
+                assert(v[0].value>=0 && v[0].value+width<=out->str_bytes);
+                assert(!memcmp(out->str_data+(size_t)v[0].value,want,width));
+                assert(!v[1].isnull && v[1].value==expected[key]); ++key;
+            } else {
+                assert(v[0].isnull && !v[1].isnull && v[1].value==null_row); null_row+=97;
+            }
+            ++seen;
+        }
+        if(out->metrics.work_peak>peak) peak=out->metrics.work_peak;
+        if(c->bytes && !c->ready) {
+            assert(c->offset+c->bytes<=raw_bytes);
+            memcpy(arena+leaf->input_offset,raw+c->offset,c->bytes); c->ready=1;
+        }
+    }
+    if(!cancel) {
+        assert(seen==rows && spill.stores && loads && peak<=budget);
+        if(workers) assert(out->metrics.workers==workers && p->pipelines[1].worker_ns);
+        assert(out->metrics.dictionary_bytes>budget && out->metrics.dictionary_entries==rows-(rows+96)/97);
+        for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i]);
+    } else {
+        assert(cancelled && !c->state);
+        for(unsigned i=0;i<spill.count;++i) { free(spill.tokens[i]); spill.tokens[i]=NULL; }
+    }
+    struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
+    if(!cancel) printf("PASS default dictionary Scan/Sort/output: %u rows, %llu bytes, STORE=%u LOAD=%u peak=%llu/%zu\n",
+        seen,(unsigned long long)out->metrics.dictionary_bytes,spill.stores,loads,(unsigned long long)peak,budget);
+    else printf("PASS default dictionary cancel after %s before CSF acknowledgement\n",cancel==1?"STORE":"LOAD");
+    free(controls); free(spill.tokens); free(expected); free(raw); free(arena); free(io); free(out); free(p);
+    assert(!pthread_mutex_destroy(&spill.mutex));
+}
 /* Independent linear physical-range oracle; source extents deliberately use
  * separated LBAs above 32 bits and split the first Heap page in half. */
 static void namespace_read(struct femu_csd_args *a,unsigned count,const unsigned char *left,
@@ -2074,6 +2202,13 @@ int main(int argc,char **argv)
     assert(qp_worker_mask(0)==0 && qp_worker_mask(32)==UINT32_MAX && qp_worker_mask(64)==UINT64_MAX);
     assert(argc==2 || argc==3 || argc==4); void *library=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(library);
     function capacity=(function)dlsym(library,"pg_sina_workmem_capacity"); assert(capacity);
+    if(argc==3 && !strcmp(argv[2],"--dictionary")) {
+        assert(!cs_work_init(64U*1024*1024));
+        function run=(function)dlsym(library,"pg_sina_plan"); assert(run);
+        for(unsigned cancel=0;cancel<=2;++cancel) dictionary_plan(run,cancel,0);
+        dictionary_plan(run,0,4);
+        return 0;
+    }
     if(argc==3) {
         struct femu_csd_args args={0}; struct cs_work_stats stats;
         uint64_t expected=strtoull(argv[2],NULL,10)*1024*1024;

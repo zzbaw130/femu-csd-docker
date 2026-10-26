@@ -28,7 +28,7 @@ void qs_dictionary_unpin(struct qs_dictionary_access *);
  * row operator's allocation fails while the dictionary still owns cache RAM. */
 int64_t qs_dictionary_evict(struct qs_dictionary *,struct qs_dictionary_access *,
     void *io,uint64_t completion);
-/* Read counters after the participating CUs have stopped dictionary calls. */
+/* Concurrent counters are observational; a quiesced snapshot is exact. */
 void qs_dictionary_get_stats(struct qs_dictionary *,struct qs_dictionary_stats *);
 int qs_dictionary_valid_id(const struct qs_dictionary *,uint32_t id);
 /* All accesses must be idle and unpinned before close; it frees every token,

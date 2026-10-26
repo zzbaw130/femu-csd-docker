@@ -44,8 +44,13 @@ struct text_reference {
     uint32_t id;
     unsigned length,ready;
 };
+/* Small per-CU memo of already interned short values. It owns copies, never
+ * borrowed page pointers, so eviction cannot invalidate a hit. This avoids
+ * serial dictionary operations for every repeated categorical Heap value. */
+struct text_intern { uint32_t id; unsigned length; char bytes[64]; };
 struct qs_dictionary_text {
     struct qs_dictionary *dictionary;
+    struct text_intern interned[64];
     struct text_reference references[2];
     struct qs_dictionary_access writer;
     const char *key;
@@ -75,13 +80,13 @@ static int64_t finish_io(struct qs_dictionary *d,void *io,uint64_t completion)
     switch(d->io) {
     case STORE:
         d->retired=p->token; p->token=completion; p->dirty=0;
-        ++d->stats.stores; d->stats.metadata_stores+=p->metadata;
+        __atomic_fetch_add(&d->stats.stores,1,__ATOMIC_RELAXED); __atomic_fetch_add(&d->stats.metadata_stores,p->metadata,__ATOMIC_RELAXED);
         if(d->retired) { d->io=RETIRE; return csNeedFree(d->retired); }
         break;
     case LOAD:
         if(completion!=p->token) return -3;
         memcpy(p->data,io,PAGE); p->valid=1;
-        ++d->stats.loads; d->stats.metadata_loads+=p->metadata;
+        __atomic_fetch_add(&d->stats.loads,1,__ATOMIC_RELAXED); __atomic_fetch_add(&d->stats.metadata_loads,p->metadata,__ATOMIC_RELAXED);
         break;
     case RETIRE:
         if(completion!=d->retired) return -3;
@@ -267,7 +272,8 @@ int64_t qs_dictionary_insert(struct qs_dictionary *d,struct qs_dictionary_access
         rc=hash_page(d,HASH_FILE,a->bucket,1,&p,io); if(rc) return rc;
         *head_at(p,a->bucket)=a->id; p->dirty=1;
         __atomic_store_n(&d->count,d->count+1,__ATOMIC_RELEASE);
-        d->stats.strings=d->count; d->stats.bytes+=length;
+        __atomic_store_n(&d->stats.strings,d->count,__ATOMIC_RELEASE);
+        __atomic_store_n(&d->stats.bytes,__atomic_load_n(&d->stats.bytes,__ATOMIC_RELAXED)+length,__ATOMIC_RELEASE);
         *id=a->id; done(d,a); return 0;
     /* Rehash by stable ID, not by the chains being rewritten. Every phase
      * copies its inputs before a possible miss, so no page must remain pinned. */
@@ -339,7 +345,14 @@ int64_t qs_dictionary_evict(struct qs_dictionary *d,struct qs_dictionary_access 
     done(d,a); return 0;
 }
 void qs_dictionary_get_stats(struct qs_dictionary *d,struct qs_dictionary_stats *out)
-{ *out=d->stats; }
+{
+    out->strings=__atomic_load_n(&d->stats.strings,__ATOMIC_ACQUIRE);
+    out->bytes=__atomic_load_n(&d->stats.bytes,__ATOMIC_ACQUIRE);
+    out->stores=__atomic_load_n(&d->stats.stores,__ATOMIC_RELAXED);
+    out->loads=__atomic_load_n(&d->stats.loads,__ATOMIC_RELAXED);
+    out->metadata_stores=__atomic_load_n(&d->stats.metadata_stores,__ATOMIC_RELAXED);
+    out->metadata_loads=__atomic_load_n(&d->stats.metadata_loads,__ATOMIC_RELAXED);
+}
 int qs_dictionary_valid_id(const struct qs_dictionary *d,uint32_t id)
 { return id && id<=__atomic_load_n(&d->count,__ATOMIC_ACQUIRE); }
 int64_t qs_dictionary_close(struct qs_dictionary *d,struct qs_dictionary_access *a,
@@ -402,13 +415,23 @@ int64_t qs_dictionary_text_get(struct qs_dictionary_text *t,uint32_t id,
 int64_t qs_dictionary_text_insert(struct qs_dictionary_text *t,const char *bytes,
     unsigned length,uint32_t *id,void *io)
 {
+    struct text_intern *cached=NULL;
+    if(length<=sizeof(t->interned[0].bytes) && (!length || bytes)) {
+        uint32_t hash=2166136261U;
+        for(unsigned i=0;i<length;++i) { hash^=(unsigned char)bytes[i]; hash*=16777619U; }
+        cached=&t->interned[hash%64];
+        if(!t->pending && !t->insert_ready && cached->id && cached->length==length &&
+           (!length || !memcmp(cached->bytes,bytes,length))) { *id=cached->id; return 0; }
+    }
     if(!t->insert_ready) {
         if(t->pending) return t->request;
         t->key=bytes; t->length=length; t->pending=3;
         int64_t status=qs_dictionary_text_resume(t,io,0); if(status) return status;
     }
     if(t->length!=length || (length && memcmp(t->key,bytes,length))) return -3;
-    *id=t->inserted; t->insert_ready=0; t->key=NULL; return 0;
+    *id=t->inserted;
+    if(cached) { cached->id=*id; cached->length=length; if(length) memcpy(cached->bytes,bytes,length); }
+    t->insert_ready=0; t->key=NULL; return 0;
 }
 int64_t qs_dictionary_text_request(const struct qs_dictionary_text *t)
 { return t->request; }

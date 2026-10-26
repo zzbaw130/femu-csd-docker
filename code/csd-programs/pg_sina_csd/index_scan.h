@@ -19,6 +19,8 @@ void qs_index_dictionary(struct qs_join_control *,struct qs_dict *);
  * Namespace pages retain their existing cache; spill uses the caller's final
  * I/O MR. A dictionary wait must retain output rows and the current input. */
 int qs_index_paged_dictionary(struct qs_join_control *,struct qs_dictionary *);
+/* Nested SQL callers bind their outer CSF spill AFDM separately from cache pages. */
+void qs_index_spill_io(struct qs_join_control *,unsigned slot,void *io);
 int qs_index_dictionary_pending(const struct qs_join_control *,unsigned slot);
 int64_t qs_index_scan_paged(struct qs_chunk *,struct qs_task *,struct qs_join_control *,void *,
     unsigned heap_pages,unsigned index_pages,int flags,struct femu_csd_args *);

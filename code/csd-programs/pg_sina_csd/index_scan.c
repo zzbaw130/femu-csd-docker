@@ -26,7 +26,7 @@ struct index_cursor {
     struct qs_scan_cursor *decoder;
     void *spill_io;
     uint64_t dictionary_completion;
-    unsigned dictionary_pending,dictionary_key;
+    unsigned dictionary_pending,dictionary_key,spill_bound;
 };
 _Static_assert(sizeof(struct index_cursor)<=4096,"index cursor must fit its per-CU budget");
 struct index_join {
@@ -109,6 +109,12 @@ int qs_index_paged_dictionary(struct qs_join_control *control,struct qs_dictiona
         if(!h->cursors[i]->decoder) return -4;
     }
     return 0;
+}
+void qs_index_spill_io(struct qs_join_control *control,unsigned slot,void *io)
+{
+    struct index_join *h=(void *)(uintptr_t)control->state;
+    struct index_cursor *c=h?index_cursor(h,slot):NULL;
+    if(c) { c->spill_io=io; c->spill_bound=io!=NULL; }
 }
 int qs_index_dictionary_pending(const struct qs_join_control *control,unsigned slot)
 {
@@ -364,7 +370,7 @@ int64_t qs_index_probe(unsigned stage,struct qs_chunk *c,const struct qs_plan *p
     struct qs_chunk *out=(void *)((unsigned char *)a->mr_addr[4]+stage*qs_join_chunk_stride(p));
     if(a->numr!=6 || a->mr_len[5]<QS_SORT_IO_BYTES+(long long)QS_INDEX_CACHE*QS_PAGE) return -1;
     if(h->paged_dictionary) {
-        cursor->spill_io=a->mr_addr[5];
+        if(!cursor->spill_bound) cursor->spill_io=a->mr_addr[5];
         cursor->dictionary_completion=cursor->dictionary_pending?csReentryValue(a):0;
     }
     if(cursor->waiting) {

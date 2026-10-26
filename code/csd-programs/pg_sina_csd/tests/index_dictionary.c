@@ -171,6 +171,7 @@ static void run(cs_work_context *parent,int probe,uint64_t cancel)
     assert(!qs_index_init(&p,&control)); assert(!qs_index_paged_dictionary(&control,dictionary));
     size_t io_bytes=QS_SORT_IO_BYTES+(size_t)QS_INDEX_CACHE*QS_PAGE;
     char *io=calloc(1,io_bytes),*spill=calloc(1,QS_SORT_IO_BYTES); assert(io && spill);
+    qs_index_spill_io(&control,task.slot,spill);
     struct qs_chunk *out=calloc(1,qs_chunk_bytes(17,p.ncols)); assert(out);
     out->capacity=17; out->ncols=p.ncols;
     struct qs_chunk *input=calloc(1,qs_chunk_bytes(1500,1)); assert(input);
@@ -202,7 +203,7 @@ static void run(cs_work_context *parent,int probe,uint64_t cancel)
         if(rc==QS_INDEX_WAIT && task.index_pending && !qs_index_dictionary_pending(&control,task.slot)) namespace_reads(&task,io);
         else {
             assert((qs_index_dictionary_pending(&control,task.slot) || consumer_phase) && rc>QS_DICTIONARY_BUSY);
-            uint64_t value=complete(rc,probe?(void *)io:(void *)spill);
+            uint64_t value=complete(rc,qs_index_dictionary_pending(&control,task.slot)?(void *)spill:(void *)io);
             a.cparam2=ordered.cparam2=value;
             if(((uint64_t)rc&~CS_IO_VALUE_MASK)==cancel) {
                 /* I/O completed, but its token has not reached the CSF. */

@@ -6,6 +6,7 @@
 #include "plan.h"
 #include "query_vector.h"
 #include "index_scan.h"
+#include "scan.h"
 #include <limits.h>
 #include <stdbool.h>
 #include <stdatomic.h>
@@ -17,6 +18,7 @@ extern int64_t pg_sina_filter_impl(struct femu_csd_args *);
 extern int64_t pg_sina_sort_sink_impl(struct femu_csd_args *);
 extern int64_t pg_sina_sort_source_impl(struct femu_csd_args *);
 extern void qs_sort_dictionary(uint64_t,struct qs_dict *);
+extern int qs_sort_paged_dictionary(uint64_t,struct qs_dictionary *);
 extern int qs_sort_prepare(uint64_t);
 extern int64_t qs_sort_finish_sink(uint64_t,struct femu_csd_args *);
 extern int64_t qs_sort_sink_columns(struct femu_csd_args *,const struct qs_plan *,const struct qs_vector *,unsigned,unsigned);
@@ -198,6 +200,7 @@ struct operator_state {
     struct spool group;
     uint64_t position, skipped, emitted;
     unsigned scan_position, scan_input, scan_bytes,scan_raw,scan_raw_bytes;
+    struct qs_scan_cursor *scan_cursor;
     int defer_strings;
     struct qs_plan *scan_filter;
     int scan_filter_checked,projection_checked;
@@ -256,6 +259,12 @@ struct execution {
     struct qp_control *control;
     struct qs_dict *dictionary;
     struct qs_dictionary *paged;
+    struct qs_dictionary_access *initial_access;
+    unsigned *literal_ids;
+    unsigned imported,literal_node,literal_string;
+    int dictionary_ready,operators_closed,closing,buffered;
+    unsigned buffered_rows,buffered_finished;
+    int64_t initial_wait,dictionary_wait;
     struct qs_dictionary_text *text;
     struct group_update_state *group_update;
     int64_t text_wait;
@@ -513,7 +522,11 @@ static int evaluate(struct execution *s,struct qs_eval *e,int index,struct qs_ce
     }
     else if(x->op==Q_CONST && x->type==Q_STRING && !x->isnull) {
         const struct qs_string *literal=&e->plan->strings[x->constant];
-        unsigned id; if(text_insert(s,literal->bytes,literal->length,&id) || text_release(s)) return -3;
+        uintptr_t at=(uintptr_t)e->plan,first=(uintptr_t)&s->plan->nodes[0].expr;
+        unsigned node=at>=first?(at-first)/sizeof(struct qp_node):s->plan->count;
+        unsigned id=s->literal_ids && node<s->plan->count && e->plan==&s->plan->nodes[node].expr?
+            s->literal_ids[node*QS_STRINGS+(unsigned)x->constant]:0;
+        if(!id && (text_insert(s,literal->bytes,literal->length,&id) || text_release(s))) return -3;
         v.value=id;
     } else if(x->op==Q_COLUMN || x->op==Q_CONST || x->op==Q_AGGREF) return qs_evaluate(e,index,out);
     else {
@@ -742,8 +755,10 @@ static int64_t sort_init(struct execution *s,struct sorted_rows *sort,const stru
     for(unsigned i=0;i<keys;++i) sort->plan.order[sort->plan.norder++]=order?order[i]:(struct qs_order){.output=columns[i]};
     sort->task.workers=1;
     int64_t status=sort_call(s,sort,0); if(status) return status;
-    qs_sort_dictionary(sort->task.state,s->dictionary);
-    sort->initialized=1; return 0;
+    sort->initialized=1;
+    if(s->paged) { int bound=qs_sort_paged_dictionary(sort->task.state,s->paged); if(bound) return bound; }
+    else qs_sort_dictionary(sort->task.state,s->dictionary);
+    return 0;
 }
 static int64_t sorted_input(struct execution *s,struct sorted_rows *sort,unsigned child,
     unsigned keys,const int *columns,const struct qs_order *order,struct qs_cell *row)
@@ -1530,6 +1545,21 @@ static int scan_filter_init(struct execution *s,const struct qs_plan *p,struct o
 {
     if(!o->scan_filter_checked) {
         o->scan_filter_checked=1; uint8_t needed[QS_EXPRS]={0};
+        if(s->paged) {
+            int text=0;
+            for(unsigned i=0;i<p->nattrs;++i) text|=p->cols[i].type==Q_STRING;
+            for(unsigned i=0;i<p->nexprs;++i) text|=p->exprs[i].type==Q_STRING;
+            if(text) {
+                if(p->predicate<0 && o->defer_strings) {
+                    struct qs_plan *filter=cs_work_alloc(s->context,sizeof(*filter)); if(!filter) return -4;
+                    *filter=*p;
+                    for(unsigned i=0;i<p->nattrs;++i) if(filter->cols[i].type==Q_STRING && filter->cols[i].slot>=0)
+                        filter->cols[i].deferred=QS_DEFERRED;
+                    o->scan_filter=filter;
+                }
+                return 0;
+            }
+        }
         if(p->predicate<0 && !o->defer_strings) return 0;
         struct qs_plan *filter=cs_work_alloc(s->context,sizeof(*p)); if(!filter) return 0;
         *filter=*p; filter->work_mem_parent=(uintptr_t)s->context;
@@ -1590,10 +1620,12 @@ static int64_t scan_chunk_next(struct execution *s,unsigned id)
         *o->index_plan=*p; o->index_plan->work_mem_parent=(uintptr_t)s->context;
         o->index_plan->join.nattrs=p->nattrs; o->index_plan->join.work_mem_bytes=QS_INDEX_WORK_BYTES;
         int status=qs_index_init(o->index_plan,&o->index_control); if(status) return status;
-        qs_index_dictionary(&o->index_control,s->dictionary);
+        if(s->paged) { int bound=qs_index_paged_dictionary(&o->index_control,s->paged); if(bound) return bound; }
+        else qs_index_dictionary(&o->index_control,s->dictionary);
     }
     for(;;) {
-        if(!o->index_task.index_pending && o->scan_position<chunk->selected) return 2;
+        if(!o->index_task.index_pending && (!n->ordered_index || !qs_index_dictionary_pending(&o->index_control,0)) &&
+           !s->dictionary_wait && o->scan_position<chunk->selected) return 2;
         if(n->ordered_index) {
             if(s->worker && (n->ordered_index&8) && !o->input_done) {
                 uint64_t first=atomic_fetch_add_explicit(&s->owner->next_offset,16*QS_PAGE,memory_order_relaxed)/QS_PAGE;
@@ -1605,10 +1637,13 @@ static int64_t scan_chunk_next(struct execution *s,unsigned id)
             if(o->index_task.index_pending) {
                 if(!s->control->ready) return QP_WAIT;
                 s->control->ready=s->control->index_nreads=0;
-            } else chunk->rows=chunk->selected=0;
-            int64_t status=qs_index_scan(chunk,&o->index_task,&o->index_control,s->arena+input_offset(s,n),
+            } else if(!s->paged || !qs_index_dictionary_pending(&o->index_control,0)) chunk->rows=chunk->selected=0;
+            int64_t status=s->paged?qs_index_scan_paged(chunk,&o->index_task,&o->index_control,s->arena+input_offset(s,n),
+                n->bytes/QS_PAGE,n->index_bytes/QS_PAGE,n->ordered_index,s->args):
+                qs_index_scan(chunk,&o->index_task,&o->index_control,s->arena+input_offset(s,n),
                 n->bytes/QS_PAGE,n->index_bytes/QS_PAGE,n->ordered_index);
-            if(status==QS_INDEX_WAIT) {
+            s->dictionary_wait=s->paged && qs_index_dictionary_pending(&o->index_control,0)?status:0;
+            if(status==QS_INDEX_WAIT && o->index_task.index_pending) {
                 s->control->node=id; s->control->index_nreads=o->index_task.index_nreads;
                 memcpy(s->control->index_reads,o->index_task.index_reads,sizeof(s->control->index_reads));
                 return QP_WAIT;
@@ -1647,9 +1682,18 @@ static int64_t scan_chunk_next(struct execution *s,unsigned id)
             long long len[]={bytes,sizeof(*p),qs_chunk_bytes(chunk->capacity,chunk->ncols),sizeof(task),0};
             struct femu_csd_args a={.numr=5,.mr_addr=mr,.mr_len=len};
             o->scan_raw=o->scan_input; o->scan_raw_bytes=bytes;
-            status=timed_call(s,pg_sina_scan_impl,&a,QS_SCAN); if(status) return status;
+            if(s->paged) {
+                if(!o->scan_cursor) o->scan_cursor=qs_scan_cursor_create(s->context,s->paged);
+                if(!o->scan_cursor) return -4;
+                mr[4]=s->io; len[4]=s->io_bytes;
+                struct blocking_timer timer={0}; if(s->profiling) timer=blocking_begin(s);
+                status=qs_scan_columns(o->scan_cursor,&a,s->dictionary_wait?csReentryValue(s->args):0);
+                if(s->profiling) blocking_end(s,QS_SCAN,timer);
+                s->dictionary_wait=status>0?status:0;
+            } else status=timed_call(s,pg_sina_scan_impl,&a,QS_SCAN);
+            if(status) return status;
             s->metrics.scanned+=chunk->rows; s->metrics.input_bytes+=task.input_bytes; ++s->metrics.chunks;
-            if(o->scan_filter && p->predicate>=0) {
+            if(o->scan_filter && o->scan_filter->predicate>=0) {
                 void *fm[]={chunk,o->scan_filter,mr[0],s->dictionary,s->params};
                 long long fl[]={len[2],sizeof(*p),task.input_bytes,0,sizeof(s->params)};
                 struct femu_csd_args filter={.numr=5,.mr_addr=fm,.mr_len=fl};
@@ -1692,7 +1736,7 @@ static int64_t scan_next(struct execution *s,unsigned id,struct qs_cell *row)
                 .scale=p->cols[i].scale,.dscale=qs_dscales(chunk)[(size_t)slot*chunk->capacity+at],
                 .isnull=(qs_nulls(chunk)[(size_t)slot*((chunk->capacity+7)/8)+at/8]>>(at%8))&1};
         }
-        int count=project_filtered(s,n,values,NULL,row,o->scan_filter!=NULL); if(count<0) return count;
+        int count=project_filtered(s,n,values,NULL,row,o->scan_filter && o->scan_filter->predicate>=0); if(count<0) return count;
         if(count) { ++s->metrics.matched; return 2; }
     }
 }
@@ -1760,8 +1804,14 @@ static int projection_import(struct projection_import *in,unsigned node,int inde
     if(e.op==Q_CONST && e.type==Q_STRING && !e.isnull) {
         if(e.constant<0 || e.constant>=n->expr.nstrings) return -1;
         const struct qs_string *v=&n->expr.strings[(unsigned)e.constant];
-        int id=qs_dict_insert(in->execution->dictionary,v->bytes,v->length); if(id<0) return -1;
-        e.constant=id;
+        if(in->execution->paged) {
+            unsigned id=in->execution->literal_ids?in->execution->literal_ids[node*QS_STRINGS+(unsigned)e.constant]:0;
+            if(!id) return -1;
+            e.constant=id;
+        } else {
+            int id=qs_dict_insert(in->execution->dictionary,v->bytes,v->length); if(id<0) return -1;
+            e.constant=id;
+        }
     }
     if(p->nexprs==QS_EXPRS) return -1;
     unsigned at=p->nexprs++; p->exprs[at]=e; in->nodes[at]=node; in->expressions[at]=index;
@@ -1962,7 +2012,8 @@ static int projection_init(struct execution *s,unsigned id,int source)
     b->plan=leaf->expr; b->plan.nexprs=0; b->plan.nout=grouped?s->plan->nodes[root->left].expr.nout:
         aggregate?root->expr.naggs:root->expr.nout; b->scan=scan; b->joined=joined; b->sorted=sorted;
     b->group_source=group_source;
-    b->filtered_scan=!joined && !sorted && !group_source && s->nodes[scan].scan_filter && leaf->expr.predicate>=0;
+    b->filtered_scan=!joined && !sorted && !group_source && s->nodes[scan].scan_filter &&
+        s->nodes[scan].scan_filter->predicate>=0;
     if(group_source) b->plan.nattrs=leaf->nkeys+leaf->expr.naggs;
     if(sorted) {
         b->plan.ncols=b->plan.nattrs;
@@ -2019,6 +2070,24 @@ static int projection_init(struct execution *s,unsigned id,int source)
     }
     if(b->plan.nexprs) b->vectors=cs_work_alloc(s->context,b->plan.nexprs*sizeof(*b->vectors));
     if(b->plan.nexprs && !b->vectors) { cs_work_free(s->context,b->cells); cs_work_free(s->context,b); return 0; }
+    /* Once this vector DAG is known to fit, let it filter raw Heap text.
+     * Rejected values never enter the dictionary. A negative predicate on
+     * this decoder copy means the DAG, rather than the flat Filter CSF,
+     * owns filtering and the resumable materialization of survivors. */
+    if(s->paged && !joined && !sorted && !group_source && !leaf->ordered_index &&
+       !s->nodes[scan].scan_filter) {
+        int text=0;
+        for(unsigned col=0;col<leaf->expr.nattrs;++col) text|=leaf->expr.cols[col].type==Q_STRING;
+        if(text) {
+            struct qs_plan *decoder=cs_work_alloc(s->context,sizeof(*decoder));
+            if(decoder) {
+                *decoder=leaf->expr; decoder->predicate=-1;
+                for(unsigned col=0;col<decoder->nattrs;++col) if(decoder->cols[col].type==Q_STRING && decoder->cols[col].slot>=0)
+                    decoder->cols[col].deferred=QS_DEFERRED;
+                s->nodes[scan].scan_filter=decoder;
+            }
+        }
+    }
     *slot=b; return 0;
 }
 static void projection_append(struct projection_batch *b,const struct qs_cell *values)
@@ -2224,7 +2293,7 @@ static int64_t projection_fill(struct execution *s,unsigned id,int source)
             struct qs_chunk *chunk=(void *)(s->arena+vector_offset(s,&s->plan->nodes[b->scan]));
             b->count=chunk->selected-scan->scan_position; if(b->count>QS_VECTOR_ROWS) b->count=QS_VECTOR_ROWS;
             const struct qp_node *source=&s->plan->nodes[b->scan];
-            if(scan->defer_strings && source->expr.predicate<0)
+            if(s->paged || (scan->defer_strings && source->expr.predicate<0))
                 for(unsigned col=0;col<b->plan.nattrs;++col) if(b->plan.cols[col].type==Q_STRING)
                     b->plan.cols[col].deferred=scan->scan_filter?scan->scan_filter->cols[col].deferred:QS_EAGER;
             const void *raw=scan->scan_raw_bytes?s->arena+input_offset(s,source)+scan->scan_raw:NULL;
@@ -3693,7 +3762,8 @@ static int64_t index_next(struct execution *s,unsigned id,struct qs_cell *row,st
             if(p->cols[i+2].slot>=0) p->cols[i+2].slot+=2;
         }
         int status=qs_index_init(p,&o->index_control); if(status) return status;
-        qs_index_dictionary(&o->index_control,s->dictionary);
+        if(s->paged) { int bound=qs_index_paged_dictionary(&o->index_control,s->paged); if(bound) return bound; }
+        else qs_index_dictionary(&o->index_control,s->dictionary);
         index_projection_init(s,id);
         struct qs_chunk *input=(void *)(s->arena+vector_offset(s,n)),*output=(void *)(s->arena+vector_offset(s,n)+4096);
         *input=(struct qs_chunk){.capacity=64,.ncols=2};
@@ -3755,7 +3825,8 @@ static int64_t index_next(struct execution *s,unsigned id,struct qs_cell *row,st
             s->arena+vector_offset(s,n)+4096,s->arena+input_offset(s,n)};
         long long len[]={qs_chunk_bytes(64,2),sizeof(*p),sizeof(o->index_task),sizeof(o->index_control),
             qs_chunk_bytes(256,p->ncols),QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE};
-        struct femu_csd_args a={.numr=6,.mr_addr=mr,.mr_len=len};
+        struct femu_csd_args a={.numr=6,.mr_addr=mr,.mr_len=len,.cparam2=s->args->cparam2};
+        if(s->paged) qs_index_spill_io(&o->index_control,0,s->io);
         /* A self-join can reuse the input pages already retained by its scan.
          * This is the current morsel only; advancing the scan updates the window. */
         int scan=qp_probe_scan(s->plan,n->left);
@@ -3767,6 +3838,7 @@ static int64_t index_next(struct execution *s,unsigned id,struct qs_cell *row,st
         index_execution=s; index_node=id; index_columns=b;
         int64_t status=qs_index_probe(0,mr[0],p,&o->index_task,&o->index_control,&a,o->index_resume);
         index_columns=NULL; o->index_resume=1;
+        s->dictionary_wait=s->paged && qs_index_dictionary_pending(&o->index_control,0)?status:0;
         if(status==QP_INDEX_YIELD) { if(b) return 2; continue; }
         if(status==QS_INDEX_WAIT && o->index_task.index_pending) {
             s->control->node=id; s->control->index_nreads=o->index_task.index_nreads;
@@ -4019,7 +4091,8 @@ static void parallel_sort_begin(struct execution *s,unsigned root)
             local->input=&s->outputs[w+1]; local->input->rows=local->input->begin=0;
             if(sort_call(e,local,0)) goto fallback;
             sort->group.states[sort->group.count++]=local->task.state;
-            qs_sort_dictionary(local->task.state,s->dictionary);
+            if(s->paged) { if(qs_sort_paged_dictionary(local->task.state,s->paged)) goto fallback; }
+            else qs_sort_dictionary(local->task.state,s->dictionary);
         }
         if(qs_sort_prepare(local->task.state)) goto fallback;
     }
@@ -4156,6 +4229,11 @@ restart:
             e->context=context; e->plan=p; e->owner=s; e->worker=w+1; e->root=root;
             e->hash_sink=hash_sink; e->group_sink=group_sink; e->aggregate_sink=aggregate_sink;
             e->control=s->control+w+1; e->dictionary=s->dictionary; e->arena=s->arena;
+            e->paged=s->paged; e->literal_ids=s->literal_ids; e->dictionary_ready=1;
+            if(e->paged) {
+                e->text=qs_dictionary_text_create(e->paged);
+                if(!e->text) { cs_work_end(context); close_workers(s); p->nodes[root].parallel=0; return row?next_row(s,root,row):3; }
+            }
             e->io_bytes=QS_SORT_IO_BYTES;
             e->sort_limit=s->sort_limit; e->profiling=s->profiling; e->initializer=p->ninit;
             e->source_node=-1;
@@ -4284,12 +4362,41 @@ static void drop_sort(struct sorted_rows *sort)
     struct femu_csd_args a={.numr=1,.mr_addr=mr,.mr_len=len};
     pg_sina_sort_source_impl(&a); sort->task.state=0;
 }
-static void close_execution(struct execution *s)
+static void close_operators(struct execution *s)
 {
+    if(s->operators_closed) return;
+    s->operators_closed=1;
     for(unsigned i=0;i<s->plan->count;++i) { drop_sort(&s->nodes[i].left_sort); drop_sort(&s->nodes[i].right_sort); }
     for(unsigned i=0;i<s->plan->count;++i) if(s->nodes[i].index_control.state) qs_index_close(&s->nodes[i].index_control);
     close_workers(s);
+}
+static void close_execution(struct execution *s)
+{
+    close_operators(s);
+    if(s->paged && !s->owner) qs_dictionary_abort(s->paged);
     cs_work_context *context=s->context; s->control->state=0; cs_work_end(context);
+}
+/* BUSY completes this graph call without publishing a partial result.
+ * Keep its row count private until the same batch can continue. */
+static int64_t dictionary_request(struct execution *s,struct qs_result *out,int64_t status)
+{
+    if(status!=QS_DICTIONARY_BUSY) return status;
+    s->buffered_rows=out->rows; s->buffered_finished=out->finished; s->buffered=1;
+    out->rows=out->finished=0;
+    s->control->output_rows=s->control->finished=0;
+    return 0;
+}
+static int64_t finish_dictionary(struct execution *s,struct femu_csd_args *a,struct qs_result *out)
+{
+    close_operators(s);
+    int64_t status=qs_dictionary_close(s->paged,s->initial_access,s->io,s->closing>1?csReentryValue(a):0);
+    if(status) {
+        s->closing=status==QS_DICTIONARY_BUSY?1:2;
+        out->finished=0; s->control->output_rows=s->control->finished=0;
+        return dictionary_request(s,out,status);
+    }
+    s->paged=NULL; out->finished=s->control->finished=1; s->control->output_rows=out->rows;
+    close_execution(s); return 0;
 }
 /* Resource discovery uses a normal zero-argument CSF and its 64-bit completion
  * value. SNIA CSE properties report CUs, but do not describe this allocator. */
@@ -4302,8 +4409,31 @@ int64_t pg_sina_workmem_capacity(struct femu_csd_args *a)
 /* plan, lifecycle/page requests, result, input/dictionary arena, spill I/O.
  * A successful call either returns result rows or asks PG to LOAD pages.
  * NEED_STORE/LOAD is handled entirely by the existing SNIA batch scheduler. */
-static void *dictionary_allocate(void *context,size_t bytes)
-{ return cs_work_alloc(context,bytes); }
+static int64_t initialize_dictionary(struct execution *s,struct femu_csd_args *a)
+{
+    if(s->dictionary_ready) return 0;
+    const struct qs_dict *config=(const void *)s->arena;
+    uint64_t completion=s->initial_wait>QS_DICTIONARY_BUSY?csReentryValue(a):0;
+    for(;s->imported<=config->count;++s->imported) {
+        const char *bytes; unsigned length; uint32_t id=0;
+        if(qs_dict_get(config,s->imported,&bytes,&length)) return -3;
+        int64_t status=qs_dictionary_insert(s->paged,s->initial_access,bytes,length,&id,s->io,completion);
+        s->initial_wait=status; if(status) return status;
+        completion=0; if(id!=s->imported) return -3;
+    }
+    for(;s->literal_node<s->plan->count;++s->literal_node,s->literal_string=0) {
+        const struct qs_plan *p=&s->plan->nodes[s->literal_node].expr;
+        if(p->nstrings>QS_STRINGS) return -1;
+        for(;s->literal_string<p->nstrings;++s->literal_string) {
+            const struct qs_string *v=&p->strings[s->literal_string]; uint32_t id=0;
+            if(v->length>sizeof(v->bytes)) return -1;
+            int64_t status=qs_dictionary_insert(s->paged,s->initial_access,v->bytes,v->length,&id,s->io,completion);
+            s->initial_wait=status; if(status) return status;
+            completion=0; s->literal_ids[s->literal_node*QS_STRINGS+s->literal_string]=id;
+        }
+    }
+    s->dictionary_ready=1; return 0;
+}
 /* Translate this SQL program's immutable file mapping into generic device
  * reads. Neither FEMU nor SNIA sees the file/extent interpretation. */
 static int namespace_ranges(struct execution *s,const struct qp_file_mapping *map,
@@ -4413,32 +4543,37 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
         cs_work_context *context=cs_work_begin_limit(budget); if(!context) return -4;
         s=cs_work_calloc(context,1,sizeof(*s)); if(!s) { cs_work_end(context); return -4; }
         s->context=context; s->plan=plan; s->control=control;
-        const struct qs_dict *config=a->mr_addr[3];
-        s->dictionary=cs_work_calloc(context,1,sizeof(*s->dictionary));
-        if(!s->dictionary) { cs_work_end(context); return -4; }
-        *s->dictionary=(struct qs_dict){.entries=config->entries,.capacity=config->entries,.data=config->data,
-            .context=context,.allocate=dictionary_allocate};
-        /* An input can already contain dictionary IDs (for example a
-         * materialized column batch). Preserve those IDs while moving its
-         * backing strings into this query's budget. PG's config is empty. */
-        for(unsigned id=1;id<=config->count;++id) {
-            const char *bytes; unsigned length;
-            if(qs_dict_get(config,id,&bytes,&length) || qs_dict_insert(s->dictionary,bytes,length)!=(int)id) {
-                cs_work_end(context); return -3;
-            }
-        }
         s->partition_join=s->source_node=-1;
         s->arena=a->mr_addr[3]; s->io=a->mr_addr[4]; s->io_bytes=a->mr_len[4];
         s->nodes=cs_work_calloc(context,plan->count,sizeof(*s->nodes));
         if(!s->nodes) { cs_work_end(context); return -4; }
         unsigned depth=sort_depth(plan,plan->root);
         s->sort_limit=budget/(depth+2); if(s->sort_limit<512*1024) { cs_work_end(context); return -4; }
+        s->literal_ids=cs_work_calloc(context,plan->count*QS_STRINGS,sizeof(*s->literal_ids));
+        s->paged=qs_dictionary_create(context);
+        if(s->paged) { s->text=qs_dictionary_text_create(s->paged); s->initial_access=qs_dictionary_access_create(s->paged); }
+        if(!s->literal_ids || !s->paged || !s->text || !s->initial_access) {
+            if(s->paged) qs_dictionary_abort(s->paged);
+            cs_work_end(context); return -4;
+        }
+        s->imported=1;
         s->profiling=a->cparam1&1; s->outputs=a->mr_addr[2]; control->state=(uintptr_t)s;
+        out->rows=out->begin=out->finished=out->str_bytes=0; out->status=0;
     }
-    s->args=a;
-    if(!csIsReentry(a) && ((uint64_t)a->cparam1&QP_PAGES_INPUT) && !((uint64_t)a->cparam1&QP_SCAN_INPUT))
+    s->args=a; s->io=a->mr_addr[4]; s->io_bytes=a->mr_len[4];
+    if(s->buffered) { out->rows=s->buffered_rows; out->finished=s->buffered_finished; s->buffered=0; }
+    if(s->closing) return finish_dictionary(s,a,out);
+    int continuing=s->text_wait || s->dictionary_wait || s->initial_wait || s->pending_sort;
+    int64_t imported=initialize_dictionary(s,a);
+    if(imported) return dictionary_request(s,out,imported);
+    if(s->text_wait) {
+        int64_t resumed=qs_dictionary_text_resume(s->text,s->io,s->text_wait>QS_DICTIONARY_BUSY?csReentryValue(a):0);
+        s->text_wait=resumed; if(resumed) return dictionary_request(s,out,resumed);
+        s->expression_wait=0;
+    }
+    if(!continuing && !csIsReentry(a) && ((uint64_t)a->cparam1&QP_PAGES_INPUT) && !((uint64_t)a->cparam1&QP_SCAN_INPUT))
         control->ready=1;
-    if(((uint64_t)a->cparam1&QP_SCAN_INPUT) && !csIsReentry(a)) {
+    if(!continuing && ((uint64_t)a->cparam1&QP_SCAN_INPUT) && !csIsReentry(a)) {
         int id=qp_probe_scan(plan,s->root);
         uint64_t page=(uint64_t)a->cparam1>>QP_SCAN_PAGE_SHIFT;
         if(!worker || id<0 || plan->nodes[id].ordered_index || page>UINT64_MAX/QS_PAGE) return -1;
@@ -4468,7 +4603,7 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
         else { memcpy(p->cache,s->io,QS_SORT_IO_BYTES); p->loaded=s->pending_block; s->metrics.spill_read_bytes+=QS_SORT_IO_BYTES; }
         s->pending_spool=NULL;
     }
-    if(!csIsReentry(a)) { out->rows=out->begin=out->finished=out->str_bytes=0; out->status=0; }
+    if(!csIsReentry(a) && !continuing) { out->rows=out->begin=out->finished=out->str_bytes=0; out->status=0; }
     uint64_t start=s->profiling?now_ns(CLOCK_MONOTONIC):0,cpu=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
     if(s->profiling && !worker) s->pipeline_tick=cpu;
     struct execution *owner=worker?s->owner:s;
@@ -4626,6 +4761,8 @@ produced:
         if(s->host_scan && !out->rows && status==2) goto produce;
     }
 combined:
+    if(s->text_wait) status=s->text_wait;
+    if(s->dictionary_wait) status=s->dictionary_wait;
     if(s->expression_wait && s->pending_spool) {
         s->expression_wait=0;
         status=csNeedLoad(s->pending_spool->tokens[s->pending_block]);
@@ -4640,10 +4777,15 @@ combined:
         ++t->calls; t->wall_ns+=now_ns(CLOCK_MONOTONIC)-start; t->cpu_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-cpu;
         atomic_fetch_sub(&owner->active_cus,1); control->peak_cus=atomic_load(&owner->peak_cus);
     }
-    control->output_rows=out->rows;
+    control->output_rows=(s->text_wait || s->dictionary_wait)?0:out->rows;
     out->metrics=s->metrics; out->metrics.workers=s->used_workers?s->used_workers:1; out->profile=s->profile;
-    out->metrics.dictionary_entries=__atomic_load_n(&s->dictionary->count,__ATOMIC_ACQUIRE);
-    out->metrics.dictionary_bytes=__atomic_load_n(&s->dictionary->bytes,__ATOMIC_RELAXED);
+    struct qs_dictionary_stats dictionary;
+    qs_dictionary_get_stats(s->paged,&dictionary);
+    out->metrics.dictionary_entries=dictionary.strings; out->metrics.dictionary_bytes=dictionary.bytes;
+    if(!worker) {
+        out->metrics.spill_read_bytes+=dictionary.loads*QS_DICTIONARY_PAGE_BYTES;
+        out->metrics.spill_write_bytes+=dictionary.stores*QS_DICTIONARY_PAGE_BYTES;
+    }
     for(unsigned i=0;i<plan->count;++i) if(plan->nodes[i].kind==QP_INDEX_JOIN || plan->nodes[i].ordered_index) {
         out->metrics.index_pages+=s->nodes[i].index_task.index_pages;
         out->metrics.index_tuples+=s->nodes[i].index_task.index_tuples;
@@ -4652,10 +4794,12 @@ combined:
     struct cs_work_context_stats memory;
     if(!cs_work_get_context_stats(s->context,&memory)) out->metrics.work_peak=memory.peak_used_bytes;
     if(status<0) return status;
+    if(s->text_wait==QS_DICTIONARY_BUSY || s->dictionary_wait==QS_DICTIONARY_BUSY ||
+       (s->pending_sort && status==QS_DICTIONARY_BUSY)) return dictionary_request(s,out,QS_DICTIONARY_BUSY);
     if(worker && status<=2)
-        return (out->rows?QP_OUTPUT_READY:0) | (s->host_scan && s->scan_drained?QP_INPUT_DRAINED:0) |
+        return (control->output_rows?QP_OUTPUT_READY:0) | (s->host_scan && s->scan_drained?QP_INPUT_DRAINED:0) |
             (out->finished?QP_WORKER_FINISHED:0) |
             (!control->ready && (control->bytes || control->index_nreads)?QP_CONTROL_REQUIRED:0);
-    if(out->finished && !worker) close_execution(s);
+    if(out->finished && !worker) { s->closing=1; return finish_dictionary(s,a,out); }
     return status==QP_WAIT?0:status>2?status:0;
 }
