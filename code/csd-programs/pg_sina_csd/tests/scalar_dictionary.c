@@ -528,6 +528,168 @@ static unsigned spill_partial_merge(struct execution *s,struct qs_dictionary *d,
     assert(!o->aggregate_position && hash_aggregate_next_impl(s,0,result,0,1)==0 && !sort->output);
     assert(waits); return waits;
 }
+static const unsigned join_left_keys[8][3]={
+    {1000,100,10},{1000,100,5000},{1000,200,2000},{2000,100,6000},
+    {2000,200,3000},{3000,100,100},{4000,100,7000},{0,100,10}};
+static const unsigned join_right_keys[8][3]={
+    {1000,100,10},{1000,100,10},{1000,200,2000},{1500,100,123},
+    {2000,100,6000},{2000,100,7000},{4000,100,7001},{0,100,10}};
+static void join_plan(struct qp_plan *p,unsigned kind)
+{
+    memset(p->nodes,0,3*sizeof(*p->nodes)); p->count=3; p->workers=0;
+    for(unsigned id=1;id<=2;++id) {
+        struct qp_node *n=&p->nodes[id];
+        /* These materialized inputs are already complete; left supplies
+         * column metadata only, so no input production runs in this test. */
+        n->kind=QP_MATERIALIZED; n->left=id; n->expr.nout=n->expr.nattrs=n->expr.nexprs=4;
+        n->expr.predicate=-1;
+        for(unsigned i=0;i<4;++i) {
+            n->expr.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.column=i,.type=i<3?Q_STRING:Q_INTEGER};
+            n->expr.outputs[i].index=i; n->expr.outputs[i].type_oid=i<3?25:23;
+            n->expr.cols[i]=(struct qs_column){.slot=i,.length=i<3?-1:4,.align=4,.type=i<3?Q_STRING:Q_INTEGER};
+        }
+    }
+    struct qp_node *n=&p->nodes[0]; n->kind=QP_JOIN; n->left=1; n->right=2;
+    n->join_type=kind; n->nkeys=2; n->left_keys[0]=n->right_keys[0]=0; n->left_keys[1]=n->right_keys[1]=1;
+    n->expr.nattrs=8; n->expr.nexprs=10; n->expr.nstrings=1; n->expr.norder=2;
+    n->expr.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.type=Q_STRING,.column=2};
+    n->expr.exprs[1]=(struct qs_expr){.op=Q_COLUMN,.type=Q_STRING,.column=6};
+    n->expr.exprs[2]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=2};
+    n->expr.exprs[3]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=6};
+    n->expr.exprs[4]=(struct qs_expr){.op=QP_SUBSTRING,.type=Q_STRING,.left=0,.right=2,.otherwise=3};
+    n->expr.exprs[5]=(struct qs_expr){.op=QP_SUBSTRING,.type=Q_STRING,.left=1,.right=2,.otherwise=3};
+    n->expr.exprs[6]=(struct qs_expr){.op=Q_EQ,.type=Q_BOOLEAN,.left=4,.right=5};
+    n->expr.exprs[7]=(struct qs_expr){.op=Q_CONST,.type=Q_STRING,.constant=0};
+    n->expr.strings[0].length=5; memcpy(n->expr.strings[0].bytes,"%-a-%",5);
+    n->expr.exprs[8]=(struct qs_expr){.op=QP_LIKE,.type=Q_BOOLEAN,.left=0,.right=7};
+    n->expr.exprs[9]=(struct qs_expr){.op=Q_AND,.type=Q_BOOLEAN,.left=8,.right=6}; n->join_qual=9;
+}
+static unsigned join_rows(struct execution *s,struct qs_dictionary *d,struct qs_dictionary_access *access)
+{
+    unsigned kinds[]={QP_INNER,QP_LEFT,QP_SEMI,QP_ANTI};
+    unsigned char *tails[3]={s->nodes[0].group.tail,s->nodes[1].group.tail,s->nodes[2].group.tail};
+    struct join_condition_state *condition=s->nodes[0].join_condition;
+    unsigned char *table=s->nodes[0].hash_data;
+    unsigned waits=0,key_waits=0,condition_waits=0;
+    struct qp_control control={0}; s->control=&control;
+    for(unsigned hash=0;hash<2;++hash) for(unsigned mode=0;mode<4;++mode) {
+        drop_cache(d,access); join_plan(s->plan,kinds[mode]);
+        memset(s->nodes,0,3*sizeof(*s->nodes));
+        struct operator_state *o=&s->nodes[0];
+        o->join_condition=condition; assert(!condition->active);
+        o->group.tail=tails[0]; o->group.loaded=UINT_MAX;
+        o->merge_ordered=7; o->merge_qual_checked=o->hash_qual_checked=1;
+        for(unsigned side=1;side<=2;++side) {
+            struct operator_state *input=&s->nodes[side];
+            input->group_ready=1; input->group.tail=tails[side]; input->group.rows=input->group.used=8;
+            for(unsigned row=0;row<8;++row) {
+                const unsigned *keys=side==1?join_left_keys[row]:join_right_keys[row];
+                struct qs_cell values[4]={{.value=ids[keys[0]][0],.isnull=row==7},
+                    {.value=ids[keys[1]][0]},{.value=ids[keys[2]][side-1]},{.value=row}};
+                memcpy(input->group.tail+row*sizeof(values),values,sizeof(values));
+            }
+        }
+        struct qp_node *n=&s->plan->nodes[0];
+        if(hash) {
+            n->hash=1; o->hash_phase=1; o->hash_shared=1; o->hash_capacity=8; o->hash_buckets=16; o->hash_data=table;
+            unsigned stride=hash_row_bytes(&s->plan->nodes[2].expr);
+            uint32_t *next=(void *)(table+8*stride),*buckets=next+8;
+            for(unsigned i=0;i<16;++i) buckets[i]=UINT_MAX;
+            for(unsigned row=0;row<8;++row) {
+                struct qs_cell *values=(void *)(tails[2]+row*4*sizeof(*values));
+                hash_store(table+row*stride,values,&s->plan->nodes[2].expr);
+                unsigned slot=row_hash(n,values,1)&15; next[row]=buckets[slot]; buckets[slot]=row;
+            }
+            /* No dictionary I/O is needed to accept/reject equal-key hash
+             * candidates, even when their string bodies were just evicted. */
+            struct qs_cell *left=(void *)tails[1],*right=(void *)tails[2];
+            unsigned before=loads; assert(keys_equal(s,n,left,right)==1 && loads==before);
+        }
+        unsigned seen[8][9]={0};
+        for(unsigned attempts=0;;++attempts) {
+            assert(attempts<10000); struct qs_cell values[QS_COLS];
+            int64_t status=hash?hash_match_next(s,0,0):merge_match_next(s,0,values);
+            if(!status) break;
+            if(status<0) {
+                assert(s->expression_wait);
+                key_waits+=o->merge_key>0; condition_waits+=condition->active;
+                waits+=resume(s); continue;
+            }
+            assert(status==2);
+            if(hash) {
+                memcpy(values,o->left,4*sizeof(*values));
+                if(o->hash_null_right) for(unsigned i=4;i<8;++i) values[i]=(struct qs_cell){.isnull=1};
+                else memcpy(values+4,o->right,4*sizeof(*values));
+            }
+            unsigned l=values[3].value,r=values[7].isnull?8:(unsigned)values[7].value;
+            assert(l<8 && r<=8); ++seen[l][r];
+        }
+        for(unsigned l=0;l<8;++l) {
+            unsigned matches=0,actual=0;
+            for(unsigned r=0;r<8;++r) {
+                int match=l!=7 && r!=7 && join_left_keys[l][0]==join_right_keys[r][0] &&
+                    join_left_keys[l][1]==join_right_keys[r][1] && join_left_keys[l][2]==join_right_keys[r][2];
+                matches+=match; actual+=seen[l][r];
+                if(kinds[mode]==QP_INNER || kinds[mode]==QP_LEFT) assert(seen[l][r]==(unsigned)match);
+                else assert(!seen[l][r] || (kinds[mode]==QP_SEMI && match && seen[l][r]==1));
+            }
+            if(kinds[mode]==QP_SEMI) assert(actual==(matches!=0) && !seen[l][8]);
+            else if(kinds[mode]==QP_ANTI) assert(!actual && seen[l][8]==(matches==0));
+            else assert(seen[l][8]==(kinds[mode]==QP_LEFT && !matches));
+        }
+        assert(s->nodes[1].position==8 && !condition->active && !o->merge_key);
+    }
+    s->control=NULL;
+    assert(waits && key_waits && condition_waits);
+    printf("join dictionary key waits=%u condition waits=%u\n",key_waits,condition_waits);
+    return waits;
+}
+static unsigned index_condition_rows(struct execution *s,struct qs_dictionary *d,struct qs_dictionary_access *access)
+{
+    drop_cache(d,access); join_plan(s->plan,QP_INNER);
+    struct operator_state *o=&s->nodes[0]; struct qp_node *n=&s->plan->nodes[0];
+    n->kind=QP_INDEX_JOIN; n->expr.nout=8; n->expr.nexprs=20; n->expr.predicate=-1;
+    for(unsigned col=0;col<8;++col) {
+        n->expr.exprs[10+col]=(struct qs_expr){.op=Q_COLUMN,.type=col%4<3?Q_STRING:Q_INTEGER,.column=col};
+        n->expr.outputs[col].index=10+col;
+    }
+    n->expr.exprs[18]=(struct qs_expr){.op=Q_COLUMN,.type=Q_STRING,.column=0};
+    n->expr.exprs[19]=(struct qs_expr){.op=QP_SUBSTRING,.type=Q_STRING,.left=18,.right=2,.otherwise=3};
+    n->expr.outputs[2].index=19;
+    o->index_left=(void *)s->nodes[1].group.tail; o->index_count=8;
+    o->index_output=cs_work_calloc(s->context,1,sizeof(*o->index_output)); assert(o->index_output);
+    o->index_active=o->index_flush=o->index_consume_position=0;
+    struct qs_chunk *chunk=calloc(1,qs_chunk_bytes(64,6)); assert(chunk); chunk->capacity=64; chunk->ncols=6;
+    for(unsigned l=0;l<7;++l) for(unsigned r=0;r<7;++r) {
+        if(join_left_keys[l][0]!=join_right_keys[r][0] || join_left_keys[l][1]!=join_right_keys[r][1]) continue;
+        unsigned at=chunk->rows++; qs_selection(chunk)[at]=at; qs_values(chunk)[chunk->capacity+at]=l;
+        struct qs_cell *right=(void *)(s->nodes[2].group.tail+r*4*sizeof(*right));
+        for(unsigned col=0;col<4;++col) qs_values(chunk)[(size_t)(col+2)*chunk->capacity+at]=right[col].value;
+    }
+    chunk->selected=chunk->rows; index_execution=s; index_node=0; index_columns=NULL;
+    unsigned waits=0,projection_waits=0;
+    for(unsigned attempts=0;;++attempts) {
+        assert(attempts<10000); int64_t rc=qs_join_consume(0,chunk,NULL,NULL,NULL,NULL,0);
+        if(rc==QP_INDEX_YIELD) break;
+        assert(rc<0 && s->expression_wait); projection_waits+=o->project_retry!=NULL; waits+=resume(s);
+    }
+    unsigned seen[8][8]={0};
+    for(unsigned i=0;i<o->index_output->rows;++i) {
+        const struct qs_cell *row=o->index_output->data[i].cells;
+        unsigned l=row[3].value,r=row[7].value; assert(l<8 && r<8); ++seen[l][r];
+        char bytes[LENGTH]; make_text(bytes,join_left_keys[l][0],0);
+        check_string(d,access,row[2].value,bytes+2,6);
+    }
+    for(unsigned l=0;l<8;++l) for(unsigned r=0;r<8;++r) {
+        int match=l!=7 && r!=7 && join_left_keys[l][0]==join_right_keys[r][0] &&
+            join_left_keys[l][1]==join_right_keys[r][1] && join_left_keys[l][2]==join_right_keys[r][2];
+        assert(seen[l][r]==(unsigned)match);
+    }
+    assert(waits && projection_waits && !o->join_condition->active && qs_join_consume(0,chunk,NULL,NULL,NULL,NULL,0)==0);
+    index_execution=NULL; cs_work_free(s->context,o->index_output); o->index_output=NULL; free(chunk);
+    printf("index dictionary projection waits=%u\n",projection_waits);
+    return waits;
+}
 /* Abort after I/O completion but before its token is acknowledged. A query
  * scope also owns this token, so it must reclaim it without needing a retry. */
 static void cancel_operation(uint64_t operation,int exporting)
@@ -539,6 +701,17 @@ static void cancel_operation(uint64_t operation,int exporting)
     s->context=ctx; s->io=io; s->text=qs_dictionary_text_create(d); assert(s->text);
     s->plan=calloc(1,sizeof(*s->plan)); assert(s->plan); plan(s->plan);
     s->nodes=cs_work_calloc(ctx,1,sizeof(*s->nodes)); assert(s->nodes);
+    if(exporting==4) {
+        s->plan->nodes[0].join_qual=9;
+        s->nodes[0].join_condition=cs_work_calloc(ctx,1,sizeof(*s->nodes[0].join_condition)); assert(s->nodes[0].join_condition);
+    }
+    if(exporting==5) {
+        struct qp_node *n=&s->plan->nodes[0]; n->left=1; n->right=2; n->nkeys=2;
+        for(unsigned i=0;i<2;++i) {
+            n->left_keys[i]=n->right_keys[i]=i;
+            s->plan->nodes[1].expr.outputs[i].index=i; s->plan->nodes[1].expr.exprs[i].type=Q_STRING;
+        }
+    }
     if(exporting==3) {
         aggregate_plan(s->plan); s->plan->nodes[0].expr.naggs=5;
         s->plan->nodes[0].nkeys=s->plan->nodes[0].expr.nkeys=1;
@@ -570,7 +743,13 @@ static void cancel_operation(uint64_t operation,int exporting)
     }
     int cancelled=0;
     for(unsigned attempts=0;attempts<10000 && !cancelled;++attempts) {
-        int status=exporting==3?group_sink_row(s,0,&s->nodes[0],input,GROUP_SHARED):
+        if(exporting==5) {
+            s->nodes[0].left[0]=(struct qs_cell){.value=1}; s->nodes[0].left[1]=(struct qs_cell){.value=1000};
+            s->nodes[0].right[0]=(struct qs_cell){.value=4096}; s->nodes[0].right[1]=(struct qs_cell){.value=2000};
+        }
+        int status=exporting==5?key_compare(s,&s->plan->nodes[0],s->nodes[0].left,s->nodes[0].right):
+            exporting==4?join_condition(s,0,input,&result[0]):
+            exporting==3?group_sink_row(s,0,&s->nodes[0],input,GROUP_SHARED):
             exporting==2?accumulate(s,&s->plan->nodes[0],&s->nodes[0]):
             exporting?export_row(s,&root,out->data[0].cells,out):
             project(s,&s->plan->nodes[0],input,NULL,result);
@@ -595,8 +774,9 @@ static void cancel_operation(uint64_t operation,int exporting)
 }
 int main(int argc,char **argv)
 {
-    assert(argc==1 || (argc==2 && (!strcmp(argv[1],"--aggregate") || !strcmp(argv[1],"--hash-aggregate"))));
+    assert(argc==1 || (argc==2 && (!strcmp(argv[1],"--aggregate") || !strcmp(argv[1],"--hash-aggregate") || !strcmp(argv[1],"--join"))));
     int aggregates=argc==2 && !strcmp(argv[1],"--aggregate"),hashed=argc==2 && !strcmp(argv[1],"--hash-aggregate");
+    int joining=argc==2 && !strcmp(argv[1],"--join");
     assert(!cs_work_init(BUDGET));
     cs_work_context *ctx=cs_work_begin_limit(BUDGET); assert(ctx);
     struct qs_dictionary *d=qs_dictionary_create(ctx); assert(d);
@@ -604,7 +784,12 @@ int main(int argc,char **argv)
     struct execution *s=cs_work_calloc(ctx,1,sizeof(*s)); assert(s);
     s->context=ctx; s->io=io; s->text=qs_dictionary_text_create(d); assert(s->text);
     s->plan=calloc(1,sizeof(*s->plan)); assert(s->plan); plan(s->plan);
-    s->nodes=cs_work_calloc(ctx,1,sizeof(*s->nodes)); assert(s->nodes);
+    s->nodes=cs_work_calloc(ctx,joining?3:1,sizeof(*s->nodes)); assert(s->nodes);
+    if(joining) {
+        s->nodes[0].join_condition=cs_work_calloc(ctx,1,sizeof(*s->nodes[0].join_condition)); assert(s->nodes[0].join_condition);
+        for(unsigned i=0;i<3;++i) { s->nodes[i].group.tail=cs_work_alloc(ctx,QS_SORT_IO_BYTES); assert(s->nodes[i].group.tail); }
+        s->nodes[0].hash_data=cs_work_alloc(ctx,4096); assert(s->nodes[0].hash_data);
+    }
     struct projection_batch *b=NULL;
     if(aggregates || hashed) {
         b=cs_work_calloc(ctx,1,sizeof(*b)); assert(b);
@@ -625,7 +810,9 @@ int main(int argc,char **argv)
         char bytes[LENGTH]; make_text(bytes,row,col); ids[row][col]=insert(d,access,bytes,LENGTH);
     }
     unsigned scalar_waits,output_waits;
-    if(hashed) {
+    if(joining) {
+        scalar_waits=join_rows(s,d,access); output_waits=index_condition_rows(s,d,access);
+    } else if(hashed) {
         scalar_waits=shared_interleave(s,peer,d,access);
         output_waits=hash_vectors(s,b)+partition_combine(s,peer,d,access)+hash_scalar(s,d,access)+spill_partial_merge(s,d,access);
         assert(!qs_dictionary_text_release(peer->text)); free(peer->io);
@@ -648,7 +835,10 @@ int main(int argc,char **argv)
     }
     assert(!live); free(tokens); tokens=NULL; ntokens=stores=loads=0; assert(!cs_work_end(ctx));
     cs_work_stats total; assert(!cs_work_get_stats(&total) && !total.used_bytes && !total.active_contexts);
-    if(hashed) {
+    if(joining) {
+        cancel_operation(CS_NEED_STORE,4); cancel_operation(CS_NEED_LOAD,4);
+        cancel_operation(CS_NEED_STORE,5); cancel_operation(CS_NEED_LOAD,5);
+    } else if(hashed) {
         cancel_operation(CS_NEED_STORE,3); cancel_operation(CS_NEED_LOAD,3);
     } else if(aggregates) {
         cancel_operation(CS_NEED_STORE,2); cancel_operation(CS_NEED_LOAD,2);
@@ -657,7 +847,8 @@ int main(int argc,char **argv)
     cancel_operation(CS_NEED_STORE,1); cancel_operation(CS_NEED_LOAD,1);
     cancel_operation(0,1);
     }
-    puts(hashed?"PASS shared hash rebase during dictionary I/O, vector partial retention and scalar arguments":
+    puts(joining?"PASS paged multi-key Merge/Hash INNER, LEFT, SEMI and ANTI with resumable scalar conditions":
+        hashed?"PASS shared hash rebase during dictionary I/O, vector partial retention and scalar arguments":
         aggregates?"PASS dictionary ID grouping and resumable scalar/vector/stream MIN/MAX and partial combine":
         "PASS scalar text memo, retained input, short circuit, partial export and cancellation/error cleanup");
     return 0;

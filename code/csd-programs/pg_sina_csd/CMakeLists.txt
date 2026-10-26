@@ -49,6 +49,7 @@ if(BUILD_TESTING)
     add_test(NAME pgSinaDictionaryScalarOutput COMMAND pg-sina-scalar-dictionary-test)
     add_test(NAME pgSinaDictionaryAggregate COMMAND pg-sina-scalar-dictionary-test --aggregate)
     add_test(NAME pgSinaDictionaryHashAggregate COMMAND pg-sina-scalar-dictionary-test --hash-aggregate)
+    add_test(NAME pgSinaDictionaryJoin COMMAND pg-sina-scalar-dictionary-test --join)
     add_executable(pg-sina-dictionary-test tests/dictionary.c dictionary.c scan.c)
     target_include_directories(pg-sina-dictionary-test PRIVATE "${CSD_FEMU_INCLUDE}" "${CMAKE_CURRENT_SOURCE_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")

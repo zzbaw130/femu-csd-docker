@@ -97,6 +97,11 @@ struct pending_projection {
     int has_input,has_aggregates,filtered,inline_only;
     struct qs_eval evaluation; /* Completed subexpressions survive dictionary I/O. */
 };
+struct join_condition_state {
+    struct qs_eval evaluation;
+    struct qs_cell input[QS_COLS];
+    int active;
+};
 struct accumulator { struct qs_cell sum,extreme,last; uint64_t count; int has_last; };
 /* Scalar aggregate arguments must finish before any accumulator changes. */
 struct aggregate_input {
@@ -200,6 +205,8 @@ struct operator_state {
     int source_checked;
     unsigned projection_deferred,source_deferred;
     int phase, have_left, have_right, input_done, group_ready, matched, finished;
+    struct join_condition_state *join_condition;
+    unsigned merge_key;
     unsigned merge_ordered; /* left/right input order verified; bit 2 marks checked. */
     struct merge_qual_batch *merge_qual;
     int merge_qual_checked;
@@ -214,7 +221,7 @@ struct operator_state {
     uint64_t index_matches;
     unsigned index_count, index_unmatched;
     unsigned index_position;
-    int index_resume, index_flush,index_active;
+    int index_resume, index_flush,index_active,index_projected;
     unsigned index_consume_position;
     unsigned char *hash_data;
     atomic_uint hash_rows;
@@ -345,6 +352,7 @@ static int64_t external_build(struct execution *,unsigned);
 static int64_t external_probe(struct execution *,unsigned,struct qs_cell *);
 static void external_advance(struct execution *,unsigned);
 static int key_compare(struct execution *,const struct qp_node *,const struct qs_cell *,const struct qs_cell *);
+static int keys_equal(struct execution *,const struct qp_node *,const struct qs_cell *,const struct qs_cell *);
 static int keys_null(const struct qp_node *,const struct qs_cell *);
 static uint64_t mix_hash(uint64_t);
 static int64_t build_set(struct execution *,unsigned);
@@ -555,6 +563,24 @@ static int evaluate(struct execution *s,struct qs_eval *e,int index,struct qs_ce
         }
     }
     e->valid[index]=1; e->cells[index]=v; *out=v; return 0;
+}
+static int join_condition(struct execution *s,unsigned id,const struct qs_cell *values,struct qs_cell *match)
+{
+    const struct qp_node *n=&s->plan->nodes[id];
+    if(!s->text) {
+        struct qs_eval e; init_eval(&e,&n->expr,values,NULL);
+        return evaluate(s,&e,n->join_qual,match);
+    }
+    struct operator_state *o=&s->nodes[id];
+    if(!o->join_condition) o->join_condition=cs_work_calloc(s->context,1,sizeof(*o->join_condition));
+    struct join_condition_state *q=o->join_condition; if(!q) return -4;
+    if(!q->active) {
+        memcpy(q->input,values,n->expr.nattrs*sizeof(*values));
+        init_eval(&q->evaluation,&n->expr,q->input,NULL); q->active=1;
+    }
+    int status=evaluate(s,&q->evaluation,n->join_qual,match);
+    if(!status) q->active=0;
+    return status;
 }
 static int project_filtered_impl(struct execution *s,const struct qp_node *n,const struct qs_cell *input,
     const struct qs_cell *aggregates,struct qs_cell *row,int filtered,struct qs_eval *e)
@@ -1006,7 +1032,8 @@ restart:
             unsigned at=o->hash_match-1; o->hash_match=next[at]==UINT_MAX?0:next[at]+1;
             hash_load(o->right,o->hash_data+(size_t)at*row_bytes,right_plan);
             const struct qs_cell *right=o->right;
-            if(key_compare(s,n,o->left,right)) continue;
+            int equal=keys_equal(s,n,o->left,right); if(equal<0) return -5;
+            if(!equal) continue;
             int null=0; for(unsigned i=0;i<n->nkeys;++i) null|=right[n->right_keys[i]].isnull;
             if(null) continue;
             if(n->join_type==QP_ANTI && n->join_qual<0) {
@@ -1016,15 +1043,15 @@ restart:
             if(n->join_qual>=0) {
                 /* EXISTS often accepts its first candidate. Keep that fast
                  * path; vectorize only after a residual condition rejects. */
-                int status=(n->join_type==QP_SEMI || n->join_type==QP_ANTI) && !o->hash_qual_rejected?
+                int pending=o->join_condition && o->join_condition->active;
+                int status=pending || ((n->join_type==QP_SEMI || n->join_type==QP_ANTI) && !o->hash_qual_rejected)?
                     3:hash_qual_next(s,id,at,next);
                 if(status<0) return status;
                 if(!status) continue;
                 if(status==2) goto matched;
                 int payload=hash_left_payload(s,id); if(payload) return payload;
                 struct qs_cell values[QS_COLS]; memcpy(values,o->left,ln*sizeof(*values)); memcpy(values+ln,right,rn*sizeof(*values));
-                struct qs_eval e; init_eval(&e,&n->expr,values,NULL);
-                if(evaluate(s,&e,n->join_qual,&match)) {
+                if(join_condition(s,id,values,&match)) {
                     if(s->expression_wait) o->hash_match=at+1;
                     return -5;
                 }
@@ -1293,19 +1320,32 @@ static int64_t build_set(struct execution *s,unsigned id)
 static int key_compare(struct execution *s,const struct qp_node *n,const struct qs_cell *left,const struct qs_cell *right)
 {
     const struct qs_plan *types=&s->plan->nodes[n->left].expr;
-    for(unsigned i=0;i<n->nkeys;++i) {
+    struct operator_state *o=&s->nodes[n-s->plan->nodes];
+    for(unsigned i=o->merge_key;i<n->nkeys;++i) {
         unsigned col=n->left_keys[i];
         unsigned type=types->exprs[types->outputs[col].index].type;
         struct qs_cell a=left[col],b=right[n->right_keys[i]];
         int cmp=compare_cell(s,a,b,type);
-        if(cmp==INT_MIN) return cmp;
+        if(cmp==INT_MIN) { o->merge_key=i; return cmp; }
         if(n->expr.norder) {
             if(a.isnull || b.isnull) { if(n->expr.order[i].nulls_first) cmp=-cmp; }
             else if(n->expr.order[i].descending) cmp=-cmp;
         }
-        if(cmp) return cmp;
+        if(cmp) { o->merge_key=0; return cmp; }
     }
-    return 0;
+    o->merge_key=0; return 0;
+}
+/* Hash matching only needs equality; canonical text IDs avoid reading
+ * dictionary bodies for candidates that already passed the hash lookup. */
+static int keys_equal(struct execution *s,const struct qp_node *n,const struct qs_cell *left,const struct qs_cell *right)
+{
+    const struct qs_plan *types=&s->plan->nodes[n->left].expr;
+    for(unsigned i=0;i<n->nkeys;++i) {
+        unsigned col=n->left_keys[i];
+        int equal=equal_cell(s,left[col],right[n->right_keys[i]],types->exprs[types->outputs[col].index].type);
+        if(equal<=0) return equal;
+    }
+    return 1;
 }
 static int keys_null(const struct qp_node *n,const struct qs_cell *left)
 { for(unsigned i=0;i<n->nkeys;++i) if(left[n->left_keys[i]].isnull) return 1; return 0; }
@@ -1364,9 +1404,9 @@ static int64_t merge_match_next(struct execution *s,unsigned id,struct qs_cell *
             int same=1;
             for(unsigned i=0;i<n->nkeys;++i) {
                 unsigned col=n->left_keys[i];
-                int cmp=compare_cell(s,o->left[col],o->first[col],types->exprs[types->outputs[col].index].type);
-                if(cmp==INT_MIN) return -5;
-                if(cmp) same=0;
+                int equal=equal_cell(s,o->left[col],o->first[col],types->exprs[types->outputs[col].index].type);
+                if(equal<0) return -5;
+                if(!equal) same=0;
             }
             if(!same) { o->group_ready=0; o->group.rows=o->group.blocks=o->group.used=0; o->group.loaded=UINT_MAX; }
         }
@@ -1403,16 +1443,20 @@ static int64_t merge_match_next(struct execution *s,unsigned id,struct qs_cell *
         }
         if(o->position<o->group.rows || (o->merge_qual && o->merge_qual->expr.position<o->merge_qual->expr.count)) {
             int qualified=0;
-            if(n->join_qual>=0) {
+            if(n->join_qual>=0 && !(o->join_condition && o->join_condition->active)) {
                 status=merge_qual_next(s,id,values);
                 if(!status) continue;
                 if(status!=3) { if(status!=2) return status; qualified=1; }
             }
             if(!qualified) {
-                memcpy(values,o->left,ln*sizeof(*values));
-                status=spool_row(s,&o->group,o->position,rn,values+ln); if(status) return status;
-                struct qs_eval e; init_eval(&e,&n->expr,values,NULL); struct qs_cell match={.value=1};
-                if(n->join_qual>=0 && evaluate(s,&e,n->join_qual,&match)) return -5;
+                if(o->join_condition && o->join_condition->active)
+                    memcpy(values,o->join_condition->input,n->expr.nattrs*sizeof(*values));
+                else {
+                    memcpy(values,o->left,ln*sizeof(*values));
+                    status=spool_row(s,&o->group,o->position,rn,values+ln); if(status) return status;
+                }
+                struct qs_cell match={.value=1};
+                if(n->join_qual>=0 && join_condition(s,id,values,&match)) return -5;
                 ++o->position;
                 if(match.isnull || !match.value) continue;
             }
@@ -1795,7 +1839,8 @@ static int hash_qual_next(struct execution *s,unsigned id,uint32_t first,const u
         while(cursor && count<capacity) {
             unsigned at=cursor-1; cursor=next[at]==UINT_MAX?0:next[at]+1;
             hash_load(o->right,o->hash_data+(size_t)at*stride,&right->expr);
-            if(key_compare(s,n,o->left,o->right)) continue;
+            int equal=keys_equal(s,n,o->left,o->right); if(equal<0) return -5;
+            if(!equal) continue;
             int null=0; for(unsigned k=0;k<n->nkeys;++k) null|=o->right[n->right_keys[k]].isnull;
             if(!null) rows[count++]=at;
         }
@@ -3505,12 +3550,13 @@ int64_t qs_join_consume(unsigned stage,struct qs_chunk *chunk,const struct qs_pl
     struct projection_batch *b=index_columns;
     if(o->index_flush) { o->index_flush=0; return 0; }
     if(!o->index_active) {
-        o->index_active=1; o->index_consume_position=0;
+        o->index_active=1; o->index_consume_position=0; o->index_projected=0;
         if(!b) { o->index_output->rows=0; o->index_position=0; }
     }
     struct projection_batch *projected=chunk->selected>1?o->index_projection:NULL;
-    if(projected) {
+    if(projected && !o->index_projected) {
         int status=index_project_batch(s,projected,chunk); if(status) return status;
+        o->index_projected=1;
     }
     struct index_qual_batch *qualified=NULL;
     if(b && n->join_qual>=0 && chunk->selected>1) {
@@ -3537,9 +3583,15 @@ int64_t qs_join_consume(unsigned stage,struct qs_chunk *chunk,const struct qs_pl
                 if(slot>=0) values[col]=q->cells[(size_t)slot*QS_VECTOR_ROWS+r];
             }
         } else {
-            int status=index_join_values(s,id,chunk,r,projected,values); if(status<0) return status; if(!status) continue;
-            struct qs_eval e; init_eval(&e,&n->expr,values,NULL);
-            if(n->join_qual>=0 && evaluate(s,&e,n->join_qual,&match)) return -5;
+            if(o->project_retry) memcpy(values,o->project_retry->input,n->expr.nattrs*sizeof(*values));
+            else {
+                if(o->join_condition && o->join_condition->active)
+                    memcpy(values,o->join_condition->input,n->expr.nattrs*sizeof(*values));
+                else {
+                    int status=index_join_values(s,id,chunk,r,projected,values); if(status<0) return status; if(!status) continue;
+                }
+                if(n->join_qual>=0 && join_condition(s,id,values,&match)) return -5;
+            }
         }
         if(match.isnull || !match.value) continue;
         uint64_t bit=UINT64_C(1)<<source;
