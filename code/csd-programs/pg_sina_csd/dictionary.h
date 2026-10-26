@@ -23,6 +23,10 @@ int64_t qs_dictionary_insert(struct qs_dictionary *,struct qs_dictionary_access 
 int64_t qs_dictionary_pin(struct qs_dictionary *,struct qs_dictionary_access *,
     uint32_t id,const char **bytes,unsigned *length,void *io,uint64_t completion);
 void qs_dictionary_unpin(struct qs_dictionary_access *);
+/* Give one unpinned cache page back to the shared query budget. Used when a
+ * row operator's allocation fails while the dictionary still owns cache RAM. */
+int64_t qs_dictionary_evict(struct qs_dictionary *,struct qs_dictionary_access *,
+    void *io,uint64_t completion);
 /* Read counters after the participating CUs have stopped dictionary calls. */
 void qs_dictionary_get_stats(struct qs_dictionary *,struct qs_dictionary_stats *);
 /* All accesses must be idle and unpinned before close; it frees every token,

@@ -10,7 +10,7 @@
 #define PAGE QS_DICTIONARY_PAGE_BYTES
 #define CHUNK_PAGES 64U
 enum { ENTRY_FILE, BODY_FILE, HASH_FILE, REHASH_FILE, FILES };
-enum { INSERT=1, PIN, CLOSE };
+enum { INSERT=1, PIN, CLOSE, EVICT };
 enum { STORE=1, LOAD, RETIRE, DROP };
 struct entry { uint32_t hash,next,page; uint16_t offset,length; };
 _Static_assert(sizeof(struct entry)==16,"dictionary entry layout");
@@ -307,6 +307,20 @@ void qs_dictionary_unpin(struct qs_dictionary_access *a)
 {
     if(a->pinned) atomic_fetch_sub_explicit(&a->pinned->pins,1,memory_order_release);
     a->pinned=NULL;
+}
+int64_t qs_dictionary_evict(struct qs_dictionary *d,struct qs_dictionary_access *a,
+    void *io,uint64_t completion)
+{
+    int64_t rc=begin(d,a,EVICT,io,completion);
+    if(rc) return rc;
+    struct page *p=victim(d);
+    if(!p) { done(d,a); return -4; }
+    if(p->dirty) {
+        memcpy(io,p->data,PAGE); d->pending=p; d->io=STORE;
+        return csNeedStore(PAGE);
+    }
+    cs_work_free(d->context,p->data); p->data=NULL; p->valid=0;
+    done(d,a); return 0;
 }
 void qs_dictionary_get_stats(struct qs_dictionary *d,struct qs_dictionary_stats *out)
 { *out=d->stats; }

@@ -4,6 +4,7 @@
 #include "cs_csf.h"
 #include "cs_workmem.h"
 #include "query_vector.h"
+#include "dictionary.h"
 #include <assert.h>
 #include <dlfcn.h>
 #include <stdio.h>
@@ -25,6 +26,22 @@ static int64_t sink_columns(struct femu_csd_args *a)
 static void *blocks[8192];
 static unsigned next_token=1,stored,loaded,workers=4;
 static size_t capacity=8U*1024*1024,budget=8U*1024*1024;
+static uint64_t complete_io(int64_t value,void *io)
+{
+    uint64_t action=(uint64_t)value&~CS_IO_VALUE_MASK,token=(uint64_t)value&CS_IO_VALUE_MASK;
+    if(action==CS_NEED_STORE) {
+        assert(token==QS_SORT_IO_BYTES && next_token<8192);
+        token=next_token++; blocks[token]=malloc(QS_SORT_IO_BYTES); assert(blocks[token]);
+        memcpy(blocks[token],io,QS_SORT_IO_BYTES); ++stored;
+    } else if(action==CS_NEED_LOAD) {
+        assert(token && token<next_token && blocks[token]);
+        memcpy(io,blocks[token],QS_SORT_IO_BYTES); ++loaded;
+    } else {
+        assert(action==CS_NEED_FREE && token && token<next_token && blocks[token]);
+        free(blocks[token]); blocks[token]=NULL;
+    }
+    return token;
+}
 static int64_t run(function f,struct femu_csd_args *args)
 {
     args->cparam2=0;
@@ -33,19 +50,8 @@ static int64_t run(function f,struct femu_csd_args *args)
         if(value<0) { struct cs_work_stats stats; assert(!cs_work_get_stats(&stats));
             fprintf(stderr,"sort status=%lld args=%d workers=%u used=%zu peak=%zu tokens=%u\n",(long long)value,args->numr,workers,stats.used_bytes,stats.peak_used_bytes,next_token); }
         assert(value>=0);
-        uint64_t action=(uint64_t)value&~CS_IO_VALUE_MASK,token=(uint64_t)value&CS_IO_VALUE_MASK;
-        void *io=args->mr_addr[args->numr-1];
-        if(action==CS_NEED_STORE) {
-            assert(token==QS_SORT_IO_BYTES && next_token<8192);
-            token=next_token++; blocks[token]=malloc(QS_SORT_IO_BYTES); assert(blocks[token]);
-            memcpy(blocks[token],io,QS_SORT_IO_BYTES); ++stored;
-        } else if(action==CS_NEED_LOAD) {
-            assert(token && token<next_token && blocks[token]);
-            memcpy(io,blocks[token],QS_SORT_IO_BYTES); ++loaded;
-        } else if(action==CS_NEED_FREE) {
-            assert(token && token<next_token && blocks[token]); free(blocks[token]); blocks[token]=NULL;
-        } else return value;
-        args->cparam2=token;
+        if(!((uint64_t)value&~CS_IO_VALUE_MASK)) return value;
+        args->cparam2=complete_io(value,args->mr_addr[args->numr-1]);
     }
 }
 static int host_order(const void *left,const void *right)
@@ -146,10 +152,146 @@ static void check(function sink,function source,unsigned rows,int64_t limit,int6
     printf("rows=%u pool=%zu budget=%zu peak=%zu store=%u load=%u\n",rows,capacity,budget,stats.peak_used_bytes,stored,loaded);
     free(input); free(out); free(io); free(c); free(expected);
 }
+enum { TEXT_KEYS=4096, TEXT_LENGTH=2048 };
+static unsigned char *text_keys;
+static int text_descending,text_nulls_first;
+static unsigned text_key(unsigned row) { return row*1009U%TEXT_KEYS; }
+static int text_order(const void *left,const void *right)
+{
+    unsigned a=*(const unsigned *)left,b=*(const unsigned *)right;
+    int cmp;
+    if((a%13==0)!=(b%13==0)) {
+        cmp=(a%13==0)?1:-1; if(text_nulls_first) cmp=-cmp; return cmp;
+    }
+    if(a%13) {
+        cmp=memcmp(text_keys+(size_t)text_key(a)*TEXT_LENGTH,text_keys+(size_t)text_key(b)*TEXT_LENGTH,TEXT_LENGTH);
+        if(cmp) return text_descending?-cmp:cmp;
+    }
+    return (a<b)-(a>b); /* Second key is descending row number. */
+}
+static void text_sort(void *so,function sink,function source,int64_t limit,int64_t offset,int descending,int cancel)
+{
+    enum { ROWS=50003, CUS=4 };
+    const size_t memory=4U*1024*1024;
+    int (*set_dictionary)(uint64_t,struct qs_dictionary *)=(void *)dlsym(so,"qs_sort_paged_dictionary");
+    assert(set_dictionary);
+    next_token=1; stored=loaded=0;
+    cs_work_context *parent=cs_work_begin_limit(memory); assert(parent);
+    struct qs_dictionary *dictionary=qs_dictionary_create(parent); assert(dictionary);
+    struct qs_dictionary_access *access=qs_dictionary_access_create(dictionary); assert(access);
+    struct qs_plan p={.nout=3,.norder=2,.ordered_rows=2,.having=-1,.predicate=-1,
+        .limit=limit,.offset=offset,.work_mem_bytes=memory/(CUS*2),.work_mem_parent=(uintptr_t)parent};
+    p.outputs[0].type_oid=25; p.outputs[1].type_oid=p.outputs[2].type_oid=23;
+    for(unsigned col=0;col<3;++col) p.outputs[col].index=col;
+    p.order[0]=(struct qs_order){.output=0,.descending=descending,.nulls_first=!descending};
+    p.order[1]=(struct qs_order){.output=1,.descending=1};
+    struct qs_result *input=calloc(1,sizeof(*input)),*output=calloc(1,sizeof(*output));
+    void *io=calloc(1,QS_SORT_IO_BYTES); assert(input && output && io);
+    struct qs_task tasks[CUS]={{0}};
+    for(unsigned i=0;i<CUS;++i) {
+        void *mr[]={input,&p,&tasks[i],io}; long long len[]={sizeof(*input),sizeof(p),sizeof(tasks[i]),QS_SORT_IO_BYTES};
+        struct femu_csd_args a={.numr=4,.mr_addr=mr,.mr_len=len};
+        tasks[i].workers=CUS; assert(!run(sink,&a)); assert(tasks[i].state);
+        assert(!set_dictionary(tasks[i].state,dictionary));
+    }
+    uint32_t ids[TEXT_KEYS]; text_keys=malloc((size_t)TEXT_KEYS*TEXT_LENGTH); assert(text_keys);
+    for(unsigned i=0;i<TEXT_KEYS;++i) {
+        char prefix[9]; assert(snprintf(prefix,sizeof(prefix),"%08u",i*7919U%TEXT_KEYS)==8);
+        char *key=(char *)text_keys+(size_t)i*TEXT_LENGTH;
+        memset(key,'a'+i%26,TEXT_LENGTH); memcpy(key,prefix,8);
+        uint64_t completion=0;
+        for(;;) {
+            int64_t status=qs_dictionary_insert(dictionary,access,key,TEXT_LENGTH,&ids[i],io,completion);
+            if(!status) break;
+            assert(status>QS_DICTIONARY_BUSY); completion=complete_io(status,io);
+        }
+    }
+    struct qs_dictionary_stats before_sink; qs_dictionary_get_stats(dictionary,&before_sink);
+    unsigned *expected=malloc(ROWS*sizeof(*expected)); assert(expected);
+    text_descending=descending; text_nulls_first=!descending;
+    for(unsigned i=0;i<ROWS;++i) expected[i]=i;
+    qsort(expected,ROWS,sizeof(*expected),text_order);
+    int columns=limit>=0;
+    unsigned batch=columns?QS_VECTOR_ROWS-7:QS_RESULT_ROWS;
+    if(columns) { p.ordered_rows=3; input->begin=7; }
+    for(unsigned first=0,chunk=0;first<ROWS;first+=batch,++chunk) {
+        unsigned count=ROWS-first; if(count>batch) count=batch;
+        input->rows=count+input->begin;
+        for(unsigned i=0;i<count;++i) {
+            unsigned row=ROWS-1-first-i;
+            struct qs_cell *cells=columns?(struct qs_cell *)input->data+(size_t)(i+input->begin)*3:input->data[i].cells;
+            cells[0]=(struct qs_cell){.value=ids[text_key(row)],.isnull=row%13==0};
+            cells[1]=(struct qs_cell){.value=row};
+            cells[2]=(struct qs_cell){.value=row*7};
+        }
+        unsigned worker=chunk%CUS;
+        void *mr[]={input,&p,&tasks[worker],io}; long long len[]={sizeof(*input),sizeof(p),sizeof(tasks[worker]),QS_SORT_IO_BYTES};
+        struct femu_csd_args a={.numr=4,.mr_addr=mr,.mr_len=len}; assert(!run(columns?sink_columns:sink,&a));
+        assert(input->begin==(columns?7U:0U) && input->rows==count+input->begin);
+    }
+    struct qs_group group={.count=CUS}; for(unsigned i=0;i<CUS;++i) group.states[i]=tasks[i].state;
+    struct qs_dictionary_stats after_sink; qs_dictionary_get_stats(dictionary,&after_sink);
+    assert(after_sink.loads>before_sink.loads);
+    void *mr[]={&group,output,io}; long long len[]={sizeof(group),sizeof(*output),QS_SORT_IO_BYTES};
+    struct femu_csd_args a={.numr=3,.mr_addr=mr,.mr_len=len};
+    unsigned seen=0; uint64_t row_stores=0,row_loads=0;
+    if(cancel==2) {
+        /* Complete an I/O but cancel before the CSF acknowledges it. Both
+         * dictionary pins and the just-completed token belong to this query. */
+        for(;;) {
+            int64_t status=source(&a); assert(status>QS_DICTIONARY_BUSY);
+            a.cparam2=complete_io(status,io);
+            if(((uint64_t)status&~CS_IO_VALUE_MASK)==CS_NEED_LOAD) break;
+        }
+        void *close[]={&group}; long long sizes[]={sizeof(group)};
+        struct femu_csd_args args={.numr=1,.mr_addr=close,.mr_len=sizes}; assert(!source(&args));
+        qs_dictionary_abort(dictionary);
+        for(unsigned i=1;i<next_token;++i) { free(blocks[i]); blocks[i]=NULL; }
+        goto released;
+    }
+    while(!output->finished) {
+        assert(!run(source,&a));
+        row_stores=output->metrics.spill_write_bytes; row_loads=output->metrics.spill_read_bytes;
+        for(unsigned i=0;i<output->rows;++i) {
+            assert(seen+(uint64_t)offset<ROWS); unsigned row=expected[seen++ +offset];
+            assert(output->data[i].cells[0].isnull==(row%13==0));
+            if(row%13) assert(output->data[i].cells[0].value==ids[text_key(row)]);
+            assert(output->data[i].cells[1].value==row && output->data[i].cells[2].value==row*7);
+        }
+        if(cancel && !output->finished) {
+            void *close[]={&group,io}; long long sizes[]={sizeof(group),QS_SORT_IO_BYTES};
+            struct femu_csd_args args={.numr=2,.mr_addr=close,.mr_len=sizes}; assert(!run(source,&args)); break;
+        }
+    }
+    if(!cancel) {
+        unsigned count=ROWS-offset; if(limit>=0 && count>(uint64_t)limit) count=limit;
+        assert(seen==count);
+    }
+    struct qs_dictionary_stats stats; qs_dictionary_get_stats(dictionary,&stats);
+    assert(stats.strings==TEXT_KEYS && stats.stores && stats.loads);
+    if(limit<0) assert(row_stores>(uint64_t)ROWS*3*sizeof(struct qs_cell)+4*QS_SORT_IO_BYTES &&
+        row_loads && stats.loads>after_sink.loads); /* Includes intermediate merged runs. */
+    uint64_t completion=0;
+    for(;;) {
+        int64_t status=qs_dictionary_close(dictionary,access,io,completion);
+        if(!status) break;
+        assert(status>QS_DICTIONARY_BUSY); completion=complete_io(status,io);
+    }
+    printf("text sort limit=%lld descending=%d cancel=%d rows=%u dict=%llu/%llu run=%llu/%llu\n",
+        (long long)limit,descending,cancel,seen,(unsigned long long)stats.stores,(unsigned long long)stats.loads,
+        (unsigned long long)row_stores,(unsigned long long)row_loads);
+released:;
+    cs_work_context_stats peak; assert(!cs_work_get_context_stats(parent,&peak)); assert(peak.peak_used_bytes<=memory);
+    printf("text sort query workmem peak=%zu limit=%zu\n",peak.peak_used_bytes,memory);
+    assert(!peak.used_bytes && !peak.allocations); assert(!cs_work_end(parent));
+    for(unsigned i=1;i<next_token;++i) assert(!blocks[i]);
+    free(expected); free(text_keys); text_keys=NULL; free(io); free(input); free(output);
+}
 int main(int argc,char **argv)
 {
     assert(argc>=2 && argc<=5);
-    if(argc>=3) capacity=(size_t)strtoul(argv[2],NULL,10)*1024*1024;
+    int dictionary=argc==3 && !strcmp(argv[2],"--dictionary");
+    if(argc>=3 && !dictionary) capacity=(size_t)strtoul(argv[2],NULL,10)*1024*1024;
     budget=argc>=4?(size_t)strtoul(argv[3],NULL,10)*1024*1024:capacity;
     if(argc==5) workers=strtoul(argv[4],NULL,10);
     assert(workers && workers<=QS_WORKERS);
@@ -158,6 +300,13 @@ int main(int argc,char **argv)
     void *so=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(so);
     function sink=(function)dlsym(so,"pg_sina_sort_sink"),source=(function)dlsym(so,"pg_sina_sort_source"); assert(sink && source);
     columns_sink=(columns_function)dlsym(so,"qs_sort_sink_columns"); assert(columns_sink);
+    if(dictionary) {
+        text_sort(so,sink,source,-1,0,0,0);
+        text_sort(so,sink,source,17,5,1,0);
+        text_sort(so,sink,source,-1,0,1,1);
+        text_sort(so,sink,source,-1,0,0,2);
+        dlclose(so); return 0;
+    }
     check(sink_columns,source,262147,-1,0,0,0,2);
     check(sink_columns,source,262147,17,5,0,0,2);
     check(sink_columns,source,262147,-1,0,1,0,2);

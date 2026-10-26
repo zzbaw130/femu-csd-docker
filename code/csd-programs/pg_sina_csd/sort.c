@@ -51,6 +51,7 @@ int64_t pg_sina_sort(struct femu_csd_args *a)
  * sort above remains the aggregate fast path. */
 #include "cs_csf.h"
 #include "query_vector.h"
+#include "dictionary.h"
 #define RUN_BYTES (1024U*1024)
 struct row_run {
     unsigned char *data;
@@ -60,6 +61,7 @@ struct row_run {
     struct qs_cell *head;
     unsigned rows, position, loaded, cache_rows;
     int sorted, spilled;
+    unsigned sort_phase,sort_i,sort_n;
 };
 struct row_sort {
     cs_work_context *context;
@@ -82,26 +84,69 @@ struct row_sort {
     unsigned compact_owner,compact_begin,compact_end,compact_free_run,compact_free_block;
     unsigned compact_rows,compact_block,compact_phase;
     int consolidated,heap_ready;
+    struct qs_dictionary *paged_dictionary;
+    struct qs_dictionary_access *text_left,*text_right,*text_evict;
+    const char *compare_left,*compare_right;
+    unsigned compare_length,compare_right_length,compare_key,compare_phase,comparing;
+    unsigned sift_active,sift_root,sift_child,sift_phase;
+    unsigned merge_active,merge_root,merge_child,merge_phase;
+    unsigned heap_build,heap_initializing,combine_owner,combine_run,combine_started;
+    unsigned top_phase,top_child,sink_active,source_active,dictionary_io;
+    uint64_t dictionary_completion;
+    void *io;
 };
 enum { ROW_NONE, ROW_STORE, ROW_LOAD, ROW_FREE, ROW_COMPACT_STORE };
-static int row_compare(const struct qs_cell *a,const struct qs_cell *b,const struct qs_plan *p,const struct qs_dict *dict)
+enum { DICTIONARY_NONE, DICTIONARY_COMPARE, DICTIONARY_EVICT };
+static int64_t row_evict(struct row_sort *,cs_work_context *,struct femu_csd_args *);
+static int64_t row_compare(struct row_sort *s,const struct qs_cell *a,const struct qs_cell *b,
+    int *result,struct femu_csd_args *args)
 {
-    for(unsigned i=0;i<p->norder;++i) {
+    const struct qs_plan *p=&s->plan;
+    for(unsigned i=s->compare_key;i<p->norder;++i) {
         const struct qs_order *key=&p->order[i]; struct qs_cell x=a[key->output],y=b[key->output]; int cmp=0;
         if(x.isnull || y.isnull) {
             cmp=(x.isnull?1:0)-(y.isnull?1:0); if(key->nulls_first) cmp=-cmp;
         } else {
             unsigned oid=p->outputs[key->output].type_oid;
-            if(dict && (oid==25 || oid==1042 || oid==1043)) {
+            if((s->dictionary || s->paged_dictionary) && (oid==25 || oid==1042 || oid==1043)) {
                 const char *left,*right; unsigned ln,rn;
-                if(qs_dict_get(dict,(unsigned)x.value,&left,&ln) || qs_dict_get(dict,(unsigned)y.value,&right,&rn)) return 0;
-                cmp=memcmp(left,right,ln<rn?ln:rn); if(!cmp) cmp=(ln>rn)-(ln<rn);
-            } else qs_compare(x,y,&cmp);
+                if(s->paged_dictionary && x.value!=y.value) {
+                    s->compare_key=i; s->comparing=1;
+                    while(s->compare_phase<2) {
+                        struct qs_dictionary_access *access=s->compare_phase?s->text_right:s->text_left;
+                        uint32_t id=(uint32_t)(s->compare_phase?y.value:x.value);
+                        int64_t status=qs_dictionary_pin(s->paged_dictionary,access,id,&right,&rn,
+                            s->io,s->dictionary_completion);
+                        s->dictionary_completion=0;
+                        if(status==-4) {
+                            /* The dictionary already evicts its own cache.
+                             * Also release row caches/runs under real shared
+                             * budget pressure, retaining the pending pin. */
+                            status=row_evict(s,s->context,args);
+                            if(!status) continue;
+                        } else if(status>QS_DICTIONARY_BUSY) s->dictionary_io=DICTIONARY_COMPARE;
+                        if(status) return status;
+                        if(!s->compare_phase) { s->compare_left=right; s->compare_length=rn; }
+                        else { s->compare_right=right; s->compare_right_length=rn; }
+                        ++s->compare_phase;
+                    }
+                    left=s->compare_left; ln=s->compare_length;
+                    right=s->compare_right; rn=s->compare_right_length;
+                    cmp=memcmp(left,right,ln<rn?ln:rn); if(!cmp) cmp=(ln>rn)-(ln<rn);
+                    qs_dictionary_unpin(s->text_left); qs_dictionary_unpin(s->text_right);
+                    s->compare_phase=s->comparing=0;
+                } else if(!s->paged_dictionary) {
+                    if(qs_dict_get(s->dictionary,(unsigned)x.value,&left,&ln) ||
+                       qs_dict_get(s->dictionary,(unsigned)y.value,&right,&rn)) return -3;
+                    cmp=memcmp(left,right,ln<rn?ln:rn); if(!cmp) cmp=(ln>rn)-(ln<rn);
+                }
+            } else if(qs_compare(x,y,&cmp)) return -3;
             if(key->descending) cmp=-cmp;
         }
-        if(cmp) return cmp;
+        if(cmp) { s->compare_key=0; *result=cmp; return 0; }
+        s->compare_key=i+1;
     }
-    return 0;
+    s->compare_key=0; *result=0; return 0;
 }
 static struct qs_cell *run_row(const struct row_sort *s,const struct row_run *r,unsigned i)
 { return (void *)(r->data+(size_t)i*s->row_bytes); }
@@ -112,14 +157,26 @@ static void row_swap(struct row_sort *s,struct row_run *r,unsigned a,unsigned b)
     memcpy(run_row(s,r,a),run_row(s,r,b),s->row_bytes);
     memcpy(run_row(s,r,b),temp,s->row_bytes);
 }
-static void row_sift(struct row_sort *s,struct row_run *r,unsigned size,unsigned root)
+static int64_t row_sift(struct row_sort *s,struct row_run *r,unsigned size,unsigned root,struct femu_csd_args *a)
 {
+    if(!s->sift_active) { s->sift_active=1; s->sift_root=root; s->sift_phase=0; }
     for(;;) {
-        unsigned child=root*2+1; if(child>=size) break;
-        if(child+1<size && row_compare(run_row(s,r,child),run_row(s,r,child+1),&s->plan,s->dictionary)<0) ++child;
-        if(row_compare(run_row(s,r,root),run_row(s,r,child),&s->plan,s->dictionary)>=0) break;
-        row_swap(s,r,root,child); root=child;
+        root=s->sift_root;
+        unsigned child=s->sift_phase?s->sift_child:root*2+1;
+        if(child>=size) break;
+        int cmp; int64_t status;
+        if(!s->sift_phase) {
+            if(child+1<size) {
+                status=row_compare(s,run_row(s,r,child),run_row(s,r,child+1),&cmp,a); if(status) return status;
+                if(cmp<0) ++child;
+            }
+            s->sift_child=child; s->sift_phase=1;
+        }
+        status=row_compare(s,run_row(s,r,root),run_row(s,r,child),&cmp,a); if(status) return status;
+        if(cmp>=0) break;
+        row_swap(s,r,root,child); s->sift_root=child; s->sift_phase=0;
     }
+    s->sift_active=0; return 0;
 }
 static uint64_t integer_sort_key(const unsigned char *row,unsigned column,int descending)
 {
@@ -211,15 +268,29 @@ static int run_radix_sort(struct row_sort *s,struct row_run *r)
     if(from!=r->data) memcpy(r->data,from,bytes);
     cs_work_free(r->owner,scratch); return 1;
 }
-static void run_sort(struct row_sort *s,struct row_run *r)
+static int64_t run_sort(struct row_sort *s,struct row_run *r,struct femu_csd_args *a)
 {
-    if(r->sorted) return;
-    if(!run_radix_sort(s,r)) {
-        for(unsigned i=r->rows/2;i;i--) row_sift(s,r,r->rows,i-1);
-        for(unsigned n=r->rows;n>1;--n) { row_swap(s,r,0,n-1); row_sift(s,r,n-1,0); }
+    if(r->sorted) return 0;
+    if(!r->sort_phase) {
+        if(run_radix_sort(s,r)) r->sort_phase=4;
+        else { r->sort_i=r->rows/2; r->sort_phase=1; }
+    }
+    if(r->sort_phase==1) {
+        while(r->sort_i) {
+            int64_t status=row_sift(s,r,r->rows,r->sort_i-1,a); if(status) return status;
+            --r->sort_i;
+        }
+        r->sort_n=r->rows; r->sort_phase=2;
+    }
+    while(r->sort_phase==2 || r->sort_phase==3) {
+        if(r->sort_n<=1) break;
+        if(r->sort_phase==2) { row_swap(s,r,0,r->sort_n-1); r->sort_phase=3; }
+        int64_t status=row_sift(s,r,r->sort_n-1,0,a); if(status) return status;
+        --r->sort_n; r->sort_phase=2;
     }
     r->sorted=1;
     if(r->rows) memcpy(r->head,r->data,s->row_bytes);
+    return 0;
 }
 static int64_t row_store(struct row_sort *s,struct row_run *r,struct femu_csd_args *a)
 {
@@ -289,10 +360,28 @@ static int64_t row_evict(struct row_sort *s,cs_work_context *owner,struct femu_c
             }
         }
     }
+    if(s->paged_dictionary && !s->comparing) {
+        int64_t status=qs_dictionary_evict(s->paged_dictionary,s->text_evict,
+            a->mr_addr[a->numr-1],0);
+        if(status>0) s->dictionary_io=DICTIONARY_EVICT;
+        return status;
+    }
     return -4;
 }
 static int64_t row_resume(struct row_sort *s,struct femu_csd_args *a)
 {
+    s->io=a->mr_addr[a->numr-1];
+    if(s->dictionary_io==DICTIONARY_EVICT) {
+        int64_t status=qs_dictionary_evict(s->paged_dictionary,s->text_evict,s->io,
+            csIsReentry(a)?csReentryValue(a):0);
+        if(!status) s->dictionary_io=DICTIONARY_NONE;
+        return status;
+    }
+    if(s->dictionary_io==DICTIONARY_COMPARE) {
+        if(!csIsReentry(a)) return -1;
+        s->dictionary_completion=csReentryValue(a); s->dictionary_io=DICTIONARY_NONE;
+        return 0;
+    }
     if(!csIsReentry(a)) return 0;
     struct row_run *r=s->pending_run;
     if(!r) return -1;
@@ -368,15 +457,17 @@ static int row_reserve(struct row_sort *s)
 /* Private SQL composition helpers; neither is a CSF/device command. */
 int qs_sort_prepare(uint64_t state)
 { return row_reserve((void *)(uintptr_t)state); }
-void qs_sort_finish_sink(uint64_t state)
+int64_t qs_sort_finish_sink(uint64_t state,struct femu_csd_args *a)
 {
     struct row_sort *s=(void *)(uintptr_t)state;
+    int64_t status=row_resume(s,a); if(status) return status;
     for(unsigned i=0;i<s->count;++i) {
         struct row_run *r=&s->runs[i];
-        if(r->rows) run_sort(s,r);
+        if(r->rows) { status=run_sort(s,r,a); if(status) return status; }
         else { cs_work_free(r->owner,r->data); r->data=NULL; r->sorted=1; }
     }
     cs_work_free(s->context,s->vectors); s->vectors=NULL;
+    return 0;
 }
 /* chunk, plan, task(handle output), spill I/O. Reentry resumes this input chunk. */
 static int64_t row_sink(struct femu_csd_args *a,const struct qs_plan *columns,
@@ -398,11 +489,16 @@ static int64_t row_sink(struct femu_csd_args *a,const struct qs_plan *columns,
     unsigned selected=columns?end-begin:row_input?rows->rows-(packed?rows->begin:0):c->selected;
     struct row_sort *s=(void *)(uintptr_t)task->state;
     if(!s) { int status=row_init(task,p,&s); if(status) return status; }
-    if(!csIsReentry(a)) {
+    if(!s->sink_active) {
+        s->sink_active=1;
         s->input_position=0; s->metrics.scanned+=columns || row_input?selected:c->rows; s->metrics.matched+=selected;
         s->metrics.input_bytes+=task->input_bytes; ++s->metrics.chunks;
     }
     int64_t status=row_resume(s,a); if(status) return status;
+    if(!s->bounded && s->count) {
+        struct row_run *last=&s->runs[s->count-1];
+        if(last->rows==s->run_rows) { status=run_sort(s,last,a); if(status) return status; }
+    }
     while(s->input_position<selected) {
         if(s->bounded && !s->topn) { s->input_position=selected; break; }
         struct row_run *r=s->count?&s->runs[s->count-1]:NULL;
@@ -433,40 +529,53 @@ static int64_t row_sink(struct femu_csd_args *a,const struct qs_plan *columns,
             else for(unsigned i=0;i<count;++i)
                 memcpy(run_row(s,r,r->rows+i),rows->data[s->input_position+i].cells,s->row_bytes);
             r->rows+=count;
-        } else
-        for(unsigned i=0;i<count;++i) {
-            struct qs_cell row[QS_OUT];
-            if(columns) {
-                for(unsigned col=0;col<p->nout;++col) {
-                    unsigned expr=columns->outputs[col].index,at=begin+s->input_position+i;
-                    if(vectors[expr].errors[at]) return -5;
-                    row[col]=qs_vector_cell(columns,vectors,expr,at);
-                }
-            } else if(row_input) memcpy(row,packed?(struct qs_cell *)rows->data+
-                (size_t)(rows->begin+s->input_position+i)*p->nout:rows->data[s->input_position+i].cells,s->row_bytes);
-            else for(unsigned col=0;col<p->nout;++col) {
-                unsigned expr=p->outputs[col].index;
-                if(s->vectors[expr].errors[i]) return -5;
-                row[col]=qs_vector_cell(p,s->vectors,expr,i);
-            }
-            if(s->bounded && r->rows==s->topn) {
-                if(row_compare(row,run_row(s,r,0),p,s->dictionary)<0) {
-                    memcpy(run_row(s,r,0),row,s->row_bytes); row_sift(s,r,r->rows,0);
-                }
-            } else {
-                memcpy(run_row(s,r,r->rows++),row,s->row_bytes);
-                if(s->bounded) {
-                    unsigned child=r->rows-1;
-                    while(child && row_compare(run_row(s,r,(child-1)/2),run_row(s,r,child),p,s->dictionary)<0) {
-                        row_swap(s,r,child,(child-1)/2); child=(child-1)/2;
+        } else {
+            unsigned position=s->input_position;
+            for(unsigned i=0;i<count;++i) {
+                struct qs_cell row[QS_OUT];
+                if(columns) {
+                    for(unsigned col=0;col<p->nout;++col) {
+                        unsigned expr=columns->outputs[col].index,at=begin+position+i;
+                        if(vectors[expr].errors[at]) return -5;
+                        row[col]=qs_vector_cell(columns,vectors,expr,at);
                     }
+                } else if(row_input) memcpy(row,packed?(struct qs_cell *)rows->data+
+                    (size_t)(rows->begin+position+i)*p->nout:rows->data[position+i].cells,s->row_bytes);
+                else for(unsigned col=0;col<p->nout;++col) {
+                    unsigned expr=p->outputs[col].index;
+                    if(s->vectors[expr].errors[i]) return -5;
+                    row[col]=qs_vector_cell(p,s->vectors,expr,i);
+                }
+                if(s->bounded) {
+                    if(!s->top_phase) {
+                        if(r->rows==s->topn) {
+                            int cmp;
+                            status=row_compare(s,row,run_row(s,r,0),&cmp,a); if(status) return status;
+                            if(cmp<0) { memcpy(run_row(s,r,0),row,s->row_bytes); s->top_phase=1; }
+                        } else {
+                            memcpy(run_row(s,r,r->rows++),row,s->row_bytes);
+                            s->top_child=r->rows-1; s->top_phase=2;
+                        }
+                    }
+                    if(s->top_phase==1) { status=row_sift(s,r,r->rows,0,a); if(status) return status; }
+                    else if(s->top_phase==2) {
+                        while(s->top_child) {
+                            unsigned child=s->top_child; int cmp;
+                            status=row_compare(s,run_row(s,r,(child-1)/2),run_row(s,r,child),&cmp,a); if(status) return status;
+                            if(cmp>=0) break;
+                            row_swap(s,r,child,(child-1)/2); s->top_child=(child-1)/2;
+                        }
+                    }
+                    s->top_phase=0; ++s->input_position;
+                } else {
+                    memcpy(run_row(s,r,r->rows++),row,s->row_bytes);
                 }
             }
         }
-        s->input_position+=count;
-        if(!s->bounded && r->rows==s->run_rows) run_sort(s,r);
+        if(!s->bounded) s->input_position+=count;
+        if(!s->bounded && r->rows==s->run_rows) { status=run_sort(s,r,a); if(status) return status; }
     }
-    return 0;
+    s->sink_active=0; return 0;
 }
 int64_t pg_sina_sort_sink(struct femu_csd_args *a)
 { return row_sink(a,NULL,NULL,0,0); }
@@ -475,42 +584,71 @@ int64_t pg_sina_sort_sink(struct femu_csd_args *a)
 int64_t qs_sort_sink_columns(struct femu_csd_args *a,const struct qs_plan *columns,
     const struct qs_vector *vectors,unsigned begin,unsigned end)
 { return row_sink(a,columns,vectors,begin,end); }
-static int heap_compare(const struct row_sort *s,unsigned a,unsigned b)
-{ return row_compare(s->heap[a]->head,s->heap[b]->head,&s->plan,s->dictionary); }
+static int64_t heap_compare(struct row_sort *s,unsigned left,unsigned right,int *cmp,struct femu_csd_args *a)
+{ return row_compare(s,s->heap[left]->head,s->heap[right]->head,cmp,a); }
 
 /* Internal SQL operator composition; never exported through SNIA or FEMU. */
 void qs_sort_dictionary(uint64_t state,struct qs_dict *dictionary)
 { ((struct row_sort *)(uintptr_t)state)->dictionary=dictionary; }
-static void merge_sift(struct row_sort *s,unsigned root)
+int qs_sort_paged_dictionary(uint64_t state,struct qs_dictionary *dictionary)
 {
-    for(;;) {
-        unsigned child=root*2+1; if(child>=s->heap_count) break;
-        if(child+1<s->heap_count && heap_compare(s,child+1,child)<0) ++child;
-        if(heap_compare(s,root,child)<=0) break;
-        struct row_run *r=s->heap[root]; s->heap[root]=s->heap[child]; s->heap[child]=r; root=child;
-    }
+    struct row_sort *s=(void *)(uintptr_t)state;
+    if(!s->text_left) s->text_left=qs_dictionary_access_create(dictionary);
+    if(!s->text_right) s->text_right=qs_dictionary_access_create(dictionary);
+    if(!s->text_evict) s->text_evict=qs_dictionary_access_create(dictionary);
+    if(!s->text_left || !s->text_right || !s->text_evict) return -4;
+    s->paged_dictionary=dictionary; return 0;
 }
-static int row_combine(struct row_sort *s,struct qs_group *group)
+static int64_t merge_sift(struct row_sort *s,unsigned root,struct femu_csd_args *a)
+{
+    if(!s->merge_active) { s->merge_active=1; s->merge_root=root; s->merge_phase=0; }
+    for(;;) {
+        root=s->merge_root;
+        unsigned child=s->merge_phase?s->merge_child:root*2+1;
+        if(child>=s->heap_count) break;
+        int cmp; int64_t status;
+        if(!s->merge_phase) {
+            if(child+1<s->heap_count) {
+                status=heap_compare(s,child+1,child,&cmp,a); if(status) return status;
+                if(cmp<0) ++child;
+            }
+            s->merge_child=child; s->merge_phase=1;
+        }
+        status=heap_compare(s,root,child,&cmp,a); if(status) return status;
+        if(cmp<=0) break;
+        struct row_run *r=s->heap[root]; s->heap[root]=s->heap[child]; s->heap[child]=r;
+        s->merge_root=child; s->merge_phase=0;
+    }
+    s->merge_active=0; return 0;
+}
+static int64_t row_combine(struct row_sort *s,struct qs_group *group,struct femu_csd_args *a,int sort_runs)
 {
     if(!group->count || group->count>QS_WORKERS || group->states[0]!=(uintptr_t)s) return -1;
     if(!s->combined) {
-        s->owners_count=group->count;
-        for(unsigned i=0;i<group->count;++i) {
-            struct row_sort *o=(void *)(uintptr_t)group->states[i];
-            if(!o) return -1;
-            for(unsigned j=0;j<i;++j) if(s->owners[j]==o) return -1;
-            s->owners[i]=o;
+        if(!s->combine_started) {
+            s->owners_count=group->count;
+            for(unsigned i=0;i<group->count;++i) {
+                struct row_sort *o=(void *)(uintptr_t)group->states[i];
+                if(!o) return -1;
+                for(unsigned j=0;j<i;++j) if(s->owners[j]==o) return -1;
+                s->owners[i]=o;
+            }
+            s->combine_started=1;
         }
-        for(unsigned i=0;i<s->owners_count;++i) {
+        for(unsigned i=s->combine_owner;i<s->owners_count;++i) {
             struct row_sort *o=s->owners[i];
             if(o->vectors) { cs_work_free(o->context,o->vectors); o->vectors=NULL; }
-            for(unsigned j=0;j<o->count;++j) run_sort(o,&o->runs[j]);
+            for(unsigned j=s->combine_run;j<o->count;++j) {
+                if(sort_runs) { int64_t status=run_sort(s,&o->runs[j],a); if(status) return status; }
+                s->combine_run=j+1;
+            }
             if(i) {
                 s->metrics.scanned+=o->metrics.scanned; s->metrics.matched+=o->metrics.matched;
                 s->metrics.input_bytes+=o->metrics.input_bytes; s->metrics.chunks+=o->metrics.chunks;
                 s->metrics.spill_write_bytes+=o->metrics.spill_write_bytes; s->metrics.spilled_runs+=o->metrics.spilled_runs;
             }
             s->metrics.runs+=o->count;
+            s->combine_owner=i+1; s->combine_run=0;
         }
         for(unsigned i=0;i<s->owners_count;++i)
             for(unsigned j=0;j<s->owners[i]->count;++j) s->owners[i]->runs[j].cache_rows=s->block_rows;
@@ -608,12 +746,18 @@ static int64_t consolidate(struct row_sort *s,struct femu_csd_args *a)
                 input->cache_rows=s->block_rows;
                 if(input->rows) s->heap[s->heap_count++]=input;
             }
-            for(unsigned i=s->heap_count/2;i;i--) merge_sift(s,i-1);
+            s->heap_build=s->heap_count/2; s->compact_phase=3;
+        }
+        if(s->compact_phase==3) {
+            while(s->heap_build) {
+                int64_t status=merge_sift(s,s->heap_build-1,a); if(status) return status;
+                --s->heap_build;
+            }
             s->compact_phase=1;
         }
         if(s->compact_phase==1) {
             while(s->heap_count || s->compact_rows) {
-                if(s->root_pending) {
+                if(s->root_pending==1) {
                     struct row_run *r=s->heap[0];
                     if(r->position==r->rows) {
                         if(r->data) { cs_work_free(r->owner,r->data); r->data=NULL; }
@@ -621,7 +765,10 @@ static int64_t consolidate(struct row_sort *s,struct femu_csd_args *a)
                     } else {
                         int64_t status=merge_head(s,r,a); if(status) return status;
                     }
-                    if(s->heap_count) merge_sift(s,0);
+                    s->root_pending=2;
+                }
+                if(s->root_pending==2) {
+                    if(s->heap_count) { int64_t status=merge_sift(s,0,a); if(status) return status; }
                     s->root_pending=0;
                 }
                 if(s->compact_rows==s->block_rows || (!s->heap_count && s->compact_rows)) {
@@ -681,6 +828,11 @@ static int64_t row_finish(struct row_sort *s,struct qs_group *group,struct qs_re
     memset(group->states,0,sizeof(group->states)); cs_work_end(context);
     return 0;
 }
+static void unpin_text(struct row_sort *s)
+{
+    if(s->text_left) qs_dictionary_unpin(s->text_left);
+    if(s->text_right) qs_dictionary_unpin(s->text_right);
+}
 /* group, output, spill I/O. Cleanup uses group, spill I/O and the same batch
  * reentry protocol, so aborts also release tokens before destroying workmem. */
 int64_t pg_sina_sort_source(struct femu_csd_args *a)
@@ -696,11 +848,14 @@ int64_t pg_sina_sort_source(struct femu_csd_args *a)
     if(a->numr==1) {
         for(unsigned i=0;i<group->count;++i) if(group->states[i]) {
             struct row_sort *owner=(void *)(uintptr_t)group->states[i];
+            unpin_text(owner);
             cs_work_end(owner->context); group->states[i]=0;
         }
         return 0;
     }
-    if(!csIsReentry(a)) {
+    struct row_sort *first=NULL;
+    for(unsigned i=0;i<group->count && !first;++i) first=(void *)(uintptr_t)group->states[i];
+    if(!csIsReentry(a) && (!first || !first->source_active)) {
         /* Dynamic scan assignment can leave CU slots without a run. Merge
          * only initialized owners, also on the ordinary output path. */
         unsigned count=0;
@@ -716,11 +871,11 @@ int64_t pg_sina_sort_source(struct femu_csd_args *a)
     if(!s) return a->numr==2?0:-1;
     if(a->numr==2 && !csIsReentry(a)) { s->pending=ROW_NONE; s->pending_run=NULL; }
     int64_t status=row_resume(s,a); if(status) return status;
-    if(row_combine(s,group)) return -1;
+    status=row_combine(s,group,a,a->numr!=2); if(status) return status;
     if(a->numr==2) return row_finish(s,group,NULL);
     if(a->mr_len[1]<(long long)sizeof(struct qs_result)) return -1;
     struct qs_result *out=a->mr_addr[1];
-    if(!csIsReentry(a)) { out->status=0; out->rows=out->begin=out->finished=0; }
+    if(!s->source_active) { s->source_active=1; out->status=0; out->rows=out->begin=out->finished=0; }
     if(!s->heap && !s->finishing) {
         while(!s->heap) {
             s->heap=cs_work_alloc(s->context,(s->metrics.runs+1)*sizeof(*s->heap));
@@ -731,21 +886,27 @@ int64_t pg_sina_sort_source(struct femu_csd_args *a)
         int64_t status=consolidate(s,a); if(status) return status;
     }
     if(!s->heap_ready && !s->finishing) {
-        for(unsigned i=0;i<s->owners_count;++i)
-            for(unsigned j=0;j<s->owners[i]->count;++j) if(s->owners[i]->runs[j].rows)
-                s->heap[s->heap_count++]=&s->owners[i]->runs[j];
-        for(unsigned i=s->heap_count/2;i;i--) merge_sift(s,i-1);
+        if(!s->heap_initializing) {
+            for(unsigned i=0;i<s->owners_count;++i)
+                for(unsigned j=0;j<s->owners[i]->count;++j) if(s->owners[i]->runs[j].rows)
+                    s->heap[s->heap_count++]=&s->owners[i]->runs[j];
+            s->heap_build=s->heap_count/2; s->heap_initializing=1;
+        }
+        while(s->heap_build) { status=merge_sift(s,s->heap_build-1,a); if(status) return status; --s->heap_build; }
         s->heap_ready=1;
     }
     while(!s->finishing && out->rows<QS_RESULT_ROWS) {
         if(!s->heap_count || (s->plan.limit>=0 && s->emitted>=(uint64_t)s->plan.limit)) { s->finishing=1; break; }
         struct row_run *r=s->heap[0];
-        if(s->root_pending) {
+        if(s->root_pending==1) {
             if(r->position==r->rows) {
                 if(r->data) { cs_work_free(r->owner,r->data); r->data=NULL; }
                 s->heap[0]=s->heap[--s->heap_count];
             } else { status=merge_head(s,r,a); if(status) return status; }
-            if(s->heap_count) merge_sift(s,0);
+            s->root_pending=2;
+        }
+        if(s->root_pending==2) {
+            if(s->heap_count) { status=merge_sift(s,0,a); if(status) return status; }
             s->root_pending=0; continue;
         }
         if(s->skipped<(uint64_t)s->plan.offset) ++s->skipped;
@@ -754,5 +915,5 @@ int64_t pg_sina_sort_source(struct femu_csd_args *a)
     }
     out->metrics=s->metrics;
     if(s->finishing) return row_finish(s,group,out);
-    return 0;
+    s->source_active=0; return 0;
 }

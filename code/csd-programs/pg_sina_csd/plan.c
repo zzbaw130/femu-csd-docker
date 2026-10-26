@@ -18,7 +18,7 @@ extern int64_t pg_sina_sort_sink_impl(struct femu_csd_args *);
 extern int64_t pg_sina_sort_source_impl(struct femu_csd_args *);
 extern void qs_sort_dictionary(uint64_t,struct qs_dict *);
 extern int qs_sort_prepare(uint64_t);
-extern void qs_sort_finish_sink(uint64_t);
+extern int64_t qs_sort_finish_sink(uint64_t,struct femu_csd_args *);
 extern int64_t qs_sort_sink_columns(struct femu_csd_args *,const struct qs_plan *,const struct qs_vector *,unsigned,unsigned);
 #define QP_WAIT 1
 /* Store PG integer/date widths directly; numeric and other values retain all
@@ -72,7 +72,7 @@ struct sorted_rows {
     unsigned batch_worker;
     struct projection_batch *columns; /* Borrowed producer vectors, retained across spill. */
     unsigned position;
-    int initialized, complete, drained, input_pending, producer_status;
+    int initialized, complete, drained, input_pending, producer_status,finishing_sink,sink_finished;
     unsigned char *prefix;
     unsigned prefix_rows,prefix_position;
     struct qs_metrics metrics;
@@ -546,6 +546,8 @@ static int64_t sort_columns_call(struct femu_csd_args *a)
     const struct projection_batch *b=a->mr_addr[0];
     return qs_sort_sink_columns(a,&b->plan,b->vectors,b->position,b->count);
 }
+static int64_t sort_finish_call(struct femu_csd_args *a)
+{ return qs_sort_finish_sink(((struct qs_task *)a->mr_addr[2])->state,a); }
 static int64_t sort_call(struct execution *s,struct sorted_rows *sort,int source)
 {
     void *mr[4]; long long len[4];
@@ -560,10 +562,11 @@ static int64_t sort_call(struct execution *s,struct sorted_rows *sort,int source
         mr[2]=&sort->task; len[2]=sizeof(sort->task); mr[3]=s->io; len[3]=s->io_bytes;
     }
     if(s->pending_sort==sort) { a.cparam2=s->args->cparam2; s->pending_sort=NULL; }
-    int64_t (*call)(struct femu_csd_args *)=source?pg_sina_sort_source_impl:
+    int64_t (*call)(struct femu_csd_args *)=source?pg_sina_sort_source_impl:sort->finishing_sink?sort_finish_call:
         sort->columns?sort_columns_call:pg_sina_sort_sink_impl;
     int64_t status=timed_call(s,call,&a,source?QS_SORT_SOURCE:QS_SORT_SINK);
     if(status>0) s->pending_sort=sort;
+    if(!status && sort->finishing_sink) { sort->finishing_sink=0; sort->sink_finished=1; }
     if(source && !status) {
         const struct qs_metrics *m=&sort->output->metrics,*old=&sort->metrics;
         s->metrics.spill_read_bytes+=m->spill_read_bytes-old->spill_read_bytes;
@@ -4237,15 +4240,12 @@ produced:
         uint64_t tick=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
         status=sort_call(s,local,0);
         if(!status) {
-            if(out->finished) {
-                uint64_t wall=s->profiling?now_ns(CLOCK_MONOTONIC):0;
-                uint64_t cpu=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
-                qs_sort_finish_sink(local->task.state);
-                if(s->profiling) {
-                    struct qs_timing *t=&s->profile.operators[QS_SORT_SINK];
-                    t->wall_ns+=now_ns(CLOCK_MONOTONIC)-wall; t->cpu_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-cpu;
-                }
+            if(out->finished && !local->sink_finished) {
+                local->finishing_sink=1;
+                status=sort_call(s,local,0);
             }
+        }
+        if(!status) {
             local->batch=NULL; out->rows=0;
             status=out->finished?0:local->producer_status;
             if(s->profiling) s->sink_rows+=rows;
