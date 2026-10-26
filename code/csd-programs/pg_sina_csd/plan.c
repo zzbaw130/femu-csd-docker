@@ -586,8 +586,17 @@ static void hash_link(const struct qp_node *n,struct operator_state *o,
 static void *hash_memory(struct execution *s,unsigned id,void *old,size_t bytes)
 {
     uint64_t started=s->profiling && !s->worker?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
+    uintptr_t previous=(uintptr_t)old;
     void *data=old?cs_work_realloc(s->context,old,bytes):cs_work_alloc(s->context,bytes);
-    if(started) s->plan->pipelines[id].hash_memory_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-started;
+    if(started) {
+        struct qp_pipeline_profile *p=&s->plan->pipelines[id];
+        p->hash_memory_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-started;
+        if(previous && data && (uintptr_t)data!=previous) {
+            const struct qp_node *n=&s->plan->nodes[id];
+            p->hash_moved_bytes+=(size_t)s->nodes[id].hash_capacity*
+                (hash_row_bytes(&s->plan->nodes[n->right].expr)+3*sizeof(uint32_t));
+        }
+    }
     return data;
 }
 static void hash_reindex(struct execution *s,unsigned id)

@@ -130,7 +130,7 @@ sh /home/femu/tests/tpch-test.sh 7 9 13
 
 `CSD Host Assigned LOADs` 记录提前分配的顺序输入块数；开启 profile 时，`Completion Reads` 和 `Control Writes` 分别记录调度期间实际进行的控制记录读写次数，不包含初始化、结束清理和最终字符串结果复制。
 
-`CSD Hash Table <节点号>` 进一步分解协调端构建开销：`memory_cpu` 是表分配/增长的CPU，`reindex_cpu` 是清桶及重建桶链的CPU，`reindexes` 包括初次建空表和预留容量后的清桶，`rows` 是累计重新处理的已有行数。两项是 `CSD Hash Build Coordinator CPU` 的内部区间，不能再与它相加。仍只在表操作边界取时钟。该记录位于PG/设备SO私有计划结构，修改布局后必须同步编译部署PG扩展与pg-sina-plan.so，不改SNIA或固件。
+`CSD Hash Table <节点号>` 进一步分解协调端构建开销：`memory_cpu` 是表分配/增长的CPU，`reindex_cpu` 是清桶及重建桶链的CPU，`reindexes` 包括初次建空表和预留容量后的清桶，`rows` 是累计重新处理的已有行数，`moved_bytes` 是扩容更换地址时搬移的旧表字节数（原地扩容不计入）。两项CPU计时是 `CSD Hash Build Coordinator CPU` 的内部区间，不能再与它相加。仍只在表操作边界取时钟。该记录位于PG/设备SO私有计划结构，修改布局后必须同步编译部署PG扩展与pg-sina-plan.so，不改SNIA或固件。
 
 `CSD Setup Wall` 与 `Cleanup Wall` 分别记录设备执行前的准备和结束清理，已包含在 Tree Wall 中；准备不包含 SQL 规划、映射读取和首次资源发现。`Completion Notice` 记录 callback 发布完成到 PG 观察到的间隔，Average/Maximum 单位为微秒，Sum 是跨请求累计值，不能当成查询关键路径或设备空闲时间。
 
