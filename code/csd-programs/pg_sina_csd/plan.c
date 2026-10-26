@@ -157,7 +157,8 @@ struct projection_batch {
     int64_t error;
     unsigned error_node;
     int joined,sorted,group_source,keep_window,lazy_text,filtered_scan;
-    int retry;
+    int retry,materializing;
+    unsigned materialized_column;
     struct qs_vector_input retry_input;
     struct qs_chunk *retry_chunk;
     const uint32_t *retry_selection;
@@ -254,6 +255,7 @@ struct execution {
     struct qp_plan *plan;
     struct qp_control *control;
     struct qs_dict *dictionary;
+    struct qs_dictionary *paged;
     struct qs_dictionary_text *text;
     struct group_update_state *group_update;
     int64_t text_wait;
@@ -563,6 +565,41 @@ static int evaluate(struct execution *s,struct qs_eval *e,int index,struct qs_ce
         }
     }
     e->valid[index]=1; e->cells[index]=v; *out=v; return 0;
+}
+/* Materialization retains its own position after expression evaluation has
+ * completed. Do not rebuild vectors or advance a producer on an I/O wait. */
+static int materialize_vector(struct execution *s,struct qs_vector *v,unsigned count)
+{
+    if(!s->paged) return qs_vector_materialize_text(v,count,s->dictionary);
+    return text_status(s,qs_vector_materialize_text_paged(v,count,s->paged,s->text,s->io,0));
+}
+static int materialize_outputs(struct execution *s,struct projection_batch *b)
+{
+    b->materializing=1;
+    for(;b->materialized_column<b->plan.nout;++b->materialized_column) {
+        int index=b->plan.outputs[b->materialized_column].index;
+        if(index>=0 && materialize_vector(s,&b->vectors[index],b->count)) return -3;
+    }
+    b->materializing=0; b->materialized_column=0; return 0;
+}
+static int intern_view(struct execution *s,struct qs_text_view view,unsigned *id)
+{
+    if(!s->paged) {
+        int value=qs_text_intern(s->dictionary,view); if(value<0) return -3;
+        *id=value; return 0;
+    }
+    if(view.id && !view.offset && view.length==UINT_MAX) {
+        if(!qs_dictionary_valid_id(s->paged,view.id)) return -3;
+        *id=view.id; return 0;
+    }
+    const char *bytes=view.data; unsigned length=view.length;
+    if(view.id) {
+        if(text_get(s,view.id,&bytes,&length)) return -3;
+        if(view.offset>length || (view.length!=UINT_MAX && view.length>length-view.offset)) return -3;
+        bytes+=view.offset; length=view.length==UINT_MAX?length-view.offset:view.length;
+    }
+    if(text_insert(s,bytes,length,id)) return -3;
+    return text_release(s);
 }
 static int join_condition(struct execution *s,unsigned id,const struct qs_cell *values,struct qs_cell *match)
 {
@@ -1753,7 +1790,7 @@ static int join_qual_init(struct execution *s,unsigned id,struct projection_batc
     b->vectors=cs_work_alloc(s->context,b->plan.nexprs*sizeof(*b->vectors));
     if((b->plan.ncols && !b->cells) || !b->vectors) {
         cs_work_free(s->context,b->cells); cs_work_free(s->context,b->vectors);
-    cs_work_free(s->context,b->group_input); return -1;
+        cs_work_free(s->context,b->group_input); return -1;
     }
     return 0;
 }
@@ -2058,10 +2095,12 @@ static int projection_execute_impl(struct projection_batch *b,struct qs_chunk *c
 static int projection_execute(struct projection_batch *b,struct qs_chunk *chunk,
     const uint32_t *selection,unsigned first,struct qs_vector_input input)
 {
+    struct execution *s=input.set_state;
+    if(s && s->paged) { input.text=s->text; input.text_io=s->io; input.resume=b->retry; }
     b->retry_input=input; b->retry_chunk=chunk; b->retry_selection=selection;
     b->retry_first=first; b->retry_count=b->count;
-    struct execution *s=input.set_state;
     int status=projection_execute_impl(b,chunk,selection,first,input);
+    if(status && input.text) text_status(s,qs_dictionary_text_request(input.text));
     b->retry=status && s && s->expression_wait;
     return status;
 }
@@ -2150,21 +2189,21 @@ static void projection_clear(struct execution *s,struct projection_batch **slot)
 {
     struct projection_batch *b=*slot; if(!b) return;
     cs_work_free(s->context,b->cells); cs_work_free(s->context,b->vectors);
-    cs_work_free(s->context,b); *slot=NULL;
+    cs_work_free(s->context,b->group_input); cs_work_free(s->context,b); *slot=NULL;
 }
 /* Return 3 only for an internal scalar fallback, before consuming input. */
 static int64_t projection_fill(struct execution *s,unsigned id,int source)
 {
     struct projection_batch **slot=source?&s->nodes[id].source_projection:&s->nodes[id].projection;
     struct projection_batch *b=*slot;
+    if(b->materializing) return materialize_outputs(s,b)?-3:2;
     if(b->retry) {
         b->count=b->retry_count;
         if(projection_execute(b,b->retry_chunk,b->retry_selection,b->retry_first,b->retry_input)) return -5;
         if(b->sorted) s->nodes[b->scan].left_sort.position+=b->retry_count;
         else if(!b->group_source && !b->joined) s->nodes[b->scan].scan_position+=b->retry_count;
         b->position=0;
-        for(unsigned o=0;!b->lazy_text && o<b->plan.nout;++o)
-            if(qs_vector_materialize_text(&b->vectors[b->plan.outputs[o].index],b->count,s->dictionary)) return -3;
+        if(!b->lazy_text && materialize_outputs(s,b)) return -3;
     }
     while(b->position==b->count) {
         if(b->error) { s->control->error=b->error; s->control->error_node=b->error_node; return b->error; }
@@ -2197,10 +2236,7 @@ static int64_t projection_fill(struct execution *s,unsigned id,int source)
         }
         /* A retained output must outlive this vector's byte views. Predicates
          * do not intern their temporary slices; projected text does. */
-        for(unsigned o=0;!b->lazy_text && o<b->plan.nout;++o) {
-            int index=b->plan.outputs[o].index; if(index<0) continue;
-            if(qs_vector_materialize_text(&b->vectors[index],b->count,s->dictionary)) return -3;
-        }
+        if(!b->lazy_text && materialize_outputs(s,b)) return -3;
     }
     return 2;
 }
@@ -2215,8 +2251,7 @@ static int64_t sort_sink_columns(struct execution *s,struct sorted_rows *sort,un
         if(sort->columns) {
             struct projection_batch *b=sort->columns; unsigned count=b->count-b->position;
             /* Runs outlive this producer batch; retain text as dictionary IDs. */
-            for(unsigned col=0;col<b->plan.nout;++col)
-                if(qs_vector_materialize_text(&b->vectors[b->plan.outputs[col].index],b->count,s->dictionary)) return -3;
+            if(materialize_outputs(s,b)) return -3;
             uint64_t tick=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
             int64_t result=sort_call(s,sort,0);
             if(s->profiling && s->worker) s->sink_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-tick;
@@ -2254,6 +2289,7 @@ static int hash_sink_vectors(struct execution *s,unsigned id)
     struct operator_state *o=&s->owner->nodes[s->hash_sink-1];
     const struct qs_plan *right=&s->plan->nodes[n->right].expr;
     if(!o->hash_data || o->hash_fallback) return 0;
+    if(s->paged && materialize_outputs(s,b)) return -3;
     unsigned at,count=hash_reserve_rows(o,b->count-b->position,&at);
     if(!count) return 0;
     uint64_t hashes[QS_VECTOR_ROWS];
@@ -2327,7 +2363,7 @@ static int64_t hash_probe_input(struct execution *s,unsigned id,const uint32_t *
                 if(!b->position || !probe->ready) {
                     for(unsigned k=0;k<n->nkeys;++k) {
                         int index=b->plan.outputs[n->left_keys[k]].index;
-                        if(qs_vector_materialize_text(&b->vectors[index],b->count,s->dictionary)) return -3;
+                        if(materialize_vector(s,&b->vectors[index],b->count)) return -3;
                     }
                     for(unsigned r=0;r<b->count;++r) {
                         uint64_t hash=UINT64_C(0x9e3779b97f4a7c15); unsigned null=0,error=0;
@@ -2386,7 +2422,7 @@ static int hash_left_cell(struct execution *s,unsigned id,unsigned col,struct qs
         if(v->kind==QS_TEXT) {
             struct qs_cell cell={.isnull=v->nulls[r]};
             if(!cell.isnull) {
-                int key=qs_text_intern(s->dictionary,v->strings[r]); if(key<0) return -3;
+                unsigned key; if(intern_view(s,v->strings[r],&key)) return -3;
                 cell.value=key;
             }
             o->left[col]=cell;
@@ -3438,8 +3474,12 @@ fallback:
 }
 static int index_project_batch(struct execution *s,struct projection_batch *b,struct qs_chunk *chunk)
 {
+    if(b->materializing) return materialize_outputs(s,b);
+    b->count=chunk->selected;
     struct qs_vector_input input={.dictionary=s->dictionary,.parameters=s->params,.nparameters=QP_PARAMS,.inset=inset_vectors,.set_state=s};
-    if(qs_vector_execute_input(&b->plan,chunk,qs_selection(chunk),0,chunk->selected,b->needed,b->vectors,input)) return -5;
+    if(s->paged) { input.text=s->text; input.text_io=s->io; input.resume=b->retry; }
+    int status=0;
+    if(qs_vector_execute_input(&b->plan,chunk,qs_selection(chunk),0,chunk->selected,b->needed,b->vectors,input)) { status=-5; goto finished; }
     uint16_t active[QS_VECTOR_ROWS]; unsigned count=0;
     for(unsigned r=0;r<chunk->selected;++r) {
         int index=b->plan.predicate;
@@ -3452,8 +3492,12 @@ static int index_project_batch(struct execution *s,struct projection_batch *b,st
     }
     input.plan=&b->plan; input.vectors=b->vectors; input.count=chunk->selected;
     for(unsigned i=0;i<b->plan.nout;++i)
-        if(qs_vector_evaluate(&input,b->plan.outputs[i].index,active,count)) return -5;
-    return 0;
+        if(qs_vector_evaluate(&input,b->plan.outputs[i].index,active,count)) { status=-5; break; }
+finished:
+    if(status && input.text) text_status(s,qs_dictionary_text_request(input.text));
+    b->retry=status && s->expression_wait;
+    if(status) return status;
+    return s->paged?materialize_outputs(s,b):0;
 }
 /* Decode one candidate in the original consumption order. A zero result is
  * rejected by the indexed side; negative results remain deferred per row. */
@@ -3478,8 +3522,7 @@ static int index_join_values(struct execution *s,unsigned id,struct qs_chunk *ch
             if(v->errors[r]) return -5;
             values[ln+i]=qs_vector_cell(&projected->plan,projected->vectors,index,r);
             if(v->kind==QS_TEXT && !values[ln+i].isnull) {
-                int text=qs_text_intern(s->dictionary,v->strings[r]);
-                if(text<0) return -3;
+                unsigned text; if(intern_view(s,v->strings[r],&text)) return -3;
                 values[ln+i].value=text;
             }
         }
@@ -3533,10 +3576,13 @@ static int index_qual_prepare(struct execution *s,unsigned id,struct qs_chunk *c
     }
     struct qs_vector_input input={.cells=b->cells,.dictionary=s->dictionary,
         .parameters=s->params,.nparameters=QP_PARAMS,.inset=inset_vectors,.set_state=s};
-    if(qs_vector_execute_input(&b->plan,NULL,NULL,0,chunk->selected,b->needed,b->vectors,input)) return -5;
+    if(s->paged) { input.text=s->text; input.text_io=s->io; input.resume=b->retry; }
+    int status=qs_vector_execute_input(&b->plan,NULL,NULL,0,chunk->selected,b->needed,b->vectors,input);
     input.plan=&b->plan; input.vectors=b->vectors; input.count=chunk->selected;
-    if(qs_vector_evaluate(&input,b->plan.predicate,active,count)) return -5;
-    return 1;
+    if(!status) status=qs_vector_evaluate(&input,b->plan.predicate,active,count);
+    if(status && input.text) text_status(s,qs_dictionary_text_request(input.text));
+    b->retry=status && s->expression_wait;
+    return status?-5:1;
 }
 /* index_scan.c calls this consumer with a batch of decoded heap matches.
  * Only the lookup key is narrowed to int64; left payloads keep 128-bit cells. */

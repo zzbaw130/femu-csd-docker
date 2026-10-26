@@ -690,17 +690,113 @@ static unsigned index_condition_rows(struct execution *s,struct qs_dictionary *d
     printf("index dictionary projection waits=%u\n",projection_waits);
     return waits;
 }
+static void pipeline_plan(struct execution *s,struct projection_batch *b,
+    struct qs_dictionary *d,struct qs_dictionary_access *access)
+{
+    plan(s->plan); b->plan=s->plan->nodes[0].expr;
+    b->plan.exprs[7].constant=insert(d,access,"%-a-%",5);
+    b->plan.exprs[12].constant=insert(d,access,"fallback",8);
+    /* Native import orders children before parents. The scalar fixture has
+     * a forward column reference; put it before COALESCE in this vector DAG. */
+    struct qs_expr column=b->plan.exprs[17];
+    memmove(b->plan.exprs+13,b->plan.exprs+12,5*sizeof(*b->plan.exprs));
+    b->plan.exprs[12]=column; b->plan.exprs[14].left=12; b->plan.exprs[14].right=13;
+    b->plan.exprs[17].left=16; b->plan.exprs[17].right=15;
+    for(unsigned o=0;o<b->plan.nout;++o) if(b->plan.outputs[o].index>=12) ++b->plan.outputs[o].index;
+    for(unsigned col=0;col<4;++col) b->plan.cols[col]=(struct qs_column){.slot=col,.type=col==2?Q_INTEGER:Q_STRING};
+    for(unsigned o=0;o<b->plan.nout;++o) assert(!qs_vector_require(&b->plan,b->plan.outputs[o].index,b->needed));
+    assert(!qs_vector_require(&b->plan,8,b->needed) && !qs_vector_require(&b->plan,6,b->needed));
+    b->filters[0].expression=8; b->filters[1].expression=6; b->nfilters=2;
+    s->nodes[0].projection=b; s->paged=d;
+}
+static void pipeline_input(struct projection_batch *b,unsigned batch,unsigned count)
+{
+    b->count=count; b->position=0;
+    for(unsigned row=0;row<count;++row) {
+        unsigned at=batch*64+row,left=at*193%KEYS,right=at%3?left:(at*97+3000)%KEYS;
+        b->cells[row]=(struct qs_cell){.value=ids[left][0]};
+        b->cells[QS_VECTOR_ROWS+row]=(struct qs_cell){.value=ids[right][1],.isnull=at%13==0};
+        b->cells[2*QS_VECTOR_ROWS+row]=(struct qs_cell){.value=at};
+        b->cells[3*QS_VECTOR_ROWS+row]=(struct qs_cell){.value=ids[left][0],.isnull=at%5==0};
+    }
+}
+static unsigned pipeline_columns(struct execution *s,struct projection_batch *b,
+    struct qs_dictionary *d,struct qs_dictionary_access *access,unsigned *materialize_waits)
+{
+    pipeline_plan(s,b,d,access);
+    unsigned waits=0; *materialize_waits=0;
+    for(unsigned batch=0;batch<3;++batch) {
+        drop_cache(d,access); pipeline_input(b,batch,64);
+        struct qs_cell original[4*QS_VECTOR_ROWS]; memcpy(original,b->cells,sizeof(original));
+        struct qs_vector_input input={.cells=b->cells,.set_state=s};
+        for(unsigned attempts=0;;++attempts) {
+            assert(attempts<10000); int status=projection_execute(b,NULL,NULL,0,input); if(!status) break;
+            assert(status<0 && s->expression_wait && b->retry && !b->materializing); waits+=resume(s);
+        }
+        unsigned expected[64],count=0;
+        for(unsigned row=0;row<64;++row) { unsigned at=batch*64+row; if(at%3 && at%13) expected[count++]=at; }
+        assert(b->count==count && !b->retry);
+        int status=materialize_outputs(s,b);
+        for(unsigned attempts=0;status;++attempts) {
+            assert(attempts<10000 && status<0 && b->materializing && !b->retry);
+            *materialize_waits+=resume(s);
+            status=projection_fill(s,0,0); if(status==2) status=0;
+        }
+        assert(!b->materializing && !b->materialized_column && b->count==count);
+        for(unsigned row=0;row<count;++row) {
+            unsigned at=expected[row],left=at*193%KEYS;
+            struct qs_cell value=qs_vector_cell(&b->plan,b->vectors,11,row); assert(value.value==at);
+            char bytes[LENGTH]; make_text(bytes,left,0);
+            value=qs_vector_cell(&b->plan,b->vectors,4,row); check_string(d,access,value.value,bytes+2,6);
+            struct qs_cell same=qs_vector_cell(&b->plan,b->vectors,10,row); assert(same.value==value.value);
+            value=qs_vector_cell(&b->plan,b->vectors,14,row);
+            check_string(d,access,value.value,at%5?bytes:"fallback",at%5?LENGTH:8);
+            value=qs_vector_cell(&b->plan,b->vectors,8,row); assert(!value.isnull && value.value);
+            value=qs_vector_cell(&b->plan,b->vectors,15,row); assert(!value.isnull && value.value);
+            assert(qs_vector_cell(&b->plan,b->vectors,0,row).value==ids[left][0]);
+            assert(qs_vector_cell(&b->plan,b->vectors,1,row).value==ids[left][1]);
+        }
+        assert(!memcmp(original,b->cells,sizeof(original)));
+    }
+    assert(waits && *materialize_waits);
+    cs_work_context_stats before,after;
+    assert(!cs_work_get_context_stats(s->context,&before));
+    projection_clear(s,&s->nodes[0].projection);
+    assert(!cs_work_get_context_stats(s->context,&after) && after.allocations+4==before.allocations);
+    return waits;
+}
 /* Abort after I/O completion but before its token is acknowledged. A query
  * scope also owns this token, so it must reclaim it without needing a retry. */
 static void cancel_operation(uint64_t operation,int exporting)
 {
-    cs_work_context *ctx=cs_work_begin_limit(384U*1024); assert(ctx);
+    cs_work_context *ctx=cs_work_begin_limit((exporting>=6?768U:384U)*1024); assert(ctx);
     struct qs_dictionary *d=qs_dictionary_create(ctx); assert(d);
     struct qs_dictionary_access *access=qs_dictionary_access_create(d); assert(access);
     struct execution *s=cs_work_calloc(ctx,1,sizeof(*s)); assert(s);
     s->context=ctx; s->io=io; s->text=qs_dictionary_text_create(d); assert(s->text);
     s->plan=calloc(1,sizeof(*s->plan)); assert(s->plan); plan(s->plan);
     s->nodes=cs_work_calloc(ctx,1,sizeof(*s->nodes)); assert(s->nodes);
+    struct projection_batch *batch=NULL;
+    if(exporting>=6) {
+        s->paged=d; batch=cs_work_calloc(ctx,1,sizeof(*batch)); assert(batch);
+        batch->vectors=cs_work_calloc(ctx,3,sizeof(*batch->vectors)); assert(batch->vectors);
+        batch->count=1; batch->plan.nout=1;
+        if(exporting==6) {
+            batch->plan.nattrs=batch->plan.ncols=1; batch->plan.nexprs=3;
+            batch->plan.cols[0]=(struct qs_column){.slot=0,.type=Q_STRING};
+            batch->plan.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.type=Q_STRING,.column=0};
+            batch->plan.exprs[1]=(struct qs_expr){.op=Q_CONST,.type=Q_STRING};
+            batch->plan.exprs[2]=(struct qs_expr){.op=QP_LIKE,.type=Q_BOOLEAN,.left=0,.right=1};
+            batch->plan.outputs[0].index=2;
+            assert(!qs_vector_require(&batch->plan,2,batch->needed));
+            batch->cells=cs_work_calloc(ctx,QS_VECTOR_ROWS,sizeof(*batch->cells)); assert(batch->cells);
+            batch->cells[0].value=1;
+        } else {
+            batch->plan.nexprs=1; batch->plan.exprs[0].type=Q_STRING;
+            batch->vectors[0].kind=QS_TEXT;
+            batch->vectors[0].strings[0]=(struct qs_text_view){.id=1,.offset=2,.length=6};
+        }
+    }
     if(exporting==4) {
         s->plan->nodes[0].join_qual=9;
         s->nodes[0].join_condition=cs_work_calloc(ctx,1,sizeof(*s->nodes[0].join_condition)); assert(s->nodes[0].join_condition);
@@ -722,6 +818,7 @@ static void cancel_operation(uint64_t operation,int exporting)
     for(unsigned row=0;row<4096;++row) {
         char bytes[LENGTH]; make_text(bytes,row,0); assert(insert(d,access,bytes,LENGTH)==row+1);
     }
+    if(exporting==6) batch->plan.exprs[1].constant=insert(d,access,"%-a-%",5);
     struct qs_cell input[4]={{.value=operation?1:UINT32_MAX},{.value=4096},{.value=7},{.isnull=1}},result[QS_OUT];
     struct qs_result *out=calloc(1,sizeof(*out)); assert(out);
     struct qs_plan root={.nout=1,.nexprs=1}; root.exprs[0].type=Q_STRING;
@@ -747,7 +844,10 @@ static void cancel_operation(uint64_t operation,int exporting)
             s->nodes[0].left[0]=(struct qs_cell){.value=1}; s->nodes[0].left[1]=(struct qs_cell){.value=1000};
             s->nodes[0].right[0]=(struct qs_cell){.value=4096}; s->nodes[0].right[1]=(struct qs_cell){.value=2000};
         }
-        int status=exporting==5?key_compare(s,&s->plan->nodes[0],s->nodes[0].left,s->nodes[0].right):
+        struct qs_vector_input vector_input={.cells=batch?batch->cells:NULL,.set_state=s};
+        int status=exporting==7?materialize_outputs(s,batch):
+            exporting==6?projection_execute(batch,NULL,NULL,0,vector_input):
+            exporting==5?key_compare(s,&s->plan->nodes[0],s->nodes[0].left,s->nodes[0].right):
             exporting==4?join_condition(s,0,input,&result[0]):
             exporting==3?group_sink_row(s,0,&s->nodes[0],input,GROUP_SHARED):
             exporting==2?accumulate(s,&s->plan->nodes[0],&s->nodes[0]):
@@ -774,9 +874,9 @@ static void cancel_operation(uint64_t operation,int exporting)
 }
 int main(int argc,char **argv)
 {
-    assert(argc==1 || (argc==2 && (!strcmp(argv[1],"--aggregate") || !strcmp(argv[1],"--hash-aggregate") || !strcmp(argv[1],"--join"))));
+    assert(argc==1 || (argc==2 && (!strcmp(argv[1],"--aggregate") || !strcmp(argv[1],"--hash-aggregate") || !strcmp(argv[1],"--join") || !strcmp(argv[1],"--pipeline"))));
     int aggregates=argc==2 && !strcmp(argv[1],"--aggregate"),hashed=argc==2 && !strcmp(argv[1],"--hash-aggregate");
-    int joining=argc==2 && !strcmp(argv[1],"--join");
+    int joining=argc==2 && !strcmp(argv[1],"--join"),pipeline=argc==2 && !strcmp(argv[1],"--pipeline");
     assert(!cs_work_init(BUDGET));
     cs_work_context *ctx=cs_work_begin_limit(BUDGET); assert(ctx);
     struct qs_dictionary *d=qs_dictionary_create(ctx); assert(d);
@@ -791,9 +891,13 @@ int main(int argc,char **argv)
         s->nodes[0].hash_data=cs_work_alloc(ctx,4096); assert(s->nodes[0].hash_data);
     }
     struct projection_batch *b=NULL;
-    if(aggregates || hashed) {
+    if(aggregates || hashed || pipeline) {
         b=cs_work_calloc(ctx,1,sizeof(*b)); assert(b);
-        b->vectors=cs_work_calloc(ctx,4,sizeof(*b->vectors)); assert(b->vectors);
+        b->vectors=cs_work_calloc(ctx,pipeline?18:4,sizeof(*b->vectors)); assert(b->vectors);
+    }
+    if(pipeline) {
+        b->cells=cs_work_calloc(ctx,4*QS_VECTOR_ROWS,sizeof(*b->cells)); assert(b->cells);
+        b->group_input=cs_work_calloc(ctx,1,sizeof(*b->group_input)); assert(b->group_input);
     }
     struct execution *peer=NULL;
     if(hashed) {
@@ -810,7 +914,9 @@ int main(int argc,char **argv)
         char bytes[LENGTH]; make_text(bytes,row,col); ids[row][col]=insert(d,access,bytes,LENGTH);
     }
     unsigned scalar_waits,output_waits;
-    if(joining) {
+    if(pipeline) {
+        scalar_waits=pipeline_columns(s,b,d,access,&output_waits);
+    } else if(joining) {
         scalar_waits=join_rows(s,d,access); output_waits=index_condition_rows(s,d,access);
     } else if(hashed) {
         scalar_waits=shared_interleave(s,peer,d,access);
@@ -835,7 +941,10 @@ int main(int argc,char **argv)
     }
     assert(!live); free(tokens); tokens=NULL; ntokens=stores=loads=0; assert(!cs_work_end(ctx));
     cs_work_stats total; assert(!cs_work_get_stats(&total) && !total.used_bytes && !total.active_contexts);
-    if(joining) {
+    if(pipeline) {
+        cancel_operation(CS_NEED_STORE,6); cancel_operation(CS_NEED_LOAD,6);
+        cancel_operation(CS_NEED_STORE,7); cancel_operation(CS_NEED_LOAD,7);
+    } else if(joining) {
         cancel_operation(CS_NEED_STORE,4); cancel_operation(CS_NEED_LOAD,4);
         cancel_operation(CS_NEED_STORE,5); cancel_operation(CS_NEED_LOAD,5);
     } else if(hashed) {
@@ -847,7 +956,8 @@ int main(int argc,char **argv)
     cancel_operation(CS_NEED_STORE,1); cancel_operation(CS_NEED_LOAD,1);
     cancel_operation(0,1);
     }
-    puts(joining?"PASS paged multi-key Merge/Hash INNER, LEFT, SEMI and ANTI with resumable scalar conditions":
+    puts(pipeline?"PASS native projection text binding, selected rows, materialization continuation and batch cleanup":
+        joining?"PASS paged multi-key Merge/Hash INNER, LEFT, SEMI and ANTI with resumable scalar conditions":
         hashed?"PASS shared hash rebase during dictionary I/O, vector partial retention and scalar arguments":
         aggregates?"PASS dictionary ID grouping and resumable scalar/vector/stream MIN/MAX and partial combine":
         "PASS scalar text memo, retained input, short circuit, partial export and cancellation/error cleanup");
