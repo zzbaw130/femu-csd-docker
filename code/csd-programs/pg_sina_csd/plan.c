@@ -109,6 +109,8 @@ struct projection_batch {
     unsigned error_node;
     int joined,sorted,group_source,keep_window,lazy_text;
     int group_keys[QS_KEYS],group_values[QS_AGGS];
+    struct { unsigned node; int expression; } filters[QP_NODES];
+    unsigned nfilters;
 };
 struct hash_probe_batch {
     uint32_t matches[QS_VECTOR_ROWS];
@@ -1383,20 +1385,21 @@ static int projection_init(struct execution *s,unsigned id)
         (root->nkeys && (!root->hash || !qp_hash_aggregate_supported(root))))) return 0;
     int grouped=aggregate && root->nkeys;
     int scan=aggregate?root->left:(int)id;
+    unsigned projections[QP_NODES],nprojections=0;
     while(s->plan->nodes[scan].kind==QP_PROJECT) {
         const struct qp_node *n=&s->plan->nodes[scan];
-        if(n->left<0 || n->expr.predicate>=0 || (!s->worker && s->plan->workers>1 && n->parallel)) return 0;
+        if(n->left<0 || (!s->worker && s->plan->workers>1 && n->parallel)) return 0;
+        projections[nprojections++]=scan;
         scan=n->left;
     }
     const struct qp_node *leaf=&s->plan->nodes[scan];
     int group_source=s->worker && s->source_node==scan && leaf->kind==QP_AGGREGATE &&
-        leaf->expr.predicate<0 && s->owner->partition_join<0 && s->owner->nodes[scan].group_phase==3;
-    int joined=leaf->expr.predicate<0 &&
-        (leaf->kind==QP_INDEX_JOIN || (leaf->kind==QP_JOIN && leaf->hash));
-    int sorted=leaf->kind==QP_SORT && leaf->left>=0 && leaf->expr.predicate<0 &&
+        s->owner->partition_join<0 && s->owner->nodes[scan].group_phase==3;
+    int joined=leaf->kind==QP_INDEX_JOIN || (leaf->kind==QP_JOIN && leaf->hash);
+    int sorted=leaf->kind==QP_SORT && leaf->left>=0 &&
         leaf->expr.nattrs==s->plan->nodes[leaf->left].expr.nout;
     if((leaf->kind!=QP_SCAN && !joined && !sorted && !group_source) || (!s->worker && s->plan->workers>1 && leaf->parallel)) return 0;
-    if(!joined && !sorted && leaf->expr.predicate>=0) {
+    if(!group_source && !joined && !sorted && leaf->expr.predicate>=0) {
         if(leaf->ordered_index) return 0;
         int status=scan_filter_init(s,&leaf->expr,&s->nodes[scan]); if(status) return status;
         if(!s->nodes[scan].scan_filter) return 0;
@@ -1411,6 +1414,17 @@ static int projection_init(struct execution *s,unsigned id)
         for(unsigned col=0;col<b->plan.nattrs;++col) b->plan.cols[col].slot=col;
     }
     struct projection_import import={.execution=s,.batch=b};
+    /* Apply each node's WHERE/HAVING in input-to-output order. A NULL result
+     * removes the row before any higher filter or projection is evaluated. */
+    for(unsigned i=0;i<=nprojections;++i) {
+        unsigned node=i?projections[nprojections-i]:(unsigned)scan;
+        if(!i && !group_source && !joined && !sorted) continue; /* Scan already filters. */
+        int predicate=s->plan->nodes[node].expr.predicate;
+        if(predicate<0) continue;
+        int index=projection_import(&import,node,predicate);
+        if(index<0 || qs_vector_dependency(&b->plan,index,b->needed)) { cs_work_free(s->context,b); return 0; }
+        b->filters[b->nfilters].node=node; b->filters[b->nfilters++].expression=index;
+    }
     if(grouped) {
         for(unsigned k=0;k<root->nkeys;++k) {
             int index=projection_import(&import,id,root->expr.keys[k]);
@@ -1459,6 +1473,69 @@ static void projection_append(struct projection_batch *b,const struct qs_cell *v
         if(slot>=0) b->cells[(size_t)slot*QS_VECTOR_ROWS+b->input_count]=values[col];
     }
     ++b->input_count;
+}
+/* Compact only requested results, after filters and output expressions have
+ * run on surviving rows. Text stays a borrowed view for lazy Join payloads. */
+static void projection_select(struct projection_batch *b,const uint16_t *rows,unsigned count)
+{
+    struct qs_cell values[QS_VECTOR_ROWS]; uint8_t errors[QS_VECTOR_ROWS];
+    for(unsigned index=0;index<b->plan.nexprs;++index) if(b->needed[index]&2) {
+        struct qs_vector *v=&b->vectors[index];
+        if(v->kind==QS_CONSTANT) { v->done=count; continue; }
+        if(v->kind==QS_TEXT) {
+            v->all_valid=1;
+            for(unsigned i=0;i<count;++i) {
+                unsigned row=rows[i],error=v->errors[row],null=error || qs_vector_null(v,row);
+                if(!null) v->strings[i]=v->strings[row];
+                else { v->strings[i].data=NULL; v->strings[i].length=0; }
+                v->nulls[i]=null; v->errors[i]=error; v->all_valid&=!null;
+            }
+            v->done=count; continue;
+        }
+        int narrow=1;
+        for(unsigned i=0;i<count;++i) {
+            errors[i]=v->errors[rows[i]];
+            values[i]=errors[i]?(struct qs_cell){.isnull=1}:qs_vector_cell(&b->plan,b->vectors,index,rows[i]);
+            if(!values[i].isnull && (values[i].scale!=b->plan.exprs[index].scale ||
+                values[i].value<INT64_MIN || values[i].value>INT64_MAX)) narrow=0;
+        }
+        v->kind=narrow?QS_NARROW:QS_DYNAMIC; v->all_valid=1; v->done=count;
+        for(unsigned i=0;i<count;++i) {
+            if(narrow) v->narrow[i]=values[i].isnull?0:(int64_t)values[i].value;
+            else v->values[i]=values[i].value;
+            v->nulls[i]=values[i].isnull; v->errors[i]=errors[i];
+            v->scales[i]=values[i].scale; v->dscales[i]=values[i].dscale;
+            v->all_valid&=!errors[i] && !values[i].isnull;
+        }
+    }
+}
+static int projection_execute(struct projection_batch *b,struct qs_chunk *chunk,
+    const uint32_t *selection,unsigned first,struct qs_vector_input input)
+{
+    unsigned count=b->count;
+    if(!b->nfilters) return qs_vector_execute_input(&b->plan,chunk,selection,first,count,b->needed,b->vectors,input)?-5:0;
+    uint8_t dependencies[QS_EXPRS];
+    for(unsigned i=0;i<b->plan.nexprs;++i) dependencies[i]=b->needed[i]&1;
+    if(qs_vector_execute_input(&b->plan,chunk,selection,first,count,dependencies,b->vectors,input)) return -5;
+    input.plan=&b->plan; input.vectors=b->vectors; input.count=count;
+    uint16_t rows[QS_VECTOR_ROWS]; for(unsigned i=0;i<count;++i) rows[i]=i;
+    unsigned kept=count,first_error=count;
+    for(unsigned f=0;f<b->nfilters && kept;++f) {
+        int index=b->filters[f].expression;
+        if(qs_vector_evaluate(&input,index,rows,kept)) return -5;
+        unsigned next=0;
+        for(unsigned i=0;i<kept;++i) {
+            unsigned row=rows[i];
+            if(b->vectors[index].errors[row]) {
+                if(row<first_error) { first_error=row; b->error=-5; b->error_node=b->filters[f].node; }
+            } else if(row<first_error && !qs_vector_null(&b->vectors[index],row) && qs_vector_value(&b->vectors[index],row))
+                rows[next++]=row;
+        }
+        kept=next;
+    }
+    for(unsigned i=0;i<b->plan.nexprs;++i) if((b->needed[i]&2) && kept && qs_vector_evaluate(&input,i,rows,kept)) return -5;
+    if(kept!=count) projection_select(b,rows,kept);
+    b->count=kept; return 0;
 }
 static int64_t projection_join_fill(struct execution *s,struct projection_batch *b)
 {
@@ -1512,8 +1589,7 @@ evaluate_batch:
     struct qs_vector_input input={.cells=b->borrowed_cells?b->borrowed_cells:b->cells,.dictionary=s->dictionary,
         .parameters=s->params,.nparameters=QP_PARAMS};
     /* COUNT(*) can have no payload columns; it still consumes cardinality. */
-    if(b->plan.nexprs && qs_vector_execute_input(&b->plan,NULL,b->borrowed_cells?b->borrowed_selection:NULL,
-        0,b->count,b->needed,b->vectors,input)) return -5;
+    if(b->plan.nexprs && projection_execute(b,NULL,b->borrowed_cells?b->borrowed_selection:NULL,0,input)) return -5;
     return 2;
 }
 /* A Sort Source already produces evaluated cells in complete batches. Keep
@@ -1529,15 +1605,17 @@ static int64_t projection_sort_fill(struct execution *s,struct projection_batch 
     struct qs_vector_input input={.cells=sort->output->data[sort->position].cells,
         .column_stride=1,.row_stride=QS_OUT,.dictionary=s->dictionary,
         .parameters=s->params,.nparameters=QP_PARAMS};
-    if(qs_vector_execute_input(&b->plan,NULL,NULL,0,b->count,b->needed,b->vectors,input)) return -5;
-    sort->position+=b->count;
+    unsigned consumed=b->count;
+    if(projection_execute(b,NULL,NULL,0,input)) return -5;
+    sort->position+=consumed;
     return 2;
 }
 /* Return 3 only for an internal scalar fallback, before consuming input. */
 static int64_t projection_fill(struct execution *s,unsigned id)
 {
     struct projection_batch *b=s->nodes[id].projection;
-    if(b->position==b->count) {
+    while(b->position==b->count) {
+        if(b->error) { s->control->error=b->error; s->control->error_node=b->error_node; return b->error; }
         int64_t status=b->group_source?projection_group_fill(s,b):b->sorted?projection_sort_fill(s,b):
             b->joined?projection_join_fill(s,b):scan_chunk_next(s,b->scan);
         if(status!=2) {
@@ -1564,8 +1642,9 @@ static int64_t projection_fill(struct execution *s,unsigned id)
             const void *raw=scan->scan_raw_bytes?s->arena+input_offset(s,source)+scan->scan_raw:NULL;
             struct qs_vector_input input={.raw=raw,.raw_bytes=scan->scan_raw_bytes,.dictionary=s->dictionary,
                 .parameters=s->params,.nparameters=QP_PARAMS};
-            if(qs_vector_execute_input(&b->plan,chunk,qs_selection(chunk),scan->scan_position,b->count,b->needed,b->vectors,input)) return -5;
-            scan->scan_position+=b->count; b->position=0;
+            unsigned consumed=b->count;
+            if(projection_execute(b,chunk,qs_selection(chunk),scan->scan_position,input)) return -5;
+            scan->scan_position+=consumed; b->position=0;
         }
         /* A retained output must outlive this vector's byte views. Predicates
          * do not intern their temporary slices; projected text does. */
@@ -1915,7 +1994,7 @@ static int64_t projection_group_fill(struct execution *s,struct projection_batch
     }
     struct qs_vector_input input={.cells=b->cells,.dictionary=s->dictionary,
         .parameters=s->params,.nparameters=QP_PARAMS};
-    if(qs_vector_execute_input(&b->plan,NULL,NULL,0,b->count,b->needed,b->vectors,input)) return -5;
+    if(projection_execute(b,NULL,NULL,0,input)) return -5;
     return 2;
 }
 /* Published keys stay immutable throughout a CU wave. The bounded shared
@@ -2819,7 +2898,7 @@ static int64_t next_row_impl(struct execution *s,unsigned id,struct qs_cell *row
         int64_t status=spool_row_bytes(s,&s->source,s->source_at,bytes,packed); if(status) return status;
         hash_load(row,packed,&n->expr); ++s->source_at; return 2;
     }
-    if(o->finished && (!o->projection || o->projection->position==o->projection->count)) return 0;
+    if(o->finished && (!o->projection || (o->projection->position==o->projection->count && !o->projection->error))) return 0;
     if(!s->worker && s->plan->workers>1 && n->parallel) return parallel_next(s,id,row);
     if(n->kind==QP_SCAN || n->kind==QP_SORT || (n->kind==QP_PROJECT && n->left>=0) || (n->kind==QP_JOIN && n->hash) || n->kind==QP_INDEX_JOIN) {
         int status=projection_init(s,id); if(status) return status;

@@ -1117,6 +1117,111 @@ static void parameter_projection(function run,int joined,int wide,int null_param
     free(raw[0]); free(raw[1]); free(arena); free(io); free(out); free(p);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
 }
+/* WHERE at each projection must suppress rejected rows before evaluating
+ * overflowing payloads or higher filters, including NULL-only batches. */
+static void filtered_projection(function run,unsigned mode)
+{
+    const unsigned rows=600;
+    struct qp_plan *p=calloc(1,sizeof(*p)); assert(p); p->count=3; p->scan_bytes=QP_SCAN_BYTES;
+    scan(&p->nodes[2]);
+    struct qp_node *lower=&p->nodes[1],*upper=&p->nodes[0];
+    *lower=(struct qp_node){.kind=QP_PROJECT,.left=2,.right=-1,.expr=p->nodes[2].expr};
+    lower->expr.nexprs=7; lower->expr.predicate=3;
+    lower->expr.exprs[2]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=1,.isnull=mode==2};
+    lower->expr.exprs[3]=(struct qs_expr){.op=Q_EQ,.type=Q_BOOLEAN,.left=1,.right=2};
+    lower->expr.exprs[4]=(struct qs_expr){.op=Q_CONST,.type=Q_DECIMAL,.constant=INT64_MAX};
+    lower->expr.exprs[5]=(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=4,.right=4};
+    lower->expr.exprs[6]=(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=5,.right=1};
+    lower->expr.outputs[1]=(struct qs_output){.index=6,.type_oid=1700};
+    *upper=(struct qp_node){.kind=QP_PROJECT,.left=1,.right=-1,.expr=p->nodes[2].expr};
+    upper->expr.work_mem_bytes=64U*1024*1024; upper->expr.nexprs=mode==2?8:5; upper->expr.predicate=mode==2?7:3;
+    upper->expr.exprs[1].type=Q_DECIMAL;
+    upper->expr.exprs[2]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.isnull=mode==1};
+    upper->expr.exprs[3]=(struct qs_expr){.op=Q_NE,.type=Q_BOOLEAN,.left=0,.right=2};
+    upper->expr.exprs[4]=(struct qs_expr){.op=Q_ADD,.type=Q_DECIMAL,.left=1,.right=0};
+    upper->expr.outputs[1]=(struct qs_output){.index=4,.type_oid=1700};
+    if(mode==2) {
+        upper->expr.exprs[5]=lower->expr.exprs[4];
+        upper->expr.exprs[6]=(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=5,.right=5};
+        upper->expr.exprs[7]=(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=6,.right=5};
+    }
+    if(mode>=4) {
+        /* The first surviving row is valid; the next predicate overflows.
+         * LIMIT 1 suppresses it, while LIMIT 2 must report it. */
+        lower->expr.nexprs=9; lower->expr.predicate=8;
+        lower->expr.exprs[7]=(struct qs_expr){.op=Q_IS_NOT_NULL,.type=Q_BOOLEAN,.left=0};
+        lower->expr.exprs[8]=(struct qs_expr){.op=Q_AND,.type=Q_BOOLEAN,.left=3,.right=7};
+        upper->expr.nexprs=10; upper->expr.predicate=9;
+        upper->expr.exprs[2].constant=8; upper->expr.exprs[3].op=Q_EQ;
+        upper->expr.exprs[5]=lower->expr.exprs[4];
+        upper->expr.exprs[6]=(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=5,.right=5};
+        upper->expr.exprs[7]=(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=6,.right=5};
+        upper->expr.exprs[8]=(struct qs_expr){.op=Q_CONST,.type=Q_BOOLEAN,.constant=1};
+        upper->expr.exprs[9]=(struct qs_expr){.op=Q_CASE,.type=Q_BOOLEAN,.left=3,.right=8,.otherwise=7};
+        p->count=4; p->nodes[3]=*upper;
+        *upper=(struct qp_node){.kind=QP_LIMIT,.left=3,.right=-1,.expr=p->nodes[2].expr};
+        upper->expr.limit=mode==4?1:2; upper->expr.work_mem_bytes=64U*1024*1024;
+        upper->expr.exprs[1].type=Q_DECIMAL; upper->expr.outputs[1].type_oid=1700;
+    }
+    size_t raw_bytes,config=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
+    unsigned char *raw=heap(rows,0,&raw_bytes);
+    if(mode==3) {
+        /* Compact borrowed substring views, then intern only surviving text. */
+        p->nodes[2].expr.cols[1].length=-1; p->nodes[2].expr.cols[1].type=Q_STRING;
+        p->nodes[2].expr.exprs[1].type=Q_STRING; p->nodes[2].expr.outputs[1].type_oid=25;
+        lower->expr.nstrings=1; lower->expr.strings[0]=(struct qs_string){.length=2,.bytes="k%"};
+        lower->expr.exprs[1].type=Q_STRING;
+        lower->expr.exprs[2]=(struct qs_expr){.op=Q_CONST,.type=Q_STRING};
+        lower->expr.exprs[3]=(struct qs_expr){.op=Q_LIKE,.type=Q_BOOLEAN,.left=1,.right=2};
+        lower->expr.exprs[4]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=2};
+        lower->expr.exprs[5]=(struct qs_expr){.op=Q_SUBSTRING,.type=Q_STRING,.left=1,.right=4,.otherwise=4};
+        lower->expr.nexprs=6; lower->expr.outputs[1]=(struct qs_output){.index=5,.type_oid=25};
+        upper->expr.nexprs=4; upper->expr.exprs[1].type=Q_STRING;
+        upper->expr.outputs[1]=(struct qs_output){.index=1,.type_oid=25};
+        for(unsigned r=0;r<rows;++r) {
+            unsigned char *tuple=raw+(r/100)*QS_PAGE+QS_PAGE-(r%100+1)*40;
+            unsigned at=r%17?28:24; char text[5];
+            snprintf(text,sizeof(text),"%c%03u",r%19?'s':'k',r%100);
+            tuple[at]=(5U<<1)|1U; memcpy(tuple+at+1,text,4);
+        }
+    }
+    struct qp_node *leaf=&p->nodes[2]; leaf->bytes=raw_bytes; leaf->input_offset=config;
+    leaf->vector_offset=config+p->scan_bytes;
+    size_t bytes=leaf->vector_offset+qs_chunk_bytes(QP_VECTOR_ROWS,2);
+    unsigned char *arena=calloc(1,bytes),*io=calloc(1,QS_SORT_IO_BYTES);
+    struct qs_result *out=calloc(1,sizeof(*out)); assert(arena && io && out);
+    *(struct qs_dict *)arena=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
+    *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=QP_VECTOR_ROWS,.ncols=2};
+    struct qp_control control={0}; void *mr[]={p,&control,out,arena,io};
+    long long lengths[]={sizeof(*p),sizeof(control),sizeof(*out),bytes,QS_SORT_IO_BYTES};
+    struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=lengths};
+    unsigned next=0,seen=0,expected=mode==4; int failed=0;
+    for(unsigned r=0;r<rows;++r) expected+=(mode==0 || mode==3) && r%19==0 && r%17 && r%11;
+    while(!out->finished) {
+        int64_t status=run(&args);
+        if(status && mode==5) {
+            assert(status==-5); control.close=1; assert(!run(&args)); failed=1; break;
+        }
+        if(status) fprintf(stderr,"filtered projection mode=%u status=%lld node=%u error=%d\n",mode,(long long)status,control.error_node,control.error);
+        assert(!status);
+        for(unsigned r=0;r<out->rows;++r) {
+            while(next<rows && !(next%19==0 && next%17 && next%11)) ++next;
+            struct qs_cell *v=out->data[r].cells;
+            assert((mode==0 || mode==3 || mode==4) && next<rows && !v[0].isnull && v[0].value==next%11);
+            if(mode==3) {
+                char text[5]; snprintf(text,sizeof(text),"k%03u",next%100);
+                assert(!v[1].isnull && qs_cell_string(&v[1])==2 && !memcmp(qs_cell_string_bytes(&v[1]),text+1,2));
+            } else assert(!v[1].isnull && v[1].value==(__int128)INT64_MAX*INT64_MAX+next%11 && !v[1].scale);
+            ++next; ++seen;
+        }
+        if(control.bytes && !control.ready) {
+            memcpy(arena+leaf->input_offset,raw+control.offset,control.bytes); control.ready=1;
+        }
+    }
+    assert(seen==expected && failed==(mode==5));
+    free(p); free(raw); free(arena); free(io); free(out);
+    struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
+}
 /* A grouped probe must join its final SUM, not expose the aggregate's
  * internal input vectors as ordinary rows. */
 static void grouped_probe(function run)
@@ -1764,6 +1869,7 @@ int main(int argc,char **argv)
     probe_payload(run,1,0,1,1); probe_payload(run,2,0,1,1);
     probe_payload(run,2,0,1,2); probe_payload(run,2,0,1,3);
     namespace_reentry(run);
+    for(unsigned mode=0;mode<6;++mode) filtered_projection(run,mode);
     for(int joined=0;joined<2;++joined) {
         parameter_projection(run,joined,0,0);
         parameter_projection(run,joined,1,0);
