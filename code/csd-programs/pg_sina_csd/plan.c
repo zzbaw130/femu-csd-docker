@@ -98,6 +98,13 @@ struct pending_projection {
     struct qs_eval evaluation; /* Completed subexpressions survive dictionary I/O. */
 };
 struct accumulator { struct qs_cell sum,extreme,last; uint64_t count; int has_last; };
+/* Scalar aggregate arguments must finish before any accumulator changes. */
+struct aggregate_input {
+    struct qs_eval evaluation;
+    struct qs_cell values[QS_AGGS];
+    unsigned argument,aggregate;
+    int active,ready;
+};
 /* sum holds the total for SUM/AVG, or the selected value for MIN/MAX. */
 struct group_value { struct qs_cell sum; uint64_t count; };
 struct compact_group { int64_t key; unsigned key_flags; struct group_value values[]; };
@@ -120,6 +127,7 @@ struct projection_batch {
     struct qs_vector *vectors;
     uint8_t needed[QS_EXPRS];
     unsigned scan,count,position,input_count;
+    unsigned aggregate_position,aggregate_row;
     struct qs_cell *cells;
     const struct qs_cell *borrowed_cells;
     const uint32_t *borrowed_selection;
@@ -161,6 +169,8 @@ struct operator_state {
     struct sorted_rows left_sort,right_sort;
     struct qs_cell left[QS_OUT],right[QS_OUT],first[QS_OUT],keys[QS_KEYS];
     struct accumulator accum[QS_AGGS];
+    struct aggregate_input *aggregate_input;
+    unsigned aggregate_position;
     struct spool group;
     uint64_t position, skipped, emitted;
     unsigned scan_position, scan_input, scan_bytes,scan_raw,scan_raw_bytes;
@@ -244,7 +254,8 @@ struct execution {
     unsigned initializer,initializer_phase;
     unsigned worker, parallel_position[QS_WORKERS];
     uint64_t parallel_done;
-    int parallel_started;
+    int parallel_started,parallel_combining;
+    unsigned parallel_combine_worker;
     unsigned parallel_node, root, used_workers;
     /* One-based parent receiving rows directly from parallel workers. */
     unsigned hash_sink,group_sink,aggregate_sink,group_combine;
@@ -328,15 +339,25 @@ static void init_eval(struct qs_eval *e,const struct qs_plan *plan,const struct 
     e->plan=plan; e->tuple=row; e->aggregates=aggregates;
     memset(e->valid,0,plan->nexprs);
 }
+static int text_get(struct execution *,unsigned,const char **,unsigned *);
+static int text_release(struct execution *);
 static int compare_cell(struct execution *s,struct qs_cell a,struct qs_cell b,unsigned type)
 {
     if(a.isnull || b.isnull) return (a.isnull!=0)-(b.isnull!=0);
     if(type==Q_STRING) {
         const char *x,*y; unsigned xn,yn;
-        if(qs_dict_get(s->dictionary,(unsigned)a.value,&x,&xn) || qs_dict_get(s->dictionary,(unsigned)b.value,&y,&yn)) return INT_MIN;
-        int cmp=memcmp(x,y,xn<yn?xn:yn); return cmp?cmp:(xn>yn)-(xn<yn);
+        if(text_get(s,(unsigned)a.value,&x,&xn) || text_get(s,(unsigned)b.value,&y,&yn)) return INT_MIN;
+        int cmp=memcmp(x,y,xn<yn?xn:yn); if(!cmp) cmp=(xn>yn)-(xn<yn);
+        if(text_release(s)) return INT_MIN;
+        return cmp;
     }
     int cmp=0; return qs_compare(a,b,&cmp)?INT_MIN:cmp;
+}
+static int equal_cell(struct execution *s,struct qs_cell a,struct qs_cell b,unsigned type)
+{
+    if(a.isnull || b.isnull) return !!a.isnull==!!b.isnull;
+    if(type==Q_STRING) return a.value==b.value;
+    int cmp=compare_cell(s,a,b,type); return cmp==INT_MIN?-1:!cmp;
 }
 static inline struct qs_cell set_contains(const struct operator_state *set,struct qs_cell a)
 {
@@ -2318,15 +2339,47 @@ static int hash_left_payload(struct execution *s,unsigned id)
     }
     return 0;
 }
+static struct aggregate_input *aggregate_input(struct execution *s,struct operator_state *o)
+{
+    if(!o->aggregate_input) o->aggregate_input=cs_work_calloc(s->context,1,sizeof(*o->aggregate_input));
+    return o->aggregate_input;
+}
+/* active: 1 initializes group keys, 2 compares this row with the group,
+ * 3 evaluates/accumulates arguments. Only one of these can wait per row. */
+static int initialize_group_keys(struct execution *s,const struct qp_node *n,struct operator_state *o)
+{
+    struct qs_eval flat,*e=&flat; struct aggregate_input *input=NULL;
+    unsigned first=0;
+    if(s->text) {
+        input=aggregate_input(s,o); if(!input) return -4;
+        if(!input->active) { input->active=1; input->argument=0; init_eval(&input->evaluation,&n->expr,o->left,NULL); }
+        if(input->active!=1) return -5;
+        e=&input->evaluation; first=input->argument;
+    } else init_eval(e,&n->expr,o->left,NULL);
+    for(unsigned k=first;k<n->expr.nkeys;++k) {
+        if(evaluate(s,e,n->expr.keys[k],&o->keys[k])) return -5;
+        if(input) input->argument=k+1;
+    }
+    if(input) input->active=0;
+    return 0;
+}
 static int group_same(struct execution *s,const struct qp_node *n,struct operator_state *o)
 {
-    struct qs_eval e; init_eval(&e,&n->expr,o->left,NULL);
-    for(unsigned k=0;k<n->expr.nkeys;++k) {
-        struct qs_cell key; if(evaluate(s,&e,n->expr.keys[k],&key)) return -1;
-        int cmp=compare_cell(s,key,o->keys[k],n->expr.exprs[n->expr.keys[k]].type);
-        if(cmp==INT_MIN) return -1;
-        if(cmp) return 0;
+    struct qs_eval flat,*e=&flat; struct aggregate_input *input=NULL;
+    unsigned first=0;
+    if(s->text) {
+        input=aggregate_input(s,o); if(!input) return -4;
+        if(!input->active) { input->active=2; input->argument=0; init_eval(&input->evaluation,&n->expr,o->left,NULL); }
+        if(input->active!=2) return -5;
+        e=&input->evaluation; first=input->argument;
+    } else init_eval(e,&n->expr,o->left,NULL);
+    for(unsigned k=first;k<n->expr.nkeys;++k) {
+        struct qs_cell key; if(evaluate(s,e,n->expr.keys[k],&key)) return -1;
+        int equal=equal_cell(s,key,o->keys[k],n->expr.exprs[n->expr.keys[k]].type);
+        if(equal<=0) { if(input) input->active=0; return equal; }
+        if(input) input->argument=k+1;
     }
+    if(input) input->active=0;
     return 1;
 }
 static inline int accumulate_value(struct execution *s,const struct qp_node *n,
@@ -2348,8 +2401,38 @@ static inline int accumulate_value(struct execution *s,const struct qp_node *n,
     ++a->count;
     return 0;
 }
+static int accumulate_paged(struct execution *s,const struct qp_node *n,struct operator_state *o)
+{
+    struct aggregate_input *input=aggregate_input(s,o); if(!input) return -4;
+    if(!input->active) {
+        input->active=3; input->ready=0; input->argument=input->aggregate=0;
+        init_eval(&input->evaluation,&n->expr,o->left,NULL);
+    }
+    if(input->active!=3) return -5;
+    for(;!input->ready && input->argument<n->expr.naggs;++input->argument) {
+        unsigned a=input->argument; const struct qs_agg *agg=&n->expr.aggs[a];
+        input->values[a]=(struct qs_cell){.value=1};
+        if(agg->kind!=Q_COUNT_STAR && evaluate(s,&input->evaluation,agg->expr,&input->values[a])) return -5;
+    }
+    input->ready=1;
+    for(;input->aggregate<n->expr.naggs;++input->aggregate) {
+        unsigned i=input->aggregate; const struct qs_agg *agg=&n->expr.aggs[i];
+        struct accumulator *a=&o->accum[i]; struct qs_cell v=input->values[i];
+        if(v.isnull) continue;
+        if((n->distinct_aggs&(1U<<i)) && a->has_last) {
+            int equal=equal_cell(s,a->last,v,n->expr.exprs[agg->expr].type);
+            if(equal<0) return -5;
+            if(equal) continue;
+        }
+        int status=accumulate_value(s,n,agg,a,v); if(status) return status;
+        /* Publish DISTINCT's last value only after MIN/MAX comparison succeeds. */
+        if(n->distinct_aggs&(1U<<i)) { a->last=v; a->has_last=1; }
+    }
+    input->active=input->ready=0; return 0;
+}
 static int accumulate(struct execution *s,const struct qp_node *n,struct operator_state *o)
 {
+    if(s->text) return accumulate_paged(s,n,o);
     struct qs_eval e; init_eval(&e,&n->expr,o->left,NULL);
     struct qs_cell values[QS_AGGS];
     for(unsigned i=0;i<n->expr.naggs;++i) {
@@ -2422,9 +2505,9 @@ static uint64_t group_hash(const struct qp_node *n,const struct qs_cell *keys)
 static int group_equal(struct execution *s,const struct qp_node *n,const struct qs_cell *a,const struct qs_cell *b)
 {
     for(unsigned k=0;k<n->nkeys;++k) {
-        int cmp=compare_cell(s,a[k],b[k],n->expr.exprs[n->expr.keys[k]].type);
-        if(cmp==INT_MIN) return -5;
-        if(cmp) return 0;
+        int equal=equal_cell(s,a[k],b[k],n->expr.exprs[n->expr.keys[k]].type);
+        if(equal<0) return -5;
+        if(!equal) return 0;
     }
     return 1;
 }
@@ -3046,19 +3129,21 @@ static int64_t stream_group_vectors(struct execution *s,unsigned id)
             ++end;
         }
         if(end==first) return 2;
-        for(unsigned a=0;a<n->expr.naggs;++a) {
+        for(unsigned a=b->aggregate_position;a<n->expr.naggs;++a,b->aggregate_position=a) {
             const struct qs_agg *agg=&n->expr.aggs[a];
             if(agg->kind==Q_COUNT_STAR) { o->accum[a].count+=end-first; continue; }
             int index=b->group_values[a];
             if(agg->kind==Q_COUNT && b->vectors[index].all_valid) {
                 o->accum[a].count+=end-first; continue;
             }
-            for(unsigned r=first;r<end;++r) {
+            for(unsigned r=b->aggregate_row?b->aggregate_row:first;r<end;++r,b->aggregate_row=r) {
                 if(b->vectors[index].errors[r]) return -5;
                 struct qs_cell value=qs_vector_cell(&b->plan,b->vectors,index,r);
                 if(!value.isnull) { int added=accumulate_value(s,n,agg,&o->accum[a],value); if(added) return added; }
             }
+            b->aggregate_row=0;
         }
+        b->aggregate_position=0;
         b->position=end; s->metrics.matched+=end-first;
         if(end<b->count) return 2;
     }
@@ -3117,13 +3202,12 @@ static int64_t aggregate_next_impl(struct execution *s,unsigned id,struct qs_cel
             memset(o->accum,0,sizeof(o->accum));
             if(o->have_left) {
                 memcpy(o->first,o->left,sizeof(o->first));
-                struct qs_eval e; init_eval(&e,&n->expr,o->left,NULL);
-                for(unsigned k=0;k<n->expr.nkeys;++k) if(evaluate(s,&e,n->expr.keys[k],&o->keys[k])) return -5;
+                int status=initialize_group_keys(s,n,o); if(status) return status;
             }
             o->phase=1;
         }
         if(o->have_left) {
-            int same=group_same(s,n,o); if(same<0) return -5;
+            int same=o->aggregate_input && o->aggregate_input->active==3?1:group_same(s,n,o); if(same<0) return -5;
             if(same) {
                 int status=accumulate(s,n,o); if(status) return status;
                 o->have_left=0; continue;
@@ -3541,7 +3625,7 @@ static int64_t next_row_impl(struct execution *s,unsigned id,struct qs_cell *row
 static int aggregate_combine(struct execution *s,unsigned id,const struct operator_state *from)
 {
     const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *to=&s->nodes[id];
-    for(unsigned i=0;i<n->expr.naggs;++i) {
+    for(unsigned i=to->aggregate_position;i<n->expr.naggs;++i,to->aggregate_position=i) {
         const struct accumulator *a=&from->accum[i]; struct accumulator *b=&to->accum[i];
         if(!a->count) continue;
         unsigned kind=n->expr.aggs[i].kind;
@@ -3554,7 +3638,7 @@ static int aggregate_combine(struct execution *s,unsigned id,const struct operat
         int status=group_add(&partial,a->sum,a->count,kind); if(status) return status;
         b->sum=partial.sum; b->count=partial.count;
     }
-    return 0;
+    to->aggregate_position=0; return 0;
 }
 /* A scan/projection-only input can feed the local aggregate directly from
  * expression vectors. Row batches remain the adapter for joins and other
@@ -3563,17 +3647,19 @@ static int aggregate_sink_vectors(struct execution *s,unsigned id)
 {
     struct projection_batch *b=s->nodes[id].projection;
     const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
-    for(unsigned a=0;a<n->expr.naggs;++a) {
+    for(unsigned a=b->aggregate_position;a<n->expr.naggs;++a,b->aggregate_position=a) {
         const struct qs_agg *agg=&n->expr.aggs[a]; int index=b->plan.outputs[a].index;
-        if(agg->kind==Q_COUNT_STAR) { o->accum[a].count+=b->count; continue; }
+        if(agg->kind==Q_COUNT_STAR) { o->accum[a].count+=b->count; b->aggregate_row=0; continue; }
         const struct qs_vector *v=&b->vectors[index];
-        for(unsigned r=0;r<b->count;++r) {
+        for(unsigned r=b->aggregate_row;r<b->count;++r,b->aggregate_row=r) {
             if(v->errors[r]) return -5;
             if(qs_vector_null(v,r)) continue;
             struct qs_cell value=qs_vector_cell(&b->plan,b->vectors,index,r);
             int status=accumulate_value(s,n,agg,&o->accum[a],value); if(status) return status;
         }
+        b->aggregate_row=0;
     }
+    b->aggregate_position=0;
     b->position=b->count; s->metrics.matched+=b->count; return 0;
 }
 static int aggregate_sink_batch(struct execution *s,struct qs_result *out)
@@ -3898,11 +3984,12 @@ restart:
     }
     if(s->parallel_done==qp_worker_mask(p->workers)) {
         struct qp_pipeline_profile *phase=&p->pipelines[s->group_combine?s->group_combine-1:root];
-        if(s->profiling) {
+        if(!s->parallel_combining && s->profiling) {
             phase->wall_ns+=now_ns(CLOCK_MONOTONIC)-s->pipeline_start;
             phase->coordinator_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-s->pipeline_tick; ++phase->rounds;
         }
-        for(unsigned w=0;w<p->workers;++w) {
+        s->parallel_combining=1;
+        for(unsigned w=s->parallel_combine_worker;w<p->workers;++w,s->parallel_combine_worker=w) {
             const struct qs_result *v=&s->outputs[w+1];
             if(s->workers[w]->aggregate_sink) {
                 unsigned id=s->workers[w]->aggregate_sink-1;
@@ -3923,6 +4010,7 @@ restart:
                 t->calls+=x->calls; t->wall_ns+=x->wall_ns; t->cpu_ns+=x->cpu_ns;
             }
         }
+        s->parallel_combine_worker=0; s->parallel_combining=0;
         unsigned group=s->workers[0]->group_sink;
         if(!s->group_combine && group && s->nodes[group-1].group_locals) {
             parallel_group_combine(s,group-1); return QP_WAIT;

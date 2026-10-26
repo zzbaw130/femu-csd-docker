@@ -170,6 +170,160 @@ static unsigned output(struct execution *s)
     }
     assert(waits && partial); free(out); return waits;
 }
+static void aggregate_plan(struct qp_plan *p)
+{
+    memset(&p->nodes[0],0,sizeof(p->nodes[0]));
+    struct qp_node *n=&p->nodes[0]; n->kind=QP_AGGREGATE;
+    struct qs_plan *e=&n->expr; e->nattrs=3; e->ncols=3; e->nexprs=6; e->naggs=e->nout=6;
+    e->exprs[0]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER,.column=0};
+    e->exprs[1]=(struct qs_expr){.op=Q_COLUMN,.type=Q_STRING,.column=1};
+    e->exprs[2]=(struct qs_expr){.op=Q_COLUMN,.type=Q_STRING,.column=2};
+    e->exprs[3]=(struct qs_expr){.op=QP_SUBSTRING,.type=Q_STRING,.left=1,.right=4,.otherwise=5};
+    e->exprs[4]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=2};
+    e->exprs[5]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=6};
+    e->aggs[0]=(struct qs_agg){.kind=Q_COUNT_STAR,.expr=-1};
+    e->aggs[1]=(struct qs_agg){.kind=Q_SUM,.expr=0};
+    e->aggs[2]=(struct qs_agg){.kind=Q_MIN,.expr=1};
+    e->aggs[3]=(struct qs_agg){.kind=Q_MAX,.expr=2};
+    e->aggs[4]=(struct qs_agg){.kind=Q_COUNT,.expr=1};
+    e->aggs[5]=(struct qs_agg){.kind=Q_MIN,.expr=3};
+}
+static unsigned aggregate_scalar(struct execution *s,struct qs_dictionary *d,struct qs_dictionary_access *reader)
+{
+    aggregate_plan(s->plan);
+    struct qp_node *n=&s->plan->nodes[0]; struct operator_state *o=&s->nodes[0];
+    memset(o->accum,0,sizeof(o->accum)); n->distinct_aggs=(1U<<4)|(1U<<5);
+    unsigned waits=0,min=KEYS,max=0,nonnull=0,nmax=0,distinct=0;
+    unsigned char seen[KEYS]={0}; uint64_t sum=0;
+    for(unsigned row=0;row<512;++row) {
+        unsigned left=(row/2*193)%KEYS,right=(row*97+2000)%KEYS;
+        int ln=row%13==0,rn=row%11==0;
+        o->left[0]=(struct qs_cell){.value=row%17};
+        o->left[1]=(struct qs_cell){.value=ids[left][0],.isnull=ln};
+        o->left[2]=(struct qs_cell){.value=ids[right][1],.isnull=rn};
+        for(unsigned tries=0;;++tries) {
+            assert(tries<10000); int status=accumulate(s,n,o); if(!status) break;
+            assert(status<0 && s->expression_wait && o->aggregate_input->active);
+            /* A missing argument must not partially update this row. */
+            if(!o->aggregate_input->ready) assert(o->accum[0].count==row && o->accum[1].sum.value==sum);
+            waits+=resume(s);
+        }
+        sum+=row%17;
+        if(!ln) { ++nonnull; if(left<min) min=left; if(!seen[left]) { seen[left]=1; ++distinct; } }
+        if(!rn) { ++nmax; if(right>max) max=right; }
+        assert(o->accum[0].count==row+1 && o->accum[1].sum.value==sum);
+        assert(o->accum[2].count==nonnull && o->accum[3].count==nmax);
+        assert(o->accum[4].count==distinct && o->accum[5].count==distinct);
+    }
+    assert(o->accum[2].extreme.value==ids[min][0] && o->accum[3].extreme.value==ids[max][1]);
+    char bytes[LENGTH]; make_text(bytes,min,0); check_string(d,reader,o->accum[5].extreme.value,bytes+2,6);
+    assert(waits && !o->aggregate_input->active);
+    return waits;
+}
+static unsigned scalar_group_keys(struct execution *s,struct qs_dictionary *d,struct qs_dictionary_access *reader)
+{
+    aggregate_plan(s->plan);
+    struct qp_node *n=&s->plan->nodes[0]; struct operator_state *o=&s->nodes[0];
+    n->nkeys=n->expr.nkeys=3; n->expr.nexprs=8; n->expr.nstrings=1;
+    n->expr.keys[0]=3; n->expr.keys[1]=6; n->expr.keys[2]=7;
+    n->expr.exprs[6]=(struct qs_expr){.op=QP_SUBSTRING,.type=Q_STRING,.left=2,.right=4,.otherwise=5};
+    n->expr.exprs[7]=(struct qs_expr){.op=Q_CONST,.type=Q_STRING,.constant=0};
+    n->expr.strings[0].length=5; memcpy(n->expr.strings[0].bytes,"group",5);
+    o->left[1]=(struct qs_cell){.value=ids[0][0]};
+    o->left[2]=(struct qs_cell){.value=ids[KEYS-1][1]};
+    unsigned waits=0;
+    while(initialize_group_keys(s,n,o)) { assert(s->expression_wait); waits+=resume(s); }
+    /* Evict the input strings before equality re-evaluates the key expressions. */
+    for(unsigned i=512;i<KEYS-512;i+=512) {
+        char key[LENGTH]; make_text(key,i,0); check_string(d,reader,ids[i][0],key,LENGTH);
+    }
+    int status;
+    while((status=group_same(s,n,o))<0) { assert(s->expression_wait); waits+=resume(s); }
+    assert(status==1 && !o->aggregate_input->active);
+    o->left[2].value=ids[4000][1];
+    while((status=group_same(s,n,o))<0) { assert(s->expression_wait); waits+=resume(s); }
+    assert(!status && !o->aggregate_input->active && waits);
+    return waits;
+}
+static unsigned aggregate_vectors(struct execution *s,struct projection_batch *b,int grouped)
+{
+    aggregate_plan(s->plan);
+    struct qp_node *n=&s->plan->nodes[0]; struct operator_state *o=&s->nodes[0];
+    n->expr.naggs=n->expr.nout=5; memset(o->accum,0,sizeof(o->accum));
+    b->plan=n->expr; b->aggregate_position=b->aggregate_row=0;
+    s->nodes[0].projection=b;
+    b->plan.outputs[0].index=-1;
+    for(unsigned a=1;a<5;++a) b->plan.outputs[a].index=n->expr.aggs[a].expr;
+    for(unsigned a=0;a<5;++a) b->group_values[a]=n->expr.aggs[a].expr;
+    if(grouped) {
+        n->nkeys=n->expr.nkeys=1; n->expr.keys[0]=3; n->expr.exprs[3].type=Q_STRING;
+        b->group_keys[0]=3; b->plan.nout=3;
+        for(unsigned i=0;i<3;++i) b->plan.outputs[i].index=i;
+    }
+    unsigned waits=0,min=KEYS,max=0,nonleft=0,nonright=0,total=0; uint64_t sum=0;
+    for(unsigned batch=0;batch<(grouped?1U:3U);++batch) {
+        b->position=0; b->count=grouped?129:128;
+        for(unsigned col=0;col<4;++col) { memset(&b->vectors[col],0,sizeof(b->vectors[col])); b->vectors[col].kind=QS_NARROW; }
+        for(unsigned row=0;row<b->count;++row) {
+            unsigned at=batch*128+row,left=at*173%KEYS,right=(at*101+3000)%KEYS;
+            b->vectors[0].narrow[row]=at%19;
+            b->vectors[1].narrow[row]=ids[left][0]; b->vectors[1].nulls[row]=at%13==0;
+            b->vectors[2].narrow[row]=ids[right][1]; b->vectors[2].nulls[row]=at%11==0;
+            b->vectors[3].narrow[row]=ids[row<128?10:11][0];
+            if(row==128) continue; /* Next group's first row stays unconsumed. */
+            ++total; sum+=at%19;
+            if(at%13) { ++nonleft; if(left<min) min=left; }
+            if(at%11) { ++nonright; if(right>max) max=right; }
+        }
+        for(unsigned tries=0;;++tries) {
+            assert(tries<10000);
+            int status=grouped?stream_group_vectors(s,0):aggregate_sink_vectors(s,0);
+            if(status==(grouped?2:0)) break;
+            assert(status<0 && s->expression_wait); waits+=resume(s);
+        }
+        assert(b->position==128 && !b->aggregate_position && !b->aggregate_row);
+        assert(o->accum[0].count==total && o->accum[1].sum.value==sum);
+        assert(o->accum[2].count==nonleft && o->accum[3].count==nonright && o->accum[4].count==nonleft);
+        assert(o->accum[2].extreme.value==ids[min][0] && o->accum[3].extreme.value==ids[max][1]);
+    }
+    assert(waits); o->projection=NULL; o->phase=0; return waits;
+}
+static unsigned combine_values(struct execution *s)
+{
+    aggregate_plan(s->plan); s->plan->nodes[0].expr.naggs=5;
+    struct operator_state *to=&s->nodes[0]; memset(to->accum,0,sizeof(to->accum));
+    unsigned waits=0,min=KEYS,max=0;
+    for(unsigned worker=0;worker<8;++worker) {
+        /* Test fixtures model another CU's immutable partial aggregate. */
+        struct operator_state *from=calloc(1,sizeof(*from)); assert(from);
+        unsigned a=(worker*701+1000)%KEYS,b=(worker*997+500)%KEYS;
+        if(a<min) min=a;
+        if(b>max) max=b;
+        from->accum[0].count=2; from->accum[1].count=2; from->accum[1].sum.value=worker+1;
+        from->accum[2]=(struct accumulator){.count=2,.extreme={.value=ids[a][0]}};
+        from->accum[3]=(struct accumulator){.count=2,.extreme={.value=ids[b][1]}};
+        from->accum[4].count=2;
+        for(unsigned tries=0;;++tries) {
+            assert(tries<10000); int status=aggregate_combine(s,0,from); if(!status) break;
+            assert(status<0 && s->expression_wait); waits+=resume(s);
+        }
+        assert(!to->aggregate_position && to->accum[0].count==2*(worker+1) &&
+            to->accum[1].sum.value==(worker+1)*(worker+2)/2);
+        free(from);
+    }
+    assert(to->accum[2].extreme.value==ids[min][0] && to->accum[3].extreme.value==ids[max][1]);
+    assert(waits); return waits;
+}
+static void equality_no_io(struct execution *s)
+{
+    struct qp_node *n=&s->plan->nodes[0]; n->nkeys=2;
+    n->expr.keys[0]=1; n->expr.keys[1]=0;
+    struct qs_cell a[2]={{.value=ids[0][0]},{.value=10,.scale=1}},b[2]={a[0],{.value=1}};
+    unsigned before=loads; assert(group_equal(s,n,a,b)==1);
+    b[0].value=ids[KEYS-1][0]; assert(!group_equal(s,n,a,b));
+    a[0].isnull=b[0].isnull=1; assert(group_equal(s,n,a,b)==1);
+    assert(loads==before && !s->text_wait);
+}
 /* Abort after I/O completion but before its token is acknowledged. A query
  * scope also owns this token, so it must reclaim it without needing a retry. */
 static void cancel_operation(uint64_t operation,int exporting)
@@ -188,9 +342,17 @@ static void cancel_operation(uint64_t operation,int exporting)
     struct qs_result *out=calloc(1,sizeof(*out)); assert(out);
     struct qs_plan root={.nout=1,.nexprs=1}; root.exprs[0].type=Q_STRING;
     out->data[0].cells[0]=input[0];
+    if(exporting==2) {
+        aggregate_plan(s->plan); s->plan->nodes[0].expr.naggs=5;
+        s->nodes[0].left[0]=(struct qs_cell){.value=7};
+        s->nodes[0].left[1]=(struct qs_cell){.value=1};
+        s->nodes[0].left[2]=(struct qs_cell){.value=4096};
+        s->nodes[0].accum[2]=(struct accumulator){.count=1,.extreme={.value=4096}};
+    }
     int cancelled=0;
     for(unsigned attempts=0;attempts<10000 && !cancelled;++attempts) {
-        int status=exporting?export_row(s,&root,out->data[0].cells,out):
+        int status=exporting==2?accumulate(s,&s->plan->nodes[0],&s->nodes[0]):
+            exporting?export_row(s,&root,out->data[0].cells,out):
             project(s,&s->plan->nodes[0],input,NULL,result);
         assert(status<0);
         if(!operation) { assert(!s->expression_wait); cancelled=1; break; }
@@ -210,8 +372,10 @@ static void cancel_operation(uint64_t operation,int exporting)
     free(tokens); tokens=NULL; ntokens=live=stores=loads=0;
     cs_work_stats total; assert(!cs_work_get_stats(&total) && !total.used_bytes && !total.active_contexts);
 }
-int main(void)
+int main(int argc,char **argv)
 {
+    assert(argc==1 || (argc==2 && !strcmp(argv[1],"--aggregate")));
+    int aggregates=argc==2;
     assert(!cs_work_init(BUDGET));
     cs_work_context *ctx=cs_work_begin_limit(BUDGET); assert(ctx);
     struct qs_dictionary *d=qs_dictionary_create(ctx); assert(d);
@@ -220,10 +384,20 @@ int main(void)
     s->context=ctx; s->io=io; s->text=qs_dictionary_text_create(d); assert(s->text);
     s->plan=calloc(1,sizeof(*s->plan)); assert(s->plan); plan(s->plan);
     s->nodes=cs_work_calloc(ctx,1,sizeof(*s->nodes)); assert(s->nodes);
+    struct projection_batch *b=NULL;
+    if(aggregates) {
+        b=cs_work_calloc(ctx,1,sizeof(*b)); assert(b);
+        b->vectors=cs_work_calloc(ctx,4,sizeof(*b->vectors)); assert(b->vectors);
+    }
     for(unsigned row=0;row<KEYS;++row) for(unsigned col=0;col<2;++col) {
         char bytes[LENGTH]; make_text(bytes,row,col); ids[row][col]=insert(d,access,bytes,LENGTH);
     }
-    unsigned scalar_waits=projection(s,d,access),output_waits=output(s);
+    unsigned scalar_waits,output_waits;
+    if(aggregates) {
+        scalar_waits=aggregate_scalar(s,d,access)+scalar_group_keys(s,d,access);
+        output_waits=aggregate_vectors(s,b,0)+aggregate_vectors(s,b,1)+combine_values(s);
+        equality_no_io(s);
+    } else { scalar_waits=projection(s,d,access); output_waits=output(s); }
     struct qs_dictionary_stats ds; qs_dictionary_get_stats(d,&ds);
     cs_work_context_stats stats; assert(!cs_work_get_context_stats(ctx,&stats));
     assert(stats.peak_used_bytes<=BUDGET && ds.stores && ds.loads);
@@ -238,9 +412,14 @@ int main(void)
     }
     assert(!live); free(tokens); tokens=NULL; ntokens=stores=loads=0; assert(!cs_work_end(ctx));
     cs_work_stats total; assert(!cs_work_get_stats(&total) && !total.used_bytes && !total.active_contexts);
+    if(aggregates) {
+        cancel_operation(CS_NEED_STORE,2); cancel_operation(CS_NEED_LOAD,2);
+    } else {
     cancel_operation(CS_NEED_STORE,0); cancel_operation(CS_NEED_LOAD,0);
     cancel_operation(CS_NEED_STORE,1); cancel_operation(CS_NEED_LOAD,1);
     cancel_operation(0,1);
-    puts("PASS scalar text memo, retained input, short circuit, partial export and cancellation/error cleanup");
+    }
+    puts(aggregates?"PASS dictionary ID grouping and resumable scalar/vector/stream MIN/MAX and partial combine":
+        "PASS scalar text memo, retained input, short circuit, partial export and cancellation/error cleanup");
     return 0;
 }
