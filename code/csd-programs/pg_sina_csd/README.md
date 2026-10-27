@@ -26,6 +26,10 @@
 
 查询先绑定扫描、Sort 和 Index 实例，再执行算子链。原始 Heap 文本可以直接参与列批次过滤，只将存活输出放入字典；表达式保留 ID 与切片偏移，实际比较才读取字节。每 CU 另保留有限数量的短值副本及其 ID，减少重复分类值对共享字典的访问，该存储也计入 workmem。相等分组和 Hash 等值键直接比较唯一 ID；有序比较及 MIN/MAX 读取真实文本。
 
+含文本的扫描也复用原有批量Filter：条件直接比较保留的Heap字节，筛选后只对存活输出做可恢复的字典编码。Filter使用的小型只读常量字典只保存当前条件中的字面量，计入该CU的查询workmem；其中的ID不传给下游，数据行仍使用全局字典ID。数值列与延迟文本扫描不访问字典，直接走原解码路径；只有扫描时必须编码字符串，才使用可恢复游标。Filter临时内存不足时，重新解码仍走分页接口，避免将spill I/O AFDM误作平铺字典。
+
+Hash Join已经选中匹配对后，如果懒物化字符串等待字典资源，向量投影保留当前匹配对及列位置，标量投影保留待输出标志；恢复并消费插入完成值后才推进到下一对。不能把这种等待存成永久投影错误，也不能在恢复前拉取新输入。
+
 非TopN Sort不再仅保存字符串ID。Sink将当前批次的全部文本列复制到run自有的变长正文区；行单元在内部保留原ID、正文区引用和偏移。run排序完成后，正文也按排序后的行列顺序重排，内存不足时与行数据分别按64KiB块写入临时空间。比较读取run正文，Source顺序加载各run的正文窗口，不再为每个输出字符串随机换入全局字典页。临时引用只在当前设备查询内有效；Source交给其他算子的单元仍是原ID，没有修改SNIA、NVMe或算子参数布局。
 
 Source将本批次正文放入已有结果缓冲的字符串区，同时保存ID到正文偏移的查询内索引；后续表达式可以直接读取这些正文。最终结果在下一次Source覆盖缓冲前复制所需字符串，不再回查字典。正文、token数组、比较暂存和页缓存全部计入workmem；正常结束逐一释放token，取消沿用查询关闭和设备会话回收。归并时先释放可回收的常驻run及字典缓存，保留顺序读取窗口，避免缓存互相淘汰。全局字典仍用于扫描intern、分组及连接的统一ID；本改动没有宣称消除所有算子的字典访问，TopN也保留原路径。
@@ -118,7 +122,7 @@ Sort Source 的结果以至多 256 行为一批交给投影及普通无分组聚
 ```sh
 cmake -S code/csd-programs -B code/csd-programs/build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build code/csd-programs/build -j4
-ctest --test-dir code/csd-programs/build -R '^pgSina(Dictionary64MiB|SortPayload64MiB)$' --output-on-failure
+ctest --test-dir code/csd-programs/build -R '^pgSina(Dictionary64MiB|SortPayload64MiB|FilterPaging64MiB|JoinPayload64MiB)$' --output-on-failure
 ```
 
 设备测试使用真实布局的模拟 PG 页与独立行循环校验 Join、NULL、重复键、外连接、精度、乱序多 run 归并、小内存 spill 和回收。它不模拟 NVMe 时间。实际 Guest 冷启动比较和使用限制见 [PG 扩展说明](../../apps/pg_sina_csd/README.md)。

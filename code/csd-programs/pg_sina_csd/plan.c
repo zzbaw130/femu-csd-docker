@@ -161,6 +161,7 @@ struct projection_batch {
     unsigned error_node;
     int joined,sorted,group_source,keep_window,lazy_text,filtered_scan;
     int retry,materializing;
+    unsigned joined_row,joined_column;
     unsigned materialized_column;
     struct qs_vector_input retry_input;
     struct qs_chunk *retry_chunk;
@@ -204,6 +205,7 @@ struct operator_state {
     struct qs_scan_cursor *scan_cursor;
     int defer_strings;
     struct qs_plan *scan_filter;
+    struct qs_dict *filter_dictionary; /* Immutable literals for raw-Heap filtering. */
     int scan_filter_checked,projection_checked;
     struct projection_batch *projection;
     struct projection_batch *source_projection;
@@ -231,7 +233,7 @@ struct operator_state {
     unsigned char *hash_data;
     atomic_uint hash_rows;
     unsigned hash_capacity,hash_match,hash_phase,hash_buckets;
-    int hash_matched,hash_fallback,hash_shared,hash_null_right;
+    int hash_matched,hash_fallback,hash_shared,hash_null_right,hash_output_pending;
     unsigned hash_payload; /* Columns still borrowed from the probe vector. */
     struct hash_probe_batch *hash_probe;
     struct hash_qual_batch *hash_qual;
@@ -1147,13 +1149,15 @@ static int64_t hash_next(struct execution *s,unsigned id,struct qs_cell *row)
     const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
     unsigned ln=s->plan->nodes[n->left].expr.nout,rn=s->plan->nodes[n->right].expr.nout;
     for(;;) {
-        int64_t status=hash_match_next(s,id,0);
+        int64_t status=o->hash_output_pending?2:hash_match_next(s,id,0);
         if(status==3) return join_next(s,id,row);
         if(status!=2) return status;
+        o->hash_output_pending=1;
         int payload=hash_left_payload(s,id); if(payload) return payload;
         struct qs_cell values[QS_COLS]; memcpy(values,o->left,ln*sizeof(*values));
         for(unsigned col=0;col<rn;++col) values[ln+col]=o->hash_null_right?(struct qs_cell){.isnull=1}:o->right[col];
-        int count=project(s,n,values,NULL,row); if(count<0) return count; if(count) return 2;
+        int count=project(s,n,values,NULL,row); if(count<0) return count;
+        o->hash_output_pending=0; if(count) return 2;
     }
 }
 static int64_t spool_append_bytes(struct execution *s,struct spool *p,const void *row,unsigned row_bytes)
@@ -1564,21 +1568,6 @@ static int scan_filter_init(struct execution *s,const struct qs_plan *p,struct o
 {
     if(!o->scan_filter_checked) {
         o->scan_filter_checked=1; uint8_t needed[QS_EXPRS]={0};
-        if(s->paged) {
-            int text=0;
-            for(unsigned i=0;i<p->nattrs;++i) text|=p->cols[i].type==Q_STRING;
-            for(unsigned i=0;i<p->nexprs;++i) text|=p->exprs[i].type==Q_STRING;
-            if(text) {
-                if(p->predicate<0 && o->defer_strings) {
-                    struct qs_plan *filter=cs_work_alloc(s->context,sizeof(*filter)); if(!filter) return -4;
-                    *filter=*p;
-                    for(unsigned i=0;i<p->nattrs;++i) if(filter->cols[i].type==Q_STRING && filter->cols[i].slot>=0)
-                        filter->cols[i].deferred=QS_DEFERRED;
-                    o->scan_filter=filter;
-                }
-                return 0;
-            }
-        }
         if(p->predicate<0 && !o->defer_strings) return 0;
         struct qs_plan *filter=cs_work_alloc(s->context,sizeof(*p)); if(!filter) return 0;
         *filter=*p; filter->work_mem_parent=(uintptr_t)s->context;
@@ -1618,14 +1607,32 @@ static int scan_filter_init(struct execution *s,const struct qs_plan *p,struct o
             for(unsigned i=0;i<filter->nexprs;++i) if(projected[i] && filter->exprs[i].op==Q_COLUMN && filter->exprs[i].column==(int)col)
                 c->deferred=QS_DEFERRED;
         }
+        /* Reuse the baseline Filter path on borrowed Heap strings. Only its
+         * immutable literals need a resident dictionary; survivors are still
+         * interned by the resumable projection, not by the flat Filter CSF. */
+        if(s->paged) for(unsigned col=0;col<filter->nattrs;++col)
+            if(filter->cols[col].type==Q_STRING && filter->cols[col].slot>=0)
+                filter->cols[col].deferred=QS_FILTER_ONLY;
         for(unsigned i=0;i<filter->nexprs;++i) if(needed[i] && filter->exprs[i].op==Q_CONST && filter->exprs[i].type==Q_STRING && !filter->exprs[i].isnull) {
             const struct qs_string *literal=&filter->strings[filter->exprs[i].constant];
-            int id=qs_dict_insert(s->dictionary,literal->bytes,literal->length);
+            struct qs_dict *dictionary=s->dictionary;
+            if(s->paged) {
+                if(!o->filter_dictionary) {
+                    unsigned bytes=0;
+                    for(unsigned j=0;j<filter->nstrings;++j) bytes+=filter->strings[j].length;
+                    o->filter_dictionary=cs_work_calloc(s->context,1,qs_dict_bytes(512,bytes));
+                    if(!o->filter_dictionary) goto scalar;
+                    *o->filter_dictionary=(struct qs_dict){.entries=512,.capacity=512,.data=bytes};
+                }
+                dictionary=o->filter_dictionary;
+            }
+            int id=qs_dict_insert(dictionary,literal->bytes,literal->length);
             if(id<0) { cs_work_free(s->context,filter); return -3; }
             filter->exprs[i].constant=id;
         }
         o->scan_filter=filter; return 0;
 scalar:
+        cs_work_free(s->context,o->filter_dictionary); o->filter_dictionary=NULL;
         cs_work_free(s->context,filter);
     }
     return 0;
@@ -1701,7 +1708,12 @@ static int64_t scan_chunk_next(struct execution *s,unsigned id)
             long long len[]={bytes,sizeof(*p),qs_chunk_bytes(chunk->capacity,chunk->ncols),sizeof(task),0};
             struct femu_csd_args a={.numr=5,.mr_addr=mr,.mr_len=len};
             o->scan_raw=o->scan_input; o->scan_raw_bytes=bytes;
-            if(s->paged) {
+            const struct qs_plan *decoder=mr[1]; int eager_text=0;
+            for(unsigned col=0;col<decoder->nattrs;++col)
+                eager_text|=decoder->cols[col].slot>=0 && decoder->cols[col].type==Q_STRING && !decoder->cols[col].deferred;
+            /* Numeric and borrowed-text scans cannot fault on a dictionary.
+             * Keep the baseline decoder instead of saving a paging cursor. */
+            if(s->paged && eager_text) {
                 if(!o->scan_cursor) o->scan_cursor=qs_scan_cursor_create(s->context,s->paged);
                 if(!o->scan_cursor) return -4;
                 mr[4]=s->io; len[4]=s->io_bytes;
@@ -1713,7 +1725,7 @@ static int64_t scan_chunk_next(struct execution *s,unsigned id)
             if(status) return status;
             s->metrics.scanned+=chunk->rows; s->metrics.input_bytes+=task.input_bytes; ++s->metrics.chunks;
             if(o->scan_filter && o->scan_filter->predicate>=0) {
-                void *fm[]={chunk,o->scan_filter,mr[0],s->dictionary,s->params};
+                void *fm[]={chunk,o->scan_filter,mr[0],o->filter_dictionary?o->filter_dictionary:s->dictionary,s->params};
                 long long fl[]={len[2],sizeof(*p),task.input_bytes,0,sizeof(s->params)};
                 struct femu_csd_args filter={.numr=5,.mr_addr=fm,.mr_len=fl};
                 status=timed_call(s,pg_sina_filter_impl,&filter,QS_FILTER);
@@ -1721,7 +1733,13 @@ static int64_t scan_chunk_next(struct execution *s,unsigned id)
                     /* Keep the query budget: if vector scratch does not fit,
                      * decode this retained input eagerly and use scalar SQL. */
                     cs_work_free(s->context,o->scan_filter); o->scan_filter=NULL; mr[1]=(void *)p;
-                    status=timed_call(s,pg_sina_scan_impl,&a,QS_SCAN);
+                    if(s->paged) {
+                        if(!o->scan_cursor) o->scan_cursor=qs_scan_cursor_create(s->context,s->paged);
+                        if(!o->scan_cursor) return -4;
+                        mr[4]=s->io; len[4]=s->io_bytes;
+                        status=qs_scan_columns(o->scan_cursor,&a,0);
+                        s->dictionary_wait=status>0?status:0;
+                    } else status=timed_call(s,pg_sina_scan_impl,&a,QS_SCAN);
                 }
                 if(status) return status;
             }
@@ -2212,7 +2230,7 @@ static int64_t projection_join_fill(struct execution *s,struct projection_batch 
         int previous=s->control->error; unsigned previous_node=s->control->error_node;
         int merge=!n->hash || o->hash_fallback==1;
         struct qs_cell values[QS_COLS];
-        int64_t status=merge?merge_match_next(s,b->scan,values):hash_match_next(s,b->scan,b->keep_window && b->input_count);
+        int64_t status=b->joined_row?2:merge?merge_match_next(s,b->scan,values):hash_match_next(s,b->scan,b->keep_window && b->input_count);
         /* Hash construction can choose the existing Merge fallback before
          * producing rows. Keep this DAG and begin collecting Merge pairs. */
         if(status==3 && !merge && o->hash_fallback==1) continue;
@@ -2232,12 +2250,16 @@ static int64_t projection_join_fill(struct execution *s,struct projection_batch 
             break;
         }
         if(merge) { projection_append(b,values); continue; }
-        for(unsigned col=0;col<b->plan.nattrs;++col) {
+        /* A matching pair is already selected. Dictionary waits while
+         * materializing its lazy payload must not advance the join again. */
+        b->joined_row=1;
+        for(unsigned col=b->joined_column;col<b->plan.nattrs;++col) {
             int slot=b->plan.cols[col].slot; if(slot<0) continue;
             struct qs_cell value;
             if(col<ln) {
                 int payload=hash_left_cell(s,b->scan,col,&value);
                 if(payload) {
+                    if(s->expression_wait) { b->joined_column=col; return payload; }
                     b->error=payload; b->error_node=b->scan;
                     if(!b->input_count) return payload;
                     goto evaluate_batch;
@@ -2245,6 +2267,7 @@ static int64_t projection_join_fill(struct execution *s,struct projection_batch 
             } else value=o->hash_null_right?(struct qs_cell){.isnull=1}:o->right[col-ln];
             b->cells[(size_t)slot*QS_VECTOR_ROWS+b->input_count]=value;
         }
+        b->joined_row=b->joined_column=0;
         ++b->input_count;
     }
 evaluate_batch:

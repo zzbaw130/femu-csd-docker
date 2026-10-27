@@ -920,8 +920,90 @@ static void cancel_operation(uint64_t operation,int exporting)
     free(tokens); tokens=NULL; ntokens=live=stores=loads=0;
     cs_work_stats total; assert(!cs_work_get_stats(&total) && !total.used_bytes && !total.active_contexts);
 }
+/* Reproduce lazy Join payload insertion yielding to another CU. The match
+ * is already consumed when materialization waits; neither adapter may select
+ * another pair before consuming the insertion completion. */
+static void join_payload_resume(void)
+{
+    const size_t budget=64U*1024*1024;
+    assert(!cs_work_init(budget));
+    for(unsigned scalar=0;scalar<2;++scalar) {
+        cs_work_context *ctx=cs_work_begin_limit(budget); assert(ctx);
+        struct qs_dictionary *d=qs_dictionary_create(ctx); assert(d);
+        struct qs_dictionary_access *peer=qs_dictionary_access_create(d); assert(peer);
+        struct execution *s=cs_work_calloc(ctx,1,sizeof(*s)); assert(s);
+        struct qp_control control={0}; s->control=&control;
+        s->context=ctx; s->paged=d; s->io=io; s->text=qs_dictionary_text_create(d); assert(s->text);
+        s->plan=calloc(1,sizeof(*s->plan)); assert(s->plan); s->plan->count=3;
+        s->nodes=cs_work_calloc(ctx,3,sizeof(*s->nodes)); assert(s->nodes);
+        struct qp_node *n=&s->plan->nodes[0];
+        *n=(struct qp_node){.kind=QP_JOIN,.hash=1,.left=1,.right=2,.nkeys=1,.join_qual=-1};
+        n->expr=(struct qs_plan){.predicate=-1,.nattrs=3,.ncols=3,.nexprs=3,.nout=3};
+        for(unsigned col=0;col<3;++col) {
+            n->expr.cols[col]=(struct qs_column){.slot=col,.type=col==1?Q_STRING:Q_INTEGER};
+            n->expr.exprs[col]=(struct qs_expr){.op=Q_COLUMN,.column=col,.type=col==1?Q_STRING:Q_INTEGER};
+            n->expr.outputs[col]=(struct qs_output){.index=col,.type_oid=col==1?25:23};
+        }
+        s->plan->nodes[1].expr.nout=2;
+        s->plan->nodes[2].expr.nout=1; s->plan->nodes[2].expr.outputs[0].type_oid=23;
+        struct projection_batch *left=cs_work_calloc(ctx,1,sizeof(*left)); assert(left);
+        left->plan=n->expr; left->plan.nout=2; left->count=left->position=1;
+        left->vectors=cs_work_calloc(ctx,3,sizeof(*left->vectors)); assert(left->vectors);
+        const char payload[]="retained lazy join payload";
+        left->vectors[1].kind=QS_TEXT;
+        left->vectors[1].strings[0]=(struct qs_text_view){.data=payload,.length=sizeof(payload)-1};
+        s->nodes[1].projection=left;
+        struct operator_state *o=&s->nodes[0];
+        o->hash_phase=o->have_left=o->hash_match=1; o->left[0].value=42; o->hash_payload=1U<<1;
+        o->hash_capacity=128; o->hash_buckets=256;
+        o->hash_data=cs_work_calloc(ctx,128,5+12); assert(o->hash_data);
+        struct qs_cell right={.value=42}; hash_store(o->hash_data,&right,&s->plan->nodes[2].expr);
+        uint32_t *next=(void *)(o->hash_data+128*5); next[0]=UINT_MAX;
+        struct projection_batch *b=cs_work_calloc(ctx,1,sizeof(*b)); assert(b);
+        b->plan=n->expr; b->cells=cs_work_calloc(ctx,3*QS_VECTOR_ROWS,sizeof(*b->cells));
+        b->vectors=cs_work_calloc(ctx,3,sizeof(*b->vectors)); assert(b->cells && b->vectors);
+        for(unsigned col=0;col<3;++col) assert(!qs_vector_require(&b->plan,col,b->needed));
+        assert(insert(d,peer,"seed",4));
+        int64_t request=qs_dictionary_evict(d,peer,io,0); assert(request>QS_DICTIONARY_BUSY);
+        unsigned char peer_io[QS_SORT_IO_BYTES]; memcpy(peer_io,io,sizeof(peer_io));
+        struct qs_cell row[QS_OUT];
+        int64_t status=scalar?hash_next(s,0,row):projection_join_fill(s,b);
+        assert(status<0 && s->expression_wait && s->text_wait==QS_DICTIONARY_BUSY);
+        assert(!b->error && !o->hash_match);
+        if(scalar) assert(o->hash_output_pending);
+        else assert(b->joined_row && b->joined_column==1 && !b->input_count);
+        do {
+            uint64_t completion=complete_io(request,peer_io);
+            request=qs_dictionary_evict(d,peer,peer_io,completion);
+        } while(request>QS_DICTIONARY_BUSY);
+        assert(!request);
+        request=qs_dictionary_text_resume(s->text,io,0);
+        while(request) {
+            assert(request>QS_DICTIONARY_BUSY);
+            request=qs_dictionary_text_resume(s->text,io,complete(request));
+        }
+        s->text_wait=0; s->expression_wait=0;
+        o->finished=1; /* No more matches, but the retained one must survive. */
+        status=scalar?hash_next(s,0,row):projection_join_fill(s,b); assert(status==2);
+        if(!scalar) {
+            assert(b->count==1 && !b->joined_row && !b->joined_column);
+            for(unsigned col=0;col<3;++col) row[col]=qs_vector_cell(&b->plan,b->vectors,col,0);
+        } else assert(!o->hash_output_pending);
+        assert(row[0].value==42 && row[2].value==42 && !row[1].isnull);
+        check_string(d,peer,(uint32_t)row[1].value,payload,sizeof(payload)-1);
+        assert(stores && loads);
+        assert(!qs_dictionary_text_release(s->text));
+        request=qs_dictionary_close(d,peer,io,0);
+        while(request) { assert(request>QS_DICTIONARY_BUSY); request=qs_dictionary_close(d,peer,io,complete(request)); }
+        free(s->plan); assert(!cs_work_end(ctx) && !live);
+        free(tokens); tokens=NULL; ntokens=stores=loads=0;
+        cs_work_stats total; assert(!cs_work_get_stats(&total) && !total.used_bytes && !total.active_contexts);
+    }
+    puts("PASS 64 MiB vector/scalar Join payload resumes its selected pair after dictionary wait");
+}
 int main(int argc,char **argv)
 {
+    if(argc==2 && !strcmp(argv[1],"--join-payload-64m")) { join_payload_resume(); return 0; }
     assert(argc==1 || (argc==2 && (!strcmp(argv[1],"--aggregate") || !strcmp(argv[1],"--hash-aggregate") || !strcmp(argv[1],"--join") || !strcmp(argv[1],"--pipeline"))));
     int aggregates=argc==2 && !strcmp(argv[1],"--aggregate"),hashed=argc==2 && !strcmp(argv[1],"--hash-aggregate");
     int joining=argc==2 && !strcmp(argv[1],"--join"),pipeline=argc==2 && !strcmp(argv[1],"--pipeline");

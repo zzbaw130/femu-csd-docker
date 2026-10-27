@@ -183,11 +183,22 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
         leaf->expr.exprs[2]=(struct qs_expr){.op=Q_COLUMN,.type=Q_STRING,.column=2};
         leaf->expr.outputs[2]=(struct qs_output){.index=2,.type_oid=25};
     }
+    if(payload==2) {
+        const char pattern[]="shared-prefix-longer-than-twelve-%";
+        leaf->expr.nstrings=1; leaf->expr.strings[0].length=sizeof(pattern)-1;
+        memcpy(leaf->expr.strings[0].bytes,pattern,sizeof(pattern)-1);
+        leaf->expr.nexprs=7;
+        leaf->expr.exprs[3]=(struct qs_expr){.op=Q_CONST,.type=Q_STRING,.constant=0};
+        leaf->expr.exprs[4]=(struct qs_expr){.op=Q_LIKE,.type=Q_INTEGER,.left=0,.right=3};
+        leaf->expr.exprs[5]=(struct qs_expr){.op=Q_IS_NULL,.type=Q_INTEGER,.left=0};
+        leaf->expr.exprs[6]=(struct qs_expr){.op=Q_OR,.type=Q_INTEGER,.left=4,.right=5};
+        leaf->expr.predicate=6;
+    }
     leaf->input_offset=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
     leaf->vector_offset=leaf->input_offset+p->scan_bytes;
     struct qp_node *root=&p->nodes[0];
     *root=(struct qp_node){.kind=QP_SORT,.left=1,.right=-1,.expr=leaf->expr};
-    root->expr.cols[0].length=4; root->expr.work_mem_bytes=budget;
+    root->expr.cols[0].length=4; root->expr.work_mem_bytes=budget; root->expr.predicate=-1;
     root->expr.norder=2; root->expr.order[0]=(struct qs_order){.output=0};
     root->expr.order[1]=(struct qs_order){.output=1}; root->expr.limit=-1;
     if(!ordered) {
@@ -316,7 +327,8 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
         assert(seen==rows && spill.stores && (!ordered || loads) && peak<=budget);
         if(!ordered) assert(namespace_loads==raw_bytes/QS_PAGE);
         if(workers) assert(out->metrics.workers==workers && p->pipelines[1].worker_ns);
-        assert(out->metrics.dictionary_bytes>budget && out->metrics.dictionary_entries==rows-(rows+96)/97+(payload?40:0));
+        assert(out->metrics.dictionary_bytes>budget && out->metrics.dictionary_entries==rows-(rows+96)/97+(payload?40:0)+(payload==2));
+        if(payload==2) assert(out->profile.operators[QS_FILTER].calls);
         if(ordered && budget>=64U*1024*1024)
             assert((uint64_t)loads*QS_SORT_IO_BYTES<out->metrics.dictionary_bytes*8);
         for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i]);
@@ -2254,6 +2266,12 @@ int main(int argc,char **argv)
         assert(!cs_work_init(64U*1024*1024));
         function run=(function)dlsym(library,"pg_sina_plan"); assert(run);
         dictionary_plan(run,0,0,1,524288,64U*1024*1024,0);
+        return 0;
+    }
+    if(argc==3 && !strcmp(argv[2],"--filter-paging-64m")) {
+        assert(!cs_work_init(64U*1024*1024));
+        function run=(function)dlsym(library,"pg_sina_plan"); assert(run);
+        dictionary_plan(run,0,0,1,524288,64U*1024*1024,2);
         return 0;
     }
     if(argc==3 && !strcmp(argv[2],"--sort-payload-64m")) {
