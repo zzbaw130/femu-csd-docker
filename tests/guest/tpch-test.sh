@@ -14,12 +14,13 @@ failed=0
 for query in "$@"; do
     case "$query" in ''|*[!0-9]*) echo "Invalid query: $query" >&2; exit 2 ;; esac
     [ -f "$QUERIES/$query.sql" ] || { echo "No query: $query" >&2; exit 2; }
-    ok=1
+    ok=1; host_ok=1; csd_ok=1
     for mode in host csd; do
         if sh "$COLD" "$mode" "$QUERIES/$query.sql" > "$RESULTS/$query.$mode.log" 2> "$RESULTS/$query.$mode.err"; then
             sed -e '/^Time:/d' -e '/^Timing is /d' "$RESULTS/$query.$mode.log" > "$RESULTS/$query.$mode.rows"
         else
             ok=0; failed=1
+            if [ "$mode" = host ]; then host_ok=0; else csd_ok=0; fi
             echo "FAIL Q$query $mode"
             cat "$RESULTS/$query.$mode.err" >&2
         fi
@@ -27,6 +28,9 @@ for query in "$@"; do
     match=no; offloaded=no; performance=error
     host=$(awk '/^Time:/ {sum+=$2; n++} END {if(n) printf "%.3f",sum}' "$RESULTS/$query.host.log")
     csd=$(awk '/^Time:/ {sum+=$2; n++} END {if(n) printf "%.3f",sum}' "$RESULTS/$query.csd.log")
+    # psql also prints elapsed time for failed statements; it is not a score.
+    [ "$host_ok" -eq 1 ] || host=
+    [ "$csd_ok" -eq 1 ] || csd=
     if [ "$ok" -eq 1 ]; then
         if cmp -s "$RESULTS/$query.host.rows" "$RESULTS/$query.csd.rows"; then match=yes; else failed=1; fi
         if psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
@@ -45,6 +49,8 @@ for query in "$@"; do
     fi
     printf '%s,%s,%s,%s,%s,%s\n' "$query" "$host" "$csd" "$match" "$offloaded" "$performance" >> "$RESULTS/timings.csv"
     echo "Q$query host=$host ms csd=$csd ms match=$match offloaded=$offloaded performance=$performance"
+    # Comparison copies are reproducible from the retained host/CSD logs.
+    rm -f "$RESULTS/$query.host.rows" "$RESULTS/$query.csd.rows"
 done
 cat "$RESULTS/timings.csv"
 echo "Slower CSD samples require memory/spill/CPU analysis; correctness alone is not acceptance."
