@@ -1,4 +1,6 @@
 #include "./nvme.h"
+#include "./csd/csd.h"
+#include "./csd/csd-cache.h"
 #include "./bbssd/ftl.h"
 #include "./kvssd/kvssd.h"
 #include "./ocssd/oc-timing.h"
@@ -3115,6 +3117,8 @@ static uint16_t nvme_get_log(FemuCtrl *n, NvmeCmd *cmd)
     }
 
     switch (lid) {
+    case FEMU_CACHE_LOG:
+        return femu_csd_cache_log(n,cmd,len,off,rae);
     case NVME_LOG_SUPPORTED:
         return nvme_supported_log_pages(n, cmd, len, off);
     case NVME_LOG_ERROR_INFO:

@@ -2417,6 +2417,7 @@ typedef struct FemuCtrl {
     QEMUBH          *aer_bh;
     QEMUTimer       *aer_timer;
     uint8_t         aer_mask;
+    unsigned        cache_aer_ack;
 
 	uint64_t		dbs_addr;
 	uint64_t		eis_addr;

@@ -11,6 +11,7 @@
 #include "./ocssd/oc12.h"
 #include "./ocssd/oc20.h"
 #include "./csd/csd.h"
+#include "./csd/csd-cache.h"
 
 static const uint32_t nvme_cse_acs[256] = {
     [NVME_ADM_CMD_DELETE_SQ]        = NVME_CMD_EFF_CSUPP,
@@ -81,6 +82,8 @@ static const uint32_t nvme_mode_io_csd[256] = {
     [NVME_CMD_CSD_NVM_TO_AFDM]      = NVME_CMD_EFF_CSUPP,
     [NVME_CMD_CSD_AFDM_TO_NVM]      = NVME_CMD_EFF_CSUPP | NVME_CMD_EFF_LBCC,
     [NVME_CMD_CSD_EXEC]             = NVME_CMD_EFF_CSUPP,
+    [FEMU_CACHE_CONTROL] = NVME_CMD_EFF_CSUPP,
+    [FEMU_CACHE_READ] = NVME_CMD_EFF_CSUPP,
     [FEMU_CSD_EXEC_GRAPH]           = NVME_CMD_EFF_CSUPP | NVME_CMD_EFF_LBCC,
     [FEMU_CSD_GRAPH_SESSION]        = NVME_CMD_EFF_CSUPP,
     [NVME_CMD_CSD_READ_AFDM]        = NVME_CMD_EFF_CSUPP,
@@ -306,6 +309,7 @@ static bool nvme_has_zoned_ns(FemuCtrl *n)
  */
 uint32_t nvme_log_support(FemuCtrl *n, uint8_t csi, uint8_t lid)
 {
+    if (n->csd_ctrl_state && lid==0xc8) return 1;
     switch (lid) {
     case NVME_LOG_SUPPORTED:
     case NVME_LOG_ERROR_INFO:

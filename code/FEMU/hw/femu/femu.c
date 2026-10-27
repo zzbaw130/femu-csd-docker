@@ -2114,6 +2114,14 @@ static void *femu_ftl_thread(void *arg)
 
             n->ftl_in_sweep = false;
         }
+        if (n->csd_ctrl_state && n->dataplane_started) {
+            bool foreground=false;
+            for (int cache_poller=1;cache_poller<=n->nr_pollers;cache_poller++)
+                if (femu_ring_count(n->to_ftl[cache_poller])) { foreground=true; break; }
+            n->ftl_in_sweep=true; smp_mb();
+            if (n->dataplane_started) femu_csd_cache_poll(n, !foreground);
+            n->ftl_in_sweep=false;
+        }
     }
 
     return NULL;
@@ -3283,6 +3291,7 @@ static void femu_free_namespace_bitmaps(FemuCtrl *n)
 static void femu_aer_bh(void *opaque)
 {
     FemuCtrl *n = opaque;
+    if (qatomic_xchg(&n->cache_aer_ack,0)) n->aer_mask &= ~(1U<<NVME_AER_TYPE_VENDOR_SPECIFIC);
     uint32_t bits = qatomic_xchg(&n->health_pending, 0);
     uint32_t aec = NVME_AEC_SMART(n->features.async_config);
 

@@ -73,7 +73,8 @@ static CS_STATUS queue_graph(void *device,CS_BATCH_MODE mode,unsigned capacity,
     struct femu_graph_header *h=(void *)data;
     h->count=htole32(count); h->bytes=htole32(bytes);
     h->flags=htole32((mode==CS_BATCH_SERIAL?FEMU_CSD_GRAPH_SERIAL:0) |
-        (d->profile?FEMU_CSD_GRAPH_PROFILE:0));
+        (d->profile?FEMU_CSD_GRAPH_PROFILE:0) |
+        (getenv("SNIA_FEMU_CACHE_REFILL") && !strcmp(getenv("SNIA_FEMU_CACHE_REFILL"),"1")?FEMU_CSD_GRAPH_CACHE:0));
     struct femu_graph_node *nodes=(void *)(h+1);
     size_t offset=sizeof(*h)+count*sizeof(*nodes);
     for(unsigned i=0;i<capacity;++i) if(entries[i].request) {

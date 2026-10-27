@@ -3,6 +3,8 @@
 
 #include "../nvme.h"
 #include "csd-graph.h"
+void femu_csd_cache_poll(FemuCtrl *n, bool service_dma);
+uint16_t femu_csd_cache_log(FemuCtrl *,NvmeCmd *,uint32_t,uint64_t,bool);
 
 enum FemuCsdIoCommands {
     NVME_CMD_CSD_ALLOC_FDM      = 0xb0,
