@@ -87,31 +87,29 @@ Sort/spill归并Source仍有串行阶段；少数复杂表达式和DISTINCT形�
 
 ## 默认字典换入换出的当前验证
 
-默认 `pg_sina_plan` 已创建可换页字典，绑定扫描、向量/标量表达式、Join、聚合、Sort、索引和结果编码，原 SNIA/FEMU 请求接口不变。初始化导入、BUSY 重试与正常/取消清理均由查询执行对象保存进度。
+默认 `pg_sina_plan` 创建可换页字典，扫描、向量/标量表达式、Join、聚合、Sort、索引和结果编码共用稳定 ID。正文、ID 目录、哈希桶按64KiB页面换出和换入；页缓存、描述符和每CU状态均计入查询预算。正常结束释放字典token，取消则由设备会话回收未确认的临时存储。SNIA/FEMU接口保持不变。
 
-`pgSinaDictionaryNativePlan` 验证默认入口，使用模拟 NVM 驱动真实 NEED_* 重入：
+当前保留的修复是：每CU提前保留一份标量投影恢复状态，缺页后保存已经消费的行和表达式进度，不再临时申请该状态。新增回归夹具占满剩余预算后继续执行真实字典表达式：修改前的执行代码会失败，当前代码通过，峰值恰为1,048,576字节预算。十二项相关原生检查（含64CU）和十项ASan/UBSan/泄漏检查通过。
 
-| 路径 | 正文字节 | 查询预算 | 已核对 |
-| --- | ---: | ---: | --- |
-| 串行 Scan→Sort→输出 | 5,188,800 | 4MiB | 32,768 行、全部文本/整数/NULL、完整顺序 |
-| 4CU Scan→局部Sort→归并→输出 | 10,377,600 | 8MiB | 65,536 行、实际 worker 计时、完整顺序 |
-| STORE/LOAD 完成但未确认时取消 | 同串行夹具 | 4MiB | 设备 workmem 归零，模拟会话回收未确认 token |
+默认入口的 `pgSinaDictionaryNativePlan` 使用模拟NVM驱动真实NEED_*重入，完整核对文本、整数、NULL和顺序：
 
-正常结束要求发生 STORE 和 LOAD，峰值不超预算，所有 token、workmem 和上下文归零。字典描述符和访问状态也在预算内。消费者组件另外覆盖元数据换页、稳定 ID、UTF-8/substring、NULL/短路、Hash/Merge/Index 条件、共享及局部聚合、分轮归并和最终输出恢复。十二项相关原生检查（含64CU）和十一项 ASan/UBSan/泄漏检查通过。
+| 路径 | 正文字节 | 查询预算 | 峰值字节 | STORE / LOAD |
+| --- | ---: | ---: | ---: | ---: |
+| 串行 Scan→Sort→输出，32,768行 | 5,188,800 | 4MiB | 4,158,512 | 104 / 32,446 |
+| 4CU Scan→局部Sort→归并→输出，65,536行 | 10,377,600 | 8MiB | 8,387,312 | 199 / 17,793 |
 
-Guest 开发验证使用现有SF=1冻结的 `part` 表，读取 `p_name,p_comment,p_partkey` 并按三列排序，不改写数据。开发SQL位于临时目录，结束已清理，不替代标准TPC-H验收。完整20万行在两种预算下均与冷启动原生PG逐字节一致，原始证据见[64MiB](../../../../results/dictionary-progress.7N3YaF/timings.csv)与[8MiB](../../../../results/dictionary-progress-8m.2bTGnh/check.txt)。
+两者均要求发生换出和换入、峰值不超预算，结束后token、workmem和上下文归零；另外覆盖STORE/LOAD完成但CSF未确认时取消。消费者检查覆盖稳定ID、元数据换页、UTF-8/substring、NULL/短路、Hash/Merge/Index条件、聚合、分轮归并和最终输出恢复。
 
-| 查询预算 | host ms | CSD ms | profile峰值 | spill读/写 | 结论 |
-| --- | ---: | ---: | ---: | --- | --- |
-| 64MiB | 655.809 | 2,109.781 | 42,670,592字节 | 0 / 0 | 结果正确，性能不合格 |
-| 8MiB | 689.380 | 183,931.114 | 8,379,520字节 | 70.21GB / 7.53GB | 结果正确，仍需分析实现开销 |
+Guest开发验证使用现有SF=1冻结的 `part` 表，读取 `p_name,p_comment,p_partkey` 并按三列排序，不修改数据。开发SQL使用后清理，不替代标准TPC-H验收。当前64MiB预算下完整20万行逐字节匹配host；[普通计时](../../../../results/dictionary-projection-64m.Kv6R69/timings.csv)为host **692.342ms**、CSD **1,989.073ms**。[profile](../../../../results/dictionary-projection-64m.Kv6R69/profile.log)峰值42,732,224字节，无spill，Sort Sink/Source CPU分别427.526/385.857ms，流水线平均活跃CU仅0.99。因此结果正确，但性能仍不合格，不能归因于容量不足。
 
-现有worker CompValue的 `QP_RESOURCE_WAIT` 位区分保留输入的资源等待和普通空批次。等待者在其他batch推进后续交；所有请求都让出时轮流试交一个，共享表迁移仍等保留状态的批次到达屏障。主机提交从此前24,939/2,383,272降至[867](../../../../results/dictionary-progress.7N3YaF/profile.log)/[872](../../../../results/dictionary-progress-8m.2bTGnh/profile.log)，未新增执行锁或设备指令。它消除了大量无效重提交，却没有解决剩余换页和计算开销，不能因此宣称性能合格。
+最近一次8MiB完整20万行验证仍为上一阶段的[结果](../../../../results/dictionary-progress-8m.2bTGnh/check.txt)：正文8,571,617字节，单独就超过预算；结果匹配，峰值8,379,520字节，但spill读70.21GB、写7.53GB。该记录证明必须换页，不能证明读写放大合理，也不作为本阶段代码的重新验收成绩。字典换页目标仍未完成，需要继续减少缺页次数和驻留场景开销。
 
-64MiB没有spill仍慢于host，不能归因于容量不足。8MiB时8,571,617字节正文单独就超过预算，确实需要换页；但读写放大仍须优化。8MiB开启profile为179,215.320ms，普通计时为183,931.114ms，两者不混用。
+本阶段标准SQL仅来自 `tests/guest/queries/`，每条host/CSD执行前独立重启PG、清除Guest page cache，关闭profile计时，测量期间没有构建或其他测试：
 
-同一标准[Q13/Q16](../../../../results/tpch.pPEuIt/timings.csv)在默认预算下均完整卸载、结果一致并快于host；另用未改写的[Q16、8MiB预算](../../../../results/tpch.bzKtEK/timings.csv)验证共享聚合扩容与spill，结果仍一致。[诊断](../../../../results/tpch.bzKtEK/16.profile.log)峰值8,012,288字节、spill读写各44,957,696字节；CSD 1,701.733ms慢于host 762.661ms，保留needs_analysis。没有重复全量22条。
+| 查询 | 预算 | host ms | CSD ms | 结果 / 完整卸载 | 性能 |
+| --- | --- | ---: | ---: | --- | --- |
+| Q13 | 默认256MiB | 1,695.902 | 404.465 | 一致 / 是 | 快于同轮host |
+| Q16 | 默认256MiB | 719.581 | 549.403 | 一致 / 是 | 快于同轮host |
+| Q16 | 8MiB | 699.089 | 1,660.833 | 一致 / 是 | needs_analysis |
 
-排序现在在run内保存12字节字符串前缀，同前缀无法定序才取正文，Source交出前恢复原ID。测试额外覆盖空串、12字节边界、长公共前缀及NULL；还修复了回收缓存返回0时误当作消费完毕而丢批次的问题。短值采用按需分配的四路缓存；两个短引用保存副本，常量读取不反复固定页面。相关原生与消毒器检查覆盖输出正确性和回收，不用组件耗时代替SQL性能结论。
-
-标准SQL仍仅来自 `tests/guest/queries/`。本阶段[Q9/Q13](../../../../results/tpch.Cgzvcc/timings.csv)及[最终恢复后的Q16](../../../../results/tpch.NbjVGP/timings.csv)均完整卸载、结果一致且快于同轮host；最终Q16为host 754.771ms、CSD 532.956ms。另作同环境[Q16分页前入口](../../../../results/tpch.A6FLAI/timings.csv)与[当前入口](../../../../results/tpch.AI3Mkh/timings.csv)对照：549.491/452.880ms。对照仅将 `plan.c` 替换为 `f111f805c` 版本，复用相同扫描/Sort等目标文件及编译选项，结束后校验设备SO恢复。此前用不同轮次约392ms推断必然退化的结论已由该对照修正；不宣称单轮结果代表固定收益。没有重新运行全量22条。
+原始成绩：[默认预算](../../../../results/tpch.mXA7Lu/timings.csv)、[8MiB](../../../../results/tpch.uB5rcA/timings.csv)。8MiB的[profile](../../../../results/tpch.uB5rcA/16.profile.log)峰值8,073,920字节，spill读写各44,957,696字节；未仅凭发生spill便认定性能合格。没有运行完整22条。

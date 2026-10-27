@@ -93,6 +93,14 @@ static void plan(struct qp_plan *p)
 }
 static unsigned projection(struct execution *s,struct qs_dictionary *d,struct qs_dictionary_access *reader)
 {
+    /* Fill the remaining budget before a scalar miss. Its continuation must
+     * already exist: cache eviction can reload a page but must not require
+     * another allocation just to retain the consumed source row. */
+    void *pressure=NULL,*block;
+    while((block=cs_work_alloc(s->context,sizeof(void *)))) {
+        *(void **)block=pressure; pressure=block;
+    }
+    assert(pressure);
     unsigned waits=0;
     for(unsigned i=0;i<512;++i) {
         unsigned left=(i*173)%KEYS,right=i%7?(i*71+4000)%KEYS:left;
@@ -135,6 +143,7 @@ static unsigned projection(struct execution *s,struct qs_dictionary *d,struct qs
     init_eval(&e,&s->plan->nodes[0].expr,bad,NULL);
     unsigned before=loads; assert(!evaluate(s,&e,16,&value) && !value.isnull && !value.value);
     assert(loads==before && !s->text_wait);
+    while(pressure) { void *next=*(void **)pressure; assert(!cs_work_free(s->context,pressure)); pressure=next; }
     return waits;
 }
 static unsigned output(struct execution *s)

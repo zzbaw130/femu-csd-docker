@@ -271,6 +271,9 @@ struct execution {
     unsigned output_column;
     int output_pending;
     struct operator_state *nodes;
+    /* One scalar projection can wait per CU. Reserve its continuation before
+     * the dictionary cache fills the query budget, rather than during a miss. */
+    struct pending_projection projection_retry;
     struct qs_cell params[QP_PARAMS];
     unsigned char *arena;
     void *io;
@@ -661,8 +664,7 @@ static int project_filtered(struct execution *s,const struct qp_node *n,const st
     int count=project_filtered_impl(s,n,input,aggregates,row,filtered,&e);
     if(count<0 && s->expression_wait) {
         if(!p) {
-            p=cs_work_calloc(s->context,1,sizeof(*p));
-            if(!p) { s->expression_wait=0; s->pending_spool=NULL; return -4; }
+            p=&s->projection_retry; memset(p,0,sizeof(*p));
             p->has_input=input!=NULL; p->has_aggregates=aggregates!=NULL; p->filtered=filtered;
             for(unsigned i=0;i<s->plan->count;++i) if(s->nodes[i].index_active &&
                 (&s->plan->nodes[i]==n || s->plan->nodes[i].right==n-s->plan->nodes)) p->inline_only=1;
@@ -672,7 +674,7 @@ static int project_filtered(struct execution *s,const struct qp_node *n,const st
         }
         p->evaluation=e; p->evaluation.tuple=p->has_input?p->input:NULL;
         p->evaluation.aggregates=p->has_aggregates?p->aggregates:NULL;
-    } else if(p) { cs_work_free(s->context,p); o->project_retry=NULL; }
+    } else if(p) o->project_retry=NULL;
     return count;
 }
 static int retry_project(struct execution *s,unsigned id,struct qs_cell *row)
