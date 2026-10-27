@@ -100,13 +100,15 @@ Sort/spill归并Source仍有串行阶段；少数复杂表达式和DISTINCT形�
 | 查询总预算 | 67,108,864字节 |
 | 输入行数 | 524,288 |
 | 字典正文 | 83,021,120字节，超过预算 |
-| 峰值workmem | 67,075,360字节 |
-| 总STORE / LOAD | 1,605 / 519,060 |
+| 峰值workmem | 62,080,416字节 |
+| 总STORE / LOAD | 3,536 / 3,614 |
 | 完整文本、整数、NULL及顺序 | 全部匹配 |
 | 结束后token、workmem、上下文 | 全部归零 |
 | ASan / UBSan / 泄漏检查 | 通过 |
 
-同夹具加载修改前SO时总STORE/LOAD为1,605/519,008，次数基本相同；不将本次修改宣称为整体换页性能收益。当前64KiB请求粒度下，519,060次LOAD约为34GB，仍需减少不必要的换入放大，不能仅以发生spill认定性能合格。
+Sort改为run自持变长字符串正文，并按有序行序存储。相同64MiB夹具的LOAD由519,060次降至3,614次，累计读取由34,017,116,160字节降至236,847,104字节，减少约99.3%；STORE由1,605次增至3,536次，因为run也携带正文。这是模拟NVM的累计请求字节，不是Guest实测SSD带宽；仅保留这组前后对照说明数据表示的收益。
+
+新增 `pgSinaSortPayload64MiB` 使用相同524,288行，额外覆盖超过12字节的公共前缀、非排序键文本列、空串、5/20/255字节文本、重复ID、NULL、串行和8 CU局部run归并，以及STORE/LOAD完成但未确认时取消。串行STORE/LOAD为4,572/5,320，8 CU为4,348/2,424（并行次数可随任务分配略有变化）；峰值分别62,166,048与65,337,168字节，均低于64MiB。完整值、顺序和资源回收通过，两个目标均通过ASan/UBSan/泄漏检查。回归测试还限制累计LOAD，避免只验证结果而放任每行换页退化。
 
 ### Guest针对性验证
 
@@ -114,11 +116,13 @@ Guest保持8CU / 256MiB物理workmem / 64MiB FDM，查询预算显式设为64MiB
 
 | 查询 | host ms | CSD ms | 结果 / 完整卸载 | 性能 |
 | --- | ---: | ---: | --- | --- |
-| Q2 | 921.965 | 327.201 | 一致 / 是 | 快于同轮host |
-| Q6 | 2,649.067 | 464.230 | 一致 / 是 | 快于同轮host |
-| Q13 | 1,209.728 | 337.336 | 一致 / 是 | 快于同轮host |
-| Q16 | 710.559 | 475.991 | 一致 / 是 | 快于同轮host |
+| Q2 | 877.114 | 326.489 | 一致 / 是 | 快于同轮host |
+| Q6 | 2,722.588 | 923.845 | 一致 / 是 | 快于同轮host |
+| Q13 | 1,178.271 | 334.317 | 一致 / 是 | 快于同轮host |
+| Q16 | 727.487 | 521.841 | 一致 / 是 | 快于同轮host |
 
-[原始成绩](../../../../results/tpch.rnLI2L/timings.csv)及各查询 `plan.log` 确认查询预算为67,108,864字节，顶层为CSD Custom Scan。
+[原始成绩](../../../../results/tpch.OpknJw/timings.csv)及各查询 `plan.log` 确认查询预算为67,108,864字节，顶层为CSD Custom Scan。
 
-另用现有冻结 `part` 表做开发验证：读取 `p_name,p_comment,p_partkey` 并按三列排序，完整20万行逐字节匹配host。开发SQL使用后清理，不替代标准TPC-H验收。[64MiB普通计时](../../../../results/dictionary-batch-final-64m.KeYuM7/timings.csv)为host **647.466ms**、CSD **1,961.747ms**；[profile](../../../../results/dictionary-batch-final-64m.KeYuM7/profile.log)无spill，流水线平均活跃CU约0.98。该场景性能仍不合格，不能归因于内存不足。字典换页功能证据已覆盖64MiB超预算数据，但换入放大与驻留场景开销仍待优化，目标尚未完成。
+另用现有冻结 `part` 表做开发验证：读取 `p_name,p_comment,p_partkey` 并按三列排序，完整20万行逐字节匹配host。开发SQL使用后清理，不替代标准TPC-H验收。[64MiB普通计时](../../../../results/sort-owned-text-64m.aY6YPA/timings.csv)为host **688.362ms**、CSD **1,680.322ms**；[profile](../../../../results/sort-owned-text-64m.aY6YPA/profile.log)无spill，峰值53,555,120字节，Sort Sink/Source累计CPU为619.506/227.050ms，流水线平均活跃CU约1.09。该场景性能仍不合格，不能归因于内存不足；本轮消除了超预算排序的大量字典随机读取，没有解决扫描intern及本地排序的全部CPU/并行开销。
+
+真实设备spill另用同一 `part` 表读取 `p_name,p_comment,p_type,p_brand,p_mfgr,p_container,p_partkey`，按 `p_name,p_comment,p_partkey` 排序，20万行完整匹配host。[普通计时](../../../../results/sort-owned-text-spill-64m.JCT11D/timings.csv)为host **927.654ms**、CSD **2,872.087ms**。[独立profile](../../../../results/sort-owned-text-spill-64m.JCT11D/profile.log)确认查询预算67,108,864字节、峰值67,094,416字节，spill读50,987,008字节、写29,425,664字节，验证了设备内部STORE/LOAD及正文归并路径。该用例包含真实内存压力，但平均活跃CU约0.93，不能将全部延迟差距归因于内存不足，性能仍未合格。临时SQL和大结果文件已清理。

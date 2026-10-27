@@ -19,6 +19,7 @@ extern int64_t pg_sina_sort_sink_impl(struct femu_csd_args *);
 extern int64_t pg_sina_sort_source_impl(struct femu_csd_args *);
 extern void qs_sort_dictionary(uint64_t,struct qs_dict *);
 extern int qs_sort_paged_dictionary(uint64_t,struct qs_dictionary *);
+extern const char *qs_sort_output_text(const struct qs_result *,uint32_t,unsigned *);
 extern int qs_sort_prepare(uint64_t);
 extern int64_t qs_sort_finish_sink(uint64_t,struct femu_csd_args *);
 extern int64_t qs_sort_sink_columns(struct femu_csd_args *,const struct qs_plan *,const struct qs_vector *,unsigned,unsigned);
@@ -496,8 +497,20 @@ static int text_status(struct execution *s,int64_t status)
     if(status>0) { s->text_wait=status; s->expression_wait=1; }
     return status?-3:0;
 }
+static const char *sort_text_get(struct execution *s,unsigned id,unsigned *length)
+{
+    for(unsigned i=0;s->plan && i<s->plan->count;++i) {
+        const struct sorted_rows *sorts[]={&s->nodes[i].left_sort,&s->nodes[i].right_sort};
+        for(unsigned j=0;j<2;++j) if(sorts[j]->output && sorts[j]->output->rows) {
+            const char *bytes=qs_sort_output_text(sorts[j]->output,id,length);
+            if(bytes) return bytes;
+        }
+    }
+    return NULL;
+}
 static int text_get(struct execution *s,unsigned id,const char **bytes,unsigned *length)
 {
+    *bytes=sort_text_get(s,id,length); if(*bytes) return 0;
     if(!s->text) return qs_dict_get(s->dictionary,id,bytes,length);
     return text_status(s,qs_dictionary_text_get(s->text,id,bytes,length,s->io));
 }
@@ -4511,7 +4524,8 @@ static int64_t namespace_wait(struct execution *s)
 static int export_row(struct execution *s,const struct qs_plan *root,struct qs_cell *row,struct qs_result *out)
 {
     for(unsigned col=s->output_column;col<root->nout;++col) {
-        if(!row[col].isnull && root->exprs[root->outputs[col].index].type==Q_STRING) {
+        if(!row[col].isnull && !qs_cell_string(&row[col]) && !qs_cell_is_string_ref(&row[col]) &&
+           root->exprs[root->outputs[col].index].type==Q_STRING) {
             const char *bytes; unsigned length;
             if(text_get(s,(unsigned)row[col].value,&bytes,&length)) {
                 s->output_column=col; s->output_pending=1; return -3;
@@ -4533,6 +4547,24 @@ static int output_string_order(const void *a,const void *b)
     const struct output_string *x=a,*y=b;
     return x->id<y->id?-1:x->id>y->id;
 }
+/* Consume Sort's run-owned payload before its next Source batch can replace
+ * the buffer. Expressions continue to use canonical IDs; only final output
+ * cells become inline strings or references into the result AFDM. */
+static void export_sort_text(struct execution *s,const struct qs_plan *root,
+    struct qs_cell *row,struct qs_result *out)
+{
+    for(unsigned col=0;col<root->nout;++col) {
+        struct qs_cell *v=&row[col];
+        if(v->isnull || root->exprs[root->outputs[col].index].type!=Q_STRING || qs_cell_string(v) || qs_cell_is_string_ref(v)) continue;
+        unsigned n; const char *bytes=sort_text_get(s,(uint32_t)v->value,&n);
+        if(!bytes || n>255 || out->str_bytes+n>QS_RESULT_STRING_BYTES) continue;
+        if(n && n<=QS_STRING_MAX) qs_cell_set_string(v,bytes,n);
+        else {
+            memcpy(out->str_data+out->str_bytes,bytes,n);
+            qs_cell_set_string_ref(v,out->str_bytes,n); out->str_bytes+=n;
+        }
+    }
+}
 /* IDs and body locations are appended together. Resolve this fixed-size
  * batch in ID order, then write each value back to its original row/column.
  * This groups directory/body reads without changing the SQL result order. */
@@ -4543,7 +4575,7 @@ static int export_batch(struct execution *s,const struct qs_plan *root,struct qs
         for(unsigned row=s->output_exported;row<out->rows;++row)
             for(unsigned col=0;col<root->nout;++col) {
                 const struct qs_cell *v=&out->data[row].cells[col];
-                if(!v->isnull && root->exprs[root->outputs[col].index].type==Q_STRING)
+                if(!v->isnull && !qs_cell_string(v) && !qs_cell_is_string_ref(v) && root->exprs[root->outputs[col].index].type==Q_STRING)
                     s->output_order[s->output_count++]=(struct output_string){(uint32_t)v->value,row,col};
             }
         qsort(s->output_order,s->output_count,sizeof(*s->output_order),output_string_order);
@@ -4777,6 +4809,7 @@ produce:
         if(status==QP_WAIT || status<0 || status>2) break;
         if(!status) { out->finished=control->finished=1; break; }
         const struct qs_plan *root=&plan->nodes[plan->root].expr;
+        if(!worker) export_sort_text(s,root,row,out);
         if(!worker && !s->output_order && export_row(s,root,row,out)) { status=-3; break; }
         ++out->rows;
     }

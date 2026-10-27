@@ -53,6 +53,16 @@ int64_t pg_sina_sort(struct femu_csd_args *a)
 #include "query_vector.h"
 #include "dictionary.h"
 #define RUN_BYTES (1024U*1024)
+/* A run owns its strings. Cells retain the canonical ID for consumers, plus
+ * a private heap reference while sorting. Finalized heaps follow sorted row
+ * order, so spilling rows does not turn their payload into dictionary probes. */
+struct run_text {
+    struct run_text *next;
+    unsigned char *data;
+    uint64_t *blocks;
+    unsigned bytes,capacity,nblocks,loaded,loaded_next,sorted,wide;
+    cs_work_context *owner;
+};
 struct row_run {
     unsigned char *data;
     cs_work_context *owner;
@@ -62,6 +72,7 @@ struct row_run {
     unsigned rows, position, loaded, cache_rows;
     int sorted, spilled;
     unsigned sort_phase,sort_i,sort_n;
+    struct run_text *text;
 };
 struct row_sort {
     cs_work_context *context;
@@ -94,27 +105,39 @@ struct row_sort {
     unsigned top_phase,top_child,sink_active,source_active,dictionary_io;
     uint64_t dictionary_completion;
     void *io;
-    unsigned prefix_active,prefix_row,prefix_key,prefix_columns;
+    unsigned text_active,text_row,text_column,text_columns;
+    struct run_text *texts,*pending_text;
+    unsigned text_block,output_column;
+    char *text_compare;
 };
-enum { ROW_NONE, ROW_STORE, ROW_LOAD, ROW_FREE, ROW_COMPACT_STORE };
-enum { DICTIONARY_NONE, DICTIONARY_COMPARE, DICTIONARY_EVICT, DICTIONARY_PREFIX };
-/* Private run representation: retain the 32-bit ID and use the remaining
- * value bytes for a 12-byte prefix, like DuckDB's abbreviated string keys.
- * scale=13 means the text continues past the prefix; dscale marks this run
- * cell only. Source restores canonical IDs before exposing any rows. */
-#define TEXT_PREFIX_BYTES 12U
-#define TEXT_PREFIX_TAG 254U
+enum { ROW_NONE, ROW_STORE, ROW_LOAD, ROW_FREE, ROW_COMPACT_STORE,
+       ROW_TEXT_STORE, ROW_TEXT_LOAD, ROW_TEXT_FREE };
+enum { DICTIONARY_NONE, DICTIONARY_COMPARE, DICTIONARY_EVICT, DICTIONARY_COPY };
+/* Run cells keep the ID and a query-local heap location in value. These
+ * private references are restored to IDs before any consumer sees the row. */
+#define TEXT_RUN_TAG 253U
+static struct run_text *cell_text(const struct qs_cell *v)
+{ return (void *)(uintptr_t)((unsigned __int128)v->value>>64); }
+static unsigned cell_text_offset(const struct qs_cell *v)
+{ return (uint32_t)((unsigned __int128)v->value>>32); }
+static void set_run_text(struct qs_cell *v,struct run_text *h,unsigned offset)
+{
+    v->value=(unsigned __int128)(uintptr_t)h<<64 | (uint64_t)offset<<32 | (uint32_t)v->value;
+    v->scale=0; v->dscale=TEXT_RUN_TAG;
+}
+static int64_t row_text_get(struct row_sort *,const struct qs_cell *,const char **,unsigned *,struct femu_csd_args *);
 static int text_output(const struct qs_plan *p,unsigned col)
 {
     unsigned oid=p->outputs[col].type_oid;
     return oid==25 || oid==1042 || oid==1043;
 }
-static void restore_text_keys(const struct row_sort *s,struct qs_cell *row)
+static void restore_text_ids(const struct row_sort *s,struct qs_cell *row)
 {
-    if(!s->prefix_columns) return;
-    for(unsigned k=0;k<s->plan.norder;++k) {
-        unsigned col=s->plan.order[k].output; struct qs_cell *v=&row[col];
-        if(text_output(&s->plan,col) && !v->isnull && v->dscale==TEXT_PREFIX_TAG) {
+    if(!s->text_columns) return;
+    for(unsigned col=0;col<s->plan.nout;++col) {
+        struct qs_cell *v=&row[col];
+        if(text_output(&s->plan,col) && !v->isnull &&
+           v->dscale==TEXT_RUN_TAG) {
             v->value=(uint32_t)v->value; v->scale=v->dscale=0;
         }
     }
@@ -132,14 +155,19 @@ static int64_t row_compare(struct row_sort *s,const struct qs_cell *a,const stru
             unsigned oid=p->outputs[key->output].type_oid;
             if((s->dictionary || s->paged_dictionary) && (oid==25 || oid==1042 || oid==1043)) {
                 const char *left,*right; unsigned ln,rn;
-                if(s->paged_dictionary && (uint32_t)x.value!=(uint32_t)y.value) {
-                    if(x.dscale==TEXT_PREFIX_TAG && y.dscale==TEXT_PREFIX_TAG) {
-                        unsigned n=x.scale<y.scale?x.scale:y.scale;
-                        if(n>TEXT_PREFIX_BYTES) n=TEXT_PREFIX_BYTES;
-                        cmp=memcmp((const char *)&x.value+sizeof(uint32_t),(const char *)&y.value+sizeof(uint32_t),n);
-                        if(!cmp && x.scale!=y.scale) cmp=(x.scale>y.scale)-(x.scale<y.scale);
-                        if(cmp || x.scale<=TEXT_PREFIX_BYTES || y.scale<=TEXT_PREFIX_BYTES) goto compared_text;
+                if(x.dscale==TEXT_RUN_TAG && y.dscale==TEXT_RUN_TAG) {
+                    if((uint32_t)x.value!=(uint32_t)y.value) {
+                        s->compare_key=i;
+                        if(!s->compare_phase) {
+                            int64_t status=row_text_get(s,&x,&left,&ln,args); if(status) return status;
+                            memcpy(s->text_compare,left,ln); s->compare_length=ln; s->compare_phase=1;
+                        }
+                        int64_t status=row_text_get(s,&y,&right,&rn,args); if(status) return status;
+                        left=s->text_compare; ln=s->compare_length;
+                        cmp=memcmp(left,right,ln<rn?ln:rn); if(!cmp) cmp=(ln>rn)-(ln<rn);
+                        s->compare_phase=0;
                     }
+                } else if(s->paged_dictionary && (uint32_t)x.value!=(uint32_t)y.value) {
                     s->compare_key=i; s->comparing=1;
                     while(s->compare_phase<2) {
                         struct qs_dictionary_access *access=s->compare_phase?s->text_right:s->text_left;
@@ -170,7 +198,6 @@ static int64_t row_compare(struct row_sort *s,const struct qs_cell *a,const stru
                     cmp=memcmp(left,right,ln<rn?ln:rn); if(!cmp) cmp=(ln>rn)-(ln<rn);
                 }
             } else if(qs_compare(x,y,&cmp)) return -3;
-compared_text:
             if(key->descending) cmp=-cmp;
         }
         if(cmp) { s->compare_key=0; *result=cmp; return 0; }
@@ -318,6 +345,35 @@ static int64_t run_sort(struct row_sort *s,struct row_run *r,struct femu_csd_arg
         int64_t status=row_sift(s,r,r->sort_n-1,0,a); if(status) return status;
         --r->sort_n; r->sort_phase=2;
     }
+    if(r->text && r->text->bytes) {
+        struct run_text *h=r->text;
+        /* Keep records within blocks except the single maximum-length value.
+         * Include identical padding in the capacity estimate and copy pass. */
+        unsigned bytes=0;
+        for(unsigned i=0;i<r->rows;++i) for(unsigned c=0;c<s->plan.nout;++c) {
+            struct qs_cell *v=&run_row(s,r,i)[c];
+            if(v->isnull || v->dscale!=TEXT_RUN_TAG) continue;
+            uint16_t n; memcpy(&n,h->data+cell_text_offset(v),sizeof(n));
+            if(bytes%QS_SORT_IO_BYTES+sizeof(n)+n>QS_SORT_IO_BYTES) bytes=(bytes+QS_SORT_IO_BYTES-1)/QS_SORT_IO_BYTES*QS_SORT_IO_BYTES;
+            bytes+=sizeof(n)+n;
+        }
+        unsigned char *ordered;
+        while(!(ordered=cs_work_alloc(r->owner,bytes))) {
+            int64_t status=row_evict(s,r->owner,a); if(status) return status;
+        }
+        unsigned at=0;
+        for(unsigned i=0;i<r->rows;++i) for(unsigned c=0;c<s->plan.nout;++c) {
+            struct qs_cell *v=&run_row(s,r,i)[c];
+            if(v->isnull || v->dscale!=TEXT_RUN_TAG) continue;
+            unsigned off=cell_text_offset(v); uint16_t n; memcpy(&n,h->data+off,sizeof(n));
+            if(at%QS_SORT_IO_BYTES+sizeof(n)+n>QS_SORT_IO_BYTES) {
+                unsigned next=(at+QS_SORT_IO_BYTES-1)/QS_SORT_IO_BYTES*QS_SORT_IO_BYTES;
+                memset(ordered+at,0,next-at); at=next;
+            }
+            memcpy(ordered+at,h->data+off,sizeof(n)+n); set_run_text(v,h,at); at+=sizeof(n)+n;
+        }
+        cs_work_free(r->owner,h->data); h->data=ordered; h->bytes=h->capacity=bytes; h->sorted=1;
+    }
     r->sorted=1;
     if(r->rows) memcpy(r->head,r->data,s->row_bytes);
     return 0;
@@ -325,6 +381,21 @@ static int64_t run_sort(struct row_sort *s,struct row_run *r,struct femu_csd_arg
 static int64_t row_store(struct row_sort *s,struct row_run *r,struct femu_csd_args *a)
 {
     s->pending_run=r; s->pending=ROW_STORE;
+    if(r->text && !r->text->blocks && r->text->bytes) {
+        struct run_text *h=r->text;
+        h->nblocks=(h->bytes+QS_SORT_IO_BYTES-1)/QS_SORT_IO_BYTES;
+        h->blocks=cs_work_calloc(h->owner,h->nblocks,sizeof(*h->blocks));
+        if(!h->blocks) return -4;
+        s->pending_text=h; s->text_block=0; s->pending=ROW_TEXT_STORE;
+    }
+    if(s->pending==ROW_TEXT_STORE) {
+        struct run_text *h=s->pending_text;
+        unsigned at=s->text_block*QS_SORT_IO_BYTES,n=h->bytes-at;
+        if(n>QS_SORT_IO_BYTES) n=QS_SORT_IO_BYTES;
+        memset(a->mr_addr[a->numr-1],0,QS_SORT_IO_BYTES);
+        memcpy(a->mr_addr[a->numr-1],h->data+at,n);
+        return csNeedStore(QS_SORT_IO_BYTES);
+    }
     unsigned first=s->pending_block*s->block_rows,n=r->rows-first;
     if(n>s->block_rows) n=s->block_rows;
     void *io=a->mr_addr[a->numr-1]; memset(io,0,QS_SORT_IO_BYTES);
@@ -367,6 +438,19 @@ static int64_t row_evict(struct row_sort *s,cs_work_context *owner,struct femu_c
             }
         }
     }
+    /* Once all sinks are done, dictionary cache RAM is reusable. Keep the
+     * sequential run windows instead of repeatedly evicting their heads. */
+    if(s->combined && s->text_columns && s->paged_dictionary && !s->comparing) {
+        int64_t status=qs_dictionary_evict(s->paged_dictionary,s->text_evict,a->mr_addr[a->numr-1],0);
+        if(status>0) s->dictionary_io=DICTIONARY_EVICT;
+        if(status!=-4) return status;
+    }
+    for(unsigned i=0;i<s->owners_count;++i)
+        for(struct run_text *h=s->owners[i]->texts;h;h=h->next)
+            if(h->owner==owner && h->blocks && h->data) {
+                cs_work_free(owner,h->data); h->data=NULL; h->loaded=h->loaded_next=UINT32_MAX;
+                return 0;
+            }
     /* A spilled run's read buffer is only a cache. Its head is retained in
      * metadata, so release the buffer before writing another resident run. */
     for(unsigned i=0;i<s->owners_count;++i) {
@@ -390,6 +474,17 @@ static int64_t row_evict(struct row_sort *s,cs_work_context *owner,struct femu_c
             }
         }
     }
+    for(unsigned i=0;i<s->owners_count;++i)
+        for(struct run_text *h=s->owners[i]->texts;h;h=h->next)
+            if(h->owner==owner && h->sorted && !h->blocks && h->data && h->bytes) {
+                h->nblocks=(h->bytes+QS_SORT_IO_BYTES-1)/QS_SORT_IO_BYTES;
+                h->blocks=cs_work_calloc(owner,h->nblocks,sizeof(*h->blocks));
+                if(!h->blocks) continue;
+                s->pending_run=NULL; s->pending_text=h; s->text_block=0; s->pending=ROW_TEXT_STORE;
+                unsigned n=h->bytes<QS_SORT_IO_BYTES?h->bytes:QS_SORT_IO_BYTES;
+                memset(a->mr_addr[a->numr-1],0,QS_SORT_IO_BYTES); memcpy(a->mr_addr[a->numr-1],h->data,n);
+                return csNeedStore(QS_SORT_IO_BYTES);
+            }
     if(s->paged_dictionary && !s->comparing) {
         int64_t status=qs_dictionary_evict(s->paged_dictionary,s->text_evict,
             a->mr_addr[a->numr-1],0);
@@ -407,13 +502,38 @@ static int64_t row_resume(struct row_sort *s,struct femu_csd_args *a)
         if(!status) s->dictionary_io=DICTIONARY_NONE;
         return status;
     }
-    if(s->dictionary_io==DICTIONARY_COMPARE || s->dictionary_io==DICTIONARY_PREFIX) {
+    if(s->dictionary_io==DICTIONARY_COMPARE || s->dictionary_io==DICTIONARY_COPY) {
         if(!csIsReentry(a)) return -1;
         s->dictionary_completion=csReentryValue(a); s->dictionary_io=DICTIONARY_NONE;
         return 0;
     }
     if(!csIsReentry(a)) return 0;
+    if(s->pending==ROW_TEXT_LOAD) {
+        struct run_text *h=s->pending_text;
+        unsigned base=s->text_block==h->loaded?0:QS_SORT_IO_BYTES;
+        memcpy(h->data+base,s->io,QS_SORT_IO_BYTES);
+        if(base) h->loaded_next=s->text_block;
+        s->metrics.spill_read_bytes+=QS_SORT_IO_BYTES;
+        s->pending=ROW_NONE; return 0;
+    }
+    if(s->pending==ROW_TEXT_FREE) {
+        s->pending_text->blocks[s->text_block]=0; s->pending=ROW_NONE; return 0;
+    }
     struct row_run *r=s->pending_run;
+    if(s->pending==ROW_TEXT_STORE) {
+        struct run_text *h=s->pending_text;
+        h->blocks[s->text_block++]=csReentryValue(a);
+        s->metrics.spill_write_bytes+=QS_SORT_IO_BYTES;
+        if(s->text_block<h->nblocks) {
+            unsigned at=s->text_block*QS_SORT_IO_BYTES,n=h->bytes-at;
+            if(n>QS_SORT_IO_BYTES) n=QS_SORT_IO_BYTES;
+            memset(s->io,0,QS_SORT_IO_BYTES); memcpy(s->io,h->data+at,n);
+            return csNeedStore(QS_SORT_IO_BYTES);
+        }
+        cs_work_free(h->owner,h->data); h->data=NULL; h->loaded=h->loaded_next=UINT32_MAX;
+        s->pending=ROW_NONE;
+        s->pending_block=0; return r?row_store(s,r,a):0;
+    }
     if(!r) return -1;
     if(s->pending==ROW_STORE) {
         if(s->pending_block>=r->nblocks) return -1;
@@ -435,33 +555,80 @@ static int64_t row_resume(struct row_sort *s,struct femu_csd_args *a)
     else return -1;
     s->pending=ROW_NONE; return 0;
 }
-/* Prepare copied rows once, before sorting or spilling them. Keeping the
- * row/key cursor makes a missing prefix page resume without copying input
- * again or advancing the producer twice. */
-static int64_t prepare_text_keys(struct row_sort *s,struct femu_csd_args *a)
+static int64_t row_text_get(struct row_sort *s,const struct qs_cell *v,const char **bytes,
+    unsigned *length,struct femu_csd_args *a)
 {
-    if(!s->prefix_active) return 0;
+    struct run_text *h=cell_text(v); unsigned offset=cell_text_offset(v),at=offset;
+    if(!h || offset+sizeof(uint16_t)>h->bytes) return -3;
+    if(h->blocks) {
+        while(!h->data) {
+            h->data=cs_work_alloc(h->owner,(h->wide?2U:1U)*QS_SORT_IO_BYTES);
+            if(!h->data) { int64_t status=row_evict(s,h->owner,a); if(status) return status; }
+        }
+        unsigned block=offset/QS_SORT_IO_BYTES; at=offset%QS_SORT_IO_BYTES;
+        if(h->loaded!=block) {
+            h->loaded=block; h->loaded_next=UINT32_MAX;
+            s->pending_text=h; s->text_block=block; s->pending=ROW_TEXT_LOAD;
+            return csNeedLoad(h->blocks[block]);
+        }
+        uint16_t n; memcpy(&n,h->data+at,sizeof(n));
+        if(at+sizeof(n)+n>QS_SORT_IO_BYTES && h->loaded_next!=block+1) {
+            if(block+1>=h->nblocks) return -3;
+            s->pending_text=h; s->text_block=block+1; s->pending=ROW_TEXT_LOAD;
+            return csNeedLoad(h->blocks[block+1]);
+        }
+    }
+    uint16_t n; memcpy(&n,h->data+at,sizeof(n));
+    if((uint64_t)offset+sizeof(n)+n>h->bytes) return -3;
+    *length=n; *bytes=(char *)h->data+at+sizeof(n); return 0;
+}
+/* Materialize all text columns once while the input batch is still live.
+ * A dictionary miss retains the row/column cursor through reentry. */
+static int64_t prepare_run_text(struct row_sort *s,struct femu_csd_args *a)
+{
+    if(!s->text_active) return 0;
     struct row_run *r=&s->runs[s->count-1];
-    for(;s->prefix_row<r->rows;++s->prefix_row,s->prefix_key=0)
-        for(;s->prefix_key<s->plan.norder;++s->prefix_key) {
-            unsigned col=s->plan.order[s->prefix_key].output;
-            struct qs_cell *v=&run_row(s,r,s->prefix_row)[col];
-            if(!text_output(&s->plan,col) || v->isnull || v->dscale==TEXT_PREFIX_TAG) continue;
+    for(;s->text_row<r->rows;++s->text_row,s->text_column=0)
+        for(;s->text_column<s->plan.nout;++s->text_column) {
+            unsigned col=s->text_column;
+            struct qs_cell *v=&run_row(s,r,s->text_row)[col];
+            if(!text_output(&s->plan,col) || v->isnull || v->dscale==TEXT_RUN_TAG) continue;
             const char *bytes; unsigned length;
-retry_prefix:
+retry_text:
             s->comparing=1;
             int64_t status=qs_dictionary_pin(s->paged_dictionary,s->text_left,(uint32_t)v->value,
                 &bytes,&length,s->io,s->dictionary_completion);
             s->dictionary_completion=0;
-            if(status==-4) { status=row_evict(s,s->context,a); if(!status) goto retry_prefix; }
-            else if(status>QS_DICTIONARY_BUSY) s->dictionary_io=DICTIONARY_PREFIX;
+            if(status==-4) { status=row_evict(s,s->context,a); if(!status) goto retry_text; }
+            else if(status>QS_DICTIONARY_BUSY) s->dictionary_io=DICTIONARY_COPY;
             if(status) return status;
-            uint32_t id=(uint32_t)v->value; v->value=id;
-            memcpy((char *)&v->value+sizeof(id),bytes,length<TEXT_PREFIX_BYTES?length:TEXT_PREFIX_BYTES);
-            v->scale=length<=TEXT_PREFIX_BYTES?length:TEXT_PREFIX_BYTES+1; v->dscale=TEXT_PREFIX_TAG;
+            if(length>UINT16_MAX) return -3;
+            if(!r->text) {
+                r->text=cs_work_calloc(r->owner,1,sizeof(*r->text));
+                if(!r->text) { qs_dictionary_unpin(s->text_left); s->comparing=0; return -4; }
+                r->text->owner=r->owner; r->text->next=s->texts; s->texts=r->text;
+            }
+            struct run_text *h=r->text; unsigned need=h->bytes+sizeof(uint16_t)+length;
+            while(need>h->capacity) {
+                unsigned capacity=h->capacity?h->capacity*2:QS_SORT_IO_BYTES;
+                if(capacity<need) capacity=need;
+                void *data=cs_work_realloc(h->owner,h->data,capacity);
+                if(!data) {
+                    /* Release the pin before yielding. The same ID is pinned
+                     * again on reentry; no borrowed pointer survives it. */
+                    qs_dictionary_unpin(s->text_left); s->comparing=0;
+                    status=row_evict(s,s->context,a); if(status) return status;
+                    goto retry_text;
+                }
+                h->data=data; h->capacity=capacity;
+            }
+            h->wide|=length+sizeof(uint16_t)>QS_SORT_IO_BYTES;
+            uint16_t n=length; memcpy(h->data+h->bytes,&n,sizeof(n));
+            memcpy(h->data+h->bytes+sizeof(n),bytes,length);
+            set_run_text(v,h,h->bytes); h->bytes=need;
             qs_dictionary_unpin(s->text_left); s->comparing=0;
         }
-    s->prefix_active=s->prefix_row=s->prefix_key=0; return 0;
+    s->text_active=s->text_row=s->text_column=0; return 0;
 }
 static int row_init(struct qs_task *task,const struct qs_plan *p,struct row_sort **out)
 {
@@ -519,7 +686,7 @@ int64_t qs_sort_finish_sink(uint64_t state,struct femu_csd_args *a)
 {
     struct row_sort *s=(void *)(uintptr_t)state;
     int64_t status=row_resume(s,a); if(status) return status;
-    status=prepare_text_keys(s,a); if(status) return status;
+    status=prepare_run_text(s,a); if(status) return status;
     for(unsigned i=0;i<s->count;++i) {
         struct row_run *r=&s->runs[i];
         if(r->rows) { status=run_sort(s,r,a); if(status) return status; }
@@ -554,10 +721,12 @@ static int64_t row_sink(struct femu_csd_args *a,const struct qs_plan *columns,
         s->metrics.input_bytes+=task->input_bytes; ++s->metrics.chunks;
     }
     int64_t status=row_resume(s,a); if(status) return status;
-    status=prepare_text_keys(s,a); if(status) return status;
+    status=prepare_run_text(s,a); if(status) return status;
     if(!s->bounded && s->count) {
         struct row_run *last=&s->runs[s->count-1];
-        if(last->rows==s->run_rows) { status=run_sort(s,last,a); if(status) return status; }
+        if(last->rows==s->run_rows || (last->text && last->text->bytes>=RUN_BYTES)) {
+            status=run_sort(s,last,a); if(status) return status;
+        }
     }
     while(s->input_position<selected) {
         if(s->bounded && !s->topn) { s->input_position=selected; break; }
@@ -574,6 +743,7 @@ static int64_t row_sink(struct femu_csd_args *a,const struct qs_plan *columns,
         }
         unsigned count=selected-s->input_position;
         if(count>QS_VECTOR_ROWS) count=QS_VECTOR_ROWS;
+        if(s->text_columns && count>64) count=64;
         if(!s->bounded && count>s->run_rows-r->rows) count=s->run_rows-r->rows;
         if(!columns && !row_input && qs_vector_execute(p,c,qs_selection(c),s->input_position,count,s->needed,s->vectors)) return -5;
         if(columns && !s->bounded) {
@@ -637,12 +807,14 @@ static int64_t row_sink(struct femu_csd_args *a,const struct qs_plan *columns,
         }
         if(!s->bounded) {
             s->input_position+=count;
-            if(s->prefix_columns) {
-                s->prefix_active=1; s->prefix_row=r->rows-count; s->prefix_key=0;
-                status=prepare_text_keys(s,a); if(status) return status;
+            if(s->text_columns) {
+                s->text_active=1; s->text_row=r->rows-count; s->text_column=0;
+                status=prepare_run_text(s,a); if(status) return status;
             }
         }
-        if(!s->bounded && r->rows==s->run_rows) { status=run_sort(s,r,a); if(status) return status; }
+        if(!s->bounded && (r->rows==s->run_rows || (r->text && r->text->bytes>=RUN_BYTES))) {
+            status=run_sort(s,r,a); if(status) return status;
+        }
     }
     s->sink_active=0; return 0;
 }
@@ -667,9 +839,12 @@ int qs_sort_paged_dictionary(uint64_t state,struct qs_dictionary *dictionary)
     if(!s->text_evict) s->text_evict=qs_dictionary_access_create(dictionary);
     if(!s->text_left || !s->text_right || !s->text_evict) return -4;
     s->paged_dictionary=dictionary;
-    for(unsigned k=0;k<s->plan.norder;++k) {
-        unsigned col=s->plan.order[k].output;
-        if(text_output(&s->plan,col)) s->prefix_columns|=1U<<col;
+    for(unsigned col=0;!s->bounded && col<s->plan.nout;++col) {
+        if(text_output(&s->plan,col)) s->text_columns|=1U<<col;
+    }
+    if(s->text_columns && !s->text_compare) {
+        s->text_compare=cs_work_alloc(s->context,UINT16_MAX);
+        if(!s->text_compare) return -4;
     }
     return 0;
 }
@@ -882,6 +1057,12 @@ static int64_t consolidate(struct row_sort *s,struct femu_csd_args *a)
 }
 static int64_t row_finish(struct row_sort *s,struct qs_group *group,struct qs_result *out)
 {
+    for(unsigned i=0;i<s->owners_count;++i)
+        for(struct run_text *h=s->owners[i]->texts;h;h=h->next)
+            for(unsigned b=0;h->blocks && b<h->nblocks;++b) if(h->blocks[b]) {
+                s->pending_text=h; s->text_block=b; s->pending=ROW_TEXT_FREE;
+                return csNeedFree(h->blocks[b]);
+            }
     for(unsigned i=0;i<s->owners_count;++i) {
         struct row_sort *o=s->owners[i];
         for(unsigned j=0;j<o->count;++j) for(unsigned b=0;b<o->runs[j].nblocks;++b) if(o->runs[j].blocks[b]) {
@@ -906,6 +1087,46 @@ static void unpin_text(struct row_sort *s)
 {
     if(s->text_left) qs_dictionary_unpin(s->text_left);
     if(s->text_right) qs_dictionary_unpin(s->text_right);
+}
+/* Private Sort Source payload. Public cells still contain canonical IDs.
+ * A small offset hash in the already existing string area lets the SQL
+ * consumer reuse these bytes without pinning the global dictionary again. */
+#define SOURCE_TEXT_SLOTS (QS_RESULT_ROWS*QS_OUT*2U)
+#define SOURCE_TEXT_HEADER (SOURCE_TEXT_SLOTS*sizeof(uint32_t))
+const char *qs_sort_output_text(const struct qs_result *out,uint32_t id,unsigned *length)
+{
+    if(out->str_bytes<SOURCE_TEXT_HEADER) return NULL;
+    const uint32_t *slots=(const void *)out->str_data;
+    unsigned slot=(id*2654435761U)&(SOURCE_TEXT_SLOTS-1);
+    while(slots[slot]) {
+        unsigned at=slots[slot]; uint32_t key; uint16_t n;
+        memcpy(&key,out->str_data+at,sizeof(key));
+        if(key==id) {
+            memcpy(&n,out->str_data+at+sizeof(key),sizeof(n));
+            *length=n; return out->str_data+at+sizeof(key)+sizeof(n);
+        }
+        slot=(slot+1)&(SOURCE_TEXT_SLOTS-1);
+    }
+    return NULL;
+}
+static int64_t source_text(struct row_sort *s,const struct qs_cell *row,struct qs_result *out,
+    struct femu_csd_args *a)
+{
+    for(;s->output_column<s->plan.nout;++s->output_column) {
+        const struct qs_cell *v=&row[s->output_column];
+        if(v->isnull || v->dscale!=TEXT_RUN_TAG) continue;
+        unsigned n; uint32_t id=(uint32_t)v->value;
+        if(qs_sort_output_text(out,id,&n)) continue;
+        const char *bytes; int64_t status=row_text_get(s,v,&bytes,&n,a); if(status) return status;
+        if((uint64_t)out->str_bytes+sizeof(id)+sizeof(uint16_t)+n>QS_RESULT_STRING_BYTES) return out->rows?3:-4;
+        unsigned slot=(id*2654435761U)&(SOURCE_TEXT_SLOTS-1); uint32_t *slots=(void *)out->str_data;
+        while(slots[slot]) slot=(slot+1)&(SOURCE_TEXT_SLOTS-1);
+        unsigned at=out->str_bytes; slots[slot]=at; uint16_t length=n;
+        memcpy(out->str_data+at,&id,sizeof(id)); at+=sizeof(id);
+        memcpy(out->str_data+at,&length,sizeof(length)); at+=sizeof(length);
+        memcpy(out->str_data+at,bytes,n); out->str_bytes=at+n;
+    }
+    s->output_column=0; return 0;
 }
 /* group, output, spill I/O. Cleanup uses group, spill I/O and the same batch
  * reentry protocol, so aborts also release tokens before destroying workmem. */
@@ -949,7 +1170,13 @@ int64_t pg_sina_sort_source(struct femu_csd_args *a)
     if(a->numr==2) return row_finish(s,group,NULL);
     if(a->mr_len[1]<(long long)sizeof(struct qs_result)) return -1;
     struct qs_result *out=a->mr_addr[1];
-    if(!s->source_active) { s->source_active=1; out->status=0; out->rows=out->begin=out->finished=0; }
+    if(!s->source_active) {
+        s->source_active=1; out->status=0; out->rows=out->begin=out->finished=0;
+        out->str_bytes=0; s->output_column=0;
+        if(s->text_columns) {
+            memset(out->str_data,0,SOURCE_TEXT_HEADER); out->str_bytes=SOURCE_TEXT_HEADER;
+        }
+    }
     if(!s->heap && !s->finishing) {
         while(!s->heap) {
             s->heap=cs_work_alloc(s->context,(s->metrics.runs+1)*sizeof(*s->heap));
@@ -985,8 +1212,11 @@ int64_t pg_sina_sort_source(struct femu_csd_args *a)
         }
         if(s->skipped<(uint64_t)s->plan.offset) ++s->skipped;
         else {
+            status=source_text(s,r->head,out,a);
+            if(status==3) { s->source_active=0; return 0; }
+            if(status) return status;
             struct qs_cell *row=out->data[out->rows++].cells;
-            memcpy(row,r->head,s->row_bytes); restore_text_keys(s,row); ++s->emitted;
+            memcpy(row,r->head,s->row_bytes); restore_text_ids(s,row); ++s->emitted;
         }
         ++r->position; s->root_pending=1;
     }
