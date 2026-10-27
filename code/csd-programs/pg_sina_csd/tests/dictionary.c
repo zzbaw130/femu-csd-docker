@@ -436,6 +436,40 @@ static void short_text_references(void)
     assert(length==5 && !memcmp(bytes,"third",5)); qs_dictionary_unpin(a.state);
     check_budget(parent,limit); close_dictionary(d,&a,&s); assert(!cs_work_end(parent)); storage_end(&s);
 }
+/* A merge head is compared repeatedly. Evict all cache pages between
+ * accesses: a retained stable location should reload only the string body. */
+static void retained_location(void)
+{
+    cs_work_context *parent=cs_work_begin_limit(384U*1024); assert(parent);
+    struct qs_dictionary *d=qs_dictionary_create(parent); assert(d);
+    struct access writer={.state=qs_dictionary_access_create(d)};
+    struct access reader={.state=qs_dictionary_access_create(d)};
+    assert(writer.state && reader.state);
+    struct storage s={.mutex=PTHREAD_MUTEX_INITIALIZER};
+    char key[800]; make_key(key,0,sizeof(key));
+    uint32_t first=insert(d,&writer,&s,key,sizeof(key)); unsigned length;
+    const char *bytes=pin(d,&reader,&s,first,&length);
+    assert(length==sizeof(key) && !memcmp(bytes,key,length)); qs_dictionary_unpin(reader.state);
+    /* Grow/rebuild hash chains without changing the retained body location. */
+    for(unsigned i=1;i<3000;++i) { make_key(key,i,sizeof(key)); insert(d,&writer,&s,key,sizeof(key)); }
+    uint64_t completion=0;
+    for(;;) {
+        int64_t rc=qs_dictionary_evict(d,writer.state,writer.io,completion);
+        if(rc==-4) break;
+        assert(rc>=0 && rc!=QS_DICTIONARY_BUSY); completion=rc?complete(&s,rc,writer.io):0;
+    }
+    size_t before=s.loads;
+    bytes=pin(d,&reader,&s,first,&length); make_key(key,0,sizeof(key));
+    assert(length==sizeof(key) && !memcmp(bytes,key,length)); qs_dictionary_unpin(reader.state);
+    assert(s.loads==before+1); /* Body only; the directory remains evicted. */
+    /* Reusing the same access for insertion must invalidate its retained
+     * entry, otherwise the next pin could use the inserted value's location. */
+    make_key(key,UINT32_MAX,sizeof(key)); insert(d,&reader,&s,key,sizeof(key));
+    bytes=pin(d,&reader,&s,first,&length); make_key(key,0,sizeof(key));
+    assert(length==sizeof(key) && !memcmp(bytes,key,length)); qs_dictionary_unpin(reader.state);
+    check_budget(parent,384U*1024); close_dictionary(d,&writer,&s);
+    assert(!s.live && !cs_work_end(parent)); storage_end(&s);
+}
 static void text_cancel(uint64_t operation)
 {
     cs_work_context *parent=cs_work_begin_limit(384U*1024); assert(parent);
@@ -474,7 +508,7 @@ int main(void)
     paging(10000,800,4U*1024*1024);
     paging(20000,17,384U*1024);
     concurrent_insert(); cancel_pending(CS_NEED_STORE); cancel_pending(CS_NEED_LOAD); heap_scan(); vector_expressions();
-    short_text_references(); text_cancel(CS_NEED_STORE); text_cancel(CS_NEED_LOAD);
+    retained_location(); short_text_references(); text_cancel(CS_NEED_STORE); text_cancel(CS_NEED_LOAD);
     cs_work_stats stats; assert(!cs_work_get_stats(&stats));
     assert(!stats.used_bytes && !stats.active_contexts && !stats.active_allocations);
     puts("dictionary paging, metadata, pins, concurrent IDs and cancellation passed");

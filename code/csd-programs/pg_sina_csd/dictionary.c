@@ -34,7 +34,7 @@ struct qs_dictionary {
 };
 struct qs_dictionary_access {
     unsigned operation,phase,length,bucket,head,candidate,rehash_id;
-    uint32_t hash,id;
+    uint32_t hash,id,pin_id;
     struct entry entry;
     struct page *pinned;
 };
@@ -204,6 +204,7 @@ static int64_t begin(struct qs_dictionary *d,struct qs_dictionary_access *a,
         return QS_DICTIONARY_BUSY;
     }
     if(a->operation && a->operation!=operation) return -3;
+    if(operation!=PIN) a->pin_id=0;
     a->operation=operation;
     return finish_io(d,io,completion);
 }
@@ -317,8 +318,14 @@ int64_t qs_dictionary_pin(struct qs_dictionary *d,struct qs_dictionary_access *a
     if(!id || id>d->count) { done(d,a); return -3; }
     struct page *p=NULL;
     if(!a->phase) {
-        rc=entry_page(d,id,&p,io); if(rc) return rc;
-        a->entry=*entry_at(p,id); a->phase=1;
+        /* Body location/length never change for a stable ID, even when
+         * rehash rewrites its next link. Retain the last location, not a
+         * borrowed metadata page pointer, across comparisons and eviction. */
+        if(a->pin_id!=id) {
+            rc=entry_page(d,id,&p,io); if(rc) return rc;
+            a->entry=*entry_at(p,id); a->pin_id=id;
+        }
+        a->phase=1;
     }
     *length=a->entry.length; *bytes="";
     if(*length) {

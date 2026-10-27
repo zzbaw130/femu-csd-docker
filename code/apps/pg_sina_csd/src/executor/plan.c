@@ -599,10 +599,13 @@ static void fetch(PlanStateCsd *s)
                 slot->control_copied=false;
             }
             struct qs_result header;
+            /* Read rows and the following string length together. Avoid a
+             * separate row request and copying the entire 1 MiB text area. */
+            const size_t result_prefix=offsetof(struct qs_result,str_data);
             if(!w) {
-                memset(&header,0,offsetof(struct qs_result,data));
+                memset(&header,0,result_prefix);
                 if(status==CS_SUCCESS && (slot->control.output_rows || slot->control.finished))
-                    status=transfer(s->memory[2],0,&header,offsetof(struct qs_result,data),false);
+                    status=transfer(s->memory[2],0,&header,result_prefix,false);
             }
             if(s->profiling) s->completion_copy_ns+=clock_ns()-observed;
             RESUME_INTERRUPTS(); CHECK_FOR_INTERRUPTS();
@@ -616,7 +619,7 @@ static void fetch(PlanStateCsd *s)
                 slot->retry_progress=atomic_load_explicit(&s->batch_progress,memory_order_acquire);
                 continue;
             }
-            memcpy(s->result,&header,offsetof(struct qs_result,data));
+            memcpy(s->result,&header,result_prefix);
             if(header.rows || header.finished || slot->control.drained)
                 atomic_fetch_add_explicit(&s->batch_progress,1,memory_order_release);
             for(unsigned i=1;i<=s->workers;++i) if(slot->control.drained&(UINT64_C(1)<<(i-1))) s->slots[i].ready=false;
@@ -635,11 +638,10 @@ static void fetch(PlanStateCsd *s)
                 }
             }
             if(s->result->rows>QS_RESULT_ROWS) elog(ERROR,"invalid CSD result page");
-            if(s->result->rows) {
-                checked(transfer(s->memory[2],offsetof(struct qs_result,data),s->result->data,s->result->rows*sizeof(struct qs_row),false),"read result");
-                checked(transfer(s->memory[2],offsetof(struct qs_result,str_bytes),&s->result->str_bytes,
-                    sizeof(s->result->str_bytes)+sizeof(s->result->str_data),false),"read result strings");
-            }
+            if(s->result->str_bytes>sizeof(s->result->str_data)) elog(ERROR,"invalid CSD result strings");
+            if(s->result->rows && s->result->str_bytes)
+                checked(transfer(s->memory[2],offsetof(struct qs_result,str_data),s->result->str_data,
+                    s->result->str_bytes,false),"read result strings");
             if(s->result->finished && s->profiling)
                 checked(transfer(s->memory[0],offsetof(struct qp_plan,pipelines),s->plan->pipelines,
                     sizeof(s->plan->pipelines),false),"read pipeline profile");

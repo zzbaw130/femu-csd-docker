@@ -345,6 +345,45 @@ static void drop_cache(struct qs_dictionary *d,struct qs_dictionary_access *a)
         completion=rc?complete(rc):0;
     }
 }
+static unsigned output_batch(struct execution *s,struct qs_dictionary *d,struct qs_dictionary_access *reader)
+{
+    drop_cache(d,reader);
+    struct qs_result *out=calloc(1,sizeof(*out)); assert(out); out->rows=64;
+    struct qs_plan root={.nout=6,.nexprs=6};
+    for(unsigned col=0;col<root.nout;++col) { root.outputs[col].index=col; root.exprs[col].type=col==2?Q_INTEGER:Q_STRING; }
+    uint32_t empty=insert(d,reader,"",0),short_id=insert(d,reader,"tiny",4);
+    for(unsigned row=0;row<64;++row) {
+        struct qs_cell *v=out->data[row].cells;
+        v[0]=(struct qs_cell){.value=ids[row*43%KEYS][0]};
+        v[1]=(struct qs_cell){.value=empty}; v[2]=(struct qs_cell){.value=row};
+        v[3]=(struct qs_cell){.value=UINT32_MAX,.isnull=1};
+        v[4]=(struct qs_cell){.value=short_id}; v[5]=(struct qs_cell){.value=ids[(row*179+3000)%KEYS][1]};
+    }
+    unsigned waits=0,partial=0; s->output_exported=0;
+    /* A namespace read can resume the producer after a partial batch was
+     * already encoded. Appending rows must not decode that prefix as IDs. */
+    for(unsigned batch=1;batch<=2;++batch) {
+        out->rows=batch*32;
+        for(unsigned tries=0;export_batch(s,&root,out);++tries) {
+            assert(tries<10000 && s->output_active);
+            partial+=s->output_position>0; waits+=resume(s);
+        }
+        assert(s->output_exported==out->rows);
+    }
+    assert(waits && partial && !s->output_active && out->rows==64 && out->str_bytes==128*LENGTH);
+    for(unsigned row=0;row<out->rows;++row) {
+        struct qs_cell *v=out->data[row].cells;
+        assert(!v[1].isnull && !qs_cell_string(&v[1]) && v[2].value==row && v[3].isnull);
+        assert(qs_cell_string(&v[4])==4 && !memcmp(qs_cell_string_bytes(&v[4]),"tiny",4));
+        for(unsigned col=0;col<2;++col) {
+            char oracle[LENGTH]; make_text(oracle,col?(row*179+3000)%KEYS:row*43%KEYS,col);
+            struct qs_cell *text=&v[col?5:0];
+            assert(qs_cell_is_string_ref(text) && qs_cell_string(text)==LENGTH);
+            assert((unsigned)text->value+LENGTH<=out->str_bytes && !memcmp(out->str_data+(unsigned)text->value,oracle,LENGTH));
+        }
+    }
+    free(out); return waits;
+}
 static void hash_table(struct execution *s)
 {
     struct operator_state *o=&s->nodes[0];
@@ -908,6 +947,9 @@ int main(int argc,char **argv)
         b->cells=cs_work_calloc(ctx,4*QS_VECTOR_ROWS,sizeof(*b->cells)); assert(b->cells);
         b->group_input=cs_work_calloc(ctx,1,sizeof(*b->group_input)); assert(b->group_input);
     }
+    if(!aggregates && !hashed && !joining && !pipeline) {
+        s->output_order=cs_work_calloc(ctx,QS_RESULT_ROWS*5,sizeof(*s->output_order)); assert(s->output_order);
+    }
     struct execution *peer=NULL;
     if(hashed) {
         hash_table(s);
@@ -935,7 +977,7 @@ int main(int argc,char **argv)
         scalar_waits=aggregate_scalar(s,d,access)+scalar_group_keys(s,d,access);
         output_waits=aggregate_vectors(s,b,0)+aggregate_vectors(s,b,1)+combine_values(s);
         equality_no_io(s);
-    } else { scalar_waits=projection(s,d,access); output_waits=output(s); }
+    } else { scalar_waits=projection(s,d,access); output_waits=output(s)+output_batch(s,d,access); }
     struct qs_dictionary_stats ds; qs_dictionary_get_stats(d,&ds);
     cs_work_context_stats stats; assert(!cs_work_get_context_stats(ctx,&stats));
     assert(stats.peak_used_bytes<=BUDGET && ds.stores && ds.loads);

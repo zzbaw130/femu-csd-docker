@@ -164,13 +164,13 @@ struct probe_test {
  * Unique heap strings exceed the entire query budget; Sort must revisit them
  * for lexical comparisons and final result encoding after eviction. */
 static void *probe_worker(void *arg);
-static void dictionary_plan(function run,unsigned cancel,unsigned workers)
+static void dictionary_plan(function run,unsigned cancel,unsigned workers,int ordered,unsigned rows,size_t budget)
 {
     enum { per_page=32, width=160, tuple_bytes=192 };
-    unsigned rows=workers?65536:32768;
-    const size_t budget=(workers?8U:4U)*1024*1024,raw_bytes=(rows/per_page)*QS_PAGE;
-    struct qp_plan *p=calloc(1,sizeof(*p)); assert(p);
-    p->count=2; p->scan_bytes=QP_SCAN_BYTES;
+    const size_t raw_bytes=(rows/per_page)*QS_PAGE;
+    size_t plan_bytes=sizeof(struct qp_plan)+(ordered?0:sizeof(struct qs_extent));
+    struct qp_plan *p=calloc(1,plan_bytes); assert(p);
+    p->count=2; p->scan_bytes=ordered?QP_SCAN_BYTES:QS_PAGE;
     struct qp_node *leaf=&p->nodes[1]; scan(leaf);
     leaf->bytes=raw_bytes;
     leaf->expr.cols[0]=(struct qs_column){.length=-1,.align=4,.slot=0,.type=Q_STRING};
@@ -182,6 +182,11 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers)
     root->expr.cols[0].length=4; root->expr.work_mem_bytes=budget;
     root->expr.norder=2; root->expr.order[0]=(struct qs_order){.output=0};
     root->expr.order[1]=(struct qs_order){.output=1}; root->expr.limit=-1;
+    if(!ordered) {
+        assert(!workers && !cancel); p->root=1; leaf->expr.work_mem_bytes=budget;
+        p->files[1]=(struct qp_file_mapping){.offset=sizeof(*p),.nsid=1,.lba_bytes=512,.count=1};
+        *(struct qs_extent *)(p+1)=(struct qs_extent){.lba=4096,.bytes=raw_bytes};
+    }
     size_t vector=(qs_chunk_bytes(QP_VECTOR_ROWS,2)+4095)&~(size_t)4095;
     size_t bytes=leaf->vector_offset+vector;
     if(workers) {
@@ -203,7 +208,7 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers)
         unsigned at=24;
         if(r%97) {
             w32(t+at,(width+4)<<2); at+=4;
-            char prefix[16]; int n=snprintf(prefix,sizeof(prefix),"key-%05u-",key);
+            char prefix[16]; int n=snprintf(prefix,sizeof(prefix),"key-%06u-",key);
             memcpy(t+at,prefix,n); memset(t+at+n,'a'+key%26,width-n); at+=width;
         }
         w32(t+at,r);
@@ -212,10 +217,10 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers)
     *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=QP_VECTOR_ROWS,.ncols=2};
     struct qp_control *controls=calloc(workers+1,sizeof(*controls)); assert(controls);
     struct qp_control *c=&controls[0]; void *mr[]={p,c,out,arena,io};
-    long long lengths[]={sizeof(*p),(workers+1)*sizeof(*c),(workers+1)*sizeof(*out),bytes,(workers+1)*QS_SORT_IO_BYTES};
+    long long lengths[]={plan_bytes,(workers+1)*sizeof(*c),(workers+1)*sizeof(*out),bytes,(workers+1)*QS_SORT_IO_BYTES};
     struct femu_csd_args a={.numr=5,.mr_addr=mr,.mr_len=lengths,.cparam1=1};
     struct test_spill spill={.mutex=PTHREAD_MUTEX_INITIALIZER};
-    unsigned seen=0,key=0,null_row=0,loads=0,epoch=0; uint64_t peak=0,available=0,done=0; int cancelled=0;
+    unsigned seen=0,key=0,null_row=0,loads=0,epoch=0,namespace_loads=0; uint64_t peak=0,available=0,done=0; int cancelled=0;
     atomic_uint_fast64_t offset=0; bool need_input[QS_WORKERS]={0};
     while(!out->finished) {
         if(c->parallel && !csIsReentry(&a)) {
@@ -236,6 +241,15 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers)
             (long long)status,seen,c->error_node,c->error,spill.stores,loads);
         assert(status>=0);
         unsigned op=(uint64_t)status>>60;
+        if(op==4) {
+            const struct femu_graph_read *r=(void *)io;
+            size_t offset=(le64toh(r->lba)-4096)*512;
+            assert(!ordered && ((uint64_t)status&CS_IO_VALUE_MASK)==1 &&
+                le32toh(r->blocks)==QS_PAGE/512 && offset+QS_PAGE<=raw_bytes &&
+                le32toh(r->afdm_index)==3 && le64toh(r->offset)==leaf->input_offset);
+            memcpy(arena+leaf->input_offset,raw+offset,QS_PAGE); a.cparam2=1; ++namespace_loads;
+            continue;
+        }
         if(op) {
             loads+=op==2; a.cparam2=spill_request(&spill,op,(uint64_t)status&CS_IO_VALUE_MASK,io);
             if(cancel==op) {
@@ -253,16 +267,18 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers)
         }
         for(unsigned r=0;r<out->rows;++r) {
             struct qs_cell *v=out->data[r].cells; assert(seen<rows);
-            while(key<rows && expected[key]%97==0) ++key;
-            if(key<rows) {
-                char want[width],prefix[16]; int n=snprintf(prefix,sizeof(prefix),"key-%05u-",key);
-                memcpy(want,prefix,n); memset(want+n,'a'+key%26,width-n);
+            if(ordered) while(key<rows && expected[key]%97==0) ++key;
+            unsigned source=ordered?(key<rows?expected[key]:null_row):seen;
+            unsigned value_key=ordered?key:(seen*1009)%rows;
+            if(source%97) {
+                char want[width],prefix[16]; int n=snprintf(prefix,sizeof(prefix),"key-%06u-",value_key);
+                memcpy(want,prefix,n); memset(want+n,'a'+value_key%26,width-n);
                 assert(!v[0].isnull && qs_cell_string(v)==width && qs_cell_is_string_ref(v));
                 assert(v[0].value>=0 && v[0].value+width<=out->str_bytes);
                 assert(!memcmp(out->str_data+(size_t)v[0].value,want,width));
-                assert(!v[1].isnull && v[1].value==expected[key]); ++key;
+                assert(!v[1].isnull && v[1].value==source); if(ordered) ++key;
             } else {
-                assert(v[0].isnull && !v[1].isnull && v[1].value==null_row); null_row+=97;
+                assert(v[0].isnull && !v[1].isnull && v[1].value==source); if(ordered) null_row+=97;
             }
             ++seen;
         }
@@ -273,7 +289,8 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers)
         }
     }
     if(!cancel) {
-        assert(seen==rows && spill.stores && loads && peak<=budget);
+        assert(seen==rows && spill.stores && (!ordered || loads) && peak<=budget);
+        if(!ordered) assert(namespace_loads==raw_bytes/QS_PAGE);
         if(workers) assert(out->metrics.workers==workers && p->pipelines[1].worker_ns);
         assert(out->metrics.dictionary_bytes>budget && out->metrics.dictionary_entries==rows-(rows+96)/97);
         for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i]);
@@ -282,8 +299,8 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers)
         for(unsigned i=0;i<spill.count;++i) { free(spill.tokens[i]); spill.tokens[i]=NULL; }
     }
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
-    if(!cancel) printf("PASS default dictionary Scan/Sort/output: %u rows, %llu bytes, STORE=%u LOAD=%u peak=%llu/%zu\n",
-        seen,(unsigned long long)out->metrics.dictionary_bytes,spill.stores,loads,(unsigned long long)peak,budget);
+    if(!cancel) printf("PASS default dictionary %s: %u rows, %llu bytes, STORE=%u LOAD=%u peak=%llu/%zu\n",
+        ordered?"Scan/Sort/output":"namespace Scan/output",seen,(unsigned long long)out->metrics.dictionary_bytes,spill.stores,loads,(unsigned long long)peak,budget);
     else printf("PASS default dictionary cancel after %s before CSF acknowledgement\n",cancel==1?"STORE":"LOAD");
     free(controls); free(spill.tokens); free(expected); free(raw); free(arena); free(io); free(out); free(p);
     assert(!pthread_mutex_destroy(&spill.mutex));
@@ -2206,11 +2223,18 @@ int main(int argc,char **argv)
     assert(qp_worker_mask(0)==0 && qp_worker_mask(32)==UINT32_MAX && qp_worker_mask(64)==UINT64_MAX);
     assert(argc==2 || argc==3 || argc==4); void *library=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(library);
     function capacity=(function)dlsym(library,"pg_sina_workmem_capacity"); assert(capacity);
+    if(argc==3 && !strcmp(argv[2],"--dictionary-64m")) {
+        assert(!cs_work_init(64U*1024*1024));
+        function run=(function)dlsym(library,"pg_sina_plan"); assert(run);
+        dictionary_plan(run,0,0,1,524288,64U*1024*1024);
+        return 0;
+    }
     if(argc==3 && !strcmp(argv[2],"--dictionary")) {
         assert(!cs_work_init(64U*1024*1024));
         function run=(function)dlsym(library,"pg_sina_plan"); assert(run);
-        for(unsigned cancel=0;cancel<=2;++cancel) dictionary_plan(run,cancel,0);
-        dictionary_plan(run,0,4);
+        for(unsigned cancel=0;cancel<=2;++cancel) dictionary_plan(run,cancel,0,1,32768,4U*1024*1024);
+        dictionary_plan(run,0,4,1,65536,8U*1024*1024);
+        dictionary_plan(run,0,0,0,32768,4U*1024*1024);
         return 0;
     }
     if(argc==3) {

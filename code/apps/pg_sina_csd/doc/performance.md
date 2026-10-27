@@ -87,29 +87,38 @@ Sort/spill归并Source仍有串行阶段；少数复杂表达式和DISTINCT形�
 
 ## 默认字典换入换出的当前验证
 
-默认 `pg_sina_plan` 创建可换页字典，扫描、向量/标量表达式、Join、聚合、Sort、索引和结果编码共用稳定 ID。正文、ID 目录、哈希桶按64KiB页面换出和换入；页缓存、描述符和每CU状态均计入查询预算。正常结束释放字典token，取消则由设备会话回收未确认的临时存储。SNIA/FEMU接口保持不变。
+当前资源验证下限为64MiB；不再增加或复测更小预算的压力场景。默认 `pg_sina_plan` 创建可换页字典，正文、ID目录、哈希桶及全部缓存/访问状态计入同一查询预算，消费者共用稳定ID。正常结束释放临时token和workmem，取消由设备会话回收未确认token。SNIA/FEMU请求及AFDM结果布局保持不变。
 
-当前保留的修复是：每CU提前保留一份标量投影恢复状态，缺页后保存已经消费的行和表达式进度，不再临时申请该状态。新增回归夹具占满剩余预算后继续执行真实字典表达式：修改前的执行代码会失败，当前代码通过，峰值恰为1,048,576字节预算。十二项相关原生检查（含64CU）和十项ASan/UBSan/泄漏检查通过。
+当前实现复用最近ID的正文定位，并将最终结果批次的文本按ID顺序读取后填回原行列。部分批次因内部NVM读取暂停后，只编码新增行。索引数组按实际文本列数分配，属于设备workmem。PG先合并读取结果前缀，再按 `str_bytes` 回传实际字符串，省去固定1MiB字符串区的整块读取。消费者组件覆盖元数据换页、UTF-8/substring、NULL/短路、Join、聚合、分轮归并、输出及取消清理；本轮还验证了部分批次追加和真实NVM请求重入。
 
-默认入口的 `pgSinaDictionaryNativePlan` 使用模拟NVM驱动真实NEED_*重入，完整核对文本、整数、NULL和顺序：
+### 64MiB功能验证
 
-| 路径 | 正文字节 | 查询预算 | 峰值字节 | STORE / LOAD |
-| --- | ---: | ---: | ---: | ---: |
-| 串行 Scan→Sort→输出，32,768行 | 5,188,800 | 4MiB | 4,158,512 | 104 / 32,446 |
-| 4CU Scan→局部Sort→归并→输出，65,536行 | 10,377,600 | 8MiB | 8,387,312 | 199 / 17,793 |
+`pgSinaDictionary64MiB` 从默认CSF入口执行Scan→Sort→输出，用模拟NVM完成真实NEED_*重入。它是设备代码的组件验证，不是Guest SQL延迟成绩。
 
-两者均要求发生换出和换入、峰值不超预算，结束后token、workmem和上下文归零；另外覆盖STORE/LOAD完成但CSF未确认时取消。消费者检查覆盖稳定ID、元数据换页、UTF-8/substring、NULL/短路、Hash/Merge/Index条件、聚合、分轮归并和最终输出恢复。
+| 项目 | 当前结果 |
+| --- | ---: |
+| 查询总预算 | 67,108,864字节 |
+| 输入行数 | 524,288 |
+| 字典正文 | 83,021,120字节，超过预算 |
+| 峰值workmem | 67,075,360字节 |
+| 总STORE / LOAD | 1,605 / 519,060 |
+| 完整文本、整数、NULL及顺序 | 全部匹配 |
+| 结束后token、workmem、上下文 | 全部归零 |
+| ASan / UBSan / 泄漏检查 | 通过 |
 
-Guest开发验证使用现有SF=1冻结的 `part` 表，读取 `p_name,p_comment,p_partkey` 并按三列排序，不修改数据。开发SQL使用后清理，不替代标准TPC-H验收。当前64MiB预算下完整20万行逐字节匹配host；[普通计时](../../../../results/dictionary-projection-64m.Kv6R69/timings.csv)为host **692.342ms**、CSD **1,989.073ms**。[profile](../../../../results/dictionary-projection-64m.Kv6R69/profile.log)峰值42,732,224字节，无spill，Sort Sink/Source CPU分别427.526/385.857ms，流水线平均活跃CU仅0.99。因此结果正确，但性能仍不合格，不能归因于容量不足。
+同夹具加载修改前SO时总STORE/LOAD为1,605/519,008，次数基本相同；不将本次修改宣称为整体换页性能收益。当前64KiB请求粒度下，519,060次LOAD约为34GB，仍需减少不必要的换入放大，不能仅以发生spill认定性能合格。
 
-最近一次8MiB完整20万行验证仍为上一阶段的[结果](../../../../results/dictionary-progress-8m.2bTGnh/check.txt)：正文8,571,617字节，单独就超过预算；结果匹配，峰值8,379,520字节，但spill读70.21GB、写7.53GB。该记录证明必须换页，不能证明读写放大合理，也不作为本阶段代码的重新验收成绩。字典换页目标仍未完成，需要继续减少缺页次数和驻留场景开销。
+### Guest针对性验证
 
-本阶段标准SQL仅来自 `tests/guest/queries/`，每条host/CSD执行前独立重启PG、清除Guest page cache，关闭profile计时，测量期间没有构建或其他测试：
+Guest保持8CU / 256MiB物理workmem / 64MiB FDM，查询预算显式设为64MiB。SQL及explain仅来自 `tests/guest/queries/`；每次host/CSD执行前重启PG并清除Guest page cache，计时关闭profile，期间没有构建或其他测试。未运行完整22条。
 
-| 查询 | 预算 | host ms | CSD ms | 结果 / 完整卸载 | 性能 |
-| --- | --- | ---: | ---: | --- | --- |
-| Q13 | 默认256MiB | 1,695.902 | 404.465 | 一致 / 是 | 快于同轮host |
-| Q16 | 默认256MiB | 719.581 | 549.403 | 一致 / 是 | 快于同轮host |
-| Q16 | 8MiB | 699.089 | 1,660.833 | 一致 / 是 | needs_analysis |
+| 查询 | host ms | CSD ms | 结果 / 完整卸载 | 性能 |
+| --- | ---: | ---: | --- | --- |
+| Q2 | 921.965 | 327.201 | 一致 / 是 | 快于同轮host |
+| Q6 | 2,649.067 | 464.230 | 一致 / 是 | 快于同轮host |
+| Q13 | 1,209.728 | 337.336 | 一致 / 是 | 快于同轮host |
+| Q16 | 710.559 | 475.991 | 一致 / 是 | 快于同轮host |
 
-原始成绩：[默认预算](../../../../results/tpch.mXA7Lu/timings.csv)、[8MiB](../../../../results/tpch.uB5rcA/timings.csv)。8MiB的[profile](../../../../results/tpch.uB5rcA/16.profile.log)峰值8,073,920字节，spill读写各44,957,696字节；未仅凭发生spill便认定性能合格。没有运行完整22条。
+[原始成绩](../../../../results/tpch.rnLI2L/timings.csv)及各查询 `plan.log` 确认查询预算为67,108,864字节，顶层为CSD Custom Scan。
+
+另用现有冻结 `part` 表做开发验证：读取 `p_name,p_comment,p_partkey` 并按三列排序，完整20万行逐字节匹配host。开发SQL使用后清理，不替代标准TPC-H验收。[64MiB普通计时](../../../../results/dictionary-batch-final-64m.KeYuM7/timings.csv)为host **647.466ms**、CSD **1,961.747ms**；[profile](../../../../results/dictionary-batch-final-64m.KeYuM7/profile.log)无spill，流水线平均活跃CU约0.98。该场景性能仍不合格，不能归因于内存不足。字典换页功能证据已覆盖64MiB超预算数据，但换入放大与驻留场景开销仍待优化，目标尚未完成。

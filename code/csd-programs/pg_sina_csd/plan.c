@@ -253,6 +253,7 @@ struct operator_state {
     struct set_probe *set_probe;
     struct pending_projection *project_retry;
 };
+struct output_string { uint32_t id; uint16_t row,column; };
 struct execution {
     cs_work_context *context;
     struct qp_plan *plan;
@@ -270,6 +271,9 @@ struct execution {
     int64_t text_wait;
     unsigned output_column;
     int output_pending;
+    struct output_string *output_order;
+    unsigned output_count,output_position,output_exported;
+    int output_active,output_status;
     struct operator_state *nodes;
     /* One scalar projection can wait per CU. Reserve its continuation before
      * the dictionary cache fills the query budget, rather than during a miss. */
@@ -4524,6 +4528,43 @@ static int export_row(struct execution *s,const struct qs_plan *root,struct qs_c
     s->output_column=0; s->output_pending=0; return 0;
 }
 
+static int output_string_order(const void *a,const void *b)
+{
+    const struct output_string *x=a,*y=b;
+    return x->id<y->id?-1:x->id>y->id;
+}
+/* IDs and body locations are appended together. Resolve this fixed-size
+ * batch in ID order, then write each value back to its original row/column.
+ * This groups directory/body reads without changing the SQL result order. */
+static int export_batch(struct execution *s,const struct qs_plan *root,struct qs_result *out)
+{
+    if(!s->output_active) {
+        s->output_count=s->output_position=0;
+        for(unsigned row=s->output_exported;row<out->rows;++row)
+            for(unsigned col=0;col<root->nout;++col) {
+                const struct qs_cell *v=&out->data[row].cells[col];
+                if(!v->isnull && root->exprs[root->outputs[col].index].type==Q_STRING)
+                    s->output_order[s->output_count++]=(struct output_string){(uint32_t)v->value,row,col};
+            }
+        qsort(s->output_order,s->output_count,sizeof(*s->output_order),output_string_order);
+        s->output_active=1;
+    }
+    for(;s->output_position<s->output_count;++s->output_position) {
+        const struct output_string *at=&s->output_order[s->output_position];
+        const char *bytes; unsigned length;
+        if(text_get(s,at->id,&bytes,&length)) return -3;
+        if(length>255 || out->str_bytes+length>QS_RESULT_STRING_BYTES) { text_release(s); return -3; }
+        struct qs_cell *v=&out->data[at->row].cells[at->column];
+        if(length<=QS_STRING_MAX) qs_cell_set_string(v,bytes,length);
+        else {
+            memcpy(out->str_data+out->str_bytes,bytes,length);
+            qs_cell_set_string_ref(v,out->str_bytes,length); out->str_bytes+=length;
+        }
+        if(text_release(s)) return -3;
+    }
+    s->output_exported=out->rows; s->output_active=0; return 0;
+}
+
 int64_t pg_sina_plan(struct femu_csd_args *a)
 {
     if(!a || a->numr!=5 || a->mr_len[0]<(long long)sizeof(struct qp_plan) ||
@@ -4552,6 +4593,14 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
         unsigned depth=sort_depth(plan,plan->root);
         s->sort_limit=budget/(depth+2); if(s->sort_limit<512*1024) { cs_work_end(context); return -4; }
         s->literal_ids=cs_work_calloc(context,plan->count*QS_STRINGS,sizeof(*s->literal_ids));
+        unsigned text_columns=0;
+        const struct qs_plan *output=&plan->nodes[plan->root].expr;
+        for(unsigned col=0;col<output->nout;++col)
+            text_columns+=output->exprs[output->outputs[col].index].type==Q_STRING;
+        if(text_columns) {
+            s->output_order=cs_work_calloc(context,(size_t)QS_RESULT_ROWS*text_columns,sizeof(*s->output_order));
+            if(!s->output_order) { cs_work_end(context); return -4; }
+        }
         s->paged=qs_dictionary_create(context);
         if(s->paged) { s->text=qs_dictionary_text_create(s->paged); s->initial_access=qs_dictionary_access_create(s->paged); }
         if(!s->literal_ids || !s->paged || !s->text || !s->initial_access) {
@@ -4605,7 +4654,9 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
         else { memcpy(p->cache,s->io,QS_SORT_IO_BYTES); p->loaded=s->pending_block; s->metrics.spill_read_bytes+=QS_SORT_IO_BYTES; }
         s->pending_spool=NULL;
     }
-    if(!csIsReentry(a) && !continuing) { out->rows=out->begin=out->finished=out->str_bytes=0; out->status=0; }
+    if(!csIsReentry(a) && !continuing) {
+        out->rows=out->begin=out->finished=out->str_bytes=0; out->status=0; s->output_exported=0;
+    }
     uint64_t start=s->profiling?now_ns(CLOCK_MONOTONIC):0,cpu=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
     if(s->profiling && !worker) s->pipeline_tick=cpu;
     struct execution *owner=worker?s->owner:s;
@@ -4614,6 +4665,7 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
         while(active>peak && !atomic_compare_exchange_weak(&owner->peak_cus,&peak,active)) { }
     }
     int64_t status=0;
+    if(s->output_active) { status=s->output_status; goto export_results; }
     while(s->initializer<plan->ninit) {
         unsigned index=s->initializer,node=plan->init_nodes[index]; int param=plan->init_params[index];
         if(param<0) {
@@ -4725,7 +4777,7 @@ produce:
         if(status==QP_WAIT || status<0 || status>2) break;
         if(!status) { out->finished=control->finished=1; break; }
         const struct qs_plan *root=&plan->nodes[plan->root].expr;
-        if(!worker && export_row(s,root,row,out)) { status=-3; break; }
+        if(!worker && !s->output_order && export_row(s,root,row,out)) { status=-3; break; }
         ++out->rows;
     }
 produced:
@@ -4761,6 +4813,13 @@ produced:
         /* A direct sink can consume another output batch from the same input
          * without asking PG to submit another compute request. */
         if(s->host_scan && !out->rows && status==2) goto produce;
+    }
+export_results:
+    if(!worker && s->output_order && out->rows && status>=0 && status<=2 &&
+       !s->text_wait && !s->dictionary_wait) {
+        if(!s->output_active) s->output_status=status;
+        if(export_batch(s,&plan->nodes[plan->root].expr,out)) status=-3;
+        else status=s->output_status;
     }
 combined:
     if(s->text_wait) status=s->text_wait;
