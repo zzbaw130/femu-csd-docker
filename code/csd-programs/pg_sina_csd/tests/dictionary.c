@@ -400,6 +400,42 @@ static void vector_expressions(void)
     assert(!qs_dictionary_text_release(text)); check_budget(parent,limit);
     close_dictionary(d,&a,&s); cs_work_free(parent,vectors); assert(!cs_work_end(parent)); storage_end(&s); free(cells);
 }
+/* Short expression values must survive page eviction and a writer, and
+ * repeated constants must not wait for another access's pending device I/O. */
+static void short_text_references(void)
+{
+    const size_t limit=384U*1024;
+    cs_work_context *parent=cs_work_begin_limit(limit); assert(parent);
+    struct qs_dictionary *d=qs_dictionary_create(parent); assert(d);
+    struct access a={.state=qs_dictionary_access_create(d)}; assert(a.state);
+    struct qs_dictionary_text *text=qs_dictionary_text_create(d); assert(text);
+    struct storage s={.mutex=PTHREAD_MUTEX_INITIALIZER};
+    uint32_t first=insert(d,&a,&s,"first",5),second=insert(d,&a,&s,"second",6),third=0;
+    const char *left,*right; unsigned ln,rn;
+    assert(!qs_dictionary_text_get(text,first,&left,&ln,a.io) && ln==5);
+    assert(!qs_dictionary_text_get(text,second,&right,&rn,a.io) && rn==6);
+    assert(!qs_dictionary_text_insert(text,"third",5,&third,a.io) && third);
+    uint64_t completion=0;
+    for(;;) {
+        int64_t status=qs_dictionary_evict(d,a.state,a.io,completion);
+        if(status==-4) break;
+        assert(status>=0 && status!=QS_DICTIONARY_BUSY); completion=status?complete(&s,status,a.io):0;
+    }
+    assert(!memcmp(left,"first",5) && !memcmp(right,"second",6));
+    assert(!qs_dictionary_text_release(text));
+    const char *bytes; unsigned length;
+    int64_t status=qs_dictionary_pin(d,a.state,third,&bytes,&length,a.io,0);
+    assert(((uint64_t)status&~CS_IO_VALUE_MASK)==CS_NEED_LOAD);
+    assert(!qs_dictionary_text_get(text,first,&left,&ln,a.io) && ln==5 && !memcmp(left,"first",5));
+    assert(!qs_dictionary_text_get(text,second,&right,&rn,a.io) && rn==6 && !memcmp(right,"second",6));
+    assert(!qs_dictionary_text_release(text));
+    while(status) {
+        assert(status>QS_DICTIONARY_BUSY); completion=complete(&s,status,a.io);
+        status=qs_dictionary_pin(d,a.state,third,&bytes,&length,a.io,completion);
+    }
+    assert(length==5 && !memcmp(bytes,"third",5)); qs_dictionary_unpin(a.state);
+    check_budget(parent,limit); close_dictionary(d,&a,&s); assert(!cs_work_end(parent)); storage_end(&s);
+}
 static void text_cancel(uint64_t operation)
 {
     cs_work_context *parent=cs_work_begin_limit(384U*1024); assert(parent);
@@ -438,7 +474,7 @@ int main(void)
     paging(10000,800,4U*1024*1024);
     paging(20000,17,384U*1024);
     concurrent_insert(); cancel_pending(CS_NEED_STORE); cancel_pending(CS_NEED_LOAD); heap_scan(); vector_expressions();
-    text_cancel(CS_NEED_STORE); text_cancel(CS_NEED_LOAD);
+    short_text_references(); text_cancel(CS_NEED_STORE); text_cancel(CS_NEED_LOAD);
     cs_work_stats stats; assert(!cs_work_get_stats(&stats));
     assert(!stats.used_bytes && !stats.active_contexts && !stats.active_allocations);
     puts("dictionary paging, metadata, pins, concurrent IDs and cancellation passed");

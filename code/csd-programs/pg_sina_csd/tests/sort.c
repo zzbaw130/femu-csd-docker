@@ -154,6 +154,7 @@ static void check(function sink,function source,unsigned rows,int64_t limit,int6
 }
 enum { TEXT_KEYS=4096, TEXT_LENGTH=2048 };
 static unsigned char *text_keys;
+static unsigned text_lengths[TEXT_KEYS];
 static int text_descending,text_nulls_first;
 static unsigned text_key(unsigned row) { return row*1009U%TEXT_KEYS; }
 static int text_order(const void *left,const void *right)
@@ -164,7 +165,9 @@ static int text_order(const void *left,const void *right)
         cmp=(a%13==0)?1:-1; if(text_nulls_first) cmp=-cmp; return cmp;
     }
     if(a%13) {
-        cmp=memcmp(text_keys+(size_t)text_key(a)*TEXT_LENGTH,text_keys+(size_t)text_key(b)*TEXT_LENGTH,TEXT_LENGTH);
+        unsigned ka=text_key(a),kb=text_key(b),la=text_lengths[ka],lb=text_lengths[kb];
+        cmp=memcmp(text_keys+(size_t)ka*TEXT_LENGTH,text_keys+(size_t)kb*TEXT_LENGTH,la<lb?la:lb);
+        if(!cmp) cmp=(la>lb)-(la<lb);
         if(cmp) return text_descending?-cmp:cmp;
     }
     return (a<b)-(a>b); /* Second key is descending row number. */
@@ -199,9 +202,14 @@ static void text_sort(void *so,function sink,function source,int64_t limit,int64
         char prefix[9]; assert(snprintf(prefix,sizeof(prefix),"%08u",i*7919U%TEXT_KEYS)==8);
         char *key=(char *)text_keys+(size_t)i*TEXT_LENGTH;
         memset(key,'a'+i%26,TEXT_LENGTH); memcpy(key,prefix,8);
+        text_lengths[i]=TEXT_LENGTH;
+        /* Empty/short strings cross the 12-byte boundary; long strings
+         * sharing a prefix must resume the exact dictionary comparison. */
+        if(i<16) { text_lengths[i]=i; memset(key,'x',i); }
+        else if(i%16==0) { memcpy(key,"shared-prefix",12); memcpy(key+12,prefix,8); }
         uint64_t completion=0;
         for(;;) {
-            int64_t status=qs_dictionary_insert(dictionary,access,key,TEXT_LENGTH,&ids[i],io,completion);
+            int64_t status=qs_dictionary_insert(dictionary,access,key,text_lengths[i],&ids[i],io,completion);
             if(!status) break;
             assert(status>QS_DICTIONARY_BUSY); completion=complete_io(status,io);
         }
@@ -256,6 +264,10 @@ static void text_sort(void *so,function sink,function source,int64_t limit,int64
             assert(seen+(uint64_t)offset<ROWS); unsigned row=expected[seen++ +offset];
             assert(output->data[i].cells[0].isnull==(row%13==0));
             if(row%13) assert(output->data[i].cells[0].value==ids[text_key(row)]);
+            if(output->data[i].cells[1].value!=row || output->data[i].cells[2].value!=row*7)
+                fprintf(stderr,"text row=%u expected=%u got=%llu key=%u null=%u limit=%lld\n",seen-1,row,
+                    (unsigned long long)output->data[i].cells[1].value,(unsigned)output->data[i].cells[0].value,
+                    output->data[i].cells[0].isnull,(long long)limit);
             assert(output->data[i].cells[1].value==row && output->data[i].cells[2].value==row*7);
         }
         if(cancel && !output->finished) {

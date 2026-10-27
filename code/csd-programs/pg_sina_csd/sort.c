@@ -94,9 +94,31 @@ struct row_sort {
     unsigned top_phase,top_child,sink_active,source_active,dictionary_io;
     uint64_t dictionary_completion;
     void *io;
+    unsigned prefix_active,prefix_row,prefix_key,prefix_columns;
 };
 enum { ROW_NONE, ROW_STORE, ROW_LOAD, ROW_FREE, ROW_COMPACT_STORE };
-enum { DICTIONARY_NONE, DICTIONARY_COMPARE, DICTIONARY_EVICT };
+enum { DICTIONARY_NONE, DICTIONARY_COMPARE, DICTIONARY_EVICT, DICTIONARY_PREFIX };
+/* Private run representation: retain the 32-bit ID and use the remaining
+ * value bytes for a 12-byte prefix, like DuckDB's abbreviated string keys.
+ * scale=13 means the text continues past the prefix; dscale marks this run
+ * cell only. Source restores canonical IDs before exposing any rows. */
+#define TEXT_PREFIX_BYTES 12U
+#define TEXT_PREFIX_TAG 254U
+static int text_output(const struct qs_plan *p,unsigned col)
+{
+    unsigned oid=p->outputs[col].type_oid;
+    return oid==25 || oid==1042 || oid==1043;
+}
+static void restore_text_keys(const struct row_sort *s,struct qs_cell *row)
+{
+    if(!s->prefix_columns) return;
+    for(unsigned k=0;k<s->plan.norder;++k) {
+        unsigned col=s->plan.order[k].output; struct qs_cell *v=&row[col];
+        if(text_output(&s->plan,col) && !v->isnull && v->dscale==TEXT_PREFIX_TAG) {
+            v->value=(uint32_t)v->value; v->scale=v->dscale=0;
+        }
+    }
+}
 static int64_t row_evict(struct row_sort *,cs_work_context *,struct femu_csd_args *);
 static int64_t row_compare(struct row_sort *s,const struct qs_cell *a,const struct qs_cell *b,
     int *result,struct femu_csd_args *args)
@@ -110,7 +132,14 @@ static int64_t row_compare(struct row_sort *s,const struct qs_cell *a,const stru
             unsigned oid=p->outputs[key->output].type_oid;
             if((s->dictionary || s->paged_dictionary) && (oid==25 || oid==1042 || oid==1043)) {
                 const char *left,*right; unsigned ln,rn;
-                if(s->paged_dictionary && x.value!=y.value) {
+                if(s->paged_dictionary && (uint32_t)x.value!=(uint32_t)y.value) {
+                    if(x.dscale==TEXT_PREFIX_TAG && y.dscale==TEXT_PREFIX_TAG) {
+                        unsigned n=x.scale<y.scale?x.scale:y.scale;
+                        if(n>TEXT_PREFIX_BYTES) n=TEXT_PREFIX_BYTES;
+                        cmp=memcmp((const char *)&x.value+sizeof(uint32_t),(const char *)&y.value+sizeof(uint32_t),n);
+                        if(!cmp && x.scale!=y.scale) cmp=(x.scale>y.scale)-(x.scale<y.scale);
+                        if(cmp || x.scale<=TEXT_PREFIX_BYTES || y.scale<=TEXT_PREFIX_BYTES) goto compared_text;
+                    }
                     s->compare_key=i; s->comparing=1;
                     while(s->compare_phase<2) {
                         struct qs_dictionary_access *access=s->compare_phase?s->text_right:s->text_left;
@@ -141,6 +170,7 @@ static int64_t row_compare(struct row_sort *s,const struct qs_cell *a,const stru
                     cmp=memcmp(left,right,ln<rn?ln:rn); if(!cmp) cmp=(ln>rn)-(ln<rn);
                 }
             } else if(qs_compare(x,y,&cmp)) return -3;
+compared_text:
             if(key->descending) cmp=-cmp;
         }
         if(cmp) { s->compare_key=0; *result=cmp; return 0; }
@@ -377,7 +407,7 @@ static int64_t row_resume(struct row_sort *s,struct femu_csd_args *a)
         if(!status) s->dictionary_io=DICTIONARY_NONE;
         return status;
     }
-    if(s->dictionary_io==DICTIONARY_COMPARE) {
+    if(s->dictionary_io==DICTIONARY_COMPARE || s->dictionary_io==DICTIONARY_PREFIX) {
         if(!csIsReentry(a)) return -1;
         s->dictionary_completion=csReentryValue(a); s->dictionary_io=DICTIONARY_NONE;
         return 0;
@@ -404,6 +434,34 @@ static int64_t row_resume(struct row_sort *s,struct femu_csd_args *a)
     }
     else return -1;
     s->pending=ROW_NONE; return 0;
+}
+/* Prepare copied rows once, before sorting or spilling them. Keeping the
+ * row/key cursor makes a missing prefix page resume without copying input
+ * again or advancing the producer twice. */
+static int64_t prepare_text_keys(struct row_sort *s,struct femu_csd_args *a)
+{
+    if(!s->prefix_active) return 0;
+    struct row_run *r=&s->runs[s->count-1];
+    for(;s->prefix_row<r->rows;++s->prefix_row,s->prefix_key=0)
+        for(;s->prefix_key<s->plan.norder;++s->prefix_key) {
+            unsigned col=s->plan.order[s->prefix_key].output;
+            struct qs_cell *v=&run_row(s,r,s->prefix_row)[col];
+            if(!text_output(&s->plan,col) || v->isnull || v->dscale==TEXT_PREFIX_TAG) continue;
+            const char *bytes; unsigned length;
+retry_prefix:
+            s->comparing=1;
+            int64_t status=qs_dictionary_pin(s->paged_dictionary,s->text_left,(uint32_t)v->value,
+                &bytes,&length,s->io,s->dictionary_completion);
+            s->dictionary_completion=0;
+            if(status==-4) { status=row_evict(s,s->context,a); if(!status) goto retry_prefix; }
+            else if(status>QS_DICTIONARY_BUSY) s->dictionary_io=DICTIONARY_PREFIX;
+            if(status) return status;
+            uint32_t id=(uint32_t)v->value; v->value=id;
+            memcpy((char *)&v->value+sizeof(id),bytes,length<TEXT_PREFIX_BYTES?length:TEXT_PREFIX_BYTES);
+            v->scale=length<=TEXT_PREFIX_BYTES?length:TEXT_PREFIX_BYTES+1; v->dscale=TEXT_PREFIX_TAG;
+            qs_dictionary_unpin(s->text_left); s->comparing=0;
+        }
+    s->prefix_active=s->prefix_row=s->prefix_key=0; return 0;
 }
 static int row_init(struct qs_task *task,const struct qs_plan *p,struct row_sort **out)
 {
@@ -461,6 +519,7 @@ int64_t qs_sort_finish_sink(uint64_t state,struct femu_csd_args *a)
 {
     struct row_sort *s=(void *)(uintptr_t)state;
     int64_t status=row_resume(s,a); if(status) return status;
+    status=prepare_text_keys(s,a); if(status) return status;
     for(unsigned i=0;i<s->count;++i) {
         struct row_run *r=&s->runs[i];
         if(r->rows) { status=run_sort(s,r,a); if(status) return status; }
@@ -495,6 +554,7 @@ static int64_t row_sink(struct femu_csd_args *a,const struct qs_plan *columns,
         s->metrics.input_bytes+=task->input_bytes; ++s->metrics.chunks;
     }
     int64_t status=row_resume(s,a); if(status) return status;
+    status=prepare_text_keys(s,a); if(status) return status;
     if(!s->bounded && s->count) {
         struct row_run *last=&s->runs[s->count-1];
         if(last->rows==s->run_rows) { status=run_sort(s,last,a); if(status) return status; }
@@ -506,7 +566,10 @@ static int64_t row_sink(struct femu_csd_args *a,const struct qs_plan *columns,
             /* Budget for the next run, not a fixed free-memory percentage.
              * Leave one I/O block plus allocation overhead for merge/metadata.
              * Allocation failure still handles fragmentation/global pressure. */
-            if(row_reserve(s)) return row_evict(s,s->context,a);
+            if(row_reserve(s)) {
+                status=row_evict(s,s->context,a); if(status) return status;
+                continue; /* Reclaimed cache is progress, not consumed input. */
+            }
             r=&s->runs[s->count-1];
         }
         unsigned count=selected-s->input_position;
@@ -572,7 +635,13 @@ static int64_t row_sink(struct femu_csd_args *a,const struct qs_plan *columns,
                 }
             }
         }
-        if(!s->bounded) s->input_position+=count;
+        if(!s->bounded) {
+            s->input_position+=count;
+            if(s->prefix_columns) {
+                s->prefix_active=1; s->prefix_row=r->rows-count; s->prefix_key=0;
+                status=prepare_text_keys(s,a); if(status) return status;
+            }
+        }
         if(!s->bounded && r->rows==s->run_rows) { status=run_sort(s,r,a); if(status) return status; }
     }
     s->sink_active=0; return 0;
@@ -597,7 +666,12 @@ int qs_sort_paged_dictionary(uint64_t state,struct qs_dictionary *dictionary)
     if(!s->text_right) s->text_right=qs_dictionary_access_create(dictionary);
     if(!s->text_evict) s->text_evict=qs_dictionary_access_create(dictionary);
     if(!s->text_left || !s->text_right || !s->text_evict) return -4;
-    s->paged_dictionary=dictionary; return 0;
+    s->paged_dictionary=dictionary;
+    for(unsigned k=0;k<s->plan.norder;++k) {
+        unsigned col=s->plan.order[k].output;
+        if(text_output(&s->plan,col)) s->prefix_columns|=1U<<col;
+    }
+    return 0;
 }
 static int64_t merge_sift(struct row_sort *s,unsigned root,struct femu_csd_args *a)
 {
@@ -910,7 +984,10 @@ int64_t pg_sina_sort_source(struct femu_csd_args *a)
             s->root_pending=0; continue;
         }
         if(s->skipped<(uint64_t)s->plan.offset) ++s->skipped;
-        else { memcpy(out->data[out->rows++].cells,r->head,s->row_bytes); ++s->emitted; }
+        else {
+            struct qs_cell *row=out->data[out->rows++].cells;
+            memcpy(row,r->head,s->row_bytes); restore_text_keys(s,row); ++s->emitted;
+        }
         ++r->position; s->root_pending=1;
     }
     out->metrics=s->metrics;

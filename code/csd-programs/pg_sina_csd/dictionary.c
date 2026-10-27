@@ -42,15 +42,19 @@ struct text_reference {
     struct qs_dictionary_access access;
     const char *bytes;
     uint32_t id;
-    unsigned length,ready;
+    unsigned length,ready,copied;
+    char copy[64];
 };
 /* Small per-CU memo of already interned short values. It owns copies, never
  * borrowed page pointers, so eviction cannot invalidate a hit. This avoids
- * serial dictionary operations for every repeated categorical Heap value. */
+ * serial dictionary operations for every repeated categorical Heap value.
+ * Four entries per bucket prevent short categorical keys with the same hash
+ * slot from evicting one another on every row. */
 struct text_intern { uint32_t id; unsigned length; char bytes[64]; };
 struct qs_dictionary_text {
     struct qs_dictionary *dictionary;
-    struct text_intern interned[64];
+    struct text_intern (*interned)[4];
+    unsigned intern_next;
     struct text_reference references[2];
     struct qs_dictionary_access writer;
     const char *key;
@@ -386,8 +390,17 @@ int64_t qs_dictionary_text_resume(struct qs_dictionary_text *t,void *io,uint64_t
     int64_t status;
     if(t->pending<=2) {
         struct text_reference *r=&t->references[t->pending-1];
+        r->copied=0;
         status=qs_dictionary_pin(t->dictionary,&r->access,r->id,&r->bytes,&r->length,io,completion);
-        if(!status) r->ready=1;
+        if(!status) {
+            /* Constant vectors repeatedly read the same small literal. Keep
+             * its bytes between expressions, not a pin on its cache page. */
+            if(r->length<=sizeof(r->copy)) {
+                if(r->length) memcpy(r->copy,r->bytes,r->length);
+                qs_dictionary_unpin(&r->access); r->bytes=r->copy; r->copied=1;
+            }
+            r->ready=1;
+        }
     } else {
         status=qs_dictionary_insert(t->dictionary,&t->writer,t->key,t->length,&t->inserted,io,completion);
         if(!status) t->insert_ready=1;
@@ -403,6 +416,10 @@ int64_t qs_dictionary_text_get(struct qs_dictionary_text *t,uint32_t id,
         *bytes=t->references[i].bytes; *length=t->references[i].length; return 0;
     }
     if(t->pending) return t->request;
+    for(unsigned i=0;i<2;++i) if(t->references[i].copied && t->references[i].id==id) {
+        struct text_reference *r=&t->references[i];
+        r->ready=1; *bytes=r->copy; *length=r->length; return 0;
+    }
     for(unsigned i=0;i<2;++i) if(!t->references[i].ready) {
         struct text_reference *r=&t->references[i];
         r->id=id; t->pending=i+1;
@@ -416,13 +433,24 @@ int64_t qs_dictionary_text_insert(struct qs_dictionary_text *t,const char *bytes
     unsigned length,uint32_t *id,void *io)
 {
     struct text_intern *cached=NULL;
-    if(length<=sizeof(t->interned[0].bytes) && (!length || bytes)) {
+    if(length<=sizeof(t->interned[0][0].bytes) && (!length || bytes)) {
+        /* Numeric-only CUs need no cache. This optimization is optional when
+         * its workmem allocation cannot fit; the paged lookup still works. */
+        if(!t->interned && !t->pending && !t->insert_ready)
+            t->interned=cs_work_calloc(t->dictionary->context,64,sizeof(*t->interned));
+        if(!t->interned) goto lookup;
         uint32_t hash=2166136261U;
         for(unsigned i=0;i<length;++i) { hash^=(unsigned char)bytes[i]; hash*=16777619U; }
-        cached=&t->interned[hash%64];
-        if(!t->pending && !t->insert_ready && cached->id && cached->length==length &&
-           (!length || !memcmp(cached->bytes,bytes,length))) { *id=cached->id; return 0; }
+        struct text_intern *bucket=t->interned[hash%64];
+        cached=&bucket[t->intern_next%4];
+        for(unsigned i=0;i<4;++i) {
+            struct text_intern *entry=&bucket[i];
+            if(!entry->id) cached=entry;
+            if(!t->pending && !t->insert_ready && entry->id && entry->length==length &&
+               (!length || !memcmp(entry->bytes,bytes,length))) { *id=entry->id; return 0; }
+        }
     }
+lookup:
     if(!t->insert_ready) {
         if(t->pending) return t->request;
         t->key=bytes; t->length=length; t->pending=3;
@@ -430,7 +458,10 @@ int64_t qs_dictionary_text_insert(struct qs_dictionary_text *t,const char *bytes
     }
     if(t->length!=length || (length && memcmp(t->key,bytes,length))) return -3;
     *id=t->inserted;
-    if(cached) { cached->id=*id; cached->length=length; if(length) memcpy(cached->bytes,bytes,length); }
+    if(cached) {
+        cached->id=*id; cached->length=length; if(length) memcpy(cached->bytes,bytes,length);
+        ++t->intern_next;
+    }
     t->insert_ready=0; t->key=NULL; return 0;
 }
 int64_t qs_dictionary_text_request(const struct qs_dictionary_text *t)
