@@ -22,7 +22,8 @@ struct plan_slot {
     u64 completion_value;
     bool profiling;
     uint64_t callback_ns;
-    bool ready, done, control_copied;
+    bool ready, done, control_copied, yielded;
+    uint64_t retry_progress;
     unsigned scan_node;
     bool need_input;
     uint64_t queued_ns;
@@ -41,6 +42,8 @@ struct PlanStateCsd {
     struct plan_slot slots[QS_WORKERS+1];
     unsigned workers, epoch, device_cus;
     atomic_uint_fast64_t next_scan_offset;
+    atomic_uint_fast64_t batch_progress;
+    unsigned retry_worker;
     atomic_bool stopping;
     bool parallel;
     atomic_uint_fast64_t load_ns, load_calls, completion_reads;
@@ -84,6 +87,7 @@ static void completed(void *context,CS_STATUS status,u64 value)
     pthread_mutex_lock(&slot->mutex);
     if(status==CS_SUCCESS && slot->worker &&
        !atomic_load_explicit(&slot->owner->stopping,memory_order_acquire)) {
+        if(value && !(value&QP_RESOURCE_WAIT)) atomic_fetch_add_explicit(&slot->owner->batch_progress,1,memory_order_release);
         uint64_t previous=slot->queued_ns;
         CS_STATUS next=CS_NOT_DONE;
         if(slot->scan_node) {
@@ -102,7 +106,7 @@ static void completed(void *context,CS_STATUS status,u64 value)
             slot->control_copied=status==CS_SUCCESS;
             /* A full sink/output or EOF needs its coordinator. Pure input
              * waits and empty output batches can continue on this CU. */
-            if(status==CS_SUCCESS && !slot->control.output_rows && !slot->control.finished && !slot->control.error)
+            if(status==CS_SUCCESS && !(value&QP_RESOURCE_WAIT) && !slot->control.output_rows && !slot->control.finished && !slot->control.error)
                 next=queue_pages(slot);
         }
         if(next==CS_QUEUED) {
@@ -191,7 +195,7 @@ static void begin(CustomScanState *node,EState *estate,int flags)
     s->explain_only=flags&EXEC_FLAG_EXPLAIN_ONLY;
     atomic_init(&s->stopping,false); atomic_init(&s->next_scan_offset,0);
     atomic_init(&s->load_ns,0); atomic_init(&s->load_calls,0);
-    atomic_init(&s->completion_reads,0);
+    atomic_init(&s->completion_reads,0); atomic_init(&s->batch_progress,0);
     s->cleanup.func=close_state; s->cleanup.arg=s;
     MemoryContextRegisterResetCallback(estate->es_query_cxt,&s->cleanup);
 }
@@ -263,6 +267,7 @@ static void start(PlanStateCsd *s)
     }
     s->profiling=pg_sina_profile; s->start_ns=clock_ns(); s->load_ns=s->load_calls=0;
     atomic_store(&s->stopping,false);
+    atomic_store(&s->batch_progress,0); s->retry_worker=0;
     s->poll_ns=s->completion_copy_ns=s->submit_ns=s->queue_ns=s->control_write_ns=0;
     s->idle_ns=s->pending_ns=s->submits=s->polls=s->completions=0;
     s->completion_reads=s->control_writes=0;
@@ -522,6 +527,7 @@ static void submit(PlanStateCsd *s,unsigned worker)
 {
     uint64_t started=s->profiling?clock_ns():0;
     struct plan_slot *slot=&s->slots[worker];
+    slot->yielded=false;
     bool assigned=slot->scan_node && slot->need_input;
     if(assigned) {
         atomic_store_explicit(&slot->completed,false,memory_order_relaxed);
@@ -604,8 +610,15 @@ static void fetch(PlanStateCsd *s)
                 ereport(ERROR,(errmsg("CSD PG Plan node %u failed: device=%d, status=%d",slot->control.error_node,slot->control.error,status)));
             checked(status,"execute tree"); progress=true;
             if(slot->resume) { checked(csFreeBatchRequest(slot->resume),"release LOAD batch"); slot->resume=NULL; }
-            if(w) { slot->ready=slot->control.output_rows || slot->control.finished; slot->done=slot->control.finished; continue; }
+            if(w) {
+                slot->ready=slot->control.output_rows || slot->control.finished; slot->done=slot->control.finished;
+                slot->yielded=(value&QP_RESOURCE_WAIT)!=0;
+                slot->retry_progress=atomic_load_explicit(&s->batch_progress,memory_order_acquire);
+                continue;
+            }
             memcpy(s->result,&header,offsetof(struct qs_result,data));
+            if(header.rows || header.finished || slot->control.drained)
+                atomic_fetch_add_explicit(&s->batch_progress,1,memory_order_release);
             for(unsigned i=1;i<=s->workers;++i) if(slot->control.drained&(UINT64_C(1)<<(i-1))) s->slots[i].ready=false;
             s->parallel=slot->control.parallel;
             if(slot->control.epoch!=s->epoch) {
@@ -613,7 +626,7 @@ static void fetch(PlanStateCsd *s)
                 atomic_store(&s->next_scan_offset,0);
                 for(unsigned i=1;i<=s->workers;++i) {
                     struct plan_slot *worker=&s->slots[i];
-                    worker->ready=worker->done=false;
+                    worker->ready=worker->done=worker->yielded=false;
                     worker->scan_node=slot->control.scan_node;
                     worker->need_input=worker->scan_node!=0;
                     /* The device initializes each phase's worker control to
@@ -632,19 +645,40 @@ static void fetch(PlanStateCsd *s)
                     sizeof(s->plan->pipelines),false),"read pipeline profile");
             if(s->result->rows || s->result->finished) { s->row=0; return; }
         }
-        if(s->parallel && !(s->slots[0].control.parallel==2 && s->slots[0].pending)) for(unsigned w=1;w<=s->workers;++w) {
-            struct plan_slot *slot=&s->slots[w];
-            if(!slot->pending && !slot->ready && !slot->done) { HOLD_INTERRUPTS(); submit(s,w); RESUME_INTERRUPTS(); progress=true; }
+        if(s->parallel && !(s->slots[0].control.parallel==2 && s->slots[0].pending)) {
+            uint64_t advanced=atomic_load_explicit(&s->batch_progress,memory_order_acquire);
+            bool pending=s->slots[0].pending!=NULL;
+            unsigned retry=0;
+            for(unsigned w=1;w<=s->workers;++w) {
+                struct plan_slot *slot=&s->slots[w];
+                if(slot->pending) { pending=true; continue; }
+                if(slot->ready || slot->done) continue;
+                if(!slot->yielded || slot->retry_progress!=advanced) {
+                    HOLD_INTERRUPTS(); submit(s,w); RESUME_INTERRUPTS(); progress=true; pending=true;
+                } else if(!retry || (retry<=s->retry_worker && w>s->retry_worker)) retry=w;
+            }
+            /* RESOURCE_WAIT retains its input but cannot currently
+             * advance (for example, another CU owns dictionary I/O).
+             * Wake it on peer progress, not every host poll. If all calls
+             * yielded, retry one in turn so an empty batch cannot deadlock. */
+            if(!pending && retry) {
+                s->retry_worker=retry;
+                HOLD_INTERRUPTS(); submit(s,retry); RESUME_INTERRUPTS(); progress=true;
+            }
         }
         struct plan_slot *main=&s->slots[0];
         if(!main->pending) {
             uint64_t ready=0;
             for(unsigned w=1;w<=s->workers;++w) if(s->slots[w].ready) ready|=UINT64_C(1)<<(w-1);
             /* Direct build/aggregate sinks share a bounded table. Its owner
-             * may resize or spill only after every CU in the wave is idle. */
+             * may resize/spill only after the wave is idle. A yielded CU
+             * still retains input/update state, so it is not at that barrier. */
             bool idle=true;
             if(main->control.parallel==2)
-                for(unsigned w=1;w<=s->workers;++w) if(s->slots[w].pending) idle=false;
+                for(unsigned w=1;w<=s->workers;++w) {
+                    struct plan_slot *slot=&s->slots[w];
+                    if(slot->pending || (slot->yielded && !slot->ready && !slot->done)) idle=false;
+                }
             if(s->profiling && main->control.parallel==2) {
                 bool output=false;
                 for(unsigned w=1;w<=s->workers;++w)

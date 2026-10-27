@@ -399,6 +399,10 @@ static void *probe_worker(void *arg)
             t->args.cparam2=spill_request(t->spill,op,id,t->args.mr_addr[4]); continue;
         }
         t->args.cparam2=0;
+        if(status&QP_RESOURCE_WAIT) {
+            assert(status==QP_RESOURCE_WAIT && !t->out->rows && !t->out->finished);
+            continue; /* The same input remains assigned to this CU. */
+        }
         assert((unsigned)status<=15);
         assert(((status&QP_OUTPUT_READY)!=0)==(t->out->rows!=0));
         assert(((status&QP_WORKER_FINISHED)!=0)==(t->out->finished!=0));

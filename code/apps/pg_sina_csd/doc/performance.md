@@ -99,14 +99,18 @@ Sort/spill归并Source仍有串行阶段；少数复杂表达式和DISTINCT形�
 
 正常结束要求发生 STORE 和 LOAD，峰值不超预算，所有 token、workmem 和上下文归零。字典描述符和访问状态也在预算内。消费者组件另外覆盖元数据换页、稳定 ID、UTF-8/substring、NULL/短路、Hash/Merge/Index 条件、共享及局部聚合、分轮归并和最终输出恢复。十二项相关原生检查（含64CU）和十一项 ASan/UBSan/泄漏检查通过。
 
-Guest 开发验证使用现有SF=1冻结的 `part` 表，读取 `p_name,p_comment,p_partkey` 并按三列排序，不改写数据。开发SQL位于临时目录，结束已清理，不替代标准TPC-H验收。完整20万行在64MiB与8MiB预算下均与冷启动原生PG逐字节一致，见[完整结果检查](../../../../results/dictionary.0t2BdS/check.txt)和[普通计时](../../../../results/dictionary.0t2BdS/timings.csv)。
+Guest 开发验证使用现有SF=1冻结的 `part` 表，读取 `p_name,p_comment,p_partkey` 并按三列排序，不改写数据。开发SQL位于临时目录，结束已清理，不替代标准TPC-H验收。完整20万行在两种预算下均与冷启动原生PG逐字节一致，原始证据见[64MiB](../../../../results/dictionary-progress.7N3YaF/timings.csv)与[8MiB](../../../../results/dictionary-progress-8m.2bTGnh/check.txt)。
 
 | 查询预算 | host ms | CSD ms | profile峰值 | spill读/写 | 结论 |
 | --- | ---: | ---: | ---: | --- | --- |
-| 64MiB | 683.774 | 2,192.858 | 42,670,592字节 | 0 / 0 | 结果正确，性能不合格 |
-| 8MiB | 683.774 | 190,455.209 | 8,385,280字节 | 71.39GB / 7.17GB | 结果正确，仍需分析实现开销 |
+| 64MiB | 655.809 | 2,109.781 | 42,670,592字节 | 0 / 0 | 结果正确，性能不合格 |
+| 8MiB | 689.380 | 183,931.114 | 8,379,520字节 | 70.21GB / 7.53GB | 结果正确，仍需分析实现开销 |
 
-[64MiB profile](../../../../results/dictionary.0t2BdS/64m.profile.log)包含330,701个字典条目、8,571,617字节正文，没有spill，但有24,939次主机提交和低并行利用率，不能归因于物理内存不足。[8MiB profile](../../../../results/dictionary.0t2BdS/8m.profile.log)的正文单独就超过预算，确实需要换页；不过2,383,272次主机提交与很高的读写放大仍属于必须继续定位的问题，不直接认定性能合格。profile执行213,330.163ms，普通关闭profile计时190,455.209ms，两者不混用。
+现有worker CompValue的 `QP_RESOURCE_WAIT` 位区分保留输入的资源等待和普通空批次。等待者在其他batch推进后续交；所有请求都让出时轮流试交一个，共享表迁移仍等保留状态的批次到达屏障。主机提交从此前24,939/2,383,272降至[867](../../../../results/dictionary-progress.7N3YaF/profile.log)/[872](../../../../results/dictionary-progress-8m.2bTGnh/profile.log)，未新增执行锁或设备指令。它消除了大量无效重提交，却没有解决剩余换页和计算开销，不能因此宣称性能合格。
+
+64MiB没有spill仍慢于host，不能归因于容量不足。8MiB时8,571,617字节正文单独就超过预算，确实需要换页；但读写放大仍须优化。8MiB开启profile为179,215.320ms，普通计时为183,931.114ms，两者不混用。
+
+同一标准[Q13/Q16](../../../../results/tpch.pPEuIt/timings.csv)在默认预算下均完整卸载、结果一致并快于host；另用未改写的[Q16、8MiB预算](../../../../results/tpch.bzKtEK/timings.csv)验证共享聚合扩容与spill，结果仍一致。[诊断](../../../../results/tpch.bzKtEK/16.profile.log)峰值8,012,288字节、spill读写各44,957,696字节；CSD 1,701.733ms慢于host 762.661ms，保留needs_analysis。没有重复全量22条。
 
 排序现在在run内保存12字节字符串前缀，同前缀无法定序才取正文，Source交出前恢复原ID。测试额外覆盖空串、12字节边界、长公共前缀及NULL；还修复了回收缓存返回0时误当作消费完毕而丢批次的问题。短值采用按需分配的四路缓存；两个短引用保存副本，常量读取不反复固定页面。相关原生与消毒器检查覆盖输出正确性和回收，不用组件耗时代替SQL性能结论。
 

@@ -4384,7 +4384,7 @@ static int64_t dictionary_request(struct execution *s,struct qs_result *out,int6
     s->buffered_rows=out->rows; s->buffered_finished=out->finished; s->buffered=1;
     out->rows=out->finished=0;
     s->control->output_rows=s->control->finished=0;
-    return 0;
+    return s->worker?QP_RESOURCE_WAIT:0;
 }
 static int64_t finish_dictionary(struct execution *s,struct femu_csd_args *a,struct qs_result *out)
 {
