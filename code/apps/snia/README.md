@@ -66,6 +66,8 @@ FEMU 插件用 Identify 校验 CSD 身份及 namespace 格式，用 GET_INFO 查
 
 设备图是本项目的 FEMU 扩展，不新增公开能力查询标志。此版本 FEMU 插件要求同时更新设备固件；不探测旧固件再静默回退。私有插件操作表升级为 ABI 3，公共库与插件须一起重新编译；应用的 cs.h 与链接规则不变。
 
+只读文件的实验性缓存回填通过 `SNIA_FEMU_CACHE_REFILL=1` 开启，默认关闭。需要 Guest 内核接收模块、文件 extent 注册，以及匹配的 FEMU 固件；数据流、只读约定、编译方法和逐块测量见 [femu-cache](../femu-cache/README.md)。它不改变标准 SNIA API。
+
 ## 二、上层应用：参数按算子约定填写
 
 ```c
