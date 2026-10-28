@@ -54,8 +54,8 @@ def refill_path(devices, hosts, critical, offset, parallel=False):
         stages = [
             ('page_bio_prepare', p['begin'], p['dma_submit']),
             ('dma_request', p['dma_submit'], p['dma_done']),
-            ('publish_pages', p['dma_done'], p['ack_begin']),
-            ('ack_request', p['ack_begin'], p['ack_end']),
+            ('publish_pages', p['dma_done'], p['published']),
+            *([('ack_request', p['ack_begin'], p['ack_end'])] if p['ack_begin'] else []),
         ]
         assert all(a <= b for _, a, b in stages)
         segments.extend((token, name, a, b) for name, a, b in stages)
@@ -67,7 +67,7 @@ def refill_path(devices, hosts, critical, offset, parallel=False):
     wait = 0
     for token in critical:
         d = devices[token]
-        a, b = d['cu'] - offset, d['cache_ack'] - offset
+        a, b = d['cu'] - offset, d['release'] - offset
         if b <= a:
             continue
         wait += b - a
@@ -94,10 +94,13 @@ def analyze(root, round_number):
     by_lba = {r['lba']: r for r in hosts.values()}
     assert len(by_lba) == 256 and all(r['dma_calls'] == 1 for r in hosts.values())
     # D = G + offset. Each device operation occurs inside its Guest request.
-    low = max(max(devices[t]['dma'] - p['dma_done'],
-                  devices[t]['cache_ack'] - p['ack_end']) for t, p in hosts.items())
-    high = min(min(devices[t]['dma_start'] - p['dma_submit'],
-                   devices[t]['cache_ack'] - p['ack_begin']) for t, p in hosts.items())
+    bounds = [(devices[t]['dma'] - p['dma_done'],
+               devices[t]['dma_start'] - p['dma_submit']) for t, p in hosts.items()]
+    bounds += [(devices[t]['cache_ack'] - p['ack_end'],
+                devices[t]['cache_ack'] - p['ack_begin']) for t, p in hosts.items()
+               if devices[t]['cache_ack'] and p['ack_begin']]
+    low = max(a for a, _ in bounds)
+    high = min(b for _, b in bounds)
     assert low <= high, f'clock bounds do not intersect: {low}, {high}'
     offset = (low + high) / 2
     critical = [by_lba[r['lba']]['token'] for r in critical_apps]
@@ -125,8 +128,10 @@ def analyze(root, round_number):
         values['dma_roundtrip'].append(p['dma_done'] - p['dma_submit'])
         values['dma_copy'].append(d['dma'] - d['dma_start'])
         values['dma_completion_return'].append(p['dma_done'] - (d['dma'] - offset))
-        values['ack_roundtrip'].append(p['ack_end'] - p['ack_begin'])
-        values['ack_completion_return'].append(p['ack_end'] - (d['cache_ack'] - offset))
+        if p['ack_begin']:
+            values['ack_roundtrip'].append(p['ack_end'] - p['ack_begin'])
+        if d['cache_ack'] and p['ack_begin']:
+            values['ack_completion_return'].append(p['ack_end'] - (d['cache_ack'] - offset))
         values['load_to_metadata'].append(p['fetch_end'] - (d['load'] - offset))
         worker_wakes.add((p['aer'], p['worker']))
         fetches.add((p['fetch_begin'], p['fetch_end']))
@@ -140,9 +145,12 @@ def analyze(root, round_number):
         service['dma_delivery_queue'] += d['dma_start'] - offset - h['dma_submit']
         service['dma_copy'] += d['dma'] - d['dma_start']
         service['dma_completion_return'] += h['dma_done'] - (d['dma'] - offset)
-        service['publish_pages'] += h['ack_begin'] - h['dma_done']
-        service['ack_delivery'] += d['cache_ack'] - offset - h['ack_begin']
-        service['ack_completion_return'] += h['ack_end'] - (d['cache_ack'] - offset)
+        service['publish_pages'] += h['published'] - h['dma_done']
+        if d['cache_ack'] and h['ack_begin']:
+            service['ack_delivery'] += d['cache_ack'] - offset - h['ack_begin']
+            service['ack_completion_return'] += h['ack_end'] - (d['cache_ack'] - offset)
+    service['ack_delivery'] += 0
+    service['ack_completion_return'] += 0
     service['metadata_fetch'] = sum(b - a for a, b in fetches)
     result['worker_service_ms'] = {k: v / 1e6 for k, v in service.items()}
     result['stage_mean_us'] = {k: stats.mean(v) / 1000 for k, v in values.items() if v}
@@ -198,8 +206,8 @@ if a.plot:
             left += width
         axes[0].text(left + .5, i, f'{left:.1f} ms', va='center')
     axes[0].set(yticks=[0, 1], yticklabels=['Refill OFF', 'Refill ON'], xlabel='Critical lane elapsed time (ms)',
-                title='Where end-to-end latency increases (5-run means)')
-    axes[0].set_xlim(0, 72)
+                title='End-to-end critical path (mean of measured runs)')
+    axes[0].margins(x=.2)
     axes[0].legend(loc='upper left', bbox_to_anchor=(0, -.17), fontsize=8)
     serial = {k: mean(r['worker_service_ms'][k] for r in result['rounds'])
               for k in result['rounds'][0]['worker_service_ms']}
@@ -216,7 +224,7 @@ if a.plot:
                        if any(r['parallel'] for r in result['rounds']) else
                        f'Why the single worker takes {total:.1f} ms'))
     axes[1].invert_yaxis()
-    axes[1].set_xlim(0, 35)
+    axes[1].margins(x=.45)
     for ax in axes:
         ax.grid(axis='x', alpha=.2)
     fig.suptitle('Light Filter: 16 MiB, 256 blocks, 8 CU / 256 MiB workmem / 64 MiB FDM', fontsize=11)

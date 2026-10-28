@@ -182,7 +182,7 @@ static void fill_event(struct work_struct *work)
     struct cache_page pages[FEMU_CACHE_BLOCK_BYTES/PAGE_SIZE]={};
     struct mapping *map;
     u64 physical=event->lba*bdev_logical_block_size(bdev->bdev);
-    u64 end=physical+event->bytes,valid=0;
+    u64 end=physical+event->bytes,valid=0,transferred=0;
     unsigned nr=event->bytes/PAGE_SIZE;
     down(&fill_slots);
     if(p) p->begin=ktime_get_ns();
@@ -235,14 +235,20 @@ static void fill_event(struct work_struct *work)
             folio_unlock(folios[j]); folio_put(folios[j]);
         }
         if(ret) atomic64_inc(&errors);
-        else { valid+=(u64)count*PAGE_SIZE; atomic64_add((u64)count*PAGE_SIZE,&filled); }
+        else { transferred+=(u64)count*PAGE_SIZE; valid+=(u64)count*PAGE_SIZE; atomic64_add((u64)count*PAGE_SIZE,&filled); }
     }
     for(unsigned i=0;i<nr;i++) if(pages[i].file) fput(pages[i].file);
 acknowledge:
     atomic64_inc(&blocks);
-    if(p) { p->published=ktime_get_ns(); p->ack_begin=ktime_get_ns(); }
-    /* Device confirmation still follows cache publication. Only the Guest
-     * wait for ACK CQ delivery is removed; the request owns job until then. */
+    if(p) p->published=ktime_get_ns();
+    /* The device can release fully transferred input once its CU is done.
+     * Only skipped/cached/failed ranges need an explicit end-of-refill ACK. */
+    if(transferred==event->bytes) {
+        kfree(job);
+        up(&fill_slots);
+        return;
+    }
+    if(p) p->ack_begin=ktime_get_ns();
     if(!submit_ack(job,valid)) { up(&fill_slots); return; }
     /* At the bound, retain the original synchronous path. */
     atomic64_inc(&ack_sync);
