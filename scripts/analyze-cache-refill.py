@@ -27,7 +27,9 @@ def host_path(path):
     lane = max(lanes, key=lambda r: r['end'])
     apps = records(path, 'CACHE_APP')
     blocks = sorted((r for r in apps if r['lane'] == lane['lane']), key=lambda r: r['block'])
-    assert len(blocks) == 32 and len(apps) == 256
+    header = {k: int(v) for k, v in re.findall(r'(bytes|lanes|chunk)=(\d+)', text.splitlines()[0])}
+    assert len(blocks) == header['bytes'] // header['chunk'] // header['lanes']
+    assert len(apps) == header['bytes'] // header['chunk']
     ns = {
         'thread_start_join': lane['begin'] - run['begin'] + run['end'] - lane['end'],
         'allocate_setup': blocks[0]['configure'] - lane['begin'],
@@ -90,9 +92,17 @@ def analyze(root, round_number):
     devices = {r['token']: r for r in records(base.with_suffix('.device'), 'CACHE_BLOCK')}
     hosts = {r['token']: r for r in records(base.with_suffix('.kernel'), 'CACHE_HOST')
              if r['token'] in devices}
-    assert len(devices) == len(hosts) == 256
+    assert len(devices) == len(hosts) and devices
     by_lba = {r['lba']: r for r in hosts.values()}
-    assert len(by_lba) == 256 and all(r['dma_calls'] == 1 for r in hosts.values())
+    assert len(by_lba) == len(devices) and all(r['dma_calls'] >= 1 for r in hosts.values())
+    graphs = defaultdict(list)
+    for d in devices.values():
+        graphs[(d['session'], d['cookie'])].append(d)
+    def app_graph(app):
+        first = devices[by_lba[app['lba']]['token']]
+        return graphs[(first['session'], first['cookie'])]
+    # A 4 MiB batch has many refill subblocks. Its terminal release is the
+    # dependency on the critical path; summing their overlapping holds is wrong.
     # D = G + offset. Each device operation occurs inside its Guest request.
     bounds = [(devices[t]['dma'] - p['dma_done'],
                devices[t]['dma_start'] - p['dma_submit']) for t, p in hosts.items()]
@@ -103,10 +113,11 @@ def analyze(root, round_number):
     high = min(b for _, b in bounds)
     assert low <= high, f'clock bounds do not intersect: {low}, {high}'
     offset = (low + high) / 2
-    critical = [by_lba[r['lba']]['token'] for r in critical_apps]
+    critical = [max(app_graph(r), key=lambda d: d['release'])['token'] for r in critical_apps]
     for app in apps:
-        d = devices[by_lba[app['lba']]['token']]
-        assert app['batch_begin'] <= d['load'] - offset <= d['release'] - offset <= app['batch_end']
+        group = app_graph(app)
+        assert app['batch_begin'] <= min(d['load'] for d in group) - offset
+        assert max(d['release'] for d in group) - offset <= app['batch_end']
     parallel=any(p.get("parallel", 0) for p in hosts.values())
     wait, costs = refill_path(devices, hosts, critical, offset, parallel)
     _, low_costs = refill_path(devices, hosts, critical, low, parallel)
@@ -114,6 +125,8 @@ def analyze(root, round_number):
     result.update(round=round_number, parallel=parallel, clock_offset_ns=offset,
                   clock_bound_width_us=(high - low) / 1000,
                   critical_cache_wait_ms=wait, wait_cost_ms=costs,
+                  read_commands=sum(p['dma_calls'] for p in hosts.values()),
+                  split_blocks=sum(p['dma_calls']>1 for p in hosts.values()),
                   wait_cost_alignment_samples_ms={k: [min(costs[k], low_costs[k], high_costs[k]),
                                            max(costs[k], low_costs[k], high_costs[k])]
                                        for k in costs})
@@ -154,6 +167,17 @@ def analyze(root, round_number):
     service['metadata_fetch'] = sum(b - a for a, b in fetches)
     result['worker_service_ms'] = {k: v / 1e6 for k, v in service.items()}
     result['stage_mean_us'] = {k: stats.mean(v) / 1000 for k, v in values.items() if v}
+    # Multi-command blocks bracket several transfers and Guest waits. Use only
+    # single-command blocks when reporting pure mapping/copy vs CQ latency.
+    singles = [(devices[t], p) for t, p in hosts.items() if p['dma_calls']==1]
+    result['single_read_mean_us'] = {
+        'request': stats.mean(p['dma_done']-p['dma_submit'] for _,p in singles)/1000,
+        'copy': stats.mean(d['dma']-d['dma_start'] for d,_ in singles)/1000,
+        'completion': stats.mean(p['dma_done']-(d['dma']-offset) for d,p in singles)/1000,
+        'bytes': stats.mean(d['bytes'] for d,_ in singles),
+        'blocks': len(singles),
+    } if singles else {}
+
     result['worker_invocations'] = len(worker_wakes)
     result['fetch_requests'] = len(fetches)
     return result
@@ -227,6 +251,6 @@ if a.plot:
     axes[1].margins(x=.45)
     for ax in axes:
         ax.grid(axis='x', alpha=.2)
-    fig.suptitle('Light Filter: 16 MiB, 256 blocks, 8 CU / 256 MiB workmem / 64 MiB FDM', fontsize=11)
+    fig.suptitle('Light Filter: measured scan batches; subblock holds grouped by device graph', fontsize=11)
     fig.savefig(root / 'breakdown.png', dpi=160)
     fig.savefig(root / 'breakdown.pdf')

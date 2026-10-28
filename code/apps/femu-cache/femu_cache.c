@@ -95,9 +95,10 @@ static int dma_folios(const struct femu_cache_event *event,unsigned offset,
 {
     struct nvme_command cmd={};
     struct request *req;
-    struct bio *bio;
-    int ret;
-    if(p) { p->dma_build=ktime_get_ns(); p->dma_calls++; }
+    struct bio *bios[DIV_ROUND_UP(FEMU_CACHE_BLOCK_BYTES/PAGE_SIZE,BIO_MAX_VECS)]={};
+    unsigned nbios=0;
+    int ret=0;
+    if(p && !p->dma_build) p->dma_build=ktime_get_ns();
     cmd.common.opcode=FEMU_CACHE_READ;
     cmd.common.nsid=cpu_to_le32(event->nsid);
     cmd.common.cdw10=cpu_to_le32(event->token);
@@ -107,19 +108,34 @@ static int dma_folios(const struct femu_cache_event *event,unsigned offset,
     req=blk_mq_alloc_request(queue,REQ_OP_DRV_IN,0);
     if(IS_ERR(req)) return PTR_ERR(req);
     nvme_init_request(req,&cmd);
-    bio=bio_alloc(bdev->bdev,count,REQ_OP_DRV_IN,GFP_NOIO);
-    if(!bio) { blk_mq_free_request(req); return -ENOMEM; }
-    for(unsigned i=0;i<count;i++)
-        if(bio_add_page(bio,folio_page(folios[i],0),PAGE_SIZE,0)!=PAGE_SIZE) {
-            bio_put(bio); blk_mq_free_request(req); return -EIO;
+    /* A 4 MiB command can span several BIOs; BIO_MAX_VECS is per BIO,
+     * not a reason to issue a separate NVMe command for every BIO. */
+    for(unsigned i=0;i<count && !ret;) {
+        unsigned n=min_t(unsigned,count-i,BIO_MAX_VECS);
+        struct bio *bio=bio_alloc(bdev->bdev,n,REQ_OP_DRV_IN,GFP_NOIO);
+        if(!bio) { ret=-ENOMEM; break; }
+        bios[nbios++]=bio;
+        for(unsigned end=i+n;i<end;i++)
+            if(bio_add_page(bio,folio_page(folios[i],0),PAGE_SIZE,0)!=PAGE_SIZE) {
+                ret=-EIO; break;
+            }
+        if(!ret) {
+            ret=blk_rq_append_bio(req,bio);
+            /* The first BIO is not checked against queue limits by append.
+             * Never submit more physical segments than NVMe can map. */
+            if(ret==-EINVAL || (!ret && blk_rq_nr_phys_segments(req)>queue_max_segments(queue)))
+                ret=-E2BIG;
         }
-    ret=blk_rq_append_bio(req,bio);
+    }
     if(!ret) {
-        if(p) p->dma_submit=ktime_get_ns();
+        if(p) {
+            if(!p->dma_submit) p->dma_submit=ktime_get_ns();
+            p->dma_calls++;
+        }
         ret=nvme_execute_rq(req,false);
         if(p) p->dma_done=ktime_get_ns();
     }
-    bio_put(bio);
+    for(unsigned i=0;i<nbios;i++) bio_put(bios[i]);
     blk_mq_free_request(req);
     return ret;
 }
@@ -179,7 +195,8 @@ static void fill_event(struct work_struct *work)
     struct cache_job *job=container_of(work,struct cache_job,work);
     const struct femu_cache_event *event=&job->event;
     struct cache_profile *p=job->profile;
-    struct cache_page pages[FEMU_CACHE_BLOCK_BYTES/PAGE_SIZE]={};
+    struct cache_page *pages=NULL;
+    struct folio **folios=NULL;
     struct mapping *map;
     u64 physical=event->lba*bdev_logical_block_size(bdev->bdev);
     u64 end=physical+event->bytes,valid=0,transferred=0;
@@ -187,7 +204,14 @@ static void fill_event(struct work_struct *work)
     down(&fill_slots);
     if(p) p->begin=ktime_get_ns();
     /* A partial file page cannot be made uptodate from partial input. */
-    if((physical|event->bytes)&(PAGE_SIZE-1) || nr>ARRAY_SIZE(pages)) {
+    if((physical|event->bytes)&(PAGE_SIZE-1) || nr>FEMU_CACHE_BLOCK_BYTES/PAGE_SIZE) {
+        atomic64_add(event->bytes,&skipped);
+        goto acknowledge;
+    }
+    /* Keep the 1024 page descriptors off the kernel stack. */
+    pages=kcalloc(nr,sizeof(*pages),GFP_NOIO);
+    folios=kcalloc(nr,sizeof(*folios),GFP_NOIO);
+    if(!pages || !folios) {
         atomic64_add(event->bytes,&skipped);
         goto acknowledge;
     }
@@ -224,21 +248,31 @@ static void fill_event(struct work_struct *work)
         } else pages[i].folio=f;
     }
     for(unsigned i=0;i<nr;) {
-        struct folio *folios[ARRAY_SIZE(pages)];
-        unsigned first=i,count=0;
-        int ret;
+        unsigned first=i;
         if(!pages[i].folio) { i++; continue; }
-        while(i<nr && pages[i].folio) folios[count++]=pages[i++].folio;
-        ret=dma_folios(event,first*PAGE_SIZE,folios,count,p);
-        for(unsigned j=0;j<count;j++) {
-            if(!ret) folio_mark_uptodate(folios[j]);
-            folio_unlock(folios[j]); folio_put(folios[j]);
+        while(i<nr && pages[i].folio) i++;
+        unsigned request_pages=i-first;
+        while(first<i) {
+            unsigned count=min(request_pages,i-first);
+            int ret;
+            for(unsigned j=0;j<count;j++) folios[j]=pages[first+j].folio;
+            ret=dma_folios(event,first*PAGE_SIZE,folios,count,p);
+            /* Keep 4 MiB when it fits. Physically fragmented file pages may
+             * exceed the driver's scatterlist limit; only those ranges split. */
+            if(ret==-E2BIG && count>1) { request_pages=count/2; continue; }
+            for(unsigned j=0;j<count;j++) {
+                if(!ret) folio_mark_uptodate(folios[j]);
+                folio_unlock(folios[j]); folio_put(folios[j]);
+            }
+            if(ret) atomic64_inc(&errors);
+            else { transferred+=(u64)count*PAGE_SIZE; valid+=(u64)count*PAGE_SIZE; atomic64_add((u64)count*PAGE_SIZE,&filled); }
+            first+=count;
         }
-        if(ret) atomic64_inc(&errors);
-        else { transferred+=(u64)count*PAGE_SIZE; valid+=(u64)count*PAGE_SIZE; atomic64_add((u64)count*PAGE_SIZE,&filled); }
     }
     for(unsigned i=0;i<nr;i++) if(pages[i].file) fput(pages[i].file);
 acknowledge:
+    kfree(folios);
+    kfree(pages);
     atomic64_inc(&blocks);
     if(p) p->published=ktime_get_ns();
     /* The device can release fully transferred input once its CU is done.

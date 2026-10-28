@@ -15,8 +15,8 @@
 #include <unistd.h>
 #include <time.h>
 #define LANES 8
-#define CHUNK (64U*1024)
-#define FILE_BYTES (16U*1024*1024)
+#define CHUNK (4U*1024*1024)
+#define FILE_BYTES (1024U*1024*1024)
 struct program { const char *file,*symbol; unsigned index; CS_CSF_ID function; int loaded,active; };
 static CS_STATUS load_program(CS_DEV_HANDLE device, struct program *p)
 {
@@ -228,12 +228,26 @@ int main(int argc,char **argv)
     uint64_t sum=0,count=0; int error=0;
     for(unsigned i=0;i<LANES;i++) { pthread_join(threads[i],NULL); sum+=lanes[i].sum; count+=lanes[i].count; error|=lanes[i].error; }
     clock_gettime(CLOCK_MONOTONIC,&end);
+    /* Query completion no longer waits for Guest page publication. Drain
+     * the existing diagnostic endpoint outside wall_ms before cache checks. */
+    uint64_t query_end=(uint64_t)end.tv_sec*1000000000+end.tv_nsec;
+    if(refill) {
+        FILE *diagnostic=fopen("/sys/kernel/debug/femu-cache/profile","r");
+        if(!diagnostic) { perror("cache drain"); error=1; }
+        else {
+            char discard[4096];
+            while(fread(discard,1,sizeof(discard),diagnostic)) {}
+            if(ferror(diagnostic)) error=1;
+            fclose(diagnostic);
+        }
+    }
+    double cache_drain_ms=refill?(now_ns()-query_end)/1e6:0;
     if(mincore(mapping,FILE_BYTES,residency)) error=1;
     for(unsigned i=0;i<sizeof(residency);i++) resident+=!!(residency[i]&1);
     if(sum!=expected_sum || count!=expected_count || cold || (refill && resident!=sizeof(residency)) || (!refill && resident)) error=1;
-    printf("refill=%d repetitions=%u bytes=%u lanes=%u chunk=%u cold_pages=%u resident_pages=%u sum=%llu count=%llu correct=%s wall_ms=%.3f\n",
+    printf("refill=%d repetitions=%u bytes=%u lanes=%u chunk=%u cold_pages=%u resident_pages=%u sum=%llu count=%llu correct=%s wall_ms=%.3f cache_drain_ms=%.3f\n",
         refill,repetitions,FILE_BYTES,LANES,CHUNK,cold,resident,(unsigned long long)sum,(unsigned long long)count,error?"no":"yes",
-        (end.tv_sec-begin.tv_sec)*1000.+(end.tv_nsec-begin.tv_nsec)/1e6);
+        (end.tv_sec-begin.tv_sec)*1000.+(end.tv_nsec-begin.tv_nsec)/1e6,cache_drain_ms);
     if(profile) {
         printf("CACHE_APP_RUN begin=%llu end=%llu\n",
             (unsigned long long)begin.tv_sec*1000000000+begin.tv_nsec,
