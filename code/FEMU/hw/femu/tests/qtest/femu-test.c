@@ -28,6 +28,7 @@
 #include "hw/femu/tests/unit/hybrid-oracle.h"
 #include "hw/femu/cxlssd/cca-abi.h"
 #include "hw/femu/csd/csd-graph.h"
+#include "hw/femu/csd/csd-cache.h"
 #include "standard-headers/linux/pci_regs.h"
 
 #define FEMU_QSIZE          16
@@ -18588,6 +18589,74 @@ static void femu_test_csd_exec_graph(void *obj,void *data,QGuestAllocator *alloc
     femu_queue_free(&c,&c.io); femu_disable(&c); femu_csd_remove_slow();
 }
 
+/* Refill uses the poller Read path and keeps FDM alive after deallocation.
+ * Read two disjoint ranges; the graph must retain the input until both finish. */
+static void femu_test_csd_cache_read(void *obj, void *data, QGuestAllocator *alloc)
+{
+    FemuCtrlState c = {0};
+    uint64_t buf;
+    uint32_t session = femu_graph_setup(&c, obj, alloc, &buf);
+    uint32_t id = femu_graph_alloc(&c, 4096);
+    QTestState *qts = c.pdev->bus->qts;
+    uint8_t expected[4096], actual[4096];
+    for (unsigned i = 0; i < sizeof(expected); i++) expected[i] = i * 13 + 7;
+    femu_graph_afdm(&c, buf, id, expected, true);
+    g_assert_cmpint(femu_csd_copy(&c, FEMU_CSD_AFDM_TO_NVM, id, 0, 0, 7), ==, NVME_SUCCESS);
+    NvmeCmd cmd = {.opcode = FEMU_CACHE_CONTROL, .nsid = cpu_to_le32(1),
+                   .cdw10 = cpu_to_le32(FEMU_CACHE_ENABLE)};
+    femu_submit(&c, &c.io, &cmd);
+    g_assert_cmpint(FEMU_SC(femu_complete(&c, &c.io, NULL, NULL)), ==, NVME_SUCCESS);
+    struct {
+        struct femu_graph_header h;
+        struct femu_graph_node n;
+        struct femu_graph_range range;
+    } graph = {
+        .h = {.bytes = cpu_to_le32(sizeof(graph)), .count = cpu_to_le32(1),
+              .flags = cpu_to_le32(FEMU_CSD_GRAPH_CACHE), .session = cpu_to_le64(session),
+              .cookie = cpu_to_le64(1)},
+        .n = {.operation = cpu_to_le32(FEMU_GRAPH_LOAD), .afdm = cpu_to_le32(id),
+              .count = cpu_to_le32(1), .payload = cpu_to_le32(offsetof(typeof(graph), range))},
+        .range = {.nsid = cpu_to_le32(1), .blocks = cpu_to_le32(8)}
+    };
+    femu_graph_submit(&c, buf, &graph, sizeof(graph));
+    FemuQueue original = c.io;
+    femu_burst_queue(&c, &c.io, 2);
+    struct femu_cache_log log;
+    int64_t deadline = g_get_monotonic_time() + FEMU_POLL_LIMIT_MS * 1000;
+    do {
+        cmd = (NvmeCmd){.opcode = FEMU_CACHE_CONTROL, .nsid = cpu_to_le32(1),
+                        .cdw10 = cpu_to_le32(FEMU_CACHE_FETCH)};
+        cmd.dptr.prp1 = cpu_to_le64(buf);
+        femu_submit(&c, &c.io, &cmd);
+        g_assert_cmpint(FEMU_SC(femu_complete(&c, &c.io, NULL, NULL)), ==, NVME_SUCCESS);
+        qtest_memread(qts, buf, &log, sizeof(log));
+        g_assert_cmpint(g_get_monotonic_time(), <, deadline);
+    } while (!log.count);
+    g_assert_cmpuint(log.count, ==, 1);
+    cmd = (NvmeCmd){.opcode = FEMU_CSD_DEALLOC, .nsid = cpu_to_le32(1),
+                    .cdw10 = cpu_to_le32(id)};
+    femu_submit(&c, &c.io, &cmd);
+    g_assert_cmpint(FEMU_SC(femu_complete(&c, &c.io, NULL, NULL)), ==, NVME_SUCCESS);
+    cmd = (NvmeCmd){.opcode = FEMU_CACHE_READ, .nsid = cpu_to_le32(1),
+                    .cdw10 = cpu_to_le32(log.events[0].token),
+                    .cdw11 = cpu_to_le32(log.events[0].token >> 32),
+                    .cdw13 = cpu_to_le32(4097)};
+    cmd.dptr.prp1 = cpu_to_le64(buf);
+    femu_submit(&c, &c.io, &cmd);
+    g_assert_cmpint(FEMU_SC(femu_complete(&c, &c.io, NULL, NULL)), ==, NVME_INVALID_FIELD);
+    for (unsigned offset = 0; offset < 4096; offset += 2048) {
+        cmd.cdw12 = cpu_to_le32(offset); cmd.cdw13 = cpu_to_le32(2048);
+        femu_submit(&c, &c.io, &cmd);
+        g_assert_cmpint(FEMU_SC(femu_complete(&c, &c.io, NULL, NULL)), ==, NVME_SUCCESS);
+        qtest_memread(qts, buf, actual + offset, 2048);
+    }
+    g_assert_cmpmem(actual, sizeof(actual), expected, sizeof(expected));
+    g_assert_cmpint(FEMU_SC(femu_complete(&c, &original, NULL, NULL)), ==, NVME_SUCCESS);
+    femu_queue_free(&c, &c.io); c.io = original;
+    femu_graph_session_cmd(&c, FEMU_GRAPH_CLOSE, session, 0);
+    femu_queue_free(&c, &c.io); femu_disable(&c); femu_csd_remove_slow();
+}
+
 static void femu_test_csd_graph_spill(void *obj,void *data,QGuestAllocator *alloc)
 {
     FemuCtrlState c={0}; uint64_t buf,token,value;
@@ -36917,6 +36986,10 @@ static void femu_register_nodes(void)
     qos_add_test("csd-exec-graph", "femu", femu_test_csd_exec_graph,
         &(QOSGraphTestOptions){.edge.extra_device_opts=g_strdup_printf(
             "femu_mode=4,fdm_size=16,nr_cu=2,csf_runtime_scale=1,pg_rd_lat=20000000,pg_wr_lat=50000000,csd_program_dir=%s",
+            femu_csd_slow_dir)});
+    qos_add_test("csd-cache-read", "femu", femu_test_csd_cache_read,
+        &(QOSGraphTestOptions){.edge.extra_device_opts=g_strdup_printf(
+            "femu_mode=4,fdm_size=16,nr_cu=2,csd_program_dir=%s",
             femu_csd_slow_dir)});
     qos_add_test("csd-exec-graph-spill", "femu", femu_test_csd_graph_spill,
         &(QOSGraphTestOptions){.edge.extra_device_opts=g_strdup_printf(

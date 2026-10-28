@@ -2115,11 +2115,8 @@ static void *femu_ftl_thread(void *arg)
             n->ftl_in_sweep = false;
         }
         if (n->csd_ctrl_state && n->dataplane_started) {
-            bool foreground=false;
-            for (int cache_poller=1;cache_poller<=n->nr_pollers;cache_poller++)
-                if (femu_ring_count(n->to_ftl[cache_poller])) { foreground=true; break; }
             n->ftl_in_sweep=true; smp_mb();
-            if (n->dataplane_started) femu_csd_cache_poll(n, !foreground);
+            if (n->dataplane_started) femu_csd_cache_poll(n);
             n->ftl_in_sweep=false;
         }
     }

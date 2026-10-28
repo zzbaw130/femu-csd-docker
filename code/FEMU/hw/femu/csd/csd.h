@@ -3,7 +3,7 @@
 
 #include "../nvme.h"
 #include "csd-graph.h"
-void femu_csd_cache_poll(FemuCtrl *n, bool service_dma);
+void femu_csd_cache_poll(FemuCtrl *n);
 uint16_t femu_csd_cache_log(FemuCtrl *,NvmeCmd *,uint32_t,uint64_t,bool);
 
 enum FemuCsdIoCommands {

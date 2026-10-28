@@ -13,7 +13,9 @@
 
 **当前约定：开启回填的 LOAD 目标范围，在 batch 返回前必须保持只读，不得由另一个 LOAD、WRITE 或 CSF 输出覆盖。** 应用可以并行提交使用独立 FDM 的 batch。当前只覆盖普通图 LOAD，不覆盖 CSF 重入发起的内部读取。PG 扩展在读取已准备的表/索引 extent 时直接注册对应文件段，注册随查询内存上下文释放，ERROR 时也会关闭；不另起进程。并发文件写入和一致性失效尚未接入。CSF 内部请求的基表读取仍未回填，不能将部分显式 LOAD 的回填视为整条 SQL 全部读取已覆盖。
 
-设备端最多保留 128 条回填记录，后台队列每次最多处理一个 4 MiB DMA；FTL 前台请求队列排空后才服务后台 DMA。Guest 将元数据获取和 I/O 处理分开，全局限制最多 4 个 I/O 任务同时执行，至多 4 条 DMA 请求在途、约 16 MiB 文件页锁定用于回填，统计与每块有效字节数分别管理。这是软件后台优先级，**不是硬件独立低优先级 SQ/WRR，也不能抢占已经开始的 DMA**。FEMU 此处使用 QEMU 的实际内存 DMA 路径，没有新增 PCIe 传输带宽模型，因此这些测量不能解释为真实硬件 PCIe 吞吐。
+设备端最多保留 128 条回填记录。F3 回填 Read 与普通 Read 一样，由处理该 NVMe 提交队列的 poller 同步执行软件 DMA；复制前后短暂持有 CSD 锁校验 token、登记在途引用和更新计时，PRP/SGL 映射与数据复制期间不持有 CSD 锁。FTL 只处理图调度、介质时延及回填记录回收，不执行回填数据复制。在途 DMA 会阻止该记录因 ACK 或超时提前释放，保证输入 FDM 在复制结束前有效。
+
+Guest 全局限制最多 4 个 I/O 任务同时执行，至多 4 条 DMA 请求在途、约 16 MiB 文件页锁定用于回填。不同 poller 可以并行处理；同一 poller 上仍会顺序处理请求。当前没有独立低优先级 SQ/WRR，复制仍消耗宿主 CPU 和内存带宽，也不能被同一 poller 的后续请求抢占。FEMU 此处使用 QEMU 的实际内存 DMA 路径，没有新增 PCIe 传输带宽模型，因此这些测量不能解释为真实硬件 PCIe 吞吐。
 
 ## Guest 编译与安装
 
@@ -71,7 +73,7 @@ python3 scripts/plot-cache-refill.py device.log results/cache-refill-plot
 
 绘图依赖 matplotlib，输出逐块 CSV、统计 JSON 和 PNG/PDF。所有时间戳来自同一个 FEMU 单调时钟：`load` 是块可用，`cu` 是最后一个消费者的计算完成，`dma_start`/`dma` 是回填 DMA 开始/结束，`cache_ack` 是设备收到缓存有效确认，`release` 是解除回填占用，`dma_bytes` 是成功传输的字节数。完整传输时不再发送 ACK，`cache_ack=0` 不表示失败；缓存发布时刻由 Guest 的 `published` 记录确认。CU 时间不包含 FTL 处理完成事件的调度滞后。
 
-必须区分 **LOAD→DMA 结束的总响应时间**和 **DMA 自身复制时间**：前者还包含 AER、Guest 调度和后台排队。缓存有效确认包含 ACK 命令的传输延迟，是缓存发布时刻的上界。`release-cu` 表示 CU 完成后的额外 FDM 占用，不能将其全部归因于 DMA 复制。
+必须区分 **LOAD→DMA 结束的总响应时间**和 **DMA 自身复制时间**：前者还包含 AER、Guest 调度和 NVMe 队列等待。缓存有效确认包含 ACK 命令的传输延迟，是缓存发布时刻的上界。`release-cu` 表示 CU 完成后的额外 FDM 占用，不能将其全部归因于 DMA 复制。
 
 ### 拆分回填等待
 

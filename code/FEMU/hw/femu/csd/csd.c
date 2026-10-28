@@ -32,6 +32,7 @@ struct FemuCacheItem {
     FemuCsdGraph *graph;
     struct FemuCsdAfdm *afdm;
     uint64_t dma_start_ns, dma_ns, ack_ns, deadline, cu_ns, consumers, valid_bytes, dma_bytes;
+    unsigned dma_active; /* pins this record and its graph during poller DMA */
     bool claimed, acknowledged;
 };
 
@@ -154,13 +155,6 @@ struct FemuCsdGraph {
     QTAILQ_ENTRY(FemuCsdGraph) entry, ready_entry;
 };
 
-typedef struct FemuCacheDma {
-    NvmeRequest *req;
-    int poller;
-    bool completed;
-    QTAILQ_ENTRY(FemuCacheDma) entry;
-} FemuCacheDma;
-
 struct FemuCsdState {
     FemuCtrl *n;
     CsdCtrlParams params;
@@ -178,9 +172,8 @@ struct FemuCsdState {
     bool cache_enabled, cache_notice;
     uint64_t cache_next;
     unsigned cache_dropped;
-    unsigned cache_work; /* queued DMA requests plus retained LOAD blocks */
+    unsigned cache_work; /* retained LOAD blocks */
     FemuCacheItem cache[128];
-    QTAILQ_HEAD(, FemuCacheDma) cache_dma;
     uint64_t *cu_next_avail;    /* when each compute unit is free again */
     QemuThread *workers;        /* one per compute unit */
     QemuCond job_cond;
@@ -433,7 +426,6 @@ static void csd_init(FemuCtrl *n, NvmeNamespace *ns, Error **errp)
 
     csd = g_new0(FemuCsdState, 1);
     csd->params = n->csd_params;
-    QTAILQ_INIT(&csd->cache_dma);
     csd->cache_next = 1;
     csd->fdm_capacity = n->csd_params.fdm_size_mb * MiB;
     csd->next_afdm_id = 1;
@@ -536,10 +528,6 @@ static void csd_exit(FemuCtrl *n)
     }
     qemu_mutex_unlock(&csd->lock);
 
-    while (!QTAILQ_EMPTY(&csd->cache_dma)) {
-        FemuCacheDma *dma=QTAILQ_FIRST(&csd->cache_dma);
-        QTAILQ_REMOVE(&csd->cache_dma,dma,entry); g_free(dma);
-    }
     pqueue_free(csd->graph_events);
     g_hash_table_destroy(csd->afdms);
     g_hash_table_destroy(csd->spills);
@@ -1309,10 +1297,6 @@ void femu_csd_drain_sq(FemuCtrl *n, NvmeSQueue *sq)
     }
 
     qemu_mutex_lock(&csd->lock);
-    FemuCacheDma *dma,*next_dma;
-    QTAILQ_FOREACH_SAFE(dma,&csd->cache_dma,entry,next_dma) {
-        if (dma->req->sq==sq) { QTAILQ_REMOVE(&csd->cache_dma,dma,entry); qatomic_dec(&csd->cache_work); g_free(dma); }
-    }
     FemuCsdGraph *g;
     QTAILQ_FOREACH(g, &csd->graphs, entry) {
         if (g->req && g->req->sq == sq) {
@@ -2007,54 +1991,59 @@ uint16_t femu_csd_cache_log(FemuCtrl *n,NvmeCmd *cmd,uint32_t len,uint64_t off,b
     return csd_cache_control(n,&copy);
 }
 
-static void csd_cache_dma_defer(FemuCtrl *n,NvmeRequest *req,int poller)
+/* Called synchronously by the NVMe poller, like ordinary Read. The record
+ * pins the graph's FDM until both its consumers and all active DMA finish. */
+static uint16_t csd_cache_read(FemuCtrl *n, NvmeCmd *cmd)
 {
-    FemuCsdState *csd=csd_state(n);
-    FemuCacheDma *dma=g_new0(FemuCacheDma,1);
-    dma->req=req; dma->poller=poller;
+    FemuCsdState *csd = csd_state(n);
+    uint64_t token = le32_to_cpu(cmd->cdw10) |
+                     ((uint64_t)le32_to_cpu(cmd->cdw11) << 32);
+    uint64_t offset = le32_to_cpu(cmd->cdw12);
+    uint64_t bytes = le32_to_cpu(cmd->cdw13);
+    uint16_t status = NVME_INVALID_FIELD | NVME_DNR;
+
     qemu_mutex_lock(&csd->lock);
-    QTAILQ_INSERT_TAIL(&csd->cache_dma,dma,entry);
-    qatomic_inc(&csd->cache_work);
+    FemuCacheItem *item = csd_cache_find(csd, token);
+    if (!item || !bytes || bytes > FEMU_CACHE_BLOCK_BYTES ||
+        offset > item->event.bytes || bytes > item->event.bytes - offset ||
+        item->acknowledged) {
+        qemu_mutex_unlock(&csd->lock);
+        return status;
+    }
+    item->dma_active++;
+    if (!item->dma_start_ns)
+        item->dma_start_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    uint8_t *data = item->afdm->data + item->event.offset + offset;
     qemu_mutex_unlock(&csd->lock);
+
+    /* PRP/SGL mapping and the entire payload copy run without csd->lock. */
+    status = dma_read_cmd(n, cmd, data, bytes);
+    uint64_t end = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+    qemu_mutex_lock(&csd->lock);
+    if (!status) {
+        /* Guest reads disjoint missing-page ranges of this block. */
+        item->dma_bytes += bytes;
+        item->dma_ns = MAX(item->dma_ns, end);
+    }
+    item->dma_active--;
+    qemu_mutex_unlock(&csd->lock);
+    return status;
 }
 
-/* Software background queue, not a claim of NVMe WRR/PCIe preemption. */
-void femu_csd_cache_poll(FemuCtrl *n, bool service_dma)
+/* FTL only releases retained blocks; it never copies refill payloads. */
+void femu_csd_cache_poll(FemuCtrl *n)
 {
-    FemuCsdState *csd=csd_state(n);
+    FemuCsdState *csd = csd_state(n);
     if (!csd || !qatomic_read(&csd->cache_work)) return;
     qemu_mutex_lock(&csd->lock);
-    FemuCacheDma *dma=QTAILQ_FIRST(&csd->cache_dma);
-    if (dma && service_dma) {
-        NvmeRequest *req=dma->req;
-        uint64_t token=le32_to_cpu(req->cmd.cdw10) | ((uint64_t)le32_to_cpu(req->cmd.cdw11)<<32);
-        FemuCacheItem *item=csd_cache_find(csd,token);
-        uint64_t offset=le32_to_cpu(req->cmd.cdw12), bytes=le32_to_cpu(req->cmd.cdw13);
-        if (!dma->completed) {
-            req->status=NVME_INVALID_FIELD | NVME_DNR;
-            if (item && bytes && bytes<=FEMU_CACHE_BLOCK_BYTES && offset<=item->event.bytes &&
-                bytes<=item->event.bytes-offset && !item->acknowledged) {
-                FemuCsdAfdm *m=item->afdm;
-                if (!item->dma_start_ns) item->dma_start_ns=qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-                req->status=dma_read_cmd(n,&req->cmd,m->data+item->event.offset+offset,bytes);
-                if (!req->status) {
-                    /* Guest reads disjoint missing-page ranges of this block. */
-                    item->dma_bytes+=bytes;
-                    item->dma_ns=qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-                }
-            }
-            req->expire_time=qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-            dma->completed=true;
-        }
-        if (femu_ring_enqueue(n->to_poller[dma->poller],(void *)&req,1)==1) {
-            QTAILQ_REMOVE(&csd->cache_dma,dma,entry); qatomic_dec(&csd->cache_work); g_free(dma);
-        }
-    }
-    uint64_t now=qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-    for (unsigned i=0;i<ARRAY_SIZE(csd->cache);i++) {
-        FemuCacheItem *item=&csd->cache[i];
-        if (item->event.token && item->cu_ns && (item->dma_bytes==item->event.bytes || item->acknowledged || now>item->deadline))
-            csd_cache_finish(csd,item,now);
+    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    for (unsigned i = 0; i < ARRAY_SIZE(csd->cache); i++) {
+        FemuCacheItem *item = &csd->cache[i];
+        if (item->event.token && !item->dma_active && item->cu_ns &&
+            (item->dma_bytes == item->event.bytes || item->acknowledged ||
+             now > item->deadline))
+            csd_cache_finish(csd, item, now);
     }
     qemu_mutex_unlock(&csd->lock);
 }
@@ -2541,7 +2530,7 @@ static uint16_t csd_io_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     case FEMU_CACHE_CONTROL:
         return csd_cache_control(n,cmd);
     case FEMU_CACHE_READ:
-        req->defer=csd_cache_dma_defer; return NVME_SUCCESS;
+        return csd_cache_read(n, cmd);
     case FEMU_CSD_EXEC_GRAPH:
         return csd_exec_graph(n, ns, cmd, req);
     case FEMU_CSD_GRAPH_SESSION:
