@@ -14,6 +14,7 @@ typedef uint32_t fc_u32;
 #endif
 #define FEMU_CACHE_CONTROL 0xe8
 #define FEMU_CACHE_READ 0xf3
+#define FEMU_CACHE_READ_PROFILE 1U /* F3 CDW14: diagnostic timestamps only */
 #define FEMU_CACHE_LOG 0xc8
 #define FEMU_CACHE_LOG_BYTES 4096
 #define FEMU_CACHE_BLOCK_BYTES (4U*1024*1024)

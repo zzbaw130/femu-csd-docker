@@ -18640,7 +18640,8 @@ static void femu_test_csd_cache_read(void *obj, void *data, QGuestAllocator *all
     cmd = (NvmeCmd){.opcode = FEMU_CACHE_READ, .nsid = cpu_to_le32(1),
                     .cdw10 = cpu_to_le32(log.events[0].token),
                     .cdw11 = cpu_to_le32(log.events[0].token >> 32),
-                    .cdw13 = cpu_to_le32(4097)};
+                    .cdw13 = cpu_to_le32(4097),
+                    .cdw14 = cpu_to_le32(FEMU_CACHE_READ_PROFILE)};
     cmd.dptr.prp1 = cpu_to_le64(buf);
     femu_submit(&c, &c.io, &cmd);
     g_assert_cmpint(FEMU_SC(femu_complete(&c, &c.io, NULL, NULL)), ==, NVME_INVALID_FIELD);

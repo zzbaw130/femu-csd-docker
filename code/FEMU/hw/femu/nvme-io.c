@@ -1,5 +1,6 @@
 #include "./nvme.h"
 #include "nvme-pi.h"
+#include "csd/csd-cache.h"
 
 static int64_t nvme_io_clock(FemuCtrl *n)
 {
@@ -10,6 +11,7 @@ static int64_t nvme_io_clock(FemuCtrl *n)
 static uint16_t nvme_io_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req);
 
 static void nvme_post_cqe(NvmeCQueue *cq, NvmeRequest *req);
+static void nvme_process_cq_cpl(void *arg, int index_poller);
 static void nvme_cq_notify(FemuCtrl *n, NvmeCQueue *cq);
 
 /* one writer per set; atomic stores so a QMP read sees each word whole */
@@ -292,6 +294,7 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
         req->defer = NULL;
         /* Coperd: record req->stime at earliest convenience */
         req->expire_time = req->stime = nvme_io_clock(n);
+        req->cache_timing.enter = req->cache_timing.copy_end = 0;
         req->t_handoff = 0;
         req->t_return = 0;
         req->cqe.cid = cmd.cid;
@@ -415,6 +418,15 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
                 }
                 QTAILQ_INSERT_TAIL(&sq->req_list, req, entry);
             }
+        } else if (req->ns && NS_CSD(req->ns) &&
+                   cmd.opcode == FEMU_CACHE_READ && !n->fw_enabled) {
+            /* FDM was already copied: no media work belongs on the FTL.
+             * Use this poller's own heap (not the FTL-owned producer ring),
+             * retaining the normal CQ-full backlog and interrupt handling. */
+            req->expire_time = nvme_io_clock(n);
+            req->reqlat = 0;
+            req->t_handoff = req->t_return = req->expire_time;
+            pqueue_insert(n->pq[index_poller], req);
         } else if (req->defer) {
             req->defer(n, req, index_poller);
         } else {
@@ -438,6 +450,9 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
         }
 
         processed++;
+        /* A CSD command may synchronously copy MiBs. Return ready completions
+         * before starting another copy, instead of draining every SQ first. */
+        if (n->csd_ctrl_state) nvme_process_cq_cpl(n, index_poller);
     }
 
     /*
@@ -474,6 +489,21 @@ static void nvme_post_cqe(NvmeCQueue *cq, NvmeRequest *req)
 
     nvme_write_cqe(n, cq, cqe);
     nvme_inc_cq_tail(cq);
+    if (cq->cqid && req->cmd_opcode == FEMU_CACHE_READ &&
+        req->cache_timing.enter && req->cache_timing.copy_end) {
+        uint64_t posted = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        uint64_t token = le32_to_cpu(req->cmd.cdw10) |
+                         ((uint64_t)le32_to_cpu(req->cmd.cdw11) << 32);
+        fprintf(stderr, "CACHE_READ token=%" PRIu64 " offset=%u bytes=%u"
+            " seen=%" PRId64 " enter=%" PRIu64 " locked=%" PRIu64
+            " copy_begin=%" PRIu64 " copy_end=%" PRIu64
+            " update_locked=%" PRIu64 " ready=%" PRIu64 " posted=%" PRIu64 "\n",
+            token, le32_to_cpu(req->cmd.cdw12), le32_to_cpu(req->cmd.cdw13),
+            req->stime, req->cache_timing.enter, req->cache_timing.locked,
+            req->cache_timing.copy_begin, req->cache_timing.copy_end,
+            req->cache_timing.update_locked, req->cache_timing.ready, posted);
+        req->cache_timing.enter = 0;
+    }
 
     /*
      * Nothing to count with coalescing off, on the admin queue, or on a

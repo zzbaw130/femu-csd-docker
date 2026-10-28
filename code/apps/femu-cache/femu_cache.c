@@ -108,6 +108,7 @@ static int dma_folios(const struct femu_cache_event *event,unsigned offset,
     cmd.common.cdw11=cpu_to_le32(event->token>>32);
     cmd.common.cdw12=cpu_to_le32(offset);
     cmd.common.cdw13=cpu_to_le32(count*PAGE_SIZE);
+    cmd.common.cdw14=cpu_to_le32(p?FEMU_CACHE_READ_PROFILE:0);
     req=blk_mq_alloc_request(queue,REQ_OP_DRV_IN,0);
     if(IS_ERR(req)) return PTR_ERR(req);
     nvme_init_request(req,&cmd);

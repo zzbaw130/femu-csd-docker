@@ -1710,6 +1710,10 @@ typedef struct NvmeRequest {
     /* io_stages: when the poller handed it to the FTL ring, and got it back */
     int64_t                 t_handoff;
     int64_t                 t_return;
+    /* Optional F3 diagnostics, enabled by the existing Guest profile switch. */
+    struct {
+        uint64_t enter, locked, copy_begin, copy_end, update_locked, ready;
+    } cache_timing;
     int64_t                 reqlat;
     int64_t                 gcrt;
     int64_t                 expire_time;

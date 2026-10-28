@@ -1993,7 +1993,7 @@ uint16_t femu_csd_cache_log(FemuCtrl *n,NvmeCmd *cmd,uint32_t len,uint64_t off,b
 
 /* Called synchronously by the NVMe poller, like ordinary Read. The record
  * pins the graph's FDM until both its consumers and all active DMA finish. */
-static uint16_t csd_cache_read(FemuCtrl *n, NvmeCmd *cmd)
+static uint16_t csd_cache_read(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req)
 {
     FemuCsdState *csd = csd_state(n);
     uint64_t token = le32_to_cpu(cmd->cdw10) |
@@ -2002,7 +2002,10 @@ static uint16_t csd_cache_read(FemuCtrl *n, NvmeCmd *cmd)
     uint64_t bytes = le32_to_cpu(cmd->cdw13);
     uint16_t status = NVME_INVALID_FIELD | NVME_DNR;
 
+    bool profile = le32_to_cpu(cmd->cdw14) & FEMU_CACHE_READ_PROFILE;
+    if (profile) req->cache_timing.enter = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     qemu_mutex_lock(&csd->lock);
+    if (profile) req->cache_timing.locked = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     FemuCacheItem *item = csd_cache_find(csd, token);
     if (!item || !bytes || bytes > FEMU_CACHE_BLOCK_BYTES ||
         offset > item->event.bytes || bytes > item->event.bytes - offset ||
@@ -2017,10 +2020,13 @@ static uint16_t csd_cache_read(FemuCtrl *n, NvmeCmd *cmd)
     qemu_mutex_unlock(&csd->lock);
 
     /* PRP/SGL mapping and the entire payload copy run without csd->lock. */
+    if (profile) req->cache_timing.copy_begin = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     status = dma_read_cmd(n, cmd, data, bytes);
     uint64_t end = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 
+    if (profile) req->cache_timing.copy_end = end;
     qemu_mutex_lock(&csd->lock);
+    if (profile) req->cache_timing.update_locked = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     if (!status) {
         /* Guest reads disjoint missing-page ranges of this block. */
         item->dma_bytes += bytes;
@@ -2028,6 +2034,7 @@ static uint16_t csd_cache_read(FemuCtrl *n, NvmeCmd *cmd)
     }
     item->dma_active--;
     qemu_mutex_unlock(&csd->lock);
+    if (profile) req->cache_timing.ready = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     return status;
 }
 
@@ -2530,7 +2537,7 @@ static uint16_t csd_io_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     case FEMU_CACHE_CONTROL:
         return csd_cache_control(n,cmd);
     case FEMU_CACHE_READ:
-        return csd_cache_read(n, cmd);
+        return csd_cache_read(n, cmd, req);
     case FEMU_CSD_EXEC_GRAPH:
         return csd_exec_graph(n, ns, cmd, req);
     case FEMU_CSD_GRAPH_SESSION:
