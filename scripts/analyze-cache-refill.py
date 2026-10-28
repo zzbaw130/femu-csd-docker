@@ -46,7 +46,7 @@ def overlap(a, b, c, d):
     return max(0, min(b, d) - max(a, c))
 
 
-def refill_path(devices, hosts, critical, offset):
+def refill_path(devices, hosts, critical, offset, parallel=False):
     segments = []
     seen_fetch = set()
     for token, p in hosts.items():
@@ -72,10 +72,15 @@ def refill_path(devices, hosts, critical, offset):
             continue
         wait += b - a
         for other, name, start, end in segments:
+            # Concurrent service intervals overlap. Only the current block
+            # has an unambiguous attribution; never add other workers twice.
+            if parallel and other != token:
+                continue
             key = name if other is None else ('own_' if token == other else 'other_') + name
             costs[key] += overlap(a, b, start, end)
-    costs['notification_or_unrecorded_gap'] = wait - sum(costs.values())
-    assert costs['notification_or_unrecorded_gap'] >= -1, costs
+    remainder = 'before_own_service' if parallel else 'notification_or_unrecorded_gap'
+    costs[remainder] = wait - sum(costs.values())
+    assert costs[remainder] >= -1, costs
     return wait / 1e6, {k: max(0, v) / 1e6 for k, v in costs.items()}
 
 
@@ -99,10 +104,11 @@ def analyze(root, round_number):
     for app in apps:
         d = devices[by_lba[app['lba']]['token']]
         assert app['batch_begin'] <= d['load'] - offset <= d['release'] - offset <= app['batch_end']
-    wait, costs = refill_path(devices, hosts, critical, offset)
-    _, low_costs = refill_path(devices, hosts, critical, low)
-    _, high_costs = refill_path(devices, hosts, critical, high)
-    result.update(round=round_number, clock_offset_ns=offset,
+    parallel=any(p.get("parallel", 0) for p in hosts.values())
+    wait, costs = refill_path(devices, hosts, critical, offset, parallel)
+    _, low_costs = refill_path(devices, hosts, critical, low, parallel)
+    _, high_costs = refill_path(devices, hosts, critical, high, parallel)
+    result.update(round=round_number, parallel=parallel, clock_offset_ns=offset,
                   clock_bound_width_us=(high - low) / 1000,
                   critical_cache_wait_ms=wait, wait_cost_ms=costs,
                   wait_cost_alignment_samples_ms={k: [min(costs[k], low_costs[k], high_costs[k]),
@@ -205,8 +211,10 @@ if a.plot:
     for i, (label, value) in enumerate(groups):
         axes[1].barh(i, value, color=['#2563eb', '#d97706', '#7c3aed', '#0891b2', '#16a34a'][i])
         axes[1].text(value + .3, i, f'{value:.1f} ms ({value / total:.1%})', va='center', fontsize=9)
-    axes[1].set(yticks=range(len(groups)), yticklabels=[n for n, _ in groups], xlabel='Serial worker service time (ms)',
-                title=f'Why the single worker takes {total:.1f} ms')
+    axes[1].set(yticks=range(len(groups)), yticklabels=[n for n, _ in groups], xlabel='Sum of per-block service time (ms)',
+                title=(f'Overlapping service summed: {total:.1f} ms'
+                       if any(r['parallel'] for r in result['rounds']) else
+                       f'Why the single worker takes {total:.1f} ms'))
     axes[1].invert_yaxis()
     axes[1].set_xlim(0, 35)
     for ax in axes:
