@@ -17,7 +17,7 @@
 
 FTL 只处理图调度、介质时延及回填记录回收，不执行回填数据复制。在途 DMA 会阻止该记录因 ACK 或超时提前释放，保证输入 FDM 在复制结束前有效。
 
-Guest 全局限制最多 4 个 I/O 任务同时执行，至多 4 条 DMA 请求在途、约 16 MiB 文件页锁定用于回填。不同 poller 可以并行处理；同一 poller 上仍会顺序处理请求。当前没有独立低优先级 SQ/WRR，复制仍消耗宿主 CPU 和内存带宽，也不能被同一 poller 的后续请求抢占。FEMU 此处使用 QEMU 的实际内存 DMA 路径，没有新增 PCIe 传输带宽模型，因此这些测量不能解释为真实硬件 PCIe 吞吐。
+Guest 全局限制最多 4 个 I/O 任务同时执行，至多 4 条 DMA 请求在途、约 16 MiB 文件页锁定用于回填。不同 poller 可以并行处理；同一 poller 上仍会顺序处理请求。当前没有独立低优先级 SQ/WRR，复制仍消耗宿主 CPU 和内存带宽，也不能被同一 poller 的后续请求抢占。FEMU 使用 QEMU 的实际内存 DMA 路径，并复用控制器的共享 PCIe 带宽模型限制完成时间；软件复制仍消耗 CPU，不能把模型上限当作实际吞吐。
 
 ## Guest 编译与安装
 
@@ -75,7 +75,7 @@ python3 scripts/plot-cache-refill.py device.log results/cache-refill-plot
 
 绘图依赖 matplotlib，输出逐块 CSV、统计 JSON 和 PNG/PDF。所有时间戳来自同一个 FEMU 单调时钟：`load` 是块可用，`cu` 是最后一个消费者的计算完成，`dma_start`/`dma` 是回填 DMA 开始/结束，`cache_ack` 是设备收到缓存有效确认，`release` 是解除回填占用，`dma_bytes` 是成功传输的字节数。完整传输时不再发送 ACK，`cache_ack=0` 不表示失败；缓存发布时刻由 Guest 的 `published` 记录确认。CU 时间不包含 FTL 处理完成事件的调度滞后。
 
-必须区分 **LOAD→DMA 结束的总响应时间**和 **DMA 自身复制时间**：前者还包含 AER、Guest 调度和 NVMe 队列等待。缓存有效确认包含 ACK 命令的传输延迟，是缓存发布时刻的上界。`release-cu` 表示 CU 完成后的额外 FDM 占用，不能将其全部归因于 DMA 复制。
+必须区分 **LOAD→DMA 结束的总响应时间**和 **DMA 传输完成时间**：前者还包含 AER、Guest 调度和 NVMe 队列等待。`dma_start→dma` 包含共享链路预算；实际 CPU 映射复制使用下文 `CACHE_READ.copy_begin→copy_end`，两者不是同一指标。缓存有效确认包含 ACK 命令的传输延迟，是缓存发布时刻的上界。`release-cu` 表示 CU 完成后的额外 FDM 占用，不能将其全部归因于 DMA 复制。
 
 ### 拆分回填等待
 
@@ -99,15 +99,15 @@ python3 scripts/analyze-cache-refill.py results/cache-refill-breakdown --plot
 
 Guest `ktime` 与 FEMU 时钟有偏移，不能直接相减。分析利用“设备 DMA（以及实际存在的 ACK）处理一定发生在对应 Guest 请求提交与返回之间”得到每轮时钟偏移区间；若所有请求的区间没有交集，直接报错，不输出混合时钟的归因。报告同时保留区间宽度和关键等待各项在下界、中点、上界对齐时的变化。按最晚结束的一条应用流统计关键路径，避免将 8 条流的重叠等待直接相加。同一 4 MiB batch 的多个回填子块按设备图归组，只取最后释放的子块作为该 batch 的释放依赖，不将重叠的子块占用重复相加。旧版串行记录可以统计单 worker 的服务构成；带 `parallel=1` 的记录中多个 worker 会重叠，分析工具只对当前块的服务进行关键等待归因，其余标为本块服务前等待，不重复计入其他 worker。并行模式图中的请求耗时之和不是整段时间，不能将其当作串行服务构成或新增总延迟的分摊。
 
-单块发生驱动限制拆分时，`dma_calls` 只统计实际提交的 Read 数量；`dma_start` 到 `dma` 包含多次请求之间的间隙，不等于纯复制时间。分析中的 `single_read_mean_us` 仅用一条 Read 完成的范围拆分复制与完成通知延迟。测试程序在计算任务返回后，通过现有诊断读取等待缓存页发布结束，再校验页驻留和内容；这段 `cache_drain_ms` 在 `wall_ms` 之外，包含诊断读取本身，不能当作纯回填尾延迟。
+单块发生驱动限制拆分时，`dma_calls` 只统计实际提交的 Read 数量；`dma_start` 到 `dma` 包含多次请求之间的间隙，不等于纯复制时间。分析中的 `single_read_mean_us` 仅用一条 Read 完成的范围拆分设备传输与完成通知延迟；其中 `copy` 是 DMA 开始到传输完成的时间，启用链路模型后还包含链路等待，不等于纯 CPU 复制。测试程序在计算任务返回后，通过现有诊断读取等待缓存页发布结束，再校验页驻留和内容；这段 `cache_drain_ms` 在 `wall_ms` 之外，包含诊断读取本身，不能当作纯回填尾延迟。
 
 ### Read 请求内部阶段
 
 现有模块 `profile=1` 时，在 F3 的 CDW14 设置 `FEMU_CACHE_READ_PROFILE`，只控制诊断，不改变数据语义。设备在 CQE 写入后输出一条 `CACHE_READ`；关闭 profile 时不输出这些记录。记录按 token、块内 offset、bytes 对应具体一次 Read，拆分读取会有多条记录。
 
-所有设备字段来自同一个 FEMU 时钟：`seen` 是 poller 取出 SQE 后建立请求的时刻；`enter` 是进入 F3 处理；`locked` 是取得第一次 CSD 锁；`copy_begin/copy_end` 包围 PRP/SGL 映射和数据复制；`update_locked` 是复制后再次取得 CSD 锁；`ready` 是更新完成并释放锁；`posted` 是 CQE 已写入的时刻，尚不代表 Guest 已处理中断。
+所有设备字段来自同一个 FEMU 时钟：`seen` 是 poller 取出 SQE 后建立请求的时刻；`enter` 是进入 F3 处理；`locked` 是取得第一次 CSD 锁；`copy_begin/copy_end` 包围 PRP/SGL 映射和数据复制；`update_locked` 是复制后再次取得 CSD 锁；`ready` 是更新完成并释放锁；`link_begin/link_end` 是共享 PCIe 模型预留的传输起止；`posted` 是 CQE 已写入的时刻，尚不代表 Guest 已处理中断。
 
-相邻设备时间戳的差可以直接拆出命令处理、两次锁等待、映射复制、状态更新和完成队列等待。Guest 的 `dma_submit→dma_done` 是同步调用往返，包含派发与线程唤醒；不得将它命名为“写 SQ/CQ 的 CPU 耗时”。对单条请求，可用 Guest 往返减去设备 `seen→posted`，报告设备取命令前与 CQE 写入后等待的合计；若跨时钟偏移不能严格确定，不把该合计硬拆成 submission 与 completion。诊断日志输出也会影响开启计时的样本，性能成绩应另测关闭计时的模式。
+相应设备时间戳之间的差值可以直接拆出命令处理、两次锁等待、映射复制、状态更新和完成队列等待。Guest 的 `dma_submit→dma_done` 是同步调用往返，包含派发与线程唤醒；不得将它命名为“写 SQ/CQ 的 CPU 耗时”。对单条请求，可用 Guest 往返减去设备 `seen→posted`，报告设备取命令前与 CQE 写入后等待的合计；若跨时钟偏移不能严格确定，不把该合计硬拆成 submission 与 completion。诊断日志输出也会影响开启计时的样本，性能成绩应另测关闭计时的模式。
 
 ### PG 冷缓存对照
 
@@ -122,3 +122,11 @@ sudo cat /sys/kernel/debug/femu-cache/profile
 每次都会重启 PG 并清理 Guest page cache。模块访问权限在加载时配置，postgres 二进制沿用实验 Guest 已授权的 CAP_SYS_ADMIN。`CACHE_STATS` 在计时关闭时也会输出块数、回填/缓存命中字节数、跳过、错误和设备累计丢记录数；它会先等待现有工作完成，不参与 SQL 执行。
 
 `CACHE_BLOCK.cu` 是输入最后一个消费者的结束时刻；它可能早于后续算子链结束。设备图返回时的 `CACHE_GRAPH` 另外记录最后一个计算节点的 `compute`、固件确认所有节点完成的 `work`、最终返回的 `done`。`compute=0` 表示该图只有 I/O，没有同图计算可以覆盖回传；`done-work` 表示图完成后的回填等待。多个图会并行，不得将这些等待直接相加当作 SQL 延迟。`work-compute` 还可能包含固件完成事件处理滞后或其他图内 I/O，不能当作纯计算。
+
+### 多 poller 与共享链路
+
+`run-csd.sh` 使用 8 个 I/O 队列、4 个 poller（`multipoller_enabled=1,poller_ratio=2`），队列按 poller 交错分配。poller 数量与 CU 数量独立。`CSD_PCIE_BANDWIDTH_MBPS` 默认 3500，单位为十进制 MB/s；所有 poller 的普通 Read/Write、FDM Read/Write 和回填 Read 共用每方向一份带宽预算，两个方向可同时传输。内部 NVM↔FDM 不经过该预算。元数据查询与管理命令不按有效载荷限速。
+
+回填 Read 的链路传输与模拟器的软件复制重叠，CQE 和 FDM 释放都不能早于链路传输结束。`copy_begin→copy_end` 是实际 CPU 映射复制；`link_begin→link_end` 是模型时间，两者不能相加。拆分请求往返时，状态就绪后的额外链路等待为 `max(0,link_end-ready)`，之后到 `posted` 才是完成队列调度等待。
+
+在本次调整的数据路径中，CSD 锁保护资源表、引用和调度状态。FDM Read/Write 固定缓冲引用后解锁执行复制；唯一 FTL 线程执行内部 LOAD/STORE 和 spill I/O 时也释放 CSD 锁，基表 NVM 复制仍由原有范围锁保护。调用方仍须通过任务依赖避免同时改写同一缓冲区。

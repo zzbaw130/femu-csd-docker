@@ -1713,6 +1713,7 @@ typedef struct NvmeRequest {
     /* Optional F3 diagnostics, enabled by the existing Guest profile switch. */
     struct {
         uint64_t enter, locked, copy_begin, copy_end, update_locked, ready;
+        uint64_t link_begin, link_end;
     } cache_timing;
     int64_t                 reqlat;
     int64_t                 gcrt;
@@ -2978,6 +2979,7 @@ void nvme_enqueue_ns_event(FemuCtrl *n, uint8_t event_type, uint8_t event_info,
                            uint8_t log_page, uint32_t nsid);
 void nvme_clear_ns_events(FemuCtrl *n, uint8_t event_type, uint32_t nsid);
 void nvme_post_cqes_io(void *opaque);
+void nvme_charge_link(FemuCtrl *n, NvmeRequest *req);
 void *nvme_poller(void *arg);
 
 /* NVMe I/O */

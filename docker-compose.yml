@@ -40,6 +40,7 @@ services:
       CSD_WORKMEM_SIZE_MB: 256    # shared CSF work arena, independent of FDM
       CSD_FDM_SIZE: 64            # in megabytes, MAX=48GB=49152, with 25%(16GB) op
       CSD_NVM_SIZE: 16384         # in megabytes           
+      CSD_PCIE_BANDWIDTH_MBPS: 3500 # shared per direction across all pollers
       CSD_NR_CU: 8                # max 64
       CSD_CSF_RUNTIME_SCALE: 1
       CSD_PROGRAM_DIR: /workspace/code/csd-programs/build

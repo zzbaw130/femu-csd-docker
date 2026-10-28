@@ -295,6 +295,7 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
         /* Coperd: record req->stime at earliest convenience */
         req->expire_time = req->stime = nvme_io_clock(n);
         req->cache_timing.enter = req->cache_timing.copy_end = 0;
+        req->cache_timing.link_begin = req->cache_timing.link_end = 0;
         req->t_handoff = 0;
         req->t_return = 0;
         req->cqe.cid = cmd.cid;
@@ -423,7 +424,7 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
             /* FDM was already copied: no media work belongs on the FTL.
              * Use this poller's own heap (not the FTL-owned producer ring),
              * retaining the normal CQ-full backlog and interrupt handling. */
-            req->expire_time = nvme_io_clock(n);
+            req->expire_time = MAX(req->expire_time, nvme_io_clock(n));
             req->reqlat = 0;
             req->t_handoff = req->t_return = req->expire_time;
             pqueue_insert(n->pq[index_poller], req);
@@ -497,11 +498,13 @@ static void nvme_post_cqe(NvmeCQueue *cq, NvmeRequest *req)
         fprintf(stderr, "CACHE_READ token=%" PRIu64 " offset=%u bytes=%u"
             " seen=%" PRId64 " enter=%" PRIu64 " locked=%" PRIu64
             " copy_begin=%" PRIu64 " copy_end=%" PRIu64
-            " update_locked=%" PRIu64 " ready=%" PRIu64 " posted=%" PRIu64 "\n",
+            " update_locked=%" PRIu64 " ready=%" PRIu64 " link_begin=%" PRIu64
+            " link_end=%" PRIu64 " posted=%" PRIu64 "\n",
             token, le32_to_cpu(req->cmd.cdw12), le32_to_cpu(req->cmd.cdw13),
             req->stime, req->cache_timing.enter, req->cache_timing.locked,
             req->cache_timing.copy_begin, req->cache_timing.copy_end,
-            req->cache_timing.update_locked, req->cache_timing.ready, posted);
+            req->cache_timing.update_locked, req->cache_timing.ready,
+            req->cache_timing.link_begin, req->cache_timing.link_end, posted);
         req->cache_timing.enter = 0;
     }
 
@@ -649,6 +652,33 @@ static uint64_t nvme_fw_cost(FemuCtrl *n, uint8_t opcode)
     }
 }
 
+/* One shared full-duplex link per controller, independent of poller count.
+ * A reservation models transfer time; actual CPU copying is not charged again.
+ * F3 reserves before reporting DMA complete; ring-based commands reserve here
+ * once their media deadline is known. link_end also prevents double charging. */
+void nvme_charge_link(FemuCtrl *n, NvmeRequest *req)
+{
+    uint64_t bytes = req->xfer_bytes;
+    if (!n->pcie_enabled || !req->ns || req->cache_timing.link_end) return;
+    if (req->cmd_opcode == NVME_CMD_READ || req->cmd_opcode == NVME_CMD_WRITE) {
+        uint8_t lbads = req->ns->id_ns.lbaf[
+            NVME_ID_NS_FLBAS_INDEX(req->ns->id_ns.flbas)].lbads;
+        bytes = NS_KVSSD(req->ns) ? req->xfer_bytes : (uint64_t)req->nlb << lbads;
+    }
+    if (!bytes) return;
+    uint64_t transfer = n->pcie_bandwidth_mbps ?
+                        DIV_ROUND_UP(bytes * 1000, n->pcie_bandwidth_mbps) : 0;
+    pthread_spin_lock(&n->pcie_lock);
+    uint64_t *next = req->is_write ? &n->pcie_rx_next_avail_time :
+                                    &n->pcie_tx_next_avail_time;
+    uint64_t start = MAX(*next, (uint64_t)req->expire_time);
+    *next = start + transfer;
+    req->cache_timing.link_begin = start;
+    req->cache_timing.link_end = *next + n->pcie_prop_delay_ns;
+    req->expire_time = req->cache_timing.link_end;
+    pthread_spin_unlock(&n->pcie_lock);
+}
+
 static void nvme_process_cq_cpl(void *arg, int index_poller)
 {
     FemuCtrl *n = (FemuCtrl *)arg;
@@ -677,39 +707,7 @@ static void nvme_process_cq_cpl(void *arg, int index_poller)
             req->t_return = nvme_io_clock(n);
         }
 
-        /*
-         * Optional host-link model: charge the transfer over a link of the
-         * configured bandwidth plus a propagation delay. The link is one
-         * physical resource, so transfers queue behind each other through a
-         * next-available time, kept per direction since a read and a write
-         * travel opposite ways over it. Applied once the media latency is
-         * already in expire_time and before the completion is posted.
-         */
-        if (unlikely(n->pcie_enabled) && req->ns &&
-            (req->cmd_opcode == NVME_CMD_READ ||
-             req->cmd_opcode == NVME_CMD_WRITE)) {
-            uint8_t lbads = req->ns->id_ns.lbaf[
-                NVME_ID_NS_FLBAS_INDEX(req->ns->id_ns.flbas)].lbads;
-            /*
-             * A key-value store and retrieve share these opcodes and carry no
-             * block count, so the link was charged for whatever the previous
-             * command in this request slot moved, in its direction.
-             */
-            uint64_t data_size = NS_KVSSD(req->ns) ? req->xfer_bytes :
-                                 (uint64_t)req->nlb << lbads;
-            uint64_t trans_ns = n->pcie_bandwidth_mbps ?
-                data_size * 1000 / n->pcie_bandwidth_mbps : 0;
-            uint64_t *next, start;
-
-            pthread_spin_lock(&n->pcie_lock);
-            next = req->is_write ? &n->pcie_rx_next_avail_time :
-                                   &n->pcie_tx_next_avail_time;
-            start = (*next > (uint64_t)req->expire_time) ?
-                    *next : (uint64_t)req->expire_time;
-            *next = start + trans_ns;
-            req->expire_time = (int64_t)(*next + n->pcie_prop_delay_ns);
-            pthread_spin_unlock(&n->pcie_lock);
-        }
+        nvme_charge_link(n, req);
 
         /*
          * Optional controller-CPU model: charge each command its firmware

@@ -49,6 +49,11 @@ FEMU_OPTIONS="-device femu"
 FEMU_OPTIONS=${FEMU_OPTIONS}",devsz_mb=${ssd_size}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",namespaces=1"
 FEMU_OPTIONS=${FEMU_OPTIONS}",femu_mode=4"
+# Eight queues, two per poller: four host-side NVMe pollers, independent of CU.
+FEMU_OPTIONS=${FEMU_OPTIONS}",queues=8,multipoller_enabled=1,poller_ratio=2"
+# Shared per-direction link budget in decimal MB/s (the FEMU property name
+# uses mbps). Internal NVM/FDM copies do not traverse this link.
+FEMU_OPTIONS=${FEMU_OPTIONS}",pcie_bandwidth_mbps=${CSD_PCIE_BANDWIDTH_MBPS:-3500}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",secsz=${secsz}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",secs_per_pg=${secs_per_pg}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",pgs_per_blk=${pgs_per_blk}"

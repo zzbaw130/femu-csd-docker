@@ -18645,12 +18645,23 @@ static void femu_test_csd_cache_read(void *obj, void *data, QGuestAllocator *all
     cmd.dptr.prp1 = cpu_to_le64(buf);
     femu_submit(&c, &c.io, &cmd);
     g_assert_cmpint(FEMU_SC(femu_complete(&c, &c.io, NULL, NULL)), ==, NVME_INVALID_FIELD);
+    FemuQueue other;
+    femu_burst_queue(&c, &other, 3);
+    /* Distinct pollers copy disjoint ranges while sharing one TX budget. */
+    int64_t begin = g_get_monotonic_time();
     for (unsigned offset = 0; offset < 4096; offset += 2048) {
         cmd.cdw12 = cpu_to_le32(offset); cmd.cdw13 = cpu_to_le32(2048);
-        femu_submit(&c, &c.io, &cmd);
-        g_assert_cmpint(FEMU_SC(femu_complete(&c, &c.io, NULL, NULL)), ==, NVME_SUCCESS);
-        qtest_memread(qts, buf, actual + offset, 2048);
+        cmd.dptr.prp1 = cpu_to_le64(buf + offset);
+        femu_submit(&c, offset ? &other : &c.io, &cmd);
     }
+    g_assert_cmpint(FEMU_SC(femu_complete(&c, &c.io, NULL, NULL)), ==, NVME_SUCCESS);
+    g_assert_cmpint(FEMU_SC(femu_complete(&c, &other, NULL, NULL)), ==, NVME_SUCCESS);
+    if (data) {
+        /* At 1 MB/s both ranges together take at least 4096 us. */
+        g_assert_cmpint(g_get_monotonic_time() - begin, >=, 4096);
+    }
+    qtest_memread(qts, buf, actual, sizeof(actual));
+    femu_queue_free(&c, &other);
     g_assert_cmpmem(actual, sizeof(actual), expected, sizeof(expected));
     g_assert_cmpint(FEMU_SC(femu_complete(&c, &original, NULL, NULL)), ==, NVME_SUCCESS);
     femu_queue_free(&c, &c.io); c.io = original;
@@ -36991,6 +37002,12 @@ static void femu_register_nodes(void)
     qos_add_test("csd-cache-read", "femu", femu_test_csd_cache_read,
         &(QOSGraphTestOptions){.edge.extra_device_opts=g_strdup_printf(
             "femu_mode=4,fdm_size=16,nr_cu=2,csd_program_dir=%s",
+            femu_csd_slow_dir)});
+    qos_add_test("csd-cache-read-four-pollers", "femu", femu_test_csd_cache_read,
+        &(QOSGraphTestOptions){.arg = GINT_TO_POINTER(1),
+            .edge.extra_device_opts = g_strdup_printf(
+            "femu_mode=4,fdm_size=16,nr_cu=2,queues=8,multipoller_enabled=1,"
+            "poller_ratio=2,pcie_bandwidth_mbps=1,csd_program_dir=%s",
             femu_csd_slow_dir)});
     qos_add_test("csd-exec-graph-spill", "femu", femu_test_csd_graph_spill,
         &(QOSGraphTestOptions){.edge.extra_device_opts=g_strdup_printf(

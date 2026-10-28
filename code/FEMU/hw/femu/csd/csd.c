@@ -1595,7 +1595,11 @@ static uint16_t csd_read_afdm(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req)
     afdm = csd_get_afdm_locked(csd, id);
     status = csd_check_afdm_range(afdm, offset, size);
     if (!status) {
+        afdm->refs++;
+        qemu_mutex_unlock(&csd->lock);
         status = dma_read_cmd(n, cmd, afdm->data + offset, size);
+        qemu_mutex_lock(&csd->lock);
+        csd_afdm_unref(afdm);
     }
     qemu_mutex_unlock(&csd->lock);
 
@@ -1603,6 +1607,7 @@ static uint16_t csd_read_afdm(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req)
         return status | NVME_DNR;
     }
 
+    req->xfer_bytes = size; req->is_write = 0;
     req->cqe.n.result = size;
     return NVME_SUCCESS;
 }
@@ -1621,7 +1626,11 @@ static uint16_t csd_write_afdm(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req)
     afdm = csd_get_afdm_locked(csd, id);
     status = csd_check_afdm_range(afdm, offset, size);
     if (!status) {
+        afdm->refs++;
+        qemu_mutex_unlock(&csd->lock);
         status = dma_write_cmd(n, cmd, afdm->data + offset, size);
+        qemu_mutex_lock(&csd->lock);
+        csd_afdm_unref(afdm);
     }
     qemu_mutex_unlock(&csd->lock);
 
@@ -1629,6 +1638,7 @@ static uint16_t csd_write_afdm(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req)
         return status | NVME_DNR;
     }
 
+    req->xfer_bytes = size; req->is_write = 1;
     req->cqe.n.result = size;
     return NVME_SUCCESS;
 }
@@ -1689,6 +1699,12 @@ static uint16_t csd_nvm_copy_locked(FemuCtrl *n, NvmeNamespace *ns, NvmeRequest 
     afdm = held ? held : csd_get_afdm_locked(csd, id);
     status = csd_check_afdm_range(afdm, offset, size);
     if (!status) {
+        /* Called by the sole FTL owner with csd->lock held. Retain the AFDM
+         * while its table entry may be removed; graph/cancellation state is
+         * updated only after reacquiring the lock. NAND state needs no CSD
+         * lock because no other thread is allowed to execute the FTL. */
+        afdm->refs++;
+        qemu_mutex_unlock(&csd->lock);
         uint64_t host_pages = ns->ssd->host_write_pages;
 
         /* Reuse normal mapping, NAND timing and GC, without a Guest DMA. */
@@ -1723,6 +1739,8 @@ static uint16_t csd_nvm_copy_locked(FemuCtrl *n, NvmeNamespace *ns, NvmeRequest 
                 nvme_note_user_write(n);
             }
         }
+        qemu_mutex_lock(&csd->lock);
+        csd_afdm_unref(afdm);
     }
     if (status) {
         return status;
@@ -1783,7 +1801,9 @@ static uint64_t csd_spill_free_locked(FemuCsdState *csd, FemuCsdSpill *s)
     NvmeRequest req = { .ns = ns, .stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
         .dsm_ranges = range, .dsm_nr_ranges = 1 }; /* ssd_trim owns the range */
     req.cmd.opcode = NVME_CMD_DSM;
+    qemu_mutex_unlock(&csd->lock);
     uint64_t lat = bb_ftl_process_req(csd->n, ns, &req);
+    qemu_mutex_lock(&csd->lock);
     for (uint64_t i = s->page; i < s->page + s->pages; i++) {
         csd->spill_bitmap[i / 8] &= ~(1U << (i % 8));
     }
@@ -2023,6 +2043,12 @@ static uint16_t csd_cache_read(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req)
     if (profile) req->cache_timing.copy_begin = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     status = dma_read_cmd(n, cmd, data, bytes);
     uint64_t end = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    if (!status) {
+        req->xfer_bytes = bytes; req->is_write = 0;
+        req->expire_time = req->stime;
+        nvme_charge_link(n, req);
+    }
+    req->expire_time = MAX(req->expire_time, end);
 
     if (profile) req->cache_timing.copy_end = end;
     qemu_mutex_lock(&csd->lock);
@@ -2030,7 +2056,7 @@ static uint16_t csd_cache_read(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req)
     if (!status) {
         /* Guest reads disjoint missing-page ranges of this block. */
         item->dma_bytes += bytes;
-        item->dma_ns = MAX(item->dma_ns, end);
+        item->dma_ns = MAX(item->dma_ns, (uint64_t)req->expire_time);
     }
     item->dma_active--;
     qemu_mutex_unlock(&csd->lock);
@@ -2048,6 +2074,7 @@ void femu_csd_cache_poll(FemuCtrl *n)
     for (unsigned i = 0; i < ARRAY_SIZE(csd->cache); i++) {
         FemuCacheItem *item = &csd->cache[i];
         if (item->event.token && !item->dma_active && item->cu_ns &&
+            now >= item->dma_ns &&
             (item->dma_bytes == item->event.bytes || item->acknowledged ||
              now > item->deadline))
             csd_cache_finish(csd, item, now);
@@ -2313,13 +2340,19 @@ static void csd_graph_io(FemuCsdState *csd, FemuCsdGraph *g, FemuCsdGraphNode *v
             NvmeRwCmd *rw = (void *)&req.cmd;
             rw->slba = cpu_to_le64(req.slba); rw->nlb = cpu_to_le16(req.nlb - 1);
             rw->control = cpu_to_le16(write ? NVME_RW_FUA : 0);
+            /* This FTL owner retains the graph, busy spill and AFDM. */
+            qemu_mutex_unlock(&csd->lock);
             uint64_t host_pages = ns->ssd->host_write_pages;
             lat = bb_ftl_process_req(n, ns, &req);
             ns->ssd->host_write_pages = host_pages;
-            if (req.status) { g->status = req.status; return; }
+            if (req.status) {
+                qemu_mutex_lock(&csd->lock);
+                g->status = req.status; return;
+            }
             uint8_t *io = v->job->args.mr_addr[v->job->args.numr - 1];
             if (write) { memcpy(csd->spill_space + offset, io + v->transferred, bytes); }
             else { memcpy(io + v->transferred, csd->spill_space + offset, bytes); }
+            qemu_mutex_lock(&csd->lock);
             v->transferred += bytes;
         }
     } else {
