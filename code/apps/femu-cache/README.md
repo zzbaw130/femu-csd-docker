@@ -71,3 +71,25 @@ python3 scripts/plot-cache-refill.py device.log results/cache-refill-plot
 绘图依赖 matplotlib，输出逐块 CSV、统计 JSON 和 PNG/PDF。所有时间戳来自同一个 FEMU 单调时钟：`load` 是块可用，`cu` 是最后一个消费者的计算完成，`dma_start`/`dma` 是回填 DMA 开始/结束，`cache_ack` 是设备收到缓存有效确认，`release` 是解除回填占用。CU 时间不包含 FTL 处理完成事件的调度滞后。
 
 必须区分 **LOAD→DMA 结束的总响应时间**和 **DMA 自身复制时间**：前者还包含 AER、Guest 调度和后台排队。缓存有效确认包含 ACK 命令的传输延迟，是缓存发布时刻的上界。`max(cache_ack-cu, 0)` 表示 CU 完成后等待回填确认的额外占用，不能将其全部归因于 DMA 复制。
+
+### 拆分回填等待
+
+模块参数 `profile` 默认关闭。开启后，将每块的 worker 入口、FETCH 起止、页分配、BIO 准备、DMA 提交/返回、页发布及 ACK 起止存入内存；测量过程中不逐块打印日志。最多记录 4096 块，重新加载模块清空记录。测试程序的 `FEMU_CACHE_PROFILE=1` 则记录 8 条流中每轮 batch、结果读取和资源分配/释放的时间，在计时结束后打印。
+
+```sh
+sudo sh -c 'echo 1 > /sys/module/femu_cache/parameters/profile'
+sudo env FEMU_CACHE_PROFILE=1 /tmp/femu-cache-user/test-refill \
+    /data/cache-refill.bin 1 1 > measured.app
+sudo cat /sys/kernel/debug/femu-cache/profile > measured.kernel
+sudo sh -c 'echo 0 > /sys/module/femu_cache/parameters/profile'
+```
+
+应在没有正在执行的回填测试时开关计时，并同时保存此次 FEMU 的 `CACHE_BLOCK` 记录。kernel 记录的 token 与设备记录对应，LBA 与应用记录对应；多个块可以合用一次 AER、一次 FETCH，不能按块重复累加通知或 FETCH 时间。
+
+`scripts/analyze-cache-refill.py` 处理 `roundN-pP-cacheC.app/.device/.kernel` 命名的一组实验记录，P 表示是否开启计时，C 表示是否回填。每轮各测 P=0/1、C=0/1，既拆分耗时，也比较计时开关自身的影响。输出 `breakdown.json`、`critical-waits.csv`，附加 `--plot` 生成图：
+
+```sh
+python3 scripts/analyze-cache-refill.py results/cache-refill-breakdown --plot
+```
+
+Guest `ktime` 与 FEMU 时钟有偏移，不能直接相减。分析利用“设备 DMA 和 ACK 处理一定发生在对应 Guest 请求提交与返回之间”得到每轮时钟偏移区间；若所有请求的区间没有交集，直接报错，不输出混合时钟的归因。报告同时保留区间宽度和关键等待各项在下界、中点、上界对齐时的变化。按最晚结束的一条应用流统计关键路径，避免将 8 条流的重叠等待直接相加。串行 worker 的服务构成是另一种口径，不能将它的各项比例直接当作新增总延迟的比例。

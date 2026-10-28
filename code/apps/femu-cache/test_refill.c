@@ -103,15 +103,25 @@ static int read_namespace_geometry(int file, const char *device, unsigned *lba, 
     return 0;
 }
 
+static int profile;
+static uint64_t now_ns(void)
+{
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+    return (uint64_t)t.tv_sec*1000000000+t.tv_nsec;
+}
+struct app_profile { uint64_t lba,configure,batch_begin,batch_end,copy_end; };
 struct lane {
     CS_DEV_HANDLE dev; CS_CSF_ID csf; struct fiemap *map;
     unsigned number,lba,repetitions; uint64_t partition,sum,count;
     int error;
+    uint64_t begin,end;
+    struct app_profile timing[FILE_BYTES/CHUNK/LANES];
 };
 #define CHECK(call) do { CS_STATUS s=(call); if(s!=CS_SUCCESS) { fprintf(stderr,"%s: %d\n",#call,s); lane->error=1; goto done; } } while(0)
 static void *run_lane(void *opaque)
 {
     struct lane *lane=opaque;
+    if(profile) lane->begin=now_ns();
     CS_MEM_HANDLE input=NULL,output=NULL;
     CS_BATCH_HANDLE batch=NULL;
     CsBatchRequest *load=NULL,*compute=NULL;
@@ -133,6 +143,8 @@ static void *run_lane(void *opaque)
     CHECK(csAllocBatchRequest(CS_BATCH_SERIAL,2,&batch));
     CS_BATCH_INDEX first,second;
     for(uint64_t at=(uint64_t)lane->number*CHUNK;at<FILE_BYTES;at+=(uint64_t)LANES*CHUNK) {
+        struct app_profile *p=&lane->timing[at/CHUNK/LANES];
+        if(profile) p->configure=now_ns();
         CsBlockIo *io=&load->u.StorageIo.u.BlockIo; io->NumRanges=0;
         uint64_t cursor=at;
         for(unsigned e=0;e<lane->map->fm_mapped_extents && cursor<at+CHUNK;e++) {
@@ -150,10 +162,13 @@ static void *run_lane(void *opaque)
             CHECK(csConfigureBatchEntry(batch,CS_BATCH_ADD,load,0,0,&first));
             CHECK(csConfigureBatchEntry(batch,CS_BATCH_ADD,compute,0,first,&second));
         } else CHECK(csConfigureBatchEntry(batch,CS_BATCH_RECONFIG,load,first,0,NULL));
+        if(profile) { p->lba=io->Range[0].StartLba; p->batch_begin=now_ns(); }
         CHECK(csQueueBatchRequest(batch,NULL,NULL,NULL,NULL,NULL));
+        if(profile) p->batch_end=now_ns();
         uint64_t values[2];
         CsCopyMemRequest copy={.Type=CS_COPY_FROM_DEVICE,.DevMem={output,0},.u.HostVAddress=values,.Bytes=16};
         CHECK(csQueueCopyMemRequest(&copy,NULL,NULL,NULL,NULL,NULL));
+        if(profile) p->copy_end=now_ns();
         lane->sum+=values[0]; lane->count+=values[1];
     }
 done:
@@ -161,12 +176,14 @@ done:
     if(batch) csFreeBatchRequest(batch);
     if(input) csFreeMem(input,&flags);
     if(output) csFreeMem(output,&flags);
+    if(profile) lane->end=now_ns();
     return NULL;
 }
 int main(int argc,char **argv)
 {
     if(argc!=4) { fprintf(stderr,"usage: %s data-file repetitions refill[0|1]\n",argv[0]); return 2; }
     unsigned repetitions=strtoul(argv[2],NULL,10); int refill=atoi(argv[3]);
+    profile=getenv("FEMU_CACHE_PROFILE") && !strcmp(getenv("FEMU_CACHE_PROFILE"),"1");
     if(!repetitions) return 2;
     setenv("SNIA_FEMU_CACHE_REFILL",refill?"1":"0",1);
     int fd=open(argv[1],O_RDWR|O_CREAT,0600); if(fd<0) { perror("open"); return 1; }
@@ -217,6 +234,21 @@ int main(int argc,char **argv)
     printf("refill=%d repetitions=%u bytes=%u lanes=%u chunk=%u cold_pages=%u resident_pages=%u sum=%llu count=%llu correct=%s wall_ms=%.3f\n",
         refill,repetitions,FILE_BYTES,LANES,CHUNK,cold,resident,(unsigned long long)sum,(unsigned long long)count,error?"no":"yes",
         (end.tv_sec-begin.tv_sec)*1000.+(end.tv_nsec-begin.tv_nsec)/1e6);
+    if(profile) {
+        printf("CACHE_APP_RUN begin=%llu end=%llu\n",
+            (unsigned long long)begin.tv_sec*1000000000+begin.tv_nsec,
+            (unsigned long long)end.tv_sec*1000000000+end.tv_nsec);
+        for(unsigned l=0;l<LANES;l++) {
+            printf("CACHE_LANE lane=%u begin=%llu end=%llu\n",l,
+                (unsigned long long)lanes[l].begin,(unsigned long long)lanes[l].end);
+            for(unsigned b=0;b<FILE_BYTES/CHUNK/LANES;b++) {
+                const struct app_profile *p=&lanes[l].timing[b];
+                printf("CACHE_APP lane=%u block=%u lba=%llu configure=%llu batch_begin=%llu batch_end=%llu copy_end=%llu\n",
+                    l,b,(unsigned long long)p->lba,(unsigned long long)p->configure,(unsigned long long)p->batch_begin,
+                    (unsigned long long)p->batch_end,(unsigned long long)p->copy_end);
+            }
+        }
+    }
     /* Read the populated cache and compare every byte, outside the timed region. */
     buffer=malloc(CHUNK);
     for(unsigned b=0;b<FILE_BYTES/CHUNK;b++) {

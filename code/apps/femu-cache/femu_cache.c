@@ -15,6 +15,9 @@
 #include <linux/uaccess.h>
 #include <linux/capability.h>
 #include <linux/slab.h>
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
+#include <linux/ktime.h>
 #include "csd-cache.h"
 struct nvme_ctrl;
 extern void nvme_init_request(struct request *, struct nvme_command *);
@@ -37,6 +40,34 @@ static void refill_work(struct work_struct *);
 static DECLARE_WORK(refill,refill_work);
 static atomic_t pending=ATOMIC_INIT(0);
 static u64 blocks, filled, cached, skipped, errors;
+/* Diagnostic records stay in memory; export only after the measured request.
+ * All fields below use Guest ktime. Device timestamps are correlated offline
+ * using the causal bounds of DMA and ACK request/response pairs. */
+static bool profile;
+module_param(profile,bool,0644);
+#define PROFILE_MAX 4096
+struct cache_profile {
+    u64 token, lba, aer, worker, fetch_begin, fetch_end, begin, pages_ns;
+    u64 dma_build, dma_submit, dma_done, published, ack_begin, ack_end;
+    unsigned dma_calls;
+};
+static struct cache_profile profiles[PROFILE_MAX];
+static unsigned profile_count;
+static atomic64_t last_aer=ATOMIC64_INIT(0);
+static struct dentry *profile_dir;
+static int profile_show(struct seq_file *out,void *unused)
+{
+    flush_workqueue(workers);
+    for(unsigned i=0;i<profile_count;i++) {
+        const struct cache_profile *p=&profiles[i];
+        seq_printf(out,"CACHE_HOST token=%llu lba=%llu aer=%llu worker=%llu fetch_begin=%llu fetch_end=%llu begin=%llu pages_ns=%llu dma_build=%llu dma_submit=%llu dma_done=%llu published=%llu ack_begin=%llu ack_end=%llu dma_calls=%u\n",
+            p->token,p->lba,p->aer,p->worker,p->fetch_begin,p->fetch_end,p->begin,p->pages_ns,
+            p->dma_build,p->dma_submit,p->dma_done,p->published,p->ack_begin,p->ack_end,p->dma_calls);
+    }
+    return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(profile);
+
 static int control_bytes(unsigned action,u64 token,void *data,unsigned valid)
 {
     struct nvme_command cmd={};
@@ -51,12 +82,13 @@ static int control_bytes(unsigned action,u64 token,void *data,unsigned valid)
 static int control(unsigned action,u64 token,void *data)
 { return control_bytes(action,token,data,0); }
 static int dma_folios(const struct femu_cache_event *event,unsigned offset,
-                      struct folio **folios,unsigned count)
+                      struct folio **folios,unsigned count,struct cache_profile *p)
 {
     struct nvme_command cmd={};
     struct request *req;
     struct bio *bio;
     int ret;
+    if(p) { p->dma_build=ktime_get_ns(); p->dma_calls++; }
     cmd.common.opcode=FEMU_CACHE_READ;
     cmd.common.nsid=cpu_to_le32(event->nsid);
     cmd.common.cdw10=cpu_to_le32(event->token);
@@ -73,17 +105,22 @@ static int dma_folios(const struct femu_cache_event *event,unsigned offset,
             bio_put(bio); blk_mq_free_request(req); return -EIO;
         }
     ret=blk_rq_append_bio(req,bio);
-    if(!ret) ret=nvme_execute_rq(req,false);
+    if(!ret) {
+        if(p) p->dma_submit=ktime_get_ns();
+        ret=nvme_execute_rq(req,false);
+        if(p) p->dma_done=ktime_get_ns();
+    }
     bio_put(bio);
     blk_mq_free_request(req);
     return ret;
 }
-static void fill_event(const struct femu_cache_event *event)
+static void fill_event(const struct femu_cache_event *event,struct cache_profile *p)
 {
     struct mapping *map;
     u64 physical=event->lba*bdev_logical_block_size(bdev->bdev);
     u64 end=physical+event->bytes;
     u64 before=filled+cached;
+    if(p) p->begin=ktime_get_ns();
     mutex_lock(&mapping_lock);
     list_for_each_entry(map,&mappings,list) {
         u64 start=max(physical,map->range.lba_bytes);
@@ -94,8 +131,10 @@ static void fill_event(const struct femu_cache_event *event)
             unsigned count=0,offset=start-physical;
             u64 file_offset=map->range.file_offset+start-map->range.lba_bytes;
             while(start<stop && count<ARRAY_SIZE(folios)) {
+                u64 page_begin=p?ktime_get_ns():0;
                 struct folio *f=__filemap_get_folio(map->file->f_mapping,file_offset>>PAGE_SHIFT,
                     FGP_LOCK|FGP_CREAT|FGP_NOWAIT,GFP_NOIO);
+                if(p) p->pages_ns+=ktime_get_ns()-page_begin;
                 if(IS_ERR(f)) { if(!count) { skipped+=PAGE_SIZE; start+=PAGE_SIZE; } break; }
                 if(folio_test_uptodate(f) || folio_test_dirty(f) || folio_order(f)) {
                     bool valid=folio_test_uptodate(f);
@@ -106,7 +145,7 @@ static void fill_event(const struct femu_cache_event *event)
                 folios[count++]=f; start+=PAGE_SIZE; file_offset+=PAGE_SIZE;
             }
             if(count) {
-                int ret=dma_folios(event,offset,folios,count);
+                int ret=dma_folios(event,offset,folios,count,p);
                 for(unsigned i=0;i<count;i++) {
                     if(!ret) folio_mark_uptodate(folios[i]);
                     folio_unlock(folios[i]); folio_put(folios[i]);
@@ -117,21 +156,36 @@ static void fill_event(const struct femu_cache_event *event)
     }
     mutex_unlock(&mapping_lock);
     blocks++;
+    if(p) p->published=ktime_get_ns();
     /* All cache folios are now visible. Device timestamps ACK reception in
      * its own clock, an upper bound on page-cache publication, not pure DMA. */
+    if(p) p->ack_begin=ktime_get_ns();
     if(control_bytes(FEMU_CACHE_ACK,event->token,NULL,filled+cached-before)) errors++;
+    if(p) p->ack_end=ktime_get_ns();
 }
 static void refill_work(struct work_struct *work)
 {
+    u64 worker_ns=profile?ktime_get_ns():0;
+    u64 aer_ns=profile?atomic64_read(&last_aer):0;
     void *data=kzalloc(FEMU_CACHE_LOG_BYTES,GFP_KERNEL);
     if(!data) return;
     do {
         struct femu_cache_log *log=data;
         atomic_set(&pending,0);
         memset(data,0,FEMU_CACHE_LOG_BYTES);
+        u64 fetch_begin=profile?ktime_get_ns():0;
         if(control(FEMU_CACHE_FETCH,0,data)) { errors++; break; }
-        for(unsigned i=0;i<min_t(unsigned,log->count,FEMU_CACHE_LOG_COUNT);i++)
-            fill_event(&log->events[i]);
+        u64 fetch_end=profile?ktime_get_ns():0;
+        for(unsigned i=0;i<min_t(unsigned,log->count,FEMU_CACHE_LOG_COUNT);i++) {
+            struct cache_profile *p=NULL;
+            if(profile && profile_count<PROFILE_MAX) {
+                p=&profiles[profile_count];
+                *p=(struct cache_profile){.token=log->events[i].token,.lba=log->events[i].lba,.aer=aer_ns,
+                    .worker=worker_ns,.fetch_begin=fetch_begin,.fetch_end=fetch_end};
+            }
+            fill_event(&log->events[i],p);
+            if(p) profile_count++;
+        }
         if(log->count) atomic_set(&pending,1);
     } while(atomic_xchg(&pending,0));
     kfree(data);
@@ -139,6 +193,7 @@ static void refill_work(struct work_struct *work)
 static void aer(void *unused,struct nvme_ctrl *ctrl,u32 result)
 {
     if((result&0x00ffffff)!=FEMU_CACHE_AER) return;
+    if(profile) atomic64_set(&last_aer,ktime_get_ns());
     atomic_set(&pending,1);
     queue_work(workers,&refill);
 }
@@ -236,12 +291,15 @@ static int __init cache_init(void)
     if(!aer_trace) { ret=-ENOENT; unregister_tracepoint_module_notifier(&module_events); goto destroy; }
     ret=misc_register(&misc);
     if(ret) { unregister_tracepoint_module_notifier(&module_events); if(aer_trace) tracepoint_probe_unregister(aer_trace,aer,NULL); tracepoint_synchronize_unregister(); goto destroy; }
+    profile_dir=debugfs_create_dir("femu-cache",NULL);
+    debugfs_create_file("profile",0400,profile_dir,NULL,&profile_fops);
     return 0;
 destroy: destroy_workqueue(workers);
 release: bdev_release(bdev); return ret;
 }
 static void __exit cache_exit(void)
 {
+    debugfs_remove_recursive(profile_dir);
     control(FEMU_CACHE_DISABLE,0,NULL);
     unregister_tracepoint_module_notifier(&module_events);
     if(aer_trace) tracepoint_probe_unregister(aer_trace,aer,NULL);
