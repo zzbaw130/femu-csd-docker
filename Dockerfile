@@ -9,7 +9,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential pkg-config cmake git ninja-build python3-venv flex bison \
         libglib2.0-dev libfdt-dev libpixman-1-dev zlib1g-dev libdw-dev \
-        libaio-dev libslirp-dev libnuma-dev liblz4-dev libreadline-dev \
+        libaio-dev libslirp-dev libnuma-dev numactl liblz4-dev libreadline-dev \
         sudo ca-certificates curl cloud-image-utils qemu-utils openssh-client \
     && rm -rf /var/lib/apt/lists/*
 

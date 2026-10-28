@@ -63,12 +63,31 @@ MemTxResult femu_dma_rw(FemuCtrl *n, dma_addr_t addr, void *buf,
         memcpy(to_host ? cmb : buf, to_host ? buf : cmb, len);
         return MEMTX_OK;
     }
-    if (!femu_dma_direct(n, addr, len, to_host)) {
+    if (len && addr > UINT64_MAX - (len - 1)) {
         return MEMTX_ACCESS_ERROR;
     }
-    return pci_dma_rw(&n->parent_obj, addr, buf, len,
-                      to_host ? DMA_DIRECTION_FROM_DEVICE :
-                                DMA_DIRECTION_TO_DEVICE, FEMU_DMA_ATTRS);
+    AddressSpace *as = pci_get_address_space(&n->parent_obj);
+    uint8_t *data = buf;
+    RCU_READ_LOCK_GUARD();
+    while (len) {
+        hwaddr xlat, size = len;
+        MemoryRegion *mr = address_space_translate(as, addr, &xlat, &size,
+                                                   to_host, FEMU_DMA_ATTRS);
+        if (!size || !memory_region_is_ram(mr) ||
+            !memory_access_is_direct(mr, to_host, FEMU_DMA_ATTRS)) {
+            return MEMTX_ACCESS_ERROR;
+        }
+        /* Translate/check once, retain the RAM mapping through the copy.
+         * unmap preserves QEMU's dirty tracking and code invalidation. */
+        memory_region_ref(mr);
+        uint8_t *ram = (uint8_t *)memory_region_get_ram_ptr(mr) + xlat;
+        memmove(to_host ? ram : data, to_host ? data : ram, size);
+        address_space_unmap(as, ram, size, to_host, size);
+        addr += size;
+        data += size;
+        len -= size;
+    }
+    return MEMTX_OK;
 }
 
 MemTxResult femu_dma_set(FemuCtrl *n, dma_addr_t addr, uint8_t c,
@@ -212,6 +231,21 @@ static uint16_t nvme_read_list(FemuCtrl *n, hwaddr addr, void *buf, int size)
     return status;
 }
 
+/* Coalesce only adjacent guest DMA addresses, retaining PRP/SGL validation. */
+static void femu_sg_add(QEMUSGList *qsg, dma_addr_t addr, dma_addr_t len)
+{
+    if (qsg->nsg) {
+        ScatterGatherEntry *last = &qsg->sg[qsg->nsg - 1];
+        if (last->len <= UINT64_MAX - last->base &&
+            last->base + last->len == addr && len <= UINT64_MAX - last->len) {
+            last->len += len;
+            qsg->size += len;
+            return;
+        }
+    }
+    qemu_sglist_add(qsg, addr, len);
+}
+
 uint16_t nvme_map_prp(QEMUSGList *qsg, QEMUIOVector *iov, uint64_t prp1,
                       uint64_t prp2, uint32_t len, FemuCtrl *n)
 {
@@ -236,7 +270,7 @@ uint16_t nvme_map_prp(QEMUSGList *qsg, QEMUIOVector *iov, uint64_t prp1,
         }
     } else {
         pci_dma_sglist_init(qsg, &n->parent_obj, num_prps);
-        qemu_sglist_add(qsg, prp1, trans_len);
+        femu_sg_add(qsg, prp1, trans_len);
     }
 
     len -= trans_len;
@@ -304,7 +338,7 @@ uint16_t nvme_map_prp(QEMUSGList *qsg, QEMUIOVector *iov, uint64_t prp1,
 
                 trans_len = MIN(len, n->page_size);
                 if (!cmb) {
-                    qemu_sglist_add(qsg, prp_ent, trans_len);
+                    femu_sg_add(qsg, prp_ent, trans_len);
                 } else if (!nvme_cmb_iovec_add(n, iov, prp_ent, trans_len)) {
                     g_free(prp_list);
                     goto unmap;
@@ -319,7 +353,7 @@ uint16_t nvme_map_prp(QEMUSGList *qsg, QEMUIOVector *iov, uint64_t prp1,
                 goto unmap;
             }
             if (!cmb) {
-                qemu_sglist_add(qsg, prp2, len);
+                femu_sg_add(qsg, prp2, len);
             } else if (!nvme_cmb_iovec_add(n, iov, prp2, len)) {
                 /* the remaining length, not the first entry's */
                 goto unmap;
@@ -376,7 +410,7 @@ uint16_t nvme_map_sgl(QEMUSGList *qsg, QEMUIOVector *iov,
                 status = NVME_DATA_SGL_LEN_INVALID;
                 goto inval;
             }
-            qemu_sglist_add(qsg, le64_to_cpu(sgl.addr), dlen);
+            femu_sg_add(qsg, le64_to_cpu(sgl.addr), dlen);
             len = 0;
             break;
         } else if (type == NVME_SGL_DESCR_TYPE_SEGMENT ||
@@ -419,7 +453,7 @@ uint16_t nvme_map_sgl(QEMUSGList *qsg, QEMUIOVector *iov,
                         g_free(descs);
                         goto inval;
                     }
-                    qemu_sglist_add(qsg, le64_to_cpu(descs[i].addr), dl);
+                    femu_sg_add(qsg, le64_to_cpu(descs[i].addr), dl);
                     len -= dl;
                     if (++nsegs > max_descrs) {
                         status = NVME_INVALID_NUM_SGL_DESCRS;

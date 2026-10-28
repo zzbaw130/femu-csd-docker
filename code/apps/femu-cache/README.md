@@ -130,3 +130,11 @@ sudo cat /sys/kernel/debug/femu-cache/profile
 回填 Read 的链路传输与模拟器的软件复制重叠，CQE 和 FDM 释放都不能早于链路传输结束。`copy_begin→copy_end` 是实际 CPU 映射复制；`link_begin→link_end` 是模型时间，两者不能相加。拆分请求往返时，状态就绪后的额外链路等待为 `max(0,link_end-ready)`，之后到 `posted` 才是完成队列调度等待。
 
 在本次调整的数据路径中，CSD 锁保护资源表、引用和调度状态。FDM Read/Write 固定缓冲引用后解锁执行复制；唯一 FTL 线程执行内部 LOAD/STORE 和 spill I/O 时也释放 CSD 锁，基表 NVM 复制仍由原有范围锁保护。调用方仍须通过任务依赖避免同时改写同一缓冲区。
+
+### NUMA 固定与 DMA 段合并
+
+Compose 默认设置 `FEMU_NUMA_NODE=0`、`FEMU_MBE_INTERLEAVE=1,2,3`。容器安装 numactl，并开放 `SYS_NICE`，用于 NUMA 策略及后端页迁移。`run-csd.sh` 在启动 QEMU 前用 numactl 将 CPU 和内存策略绑定到 node0，Guest RAM、FDM、workmem 及 CU/poller 线程继承该策略。16GiB 的 RAM-backed NVM 单独限定在 node1～3 的节点集合内；其访问仍跨 NUMA，不能声称整个 SSD 仿真已排除 NUMA 影响。节点编号针对本实验宿主，可在 Compose 中调整；绑定失败会停止启动。
+
+Guest 中运行 `sh /home/femu/scripts/init-csd-env.sh`，检查单虚拟 NUMA 节点后完成原有分区、挂载与 SNIA 安装。Guest 不能设置宿主物理 NUMA 绑定，因此修改绑定参数后需要重建容器并重启 Guest，先保存易失 SSD 数据。可通过宿主 `/proc/<QEMU pid>/numa_maps` 核对实际页分布，不能仅凭启动参数认定绑定成功。
+
+DMA 解析仍逐项校验 PRP/SGL，但将相邻 DMA 地址合为一个 SG 段；不相邻的页维持分散布局。复制时每个实际内存区域只做一次地址翻译和直接 RAM 校验，持有区域引用完成复制，随后通过 QEMU unmap 更新脏页与代码失效状态。映射仅在当前调用中使用，不跨请求保留 Guest 指针；MMIO 等非直接 RAM 目标仍返回传输错误。

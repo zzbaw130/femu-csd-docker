@@ -10335,7 +10335,7 @@ static void femu_test_prp_list_offset(void *obj, void *data,
     for (k = 0; k < FEMU_PRP_PAGES - 1; k++) {
         uint64_t slot;
 
-        entry = cpu_to_le64(pages + (FEMU_PRP_PAGES - 1 - k) * 4096);
+        entry = cpu_to_le64(pages + (data ? k + 1 : FEMU_PRP_PAGES - 1 - k) * 4096);
         slot = k < slots - 1 ? list_a + FEMU_PRP_LIST_OFF + k * 8
                              : list_b + (k - (slots - 1)) * 8;
         qtest_memwrite(qts, slot, &entry, sizeof(entry));
@@ -10348,7 +10348,7 @@ static void femu_test_prp_list_offset(void *obj, void *data,
     }
     /* transfer page p lives at buffer page 0 for p == 0, else 40 - p */
     for (k = 0; k < FEMU_PRP_PAGES; k++) {
-        int at = k ? FEMU_PRP_PAGES - k : 0;
+        int at = data ? k : (k ? FEMU_PRP_PAGES - k : 0);
 
         qtest_memwrite(qts, pages + at * 4096, wbuf + k * 4096, 4096);
     }
@@ -10361,7 +10361,7 @@ static void femu_test_prp_list_offset(void *obj, void *data,
                                      list_a + FEMU_PRP_LIST_OFF),
                     ==, NVME_SUCCESS);
     for (k = 0; k < FEMU_PRP_PAGES; k++) {
-        int at = k ? FEMU_PRP_PAGES - k : 0;
+        int at = data ? k : (k ? FEMU_PRP_PAGES - k : 0);
 
         qtest_memread(qts, pages + at * 4096, rbuf + k * 4096, 4096);
     }
@@ -36952,6 +36952,8 @@ static void femu_register_nodes(void)
         .edge.extra_device_opts = "devsz_mb=512,femu_mode=5,sgl=on"
     });
     qos_add_test("prp-list-offset", "femu", femu_test_prp_list_offset, NULL);
+    qos_add_test("prp-list-contiguous", "femu", femu_test_prp_list_offset,
+                 &(QOSGraphTestOptions){.arg = GINT_TO_POINTER(1)});
     qos_add_test("fdp-features", "femu", femu_test_fdp_features,
                  &(QOSGraphTestOptions) {
         .edge.extra_device_opts =

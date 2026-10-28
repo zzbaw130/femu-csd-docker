@@ -3,29 +3,33 @@
 
 /* Coperd: FEMU Memory Backend (mbe) for emulated SSD */
 
-/*
- * Optionally bind the emulated-SSD backend buffer to a NUMA node before it is
- * first touched. FEMU_MBE_INTERLEAVE=<n> binds every page to node n
- * (MPOL_BIND); =on interleaves across nodes 0-1 (MPOL_INTERLEAVE). This is the
- * device-side half of the strict socket-isolation setup: pin the guest's vCPUs
- * and RAM to one socket and the FEMU poller threads + this backend to the
- * other, so the only thing crossing the inter-socket link is the per-I/O
- * emulation copy and the two DRAM-bandwidth domains do not contend. A direct
- * mbind(2) syscall avoids a libnuma build dependency. No-op (default) when the
- * env var is unset, so existing single-socket setups are unchanged.
- */
+/* FEMU_MBE_INTERLEAVE is a comma-separated allowed node set. Bind the NVM
+ * buffer to that set independently of the process policy.
+ * Legacy "on" still means nodes 0,1. Unset preserves the process policy. */
 static void mbe_numa_bind(void *addr, int64_t len)
 {
     const char *il = getenv("FEMU_MBE_INTERLEAVE");
     if (!il || !il[0]) {
         return;
     }
-    if (strcmp(il, "on") && strcmp(il, "0") && strcmp(il, "1")) {
-        femu_err("backend: ignoring FEMU_MBE_INTERLEAVE=%s (want on|0|1)\n", il);
-        return;
+    unsigned long nodemask = 0;
+    if (!strcmp(il, "on")) {
+        nodemask = 3;
+    } else {
+        const char *p = il;
+        do {
+            char *end;
+            long node = strtol(p, &end, 10);
+            if (end == p || node < 0 || node >= sizeof(nodemask) * 8 ||
+                (*end && (*end != ',' || !end[1]))) {
+                femu_err("backend: invalid FEMU_MBE_INTERLEAVE=%s\n", il);
+                exit(EXIT_FAILURE);
+            }
+            nodemask |= 1ul << node;
+            p = *end ? end + 1 : end;
+        } while (*p);
     }
-    int mode = strcmp(il, "on") ? 2 /* MPOL_BIND */ : 3 /* MPOL_INTERLEAVE */;
-    unsigned long nodemask = strcmp(il, "on") ? (1ul << atoi(il)) : 0x3ul;
+    int mode = !strcmp(il, "on") ? 3 /* legacy INTERLEAVE */ : 2 /* BIND */;
 
     /*
      * mbind(2) requires a page-aligned start address; g_malloc0 returns only
@@ -46,6 +50,7 @@ static void mbe_numa_bind(void *addr, int64_t len)
                 sizeof(nodemask) * 8, 0x2 /* MPOL_MF_MOVE */)) {
         femu_err("backend: mbind(FEMU_MBE_INTERLEAVE=%s) failed: %s\n",
                  il, strerror(errno));
+        exit(EXIT_FAILURE);
     } else {
         femu_log("backend: %ld MB bound via FEMU_MBE_INTERLEAVE=%s\n",
                  (long)(len >> 20), il);

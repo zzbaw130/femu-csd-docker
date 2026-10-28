@@ -21,6 +21,8 @@ services:
       retries: 60        # 60*10s = 10分钟，覆盖构建+启动
     devices:
       - /dev/kvm                  # FEMU boots its guest with KVM
+    cap_add:
+      - SYS_NICE                  # NUMA memory policy and backend page migration
     ports:
       - "8080:8080"               # guest SSH, forwarded by run-csd.sh
     stdin_open: true              # -nographic serial console
@@ -37,6 +39,8 @@ services:
     environment:
       FEMU_SMP: 8
       FEMU_MEM: 8G
+      FEMU_NUMA_NODE: 0           # Guest RAM, FDM, workmem and all QEMU threads
+      FEMU_MBE_INTERLEAVE: 1,2,3  # allowed NVM nodes; excluded from the single-node claim
       CSD_WORKMEM_SIZE_MB: 256    # shared CSF work arena, independent of FDM
       CSD_FDM_SIZE: 64            # in megabytes, MAX=48GB=49152, with 25%(16GB) op
       CSD_NVM_SIZE: 16384         # in megabytes           

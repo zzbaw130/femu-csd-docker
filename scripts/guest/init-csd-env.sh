@@ -2,6 +2,14 @@
 set -e
 
 # Guest 初始化：准备数据/spill 分区，并安装应用使用的 SNIA 库。
+# 宿主物理 NUMA 绑定由 run-csd.sh 的 numactl 完成，覆盖 Guest RAM、
+# FDM、workmem 和执行线程；NVM 后端单独放置，仍有跨节点访问。
+# Guest 内设置策略不能约束宿主物理页，因此这里只检查单虚拟节点。
+if [ "$(cat /sys/devices/system/node/online)" != 0 ]; then
+    echo '实验要求 Guest 仅暴露一个 NUMA 节点；请检查 FEMU 启动配置。' >&2
+    exit 1
+fi
+echo 'Guest NUMA=node0；物理节点由宿主 run-csd.sh 绑定，NVM 后端单独放置。'
 
 DEVICE=/dev/nvme0n1
 DATA=${DEVICE}p1

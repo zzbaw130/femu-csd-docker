@@ -87,7 +87,13 @@ if [[ ! -e "$OSIMGF" ]]; then
 	exit 1
 fi
 
-sudo env CSD_WORKMEM_SIZE_MB="${CSD_WORKMEM_SIZE_MB:-64}" ./qemu-system-x86_64 \
+# Bind at the host process, so Guest allocations and every CU/poller inherit
+# the same physical-node policy. The large NVM buffer overrides it via mbind.
+echo "NUMA: execution/RAM node=${FEMU_NUMA_NODE:-0}; NVM nodes=${FEMU_MBE_INTERLEAVE:-1,2,3}"
+sudo env CSD_WORKMEM_SIZE_MB="${CSD_WORKMEM_SIZE_MB:-64}" \
+    FEMU_MBE_INTERLEAVE="${FEMU_MBE_INTERLEAVE:-1,2,3}" \
+    numactl --cpunodebind="${FEMU_NUMA_NODE:-0}" --membind="${FEMU_NUMA_NODE:-0}" \
+    ./qemu-system-x86_64 \
     -name "FEMU-CSD-VM",debug-threads=on \
     -enable-kvm \
     -cpu host \
