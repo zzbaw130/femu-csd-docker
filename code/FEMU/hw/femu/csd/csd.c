@@ -2480,6 +2480,18 @@ void femu_csd_graph_poll(FemuCtrl *n)
             if (femu_ring_enqueue(ring, (void *)&req, 1) != 1) {
                 csd_graph_ready_locked(csd, g); break;
             }
+            if (g->flags & FEMU_CSD_GRAPH_CACHE) {
+                uint64_t compute_end=0;
+                bool load=false;
+                for(unsigned i=0;i<g->count;i++) {
+                    load|=g->nodes[i].wire.operation==FEMU_GRAPH_LOAD;
+                    if(g->nodes[i].job) compute_end=MAX(compute_end,g->nodes[i].deadline);
+                }
+                /* Input lifetime and the end of the full CSF chain differ. */
+                if(load) fprintf(stderr,"CACHE_GRAPH session=%u cookie=%" PRIu64
+                    " compute=%" PRIu64 " work=%" PRIu64 " done=%" PRIu64 "\n",
+                    g->session->id,g->cookie,compute_end,g->cu_done_ns,now);
+            }
             if (g->flags & FEMU_CSD_GRAPH_PROFILE) {
                 g->session->profile = true; g->session->completed_graphs++;
                 g->session->graph_ns += req->reqlat;

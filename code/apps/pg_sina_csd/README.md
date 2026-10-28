@@ -63,6 +63,8 @@ EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT count(*) FROM lineitem;
 
 `prepare` 由 PG superuser 调用，检查 visible/frozen、schema、relfilenode、Heap/索引文件和 FIEMAP，将 extent 转换为 namespace LBA。支持跨 1 GiB 文件段和数据分区起始偏移；准备结果存入 `sina_csd.relations/columns/indexes/extents`。期间没有写请求，不需要守护会话。重启 FEMU/容器、重新加载数据库文件、REINDEX 或文件布局变化后必须重新准备，不能继续使用旧映射。
 
+回填实验需先加载 Guest 内核模块并配置 `/dev/femu-cache` 权限，见 [femu-cache](../femu-cache/README.md)。在 PG 服务进程环境设置 `SNIA_FEMU_CACHE_REFILL=1` 后，扩展读取已有 extent 时直接注册表/索引文件，查询上下文结束或出错时关闭注册；默认关闭，不改变公开 SNIA API，也不启动额外进程。回填目前只覆盖显式 LOAD，CSF 内部发起的基表读尚未覆盖，因此测试必须同时报告实际回填字节和路径缺口。此功能只将数据填入 Guest 文件页缓存，尚不包含缓存数据自动回送 FDM。
+
 ## 访问路径和内存
 
 查询不持有 namespace 执行锁。每个 PG 后端使用独立的 CSF 程序编号段（原编号加 `BackendId * 16`），AFDM 和算子状态按执行独立分配、释放，避免不同连接覆盖彼此的程序和缓冲区。FEMU 的程序编号为 16 位，当前分段支持 BackendId 1–4064；并发请求仍受设备实际 AFDM/workmem 总容量约束，分配失败会返回错误，不会把整条查询串行化等待。

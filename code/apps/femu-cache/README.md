@@ -11,7 +11,7 @@
 5. I/O worker 只在取得文件引用时持有映射锁，随后独立申请并锁定缺失的文件页，把这些页直接作为 F3 请求的 BIO。4 MiB 的页描述符在堆上分配；一个 NVMe 请求可链接多个 BIO。当前驱动每请求最多 128 个物理段；若目标缓存页过于分散，只有该范围会缩小后重试构建，不固定按 64 KiB 拆分。文件引用保留到 DMA 和页发布结束，调用者关闭注册不会使在途映射失效。NVMe 驱动映射目标页，FEMU 从原 FDM 范围直接 DMA 到目标页；不重读 NVM，也不经用户态缓冲复制。已有有效缓存页不覆盖，锁冲突、脏页等情况跳过。
 6. 设备记录各段成功传输的字节数，整个块已传到主机且引用该范围的 CU 消费结束后，即释放回填占用，允许整条图完成；无需等待主机发布缓存页。Guest 的 Read 完成后标记 folio 有效并解锁，完整传输不再发送 ACK。若已有缓存、跳过页面或传输失败，Guest 仍在处理结束后异步发送 ACK，让设备释放未传输部分的占用；最多 8 个异步 ACK，达到上限时同步确认。旧模块在完整传输后发送的迟到 ACK 可以安全忽略。失联 5 秒后放弃该块回填，不永久占用 FDM；日志里不将失败标成成功。
 
-**当前约定：开启回填的 LOAD 目标范围，在 batch 返回前必须保持只读，不得由另一个 LOAD、WRITE 或 CSF 输出覆盖。** 应用可以并行提交使用独立 FDM 的 batch。当前只覆盖普通图 LOAD，不覆盖 CSF 重入发起的内部读取。并发文件写入、一致性失效和 PG 文件注册尚未接入；本阶段针对冻结只读文件验证设备与内核闭环。
+**当前约定：开启回填的 LOAD 目标范围，在 batch 返回前必须保持只读，不得由另一个 LOAD、WRITE 或 CSF 输出覆盖。** 应用可以并行提交使用独立 FDM 的 batch。当前只覆盖普通图 LOAD，不覆盖 CSF 重入发起的内部读取。PG 扩展在读取已准备的表/索引 extent 时直接注册对应文件段，注册随查询内存上下文释放，ERROR 时也会关闭；不另起进程。并发文件写入和一致性失效尚未接入。CSF 内部请求的基表读取仍未回填，不能将部分显式 LOAD 的回填视为整条 SQL 全部读取已覆盖。
 
 设备端最多保留 128 条回填记录，后台队列每次最多处理一个 4 MiB DMA；FTL 前台请求队列排空后才服务后台 DMA。Guest 将元数据获取和 I/O 处理分开，全局限制最多 4 个 I/O 任务同时执行，至多 4 条 DMA 请求在途、约 16 MiB 文件页锁定用于回填，统计与每块有效字节数分别管理。这是软件后台优先级，**不是硬件独立低优先级 SQ/WRR，也不能抢占已经开始的 DMA**。FEMU 此处使用 QEMU 的实际内存 DMA 路径，没有新增 PCIe 传输带宽模型，因此这些测量不能解释为真实硬件 PCIe 吞吐。
 
@@ -25,6 +25,7 @@ cp /home/femu/apps/femu-cache/femu_cache.c /home/femu/apps/femu-cache/csd-cache.
    /home/femu/apps/femu-cache/Makefile /tmp/femu-cache-build/
 make -C /tmp/femu-cache-build -j2
 sudo insmod /tmp/femu-cache-build/femu_cache.ko
+sudo chown "$(id -un):$(id -gn)" /dev/femu-cache
 cmake -S /home/femu/apps/femu-cache -B /tmp/femu-cache-user
 cmake --build /tmp/femu-cache-user -j2
 ```
@@ -95,3 +96,17 @@ python3 scripts/analyze-cache-refill.py results/cache-refill-breakdown --plot
 Guest `ktime` 与 FEMU 时钟有偏移，不能直接相减。分析利用“设备 DMA（以及实际存在的 ACK）处理一定发生在对应 Guest 请求提交与返回之间”得到每轮时钟偏移区间；若所有请求的区间没有交集，直接报错，不输出混合时钟的归因。报告同时保留区间宽度和关键等待各项在下界、中点、上界对齐时的变化。按最晚结束的一条应用流统计关键路径，避免将 8 条流的重叠等待直接相加。同一 4 MiB batch 的多个回填子块按设备图归组，只取最后释放的子块作为该 batch 的释放依赖，不将重叠的子块占用重复相加。旧版串行记录可以统计单 worker 的服务构成；带 `parallel=1` 的记录中多个 worker 会重叠，分析工具只对当前块的服务进行关键等待归因，其余标为本块服务前等待，不重复计入其他 worker。并行模式图中的请求耗时之和不是整段时间，不能将其当作串行服务构成或新增总延迟的分摊。
 
 单块发生驱动限制拆分时，`dma_calls` 只统计实际提交的 Read 数量；`dma_start` 到 `dma` 包含多次请求之间的间隙，不等于纯复制时间。分析中的 `single_read_mean_us` 仅用一条 Read 完成的范围拆分复制与完成通知延迟。测试程序在计算任务返回后，通过现有诊断读取等待缓存页发布结束，再校验页驻留和内容；这段 `cache_drain_ms` 在 `wall_ms` 之外，包含诊断读取本身，不能当作纯回填尾延迟。
+
+### PG 冷缓存对照
+
+回填标志必须放在 **PG 服务进程的环境** 中；仅给 psql 设置环境不会改变已启动的后端。以下复用冷启动脚本：
+
+```sh
+SNIA_FEMU_CACHE_REFILL=0 sh /home/femu/scripts/cold-query.sh csd /home/femu/tests/queries/6.sql
+SNIA_FEMU_CACHE_REFILL=1 sh /home/femu/scripts/cold-query.sh csd /home/femu/tests/queries/6.sql
+sudo cat /sys/kernel/debug/femu-cache/profile
+```
+
+每次都会重启 PG 并清理 Guest page cache。模块访问权限在加载时配置，postgres 二进制沿用实验 Guest 已授权的 CAP_SYS_ADMIN。`CACHE_STATS` 在计时关闭时也会输出块数、回填/缓存命中字节数、跳过、错误和设备累计丢记录数；它会先等待现有工作完成，不参与 SQL 执行。
+
+`CACHE_BLOCK.cu` 是输入最后一个消费者的结束时刻；它可能早于后续算子链结束。设备图返回时的 `CACHE_GRAPH` 另外记录最后一个计算节点的 `compute`、固件确认所有节点完成的 `work`、最终返回的 `done`。`compute=0` 表示该图只有 I/O，没有同图计算可以覆盖回传；`done-work` 表示图完成后的回填等待。多个图会并行，不得将这些等待直接相加当作 SQL 延迟。`work-compute` 还可能包含固件完成事件处理滞后或其他图内 I/O，不能当作纯计算。

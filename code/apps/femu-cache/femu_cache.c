@@ -46,7 +46,7 @@ static DECLARE_WORK(refill,refill_work);
 static atomic_t pending=ATOMIC_INIT(0);
 static atomic_t ack_inflight=ATOMIC_INIT(0);
 static DECLARE_WAIT_QUEUE_HEAD(ack_idle);
-static atomic64_t blocks, filled, cached, skipped, errors, ack_sync;
+static atomic64_t blocks, filled, cached, skipped, errors, ack_sync, dropped;
 /* Diagnostic records stay in memory; export only after the measured request.
  * All fields below use Guest ktime. Device timestamps are correlated offline
  * using the causal bounds of DMA and ACK request/response pairs. */
@@ -73,6 +73,9 @@ static int profile_show(struct seq_file *out,void *unused)
             p->token,p->lba,p->aer,p->worker,p->fetch_begin,p->fetch_end,p->begin,p->pages_ns,
             p->dma_build,p->dma_submit,p->dma_done,p->published,p->ack_begin,p->ack_end,p->dma_calls);
     }
+    seq_printf(out,"CACHE_STATS blocks=%llu filled=%llu cached=%llu skipped=%llu errors=%llu ack_sync=%llu dropped=%llu\n",
+        atomic64_read(&blocks),atomic64_read(&filled),atomic64_read(&cached),
+        atomic64_read(&skipped),atomic64_read(&errors),atomic64_read(&ack_sync),atomic64_read(&dropped));
     return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(profile);
@@ -304,6 +307,7 @@ static void refill_work(struct work_struct *work)
         u64 fetch_begin=profile?ktime_get_ns():0;
         if(control(FEMU_CACHE_FETCH,0,data)) { atomic64_inc(&errors); break; }
         u64 fetch_end=profile?ktime_get_ns():0;
+        atomic64_set(&dropped,log->dropped);
         for(unsigned i=0;i<min_t(unsigned,log->count,FEMU_CACHE_LOG_COUNT);i++) {
             struct cache_profile *p=NULL;
             struct cache_job *job=kzalloc(sizeof(*job),GFP_NOIO);
