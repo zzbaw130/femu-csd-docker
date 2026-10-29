@@ -134,9 +134,9 @@ sh /home/femu/tests/tpch-test.sh 7 9 13
 
 每次测量前 `scripts/guest/cold-query.sh` 停止 PG、sync、清除 Guest page cache 并重启 PG；不重启 FEMU，以免丢失 RAM-backed NVM。profile 默认关闭。Q15 的计时是原始脚本中各 SQL 耗时之和，包含创建/删除视图，host/CSD 规则相同。
 
-结果保存到 Guest `/home/femu/results/tpch.*`，对应主机 `results/tpch.*`：`timings.csv` 分别记录完整结果是否一致、是否实际卸载和性能状态。较慢的 CSD 查询会另行冷启动，读取相同查询的 explain 文件，仅增加 ANALYZE/计时选项采集设备 CPU、内读、工作内存和 spill；该诊断耗时不混入关闭 profile 的性能比较。
+默认对五种 exe_path 各执行完整 22 条查询。结果保存到 Guest `/home/femu/results/tpch.*`，对应主机 `results/tpch.*`：`timings.csv` 每行记录查询编号、模式、延迟、结果是否一致和执行是否成功。Guest 需安装 PG 自带的 `auto_explain`；五种模式统一记录实际执行计划为 JSON（各查询的 `.err`），不启用 ANALYZE/TIMING 节点插桩。SQLerate 的实际 HOST/CSD 边界、成本估计和设备状态可从这些计划提取，无需另跑暖缓存 EXPLAIN 猜测测量时的选择。计时包含实际计划记录开销，单次微小差异不作为稳定优劣结论。
 
-**结果一致不代表性能验收合格。** 只有实际设备工作内存不足且必须频繁 spill 造成的延迟增加可以接受。单 CU/向量化不足、重复扫描或复制、碎片化页请求、保守节点配额等实现问题造成的退化均不合格。脚本将较慢样本标记为 `needs_analysis` 并返回非零；必须结合实际占用和计时判断，不能看到 spill 就自动认定内存不足。单次测量不用于宣称稳定加速比。
+**结果一致不代表性能验收合格。** 只有实际设备工作内存不足且必须频繁 spill 造成的延迟增加可以接受。单 CU/向量化不足、重复扫描或复制、碎片化页请求、保守节点配额等实现问题造成的退化均不合格。脚本对执行错误或结果不一致返回非零；运行完成只表示正确性检查结束，不能当作性能验收通过。延迟必须另行比较并结合实际占用和计时分析，不能看到 spill 就自动认定内存不足。单次测量不用于宣称稳定加速比。
 
 通用树 EXPLAIN 显示来自 PG 的连接树、实际 worker 数、并行流水线次数、顺序扫描行数、索引 Heap Tuple 数、内部读取、工作内存峰值及 spill 字节。开启 profile 后增加整个 CSF 的累计 CPU/墙钟/调用次数、实际同时执行的 CU 峰值，以及扫描解码、向量过滤和 Sort sink/source 的 CPU 时间。CPU 是各 CU 的累计值，可能大于查询墙钟；扫描/过滤/排序已包含在 CSF 总 CPU 中，不能再次相加。`CSD LOAD Preparation` 仅为 PG 构造请求的时间，异步 LOAD 的等待不计入该字段。单表快路径保留已有的逐算子计时。
 

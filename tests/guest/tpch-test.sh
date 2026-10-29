@@ -1,5 +1,6 @@
 #!/bin/sh
-# TPC-H 验收唯一入口。查询正文只来自相邻的 queries/。
+# 正式 22 条查询、五种路径，每次测量前独立冷启动。
+# auto_explain 只记录实际执行树，不开启逐节点 ANALYZE/TIMING 插桩。
 set -eu
 export PATH=/home/femu/opt/postgres/release/bin:$PATH
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -8,50 +9,38 @@ COLD=/home/femu/scripts/cold-query.sh
 RESULTS=$(mktemp -d /home/femu/results/tpch.XXXXXX)
 chmod 755 "$RESULTS"
 echo "Results: $RESULTS"
-printf 'query,host_ms,csd_ms,result_match,csd_offloaded,performance\n' > "$RESULTS/timings.csv"
+printf 'query,mode,latency_ms,result_match,execution_ok\n' > "$RESULTS/timings.csv"
+# Identical plan logging for every mode. JSON includes the actual SQLerate
+# CustomScan boundaries, device plan and runtime workmem/spill counters.
+export PGOPTIONS="${PGOPTIONS:-} -c session_preload_libraries=auto_explain -c auto_explain.log_min_duration=0 -c auto_explain.log_level=notice -c auto_explain.log_analyze=off -c auto_explain.log_timing=off -c auto_explain.log_format=json"
+printf '%s\n' "$PGOPTIONS" > "$RESULTS/pgoptions.txt"
+psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
+    -c "SELECT version()" -c "SHOW shared_buffers" -c "SHOW work_mem" \
+    -c "SHOW max_parallel_workers_per_gather" > "$RESULTS/environment.log" 2> "$RESULTS/environment.err"
 if [ "$#" -eq 0 ]; then set -- 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22; fi
 failed=0
 for query in "$@"; do
     case "$query" in ''|*[!0-9]*) echo "Invalid query: $query" >&2; exit 2 ;; esac
     [ -f "$QUERIES/$query.sql" ] || { echo "No query: $query" >&2; exit 2; }
-    ok=1; host_ok=1; csd_ok=1
-    for mode in host csd; do
+    host_ok=0
+    for mode in host-only filter-only csd-without-hpcp csd-with-hpcp SQLerate; do
+        ok=no; match=no; elapsed=
         if sh "$COLD" "$mode" "$QUERIES/$query.sql" > "$RESULTS/$query.$mode.log" 2> "$RESULTS/$query.$mode.err"; then
+            ok=yes
+            elapsed=$(awk '/^Time:/ {sum+=$2; n++} END {if(n) printf "%.3f",sum}' "$RESULTS/$query.$mode.log")
             sed -e '/^Time:/d' -e '/^Timing is /d' "$RESULTS/$query.$mode.log" > "$RESULTS/$query.$mode.rows"
+            if [ "$mode" = host-only ]; then host_ok=1; match=yes;
+            elif [ "$host_ok" -eq 1 ] && cmp -s "$RESULTS/$query.host-only.rows" "$RESULTS/$query.$mode.rows"; then match=yes;
+            else failed=1; fi
         else
-            ok=0; failed=1
-            if [ "$mode" = host ]; then host_ok=0; else csd_ok=0; fi
-            echo "FAIL Q$query $mode"
-            cat "$RESULTS/$query.$mode.err" >&2
+            failed=1
+            echo "FAIL Q$query $mode; see $RESULTS/$query.$mode.err" >&2
         fi
+        printf '%s,%s,%s,%s,%s\n' "$query" "$mode" "$elapsed" "$match" "$ok" >> "$RESULTS/timings.csv"
+        echo "Q$query $mode=$elapsed ms match=$match ok=$ok"
     done
-    match=no; offloaded=no; performance=error
-    host=$(awk '/^Time:/ {sum+=$2; n++} END {if(n) printf "%.3f",sum}' "$RESULTS/$query.host.log")
-    csd=$(awk '/^Time:/ {sum+=$2; n++} END {if(n) printf "%.3f",sum}' "$RESULTS/$query.csd.log")
-    # psql also prints elapsed time for failed statements; it is not a score.
-    [ "$host_ok" -eq 1 ] || host=
-    [ "$csd_ok" -eq 1 ] || csd=
-    if [ "$ok" -eq 1 ]; then
-        if cmp -s "$RESULTS/$query.host.rows" "$RESULTS/$query.csd.rows"; then match=yes; else failed=1; fi
-        if psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
-            -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path='csd-without-hpcp'" \
-            -f "$QUERIES/$query.explain.sql" > "$RESULTS/$query.plan.log" 2> "$RESULTS/$query.plan.err" &&
-            grep -q '^Custom Scan (SniaCsd' "$RESULTS/$query.plan.log" &&
-            ! grep -Eq '^[[:space:]]*(->|InitPlan|SubPlan)[[:space:]]' "$RESULTS/$query.plan.log"; then offloaded=yes; else failed=1; fi
-        performance=not_slower
-        if awk -v h="$host" -v c="$csd" 'BEGIN {exit !(c>h)}'; then
-            # Spill alone never proves physical memory exhaustion. A slower
-            # sample remains unqualified until its cause has been established.
-            performance=needs_analysis; failed=1
-            sed -E 's/^([[:space:]]*)explain[[:space:]]+/\1EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) /I' "$QUERIES/$query.explain.sql" |
-                PG_SINA_PROFILE=on sh "$COLD" csd - > "$RESULTS/$query.profile.log" 2> "$RESULTS/$query.profile.err" || failed=1
-        fi
-    fi
-    printf '%s,%s,%s,%s,%s,%s\n' "$query" "$host" "$csd" "$match" "$offloaded" "$performance" >> "$RESULTS/timings.csv"
-    echo "Q$query host=$host ms csd=$csd ms match=$match offloaded=$offloaded performance=$performance"
-    # Comparison copies are reproducible from the retained host/CSD logs.
-    rm -f "$RESULTS/$query.host.rows" "$RESULTS/$query.csd.rows"
+    rm -f "$RESULTS/$query."*.rows
 done
-cat "$RESULTS/timings.csv"
-echo "Slower CSD samples require memory/spill/CPU analysis; correctness alone is not acceptance."
+echo "Results: $RESULTS"
+echo 'Correctness and performance must be assessed separately; a completed run is not performance acceptance.'
 exit "$failed"

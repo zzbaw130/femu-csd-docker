@@ -90,3 +90,15 @@ SQLerate 的 EXPLAIN 新增串行 CPU、并行 CPU、调度、最终处理、字
 结果目录：`results/planner-cost.vwqPAX/`。Q13 的 64MiB 实际执行另记在 `13.SQLerate-64MiB.log`，与该目录原生结果一致；目录中的普通 `13.SQLerate.log` 是 256MiB 执行，不与 64MiB 预测混用。可复现入口为 `tests/guest/planner-cost-test.sh`（后续 Q13 的执行和 EXPLAIN 均使用 64MiB）。
 
 Q6 高估、Q13 低估说明单一 CPU 换算仍不足以覆盖扫描、哈希、聚合与执行框架的不同固定开销。当前已完成阶段与状态估计结构修正，尚未完成逐阶段实测参数校准；本次没有测得实际状态峰值、没有验证随机字典重读的预测精度，也不能据此宣称模型准确率达标。
+
+## 完整五模式冷启动测量
+
+同日基于上述扩展版本，完成正式 22 条 SQL×五种 exe_path 的 110 次独立冷启动测量，结果全部一致。资源保持 4 CU、256MiB workmem、64MiB FDM，PG shared_buffers=128MiB、work_mem=4MiB。五种模式统一通过 auto_explain 保存实际执行树，没有 ANALYZE/TIMING 节点插桩；计时包含计划日志交付。数据与分析保存在 `results/tpch.F1pZUv/`：`timings.csv`、`plans.json`、`summary.json`、`report.md`，原始 SQL/计划日志一并保留。
+
+累计延迟分别为 HOST 49.893s、filter-only 434.489s、CSD 无 HPCP 23.705s、CSD 有 HPCP 22.788s、SQLerate 27.537s。SQLerate 实际选 Q1 全 HOST，Q2/Q21 仅 Limit 在 HOST，其余 19 条全 CSD。本轮最低延迟命中 1/22，在最低值 5% 内 13/22；正确性通过，最优延迟目标尚未达到。
+
+最主要的明确错误是 Q1：通用设备候选被估计需要约 6.46GiB spill，但强制 CSD 使用的专用聚合快路径实际只使用约 1.90MiB，spill 为零。当前 select_plan 在选中卸载以后才换成专用快路径，估计对象和执行对象不一致；必须在候选比较之前区分并正确计价。Q1 贡献了 SQLerate 相比本轮事后逐查询最小值的额外延迟约 76%。
+
+此外，相同 CSD 树仍有自适应规划及结果/计划日志交付的额外开销；当前 SQLerate 没有关闭 HPCP 的设备候选；PG 基数估计误差会放大边界成本（Q9 估计 60,150 行，实际 175 行）。Q18 虽确有读写各约 206.6MiB spill，设备路径时间仍从约 1.23s 低估到实测约 5.74s，不能只根据带宽换算认定 spill 时间或性能已合格。
+
+Q4、Q21 另做了两轮交错冷启动复测（`repeats.csv`），所有结果一致。Q4 初次 HPCP 的大幅优势、Q21 初次 SQLerate 的 27.5% 回退均未稳定复现，不能作为稳定收益/退化的证据；运行时波动原因尚未定位。原始 110 次测量没有被复测值替换。每次清缓存也意味着本轮不能验证 HPCP 对后续暖缓存查询的收益。
