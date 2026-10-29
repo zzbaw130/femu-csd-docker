@@ -1,0 +1,92 @@
+# SQLerate 阶段成本与状态估计
+
+本文记录 `adaptive-exec-path` 的规划模型，供论文方法描述与后续校准使用。模型在 Guest 的 PG 扩展中运行；设备 CSF、FEMU 与 SNIA 不参与成本规划。下面的字节数和时间都是规划估计，不能当作实测结果。
+
+## 规划范围与数据来源
+
+在 PG 已选定的物理计划上自底向上选择执行位置，保留其连接顺序。继承 PG 的过滤/连接输出行数 `plan_rows`、HAVING 之前的组数 `numGroups`。扫描输入行数读取 `pg_class.reltuples`；字符串 NDV、NULL 比例与平均长度来自 `pg_statistic`。缺少字符串统计时，NDV 暂用最多 200、平均长度 32B，均是明确的回退假设。不同列/关系的字典值可能重合，目前按其 NDV 之和估计，未假设跨表相关性。
+
+HOST 本地成本从 PG 累计成本扣除子成本，再修正规划时文件页缓存驻留。CSD 使用设备表示和实际算法重新计价，不把 PG 总成本统一除以 CU 数。成本单位为毫秒。
+
+每个节点保留 H（HOST 节点、子树可混合）和 D（完整 CSD 子树）两种候选。H 可接收 D 的元组流并支付边界成本，D 不接受 HOST 中间结果。Hash Join 的 build/probe、Sort 的生成 run/归并、聚合状态的更新/合并/输出属于一个算子的内部生命周期，整体选址。不能把原生 Hash 的 MultiExec 状态当普通元组输出；需要 mark/restore 的原生 Merge Join 内侧同样保留接口。Partial Aggregate→Final Aggregate 只有在明确实现可合并状态传输时才可作为两个独立算子跨侧执行；本次不新增此执行能力。
+
+## 并行阶段
+
+PG 的参考点是 `costsize.c` 的并行扫描、Gather/GatherMerge、Hash Join 与 Aggregate：只缩短可并行工作，单独计入启动、传输、建表和最终处理。DuckDB 的参考点是 `physical_hash_join.cpp`、`physical_hash_aggregate.cpp` 和 `physical_order.cpp` 的 sink/local state、combine、finalize/source 阶段；这里按本项目实际运行时计费，不假设已具备 DuckDB 的全部并行能力。
+
+规划器复用 `qp_parallel_boundaries` 和 `qp_pipeline_source`，与执行器使用相同的 pipeline 可并行性判定。只沿 probe/投影链传播并行性，不越过 build 边或阻塞边界。FDM 按 4/2/1MiB 块、列批次、控制/结果/IO 缓冲选 CU 数，先缩小块，再减少 worker。FDM 是 IO 内存，不能作为 workmem。
+
+对一个阶段，令 W 为可分配 worker，T 为任务数，C 为单 CU 完成全部可并行工作的估计时间：
+
+```text
+waves = ceil(T / W)
+parallel_compute = waves × C / T
+schedule = waves × parallel_task_ms
+stage_time = serial + parallel_compute + schedule + combine
+```
+
+T≤1 或 W≤1 时按单 CU 估计，不额外收费并行波次。扫描按物理输入块数估计任务，已完成 Hash Aggregate 的 source 按组数/向量容量估计。最后不足一轮的任务也占一个波次。该公式假设任务均衡，是尾部不满和调度已知条件下的估计，不声称预测了真实任务倾斜或所有共享锁竞争。
+
+| 阶段 | 处理方式 |
+| --- | --- |
+| Heap/Index 扫描、投影、Hash Probe | 只有位于已标记 pipeline 中才按任务波次缩放 |
+| Hash Build | worker 追加/编码按 build 输入的 pipeline 缩放；协调端 bucket 重建另按全部 build 行数串行收费 |
+| 无分组聚合 | worker 更新局部状态，协调端按 CU 数×聚合数合并 |
+| Hash Aggregate | 按实际布局判断局部表是否能够同时放下；放得下则计局部更新与分组分片合并，否则计共享更新及键更新串行争用项 |
+| Sort | run 内比较可随已标记的上游 sink 并行；多 run 归并和最终输出单独按串行收费 |
+| Merge Join | 无 Hash 的设备 Join 实际走 Merge；未证明有序的输入分别计排序，再计两路归并及输出表达式 |
+| 已排序分组聚合、Materialize、Set | 按当前执行方式计费，不因配置了多个 CU 就自动缩短 |
+
+CPU 单价仍复用 PG `cpu_tuple_cost`、`cpu_operator_cost`，乘 `host_cost_ms × csd_cpu_ratio`。表达式数是工作量代理，不是逐指令周期模拟。新增 `parallel_task_ms`（默认 0.02ms）只表示并行任务波次的调度成本；它和既有 CPU 换算系数都是待实测校准的初值。不能把默认值写成设备测量结论。
+
+内部 NVM 带宽、PCIe 链路仍按共享总带宽计算，不乘 CU 数。当前内部读取与计算时间相加；本次没有假设尚未证实的全面读算重叠。HPCP 按其链路工作与前台工作的未覆盖部分估计，也不预支后续查询的缓存收益。
+
+## 状态布局与生命周期
+
+估计实现位于 `src/planner/cost.c` 与 `cost_model.h`。容量增长和槽位大小对照设备 `plan.c`、`sort.c`、`dictionary.c`；这些是模型里的布局估计，不新增设备 ABI 或改变执行器内存配额。
+
+| 状态 | 估计方式 |
+| --- | --- |
+| Hash build | 每列按实际压缩格式：PG int2/int4/bool/date 为 4B+1B NULL；int8 为 8B+1B；其他值为 16B+scale/dscale/NULL。每行再加一个 4B next 和两个 4B bucket。容量从 128 起按 2 次幂增长 |
+| Hash Aggregate | 单整数键保留紧凑键格式；多键按整数/字典 ID 或完整 cell 区分；聚合值是对齐后的 cell+count。记录对齐到 16B，哈希槽 8B，最多使用 7/8 的记录容量，容量从 128 起翻倍 |
+| CU 局部聚合 | 先估计一张全局表，只有全部 CU 局部表与全局表、执行器既有的两份 sort reserve 都能放下时才估计局部模式；否则估计共享模式，不因局部表放不下就判整个聚合 spill |
+| Sort | cell 记录加字符串独立载荷、长度字段；字符串平均长度沿直接列引用回溯到 PG 统计，计算生成字符串用 typmod/32B 回退；另计 run 描述、spill token、IO 缓冲。行数据与字典正文同时存在时分别计费 |
+| Set/Materialize | Set 按最多输入行数的不同值和 1/2 装载率估计 16B 槽位；Materialize 按实际 cell 行估计。Set 未恢复所有表达式形态的精确 NDV，属于偏保守的基数上界 |
+| 字典 | NDV×16B entry，2 次幂的 4B hash head、字符串正文；rehash 暂存新旧 hash head。正文/entry 按 64KiB 页取整，页描述暂按 48B/页估计 |
+| 表达式暂存 | 每个活动执行副本按表达式数×256 行向量估计；不是 2048 行 Heap 列批次，后者在 AFDM。执行器按需分配，故这部分是预留估计 |
+
+Join 先构建右侧，再在保留 build 表时消费左侧；Sort/Aggregate 在消费输入时积累自己的状态，随后释放上游状态并输出。模型分别维护“输出期间存活”和“EOF 后仍保留”（Set/Materialize）的状态，以及构建峰值，避免无条件累加所有已完成节点的工作集。小表初始分配与随后增长也分开处理。字典为查询共享状态，只计一次；允许随其他工作集增长被驱逐，没有新增固定 25% 字典配额。hash/sort reserve 来自现有执行器，不是规划器新加的内存限制。
+
+这仍是静态生命周期近似：并行分支的瞬时分配、分配器元数据、表达式惰性分配、CTE/InitPlan 多消费者重用等可能影响实际峰值。估计不会覆盖或代替统一 workmem 分配器的硬限制。
+
+## Spill 与串行归并
+
+- **Sort**：按照实际 1MiB run（受 sort quota 限制时缩小）、64KiB 归并缓存、最多 32 路归并估算 run 数。先计必须驱逐的 run 写出与最终读回；run 超过 fan-in 时，再计完整中间归并的读写。CPU 分开计算 run 内比较和跨 run 的堆比较。不再统一使用 8 路外排公式。
+- **Hash Join**：沿实际 4 分区 Hash spill 计 build/probe 数据的写出读回；分区放不下时按 build 批次增加 probe 重读，不假设实现了递归 radix repartition。实际倾斜需要用运行计时进一步校准。
+- **Hash Aggregate**：容量不足时按 key/value/count 中间记录和输入量上界估计冲刷，再计外部合并 CPU；没有伪造精确的溢出组分布。
+- **Set/Materialize**：按超出可用容量的部分估计一次写出读回。
+- **字典**：可驱逐正文按共享剩余内存估计，一写一读是最低换出换入工作量；随机反复换入、rehash IO 放大仍不能由 NDV 单独准确预测。不能用这个下界认定实际 spill 放大已经解决。
+
+## 可观察性与验证要求
+
+SQLerate 的 EXPLAIN 新增串行 CPU、并行 CPU、调度、最终处理、字典工作集、FDM 预留及 worker 数；`CSD Stage Estimates` 按设备节点列出任务数、CPU、状态需求、估计常驻、可用额度和 spill。`Estimated Peak Workmem` 是常驻峰值估计，不能与完整逻辑工作集混为一谈。H/D 节点选择仍显示在 SQLerate 外层。未选中的设备候选保留汇总估计；原有强制 CSD 快路径不一定调用成本规划，不保证产生上述估计字段。调度按 pipeline 波次计一次，不对链中的每个 SQL 节点重复收费。
+
+`tests/planner_cost.c` 检查单块不能多 CU 加速、不满一轮的开销、压缩 Hash 布局/容量跳变、分组表 7/8 容量边界，以及 64/256MiB 条件下内存增加可减少外排。集成验证只使用正式查询目录，冷启动核对结果与 EXPLAIN，不按查询编号修正模型。
+
+论文实验还需要用既有执行 profile 比较：预测/实测阶段墙钟、协调 CPU、worker CPU、workmem 峰值及 spill 字节，并单列模型误差。构建成功、结果相等和模型预测准确是三个不同结论；在校准完成前不能声称 SQLerate 总能选中实测最快路径。
+
+## 本次针对性验证记录
+
+2026-10-30，4 CU、设备 workmem 256MiB、FDM 64MiB。已构建并安装 Guest 扩展，`pgSinaHeapLayout` 和 `pgSinaPlannerCost` 两个 CTest 均通过。正式 Q6/Q9/Q13 的 HOST 与 SQLerate 结果逐行一致；Q13 另实际执行了 64MiB 查询 workmem 限额并核对结果。没有运行完整 TPC-H。
+
+下面记录单次冷启动观察，仅用于暴露初始模型误差，不作为性能验收或校准后的精度结论。每次执行前重启 PG 并清理 Guest page cache。规划记录也独立冷启动，但与执行不是同一次规划快照；EXPLAIN 用时未当作查询执行时间。
+
+| 查询 | SQLerate 的查询 workmem | 设备成本+返回成本估计 | SQLerate 实际 SQL 延迟 | 原生 HOST 实际 SQL 延迟 |
+| --- | ---: | ---: | ---: | ---: |
+| Q6 | 256MiB | 799.137ms | 496.632ms | 1563.805ms |
+| Q9 | 256MiB | 1138.194ms | 1233.945ms | 2892.930ms |
+| Q13 | 64MiB | 237.652ms | 502.392ms | 1154.147ms |
+
+结果目录：`results/planner-cost.vwqPAX/`。Q13 的 64MiB 实际执行另记在 `13.SQLerate-64MiB.log`，与该目录原生结果一致；目录中的普通 `13.SQLerate.log` 是 256MiB 执行，不与 64MiB 预测混用。可复现入口为 `tests/guest/planner-cost-test.sh`（后续 Q13 的执行和 EXPLAIN 均使用 64MiB）。
+
+Q6 高估、Q13 低估说明单一 CPU 换算仍不足以覆盖扫描、哈希、聚合与执行框架的不同固定开销。当前已完成阶段与状态估计结构修正，尚未完成逐阶段实测参数校准；本次没有测得实际状态峰值、没有验证随机字典重读的预测精度，也不能据此宣称模型准确率达标。

@@ -71,6 +71,7 @@ static const struct config_enum_entry execution_paths[] = {
     {"SQLerate",PG_SINA_ADAPTIVE,false}, {NULL, 0, false}
 };
 double pg_sina_host_cost_ms=0.02,pg_sina_csd_cpu_ratio=0.35;
+double pg_sina_parallel_task_ms=0.02;
 double pg_sina_internal_mbps=5000,pg_sina_pcie_mbps=3500,pg_sina_cache_mbps=10000;
 double pg_sina_result_batch_ms=1;
 static void assign_cost(double value,void *extra) { ResetPlanCache(); }
@@ -87,6 +88,8 @@ void _PG_init(void)
         &pg_sina_host_cost_ms,0.02,0.000001,1000,PGC_USERSET,0,NULL,assign_cost,NULL);
     DefineCustomRealVariable("pg_sina_csd.csd_cpu_ratio","Device vector CPU cost relative to native PG before CU scaling",NULL,
         &pg_sina_csd_cpu_ratio,0.35,0.001,1000,PGC_USERSET,0,NULL,assign_cost,NULL);
+    DefineCustomRealVariable("pg_sina_csd.parallel_task_ms","Scheduling cost per parallel task wave in milliseconds",NULL,
+        &pg_sina_parallel_task_ms,0.02,0,1000,PGC_USERSET,0,NULL,assign_cost,NULL);
     DefineCustomRealVariable("pg_sina_csd.internal_mbps","Aggregate internal NVM/FDM bandwidth in decimal MB/s",NULL,
         &pg_sina_internal_mbps,5000,1,1000000,PGC_USERSET,0,NULL,assign_cost,NULL);
     DefineCustomRealVariable("pg_sina_csd.pcie_mbps","Shared PCIe bandwidth per direction in decimal MB/s",NULL,
