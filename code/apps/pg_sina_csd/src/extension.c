@@ -20,20 +20,7 @@ static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,Param
         Query *candidate=copyObject(parse);
         if(pg_sina_rewrite_query(candidate)) query=candidate;
     }
-    /* A scan-only device boundary cannot run independently in every PG
-     * parallel worker: each would scan the complete device relation. */
-    volatile int nest=0;
-    if(pg_sina_exe_path==PG_SINA_FILTER) {
-        nest=NewGUCNestLevel();
-        set_config_option("max_parallel_workers_per_gather","0",PGC_USERSET,PGC_S_SESSION,GUC_ACTION_SAVE,true,0,false);
-    }
-    PlannedStmt *volatile plan=NULL;
-    PG_TRY();
-    { plan=previous_planner_hook?previous_planner_hook(query,cursorOptions,boundParams):standard_planner(query,cursorOptions,boundParams); }
-    PG_CATCH();
-    { if(nest) AtEOXact_GUC(false,nest); PG_RE_THROW(); }
-    PG_END_TRY();
-    if(nest) AtEOXact_GUC(false,nest);
+    PlannedStmt *plan=previous_planner_hook?previous_planner_hook(query,cursorOptions,boundParams):standard_planner(query,cursorOptions,boundParams);
     plan->planTree=pg_sina_native_plan(plan->planTree);
     return plan;
 }

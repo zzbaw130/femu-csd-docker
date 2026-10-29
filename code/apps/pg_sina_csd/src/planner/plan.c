@@ -1,6 +1,7 @@
 /* Lower the selected PG Plan, without choosing another join order. */
 #include "pg_internal.h"
 #include "access/table.h"
+#include "access/sysattr.h"
 #include "access/relation.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type_d.h"
@@ -452,6 +453,78 @@ static TargetEntry *matching_entry(List *list,Expr *expr)
     ListCell *c;
     foreach(c,list) { TargetEntry *t=lfirst(c); if(equal(t->expr,expr)) return t; }
     return NULL;
+}
+/* Collect HOST consumers, not the physical Scan/pass-through targetlists
+ * that PG deliberately leaves wide to avoid adding a host projection. */
+static void scan_references(Plan *plan,Plan *scan,Bitmapset **attributes)
+{
+    if(!plan || plan==scan) return;
+    Index relation=((Scan *)scan)->scanrelid;
+    if(!IsA(plan,Sort) && !IsA(plan,Hash) && !IsA(plan,Material) &&
+       !IsA(plan,Gather) && !IsA(plan,GatherMerge))
+        pull_varattnos((Node *)plan->targetlist,relation,attributes);
+    pull_varattnos((Node *)plan->qual,relation,attributes);
+    if(IsA(plan,HashJoin)) {
+        pull_varattnos((Node *)((HashJoin *)plan)->join.joinqual,relation,attributes);
+        pull_varattnos((Node *)((HashJoin *)plan)->hashclauses,relation,attributes);
+    }
+    if(IsA(plan,MergeJoin)) {
+        pull_varattnos((Node *)((MergeJoin *)plan)->join.joinqual,relation,attributes);
+        pull_varattnos((Node *)((MergeJoin *)plan)->mergeclauses,relation,attributes);
+    }
+    if(IsA(plan,NestLoop)) {
+        pull_varattnos((Node *)((NestLoop *)plan)->join.joinqual,relation,attributes);
+        ListCell *c; foreach(c,((NestLoop *)plan)->nestParams)
+            pull_varattnos((Node *)((NestLoopParam *)lfirst(c))->paramval,relation,attributes);
+    }
+    if(IsA(plan,Hash)) pull_varattnos((Node *)((Hash *)plan)->hashkeys,relation,attributes);
+    if(IsA(plan,Result)) pull_varattnos(((Result *)plan)->resconstantqual,relation,attributes);
+    AttrNumber *keys=NULL; unsigned count=0;
+    if(IsA(plan,Sort)) { keys=((Sort *)plan)->sortColIdx; count=((Sort *)plan)->numCols; }
+    if(IsA(plan,GatherMerge)) { keys=((GatherMerge *)plan)->sortColIdx; count=((GatherMerge *)plan)->numCols; }
+    if(IsA(plan,Agg)) { keys=((Agg *)plan)->grpColIdx; count=((Agg *)plan)->numCols; }
+    for(unsigned i=0;i<count;++i) {
+        TargetEntry *entry=get_tle_by_resno(plan->lefttree->targetlist,keys[i]);
+        if(entry) pull_varattnos((Node *)entry->expr,relation,attributes);
+    }
+    /* Subquery RT indexes belong to another PlannerInfo; its own scope is
+     * passed by placement's SubqueryScan recursion. */
+    scan_references(plan->lefttree,scan,attributes);
+    scan_references(plan->righttree,scan,attributes);
+}
+Plan *pg_sina_project_scan(Plan *scope,Plan *scan)
+{
+    if(scope==scan) return scan;
+    Bitmapset *attributes=NULL;
+    scan_references(scope,scan,&attributes);
+    if(bms_is_member(-FirstLowInvalidHeapAttributeNumber,attributes)) return scan;
+    Plan *copy=copyObject(scan); List *outputs=NIL; ListCell *c;
+    foreach(c,copy->targetlist) {
+        TargetEntry *entry=lfirst(c); Var *v=IsA(entry->expr,Var)?(Var *)entry->expr:NULL;
+        if(!v || v->varno!=((Scan *)scan)->scanrelid ||
+           bms_is_member(v->varattno-FirstLowInvalidHeapAttributeNumber,attributes)) {
+            entry->resno=list_length(outputs)+1; outputs=lappend(outputs,entry);
+        }
+    }
+    /* COUNT(*) needs row presence. Retain one field without introducing a
+     * separate zero-column wire format. */
+    if(outputs==NIL && copy->targetlist!=NIL) {
+        TargetEntry *entry=linitial(copy->targetlist); entry->resno=1; outputs=list_make1(entry);
+    }
+    copy->targetlist=outputs; return copy;
+}
+void pg_sina_remap_input(Plan *parent,List *old,List *projected)
+{
+    AttrNumber *keys=NULL; unsigned count=0;
+    if(IsA(parent,Sort)) { keys=((Sort *)parent)->sortColIdx; count=((Sort *)parent)->numCols; }
+    if(IsA(parent,GatherMerge)) { keys=((GatherMerge *)parent)->sortColIdx; count=((GatherMerge *)parent)->numCols; }
+    if(IsA(parent,Agg)) { keys=((Agg *)parent)->grpColIdx; count=((Agg *)parent)->numCols; }
+    for(unsigned i=0;i<count;++i) {
+        TargetEntry *entry=get_tle_by_resno(old,keys[i]);
+        TargetEntry *next=entry?matching_entry(projected,entry->expr):NULL;
+        if(!next) elog(ERROR,"CSD scan projection lost a HOST grouping/sort key");
+        keys[i]=next->resno;
+    }
 }
 /* Gather Merge orders partial states, not raw input. After collapsing the
  * parallel aggregate, preserve that order above the completed groups so an
@@ -1172,12 +1245,18 @@ Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
     if(!prepared) { pfree(tree); return native; }
     tree->root=result;
     pg_sina_read_resources(device);
+    if(pg_sina_exe_path==PG_SINA_FILTER && native->parallel_aware &&
+       (!IsA(native,SeqScan) || pg_sina_resources.cus<2)) { pfree(tree); return native; }
     tree->nodes[result].expr.work_mem_bytes=pg_sina_query_memory();
     bytea *bytes=palloc(VARHDRSZ+sizeof(*tree)); SET_VARSIZE(bytes,VARHDRSZ+sizeof(*tree)); memcpy(VARDATA(bytes),tree,sizeof(*tree)); pfree(tree);
     CustomScan *scan=makeNode(CustomScan);
     scan->scan.plan=*native; NodeSetTag(scan,T_CustomScan);
     scan->scan.plan.lefttree=scan->scan.plan.righttree=NULL;
     scan->scan.plan.qual=NIL; scan->scan.plan.initPlan=NIL; scan->scan.plan.parallel_aware=false; scan->scan.plan.parallel_safe=false;
+    if(pg_sina_exe_path==PG_SINA_FILTER) {
+        scan->scan.plan.parallel_safe=native->parallel_safe;
+        scan->scan.plan.parallel_aware=native->parallel_aware;
+    }
     /* PG projects device results; it must not retain removed InitPlan deps. */
     scan->scan.plan.targetlist=(List *)device_output_expression((Node *)native->targetlist,NULL);
     scan->custom_scan_tlist=copyObject(scan->scan.plan.targetlist);

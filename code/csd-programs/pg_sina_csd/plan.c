@@ -4597,7 +4597,7 @@ static int export_batch(struct execution *s,const struct qs_plan *root,struct qs
         s->output_count=s->output_position=0;
         for(unsigned row=s->output_exported;row<out->rows;++row)
             for(unsigned col=0;col<root->nout;++col) {
-                const struct qs_cell *v=&out->data[row].cells[col];
+                const struct qs_cell *v=qp_result_row(out,row,root->nout,s->plan->packed_result)+col;
                 if(!v->isnull && !qs_cell_string(v) && !qs_cell_is_string_ref(v) && root->exprs[root->outputs[col].index].type==Q_STRING)
                     s->output_order[s->output_count++]=(struct output_string){(uint32_t)v->value,row,col};
             }
@@ -4609,7 +4609,7 @@ static int export_batch(struct execution *s,const struct qs_plan *root,struct qs
         const char *bytes; unsigned length;
         if(text_get(s,at->id,&bytes,&length)) return -3;
         if(length>255 || out->str_bytes+length>QS_RESULT_STRING_BYTES) { text_release(s); return -3; }
-        struct qs_cell *v=&out->data[at->row].cells[at->column];
+        struct qs_cell *v=qp_result_row(out,at->row,root->nout,s->plan->packed_result)+at->column;
         if(length<=QS_STRING_MAX) qs_cell_set_string(v,bytes,length);
         else {
             memcpy(out->str_data+out->str_bytes,bytes,length);
@@ -4653,7 +4653,7 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
         for(unsigned col=0;col<output->nout;++col)
             text_columns+=output->exprs[output->outputs[col].index].type==Q_STRING;
         if(text_columns) {
-            s->output_order=cs_work_calloc(context,(size_t)QS_RESULT_ROWS*text_columns,sizeof(*s->output_order));
+            s->output_order=cs_work_calloc(context,(size_t)qp_result_capacity(output,plan->packed_result)*text_columns,sizeof(*s->output_order));
             if(!s->output_order) { cs_work_end(context); return -4; }
         }
         s->paged=qs_dictionary_create(context);
@@ -4741,7 +4741,8 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
     unsigned columns=plan->nodes[worker?(int)s->root:(int)plan->root].expr.nout;
     /* Internal buffers pack only the pipeline's projected columns. A two-column
      * pipeline fits 2048 rows in the same AFDM as 256 final sixteen-cell rows. */
-    unsigned capacity=worker?QS_RESULT_ROWS*QS_OUT/(columns?columns:1):QS_RESULT_ROWS;
+    unsigned capacity=worker?QS_RESULT_ROWS*QS_OUT/(columns?columns:1):
+        qp_result_capacity(&plan->nodes[plan->root].expr,plan->packed_result);
 produce:
     if(worker && s->group_combine) {
         uint64_t tick=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
@@ -4827,7 +4828,8 @@ produce:
         status=2;
     }
     while(status>=0 && status!=QP_WAIT && status<=2 && out->rows<capacity) {
-        struct qs_cell *row=worker?(struct qs_cell *)out->data+(size_t)out->rows*columns:out->data[out->rows].cells;
+        struct qs_cell *row=worker?(struct qs_cell *)out->data+(size_t)out->rows*columns:
+            qp_result_row(out,out->rows,columns,plan->packed_result);
         status=s->output_pending?2:next_row(s,worker?(int)s->root:(int)plan->root,row);
         if(status==QP_WAIT || status<0 || status>2) break;
         if(!status) { out->finished=control->finished=1; break; }
@@ -4895,6 +4897,7 @@ combined:
         atomic_fetch_sub(&owner->active_cus,1); control->peak_cus=atomic_load(&owner->peak_cus);
     }
     control->output_rows=(s->text_wait || s->dictionary_wait)?0:out->rows;
+    control->output_strings=out->str_bytes;
     out->metrics=s->metrics; out->metrics.workers=s->used_workers?s->used_workers:1; out->profile=s->profile;
     struct qs_dictionary_stats dictionary;
     qs_dictionary_get_stats(s->paged,&dictionary);

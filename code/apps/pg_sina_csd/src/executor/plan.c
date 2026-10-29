@@ -3,6 +3,7 @@
 #include "cs.h"
 #include "catalog/pg_type_d.h"
 #include "executor/executor.h"
+#include "access/parallel.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -12,6 +13,11 @@
 #include <stdlib.h>
 
 typedef struct PlanStateCsd PlanStateCsd;
+/* Native PG parallel scan participants claim disjoint device chunks. */
+struct parallel_scan {
+    atomic_uint_fast64_t next_offset;
+    unsigned participants;
+};
 struct plan_slot {
     struct qp_control control;
     CS_BATCH_HANDLE batch, resume;
@@ -42,6 +48,7 @@ struct PlanStateCsd {
     struct plan_slot slots[QS_WORKERS+1];
     unsigned workers, epoch, device_cus;
     atomic_uint_fast64_t next_scan_offset;
+    struct parallel_scan *shared_scan;
     atomic_uint_fast64_t batch_progress;
     unsigned retry_worker;
     atomic_bool stopping;
@@ -55,7 +62,7 @@ struct PlanStateCsd {
     uint64_t notice_ns, notice_max_ns;
     uint64_t barrier_started,barrier_ns,barriers;
     uint64_t setup_ns, cleanup_ns;
-    uint64_t fdm_bytes;
+    uint64_t fdm_bytes,result_bytes,result_reads,result_rows;
     struct qs_request files[QP_NODES];
     struct qs_extent *extents[QP_NODES];
     struct qs_request indexes[QP_NODES];
@@ -131,8 +138,10 @@ static void completed(void *context,CS_STATUS status,u64 value)
 }
 static CS_STATUS transfer(CS_MEM_HANDLE memory,size_t offset,void *data,size_t bytes,bool write)
 {
+    /* Keep large plan uploads bounded; one projected result batch fits in
+     * a single request instead of three independent 64KiB requests. */
     for(size_t done=0;done<bytes;) {
-        size_t n=Min((size_t)QS_SORT_IO_BYTES,bytes-done);
+        size_t n=Min((size_t)256*1024,bytes-done);
         CsCopyMemRequest request={.Type=write?CS_COPY_TO_DEVICE:CS_COPY_FROM_DEVICE,.DevMem={memory,offset+done},
             .u.HostVAddress=(char *)data+done,.Bytes=n};
         CS_STATUS status=csQueueCopyMemRequest(&request,NULL,NULL,NULL,NULL,NULL);
@@ -198,6 +207,7 @@ static void begin(CustomScanState *node,EState *estate,int flags)
     Const *constant=linitial_node(Const,scan->custom_private); bytea *bytes=DatumGetByteaP(constant->constvalue);
     if(VARSIZE_ANY_EXHDR(bytes)!=sizeof(*s->plan)) elog(ERROR,"invalid CSD PG Plan");
     s->plan=palloc(sizeof(*s->plan)); memcpy(s->plan,VARDATA_ANY(bytes),sizeof(*s->plan));
+    s->plan->packed_result=1;
     s->result=(void *)TYPEALIGN(16,(uintptr_t)palloc0(sizeof(*s->result)+15));
     s->explain_only=flags&EXEC_FLAG_EXPLAIN_ONLY;
     atomic_init(&s->stopping,false); atomic_init(&s->next_scan_offset,0);
@@ -273,6 +283,7 @@ static void start(PlanStateCsd *s)
         }
     }
     s->profiling=pg_sina_profile; s->start_ns=clock_ns(); s->load_ns=s->load_calls=0;
+    s->result_bytes=s->result_reads=s->result_rows=0;
     atomic_store(&s->stopping,false);
     atomic_store(&s->batch_progress,0); s->retry_worker=0;
     s->poll_ns=s->completion_copy_ns=s->submit_ns=s->queue_ns=s->control_write_ns=0;
@@ -293,6 +304,7 @@ static void start(PlanStateCsd *s)
     bool indexed[QP_NODES]={0};
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_INDEX_JOIN) indexed[s->plan->nodes[i].right]=true;
     qp_parallel_boundaries(s->plan,s->plan->root);
+    if(s->shared_scan) s->plan->nodes[s->plan->root].parallel=1;
     for(unsigned i=0;i<s->plan->ninit;++i) qp_parallel_boundaries(s->plan,s->plan->init_nodes[i]);
     bool parallel=false;
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].parallel) parallel=true;
@@ -300,25 +312,41 @@ static void start(PlanStateCsd *s)
     s->device_cus=pg_sina_resources.cus;
     if(parallel) s->workers=Min(QS_WORKERS,s->device_cus);
     uint64_t capacity=pg_sina_resources.fdm_bytes;
+    if(s->shared_scan) capacity/=s->shared_scan->participants;
     if(s->workers<=1) s->workers=0;
     s->plan->scan_bytes=QS_CHUNK;
-    size_t arena;
+    size_t arena,sizes[5];
+    CsMemFlags flags={.FDMId=1};
     for(;;) {
         arena=layout_buffers(s,indexed);
         size_t needed=arena+plan_bytes+(s->workers+1)*(sizeof(struct qp_control)+sizeof(*s->result)+QS_SORT_IO_BYTES)+65536;
         if(capacity && needed>capacity) {
             if(s->plan->scan_bytes>QP_SCAN_BYTES) { s->plan->scan_bytes/=2; continue; }
-            if(s->workers>1) { if(--s->workers==1) s->workers=0; continue; }
+            if(s->workers>(s->shared_scan?2U:0U)) { if(--s->workers==1) s->workers=0; continue; }
         }
-        break;
+        sizes[0]=plan_bytes; sizes[1]=(s->workers+1)*sizeof(struct qp_control);
+        sizes[2]=(s->workers+1)*sizeof(*s->result); sizes[3]=arena; sizes[4]=QS_SORT_IO_BYTES;
+        CS_STATUS status=CS_SUCCESS;
+        for(unsigned i=0;i<5 && status==CS_SUCCESS;++i)
+            status=csAllocMem(s->device,sizes[i],&flags,&s->memory[i],NULL);
+        for(unsigned w=0;w<s->workers && status==CS_SUCCESS;++w)
+            status=csAllocMem(s->device,QS_SORT_IO_BYTES,&flags,&s->worker_io[w],NULL);
+        if(status==CS_SUCCESS) break;
+        /* Concurrent HOST join inputs share physical AFDM. Retry a smaller
+         * layout using actual allocation failure, not a fixed node quota. */
+        for(unsigned i=0;i<5;++i) if(s->memory[i]) {
+            csFreeMem(s->memory[i],&flags); s->memory[i]=NULL;
+        }
+        for(unsigned w=0;w<s->workers;++w) if(s->worker_io[w]) {
+            csFreeMem(s->worker_io[w],&flags); s->worker_io[w]=NULL;
+        }
+        if(status!=CS_NOT_ENOUGH_MEMORY && status!=CS_OUT_OF_RESOURCES) checked(status,"allocate AFDM");
+        if(s->plan->scan_bytes>QP_SCAN_BYTES) { s->plan->scan_bytes/=2; continue; }
+        if(s->workers>(s->shared_scan?2U:0U)) { if(--s->workers==1) s->workers=0; continue; }
+        checked(status,"allocate AFDM");
     }
-    CsMemFlags flags={.FDMId=1};
-    size_t sizes[]={plan_bytes,(s->workers+1)*sizeof(struct qp_control),(s->workers+1)*sizeof(*s->result),arena,QS_SORT_IO_BYTES};
     s->fdm_bytes=s->workers*QS_SORT_IO_BYTES;
     for(unsigned i=0;i<5;++i) s->fdm_bytes+=sizes[i];
-    for(unsigned i=0;i<5;++i) checked(csAllocMem(s->device,sizes[i],&flags,&s->memory[i],NULL),"allocate AFDM");
-    for(unsigned w=0;w<s->workers;++w)
-        checked(csAllocMem(s->device,QS_SORT_IO_BYTES,&flags,&s->worker_io[w],NULL),"allocate worker spill AFDM");
     checked(transfer(s->memory[0],0,s->plan,sizeof(*s->plan),true),"copy plan");
     for(unsigned i=0;i<s->plan->count;++i) {
         if(s->plan->files[i].count) checked(transfer(s->memory[0],s->plan->files[i].offset,s->extents[i],
@@ -390,7 +418,8 @@ static CS_STATUS queue_scan(struct plan_slot *slot)
     unsigned node=slot->scan_node-1,worker=slot->worker;
     const struct qp_node *n=&s->plan->nodes[node];
     const struct qs_request *file=&s->files[node];
-    uint64_t offset=atomic_fetch_add_explicit(&s->next_scan_offset,s->plan->scan_bytes,memory_order_relaxed);
+    atomic_uint_fast64_t *next=s->shared_scan?&s->shared_scan->next_offset:&s->next_scan_offset;
+    uint64_t offset=atomic_fetch_add_explicit(next,s->plan->scan_bytes,memory_order_relaxed);
     if(offset>n->bytes) offset=n->bytes;
     uint64_t bytes=Min((uint64_t)s->plan->scan_bytes,n->bytes-offset);
     size_t size=sizeof(CsBatchRequest)+(file->nextents+1)*sizeof(CSBlockRange);
@@ -609,14 +638,18 @@ static void fetch(PlanStateCsd *s)
                 }
                 slot->control_copied=false;
             }
-            struct qs_result header;
-            /* Read rows and the following string length together. Avoid a
-             * separate row request and copying the entire 1 MiB text area. */
-            const size_t result_prefix=offsetof(struct qs_result,str_data);
-            if(!w) {
-                memset(&header,0,result_prefix);
-                if(status==CS_SUCCESS && (slot->control.output_rows || slot->control.finished))
-                    status=transfer(s->memory[2],0,&header,result_prefix,false);
+            /* Only actual projected cells cross the device/host boundary.
+             * The control already supplies row/text counts; no header probe. */
+            const struct qs_plan *output=&s->plan->nodes[s->plan->root].expr;
+            size_t result_prefix=offsetof(struct qs_result,data)+
+                (size_t)slot->control.output_rows*output->nout*sizeof(struct qs_cell);
+            if(!w) { memset(s->result,0,offsetof(struct qs_result,data)); s->result->str_bytes=0; }
+            if(!w && status==CS_SUCCESS && (slot->control.output_rows || slot->control.finished)) {
+                if(slot->control.output_rows>qp_result_capacity(output,1))
+                    ereport(ERROR,(errmsg("invalid packed CSD result row count")));
+                status=transfer(s->memory[2],0,s->result,result_prefix,false);
+                s->result_bytes+=result_prefix; ++s->result_reads; s->result_rows+=slot->control.output_rows;
+                s->result->str_bytes=slot->control.output_strings;
             }
             if(s->profiling) s->completion_copy_ns+=clock_ns()-observed;
             RESUME_INTERRUPTS(); CHECK_FOR_INTERRUPTS();
@@ -630,8 +663,7 @@ static void fetch(PlanStateCsd *s)
                 slot->retry_progress=atomic_load_explicit(&s->batch_progress,memory_order_acquire);
                 continue;
             }
-            memcpy(s->result,&header,result_prefix);
-            if(header.rows || header.finished || slot->control.drained)
+            if(s->result->rows || s->result->finished || slot->control.drained)
                 atomic_fetch_add_explicit(&s->batch_progress,1,memory_order_release);
             for(unsigned i=1;i<=s->workers;++i) if(slot->control.drained&(UINT64_C(1)<<(i-1))) s->slots[i].ready=false;
             s->parallel=slot->control.parallel;
@@ -648,11 +680,13 @@ static void fetch(PlanStateCsd *s)
                     memset(&worker->control,0,sizeof(worker->control));
                 }
             }
-            if(s->result->rows>QS_RESULT_ROWS) elog(ERROR,"invalid CSD result page");
+            if(s->result->rows>qp_result_capacity(output,1)) elog(ERROR,"invalid CSD result page");
             if(s->result->str_bytes>sizeof(s->result->str_data)) elog(ERROR,"invalid CSD result strings");
-            if(s->result->rows && s->result->str_bytes)
+            if(s->result->rows && s->result->str_bytes) {
                 checked(transfer(s->memory[2],offsetof(struct qs_result,str_data),s->result->str_data,
                     s->result->str_bytes,false),"read result strings");
+                s->result_bytes+=s->result->str_bytes; ++s->result_reads;
+            }
             if(s->result->finished && s->profiling)
                 checked(transfer(s->memory[0],offsetof(struct qp_plan,pipelines),s->plan->pipelines,
                     sizeof(s->plan->pipelines),false),"read pipeline profile");
@@ -721,7 +755,7 @@ static TupleTableSlot *execute(CustomScanState *node)
     if(s->row==s->result->rows) { close_state(s); return ExecClearTuple(slot); }
     ResetExprContext(node->ss.ps.ps_ExprContext); ExecClearTuple(slot);
     const struct qs_plan *root=&s->plan->nodes[s->plan->root].expr;
-    const struct qs_cell *row=s->result->data[s->row++].cells;
+    const struct qs_cell *row=qp_result_row(s->result,s->row++,root->nout,1);
     for(unsigned i=0;i<root->nout;++i) {
         struct qs_cell v=row[i]; slot->tts_isnull[i]=v.isnull; if(v.isnull) continue;
         Oid type=root->outputs[i].type_oid;
@@ -750,6 +784,23 @@ static TupleTableSlot *execute(CustomScanState *node)
     return node->ss.ps.ps_ProjInfo?ExecProject(node->ss.ps.ps_ProjInfo):slot;
 }
 static void end(CustomScanState *node) { close_state(node); }
+static Size estimate_dsm(CustomScanState *node,ParallelContext *pcxt)
+{ return sizeof(struct parallel_scan); }
+static void initialize_dsm(CustomScanState *node,ParallelContext *pcxt,void *coordinate)
+{
+    PlanStateCsd *s=(void *)node;
+    s->shared_scan=coordinate;
+    atomic_init(&s->shared_scan->next_offset,0);
+    s->shared_scan->participants=pcxt->nworkers+1;
+}
+static void initialize_worker(CustomScanState *node,shm_toc *toc,void *coordinate)
+{ ((PlanStateCsd *)node)->shared_scan=coordinate; }
+static void shutdown_scan(CustomScanState *node)
+{
+    PlanStateCsd *s=(void *)node;
+    close_state(s); /* Drain SNIA callbacks before PG detaches shared memory. */
+    s->shared_scan=NULL;
+}
 static void rescan(CustomScanState *node)
 {
     PlanStateCsd *s=(void *)node; close_state(s);
@@ -765,6 +816,11 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     ExplainPropertyInteger("CSD Device Workmem","bytes",pg_sina_resources.workmem_bytes,es);
     ExplainPropertyInteger("CSD Query Memory Limit","bytes",s->plan->nodes[s->plan->root].expr.work_mem_bytes,es);
     ExplainPropertyText("CSD Plan Source","PostgreSQL selected Plan; original join tree",es);
+    ExplainPropertyInteger("CSD Host Result Bytes","bytes",s->result_bytes,es);
+    ExplainPropertyText("CSD Counter Scope","current PG backend; parallel workers have separate counters",es);
+    ExplainPropertyInteger("CSD Host Result Requests",NULL,s->result_reads,es);
+    ExplainPropertyInteger("CSD Returned Rows",NULL,s->result_rows,es);
+    ExplainPropertyInteger("CSD Output Columns",NULL,s->plan->nodes[s->plan->root].expr.nout,es);
     ExplainPropertyText("CSD Intermediate Data","device workmem and internal spill; 128-bit values",es);
     static const char *names[]={"Scan","Projection","Merge Join","Aggregate","Sort","Limit","Index Join","CTE Scan","CTE materialization","IN hash set"};
     StringInfoData tree; initStringInfo(&tree);
@@ -881,5 +937,8 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     }
 }
 static const CustomExecMethods methods={.CustomName="SniaCsdPlan",.BeginCustomScan=begin,.ExecCustomScan=execute,
-    .EndCustomScan=end,.ReScanCustomScan=rescan,.ExplainCustomScan=explain};
+    .EndCustomScan=end,.ReScanCustomScan=rescan,.ExplainCustomScan=explain,
+    .EstimateDSMCustomScan=estimate_dsm,.InitializeDSMCustomScan=initialize_dsm,
+    .ReInitializeDSMCustomScan=initialize_dsm,.InitializeWorkerCustomScan=initialize_worker,
+    .ShutdownCustomScan=shutdown_scan};
 const CustomScanMethods pg_sina_plan_methods={.CustomName="SniaCsdPlan",.CreateCustomScanState=create};

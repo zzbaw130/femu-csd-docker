@@ -55,6 +55,7 @@ struct qp_file_mapping {
 struct qp_plan {
     unsigned count, root, nparams, ninit;
     unsigned workers, scan_bytes;
+    unsigned packed_result; /* Host boundary only; internal worker batches stay unchanged. */
     uint64_t parallel_stride;
     int param_nodes[QP_PARAMS],cte_nodes[QP_PARAMS],init_nodes[QP_PARAMS],init_params[QP_PARAMS];
     struct qp_node nodes[QP_NODES];
@@ -73,7 +74,7 @@ struct qp_control {
     unsigned scan_node;
     uint64_t available, drained;
     /* Completion metadata avoids a second AFDM read for internal row batches. */
-    unsigned output_rows, peak_cus;
+    unsigned output_rows, peak_cus, output_strings;
     struct qs_index_read index_reads[QS_INDEX_READS];
 };
 /* Each spilled group carries its keys and one value/count pair per aggregate.
@@ -135,6 +136,28 @@ static inline void qp_dictionary_size(const struct qp_plan *p,unsigned *entries,
     while(*entries<count) *entries*=2;
     *data=(bytes+4095)&~UINT64_C(4095);
 }
+/* Reuse the existing 4096-cell AFDM for projected rows. Bound string output
+ * by the current host ABI's 255-byte value limit and the 64KiB text arena. */
+static inline unsigned qp_result_capacity(const struct qs_plan *p,int packed)
+{
+    if(!packed) return QS_RESULT_ROWS;
+    unsigned rows=QS_RESULT_ROWS*QS_OUT/(p->nout?p->nout:1),text=0;
+    for(unsigned c=0;c<p->nout;++c) {
+        int expression=p->outputs[c].index;
+        if(p->outputs[c].aggregate) {
+            const struct qs_agg *a=&p->aggs[expression];
+            if(a->kind!=Q_MIN && a->kind!=Q_MAX) continue;
+            expression=a->expr;
+        }
+        if(expression<0 || p->exprs[expression].type!=Q_STRING) continue;
+        unsigned bytes=p->outputs[c].typmod>4?(unsigned)p->outputs[c].typmod-4:255;
+        if(bytes>QS_STRING_MAX) text+=bytes<255?bytes:255;
+    }
+    if(text && rows>QS_RESULT_STRING_BYTES/text) rows=QS_RESULT_STRING_BYTES/text;
+    return rows?rows:1;
+}
+static inline struct qs_cell *qp_result_row(struct qs_result *out,unsigned row,unsigned columns,int packed)
+{ return (struct qs_cell *)out->data+(size_t)row*(packed?columns:QS_OUT); }
 /* A parallel probe pipeline ends before an order-dependent/blocking operator.
  * Hash build children retain the exact PG-selected tree and are built once. */
 static inline int qp_probe_scan(const struct qp_plan *p,int id)
@@ -172,6 +195,7 @@ static inline void qp_parallel_boundaries(struct qp_plan *p,int id)
 {
     if(id<0) return;
     struct qp_node *n=&p->nodes[id]; int candidate=-1;
+    if((unsigned)id==p->root && n->kind==QP_SCAN) qp_mark_parallel(p,id);
     if(n->kind==QP_SORT || (n->kind==QP_AGGREGATE && (!n->nkeys || !n->sorted_input))) candidate=n->left;
     qp_mark_parallel(p,candidate);
     qp_parallel_boundaries(p,n->left);

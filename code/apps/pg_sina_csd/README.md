@@ -18,6 +18,8 @@ HPCP 全称 **Host Page Cache Population（主机页缓存填充）**。它把�
 
 非 `host-only` 模式保留 PG 选定的连接顺序。完整卸载和 SQLerate 在规划前进行已支持的安全子查询去关联；`filter-only` 保留原 SQL，仅转换支持的扫描叶节点，不卸载 Join、Aggregate 或 Sort。
 
+`filter-only` 只解码、返回 HOST 后续节点需要的列，使用设备多 CU 扫描过滤，并保留 PG 原生并行聚合/连接。parallel-aware 顺序扫描通过 PG 共享计数器分配不同输入块，不重复返回整表。结果按实际列数打包，直接构造 PG Numeric；实现及针对性测量见 [filter-only 执行](doc/filter-only.md)。
+
 转换会删除下游不需要的物理扫描输出列，并同步调整 Sort、Aggregate 的列位置。PG 的部分/最终聚合合并为设备端的一次聚合；SUM/AVG/COUNT/MIN/MAX 可共同使用有界 Hash Aggregate，支持多键、字符串和聚合参数表达式，输入可来自扫描或连接；各聚合分别保存值/count（SUM/AVG 保存和，MIN/MAX 保存极值），超限时归并这些部分状态；分组键数加两倍聚合数超过现有16列中间行容量时，保留原排序聚合。原计划利用分组排序提供 ORDER BY 时，将该排序移至聚合后，按聚合输出列的位置保留顺序；符合条件的 PG HashAggregate 保留 Hash 算法。Gather 不再启动 Guest worker，扫描内存预留使用 PG 的全表过滤后行数估计，避免把单 worker 的估计误作总量。参数化 B-tree Nested Loop 在原位置转换为设备 Index Join；其他等值连接使用 Hash Join 或 Merge Join。INNER Hash build 扩容失败时，保留已经消费的输入，按键分区落盘并继续 Hash；构建侧结束、子节点释放空间后，若实际行数对应的表能驻留，则直接多 CU 扫描 Probe 侧，否则共享当前分区的表并动态领取 Probe 临时块；其他形态保留外部归并，不重新扫描 Heap。每个 CU 的重入 spill 使用独立的 64 KiB AFDM，AFDM 总预算不增加。
 
 支持的节点包括投影/过滤、INNER/LEFT/SEMI/ANTI 等值连接、SUM/AVG/COUNT/MIN/MAX、COUNT DISTINCT、HAVING、Sort、Limit/Offset、派生表、共享 CTE、标量 InitPlan 和整数 IN/NOT IN 集合。相关标量聚合目前仅将严格 WHERE 条件中的 SUM/AVG/MIN/MAX 按整数等值关联键去关联；COUNT 的空输入、OR 等不安全形态保留 PG 执行。不能转换的计划整体回退原生 PG。`auto` 尚未实现，不接受该配置值。

@@ -38,16 +38,29 @@ static void begin(CustomScanState *node,EState *estate,int flags)
 }
 Datum pg_sina_decimal(struct qs_cell value)
 {
-    char digits[48],text[96]; unsigned n=0,pos=0;
+    /* PG numeric.c NumericLong: varlena, sign/dscale, weight, base-10000
+     * int16 digits. Construct its native representation without numeric_in's
+     * decimal formatting/parsing. This is PG-side storage, never a CSF ABI. */
+    uint16_t digits[12]; unsigned count=0,first=0,scale=value.scale;
+    unsigned display=value.dscale<scale?value.dscale:scale;
     unsigned __int128 magnitude=value.value<0?0-(unsigned __int128)value.value:(unsigned __int128)value.value;
-    do { digits[n++]='0'+magnitude%10; magnitude/=10; } while(magnitude);
-    while(n<=value.scale) digits[n++]='0';
-    if(value.value<0) text[pos++]='-';
-    for(unsigned i=n;i>0;--i) { text[pos++]=digits[i-1]; if(i-1==value.scale && value.dscale) text[pos++]='.'; }
-    /* The fixed arithmetic scale may exceed the numeric display scale. */
-    if(value.dscale<value.scale) pos-=value.scale-value.dscale;
-    text[pos]=0;
-    return DirectFunctionCall3(numeric_in,CStringGetDatum(text),ObjectIdGetDatum(InvalidOid),Int32GetDatum(-1));
+    while(scale>display) { magnitude/=10; --scale; }
+    do { digits[count++]=magnitude%10000; magnitude/=10000; } while(magnitude);
+    unsigned padding=(4-scale%4)%4,factor=1;
+    while(padding--) factor*=10;
+    unsigned carry=0;
+    for(unsigned i=0;i<count;++i) { unsigned n=digits[i]*factor+carry; digits[i]=n%10000; carry=n/10000; }
+    if(carry) digits[count++]=carry;
+    int16_t weight=(int)count-(scale+3)/4-1;
+    while(first<count && !digits[first]) ++first;
+    if(first==count) weight=0;
+    unsigned ndigits=count-first;
+    uint16_t header=display | (value.value<0 && ndigits?0x4000:0);
+    size_t bytes=VARHDRSZ+2*sizeof(uint16_t)+ndigits*sizeof(uint16_t);
+    void *numeric=palloc(bytes); SET_VARSIZE(numeric,bytes);
+    char *data=VARDATA(numeric); memcpy(data,&header,2); memcpy(data+2,&weight,2);
+    for(unsigned i=0;i<ndigits;++i) memcpy(data+4+2*i,&digits[count-1-i],2);
+    return PointerGetDatum(numeric);
 }
 static TupleTableSlot *execute(CustomScanState *node)
 {

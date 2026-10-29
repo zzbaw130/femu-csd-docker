@@ -16,7 +16,7 @@
 typedef int64_t (*function)(struct femu_csd_args *);
 enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_INDEX_PIPELINE,TEST_INDEX_HASH,TEST_INDEX_CHAIN,TEST_INDEX_EXPR,TEST_DEVICE_IO,TEST_PACKED_KEYS,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL, TEST_VECTOR_AGG=-1,TEST_JOIN_QUAL=-2,TEST_GROUP_SOURCE=-3,TEST_GROUP_SOURCE_SPILL=-4,TEST_BUILD_GROUP_SOURCE=-5,TEST_BUILD_GROUP_HAVING=-6,TEST_BUILD_GROUP_DIRECT=-7 };
 static unsigned test_workers=4;
-static bool test_scheduled;
+static bool test_scheduled,test_packed;
 /* Reservations must cover physical input even when filters/NDV estimates
  * are tiny, while unused string columns must not consume AFDM. */
 static void dictionary_size(void)
@@ -172,7 +172,7 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
     const size_t raw_bytes=(rows/per_page)*QS_PAGE;
     size_t plan_bytes=sizeof(struct qp_plan)+(ordered?0:sizeof(struct qs_extent));
     struct qp_plan *p=calloc(1,plan_bytes); assert(p);
-    p->count=2; p->scan_bytes=ordered?QP_SCAN_BYTES:QS_PAGE;
+    p->count=2; p->packed_result=test_packed; p->scan_bytes=ordered?QP_SCAN_BYTES:QS_PAGE;
     struct qp_node *leaf=&p->nodes[1]; scan(leaf);
     leaf->bytes=raw_bytes;
     leaf->expr.cols[0]=(struct qs_column){.length=-1,.align=4,.slot=0,.type=Q_STRING};
@@ -291,7 +291,7 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
             for(unsigned w=0;w<workers;++w) need_input[w]=true;
         }
         for(unsigned r=0;r<out->rows;++r) {
-            struct qs_cell *v=out->data[r].cells; assert(seen<rows);
+            struct qs_cell *v=qp_result_row(out,r,p->nodes[p->root].expr.nout,p->packed_result); assert(seen<rows);
             if(ordered) while(key<rows && expected[key]%97==0) ++key;
             unsigned source=ordered?(key<rows?expected[key]:null_row):seen;
             unsigned value_key=ordered?key:(seen*1009)%rows;
@@ -324,10 +324,10 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
         }
     }
     if(!cancel) {
-        assert(seen==rows && spill.stores && (!ordered || loads) && peak<=budget);
+        assert(seen==rows && (test_packed || (spill.stores && (!ordered || loads))) && peak<=budget);
         if(!ordered) assert(namespace_loads==raw_bytes/QS_PAGE);
         if(workers) assert(out->metrics.workers==workers && p->pipelines[1].worker_ns);
-        assert(out->metrics.dictionary_bytes>budget && out->metrics.dictionary_entries==rows-(rows+96)/97+(payload?40:0)+(payload==2));
+        assert((test_packed || out->metrics.dictionary_bytes>budget) && out->metrics.dictionary_entries==rows-(rows+96)/97+(payload?40:0)+(payload==2));
         if(payload==2) assert(out->profile.operators[QS_FILTER].calls);
         if(ordered && budget>=64U*1024*1024)
             assert((uint64_t)loads*QS_SORT_IO_BYTES<out->metrics.dictionary_bytes*8);
@@ -2262,6 +2262,13 @@ int main(int argc,char **argv)
     assert(qp_worker_mask(0)==0 && qp_worker_mask(32)==UINT32_MAX && qp_worker_mask(64)==UINT64_MAX);
     assert(argc==2 || argc==3 || argc==4); void *library=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(library);
     function capacity=(function)dlsym(library,"pg_sina_workmem_capacity"); assert(capacity);
+    if(argc==3 && !strcmp(argv[2],"--packed-output-64m")) {
+        test_packed=true; assert(!cs_work_init(64U*1024*1024));
+        function run=(function)dlsym(library,"pg_sina_plan"); assert(run);
+        dictionary_plan(run,0,0,0,8192,64U*1024*1024,1);
+        dictionary_plan(run,0,4,1,8192,64U*1024*1024,1);
+        return 0;
+    }
     if(argc==3 && !strcmp(argv[2],"--dictionary-64m")) {
         assert(!cs_work_init(64U*1024*1024));
         function run=(function)dlsym(library,"pg_sina_plan"); assert(run);

@@ -82,13 +82,14 @@ static Oid scan_relation(PlannerInfo *root,Plan *p)
     }
     return InvalidOid;
 }
-static double output_bytes(Plan *p)
+static double output_bytes(Plan *p,const struct qs_plan *output)
 {
-    /* The existing result ABI transfers a full fixed-width result prefix,
-     * not only the projected columns. Price the bytes actually returned. */
+    /* Generic boundaries transfer projected cells and actual row counts;
+     * worker intermediates and legacy single-table CSFs retain their ABI. */
     double rows=Max(0,p->plan_rows);
-    return Max(1,ceil(rows/QS_RESULT_ROWS))*offsetof(struct qs_result,str_data)+
-        rows*Max(0,p->plan_width-list_length(p->targetlist)*(int)sizeof(struct qs_cell));
+    return rows*output->nout*sizeof(struct qs_cell)+
+        Max(1,ceil(rows/qp_result_capacity(output,1)))*offsetof(struct qs_result,data)+
+        rows*Max(0,p->plan_width-(int)output->nout*(int)sizeof(struct qs_cell));
 }
 /* Match executor layout selection: try smaller input blocks before fewer CUs.
  * File-extent descriptors are not yet available here; allow one page/node. */
@@ -427,24 +428,24 @@ static void device_cost(struct placement *p,List **observations)
     double device=io+p->cpu;
     if(pg_sina_hpcp_enabled()) device=Max(device,p->population)+blocks*0.002;
     p->csd=device+2;
-    p->boundary=transfer_ms(output_bytes(p->native),pg_sina_pcie_mbps)+
+    p->boundary=transfer_ms(output_bytes(p->native,&tree->nodes[tree->root].expr),pg_sina_pcie_mbps)+
         Max(0,p->native->plan_rows)*cpu_tuple_cost*pg_sina_host_cost_ms+
-        Max(1,ceil(p->native->plan_rows/QS_RESULT_ROWS))*pg_sina_result_batch_ms;
+        Max(1,ceil(p->native->plan_rows/qp_result_capacity(&tree->nodes[tree->root].expr,1)))*pg_sina_result_batch_ms;
     pfree(tree);
 }
-static struct placement *estimate(PlannerInfo *root,Plan *native,List **observations,bool top,bool mark_restore)
+static struct placement *estimate(PlannerInfo *root,Plan *native,Plan *scope,List **observations,bool top,bool mark_restore)
 {
     struct placement *p=palloc0(sizeof(*p)); p->native=native; p->root=root; p->csd=DBL_MAX;
-    /* Gather is an indivisible host region unless its complete subtree can
-     * be offloaded. Never replace a parallel worker's scan by a full scan. */
+    /* Adaptive placement keeps Gather indivisible. Filter-only may replace
+     * its scans using the executor's shared chunk allocator. */
     {
-        if(native->lefttree) p->children=lappend(p->children,estimate(root,native->lefttree,observations,false,false));
-        if(native->righttree) p->children=lappend(p->children,estimate(root,native->righttree,observations,false,
+        if(native->lefttree) p->children=lappend(p->children,estimate(root,native->lefttree,scope,observations,false,false));
+        if(native->righttree) p->children=lappend(p->children,estimate(root,native->righttree,scope,observations,false,
             IsA(native,MergeJoin) && !((MergeJoin *)native)->skip_mark_restore));
         if(IsA(native,SubqueryScan)) {
             RelOptInfo *rel=root->simple_rel_array[((SubqueryScan *)native)->scan.scanrelid];
             if(rel && rel->subroot) p->children=lappend(p->children,
-                estimate(rel->subroot,((SubqueryScan *)native)->subplan,observations,false,false));
+                estimate(rel->subroot,((SubqueryScan *)native)->subplan,((SubqueryScan *)native)->subplan,observations,false,false));
         }
     }
     double original_children=0,best_children=0,native_children=0;
@@ -478,8 +479,9 @@ static struct placement *estimate(PlannerInfo *root,Plan *native,List **observat
     /* An island cannot consume parameters produced in a different host
      * InitPlan. Whole-query conversion keeps the existing device protocol. */
     if(eligible && (top || root->init_plans==NIL)) {
-        Plan *device=pg_sina_compile_subtree(root,native,!top);
-        if(device!=native) { p->device=device; device_cost(p,observations); }
+        Plan *candidate=pg_sina_exe_path==PG_SINA_FILTER?pg_sina_project_scan(scope,native):native;
+        Plan *device=pg_sina_compile_subtree(root,candidate,!top);
+        if(device!=candidate) { p->device=device; device_cost(p,observations); }
     }
     p->offload=p->device && (pg_sina_exe_path!=PG_SINA_ADAPTIVE || p->csd+p->boundary<p->host);
     return p;
@@ -542,13 +544,17 @@ static Plan *select_plan(struct placement *p,bool top,StringInfo decisions)
         return out;
     }
     Plan *out=p->native; ListCell *c;
-    if(IsA(out,Gather) || IsA(out,GatherMerge)) return out;
+    if(pg_sina_exe_path!=PG_SINA_FILTER && (IsA(out,Gather) || IsA(out,GatherMerge))) return out;
     foreach(c,p->children) {
         struct placement *child=lfirst(c); Plan *chosen=select_plan(child,false,decisions);
-        if(child->native==out->lefttree) out->lefttree=chosen;
+        if(child->native==out->lefttree) {
+            if(pg_sina_exe_path==PG_SINA_FILTER && chosen!=child->native)
+                pg_sina_remap_input(out,child->native->targetlist,chosen->targetlist);
+            out->lefttree=chosen;
+        }
         else if(child->native==out->righttree) out->righttree=chosen;
         else if(IsA(out,SubqueryScan)) ((SubqueryScan *)out)->subplan=chosen;
-        if(chosen!=child->native) out->parallel_safe=out->parallel_aware=false;
+        if(chosen!=child->native && !chosen->parallel_safe) out->parallel_safe=out->parallel_aware=false;
     }
     return out;
 }
@@ -606,7 +612,7 @@ const CustomScanMethods pg_sina_adaptive_methods={.CustomName="SQLeratePlan",.Cr
 Plan *pg_sina_adaptive_plan(PlannerInfo *root,Plan *native)
 {
     List *observations=NIL;
-    struct placement *p=estimate(root,native,&observations,true,false);
+    struct placement *p=estimate(root,native,native,&observations,true,false);
     StringInfoData decisions; initStringInfo(&decisions);
     StringInfoData costs; initStringInfo(&costs); node_costs(p,&costs);
     Plan *out=select_plan(p,true,&decisions);

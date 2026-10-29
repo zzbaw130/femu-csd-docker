@@ -44,4 +44,6 @@ struct qs_extent *pg_sina_mapping(struct qs_request *request);
 void pg_sina_execute(struct qs_request *,struct qs_extent *,struct qs_result *,bool,struct pg_sina_stream **);
 void pg_sina_fetch(struct pg_sina_stream **,struct qs_result *);
 void pg_sina_close(struct pg_sina_stream *);
+Plan *pg_sina_project_scan(Plan *scope,Plan *scan);
+void pg_sina_remap_input(Plan *parent,List *old,List *projected);
 #endif
