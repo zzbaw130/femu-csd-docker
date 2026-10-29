@@ -6,13 +6,13 @@ SNIA 应用仍包含 `cs.h`、链接 `-lsnia`。Guest 中的 FEMU 插件将纯�
 
 ## 执行流程
 
-可选缓存回填覆盖显式 LOAD 和 CSF 可重入 namespace read，隐藏 spill 换入不回填。内部读取复用同一 AFDM 区域时，设备只在该区域仍被 DMA 使用时暂停该读取，完成后通过就绪队列继续；不阻塞 FTL 处理其他节点，也不等待 Guest 页缓存发布。开启回填的 CSF 需保持基表输入只读，输出与控制信息使用独立区域。
+可选主机页缓存填充覆盖显式 LOAD 和 CSF 可重入 namespace read，隐藏 spill 换入不HPCP。内部读取复用同一 AFDM 区域时，设备只在该区域仍被 DMA 使用时暂停该读取，完成后通过就绪队列继续；不阻塞 FTL 处理其他节点，也不等待 Guest 页缓存发布。开启HPCP的 CSF 需保持基表输入只读，输出与控制信息使用独立区域。
 
-`run-csd.sh` 配置 8 个 I/O 队列、2 个正常 I/O poller；CSD 另有 2 个 `femu-cache-dma` 线程处理可选回填。两组传输共享 PCIe 带宽模型，回填不再占用正常 poller。
+`run-csd.sh` 配置 8 个 I/O 队列、2 个正常 I/O poller；CSD 另有 2 个 `femu-cache-dma` 线程处理可选HPCP。两组传输共享 PCIe 带宽模型，HPCP不再占用正常 poller。
 
-当前 Compose 实验配置为 4 CU。Guest 的 8 个 vCPU 及其他 QEMU 线程使用 node3 的 CPU 30–39，8GiB Guest RAM 通过 QEMU memory-backend 固定在 node3；其中包括 PG 缓冲、Guest 页缓存及回填接收缓冲。
+当前 Compose 实验配置为 4 CU。Guest 的 8 个 vCPU 及其他 QEMU 线程使用 node3 的 CPU 30–39，8GiB Guest RAM 通过 QEMU memory-backend 固定在 node3；其中包括 PG 缓冲、Guest 页缓存及HPCP接收缓冲。
 
-设备的 1 个 FTL、4 个 CU、2 个 poller、2 个回填线程在各自入口设置亲和性，使用 node2 的 CPU 20–28。进程默认内存策略固定在 node2，因此 NVM RAM 后端、FDM、workmem、隐藏 spill 空间和设备元数据均分配在 node2，不随首次访问线程迁移。设备线程共享这 9 个物理核的可用集合，由 Linux 在集合内调度；并非逐线程独占一个核。
+设备的 1 个 FTL、4 个 CU、2 个 poller、2 个HPCP线程在各自入口设置亲和性，使用 node2 的 CPU 20–28。进程默认内存策略固定在 node2，因此 NVM RAM 后端、FDM、workmem、隐藏 spill 空间和设备元数据均分配在 node2，不随首次访问线程迁移。设备线程共享这 9 个物理核的可用集合，由 Linux 在集合内调度；并非逐线程独占一个核。
 
 上述位置由 Compose 的 `FEMU_HOST_CPUS`、`FEMU_HOST_NODE`、`FEMU_DEVICE_CPUS`、`FEMU_DEVICE_NODE` 指定。这里 HOST 表示 Guest 模拟的数据库主机侧。启动器使用 numactl，容器通过 SYS_NICE 允许设置内存策略，不需要启动后查找 PID/TID。更换宿主时先核对 CPU/NUMA/SMT 拓扑与容量，再调整这四项；连续 CPU 编号不保证是独立物理核。直接运行 FEMU 且未设置 FEMU_DEVICE_CPUS 时不修改工作线程亲和性。
 

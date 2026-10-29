@@ -19,5 +19,8 @@ case ${1:-build} in
     tpch)
         guest 'sh /home/femu/tests/tpch-test.sh'
         ;;
-    *) echo '用法：pg-sina-csd-test.sh [build|prepare|check|tpch]' >&2; exit 2 ;;
+    paths)
+        guest 'sh /home/femu/tests/execution-path-test.sh'
+        ;;
+    *) echo '用法：pg-sina-csd-test.sh [build|prepare|check|tpch|paths]' >&2; exit 2 ;;
 esac

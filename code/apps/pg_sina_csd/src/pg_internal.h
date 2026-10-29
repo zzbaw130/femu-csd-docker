@@ -5,6 +5,12 @@
 #include "query.h"
 #include "plan.h"
 extern int pg_sina_exe_path;
+enum pg_sina_path { PG_SINA_HOST, PG_SINA_FILTER, PG_SINA_CSD, PG_SINA_HPCP, PG_SINA_ADAPTIVE };
+const char *pg_sina_path_name(void);
+bool pg_sina_hpcp_enabled(void);
+extern double pg_sina_host_cost_ms, pg_sina_csd_cpu_ratio;
+extern double pg_sina_internal_mbps, pg_sina_pcie_mbps, pg_sina_cache_mbps;
+extern double pg_sina_result_batch_ms;
 extern bool pg_sina_profile;
 extern int pg_sina_max_memory;
 /* Per-backend device capacities, populated before finalizing an offloaded plan.
@@ -27,6 +33,10 @@ struct pg_sina_stream;
 void pg_sina_upper_paths(PlannerInfo *, UpperRelationKind, RelOptInfo *, RelOptInfo *, void *);
 bool pg_sina_rewrite_query(Query *q);
 Plan *pg_sina_rewrite_plan(PlannerInfo *,Plan *);
+Plan *pg_sina_compile_subtree(PlannerInfo *,Plan *,bool);
+Plan *pg_sina_adaptive_plan(PlannerInfo *,Plan *);
+void pg_sina_explain_placement(CustomScan *,ExplainState *);
+extern const CustomScanMethods pg_sina_adaptive_methods;
 Plan *pg_sina_fast_plan(PlannerInfo *,Plan *);
 Plan *pg_sina_native_plan(Plan *);
 extern const CustomScanMethods pg_sina_plan_methods;

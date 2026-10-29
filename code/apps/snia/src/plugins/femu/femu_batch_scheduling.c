@@ -17,7 +17,7 @@ static CS_STATUS session_command(struct cs_device *d, unsigned action, uint64_t 
 }
 void femu_graph_close(struct cs_device *d)
 {
-    femu_cache_stop(d);
+    femu_hpcp_stop(d);
     if(d->graph_session) session_command(d,FEMU_GRAPH_CLOSE,0,NULL);
     while(d->graph_scopes) {
         struct cs_graph_scope *next=d->graph_scopes->next;
@@ -77,7 +77,7 @@ static CS_STATUS queue_graph(void *device,CS_BATCH_MODE mode,unsigned capacity,
     h->count=htole32(count); h->bytes=htole32(bytes);
     h->flags=htole32((mode==CS_BATCH_SERIAL?FEMU_CSD_GRAPH_SERIAL:0) |
         (d->profile?FEMU_CSD_GRAPH_PROFILE:0) |
-        (getenv("SNIA_FEMU_CACHE_REFILL") && !strcmp(getenv("SNIA_FEMU_CACHE_REFILL"),"1")?FEMU_CSD_GRAPH_CACHE:0));
+        (getenv("SNIA_FEMU_HPCP") && !strcmp(getenv("SNIA_FEMU_HPCP"),"1")?FEMU_CSD_GRAPH_CACHE:0));
     struct femu_graph_node *nodes=(void *)(h+1);
     size_t offset=sizeof(*h)+count*sizeof(*nodes);
     for(unsigned i=0;i<capacity;++i) if(entries[i].request) {
@@ -124,7 +124,7 @@ static CS_STATUS queue_graph(void *device,CS_BATCH_MODE mode,unsigned capacity,
         u64 id=0; status=session_command(d,FEMU_GRAPH_OPEN,0,&id);
         if(status==CS_SUCCESS) d->graph_session=id;
     }
-    if(status==CS_SUCCESS) status=femu_cache_start(d);
+    if(status==CS_SUCCESS) status=femu_hpcp_start(d);
     if(status!=CS_SUCCESS || cancelled(execution)) {
         pthread_mutex_unlock(&d->graph_lock); free(data); free(record);
         return status==CS_SUCCESS?CS_ERROR_IN_EXECUTION:status;

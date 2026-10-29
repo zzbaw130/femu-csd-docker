@@ -34,7 +34,7 @@ for query in "$@"; do
     if [ "$ok" -eq 1 ]; then
         if cmp -s "$RESULTS/$query.host.rows" "$RESULTS/$query.csd.rows"; then match=yes; else failed=1; fi
         if psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
-            -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path=csd" \
+            -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path='csd-without-hpcp'" \
             -f "$QUERIES/$query.explain.sql" > "$RESULTS/$query.plan.log" 2> "$RESULTS/$query.plan.err" &&
             grep -q '^Custom Scan (SniaCsd' "$RESULTS/$query.plan.log" &&
             ! grep -Eq '^[[:space:]]*(->|InitPlan|SubPlan)[[:space:]]' "$RESULTS/$query.plan.log"; then offloaded=yes; else failed=1; fi

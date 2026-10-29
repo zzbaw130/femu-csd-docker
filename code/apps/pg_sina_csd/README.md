@@ -1,10 +1,22 @@
-# pg_sina_csd
+# SQLerate（pg_sina_csd）
 
 这是只读实验用 PostgreSQL 12 扩展。Guest 中的 PG 负责解析 SQL、规划和调用 SNIA；容器中编译的设备 SO 由 FEMU CU 执行扫描、表达式、连接、聚合和排序。原始 Heap 和中间结果不传回 Guest 执行器，只有最终结果转换为 PG Datum。
 
 ## 计划从哪里来
 
-`pg_sina_csd.exe_path=host` 使用原生 PG。设置为 `csd` 后，扩展先进行保证语义的相关子查询去关联，再让 PG 正常选择计划，最后将它选中的物理 Plan 转换为设备执行树。连接的左右输入和树形结构来自 PG，不再使用扩展原来的贪心连接排序，也没有针对 Q13、Q18 的专用计划。
+`pg_sina_csd.exe_path` 提供五种执行模式：
+
+| 模式 | 执行位置 | HPCP |
+| --- | --- | --- |
+| `host-only` | 原生 PG | 关闭 |
+| `filter-only` | 支持的基表扫描及过滤在 CSD，其余在 PG | 关闭 |
+| `csd-without-hpcp` | 尽可能完整卸载，未支持的节点在 PG | 关闭 |
+| `csd-with-hpcp` | 同上 | 开启 |
+| `SQLerate` | 对 PG 选中的树自底向上比较 HOST/CSD 成本，选择可执行的混合计划 | CSD 子树开启 |
+
+HPCP 全称 **Host Page Cache Population（主机页缓存填充）**。它把设备读入的数据填充到 Guest 文件页缓存；两种 CSD 模式目前都从内部 NVM 读入 FDM，不会因为命中主机缓存就默认上传。SQLerate 会考虑缓存驻留对 HOST 成本的影响。成本公式、参数及当前执行边界见 [规划说明](doc/planning.md)。
+
+非 `host-only` 模式保留 PG 选定的连接顺序。完整卸载和 SQLerate 在规划前进行已支持的安全子查询去关联；`filter-only` 保留原 SQL，仅转换支持的扫描叶节点，不卸载 Join、Aggregate 或 Sort。
 
 转换会删除下游不需要的物理扫描输出列，并同步调整 Sort、Aggregate 的列位置。PG 的部分/最终聚合合并为设备端的一次聚合；SUM/AVG/COUNT/MIN/MAX 可共同使用有界 Hash Aggregate，支持多键、字符串和聚合参数表达式，输入可来自扫描或连接；各聚合分别保存值/count（SUM/AVG 保存和，MIN/MAX 保存极值），超限时归并这些部分状态；分组键数加两倍聚合数超过现有16列中间行容量时，保留原排序聚合。原计划利用分组排序提供 ORDER BY 时，将该排序移至聚合后，按聚合输出列的位置保留顺序；符合条件的 PG HashAggregate 保留 Hash 算法。Gather 不再启动 Guest worker，扫描内存预留使用 PG 的全表过滤后行数估计，避免把单 worker 的估计误作总量。参数化 B-tree Nested Loop 在原位置转换为设备 Index Join；其他等值连接使用 Hash Join 或 Merge Join。INNER Hash build 扩容失败时，保留已经消费的输入，按键分区落盘并继续 Hash；构建侧结束、子节点释放空间后，若实际行数对应的表能驻留，则直接多 CU 扫描 Probe 侧，否则共享当前分区的表并动态领取 Probe 临时块；其他形态保留外部归并，不重新扫描 Heap。每个 CU 的重入 spill 使用独立的 64 KiB AFDM，AFDM 总预算不增加。
 
@@ -57,17 +69,17 @@ SELECT sina_csd.prepare(c.oid)
 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 WHERE n.nspname='public' AND c.relkind='r';
 LOAD 'pg_sina_csd';
-SET pg_sina_csd.exe_path=csd;
+SET pg_sina_csd.exe_path='SQLerate';
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT count(*) FROM lineitem;
 ```
 
 `prepare` 由 PG superuser 调用，检查 visible/frozen、schema、relfilenode、Heap/索引文件和 FIEMAP，将 extent 转换为 namespace LBA。支持跨 1 GiB 文件段和数据分区起始偏移；准备结果存入 `sina_csd.relations/columns/indexes/extents`。期间没有写请求，不需要守护会话。重启 FEMU/容器、重新加载数据库文件、REINDEX 或文件布局变化后必须重新准备，不能继续使用旧映射。
 
-回填实验需先加载 Guest 内核模块并配置 `/dev/femu-cache` 权限，见 [femu-cache](../femu-cache/README.md)。在 PG 服务进程环境设置 `SNIA_FEMU_CACHE_REFILL=1` 后，扩展读取已有 extent 时直接注册表/索引文件，查询上下文结束或出错时关闭注册；默认关闭，不改变公开 SNIA API，也不启动额外进程。显式 LOAD 和 CSF 内部 namespace 基表读均覆盖回填，隐藏 spill 换入除外。此功能只将数据填入 Guest 文件页缓存，尚不包含缓存数据自动回送 FDM。
+HPCP 实验需先加载 Guest 内核模块并配置 `/dev/femu-cache` 权限，见 [HPCP 组件说明](../femu-cache/README.md)。PG 通过执行模式控制开关，不再要求在服务环境手工配置。普通 SNIA 应用仍可用 `SNIA_FEMU_HPCP=1`。扩展按预备 extent 注册表/索引文件，查询上下文结束或出错时关闭注册。显式 LOAD 和 CSF 内部 namespace 基表读都支持 HPCP，隐藏 spill 换入除外；不启动额外进程。
 
 ## 访问路径和内存
 
-查询不持有 namespace 执行锁。每个 PG 后端使用独立的 CSF 程序编号段（原编号加 `BackendId * 16`），AFDM 和算子状态按执行独立分配、释放，避免不同连接覆盖彼此的程序和缓冲区。FEMU 的程序编号为 16 位，当前分段支持 BackendId 1–4064；并发请求仍受设备实际 AFDM/workmem 总容量约束，分配失败会返回错误，不会把整条查询串行化等待。
+查询不持有 namespace 执行锁。每个 PG 后端使用独立的 CSF 程序编号段（原编号加 `BackendId * 16`）；同时存活的通用执行子树分别借用 500–510 中的编号，511 用于资源探测。AFDM 和算子状态按执行独立分配、释放，避免不同连接覆盖彼此的程序和缓冲区。FEMU 的程序编号为 16 位，当前分段支持 BackendId 1–4064；并发请求仍受设备实际 AFDM/workmem 总容量约束，分配失败会返回错误，不会把整条查询串行化等待。
 
 Heap 扫描从页内行指针直接取得各 tuple 的起点，不依赖前一个 tuple 的长度。读取块分配给不同 CU 并行解码；CU 内每批最多收集 64 个 tuple，按列定位字段、转换并连续写入列向量，参考 pg_duckdb 的批量 tuple 转换方式。变长字段之后的偏移仍依赖同一 tuple 的前置字段，各 tuple 各自保存偏移；这不表示 Heap 解码已全部使用 SIMD，也不在 CSF 内另起线程。
 
@@ -77,7 +89,7 @@ Heap 扫描从页内行指针直接取得各 tuple 的起点，不依赖前一�
 
 ```sql
 SET pg_sina_csd.max_memory=0;      -- 默认值，自动使用设备 workmem 总容量
--- SET pg_sina_csd.max_memory='16MB'; -- 可选：进一步缩小查询预算，非零值最低 4MB
+-- SET pg_sina_csd.max_memory='64MB'; -- 可选：进一步限制预算，实验至少使用 64MiB
 SET pg_sina_csd.profile=on;       -- 开发时开启，默认 off
 ```
 

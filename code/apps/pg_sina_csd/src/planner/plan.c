@@ -1126,7 +1126,7 @@ static Node *device_output_expression(Node *node,void *context)
     return expression_tree_mutator(node,device_output_expression,context);
 }
 
-Plan *pg_sina_rewrite_plan(PlannerInfo *root,Plan *native)
+Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
 {
     struct qp_plan *tree=palloc0(sizeof(*tree));
     for(unsigned i=0;i<QP_PARAMS;++i) tree->param_nodes[i]=tree->cte_nodes[i]=-1;
@@ -1143,7 +1143,10 @@ Plan *pg_sina_rewrite_plan(PlannerInfo *root,Plan *native)
         tree->param_nodes[param]=id; tree->nparams=Max(tree->nparams,(unsigned)param+1);
         unsigned init=tree->ninit++; tree->init_nodes[init]=id; tree->init_params[init]=param;
     }
-    int result=compile_tree(root,native,tree);
+    Plan *copy=copyObject(native);
+    int result=-1;
+    if(normalize_parallel_aggregate(&copy) && prune_columns(copy,NULL,true))
+        result=compile_node(root,copy,tree,boundary || root->parse->sortClause!=NIL);
     if(result<0) { pfree(tree); return native; }
     bool has_scan=false;
     for(unsigned i=0;i<tree->count;++i) {
@@ -1167,7 +1170,6 @@ Plan *pg_sina_rewrite_plan(PlannerInfo *root,Plan *native)
     }
     SPI_finish();
     if(!prepared) { pfree(tree); return native; }
-    root->init_plans=NIL; /* Scalar and CTE initializers now run on the device. */
     tree->root=result;
     pg_sina_read_resources(device);
     tree->nodes[result].expr.work_mem_bytes=pg_sina_query_memory();
@@ -1183,6 +1185,8 @@ Plan *pg_sina_rewrite_plan(PlannerInfo *root,Plan *native)
     scan->methods=&pg_sina_plan_methods;
     return (Plan *)scan;
 }
+Plan *pg_sina_rewrite_plan(PlannerInfo *root,Plan *native)
+{ return pg_sina_compile_subtree(root,native,false); }
 
 /* Planner-only wrapper, removed after setrefs if conversion is rejected. */
 static const CustomScanMethods native_methods={.CustomName="SniaNativePlan"};
@@ -1204,14 +1208,26 @@ static Plan *rewrite_selected(PlannerInfo *root,RelOptInfo *rel,CustomPath *path
     pg_sina_compiling_plan=true;
     PG_TRY();
     {
-        compiled=pg_sina_fast_plan(root,native);
-        if(!compiled) compiled=pg_sina_rewrite_plan(root,native);
+        if(pg_sina_exe_path==PG_SINA_FILTER || pg_sina_exe_path==PG_SINA_ADAPTIVE)
+            compiled=pg_sina_adaptive_plan(root,native);
+        else {
+            compiled=pg_sina_fast_plan(root,native);
+            if(!compiled) compiled=pg_sina_rewrite_plan(root,native);
+            if(compiled==native) compiled=pg_sina_adaptive_plan(root,native);
+            if(compiled!=native) root->init_plans=NIL;
+        }
     }
     PG_CATCH();
     { pg_sina_compiling_plan=false; PG_RE_THROW(); }
     PG_END_TRY();
     pg_sina_compiling_plan=false;
-    if(compiled!=native) return compiled;
+    if(compiled!=native) {
+        if(pg_sina_exe_path==PG_SINA_ADAPTIVE) {
+            path->path.startup_cost=compiled->startup_cost;
+            path->path.total_cost=compiled->total_cost;
+        }
+        return compiled;
+    }
     CustomScan *fallback=makeNode(CustomScan);
     fallback->scan.plan.targetlist=tlist;
     fallback->custom_scan_tlist=copyObject(native->targetlist);
@@ -1223,7 +1239,7 @@ static const CustomPathMethods selected_methods={.CustomName="SniaSelectedPlan",
 void pg_sina_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *input,RelOptInfo *output,void *extra)
 {
     Query *q=root->parse;
-    if(pg_sina_exe_path!=1 || root->parent_root || stage!=UPPERREL_FINAL || q->commandType!=CMD_SELECT ||
+    if(pg_sina_exe_path==PG_SINA_HOST || root->parent_root || stage!=UPPERREL_FINAL || q->commandType!=CMD_SELECT ||
        q->hasRowSecurity || q->hasTargetSRFs || q->rowMarks || q->windowClause || q->groupingSets ||
        q->setOperations || root->append_rel_list) return;
     Path *selected=NULL; ListCell *c;

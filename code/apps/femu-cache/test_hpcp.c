@@ -1,4 +1,4 @@
-/* Guest-only test: extent LOAD -> read-only Filter, with optional cache refill. */
+/* Guest-only test: extent LOAD -> read-only Filter, with optional Host Page Cache Population. */
 #include "cs.h"
 #include "csd-cache.h"
 #include <linux/fs.h>
@@ -181,11 +181,11 @@ done:
 }
 int main(int argc,char **argv)
 {
-    if(argc!=4) { fprintf(stderr,"usage: %s data-file repetitions refill[0|1]\n",argv[0]); return 2; }
-    unsigned repetitions=strtoul(argv[2],NULL,10); int refill=atoi(argv[3]);
-    profile=getenv("FEMU_CACHE_PROFILE") && !strcmp(getenv("FEMU_CACHE_PROFILE"),"1");
+    if(argc!=4) { fprintf(stderr,"usage: %s data-file repetitions hpcp[0|1]\n",argv[0]); return 2; }
+    unsigned repetitions=strtoul(argv[2],NULL,10); int hpcp=atoi(argv[3]);
+    profile=getenv("FEMU_HPCP_PROFILE") && !strcmp(getenv("FEMU_HPCP_PROFILE"),"1");
     if(!repetitions) return 2;
-    setenv("SNIA_FEMU_CACHE_REFILL",refill?"1":"0",1);
+    setenv("SNIA_FEMU_HPCP",hpcp?"1":"0",1);
     int fd=open(argv[1],O_RDWR|O_CREAT,0600); if(fd<0) { perror("open"); return 1; }
     uint32_t *buffer=malloc(CHUNK); uint64_t expected_sum=0,expected_count=0;
     for(unsigned b=0;b<FILE_BYTES/CHUNK;b++) {
@@ -204,7 +204,7 @@ int main(int argc,char **argv)
     int module=open("/dev/femu-cache",O_RDWR);
     if(module<0) { perror("femu-cache"); return 1; }
     if(ioctl(module,FEMU_CACHE_CLEAR)) { perror("CLEAR"); return 1; }
-    if(refill) for(unsigned i=0;i<map->fm_mapped_extents;i++) {
+    if(hpcp) for(unsigned i=0;i<map->fm_mapped_extents;i++) {
         struct fiemap_extent *extent=&map->fm_extents[i];
         struct femu_cache_mapping range={.fd=fd,.nsid=nsid,.lba_bytes=partition*lba+extent->fe_physical,
             .file_offset=extent->fe_logical,.bytes=extent->fe_length};
@@ -232,7 +232,7 @@ int main(int argc,char **argv)
      * the existing diagnostic endpoint outside wall_ms before cache checks. */
     uint64_t query_end=(uint64_t)end.tv_sec*1000000000+end.tv_nsec;
     unload_program(dev,&program); csCloseCSx(dev);
-    if(refill) {
+    if(hpcp) {
         FILE *diagnostic=fopen("/sys/kernel/debug/femu-cache/profile","r");
         if(!diagnostic) { perror("cache drain"); error=1; }
         else {
@@ -248,9 +248,9 @@ int main(int argc,char **argv)
     /* Refill is best effort: spare FDM may run out, so partial residency is
      * valid. The full-file byte comparison below still detects stale pages. */
     if(sum!=expected_sum || count!=expected_count || cold ||
-       (refill && !resident) || (!refill && resident)) error=1;
-    printf("refill=%d repetitions=%u bytes=%u lanes=%u chunk=%u cold_pages=%u resident_pages=%u sum=%llu count=%llu correct=%s wall_ms=%.3f cache_drain_ms=%.3f\n",
-        refill,repetitions,FILE_BYTES,LANES,CHUNK,cold,resident,(unsigned long long)sum,(unsigned long long)count,error?"no":"yes",
+       (hpcp && !resident) || (!hpcp && resident)) error=1;
+    printf("hpcp=%d repetitions=%u bytes=%u lanes=%u chunk=%u cold_pages=%u resident_pages=%u sum=%llu count=%llu correct=%s wall_ms=%.3f cache_drain_ms=%.3f\n",
+        hpcp,repetitions,FILE_BYTES,LANES,CHUNK,cold,resident,(unsigned long long)sum,(unsigned long long)count,error?"no":"yes",
         (end.tv_sec-begin.tv_sec)*1000.+(end.tv_nsec-begin.tv_nsec)/1e6,cache_drain_ms);
     if(profile) {
         printf("CACHE_APP_RUN begin=%llu end=%llu\n",

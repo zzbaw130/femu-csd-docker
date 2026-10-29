@@ -107,7 +107,7 @@ int main(int argc,char **argv)
     unsigned count=strtoul(argv[3],NULL,10),rounds=strtoul(argv[4],NULL,10);
     if(!chunk || chunk>4*1024*1024 || chunk%4096 || FILE_BYTES%chunk ||
        !count || count>8 || !rounds) return 2;
-    setenv("SNIA_FEMU_CACHE_REFILL","0",1);
+    setenv("SNIA_FEMU_HPCP","0",1);
     setenv("SNIA_FEMU_PROFILE","0",1);
     int fd=open(argv[1],O_RDWR|O_CREAT,0600);
     struct stat st;

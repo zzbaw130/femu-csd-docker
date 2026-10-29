@@ -22,11 +22,10 @@ static void close_cache_registration(void *arg)
 }
 static void register_cache(const struct qs_request *request,const struct qs_extent *extents)
 {
-    const char *enabled=getenv("SNIA_FEMU_CACHE_REFILL");
-    if(!enabled || strcmp(enabled,"1") || !request->nextents) return;
+    if(!pg_sina_hpcp_enabled() || !request->nextents) return;
     struct cache_registration *r=palloc0(sizeof(*r));
     r->fd=open("/dev/femu-cache",O_RDWR|O_CLOEXEC);
-    if(r->fd<0) ereport(ERROR,(errmsg("cannot open cache refill device: %m")));
+    if(r->fd<0) ereport(ERROR,(errmsg("cannot open HPCP device: %m")));
     r->cleanup=(MemoryContextCallback){.func=close_cache_registration,.arg=r};
     MemoryContextRegisterResetCallback(CurrentMemoryContext,&r->cleanup);
     Relation relation=relation_open(request->plan.relid,AccessShareLock);
@@ -40,14 +39,14 @@ static void register_cache(const struct qs_request *request,const struct qs_exte
             if(input>=0) CloseTransientFile(input);
             char *path=segment?psprintf("%s.%llu",base,(unsigned long long)segment):base;
             input=OpenTransientFile(path,O_RDONLY|PG_BINARY);
-            if(input<0) ereport(ERROR,(errmsg("cannot open relation for cache refill: %m")));
+            if(input<0) ereport(ERROR,(errmsg("cannot open relation for HPCP: %m")));
             if(segment) pfree(path);
             previous=segment;
         }
         struct femu_cache_mapping mapping={.fd=input,.nsid=request->nsid,
             .lba_bytes=e->lba*request->lba_bytes,.file_offset=e->logical%segment_bytes,.bytes=e->bytes};
         if(ioctl(r->fd,FEMU_CACHE_REGISTER,&mapping))
-            ereport(ERROR,(errmsg("cannot register relation cache refill: %m")));
+            ereport(ERROR,(errmsg("cannot register relation HPCP: %m")));
     }
     if(input>=0) CloseTransientFile(input);
     pfree(base); relation_close(relation,AccessShareLock);

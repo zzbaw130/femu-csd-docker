@@ -51,9 +51,9 @@ static void *receive_cache(void *opaque)
     }
     return NULL;
 }
-CS_STATUS femu_cache_start(struct cs_device *d)
+CS_STATUS femu_hpcp_start(struct cs_device *d)
 {
-    const char *enabled=getenv("SNIA_FEMU_CACHE_REFILL");
+    const char *enabled=getenv("SNIA_FEMU_HPCP");
     if(d->cache || !enabled || strcmp(enabled,"1")) return CS_SUCCESS;
     struct cs_cache_receiver *r=calloc(1,sizeof(*r));
     if(!r) return CS_OUT_OF_RESOURCES;
@@ -76,7 +76,7 @@ fail:
     if(r->fd>=0) close(r->fd);
     free(r); return CS_DEVICE_NOT_AVAILABLE;
 }
-void femu_cache_stop(struct cs_device *d)
+void femu_hpcp_stop(struct cs_device *d)
 {
     struct cs_cache_receiver *r=d->cache;
     if(!r) return;

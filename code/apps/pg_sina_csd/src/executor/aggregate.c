@@ -150,6 +150,7 @@ static void explain_profile(const struct qs_profile *p,ExplainState *es)
 static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
 {
     SniaState *s=(SniaState *)node; const struct qs_plan *p=&s->request.plan;
+    pg_sina_explain_placement((CustomScan *)node->ss.ps.plan,es);
     ExplainPropertyText("Execution Path","csd",es);
     ExplainPropertyInteger("CSD Device CUs",NULL,pg_sina_resources.cus,es);
     ExplainPropertyInteger("CSD Device FDM","bytes",pg_sina_resources.fdm_bytes,es);

@@ -72,6 +72,9 @@ struct PlanStateCsd {
     MemoryContextCallback cleanup;
 };
 static const CustomExecMethods methods;
+/* Mixed plans can keep several device streams open at once. Each program
+ * retains its own device-global ID until EOF/rescan/error cleanup. */
+static bool program_slots[11];
 static uint64_t clock_ns(void)
 { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000ULL+t.tv_nsec; }
 static CS_STATUS queue_scan(struct plan_slot *slot);
@@ -181,6 +184,10 @@ static void close_state(void *arg)
         CsCSFDownloadInfo d={.CSEEId=1,.Index=s->program_index,.common.Unload=1}; u32 id;
         csCSFDownload(s->device,&d,&id); s->loaded=false;
     }
+    if(s->program_index) {
+        program_slots[s->program_index-pg_sina_program_index(500)]=false;
+        s->program_index=0;
+    }
     if(s->device) { csCloseCSx(s->device); s->device=NULL; }
     if(s->profiling) s->cleanup_ns+=clock_ns()-started;
     RESUME_INTERRUPTS();
@@ -276,7 +283,10 @@ static void start(PlanStateCsd *s)
     s->setup_ns=s->cleanup_ns=0;
     memset(s->plan->pipelines,0,sizeof(s->plan->pipelines));
     s->plan->nodes[s->plan->root].expr.work_mem_bytes=pg_sina_query_memory();
-    s->program_index=pg_sina_program_index(510);
+    for(unsigned i=0;i<lengthof(program_slots);++i) if(!program_slots[i]) {
+        program_slots[i]=true; s->program_index=pg_sina_program_index(500+i); break;
+    }
+    if(!s->program_index) elog(ERROR,"too many simultaneously active CSD subtrees");
     checked(csOpenCSx(device,NULL,&s->device),"open");
     unsigned entries,data;
     qp_dictionary_size(s->plan,&entries,&data);
@@ -328,13 +338,14 @@ static void start(PlanStateCsd *s)
         checked(transfer(s->memory[1],(w+1)*sizeof(struct qp_control),&s->slots[w+1].control,sizeof(struct qp_control),true),"initialize worker control");
     char descriptor[]="pg-sina-plan.so\0pg_sina_plan";
     CsCSFDownloadInfo download={.Type=CS_CSF_VENDOR_SPECIFIC,.SubType=CS_SUBTYPE_VENDOR_SPECIFIC,.CSEEId=1,.Index=s->program_index};
-    strcpy(download.common.UniqueName,"pg-sina-plan"); download.common.DataBuffer=descriptor; download.common.Length=sizeof(descriptor);
+    snprintf(download.common.UniqueName,sizeof(download.common.UniqueName),"pg-sina-plan-%u",s->program_index);
+    download.common.DataBuffer=descriptor; download.common.Length=sizeof(descriptor);
     u32 id; checked(csCSFDownload(s->device,&download,&id),"download"); s->loaded=true;
     CsConfigInfo config={.Type=CS_CSF_ACTIVATE,.u.CSFActivateInfo={.CSFId=s->program_index,.EEIId=1,.State=CS_ACTIVE_STATE}};
     CsConfigData result; int length=sizeof(result); checked(csConfig(s->device,&length,&config,&result),"activate"); s->active=true;
-    length=0; int count=0; CS_STATUS status=csGetCSFId(s->device,"pg-sina-plan",0,&length,&count,NULL);
+    length=0; int count=0; CS_STATUS status=csGetCSFId(s->device,download.common.UniqueName,0,&length,&count,NULL);
     if(status!=CS_LENGTH_RETURNED) checked(status,"lookup function length");
-    CSFIdInfo *functions=palloc(length); checked(csGetCSFId(s->device,"pg-sina-plan",0,&length,&count,functions),"lookup function");
+    CSFIdInfo *functions=palloc(length); checked(csGetCSFId(s->device,download.common.UniqueName,0,&length,&count,functions),"lookup function");
     s->function=functions[0].CSFId; pfree(functions);
     size_t size=sizeof(CsBatchRequest)+6*sizeof(CsComputeArg); CsBatchRequest *request=palloc0(size);
     request->ReqType=CS_QUEUE_COMPUTE; request->u.Compute.CSFId=s->function; request->u.Compute.NumArgs=6;
@@ -747,6 +758,7 @@ static void rescan(CustomScanState *node)
 static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
 {
     PlanStateCsd *s=(void *)node;
+    pg_sina_explain_placement((CustomScan *)node->ss.ps.plan,es);
     ExplainPropertyText("Execution Path","csd",es);
     ExplainPropertyInteger("CSD Device CUs",NULL,pg_sina_resources.cus,es);
     ExplainPropertyInteger("CSD Device FDM","bytes",pg_sina_resources.fdm_bytes,es);

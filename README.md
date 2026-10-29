@@ -1,6 +1,5 @@
-> 当前 `pg_sina_csd_dev` 从 `sina-femu-csd` 标签开始开发
-> [pg_sina_csd 扩展](code/apps/pg_sina_csd/README.md)，通过 SNIA 调用设备算子。
-> 当前已实现冻结 heap 映射、host/csd 路径选择及 Q1/Q3/Q4/Q5/Q6/Q7/Q8/Q9/Q10/Q12/Q13/Q14/Q19 完整数据算子卸载；TPC-H 测试统一冷启动。
+> `hpcp-dev` 保存已验证的 Host Page Cache Population（HPCP，主机页缓存填充）基线。
+> `adaptive-exec-path` 开发 SQLerate 的节点级 HOST/CSD 规划；使用方式见 [扩展说明](code/apps/pg_sina_csd/README.md)。
 
 > `snia_csd_dev` 分支基于 `femu-csd-with-original-postgre` tag，新增独立的
 > [Computational Storage API 库](code/apps/snia/README.md)。Guest 应用包含
