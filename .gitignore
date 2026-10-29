@@ -9,6 +9,7 @@
 # data
 /data/**
 !/data/tpch_s0.01.tar
+/paper
 
 # code
 /code/pg_duckdb/

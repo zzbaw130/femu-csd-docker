@@ -1,6 +1,6 @@
 #include "./nvme.h"
 #include "nvme-pi.h"
-#include "csd/csd-cache.h"
+#include "csd/csd.h"
 
 static int64_t nvme_io_clock(FemuCtrl *n)
 {
@@ -294,8 +294,7 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
         req->defer = NULL;
         /* Coperd: record req->stime at earliest convenience */
         req->expire_time = req->stime = nvme_io_clock(n);
-        req->cache_timing.enter = req->cache_timing.copy_end = 0;
-        req->cache_timing.link_begin = req->cache_timing.link_end = 0;
+        req->link_timing.begin = req->link_timing.end = 0;
         req->t_handoff = 0;
         req->t_return = 0;
         req->cqe.cid = cmd.cid;
@@ -419,15 +418,6 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
                 }
                 QTAILQ_INSERT_TAIL(&sq->req_list, req, entry);
             }
-        } else if (req->ns && NS_CSD(req->ns) &&
-                   cmd.opcode == FEMU_CACHE_READ && !n->fw_enabled) {
-            /* FDM was already copied: no media work belongs on the FTL.
-             * Use this poller's own heap (not the FTL-owned producer ring),
-             * retaining the normal CQ-full backlog and interrupt handling. */
-            req->expire_time = MAX(req->expire_time, nvme_io_clock(n));
-            req->reqlat = 0;
-            req->t_handoff = req->t_return = req->expire_time;
-            pqueue_insert(n->pq[index_poller], req);
         } else if (req->defer) {
             req->defer(n, req, index_poller);
         } else {
@@ -490,23 +480,6 @@ static void nvme_post_cqe(NvmeCQueue *cq, NvmeRequest *req)
 
     nvme_write_cqe(n, cq, cqe);
     nvme_inc_cq_tail(cq);
-    if (cq->cqid && req->cmd_opcode == FEMU_CACHE_READ &&
-        req->cache_timing.enter && req->cache_timing.copy_end) {
-        uint64_t posted = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-        uint64_t token = le32_to_cpu(req->cmd.cdw10) |
-                         ((uint64_t)le32_to_cpu(req->cmd.cdw11) << 32);
-        fprintf(stderr, "CACHE_READ token=%" PRIu64 " offset=%u bytes=%u"
-            " seen=%" PRId64 " enter=%" PRIu64 " locked=%" PRIu64
-            " copy_begin=%" PRIu64 " copy_end=%" PRIu64
-            " update_locked=%" PRIu64 " ready=%" PRIu64 " link_begin=%" PRIu64
-            " link_end=%" PRIu64 " posted=%" PRIu64 "\n",
-            token, le32_to_cpu(req->cmd.cdw12), le32_to_cpu(req->cmd.cdw13),
-            req->stime, req->cache_timing.enter, req->cache_timing.locked,
-            req->cache_timing.copy_begin, req->cache_timing.copy_end,
-            req->cache_timing.update_locked, req->cache_timing.ready,
-            req->cache_timing.link_begin, req->cache_timing.link_end, posted);
-        req->cache_timing.enter = 0;
-    }
 
     /*
      * Nothing to count with coalescing off, on the admin queue, or on a
@@ -654,12 +627,12 @@ static uint64_t nvme_fw_cost(FemuCtrl *n, uint8_t opcode)
 
 /* One shared full-duplex link per controller, independent of poller count.
  * A reservation models transfer time; actual CPU copying is not charged again.
- * F3 reserves before reporting DMA complete; ring-based commands reserve here
- * once their media deadline is known. link_end also prevents double charging. */
+ * Cache push DMA reserves before publishing its completion; normal commands
+ * reserve once their media deadline is known. link_timing avoids double charging. */
 void nvme_charge_link(FemuCtrl *n, NvmeRequest *req)
 {
     uint64_t bytes = req->xfer_bytes;
-    if (!n->pcie_enabled || !req->ns || req->cache_timing.link_end) return;
+    if (!n->pcie_enabled || !req->ns || req->link_timing.end) return;
     if (req->cmd_opcode == NVME_CMD_READ || req->cmd_opcode == NVME_CMD_WRITE) {
         uint8_t lbads = req->ns->id_ns.lbaf[
             NVME_ID_NS_FLBAS_INDEX(req->ns->id_ns.flbas)].lbads;
@@ -673,9 +646,9 @@ void nvme_charge_link(FemuCtrl *n, NvmeRequest *req)
                                     &n->pcie_tx_next_avail_time;
     uint64_t start = MAX(*next, (uint64_t)req->expire_time);
     *next = start + transfer;
-    req->cache_timing.link_begin = start;
-    req->cache_timing.link_end = *next + n->pcie_prop_delay_ns;
-    req->expire_time = req->cache_timing.link_end;
+    req->link_timing.begin = start;
+    req->link_timing.end = *next + n->pcie_prop_delay_ns;
+    req->expire_time = req->link_timing.end;
     pthread_spin_unlock(&n->pcie_lock);
 }
 
@@ -842,6 +815,7 @@ static void nvme_process_cq_cpl(void *arg, int index_poller)
 
 void *nvme_poller(void *arg)
 {
+    femu_bind_device_thread();
     FemuCtrl *n = ((NvmePollerThreadArgument *)arg)->n;
     int index = ((NvmePollerThreadArgument *)arg)->index;
     int i;

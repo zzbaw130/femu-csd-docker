@@ -120,9 +120,11 @@ tests/    ← 9p: 宿主机 tests/guest    （tpch-test.sh + queries/）
 模拟盘的 `femu-data` 分区约占 80%，`femu-spill` 分区约占 20%，后者不格式化、不挂载。
 Guest 需安装 `parted`。首次运行或标签不匹配时会重新分区并格式化数据区，清除原有数据；
 标签匹配时复用已有布局。执行 `./scripts/sh-guest.sh scripts/guest/init-csd-env.sh` 即可。
-脚本先检查 Guest 只有一个虚拟 NUMA 节点。宿主物理绑定在 `run-csd.sh` 启动 QEMU 时执行：
-Compose 默认 `FEMU_NUMA_NODE=0`，约束 Guest RAM、FDM、workmem 和执行线程；
-`FEMU_MBE_INTERLEAVE=1,2,3` 将 RAM-backed NVM 限定到另一组节点，仍保留 NVM 跨节点访问。
+宿主物理绑定在 `run-csd.sh` 启动 QEMU 时执行。当前 Compose 使用 4 CU：
+`FEMU_HOST_CPUS=30-39`、`FEMU_HOST_NODE=3` 放置 Guest vCPU、其他 QEMU 线程及 8GiB Guest RAM；
+`FEMU_DEVICE_CPUS=20-28`、`FEMU_DEVICE_NODE=2` 放置 9 个设备线程和 NVM、FDM、workmem、spill 等设备内存。
+设备线程在入口设置亲和性，不需要启动后查找 PID/TID；容器通过 SYS_NICE 允许设置 NUMA 内存策略。
+Guest 仍只看到一个虚拟 NUMA 节点。更换宿主时应核对物理核、SMT 拓扑和节点容量，再调整上述四项。
 更改这些参数需要先保存易失 SSD 数据，再重建容器。
 后续 SNIA 按 GPT `PARTLABEL=femu-spill` 查找 spill 分区，读取其起始位置和容量；
 分区序号不承担角色含义。SNIA 插件通过内部 D0/D1 处理 spill LOAD/STORE。

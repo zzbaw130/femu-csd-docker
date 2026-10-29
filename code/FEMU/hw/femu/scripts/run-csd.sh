@@ -49,8 +49,8 @@ FEMU_OPTIONS="-device femu"
 FEMU_OPTIONS=${FEMU_OPTIONS}",devsz_mb=${ssd_size}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",namespaces=1"
 FEMU_OPTIONS=${FEMU_OPTIONS}",femu_mode=4"
-# Eight queues, two per poller: four host-side NVMe pollers, independent of CU.
-FEMU_OPTIONS=${FEMU_OPTIONS}",queues=8,multipoller_enabled=1,poller_ratio=2"
+# Eight queues, four per poller: two normal I/O pollers plus two CSD DMA workers.
+FEMU_OPTIONS=${FEMU_OPTIONS}",queues=8,multipoller_enabled=1,poller_ratio=4"
 # Shared per-direction link budget in decimal MB/s (the FEMU property name
 # uses mbps). Internal NVM/FDM copies do not traverse this link.
 FEMU_OPTIONS=${FEMU_OPTIONS}",pcie_bandwidth_mbps=${CSD_PCIE_BANDWIDTH_MBPS:-3500}"
@@ -87,18 +87,19 @@ if [[ ! -e "$OSIMGF" ]]; then
 	exit 1
 fi
 
-# Bind at the host process, so Guest allocations and every CU/poller inherit
-# the same physical-node policy. The large NVM buffer overrides it via mbind.
-echo "NUMA: execution/RAM node=${FEMU_NUMA_NODE:-0}; NVM nodes=${FEMU_MBE_INTERLEAVE:-1,2,3}"
+# Bind thread groups at creation, without finding and repinning Linux TIDs.
+# Default allocations belong to the device; Guest RAM overrides that policy.
 sudo env CSD_WORKMEM_SIZE_MB="${CSD_WORKMEM_SIZE_MB:-64}" \
-    FEMU_MBE_INTERLEAVE="${FEMU_MBE_INTERLEAVE:-1,2,3}" \
-    numactl --cpunodebind="${FEMU_NUMA_NODE:-0}" --membind="${FEMU_NUMA_NODE:-0}" \
+    FEMU_DEVICE_CPUS="${FEMU_DEVICE_CPUS}" \
+    numactl --physcpubind="${FEMU_HOST_CPUS}" --membind="${FEMU_DEVICE_NODE}" \
     ./qemu-system-x86_64 \
     -name "FEMU-CSD-VM",debug-threads=on \
     -enable-kvm \
     -cpu host \
     -smp ${FEMU_SMP} \
     -m ${FEMU_MEM} \
+    -object memory-backend-ram,id=guest-ram,size=${FEMU_MEM},host-nodes=${FEMU_HOST_NODE},policy=bind,prealloc=on \
+    -numa node,memdev=guest-ram \
     -device virtio-scsi-pci,id=scsi0 \
     -device scsi-hd,drive=hd0 \
     -drive file=$OSIMGF,if=none,aio=native,cache=none,format=qcow2,id=hd0 \

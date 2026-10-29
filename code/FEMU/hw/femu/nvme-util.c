@@ -1,4 +1,32 @@
 #include "./nvme.h"
+#include "csd/csd.h"
+#ifdef CONFIG_NUMA
+#include <numa.h>
+#endif
+
+/* Device workers override the Guest CPU affinity inherited at QEMU startup.
+ * Memory stays on the device node selected by the launcher's membind policy;
+ * Guest RAM has its own QEMU memory-backend policy. */
+void femu_bind_device_thread(void)
+{
+    const char *cpus = getenv("FEMU_DEVICE_CPUS");
+
+    if (!cpus || !*cpus) {
+        return;
+    }
+#ifdef CONFIG_NUMA
+    struct bitmask *mask = numa_parse_cpustring_all(cpus);
+    if (!mask || numa_sched_setaffinity(0, mask)) {
+        femu_err("cannot bind device thread to CPUs %s: %s\n",
+                 cpus, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    numa_bitmask_free(mask);
+#else
+    femu_err("FEMU_DEVICE_CPUS requires a NUMA-enabled QEMU build\n");
+    exit(EXIT_FAILURE);
+#endif
+}
 
 /*
  * Deallocation-state tracking (TRIM / Write Zeroes Deallocate / DULBE).
@@ -145,6 +173,7 @@ static bool nvme_pause_controller(FemuCtrl *n)
             usleep(100);
         }
     } while (busy);
+    femu_csd_cache_quiesce(n);
 
     return was_started;
 }

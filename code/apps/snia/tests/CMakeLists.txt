@@ -52,3 +52,6 @@ if(EXISTS "${PROJECT_SOURCE_DIR}/../../FEMU/hw/femu/csd/csd-graph.h")
     add_test(NAME csFemuGraphWireAgreement COMMAND ${CMAKE_COMMAND} -E compare_files
         "${FEMU_DIR}/include/csd-graph.h" "${PROJECT_SOURCE_DIR}/../../FEMU/hw/femu/csd/csd-graph.h")
 endif()
+
+add_test(NAME csFemuCacheGuestWireAgreement COMMAND ${CMAKE_COMMAND} -E compare_files
+    "${FEMU_DIR}/include/csd-cache.h" "${PROJECT_SOURCE_DIR}/../femu-cache/csd-cache.h")

@@ -1710,11 +1710,8 @@ typedef struct NvmeRequest {
     /* io_stages: when the poller handed it to the FTL ring, and got it back */
     int64_t                 t_handoff;
     int64_t                 t_return;
-    /* Optional F3 diagnostics, enabled by the existing Guest profile switch. */
-    struct {
-        uint64_t enter, locked, copy_begin, copy_end, update_locked, ready;
-        uint64_t link_begin, link_end;
-    } cache_timing;
+    /* Shared PCIe link reservation, also used by autonomous cache DMA. */
+    struct { uint64_t begin,end; } link_timing;
     int64_t                 reqlat;
     int64_t                 gcrt;
     int64_t                 expire_time;
@@ -2422,7 +2419,6 @@ typedef struct FemuCtrl {
     QEMUBH          *aer_bh;
     QEMUTimer       *aer_timer;
     uint8_t         aer_mask;
-    unsigned        cache_aer_ack;
 
 	uint64_t		dbs_addr;
 	uint64_t		eis_addr;
@@ -2768,6 +2764,7 @@ static inline bool CSD(FemuCtrl *n)
 }
 
 /* Deallocation-state tracking (TRIM / Write Zeroes / DULBE) from nvme-util.c */
+void femu_bind_device_thread(void);
 void nvme_mark_written(NvmeNamespace *ns, uint64_t slba, uint32_t nlb);
 void nvme_deallocate_range(FemuCtrl *n, NvmeNamespace *ns, uint64_t slba,
                            uint32_t nlb);

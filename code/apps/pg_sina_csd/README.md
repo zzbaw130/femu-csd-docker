@@ -63,7 +63,7 @@ EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT count(*) FROM lineitem;
 
 `prepare` 由 PG superuser 调用，检查 visible/frozen、schema、relfilenode、Heap/索引文件和 FIEMAP，将 extent 转换为 namespace LBA。支持跨 1 GiB 文件段和数据分区起始偏移；准备结果存入 `sina_csd.relations/columns/indexes/extents`。期间没有写请求，不需要守护会话。重启 FEMU/容器、重新加载数据库文件、REINDEX 或文件布局变化后必须重新准备，不能继续使用旧映射。
 
-回填实验需先加载 Guest 内核模块并配置 `/dev/femu-cache` 权限，见 [femu-cache](../femu-cache/README.md)。在 PG 服务进程环境设置 `SNIA_FEMU_CACHE_REFILL=1` 后，扩展读取已有 extent 时直接注册表/索引文件，查询上下文结束或出错时关闭注册；默认关闭，不改变公开 SNIA API，也不启动额外进程。回填目前只覆盖显式 LOAD，CSF 内部发起的基表读尚未覆盖，因此测试必须同时报告实际回填字节和路径缺口。此功能只将数据填入 Guest 文件页缓存，尚不包含缓存数据自动回送 FDM。
+回填实验需先加载 Guest 内核模块并配置 `/dev/femu-cache` 权限，见 [femu-cache](../femu-cache/README.md)。在 PG 服务进程环境设置 `SNIA_FEMU_CACHE_REFILL=1` 后，扩展读取已有 extent 时直接注册表/索引文件，查询上下文结束或出错时关闭注册；默认关闭，不改变公开 SNIA API，也不启动额外进程。显式 LOAD 和 CSF 内部 namespace 基表读均覆盖回填，隐藏 spill 换入除外。此功能只将数据填入 Guest 文件页缓存，尚不包含缓存数据自动回送 FDM。
 
 ## 访问路径和内存
 
@@ -138,4 +138,4 @@ sh /home/femu/tests/tpch-test.sh 7 9 13
 
 `CSD Callback Requeue Average/Maximum` 是 callback 收到完成到提交下一块的间隔，包含请求重配；`CSD PG Scan Requeue Average/Maximum` 是返回 PG 的扫描请求完成到 PG 再提交下一块的间隔，可能包含等待下游消费输出或阶段协调，不能全算调度开销。`CSD Callback Completed Requests Sum` 是自动续交之前各请求从提交到完成的累计时间，已包含在 Pending Requests Sum 中。`CSD Shared Sink Waits/Wait` 仅记录共享 Sink 有未消费输出时等待其他 worker 排空的次数和时间，不包含最终 EOF 等待或协调任务自身执行。
 
-设备入口见 [设备算子说明](../../csd-programs/pg_sina_csd/README.md)。新验收结果见 [性能记录](doc/performance.md)，旧记录仅为历史，不作为当前验收依据。
+设备入口见 [设备算子说明](../../csd-programs/pg_sina_csd/README.md)。性能测量只使用正式 SQL 和当前环境，运行结果保存在仓库 results 目录；不将历史开发轮次当作当前验收结论。

@@ -20,6 +20,7 @@ struct cs_device {
     struct cs_graph_request *graphs;
     struct cs_graph_scope *graph_scopes;
     uint32_t graph_session;
+    struct cs_cache_receiver *cache;
     uint64_t next_graph;
     char path[4096];
     struct { uint32_t workers; uint64_t fdm_bytes, features; } caps;
@@ -44,6 +45,8 @@ CS_STATUS cs_io(struct cs_device *, bool, struct nvme_passthru_cmd *);
 CS_STATUS cs_io64(struct cs_device *, bool, struct nvme_passthru_cmd64 *);
 int cs_profile_load(struct cs_device *, const char *);
 void femu_graph_close(struct cs_device *);
+CS_STATUS femu_cache_start(struct cs_device *);
+void femu_cache_stop(struct cs_device *);
 CS_STATUS femu_queueBatchRequest(void *,CS_BATCH_MODE,unsigned,const struct cs_backend_batch_entry *,bool (*)(void *),void *,u64 *);
 CS_STATUS femu_abortBatchRequest(void *,void *);
 void femu_finishBatchExecution(void *,void *,bool);

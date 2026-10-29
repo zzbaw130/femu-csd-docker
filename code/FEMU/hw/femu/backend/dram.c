@@ -1,61 +1,6 @@
-#include <sys/syscall.h>
 #include "../nvme.h"
 
 /* Coperd: FEMU Memory Backend (mbe) for emulated SSD */
-
-/* FEMU_MBE_INTERLEAVE is a comma-separated allowed node set. Bind the NVM
- * buffer to that set independently of the process policy.
- * Legacy "on" still means nodes 0,1. Unset preserves the process policy. */
-static void mbe_numa_bind(void *addr, int64_t len)
-{
-    const char *il = getenv("FEMU_MBE_INTERLEAVE");
-    if (!il || !il[0]) {
-        return;
-    }
-    unsigned long nodemask = 0;
-    if (!strcmp(il, "on")) {
-        nodemask = 3;
-    } else {
-        const char *p = il;
-        do {
-            char *end;
-            long node = strtol(p, &end, 10);
-            if (end == p || node < 0 || node >= sizeof(nodemask) * 8 ||
-                (*end && (*end != ',' || !end[1]))) {
-                femu_err("backend: invalid FEMU_MBE_INTERLEAVE=%s\n", il);
-                exit(EXIT_FAILURE);
-            }
-            nodemask |= 1ul << node;
-            p = *end ? end + 1 : end;
-        } while (*p);
-    }
-    int mode = !strcmp(il, "on") ? 3 /* legacy INTERLEAVE */ : 2 /* BIND */;
-
-    /*
-     * mbind(2) requires a page-aligned start address; g_malloc0 returns only
-     * malloc alignment. Round the start down and the length up to whole pages
-     * so the policy covers every page backing the buffer. (Touching the shared
-     * boundary pages is harmless: the policy only steers where not-yet-faulted
-     * pages land, and the prealloc below faults our buffer immediately.)
-     */
-    long pgsz = sysconf(_SC_PAGESIZE);
-    uintptr_t start = (uintptr_t)addr & ~((uintptr_t)pgsz - 1);
-    uintptr_t end = ((uintptr_t)addr + len + pgsz - 1) & ~((uintptr_t)pgsz - 1);
-    /*
-     * MPOL_MF_MOVE (0x2): g_malloc0 has already zeroed (hence faulted) the
-     * pages onto the default node, so a plain mbind would not relocate them.
-     * MF_MOVE migrates the already-resident pages to the target node now.
-     */
-    if (syscall(SYS_mbind, (void *)start, end - start, mode, &nodemask,
-                sizeof(nodemask) * 8, 0x2 /* MPOL_MF_MOVE */)) {
-        femu_err("backend: mbind(FEMU_MBE_INTERLEAVE=%s) failed: %s\n",
-                 il, strerror(errno));
-        exit(EXIT_FAILURE);
-    } else {
-        femu_log("backend: %ld MB bound via FEMU_MBE_INTERLEAVE=%s\n",
-                 (long)(len >> 20), il);
-    }
-}
 
 int init_dram_backend(SsdDramBackend **mbe, int64_t nbytes)
 {
@@ -63,9 +8,6 @@ int init_dram_backend(SsdDramBackend **mbe, int64_t nbytes)
 
     b->size = nbytes;
     b->logical_space = g_malloc0(nbytes);
-
-    /* bind to the requested NUMA node before mlock faults the pages in */
-    mbe_numa_bind(b->logical_space, nbytes);
 
     /*
      * Pinning keeps page faults out of the emulated latency, but it needs

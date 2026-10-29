@@ -2,6 +2,8 @@
 #include "femu_internal.h"
 #include "csd-graph.h"
 #include <endian.h>
+#include <time.h>
+#include <stdio.h>
 struct cs_graph_request { void *execution; uint64_t cookie; struct cs_graph_request *next; };
 /* Only mixed batches containing host copies need per-node rollback bookkeeping. */
 struct cs_graph_scope { void *scope; uint64_t cookie; struct cs_graph_scope *next; };
@@ -15,6 +17,7 @@ static CS_STATUS session_command(struct cs_device *d, unsigned action, uint64_t 
 }
 void femu_graph_close(struct cs_device *d)
 {
+    femu_cache_stop(d);
     if(d->graph_session) session_command(d,FEMU_GRAPH_CLOSE,0,NULL);
     while(d->graph_scopes) {
         struct cs_graph_scope *next=d->graph_scopes->next;
@@ -121,6 +124,7 @@ static CS_STATUS queue_graph(void *device,CS_BATCH_MODE mode,unsigned capacity,
         u64 id=0; status=session_command(d,FEMU_GRAPH_OPEN,0,&id);
         if(status==CS_SUCCESS) d->graph_session=id;
     }
+    if(status==CS_SUCCESS) status=femu_cache_start(d);
     if(status!=CS_SUCCESS || cancelled(execution)) {
         pthread_mutex_unlock(&d->graph_lock); free(data); free(record);
         return status==CS_SUCCESS?CS_ERROR_IN_EXECUTION:status;
@@ -131,7 +135,15 @@ static CS_STATUS queue_graph(void *device,CS_BATCH_MODE mode,unsigned capacity,
     pthread_mutex_unlock(&d->graph_lock);
     struct nvme_passthru_cmd64 cmd={.opcode=FEMU_CSD_EXEC_GRAPH,.nsid=d->nsid,
         .addr=(uintptr_t)data,.data_len=bytes,.cdw10=bytes};
+    struct timespec before,after;
+    if(d->profile) clock_gettime(CLOCK_MONOTONIC,&before);
     status=cs_io64(d,false,&cmd);
+    if(d->profile) {
+        clock_gettime(CLOCK_MONOTONIC,&after);
+        fprintf(stderr,"PROFILE GRAPH_IO session=%u cookie=%llu begin=%llu end=%llu\n",d->graph_session,
+            (unsigned long long)active.cookie,(unsigned long long)before.tv_sec*1000000000+before.tv_nsec,
+            (unsigned long long)after.tv_sec*1000000000+after.tv_nsec);
+    }
     pthread_mutex_lock(&d->graph_lock);
     struct cs_graph_request **slot=&d->graphs;
     while(*slot!=&active) slot=&(*slot)->next;

@@ -1,140 +1,77 @@
-# FEMU 文件页缓存回填
+# FEMU 主动 DMA 与文件缓存回填
 
-本目录是运行在 **Guest 内核** 的页缓存接收模块和运行在 **Guest 用户态** 的小型 SNIA 验证程序。设备实现位于 `code/FEMU/hw/femu/csd/csd.c`，测试 Filter 算子位于 `code/csd-programs/examples/cache-filter.c`，在 FEMU CU 线程执行。没有用户态代理、临时辅助进程或轮询守护进程。
+本功能用于只读、extent 固定的实验数据。默认关闭，应用设置 `SNIA_FEMU_CACHE_REFILL=1` 后启用，不改变公开 SNIA API。文件注册仍由 PG 扩展或测试应用执行；普通 SNIA 应用若未注册文件，只接收并丢弃无法关联到文件的数据。
 
-## 数据流与生命周期
+## 运行位置与流程
 
-1. 应用对只读、位置固定的文件执行 FIEMAP，将文件描述符、文件偏移及对应的 namespace 物理字节范围注册到 `/dev/femu-cache`。模块按打开的设备文件描述符管理注册并持有文件引用；CLEAR 只清理该调用者，关闭描述符（包括进程异常退出）时也会自动释放，不清理其他调用者的注册。
-2. 设置 `SNIA_FEMU_CACHE_REFILL=1` 后，FEMU 插件给 EXEC_GRAPH 添加本项目的回填标志。它不改变公开 SNIA API，默认关闭。
-3. 设备将图中的普通 LOAD 拆为最多 4 MiB 的子块。每块内部读取完成后，生成包含 token、LBA、FDM 范围的记录，发出 vendor AER；计算节点按原依赖继续执行，无需等待回填。
-4. Guest 内核通过 NVMe AER tracepoint 收到通知，唤醒有序 workqueue 获取元数据，将各块投递到 I/O 工作队列，全局限制最多 4 个块同时准备页和执行 I/O。一次取最多 32 条元数据记录；元数据不包含文件数据。标准 vendor Get Log Page 为 C8；模块使用等价的 E8/FETCH I/O 命令读取，避免依赖 NVMe 驱动的私有控制器结构。
-5. I/O worker 只在取得文件引用时持有映射锁，随后独立申请并锁定缺失的文件页，把这些页直接作为 F3 请求的 BIO。4 MiB 的页描述符在堆上分配；一个 NVMe 请求可链接多个 BIO。当前驱动每请求最多 128 个物理段；若目标缓存页过于分散，只有该范围会缩小后重试构建，不固定按 64 KiB 拆分。文件引用保留到 DMA 和页发布结束，调用者关闭注册不会使在途映射失效。NVMe 驱动映射目标页，FEMU 从原 FDM 范围直接 DMA 到目标页；不重读 NVM，也不经用户态缓冲复制。已有有效缓存页不覆盖，锁冲突、脏页等情况跳过。
-6. 设备记录各段成功传输的字节数，整个块已传到主机且引用该范围的 CU 消费结束后，即释放回填占用，允许整条图完成；无需等待主机发布缓存页。Guest 的 Read 完成后标记 folio 有效并解锁，完整传输不再发送 ACK。若已有缓存、跳过页面或传输失败，Guest 仍在处理结束后异步发送 ACK，让设备释放未传输部分的占用；最多 8 个异步 ACK，达到上限时同步确认。旧模块在完整传输后发送的迟到 ACK 可以安全忽略。失联 5 秒后放弃该块回填，不永久占用 FDM；日志里不将失败标成成功。
+- **Guest 用户态**：`libsnia` 的 FEMU 插件管理接收缓冲和一个库内消费线程，不启动辅助进程或代理。
+- **Guest 内核态**：本目录的 `femu_cache.ko` 固定 DMA 接收页、提供完成记录映射，并把收到的数据复制到干净的文件页缓存。
+- **设备端**：FEMU `hw/femu/csd/csd.c` 的 LOAD 与 CSF 调度；两个设备级回填线程执行主动软件 DMA；正常 I/O 由两个 NVMe poller 处理。设备不理解 inode、PG 表或文件偏移。
 
-**当前约定：开启回填的 LOAD 目标范围，在 batch 返回前必须保持只读，不得由另一个 LOAD、WRITE 或 CSF 输出覆盖。** 应用可以并行提交使用独立 FDM 的 batch。当前只覆盖普通图 LOAD，不覆盖 CSF 重入发起的内部读取。PG 扩展在读取已准备的表/索引 extent 时直接注册对应文件段，注册随查询内存上下文释放，ERROR 时也会关闭；不另起进程。并发文件写入和一致性失效尚未接入。CSF 内部请求的基表读取仍未回填，不能将部分显式 LOAD 的回填视为整条 SQL 全部读取已覆盖。
+1. 上层将文件、namespace LBA 和文件偏移注册到 `/dev/femu-cache`。文件保持只读，不改变 extent；开启回填时，LOAD 输入在图内也保持只读，算子使用独立输出缓冲，不原地修改这份基表输入。
+2. 模块加载时预分配 **8 个 4MiB 接收槽位**（32MiB Guest 内存）和一页完成记录，完成固定页及 DMA 映射。这是设备环境初始化成本，应单独报告。SNIA 首次提交开启回填的设备图时借用这组缓冲，通过一次私有 NVMe 注册命令绑定当前会话；查询结束后归还，下次直接复用。模块保存本次会话的文件映射引用。并发会话需要独立缓冲，预分配组已借出时按需分配额外接收区；不会串行化 SQL 执行。
+3. 设备图显式 LOAD 和 CSF 通过可重入 namespace read 请求的内部基表读取都接入回填，最多按4MiB分块；隐藏 spill 的换入不回填。计算按原依赖继续推进；两个回填线程从保留块中领取任务，将同一份输入 DMA 到空闲接收槽位。DMA 复用共享 PCIe 带宽模型，没有二次 NAND/FTL 读取延迟。数据复制不占用 FTL 或正常 I/O poller 线程，也不持有 CSD 全局锁。回填线程空闲时等待条件变量；仅在等待尚未到期的 PCIe 模拟完成时间时进行短等待。
+4. 软件复制和模拟链路传输均完成后，设备写入来源 LBA、长度等元数据，最后发布槽位的 `ready`。**没有 AER、逐块日志读取、F3 Read 或 ACK 命令。** 没有空闲接收槽位时跳过回填，不等待页缓存处理。
+5. SNIA 库内线程检查完成记录，调用模块消费该槽位。模块把接收数据复制到缺失的文件缓存页，已有有效页不覆盖，脏页、冲突等情况跳过；不产生文件写入或 NVM 写回。处理完成后更新共享 `ready`，归还槽位，不发送 NVMe 请求。
+6. CU 和 DMA 都结束后，设备输入可以复用。原 FDM 输入同时供 CU 和 DMA 读取，保留到二者结束；不再建立设备页别名或重复映射，仍不等待主机填入文件缓存。接收槽位是 Guest 内存，不计入设备 FDM。
+   数据复制及模拟链路传输结束后，即允许重叠区域被下一次读取覆盖，不再为完成记录的发布继续占用该输入。回填线程使用专用缓存元数据锁，完全不获取 CU/FTL 的执行调度锁；接收槽探测另用环锁，访问 Guest 内存时也不持有缓存元数据锁。FTL 只在状态改变后回收输入、推进等待节点，锁顺序固定为执行调度锁→缓存元数据锁。逐块计时日志在全局锁外输出，关闭细分计时时不输出 CACHE_BLOCK。
+   CSF 重入时也必须保持内部读取的基表输入只读，使用独立输出和控制区域。下一次内部读取若要覆盖仍在 DMA 的重叠区域，设备只暂停该节点，DMA 完成后通过就绪队列唤醒；尚未开始 DMA 的可选回填可以直接放弃。细分计时的 `CACHE_REUSE_WAIT` 记录此等待，`CACHE_BLOCK` 的 `internal=1` 标识内部读取。
+7. 关闭 SNIA 设备时，先停止并等待实际 DMA 写入退出，再排空消费线程，最后解除 DMA 映射。模块也在文件描述符异常关闭时执行停止，避免设备继续写入释放后的页。关闭阶段的排空耗时需单独考虑，不能宣称后台工作没有任何资源开销。
 
-设备端最多保留 128 条回填记录。F3 回填 Read 由处理该 NVMe 提交队列的 poller 同步执行软件 DMA；复制前后短暂持有 CSD 锁校验 token、登记在途引用和更新计时，PRP/SGL 映射与数据复制期间不持有 CSD 锁。复制完成后直接放入本 poller 的完成时间堆，复用正常 CQ 满时的等待及中断处理，不再经过 FTL 往返；启用固件 CPU 时延模型时仍保留通用完成路径，以遵守该模型。CSD 模式每执行一条提交请求后检查 CQ，避免多个大块复制完成后才统一返回。普通 namespace Read 仍保留 FTL 介质时延模拟。
+控制器暂停时会等待在途软件 DMA 退出；控制器复位会注销接收环，恢复后须重新注册，避免向旧 Guest 地址写入。设备关闭时唤醒并回收两个回填线程。8 个 I/O 队列按每 poller 4 个队列配置；正常 I/O 与回填仍共用同一个设备到主机 PCIe 带宽预算，并未增加链路容量或实现抢占优先级。
 
-FTL 只处理图调度、介质时延及回填记录回收，不执行回填数据复制。在途 DMA 会阻止该记录因 ACK 或超时提前释放，保证输入 FDM 在复制结束前有效。
+`0xeb` 是本项目的设备私有接收注册/停止命令，不是 SNIA 标准命令。头文件 `csd-cache.h` 定义初始化地址表和共享完成记录，按小端编码。接收页由模块持有到停止完成，不保存普通已完成 NVMe 请求的临时 PRP 映射。现实现针对 Linux 6.8、4KiB 页、PCIe FEMU 和 `/dev/nvme0n1`，注册和发布接口要求实验 Guest 已授权的 CAP_SYS_ADMIN。
 
-Guest 全局限制最多 4 个 I/O 任务同时执行，至多 4 条 DMA 请求在途、约 16 MiB 文件页锁定用于回填。不同 poller 可以并行处理；同一 poller 上仍会顺序处理请求。当前没有独立低优先级 SQ/WRR，复制仍消耗宿主 CPU 和内存带宽，也不能被同一 poller 的后续请求抢占。FEMU 使用 QEMU 的实际内存 DMA 路径，并复用控制器的共享 PCIe 带宽模型限制完成时间；软件复制仍消耗 CPU，不能把模型上限当作实际吞吐。
+## 编译与安装
 
-## Guest 编译与安装
-
-需要当前运行内核对应的 headers、C 编译器、make、CMake，且已安装 SNIA。内核模块必须由 Linux Kbuild 编译：
+Guest 已安装 SNIA、当前内核 headers、make 和 C 编译器：
 
 ```sh
 mkdir -p /tmp/femu-cache-build
 cp /home/femu/apps/femu-cache/femu_cache.c /home/femu/apps/femu-cache/csd-cache.h \
    /home/femu/apps/femu-cache/Makefile /tmp/femu-cache-build/
-make -C /tmp/femu-cache-build -j2
-sudo insmod /tmp/femu-cache-build/femu_cache.ko
+make -C /tmp/femu-cache-build -j4
+sudo mkdir -p /home/femu/.local/lib/femu-cache
+sudo cp /tmp/femu-cache-build/femu_cache.ko /home/femu/.local/lib/femu-cache/
+sudo insmod /home/femu/.local/lib/femu-cache/femu_cache.ko
 sudo chown "$(id -un):$(id -gn)" /dev/femu-cache
+```
+
+需要匹配的 FEMU 固件和 SNIA 插件，使用发行版原生 NVMe 驱动，无需修改内核 NVMe 模块。
+
+SNIA 按其 [README](../snia/README.md) 编译安装。应用仍只包含 `cs.h`、链接 `-lsnia`；文件映射注册接口由本目录头文件提供，PG 已使用此接口。
+
+## 验证与计时
+
+```sh
 cmake -S /home/femu/apps/femu-cache -B /tmp/femu-cache-user
 cmake --build /tmp/femu-cache-user -j2
-```
-
-模块目前针对 Linux 6.8、4 KiB 页和 `/dev/nvme0n1`。注册接口限 CAP_SYS_ADMIN；这里的权限不通过辅助进程转发。
-
-### Linux 6.8 的 AER 启动修正
-
-该版本驱动在 OAES 没有可选事件位时不提交 AER；FEMU CSD 的 vendor 事件也需要常驻 AER。`kernel/linux-6.8-aer.patch` 只修正这一启动条件，不虚报 OAES。必须用与运行内核**版本完全对应**的 Ubuntu 源码重新编译 nvme-core，不能用其他版本替换：
-
-```sh
-sudo apt-get install linux-source-6.8.0 linux-headers-$(uname -r)
-mkdir -p /tmp/femu-nvme-kernel
-tar -xjf /usr/src/linux-source-6.8.0.tar.bz2 -C /tmp/femu-nvme-kernel \
-    --strip-components=1 linux-source-6.8.0/drivers/nvme/host
-cd /tmp/femu-nvme-kernel/drivers/nvme/host
-patch -p1 < /home/femu/apps/femu-cache/kernel/linux-6.8-aer.patch
-make -C /lib/modules/$(uname -r)/build M="$PWD" -j4 nvme-core.ko
-sudo mkdir -p /lib/modules/$(uname -r)/updates
-sudo cp nvme-core.ko /lib/modules/$(uname -r)/updates/
-sudo depmod -a
-sudo update-initramfs -u
-```
-
-安装后需重新加载 NVMe 驱动或重启 Guest。重新加载前先停止 PG、卸载本模块和 `/data` 文件系统；先卸载模块才能释放文件注册。FEMU 的 RAM 后端在容器重启时丢失，必须先备份 namespace、重启后恢复，不能直接重启丢弃实验数据。
-
-## 针对性测量与绘图
-
-程序生成 1 GiB 顺序整数文件，8 条独立流各自提交 LOAD→只读 Filter，每个扫描任务 4 MiB，共 256 个任务，与数据库默认扫描粒度一致。开启回填时，设备按最多 4 MiB 范围通知和回读；物理范围连续、所有页缺失且驱动散列表未超限时，每个任务只发送一次 Read FDM，共 256 次，extent 边界和跳过页面可能增加次数。Filter 的重复次数用于分别测量轻、重计算，执行真实过滤与求和，不插入 sleep。两种模式都先驱逐文件缓存，计算结束后检查页驻留数量、计算结果，并在计时区间外逐字节检查文件内容：
-
-```sh
 sudo /tmp/femu-cache-user/test-refill /data/cache-refill.bin 1 0
 sudo /tmp/femu-cache-user/test-refill /data/cache-refill.bin 1 1
-sudo /tmp/femu-cache-user/test-refill /data/cache-refill.bin 1000 0
-sudo /tmp/femu-cache-user/test-refill /data/cache-refill.bin 1000 1
-```
-
-保存 FEMU 日志中的本次 `CACHE_BLOCK` 行后，在宿主执行：
-
-```sh
-python3 scripts/plot-cache-refill.py device.log results/cache-refill-plot
-```
-
-绘图依赖 matplotlib，输出逐块 CSV、统计 JSON 和 PNG/PDF。所有时间戳来自同一个 FEMU 单调时钟：`load` 是块可用，`cu` 是最后一个消费者的计算完成，`dma_start`/`dma` 是回填 DMA 开始/结束，`cache_ack` 是设备收到缓存有效确认，`release` 是解除回填占用，`dma_bytes` 是成功传输的字节数。完整传输时不再发送 ACK，`cache_ack=0` 不表示失败；缓存发布时刻由 Guest 的 `published` 记录确认。CU 时间不包含 FTL 处理完成事件的调度滞后。
-
-必须区分 **LOAD→DMA 结束的总响应时间**和 **DMA 传输完成时间**：前者还包含 AER、Guest 调度和 NVMe 队列等待。`dma_start→dma` 包含共享链路预算；实际 CPU 映射复制使用下文 `CACHE_READ.copy_begin→copy_end`，两者不是同一指标。缓存有效确认包含 ACK 命令的传输延迟，是缓存发布时刻的上界。`release-cu` 表示 CU 完成后的额外 FDM 占用，不能将其全部归因于 DMA 复制。
-
-### 拆分回填等待
-
-模块参数 `profile` 默认关闭。开启后，将每块的 worker 入口、FETCH 起止、页分配、BIO 准备、DMA 提交/返回、页发布及 ACK 提交/完成回调时间存入内存；测量过程中不逐块打印日志。最多记录 4096 个回填范围；1 GiB 测试通常产生 256 条记录，每轮测量前重新加载模块清空。测试程序的 `FEMU_CACHE_PROFILE=1` 则记录 8 条流中每轮 batch、结果读取和资源分配/释放的时间，在计时结束后打印。
-
-```sh
-sudo sh -c 'echo 1 > /sys/module/femu_cache/parameters/profile'
-sudo env FEMU_CACHE_PROFILE=1 /tmp/femu-cache-user/test-refill \
-    /data/cache-refill.bin 1 1 > measured.app
-sudo cat /sys/kernel/debug/femu-cache/profile > measured.kernel
-sudo sh -c 'echo 0 > /sys/module/femu_cache/parameters/profile'
-```
-
-应在没有正在执行的回填测试时开关计时，并同时保存此次 FEMU 的 `CACHE_BLOCK` 记录。kernel 记录的 token 与设备记录对应，LBA 与应用记录对应；多个块可以合用一次 AER、一次 FETCH，不能按块重复累加通知或 FETCH 时间。
-
-`scripts/analyze-cache-refill.py` 处理 `roundN-pP-cacheC.app/.device/.kernel` 命名的一组实验记录，P 表示是否开启计时，C 表示是否回填。每轮各测 P=0/1、C=0/1，既拆分耗时，也比较计时开关自身的影响。输出 `breakdown.json`、`critical-waits.csv`，附加 `--plot` 生成图：
-
-```sh
-python3 scripts/analyze-cache-refill.py results/cache-refill-breakdown --plot
-```
-
-Guest `ktime` 与 FEMU 时钟有偏移，不能直接相减。分析利用“设备 DMA（以及实际存在的 ACK）处理一定发生在对应 Guest 请求提交与返回之间”得到每轮时钟偏移区间；若所有请求的区间没有交集，直接报错，不输出混合时钟的归因。报告同时保留区间宽度和关键等待各项在下界、中点、上界对齐时的变化。按最晚结束的一条应用流统计关键路径，避免将 8 条流的重叠等待直接相加。同一 4 MiB batch 的多个回填子块按设备图归组，只取最后释放的子块作为该 batch 的释放依赖，不将重叠的子块占用重复相加。旧版串行记录可以统计单 worker 的服务构成；带 `parallel=1` 的记录中多个 worker 会重叠，分析工具只对当前块的服务进行关键等待归因，其余标为本块服务前等待，不重复计入其他 worker。并行模式图中的请求耗时之和不是整段时间，不能将其当作串行服务构成或新增总延迟的分摊。
-
-单块发生驱动限制拆分时，`dma_calls` 只统计实际提交的 Read 数量；`dma_start` 到 `dma` 包含多次请求之间的间隙，不等于纯复制时间。分析中的 `single_read_mean_us` 仅用一条 Read 完成的范围拆分设备传输与完成通知延迟；其中 `copy` 是 DMA 开始到传输完成的时间，启用链路模型后还包含链路等待，不等于纯 CPU 复制。测试程序在计算任务返回后，通过现有诊断读取等待缓存页发布结束，再校验页驻留和内容；这段 `cache_drain_ms` 在 `wall_ms` 之外，包含诊断读取本身，不能当作纯回填尾延迟。
-
-### Read 请求内部阶段
-
-现有模块 `profile=1` 时，在 F3 的 CDW14 设置 `FEMU_CACHE_READ_PROFILE`，只控制诊断，不改变数据语义。设备在 CQE 写入后输出一条 `CACHE_READ`；关闭 profile 时不输出这些记录。记录按 token、块内 offset、bytes 对应具体一次 Read，拆分读取会有多条记录。
-
-所有设备字段来自同一个 FEMU 时钟：`seen` 是 poller 取出 SQE 后建立请求的时刻；`enter` 是进入 F3 处理；`locked` 是取得第一次 CSD 锁；`copy_begin/copy_end` 包围 PRP/SGL 映射和数据复制；`update_locked` 是复制后再次取得 CSD 锁；`ready` 是更新完成并释放锁；`link_begin/link_end` 是共享 PCIe 模型预留的传输起止；`posted` 是 CQE 已写入的时刻，尚不代表 Guest 已处理中断。
-
-相应设备时间戳之间的差值可以直接拆出命令处理、两次锁等待、映射复制、状态更新和完成队列等待。Guest 的 `dma_submit→dma_done` 是同步调用往返，包含派发与线程唤醒；不得将它命名为“写 SQ/CQ 的 CPU 耗时”。对单条请求，可用 Guest 往返减去设备 `seen→posted`，报告设备取命令前与 CQE 写入后等待的合计；若跨时钟偏移不能严格确定，不把该合计硬拆成 submission 与 completion。诊断日志输出也会影响开启计时的样本，性能成绩应另测关闭计时的模式。
-
-### PG 冷缓存对照
-
-回填标志必须放在 **PG 服务进程的环境** 中；仅给 psql 设置环境不会改变已启动的后端。以下复用冷启动脚本：
-
-```sh
-SNIA_FEMU_CACHE_REFILL=0 sh /home/femu/scripts/cold-query.sh csd /home/femu/tests/queries/6.sql
-SNIA_FEMU_CACHE_REFILL=1 sh /home/femu/scripts/cold-query.sh csd /home/femu/tests/queries/6.sql
 sudo cat /sys/kernel/debug/femu-cache/profile
 ```
 
-每次都会重启 PG 并清理 Guest page cache。模块访问权限在加载时配置，postgres 二进制沿用实验 Guest 已授权的 CAP_SYS_ADMIN。`CACHE_STATS` 在计时关闭时也会输出块数、回填/缓存命中字节数、跳过、错误和设备累计丢记录数；它会先等待现有工作完成，不参与 SQL 执行。
+测试使用 1GiB 文件、4MiB 输入、8 条流，重复数 1 为轻计算，可改为 100 测重计算。两种模式都从冷文件缓存开始，校验计算及文件字节；回填是尽力而为，不要求全部驻留。`wall_ms` 为任务执行时间，`cache_drain_ms` 在两种模式下都记录 CSF 卸载、关闭设备及排空后台消费，二者分别报告。每次查询测试仍须使用冷启动脚本，TPC-H 只使用正式 SQL。
 
-`CACHE_BLOCK.cu` 是输入最后一个消费者的结束时刻；它可能早于后续算子链结束。设备图返回时的 `CACHE_GRAPH` 另外记录最后一个计算节点的 `compute`、固件确认所有节点完成的 `work`、最终返回的 `done`。`compute=0` 表示该图只有 I/O，没有同图计算可以覆盖回传；`done-work` 表示图完成后的回填等待。多个图会并行，不得将这些等待直接相加当作 SQL 延迟。`work-compute` 还可能包含固件完成事件处理滞后或其他图内 I/O，不能当作纯计算。
+设备 `CACHE_BLOCK` 记录 LOAD 完成、CU 完成、DMA 开始、软件复制结束、链路结束、完成记录发布及输入释放时间；其中 `dma` 是发布完成记录后的设备时间。`CACHE_GRAPH` 记录计算图完成，不能把并行图的等待相加当作查询延迟。Guest `CACHE_STATS` 记录块数、实际填充、已有缓存、跳过字节和错误数；读取统计不负责驱动或排空后台线程，应在设备关闭后读取。
 
-### 多 poller 与共享链路
+分析瓶颈时给应用设置 `SNIA_FEMU_PROFILE=1`，模块加载时设置 `profile=1`（已加载时可写 `/sys/module/femu_cache/parameters/profile`）。设备增加 `CSD_IO_SPAN`、`CSD_CU_SPAN`、`CSD_GRAPH_TIME`，分别记录内部 I/O、CU 排队/执行、执行图从取到命令至返回完成队列的时间；软件 I/O 和 CU 同时记录线程 CPU 时间，以区分实际工作与被调度出去的时间。内部 I/O 还分别统计 FTL 模型处理、后端范围锁等待、NVM/FDM 软件复制和返回时的 CSD 锁等待。`CACHE_BLOCK` 包含 DMA 锁等待、更新状态锁等待、完成记录发布、SG 段数及复制线程 CPU 时间。
 
-`run-csd.sh` 使用 8 个 I/O 队列、4 个 poller（`multipoller_enabled=1,poller_ratio=2`），队列按 poller 交错分配。poller 数量与 CU 数量独立。`CSD_PCIE_BANDWIDTH_MBPS` 默认 3500，单位为十进制 MB/s；所有 poller 的普通 Read/Write、FDM Read/Write 和回填 Read 共用每方向一份带宽预算，两个方向可同时传输。内部 NVM↔FDM 不经过该预算。元数据查询与管理命令不按有效载荷限速。
+环内 `ready` 的更新只是一次状态发布，不代表整个缓存操作只有一次赋值。设备还要探测 Guest 接收槽、转换 DMA 地址、复制数据并等待模拟链路；Guest 还要获取文件缓存页并复制数据。锁等待、线程唤醒与日志输出也不能归为标志位写入本身。接收页分配及 DMA 映射在模块初始化时单独计量；查询中的缓冲借用、会话绑定等真实开销仍计入查询，不从结果中扣除。
 
-回填 Read 的链路传输与模拟器的软件复制重叠，CQE 和 FDM 释放都不能早于链路传输结束。`copy_begin→copy_end` 是实际 CPU 映射复制；`link_begin→link_end` 是模型时间，两者不能相加。拆分请求往返时，状态就绪后的额外链路等待为 `max(0,link_end-ready)`，之后到 `posted` 才是完成队列调度等待。
+SNIA 的 `PROFILE GRAPH_IO` 可通过 session/cookie 与设备执行图对应。两侧分别计算时长后相减，得到取 SQE 前与完成返回后的合计开销；Guest 与 FEMU 时钟不能直接相减。`PROFILE CACHE_RX` 记录接收缓冲初始化、注册、停止、线程排空，以及消费线程的 CPU 时间、发布 ioctl 和空闲睡眠。模块的 `CACHE_HOST` 把发布耗时拆为 DMA 同步、文件映射查找、缓存页获取/分配、复制和剩余处理。分项为累计工作时间，可能互相并行；只有同一条串行任务流内互斥的区间才可相加并计算总耗时占比。细分采样也有开销，性能验收应关闭这些开关。
 
-在本次调整的数据路径中，CSD 锁保护资源表、引用和调度状态。FDM Read/Write 固定缓冲引用后解锁执行复制；唯一 FTL 线程执行内部 LOAD/STORE 和 spill I/O 时也释放 CSD 锁，基表 NVM 复制仍由原有范围锁保护。调用方仍须通过任务依赖避免同时改写同一缓冲区。
+真实设备 DMA 对应的 FEMU 软件复制，以及新增的 Guest 内存复制都会消耗 CPU 和内存带宽，必须实测是否拖慢计算。当前 Compose 将设备线程及内存固定在 node2，Guest 线程及 RAM 固定在 node3；具体参数见项目根 README。
 
-### NUMA 固定与 DMA 段合并
+### 缓存输入路径对比
 
-Compose 默认设置 `FEMU_NUMA_NODE=0`、`FEMU_MBE_INTERLEAVE=1,2,3`。容器安装 numactl，并开放 `SYS_NICE`，用于 NUMA 策略及后端页迁移。`run-csd.sh` 在启动 QEMU 前用 numactl 将 CPU 和内存策略绑定到 node0，Guest RAM、FDM、workmem 及 CU/poller 线程继承该策略。16GiB 的 RAM-backed NVM 单独限定在 node1～3 的节点集合内；其访问仍跨 NUMA，不能声称整个 SSD 仿真已排除 NUMA 影响。节点编号针对本实验宿主，可在 Compose 中调整；绑定失败会停止启动。
+同一 CMake 项目还提供 `test-cache-input`，用于比较同一份 1GiB 文件的内部 LOAD、已驻留文件页的只读 `mmap` 输入，以及 `pread` 到用户缓冲后再输入。它只测数据搬运，不执行 SQL 或计算算子，不开启回填；缓存预热、FDM 分配和末尾数据校验单独进行。
 
-Guest 中运行 `sh /home/femu/scripts/init-csd-env.sh`，检查单虚拟 NUMA 节点后完成原有分区、挂载与 SNIA 安装。Guest 不能设置宿主物理 NUMA 绑定，因此修改绑定参数后需要重建容器并重启 Guest，先保存易失 SSD 数据。可通过宿主 `/proc/<QEMU pid>/numa_maps` 核对实际页分布，不能仅凭启动参数认定绑定成功。
+```sh
+cmake --build /tmp/femu-cache-user --target test-cache-input -j2
+sudo /tmp/femu-cache-user/test-cache-input /data/cache-input.bin 4096 4 3
+```
 
-DMA 解析仍逐项校验 PRP/SGL，但将相邻 DMA 地址合为一个 SG 段；不相邻的页维持分散布局。复制时每个实际内存区域只做一次地址翻译和直接 RAM 校验，持有区域引用完成复制，随后通过 QEMU unmap 更新脏页与代码失效状态。映射仅在当前调用中使用，不跨请求保留 Guest 指针；MMIO 等非直接 RAM 目标仍返回传输错误。
+参数为文件路径、数据块 KiB、并发流数、轮数；空文件自动写入 1GiB 测试数据，请使用独立测试文件。`mmap` 地址可直接传入 `csQueueCopyMemRequest`，不经过插件的用户数据中转缓冲。测试根据 Guest 的 NVMe `max_segments` 限制分段输入：本机 128 段、4KiB 页，对应最多 512KiB 一次；现有插件固定 1MiB 分段不能保证容纳分散文件页。该限制尚未改入生产适配层。
+
+缓存输入仍占主机到设备的 PCIe 带宽，内部 LOAD 不占这条链路，因此缓存命中不保证更快。后续混合输入需要保留内部 LOAD 路径，并正确区分缓存命中和缺失，不能让缺页隐式读取文件后再上传。

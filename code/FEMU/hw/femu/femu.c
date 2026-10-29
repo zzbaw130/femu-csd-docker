@@ -486,6 +486,7 @@ static void nvme_clear_ctrl(FemuCtrl *n, bool shutdown)
      * added to do.
      */
     resume = nvme_pause_pollers(n);
+    femu_csd_cache_reset(n);
 
     /*
      * Drop every Async Event Request the controller was holding, along with any
@@ -2006,6 +2007,7 @@ static uint64_t femu_ftl_process_req(FemuCtrl *n, NvmeRequest *req)
  */
 static void *femu_ftl_thread(void *arg)
 {
+    femu_bind_device_thread();
     FemuCtrl *n = (FemuCtrl *)arg;
     NvmeRequest *req = NULL;
     uint64_t lat;
@@ -3288,7 +3290,6 @@ static void femu_free_namespace_bitmaps(FemuCtrl *n)
 static void femu_aer_bh(void *opaque)
 {
     FemuCtrl *n = opaque;
-    if (qatomic_xchg(&n->cache_aer_ack,0)) n->aer_mask &= ~(1U<<NVME_AER_TYPE_VENDOR_SPECIFIC);
     uint32_t bits = qatomic_xchg(&n->health_pending, 0);
     uint32_t aec = NVME_AEC_SMART(n->features.async_config);
 

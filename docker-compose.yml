@@ -22,7 +22,7 @@ services:
     devices:
       - /dev/kvm                  # FEMU boots its guest with KVM
     cap_add:
-      - SYS_NICE                  # NUMA memory policy and backend page migration
+      - SYS_NICE                  # allow explicit NUMA memory policies
     ports:
       - "8080:8080"               # guest SSH, forwarded by run-csd.sh
     stdin_open: true              # -nographic serial console
@@ -39,12 +39,14 @@ services:
     environment:
       FEMU_SMP: 8
       FEMU_MEM: 8G
-      FEMU_NUMA_NODE: 0           # Guest RAM, FDM, workmem and all QEMU threads
-      FEMU_MBE_INTERLEAVE: 1,2,3  # allowed NVM nodes; excluded from the single-node claim
+      FEMU_HOST_CPUS: 30-39       # node3: eight vCPUs and QEMU host threads
+      FEMU_HOST_NODE: 3           # Guest RAM, including its caches/receive ring
+      FEMU_DEVICE_CPUS: 20-28     # node2: 1 FTL + 4 CU + 2 poller + 2 cache
+      FEMU_DEVICE_NODE: 2         # NVM, FDM, workmem, spill and device metadata
       CSD_WORKMEM_SIZE_MB: 256    # shared CSF work arena, independent of FDM
       CSD_FDM_SIZE: 64            # in megabytes, MAX=48GB=49152, with 25%(16GB) op
       CSD_NVM_SIZE: 16384         # in megabytes           
       CSD_PCIE_BANDWIDTH_MBPS: 3500 # shared per direction across all pollers
-      CSD_NR_CU: 8                # max 64
+      CSD_NR_CU: 4                # max 64
       CSD_CSF_RUNTIME_SCALE: 1
       CSD_PROGRAM_DIR: /workspace/code/csd-programs/build
