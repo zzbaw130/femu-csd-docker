@@ -130,7 +130,12 @@ TPC-H 验收只读取仓库 `tests/guest/queries/1.sql` 至 `22.sql` 及对应 `
 bash tests/pg-sina-csd-test.sh tpch
 # Guest：默认全部 22 条，也可以只测指定编号
 sh /home/femu/tests/tpch-test.sh 7 9 13
+# Guest：只运行原生 PG，用于 HOST 配置对照
+TPCH_MODES=host-only sh /home/femu/tests/tpch-test.sh
 ```
+
+`scripts/guest/start-postgre.sh` 将原生 PG 对照配置写入数据目录：`max_parallel_workers_per_gather=4`、`shared_buffers=2GB`、`work_mem=16MB`。后续冷启动也沿用这些值；`work_mem` 是每个执行节点/worker 的额度，并非整条查询的总内存。每次基准的 `environment.log` 记录运行配置。
+与原默认配置的完整冷启动对照见 [原生 PG 配置对照](doc/host-configuration.md)。
 
 只保留标准规定的 Q2=100、Q3=10、Q10=20、Q18=100、Q21=100 行上限，其余查询不额外添加 LIMIT。查询参数、子查询写法和 Q15 的 CREATE VIEW/SELECT/DROP VIEW 均保持该目录原样。host 与 CSD 接收同一个文件，超时或错误直接记录为失败，不用手写参考 SQL 替代。
 

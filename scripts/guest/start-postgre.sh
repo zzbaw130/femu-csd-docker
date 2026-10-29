@@ -24,6 +24,13 @@ if ! command -v psql; then
     exit 0
 fi
 
+# 原生 PG 对照配置；写入数据目录，cold-query.sh 重启后同样生效。
+sed -i \
+    -e 's/^[#[:space:]]*max_parallel_workers_per_gather[[:space:]]*=.*/max_parallel_workers_per_gather = 4/' \
+    -e "s/^[#[:space:]]*shared_buffers[[:space:]]*=.*/shared_buffers = '2GB'/" \
+    -e "s/^[#[:space:]]*work_mem[[:space:]]*=.*/work_mem = '16MB'/" \
+    "${PGDATA}/postgresql.conf"
+
 pg_ctl -D $(psql postgres -tc "SHOW data_directory;" 2>/dev/null) stop >/dev/null 2>&1
 
 pg_ctl -D ${PGDATA} -l ${PGDATA}/log start
