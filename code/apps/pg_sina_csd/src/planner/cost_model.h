@@ -59,7 +59,7 @@ static inline double cost_parallel(double work,double tasks,unsigned workers,dou
 /* Sort uses 1MiB runs (or smaller under its quota), 64KiB input caches and
  * bounded 2..32-way consolidation. Charge initial eviction separately from
  * full intermediate passes; the final merge only reads spilled payload. */
-struct cost_sort { double state,runs,spill,comparisons,merge; unsigned fan; };
+struct cost_sort { double state,runs,spill,comparisons,merge,record_copies; unsigned fan,passes; };
 static inline struct cost_sort cost_sort_state(double rows,double width,double available)
 {
     struct cost_sort s={0};
@@ -73,9 +73,47 @@ static inline struct cost_sort cost_sort_state(double rows,double width,double a
     double resident=cost_max(0,available-metadata-run_bytes-2*QS_SORT_IO_BYTES);
     double evicted=cost_max(0,payload-resident),runs=s.runs;
     s.spill=2*evicted;
-    while(evicted>0 && runs>s.fan) { s.spill+=2*payload; runs=ceil(runs/s.fan); }
+    while(evicted>0 && runs>s.fan) { s.spill+=2*payload; runs=ceil(runs/s.fan); ++s.passes; }
     s.comparisons=rows*log2(cost_max(2,cost_min(rows,run_rows)));
     s.merge=rows*log2(cost_max(1,s.runs));
+    s.record_copies=rows*(s.passes+1);
     return s;
+}
+/* Interpolate uniform occupancy and clustered keys using PG correlation^2.
+ * This estimates duplicates across flushes; it is not an exact NDV. */
+static inline double cost_partial_rows(double rows,double groups,double resident_groups,double correlation)
+{
+    if(rows<=0 || groups<=0) return 0;
+    double flushes=cost_max(1,ceil(groups/cost_max(1,resident_groups)));
+    double random=cost_min(rows,groups*flushes*(-expm1(-rows/(groups*flushes))));
+    double clustered=cost_min(rows,groups);
+    double weight=cost_min(1,correlation*correlation);
+    return random*(1-weight)+clustered*weight;
+}
+static inline double cost_spill_io(double bytes,double read_mbps,double write_mbps)
+{ return bytes/2/(read_mbps*1000)+bytes/2/(write_mbps*1000); }
+/* Group keys drawn only from a join's probe side cannot form more groups
+ * than probe rows, even when the join emits many matching build rows. */
+static inline bool cost_probe_expression(const struct qp_plan *tree,int node,int expression,int join)
+{
+    const struct qp_node *n=&tree->nodes[node];
+    if(expression<0 || (unsigned)expression>=n->expr.nexprs) return false;
+    const struct qs_expr *e=&n->expr.exprs[expression];
+    if(e->op==Q_CONST || e->op==Q_PARAMETER) return true;
+    if(e->op==Q_COLUMN) {
+        if(node==join) return e->column>=0 && (unsigned)e->column<tree->nodes[n->left].expr.nout;
+        if(n->left<0 || e->column<0) return false;
+        int child=n->left,column=e->column;
+        if((unsigned)column>=tree->nodes[child].expr.nout) {
+            column-=tree->nodes[child].expr.nout; child=n->right;
+        }
+        if(child<0 || (unsigned)column>=tree->nodes[child].expr.nout) return false;
+        const struct qs_output *out=&tree->nodes[child].expr.outputs[column];
+        return !out->aggregate && cost_probe_expression(tree,child,out->index,join);
+    }
+    if(e->op==Q_AGGREF || e->left<0) return false;
+    return cost_probe_expression(tree,node,e->left,join) &&
+        (e->right<0 || cost_probe_expression(tree,node,e->right,join)) &&
+        (e->otherwise<0 || cost_probe_expression(tree,node,e->otherwise,join));
 }
 #endif

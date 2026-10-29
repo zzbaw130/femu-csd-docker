@@ -39,6 +39,18 @@ int main(void)
     qp_parallel_boundaries(&scan,0); CHECK(scan.nodes[0].parallel);
     scan.nodes[0].parallel=0; scan.nodes[0].ordered_index=1;
     qp_parallel_boundaries(&scan,0); CHECK(!scan.nodes[0].parallel);
+    memset(&scan,0,sizeof(scan)); scan.count=4;
+    scan.nodes[0].left=1; scan.nodes[0].expr.nexprs=1;
+    scan.nodes[0].expr.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.column=0};
+    scan.nodes[1].kind=QP_INDEX_JOIN; scan.nodes[1].left=2; scan.nodes[1].right=3;
+    scan.nodes[1].expr.nout=scan.nodes[1].expr.nexprs=2;
+    scan.nodes[1].expr.outputs[1].index=1;
+    scan.nodes[1].expr.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.column=0};
+    scan.nodes[1].expr.exprs[1]=(struct qs_expr){.op=Q_COLUMN,.column=1};
+    scan.nodes[2].expr.nout=scan.nodes[3].expr.nout=1;
+    CHECK(cost_probe_expression(&scan,0,0,1));
+    scan.nodes[0].expr.exprs[0].column=1;
+    CHECK(!cost_probe_expression(&scan,0,0,1));
     /* Only supported >=64MiB conditions. More workmem reduces spill, and a
      * dataset larger than all memory still requires external merge. */
     double mib=1024*1024;
@@ -51,6 +63,13 @@ int main(void)
     CHECK(low.comparisons>0 && low.merge>0);
     CHECK(low.state==high.state);
     CHECK(isfinite(low.spill));
+    CHECK(low.record_copies==8*mib*(low.passes+1));
+    CHECK(cost_partial_rows(1000,100,100,0)<1000);
+    CHECK(cost_partial_rows(1000,100,10,0)>cost_partial_rows(1000,100,100,0));
+    CHECK(cost_partial_rows(1000,100,10,1)==100);
+    CHECK(cost_partial_rows(1000,100,10,-1)==100);
+    CHECK(cost_partial_rows(0,100,10,0)==0);
+    CHECK(cost_spill_io(1024*1024,5000,1000)>cost_spill_io(1024*1024,5000,5000));
     puts("planner cost: parallel waves, packed hash/group layouts and external sort passed");
     return EXIT_SUCCESS;
 }

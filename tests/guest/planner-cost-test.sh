@@ -5,7 +5,7 @@ OUT=$(mktemp -d /home/femu/results/planner-cost.XXXXXX)
 chmod 755 "$OUT"
 COLD=/home/femu/scripts/cold-query.sh
 QUERIES=/home/femu/tests/queries
-if [ "$#" -eq 0 ]; then set -- 1 6 9 13; fi
+if [ "$#" -eq 0 ]; then set -- 1 6 9 13 18; fi
 for query in "$@"; do
     if [ "$query" = 13 ]; then export PGOPTIONS='-c pg_sina_csd.max_memory=65536'; fi
     for mode in host-only SQLerate; do
@@ -24,6 +24,7 @@ for query in "$@"; do
         grep -q 'Estimated Spill I/O: 0 bytes' "$OUT/$query.plan"
     fi
     if [ "$query" = 9 ]; then grep -q 'rows=175 ' "$OUT/$query.plan"; fi
+    if [ "$query" = 18 ]; then grep -q 'Estimated Spill I/O: 0 bytes' "$OUT/$query.plan"; fi
     if grep -q 'Estimated CSD Serial CPU:' "$OUT/$query.plan"; then
         grep -q 'Estimated CSD Scheduling:' "$OUT/$query.plan"
         grep -q 'CSD Stage Estimates:' "$OUT/$query.plan"

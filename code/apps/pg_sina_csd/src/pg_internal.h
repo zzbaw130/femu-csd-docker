@@ -10,6 +10,7 @@ const char *pg_sina_path_name(void);
 bool pg_sina_hpcp_enabled(void);
 extern double pg_sina_host_cost_ms, pg_sina_csd_cpu_ratio;
 extern double pg_sina_internal_mbps, pg_sina_pcie_mbps, pg_sina_cache_mbps;
+extern double pg_sina_internal_write_mbps;
 extern double pg_sina_result_batch_ms, pg_sina_parallel_task_ms;
 extern bool pg_sina_profile;
 extern int pg_sina_max_memory;
@@ -34,6 +35,7 @@ void pg_sina_upper_paths(PlannerInfo *, UpperRelationKind, RelOptInfo *, RelOptI
 bool pg_sina_rewrite_query(Query *q);
 Plan *pg_sina_rewrite_plan(PlannerInfo *,Plan *);
 Plan *pg_sina_compile_subtree(PlannerInfo *,Plan *,bool);
+void pg_sina_refine_groups(struct qp_plan *);
 Plan *pg_sina_adaptive_plan(PlannerInfo *,Plan *);
 void pg_sina_explain_placement(CustomScan *,ExplainState *);
 extern const CustomScanMethods pg_sina_adaptive_methods;

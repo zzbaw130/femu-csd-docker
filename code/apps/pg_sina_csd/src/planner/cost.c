@@ -5,6 +5,7 @@
 #include "pg_internal.h"
 #include "cost_model.h"
 #include "catalog/pg_statistic.h"
+#include "catalog/pg_constraint.h"
 #include "utils/syscache.h"
 #include "utils/lsyscache.h"
 #include "access/relation.h"
@@ -286,12 +287,18 @@ static bool column_origin(const struct qp_plan *tree,int node,int expression,Oid
     const struct qs_output *out=&tree->nodes[child].expr.outputs[column];
     return !out->aggregate && column_origin(tree,child,out->index,rel,att,year);
 }
-static double column_distinct(Oid rel,int att,bool year,List **observations)
+static double relation_tuples(Oid rel)
+{
+    Relation relation=relation_open(rel,AccessShareLock);
+    double rows=Max(1,relation->rd_rel->reltuples);
+    relation_close(relation,AccessShareLock); return rows;
+}
+static double column_distinct(Oid rel,int att,bool year)
 {
     HeapTuple tuple=SearchSysCache3(STATRELATTINH,ObjectIdGetDatum(rel),Int16GetDatum(att),BoolGetDatum(false));
     if(!HeapTupleIsValid(tuple)) return 0;
     Form_pg_statistic st=(Form_pg_statistic)GETSTRUCT(tuple);
-    double rows=residency(rel,observations)->tuples;
+    double rows=relation_tuples(rel);
     double distinct=st->stadistinct<0?-st->stadistinct*rows:st->stadistinct;
     if(year) {
         int low=INT_MAX,high=INT_MIN;
@@ -309,9 +316,23 @@ static double column_distinct(Oid rel,int att,bool year,List **observations)
         }
         distinct=low<=high?Min(distinct,(double)high-low+1):0;
     }
+    if(distinct>0 && st->stanullfrac>0) distinct+=1;
     ReleaseSysCache(tuple); return distinct;
 }
-static void refine_groups(struct qp_plan *tree,List **observations)
+static double group_correlation(const struct qp_plan *tree,int node)
+{
+    const struct qp_node *n=&tree->nodes[node]; Oid rel; int att; bool year=false;
+    if(n->nkeys!=1 || !column_origin(tree,node,n->expr.keys[0],&rel,&att,&year)) return 0;
+    HeapTuple tuple=SearchSysCache3(STATRELATTINH,ObjectIdGetDatum(rel),Int16GetDatum(att),BoolGetDatum(false));
+    if(!HeapTupleIsValid(tuple)) return 0;
+    AttStatsSlot slot; double correlation=0;
+    if(get_attstatsslot(&slot,tuple,STATISTIC_KIND_CORRELATION,InvalidOid,ATTSTATSSLOT_NUMBERS)) {
+        if(slot.nnumbers) correlation=slot.numbers[0];
+        free_attstatsslot(&slot);
+    }
+    ReleaseSysCache(tuple); return correlation;
+}
+void pg_sina_refine_groups(struct qp_plan *tree)
 {
     double original[QP_NODES];
     for(unsigned i=0;i<tree->count;++i) original[i]=tree->nodes[i].estimated_rows;
@@ -322,7 +343,7 @@ static void refine_groups(struct qp_plan *tree,List **observations)
             for(unsigned k=0;k<n->nkeys;++k) {
                 Oid rel; int att; bool year=false;
                 if(!column_origin(tree,i,n->expr.keys[k],&rel,&att,&year)) { known=false; break; }
-                double ndv=column_distinct(rel,att,year,observations);
+                double ndv=column_distinct(rel,att,year);
                 if(ndv<=0) { known=false; break; }
                 groups*=ndv; derived|=year;
             }
@@ -330,6 +351,40 @@ static void refine_groups(struct qp_plan *tree,List **observations)
                 double selectivity=Min(1.0,n->estimated_rows/Max(1,n->estimated_groups));
                 n->estimated_groups=groups;
                 n->estimated_rows=groups*selectivity;
+            }
+            /* A sampled FK NDV can severely under-reserve local/global hash
+             * tables. Its referenced unique-key domain bounds state size;
+             * it does not prove all parent keys occur or change output rows. */
+            if(n->nkeys==1 && n->left>=0) {
+                Oid rel; int att; bool year=false;
+                if(column_origin(tree,i,n->expr.keys[0],&rel,&att,&year) && !year) {
+                    Relation relation=relation_open(rel,AccessShareLock); ListCell *c;
+                    foreach(c,RelationGetFKeyList(relation)) {
+                        ForeignKeyCacheInfo *fk=lfirst(c);
+                        if(fk->nkeys!=1 || fk->conkey[0]!=att) continue;
+                        HeapTuple constraint=SearchSysCache1(CONSTROID,ObjectIdGetDatum(fk->conoid));
+                        if(!HeapTupleIsValid(constraint)) continue;
+                        bool valid=((Form_pg_constraint)GETSTRUCT(constraint))->convalidated;
+                        ReleaseSysCache(constraint);
+                        if(!valid) continue;
+                        double bound=Min(tree->nodes[n->left].estimated_rows,relation_tuples(fk->confrelid)+1);
+                        n->estimated_groups=Max(n->estimated_groups,bound);
+                    }
+                    relation_close(relation,AccessShareLock);
+                }
+            }
+            for(int id=n->left;id>=0;id=tree->nodes[id].left) {
+                const struct qp_node *join=&tree->nodes[id];
+                if(join->kind==QP_AGGREGATE) break;
+                if(join->kind!=QP_JOIN && join->kind!=QP_INDEX_JOIN) continue;
+                bool probe=true;
+                for(unsigned k=0;k<n->nkeys;++k)
+                    if(!cost_probe_expression(tree,i,n->expr.keys[k],id)) probe=false;
+                if(probe && join->left>=0) {
+                    double bound=tree->nodes[join->left].estimated_rows;
+                    n->estimated_groups=Min(n->estimated_groups,bound);
+                    n->estimated_rows=Min(n->estimated_rows,bound);
+                }
             }
         } else if(n->kind==QP_LIMIT && n->left>=0) {
             n->estimated_rows=Min(original[i],Max(0,tree->nodes[n->left].estimated_rows-n->expr.offset));
@@ -358,10 +413,12 @@ static void fast_cost(struct placement *p,const struct qs_plan *plan,List **obse
     p->parallel=cost_parallel(r->tuples*(cpu_tuple_cost+cpu_operator_cost*Max(1,plan->nexprs))*unit,tasks,cus,0);
     p->schedule=cost_parallel(0,tasks,cus,pg_sina_parallel_task_ms);
     p->combine=(sort.comparisons+sort.merge+partial*plan->naggs)*cpu_operator_cost*unit;
-    p->cpu=p->parallel+p->schedule+p->combine;
     p->spill=plan->nkeys?sort.spill:0;
     p->peak=Min((double)pg_sina_query_memory(),fixed+(plan->nkeys?sort.state:0));
-    p->io=transfer_ms(r->bytes+p->spill,pg_sina_internal_mbps);
+    p->io=transfer_ms(r->bytes,pg_sina_internal_mbps)+
+        cost_spill_io(p->spill,pg_sina_internal_mbps,pg_sina_internal_write_mbps);
+    p->schedule+=ceil(p->spill/QS_SORT_IO_BYTES)*pg_sina_parallel_task_ms;
+    p->cpu=p->parallel+p->schedule+p->combine;
     p->population=pg_sina_hpcp_enabled()?transfer_ms(r->bytes,pg_sina_pcie_mbps):0;
     p->csd=Max(p->io+p->cpu,p->population)+2;
     p->boundary=transfer_ms(Max(1,ceil(rows/QS_RESULT_ROWS))*offsetof(struct qs_result,str_data),pg_sina_pcie_mbps)+
@@ -379,7 +436,6 @@ static void device_cost(struct placement *p,List **observations)
         fast_cost(p,(const struct qs_plan *)VARDATA(bytes),observations); return;
     }
     struct qp_plan *tree=palloc(sizeof(*tree)); memcpy(tree,VARDATA(bytes),sizeof(*tree));
-    refine_groups(tree,observations);
     bool used[QP_NODES]={0},indexed[QP_NODES]={0}; used[tree->root]=true;
     for(unsigned i=0;i<tree->ninit;++i) used[tree->init_nodes[i]]=true;
     for(unsigned pass=0;pass<tree->count;++pass) for(unsigned i=0;i<tree->count;++i) if(used[i]) {
@@ -468,9 +524,17 @@ static void device_cost(struct placement *p,List **observations)
                 p->combine+=groups*n->expr.naggs*cpu_operator_cost*unit;
                 if(table>available) {
                     double row=(n->nkeys+2*n->expr.naggs)*sizeof(struct qs_cell);
-                    spill=2*input*row; /* flushed states, bounded by input */
-                    double runs=Max(2,ceil(table/available));
-                    p->combine+=input*log2(runs)*cpu_operator_cost*unit;
+                    double resident_groups=groups*available/table;
+                    double partial=cost_partial_rows(input,groups,resident_groups,group_correlation(tree,i));
+                    struct cost_sort sort=cost_sort_state(partial,row,Min(quota,available/2));
+                    spill=sort.spill;
+                    /* This fallback runs on the coordinator: hashing input,
+                     * serializing partial states, sorting and recombining
+                     * them are distinct work, never divided by all CUs. */
+                    double scalar=pg_sina_host_cost_ms;
+                    p->combine+=(sort.comparisons+sort.merge)*cpu_operator_cost*scalar;
+                    p->combine+=sort.record_copies*(cpu_tuple_cost+(n->nkeys+2*n->expr.naggs)*cpu_operator_cost)*scalar;
+                    p->combine+=partial*n->expr.naggs*(cpu_tuple_cost+cpu_operator_cost)*scalar;
                 }
             } else if(n->sorted_input && !n->distinct && !n->distinct_aggs) {
                 state=n->expr.naggs*(3*sizeof(struct qs_cell)+16);
@@ -479,14 +543,16 @@ static void device_cost(struct placement *p,List **observations)
                 struct cost_sort sort=cost_sort_state(input,sort_width(tree,n->left),Min(quota,available));
                 state=sort.state; spill=sort.spill;
                 parallel_cpu(p,sort.comparisons*cpu_operator_cost*unit,group_tasks,cus);
-                p->combine+=(sort.merge*cpu_operator_cost*unit)+work;
+                p->combine+=(sort.merge*cpu_operator_cost+
+                    sort.record_copies*(cpu_tuple_cost+n->expr.nout*cpu_operator_cost))*pg_sina_host_cost_ms+work;
             }
         } else if(n->kind==QP_SORT) {
             double sort_memory=Max(quota,Max(available/2,available-2*quota));
             struct cost_sort sort=cost_sort_state(input,sort_width(tree,i),sort_memory);
             state=sort.state; spill=sort.spill;
             parallel_cpu(p,sort.comparisons*cpu_operator_cost*unit,n->left>=0?tasks[n->left]:0,cus);
-            p->combine+=sort.merge*cpu_operator_cost*unit+input*cpu_tuple_cost*unit;
+            p->combine+=(sort.merge*cpu_operator_cost+
+                sort.record_copies*(cpu_tuple_cost+n->expr.nout*cpu_operator_cost))*pg_sina_host_cost_ms;
         } else if(n->kind==QP_MATERIALIZED || n->kind==QP_SET) {
             state=n->kind==QP_SET?cost_slots(Max(rows,input)*2,64)*16:input*Max(1,n->expr.nout)*sizeof(struct qs_cell);
             spill=2*Max(0,state-available); p->serial+=work;
@@ -520,8 +586,8 @@ static void device_cost(struct placement *p,List **observations)
         double dictionary_live=Min(p->dictionary,Max(dictionary_meta,memory-peak[i]));
         dictionary_evicted=Max(dictionary_evicted,p->dictionary-dictionary_live);
         p->peak=Max(p->peak,peak[i]+dictionary_live);
-        appendStringInfo(p->stages,"%s%d/%s tasks=%.0f cpu=%.3fms state=%.0fB resident=%.0fB available=%.0fB spill=%.0fB",
-            p->stages->len?"; ":"",i,device_kind(n->kind),tasks[i],
+        appendStringInfo(p->stages,"%s%d/%s rows=%.0f groups=%.0f tasks=%.0f cpu=%.3fms state=%.0fB resident=%.0fB available=%.0fB spill=%.0fB",
+            p->stages->len?"; ":"",i,device_kind(n->kind),rows,n->estimated_groups,tasks[i],
             p->serial+p->parallel+p->schedule+p->combine-previous_cpu,state,resident,available,spill);
     }
     /* One CSF task executes a whole pipeline, not one request per SQL node.
@@ -531,7 +597,8 @@ static void device_cost(struct placement *p,List **observations)
             p->schedule+=cost_parallel(0,tasks[i],cus,pg_sina_parallel_task_ms);
     p->cache=scan_bytes?cache_bytes/scan_bytes:0;
     p->spill+=2*dictionary_evicted;
-    io+=transfer_ms(p->spill,pg_sina_internal_mbps);
+    io+=cost_spill_io(p->spill,pg_sina_internal_mbps,pg_sina_internal_write_mbps);
+    p->schedule+=ceil(p->spill/QS_SORT_IO_BYTES)*pg_sina_parallel_task_ms;
     p->io=io; p->cpu=p->serial+p->parallel+p->schedule+p->combine;
     p->population=pg_sina_hpcp_enabled()?transfer_ms(population_bytes,pg_sina_pcie_mbps):0;
     double device=io+p->cpu;

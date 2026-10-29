@@ -1263,6 +1263,7 @@ Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
     SPI_finish();
     if(!prepared) { pfree(tree); return native; }
     tree->root=result;
+    pg_sina_refine_groups(tree);
     pg_sina_read_resources(device);
     if(pg_sina_exe_path==PG_SINA_FILTER && native->parallel_aware &&
        (!IsA(native,SeqScan) || pg_sina_resources.cus<2)) { pfree(tree); return native; }

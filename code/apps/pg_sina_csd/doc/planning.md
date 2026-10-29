@@ -48,6 +48,7 @@ SET pg_sina_csd.max_memory=0;  -- 使用设备实际 workmem 总容量
 | csd_cpu_ratio | 0.35 | CU 数缩放前，设备向量 CPU 相对 HOST 的比例 |
 | parallel_task_ms | 0.02 | 每个并行任务波次的调度成本，待校准的初值 |
 | internal_mbps | 5000 | 聚合内部 I/O 带宽，十进制 MB/s |
+| internal_write_mbps | 1000 | Spill 写带宽初值，读仍用 internal_mbps；需随设备校准 |
 | pcie_mbps | 3500 | 每方向共享链路带宽，十进制 MB/s |
 | cache_mbps | 10000 | HOST 缓存扫描带宽，十进制 MB/s |
 | result_batch_ms | 1 | 每个设备结果批次的额外交付/物化毫秒数 |
