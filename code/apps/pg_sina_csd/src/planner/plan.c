@@ -586,6 +586,23 @@ static bool normalize_parallel_aggregate(Plan **slot)
     if(output_sort) *slot=(Plan *)output_sort;
     return true;
 }
+/* PG partial paths report rows per participant. Restore full-stream rows
+ * before removing Gather/partial Agg; private join build inputs stay whole. */
+static void global_parallel_rows(Plan *plan,double divisor)
+{
+    if(!plan) return;
+    if(divisor>1) plan->plan_rows*=divisor;
+    if(IsA(plan,Gather) || IsA(plan,GatherMerge)) {
+        unsigned workers=IsA(plan,Gather)?((Gather *)plan)->num_workers:((GatherMerge *)plan)->num_workers;
+        double leader=parallel_leader_participation?Max(0.0,1.0-0.3*workers):0;
+        global_parallel_rows(plan->lefttree,Max(1.0,workers+leader));
+        return;
+    }
+    global_parallel_rows(plan->lefttree,divisor);
+    double inner=IsA(plan,HashJoin) && plan->parallel_aware?divisor:1;
+    global_parallel_rows(plan->righttree,inner);
+    if(IsA(plan,SubqueryScan)) global_parallel_rows(((SubqueryScan *)plan)->subplan,divisor);
+}
 struct required_columns {
     Plan *plan,*left,*right;
     Bitmapset *left_columns,*right_columns;
@@ -660,6 +677,7 @@ static bool prune_columns(Plan *plan,Bitmapset *keep,bool all)
 static int compile_tree(PlannerInfo *root,Plan *native,struct qp_plan *tree)
 {
     Plan *copy=copyObject(native);
+    global_parallel_rows(copy,1);
     if(!normalize_parallel_aggregate(&copy) || !prune_columns(copy,NULL,true)) return -1;
     return compile_node(root,copy,tree,root->parse->sortClause!=NIL);
 }
@@ -1217,6 +1235,7 @@ Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
         unsigned init=tree->ninit++; tree->init_nodes[init]=id; tree->init_params[init]=param;
     }
     Plan *copy=copyObject(native);
+    global_parallel_rows(copy,1);
     int result=-1;
     if(normalize_parallel_aggregate(&copy) && prune_columns(copy,NULL,true))
         result=compile_node(root,copy,tree,boundary || root->parse->sortClause!=NIL);

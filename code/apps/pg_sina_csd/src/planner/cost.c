@@ -17,6 +17,8 @@
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "utils/rel.h"
+#include "utils/date.h"
+#include "utils/datetime.h"
 #include <float.h>
 #include <math.h>
 #include <fcntl.h>
@@ -29,7 +31,7 @@ struct placement {
     Plan *native,*device;
     PlannerInfo *root;
     List *children;
-    double host,native_host,csd,boundary,cache,spill,io,cpu,peak,population;
+    double host,native_host,csd,boundary,cache,spill,io,cpu,peak,population,rows;
     double serial,parallel,schedule,combine,dictionary,fdm;
     unsigned workers;
     StringInfo stages;
@@ -82,11 +84,11 @@ static Oid scan_relation(PlannerInfo *root,Plan *p)
     }
     return InvalidOid;
 }
-static double output_bytes(Plan *p,const struct qs_plan *output)
+static double output_bytes(Plan *p,const struct qs_plan *output,double rows)
 {
     /* Generic boundaries transfer projected cells and actual row counts;
      * worker intermediates and legacy single-table CSFs retain their ABI. */
-    double rows=Max(0,p->plan_rows);
+    rows=Max(0,rows);
     return rows*output->nout*sizeof(struct qs_cell)+
         Max(1,ceil(rows/qp_result_capacity(output,1)))*offsetof(struct qs_result,data)+
         rows*Max(0,p->plan_width-(int)output->nout*(int)sizeof(struct qs_cell));
@@ -265,12 +267,119 @@ static const char *device_kind(int kind)
     static const char *names[]={"Scan","Project","Join","Aggregate","Sort","Limit","IndexJoin","CTEScan","Materialize","Set"};
     return kind>=0 && kind<(int)lengthof(names)?names[kind]:"Unknown";
 }
+/* Follow compiled column references, including joins and projections. Only
+ * recognized expressions refine PG estimates; no query-specific row counts. */
+static bool column_origin(const struct qp_plan *tree,int node,int expression,Oid *rel,int *att,bool *year)
+{
+    const struct qp_node *n=&tree->nodes[node];
+    if(expression<0 || (unsigned)expression>=n->expr.nexprs) return false;
+    const struct qs_expr *e=&n->expr.exprs[expression];
+    if(e->op==Q_YEAR) { *year=true; return column_origin(tree,node,e->left,rel,att,year); }
+    if(e->op!=Q_COLUMN || e->column<0) return false;
+    if(n->kind==QP_SCAN) { *rel=n->expr.relid; *att=e->column+1; return true; }
+    if(n->left<0) return false;
+    int child=n->left,column=e->column;
+    if((unsigned)column>=tree->nodes[child].expr.nout) {
+        column-=tree->nodes[child].expr.nout; child=n->right;
+    }
+    if(child<0 || (unsigned)column>=tree->nodes[child].expr.nout) return false;
+    const struct qs_output *out=&tree->nodes[child].expr.outputs[column];
+    return !out->aggregate && column_origin(tree,child,out->index,rel,att,year);
+}
+static double column_distinct(Oid rel,int att,bool year,List **observations)
+{
+    HeapTuple tuple=SearchSysCache3(STATRELATTINH,ObjectIdGetDatum(rel),Int16GetDatum(att),BoolGetDatum(false));
+    if(!HeapTupleIsValid(tuple)) return 0;
+    Form_pg_statistic st=(Form_pg_statistic)GETSTRUCT(tuple);
+    double rows=residency(rel,observations)->tuples;
+    double distinct=st->stadistinct<0?-st->stadistinct*rows:st->stadistinct;
+    if(year) {
+        int low=INT_MAX,high=INT_MIN;
+        for(int kind=STATISTIC_KIND_MCV;kind<=STATISTIC_KIND_HISTOGRAM;++kind) {
+            AttStatsSlot slot;
+            if(get_attstatsslot(&slot,tuple,kind,InvalidOid,ATTSTATSSLOT_VALUES)) {
+                if(slot.valuetype==DATEOID) for(int i=0;i<slot.nvalues;++i) {
+                    DateADT date=DatumGetDateADT(slot.values[i]); int y,m,d;
+                    if(DATE_NOT_FINITE(date)) continue;
+                    j2date(date+POSTGRES_EPOCH_JDATE,&y,&m,&d);
+                    low=Min(low,y); high=Max(high,y);
+                }
+                free_attstatsslot(&slot);
+            }
+        }
+        distinct=low<=high?Min(distinct,(double)high-low+1):0;
+    }
+    ReleaseSysCache(tuple); return distinct;
+}
+static void refine_groups(struct qp_plan *tree,List **observations)
+{
+    double original[QP_NODES];
+    for(unsigned i=0;i<tree->count;++i) original[i]=tree->nodes[i].estimated_rows;
+    for(int i=(int)tree->count-1;i>=0;--i) {
+        struct qp_node *n=&tree->nodes[i];
+        if(n->kind==QP_AGGREGATE && n->nkeys) {
+            double groups=1; bool derived=false,known=true;
+            for(unsigned k=0;k<n->nkeys;++k) {
+                Oid rel; int att; bool year=false;
+                if(!column_origin(tree,i,n->expr.keys[k],&rel,&att,&year)) { known=false; break; }
+                double ndv=column_distinct(rel,att,year,observations);
+                if(ndv<=0) { known=false; break; }
+                groups*=ndv; derived|=year;
+            }
+            if(known && derived && n->estimated_groups>groups) {
+                double selectivity=Min(1.0,n->estimated_rows/Max(1,n->estimated_groups));
+                n->estimated_groups=groups;
+                n->estimated_rows=groups*selectivity;
+            }
+        } else if(n->kind==QP_LIMIT && n->left>=0) {
+            n->estimated_rows=Min(original[i],Max(0,tree->nodes[n->left].estimated_rows-n->expr.offset));
+        } else if(n->left>=0 && original[n->left]>0) {
+            n->estimated_rows*=tree->nodes[n->left].estimated_rows/original[n->left];
+        }
+    }
+}
+/* The fused single-table CSF keeps at most 256 groups per CU, flushes partial
+ * states when full, and merges those states rather than sorting base rows. */
+static void fast_cost(struct placement *p,const struct qs_plan *plan,List **observations)
+{
+    struct residency *r=residency(plan->relid,observations);
+    unsigned cus=Min(QS_WORKERS,Max(1,pg_sina_resources.cus));
+    double tasks=Max(1,ceil(r->bytes/QS_CHUNK)); cus=Min(cus,(unsigned)tasks);
+    Plan *aggregate=p->native;
+    while(aggregate && !IsA(aggregate,Agg)) aggregate=aggregate->lefttree;
+    double groups=plan->nkeys && aggregate?Max(1,((Agg *)aggregate)->numGroups):1;
+    double rows=Max(0,p->native->plan_rows),unit=pg_sina_host_cost_ms*pg_sina_csd_cpu_ratio;
+    double partial=groups<=QS_GROUPS?Min(r->tuples,cus*groups):r->tuples;
+    double fixed=cus*(QS_GROUPS*(QS_KEYS+QS_AGGS)*sizeof(struct qs_cell)+
+        2*sizeof(struct qs_plan)+sizeof(struct qs_result)+plan->nexprs*(256*20+128.0)+8192);
+    struct cost_sort sort=cost_sort_state(partial,(plan->nkeys+plan->naggs)*sizeof(struct qs_cell),
+        Max((double)QS_SORT_IO_BYTES,pg_sina_query_memory()-fixed));
+    p->workers=cus; p->rows=rows; p->cache=r->fraction;
+    p->parallel=cost_parallel(r->tuples*(cpu_tuple_cost+cpu_operator_cost*Max(1,plan->nexprs))*unit,tasks,cus,0);
+    p->schedule=cost_parallel(0,tasks,cus,pg_sina_parallel_task_ms);
+    p->combine=(sort.comparisons+sort.merge+partial*plan->naggs)*cpu_operator_cost*unit;
+    p->cpu=p->parallel+p->schedule+p->combine;
+    p->spill=plan->nkeys?sort.spill:0;
+    p->peak=Min((double)pg_sina_query_memory(),fixed+(plan->nkeys?sort.state:0));
+    p->io=transfer_ms(r->bytes+p->spill,pg_sina_internal_mbps);
+    p->population=pg_sina_hpcp_enabled()?transfer_ms(r->bytes,pg_sina_pcie_mbps):0;
+    p->csd=Max(p->io+p->cpu,p->population)+2;
+    p->boundary=transfer_ms(Max(1,ceil(rows/QS_RESULT_ROWS))*offsetof(struct qs_result,str_data),pg_sina_pcie_mbps)+
+        rows*cpu_tuple_cost*pg_sina_host_cost_ms+Max(1,ceil(rows/QS_RESULT_ROWS))*pg_sina_result_batch_ms;
+    p->stages=makeStringInfo();
+    appendStringInfo(p->stages,"fused Scan/Filter/Aggregate tasks=%.0f groups=%.0f partial_rows=%.0f state=%.0fB spill=%.0fB",
+        tasks,groups,partial,p->peak,p->spill);
+}
 static void device_cost(struct placement *p,List **observations)
 {
     CustomScan *scan=(CustomScan *)p->device;
     Const *constant=linitial_node(Const,scan->custom_private);
     bytea *bytes=DatumGetByteaP(constant->constvalue);
+    if(scan->methods==&pg_sina_scan_methods) {
+        fast_cost(p,(const struct qs_plan *)VARDATA(bytes),observations); return;
+    }
     struct qp_plan *tree=palloc(sizeof(*tree)); memcpy(tree,VARDATA(bytes),sizeof(*tree));
+    refine_groups(tree,observations);
     bool used[QP_NODES]={0},indexed[QP_NODES]={0}; used[tree->root]=true;
     for(unsigned i=0;i<tree->ninit;++i) used[tree->init_nodes[i]]=true;
     for(unsigned pass=0;pass<tree->count;++pass) for(unsigned i=0;i<tree->count;++i) if(used[i]) {
@@ -428,9 +537,12 @@ static void device_cost(struct placement *p,List **observations)
     double device=io+p->cpu;
     if(pg_sina_hpcp_enabled()) device=Max(device,p->population)+blocks*0.002;
     p->csd=device+2;
-    p->boundary=transfer_ms(output_bytes(p->native,&tree->nodes[tree->root].expr),pg_sina_pcie_mbps)+
-        Max(0,p->native->plan_rows)*cpu_tuple_cost*pg_sina_host_cost_ms+
-        Max(1,ceil(p->native->plan_rows/qp_result_capacity(&tree->nodes[tree->root].expr,1)))*pg_sina_result_batch_ms;
+    p->rows=tree->nodes[tree->root].estimated_rows;
+    scan->scan.plan.plan_rows=p->rows;
+    p->boundary=transfer_ms(output_bytes(p->native,&tree->nodes[tree->root].expr,p->rows),pg_sina_pcie_mbps)+
+        p->rows*cpu_tuple_cost*pg_sina_host_cost_ms+
+        Max(1,ceil(p->rows/qp_result_capacity(&tree->nodes[tree->root].expr,1)))*pg_sina_result_batch_ms;
+    memcpy(VARDATA(bytes),tree,sizeof(*tree));
     pfree(tree);
 }
 static struct placement *estimate(PlannerInfo *root,Plan *native,Plan *scope,List **observations,bool top,bool mark_restore)
@@ -480,7 +592,8 @@ static struct placement *estimate(PlannerInfo *root,Plan *native,Plan *scope,Lis
      * InitPlan. Whole-query conversion keeps the existing device protocol. */
     if(eligible && (top || root->init_plans==NIL)) {
         Plan *candidate=pg_sina_exe_path==PG_SINA_FILTER?pg_sina_project_scan(scope,native):native;
-        Plan *device=pg_sina_compile_subtree(root,candidate,!top);
+        Plan *device=top && pg_sina_exe_path!=PG_SINA_FILTER?pg_sina_fast_plan(root,native):NULL;
+        if(!device) device=pg_sina_compile_subtree(root,candidate,!top);
         if(device!=candidate) { p->device=device; device_cost(p,observations); }
     }
     p->offload=p->device && (pg_sina_exe_path!=PG_SINA_ADAPTIVE || p->csd+p->boundary<p->host);
@@ -519,8 +632,6 @@ static Plan *select_plan(struct placement *p,bool top,StringInfo decisions)
     if(p->offload) {
         Plan *out=p->device;
         if(top) {
-            Plan *fast=pg_sina_fast_plan(p->root,p->native);
-            if(fast) out=fast;
             p->root->init_plans=NIL;
         }
         CustomScan *scan=(CustomScan *)out;
