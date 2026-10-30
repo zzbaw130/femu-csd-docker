@@ -180,3 +180,42 @@ Q10候选元组仍为228021，workmem峰值仍为103780640B，Q12峰值仍为305
 额外固件tracing单独保存在`tpch.2ZOtgx`和`exec-graph-batch.aRjWGW/firmware-profile.log`：Q10完成事件数由36079降至3920，Q12由8451降至1939。逐段日志会影响墙钟，只用于验证完成归并。共同到达时间下，每段模型延迟包含同LUN的排队，累加的`io_model_ns`不再等于原串行服务时间和，不能用于推算查询墙钟收益。
 
 针对性qtest通过：16路独立NAND读取、同LUN排队、重叠FDM有序覆盖、普通LOAD跨64段窗口（65段逐页校验）、原设备图、spill及4KiB LBA、取消，以及默认/双poller的HPCP DMA。多MR用例还验证描述符所在MR被读结果覆盖后快照仍有效、两个范围的HPCP内容和LBA均正确。查询结束后FDM_USED=0，PG已恢复为无transport tracing的正常进程。本轮没有运行全量TPC-H。
+
+## Q12：让索引读取挂起时仍有其他任务可运行
+
+完整卸载和filter-only共有lineitem扫描及复杂谓词，不能将整段过滤CPU作为完整卸载多出的成本。完整卸载额外在设备上执行orders索引连接和聚合；此前4个任务槽对应4个物理CU，每个槽持有自己的4MiB输入及索引游标。索引缺页挂起会释放CU，却不释放当前任务槽；如果4个槽同时等内部读取，即使还有未领取的扫描块，也没有独立上下文开始处理它们。filter-only则可以让PG处理上一批匹配行，同时设备继续扫描。
+
+参考DuckDB的`PipelineExecutor`在输入阻塞时返回`INTERRUPTED`并保留任务状态的做法，本项目复用已有独立执行上下文、SNIA回调和设备就绪队列。含并行Index Join的pipeline使用每物理CU两个任务槽，最多64槽；物理CU数、线程数、NVMe接口和SQL算子均不变。扫描任务仍领取共享块序号，独立槽各自持有输入，不共享尚未完成的FDM内容。普通scan/filter不增加槽数。FDM布局继续按实际容量缩小输入块或减少槽数，不突破设备上限。
+
+规划器与执行器使用同一槽数规则：FDM、表达式scratch、局部聚合状态按任务槽计费，CPU并行成本仍最多按物理CU数计算。EXPLAIN的`CSD Device CUs`为物理数量，新增`CSD Task Slots`明确表示独立上下文数量；已有`CSD Workers`保留原字段及其执行槽统计含义。
+
+只用正式`tests/guest/queries/12.sql`，每个模式分别重启PG并清除Guest page cache。4 CU、256MiB workmem、64MiB FDM和PG参数不变。关闭profiling的最终记录为`results/tpch.I4mggb/`，所有结果与HOST一致：
+
+| Q12执行路径 | 冷启动延迟（ms） |
+| --- | ---: |
+| host-only | 1599.295 |
+| filter-only | 1156.080 |
+| csd-without-hpcp | 1044.980 |
+| csd-with-hpcp | 1062.048 |
+| SQLerate | 1131.961 |
+
+SQLerate选择完整CSD树：lineitem Scan/Filter → orders Index Join → Hash Aggregate → Sort，开启HPCP。无HPCP完整卸载比同轮filter-only低9.6%，比HOST低34.7%；相对此前关闭profiling的1505.277ms降低30.6%。跨轮单次数据不作为精确加速置信区间。
+
+相同PG阶段计时的独立诊断为修改前`tpch.xnRU1U`、修改后`tpch.CjdzuH`，与正式延迟分开：
+
+| 完整CSD指标 | 4任务槽 | 8任务槽 |
+| --- | ---: | ---: |
+| 物理CU | 4 | 4 |
+| 主扫描/索引连接阶段墙钟 | 1439.493ms | 1012.379ms |
+| 该阶段worker CPU累计 | 3752.527ms | 3394.866ms |
+| 平均活跃CU / CPU利用率 | 2.61 / 65.2% | 3.35 / 83.8% |
+| CSF调用次数 | 978 | 1017 |
+| 索引/Heap载入页 | 24592 | 24673 |
+| 匹配订单元组 | 31235 | 31235 |
+| FDM预留 | 24140496B（23.02MiB） | 46919632B（44.75MiB） |
+| workmem实际峰值 | 3052672B（2.91MiB） | 4745952B（4.53MiB） |
+| spill读/写 | 0 / 0 | 0 / 0 |
+
+索引读取页数及CSF调用没有减少，两个模式共有的过滤实现也未修改；收益来自用现有空闲FDM保留更多独立任务、提高计算与内部索引读取的重叠程度。复杂谓词的累计CPU仍很高，但不是本次针对的新增工作。阶段墙钟减去worker CPU/4约由501ms降至164ms，这个差额包含I/O、调度及负载不均衡等因素，不能称为精确的索引等待计时。
+
+扩展的heap布局及规划成本测试通过；设备算子的4槽和新增8槽索引连接测试在64MiB workmem下通过，覆盖inner/left/semi/anti、空输入、直接及分块输入、结果和资源清理。查询结束后FDM_USED=0。本轮未运行其他TPC-H查询。

@@ -2324,8 +2324,9 @@ int main(int argc,char **argv)
     assert(qp_worker_mask(0)==0 && qp_worker_mask(32)==UINT32_MAX && qp_worker_mask(64)==UINT64_MAX);
     assert(argc==2 || argc==3 || argc==4); void *library=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(library);
     function capacity=(function)dlsym(library,"pg_sina_workmem_capacity"); assert(capacity);
-    if(argc==3 && !strcmp(argv[2],"--index-join-64m")) {
-        assert(!cs_work_init(64U*1024*1024)); test_workers=4;
+    if(argc>=3 && !strcmp(argv[2],"--index-join-64m")) {
+        assert(!cs_work_init(64U*1024*1024)); test_workers=argc==4?strtoul(argv[3],NULL,10):4;
+        assert(test_workers && test_workers<=QS_WORKERS);
         function run=(function)dlsym(library,"pg_sina_plan"); assert(run);
         for(unsigned scheduled=0;scheduled<2;++scheduled) {
             test_scheduled=scheduled;

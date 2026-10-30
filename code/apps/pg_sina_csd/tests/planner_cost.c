@@ -132,6 +132,7 @@ int main(void)
     struct qp_plan scan={.count=1};
     scan.nodes[0].kind=QP_SCAN; scan.nodes[0].left=scan.nodes[0].right=-1; scan.nodes[0].bytes=8*1024*1024;
     qp_parallel_boundaries(&scan,0); CHECK(scan.nodes[0].parallel);
+    CHECK(qp_task_slots(&scan,4)==4); /* Scan-only needs no extra I/O contexts. */
     scan.nodes[0].parallel=0; scan.nodes[0].ordered_index=1;
     qp_parallel_boundaries(&scan,0); CHECK(!scan.nodes[0].parallel);
     memset(&scan,0,sizeof(scan)); scan.count=4;
@@ -146,6 +147,12 @@ int main(void)
     CHECK(cost_probe_expression(&scan,0,0,1));
     scan.nodes[0].expr.exprs[0].column=1;
     CHECK(!cost_probe_expression(&scan,0,0,1));
+    scan.nodes[1].parallel=1; scan.nodes[2].left=-1;
+    CHECK(qp_task_slots(&scan,4)==8);
+    CHECK(qp_task_slots(&scan,8)==16);
+    CHECK(qp_task_slots(&scan,64)==QS_WORKERS);
+    scan.nodes[1].parallel=0;
+    CHECK(qp_task_slots(&scan,4)==4); /* A serial index branch changes nothing. */
     /* Only supported >=64MiB conditions. More workmem reduces spill, and a
      * dataset larger than all memory still requires external merge. */
     double mib=1024*1024;

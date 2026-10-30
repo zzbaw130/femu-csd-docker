@@ -110,14 +110,14 @@ static double output_bytes(Plan *p,const struct qs_plan *output,double rows)
     rows=Max(0,rows);
     return rows*width+Max(1,ceil(rows/output_capacity(p,output)))*offsetof(struct qs_result,data);
 }
-/* Match executor layout selection: try smaller input blocks before fewer CUs.
+/* Match executor layout selection: try smaller input blocks before fewer tasks.
  * File-extent descriptors are not yet available here; allow one page/node. */
 static unsigned device_workers(struct qp_plan *tree,double *fdm)
 {
     unsigned workers=1;
     bool indexed[QP_NODES]={0};
     for(unsigned i=0;i<tree->count;++i) {
-        if(tree->nodes[i].parallel) workers=Min(QS_WORKERS,Max(1,pg_sina_resources.cus));
+        if(tree->nodes[i].parallel) workers=qp_task_slots(tree,pg_sina_resources.cus);
         if(tree->nodes[i].kind==QP_INDEX_JOIN) indexed[tree->nodes[i].right]=true;
     }
     unsigned chunk=QS_CHUNK;
@@ -463,7 +463,9 @@ static void device_cost(struct placement *p,List **observations)
     }
     qp_parallel_boundaries(tree,tree->root);
     for(unsigned i=0;i<tree->ninit;++i) qp_parallel_boundaries(tree,tree->init_nodes[i]);
-    unsigned cus=device_workers(tree,&p->fdm); p->workers=cus;
+    unsigned slots=device_workers(tree,&p->fdm); p->workers=slots;
+    /* Suspended task contexts consume buffers/state, never extra CPU cores. */
+    unsigned cus=Min(slots,Max(1,pg_sina_resources.cus));
     p->stages=makeStringInfo();
     double tasks[QP_NODES]={0},peak[QP_NODES]={0},live[QP_NODES]={0},retained[QP_NODES]={0};
     pipeline_tasks(tree,tasks);
@@ -486,7 +488,7 @@ static void device_cost(struct placement *p,List **observations)
         double lr=n->left>=0?retained[n->left]:0,rr=n->right>=0?retained[n->right]:0;
         /* One vector has 16-byte lanes + NULL/scale/error arrays. Actual
          * expression allocation can be lazy; this is reserved scratch. */
-        unsigned copies=tasks[i]>1?cus+1:1;
+        unsigned copies=tasks[i]>1?slots+1:1;
         double scratch=copies*(n->expr.nexprs*(256*20+128.0)+sizeof(struct qs_plan));
         double available=Max((double)QS_SORT_IO_BYTES,memory-dictionary_meta-scratch-l-r);
         double expression=cpu_operator_cost*Max(1,n->expr.nexprs);
@@ -526,16 +528,16 @@ static void device_cost(struct placement *p,List **observations)
         } else if(n->kind==QP_AGGREGATE) {
             double groups=Max(1,n->estimated_groups),group_tasks=n->left>=0?tasks[n->left]:0;
             if(!n->nkeys) {
-                state=(cus+1)*n->expr.naggs*(3*sizeof(struct qs_cell)+16);
+                state=(slots+1)*n->expr.naggs*(3*sizeof(struct qs_cell)+16);
                 parallel_cpu(p,work,group_tasks,cus);
-                p->combine+=cus*n->expr.naggs*cpu_operator_cost*unit;
+                p->combine+=slots*n->expr.naggs*cpu_operator_cost*unit;
             } else if(n->hash && qp_hash_aggregate_supported(n)) {
                 available=Max((double)QS_SORT_IO_BYTES,available-2*quota);
                 double table=cost_group_state(n,groups);
-                bool locals=cus>1 && group_tasks>1 && (cus+1)*table<=available;
-                state=locals?(cus+1)*table:table;
+                bool locals=slots>1 && group_tasks>1 && (slots+1)*table<=available;
+                state=locals?(slots+1)*table:table;
                 parallel_cpu(p,input*(cpu_tuple_cost+expression)*unit,group_tasks,cus);
-                if(locals) parallel_cpu(p,cus*groups*n->expr.naggs*cpu_operator_cost*unit,ceil(groups/QP_VECTOR_ROWS),cus);
+                if(locals) parallel_cpu(p,slots*groups*n->expr.naggs*cpu_operator_cost*unit,ceil(groups/QP_VECTOR_ROWS),cus);
                 else if(group_tasks>1) p->serial+=input*cpu_operator_cost*Max(1,n->nkeys)*unit;
                 p->combine+=groups*n->expr.naggs*cpu_operator_cost*unit;
                 if(table>available) {

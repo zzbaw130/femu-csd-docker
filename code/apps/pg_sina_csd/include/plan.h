@@ -61,7 +61,7 @@ struct qp_file_mapping {
 };
 struct qp_plan {
     unsigned count, root, nparams, ninit;
-    unsigned workers, scan_bytes;
+    unsigned workers, scan_bytes; /* workers counts task contexts, not physical CUs. */
     unsigned packed_result; /* 0: legacy, 1: projected cells, 2: typed, 3: CU-direct typed. */
     uint64_t parallel_stride;
     int param_nodes[QP_PARAMS],cte_nodes[QP_PARAMS],init_nodes[QP_PARAMS],init_params[QP_PARAMS];
@@ -242,5 +242,21 @@ static inline void qp_parallel_boundaries(struct qp_plan *p,int id)
     /* Merge inputs have independent blocking pipelines too. An index lookup
      * is driven by its left input and must not become a full parallel scan. */
     if(n->kind==QP_JOIN) qp_parallel_boundaries(p,n->right);
+}
+/* Index misses suspend a task while retaining its input. Keep a second
+ * task per physical CU ready to run during that I/O. These are independent
+ * execution contexts, not extra compute threads. The caller must still fit
+ * their buffers in FDM and may reduce this count when capacity is limited. */
+static inline unsigned qp_task_slots(const struct qp_plan *p,unsigned cus)
+{
+    unsigned slots=cus<QS_WORKERS?cus:QS_WORKERS;
+    if(!slots) slots=1;
+    for(unsigned i=0;i<p->count;++i) if(p->nodes[i].parallel)
+        for(int id=i;id>=0;id=p->nodes[id].left) {
+            if(p->nodes[id].kind==QP_INDEX_JOIN)
+                return slots>QS_WORKERS/2?QS_WORKERS:2*slots;
+            if(id==qp_pipeline_source(p,i)) break;
+        }
+    return slots;
 }
 #endif

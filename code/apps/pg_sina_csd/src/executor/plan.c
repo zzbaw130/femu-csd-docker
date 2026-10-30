@@ -424,7 +424,7 @@ static void start(PlanStateCsd *s)
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].parallel) parallel=true;
     s->plan->workers=1; s->workers=0;
     s->device_cus=pg_sina_resources.cus;
-    if(parallel) s->workers=Min(QS_WORKERS,s->device_cus);
+    if(parallel) s->workers=qp_task_slots(s->plan,s->device_cus);
     uint64_t capacity=pg_sina_resources.fdm_bytes;
     if(s->workers<=1) s->workers=0;
     s->plan->scan_bytes=QS_CHUNK;
@@ -1144,6 +1144,7 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
         ExplainPropertyInteger("CSD Indexed Heap Tuples",NULL,s->result->metrics.index_tuples,es);
         ExplainPropertyInteger("CSD Workmem Peak","bytes",s->result->metrics.work_peak,es);
         ExplainPropertyInteger("CSD Workers",NULL,s->result->metrics.workers,es);
+        ExplainPropertyInteger("CSD Task Slots",NULL,s->workers?s->workers:1,es);
         ExplainPropertyInteger("CSD Parallel Pipelines",NULL,s->slots[0].control.epoch,es);
         ExplainPropertyInteger("CSD Scan Block","bytes",s->plan->scan_bytes,es);
         ExplainPropertyInteger("CSD Scan Vector Capacity","rows",QP_VECTOR_ROWS,es);
