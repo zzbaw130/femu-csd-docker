@@ -116,3 +116,46 @@ Q1 的独立冷启动诊断使用 `tpch.0aL9ts` 与 `tpch.rDLmIJ`，不混入正
 两次设备 spill 均为零，协调 CPU 均约 0.011ms。原来的主要问题是失去原值投影后的转换和通用路径开销，不能归因于物理内存不足。各项累计时间存在并行和包含关系，不作为可相加的 SQL 墙钟占比。
 
 PG 两项组件测试通过；设备的原类型返回、4/8 CU 直接交付和索引连接三项测试通过。直接交付用例补充了固定列比较后保留变长正文、NULL、过滤排除行及唯一性交付检查；Numeric/字符串谓词继续走原物化路径的边界也有覆盖。三条查询结束后 FDM_USED 为零。本轮未重跑完整 TPC-H。
+
+## Q16/Q21 的供给、反压与 Q11/Q22 未卸载原因
+
+本轮只诊断，不修改执行代码。正式全量记录`results/tpch.BW5CB4/`中Q16为HOST 601.408ms、filter-only 849.303ms；Q21为1911.633/2173.111ms。补充使用原SQL、逐次冷启动的设备/交付profiling，记录在`results/tpch.YSbPWD/`；另用auto_explain开启ANALYZE/TIMING/BUFFERS/VERBOSE，保存在`results/filter-only-node-times.A6lOfa/`。两组诊断都逐行比较HOST/filter-only一致，插桩延迟不作为新的正式成绩。设备仍为4 CU、256MiB workmem、64MiB FDM，结束后FDM_USED=0。
+
+当前两条的IN/EXISTS并没有全部卸载：Q16仅卸载part的品牌、类型、尺寸过滤，partsupp的NOT IN及supplier子查询留在HOST；Q21仅卸载l1的`l_receiptdate > l_commitdate`，l2/l3的EXISTS/NOT EXISTS仍由HOST执行参数化lineitem_pkey探测，orders也留在HOST。因此不能把它们概括成设备执行了完整的IN/EXISTS过滤。
+
+| 设备/交付诊断 | Q16 | Q21 |
+| --- | ---: | ---: |
+| 设备扫描行数 | 200000 | 6001215 |
+| 返回行数 | 29182 | 3793296 |
+| 返回字节 | 1731802 | 31615400 |
+| 扫描pipeline墙钟 | 218.797ms | 1956.036ms |
+| CSF CPU累计 | 242.988ms | 1818.259ms |
+| Heap解码CPU累计 | 26.819ms | 1078.419ms |
+| Filter CPU累计 | 187.941ms | 193.679ms |
+| 平均活跃CU | 1.11 | 0.93 |
+| HOST等空队列累计 | 857.696ms | 16.614ms |
+| 回调等满队列累计 | 0 | 1786.479ms |
+| 结果读取墙钟累计 | 4.685ms | 112.764ms |
+| 消费队列复制累计 | 1.375ms | 38.124ms |
+| 消费队列锁等待累计 | 2.804ms | 7.872ms |
+
+这些累计量有并行和包含关系，尤其HOST空队列等待合计多个PG参与者，不能与pipeline墙钟相加。`CSD Tree Wall`还包括源扫描结束后HOST执行期间，不能当作设备扫描计算时间；Q21的pipeline墙钟本身也包含HOST反压，不能将约2秒全部算作设备过滤。
+
+Q16由设备供给及其与PG并行Hash构建的衔接拖累，未表现出HOST消费不及。满队列等待为0，HOST则明显等数据，读回/复制/队列锁均远小于源阶段。节点插桩中，相同part输入的平均扫描时间（5个PG参与者，含leader）从原生54.219ms变为CustomScan 153.911ms；Gather结束从187.793ms推迟到435.142ms。其后HOST输入排序自身约289.6/290.1ms，聚合自身约61.8/62.5ms，基本不变，不能将两边共有的排序、DISTINCT或NOT IN归为新增开销。设备Filter占CSF累计CPU大头，字符串比较/LIKE仍走`query_vector.h`的逐值通用求值，不走`filter.c`的纯数值比较SIMD快路径；实际平均活跃也只有约1.1 CU。现有计时尚不能把所有供给/启动间隙归到某一个锁或函数。
+
+Q21表现为HOST索引消费受阻，进一步使设备反压。与原生相比并没有增加EXISTS探测次数；关键差异是没有经HOST扫描填入基表页，破坏了本次查询内部的索引缓存复用。节点诊断如下：
+
+| Q21 HOST节点指标 | 原生PG | filter-only |
+| --- | ---: | ---: |
+| l3索引探测次数 | 141445 | 141445 |
+| l3 shared_buffers缺失页 | 16634 | 97838 |
+| l3 shared_buffers命中页 | 551668 | 470464 |
+| l3文件读取I/O时间累计 | 487.554ms | 6452.679ms |
+| l2索引探测次数 | 12602 | 12602 |
+| orders索引探测次数 | 7601 | 7601 |
+
+原生l1扫描逐渐将lineitem Heap页放入shared_buffers及文件页缓存，后续l3可复用；filter-only的内部NVM读取没有将这些页带回HOST，只交付过滤后的列值，且该模式按定义关闭HPCP。冷启动只清空查询开始前的缓存，不禁止查询内复用。多出的81204次PG缺失块读取约合634.4MiB逻辑页访问；这里的页数不是NVMe命令数，I/O时间也包含多个PG参与者的并发，不与SQL墙钟相加。结果交付仍有额外成本，但不能用原生也存在的三组索引探测或设备约2秒的受反压源阶段，替代这个缓存差异解释。
+
+Q11/Q22都有Seq Scan，未卸载不是缺少扫描算子或FDM不足，而是`src/planner/cost.c:estimate`的`eligible && (top || root->init_plans==NIL)`规则：只要所在PlannerInfo有InitPlan，所有非根CSD子树都被跳过。Q11的HAVING阈值、Q22的AVG阈值都被PG编成`InitPlan 1 (returns $1)`。该规则为隔离HOST生成的执行参数而设，却连不使用$1的扫描一起挡住；此外Gather下非parallel-aware的私有Hash输入仍按既有规则保留HOST，这与共享流不是可重放源有关。
+
+正确的修复边界应区分扫描是否真正依赖HOST参数。Q11的partsupp扫描、Q22不依赖$1的输入可独立处理；Q22的`c_acctbal > $1`确实需要HOST参数绑定或保留该剩余谓词。不能只去掉这个判断：当前`pg_sina_compile_subtree`会遍历并编译所在root的全部InitPlan，直接放开会把聚合/连接子计划偷偷塞入filter-only扫描程序，违背只卸载扫描过滤的边界。本轮仅确认原因，未改规则或新增协议。
