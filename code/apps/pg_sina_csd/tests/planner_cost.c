@@ -113,6 +113,22 @@ int main(void)
     for(unsigned i=0;i<strings;++i) CHECK((unsigned char)slice->str_data[i]==(unsigned char)i);
     free(slice);
     free(packet);
+    /* Filtering a fixed-width column need not decode or re-encode the
+     * Numeric projection. A numeric/string predicate retains the old path. */
+    struct qp_plan *filtered=calloc(1,sizeof(*filtered)); CHECK(filtered);
+    filtered->packed_result=QP_DIRECT_RESULT; filtered->count=1;
+    struct qs_plan *projection=&filtered->nodes[0].expr;
+    projection->nattrs=2; projection->nexprs=4; projection->nout=1; projection->predicate=3;
+    projection->cols[0].type=Q_DECIMAL; projection->cols[1].type=Q_INTEGER;
+    projection->exprs[0]=(struct qs_expr){.op=Q_COLUMN,.column=0};
+    projection->exprs[1]=(struct qs_expr){.op=Q_COLUMN,.column=1};
+    projection->exprs[2]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=100};
+    projection->exprs[3]=(struct qs_expr){.op=Q_LE,.left=1,.right=2};
+    projection->outputs[0].type_oid=1700;
+    CHECK(qp_host_raw_projection(filtered));
+    projection->cols[1].type=Q_DECIMAL; CHECK(!qp_host_raw_projection(filtered));
+    projection->cols[1].type=Q_STRING; CHECK(!qp_host_raw_projection(filtered));
+    free(filtered);
     struct qp_plan scan={.count=1};
     scan.nodes[0].kind=QP_SCAN; scan.nodes[0].left=scan.nodes[0].right=-1; scan.nodes[0].bytes=8*1024*1024;
     qp_parallel_boundaries(&scan,0); CHECK(scan.nodes[0].parallel);

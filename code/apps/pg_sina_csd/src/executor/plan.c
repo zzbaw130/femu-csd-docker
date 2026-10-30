@@ -956,6 +956,7 @@ static void fetch(PlanStateCsd *s)
                 else {
                     memcpy(s->result->data,batch->data,qp_host_bytes(&s->plan->nodes[s->plan->root].expr,rows));
                     memcpy(s->result->str_data,batch->str_data,batch->str_bytes);
+                    s->result->str_bytes=batch->str_bytes;
                 }
                 q->position+=rows;
                 s->result->finished=batch->finished && q->position==batch->rows;

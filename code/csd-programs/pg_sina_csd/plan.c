@@ -1580,7 +1580,7 @@ static int scan_filter_init(struct execution *s,const struct qs_plan *p,struct o
         *o->scan_filter=*p;
         for(unsigned col=0;col<p->nattrs;++col)
             if(p->cols[col].slot>=0 && (p->cols[col].type==Q_DECIMAL || p->cols[col].type==Q_STRING))
-                o->scan_filter->cols[col].deferred=QS_DEFERRED;
+                o->scan_filter->cols[col].deferred=QS_FILTER_ONLY;
         o->scan_filter_checked=1;
     }
     if(!o->scan_filter_checked) {

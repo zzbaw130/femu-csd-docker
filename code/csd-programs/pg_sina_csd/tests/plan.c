@@ -202,6 +202,12 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
         leaf->expr.exprs[6]=(struct qs_expr){.op=Q_OR,.type=Q_INTEGER,.left=4,.right=5};
         leaf->expr.predicate=6;
     }
+    if(payload==3) {
+        leaf->expr.nexprs=5;
+        leaf->expr.exprs[3]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER,.constant=rows/2};
+        leaf->expr.exprs[4]=(struct qs_expr){.op=Q_GE,.type=Q_INTEGER,.left=1,.right=3};
+        leaf->expr.predicate=4;
+    }
     leaf->input_offset=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
     leaf->vector_offset=leaf->input_offset+p->scan_bytes;
     struct qp_node *root=&p->nodes[0];
@@ -339,6 +345,7 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
             assert(seen<rows);
             if(ordered==DICTIONARY_SORT) while(key<rows && expected[key]%97==0) ++key;
             unsigned source=ordered==DICTIONARY_SORT?(key<rows?expected[key]:null_row):(unsigned)v[1].value;
+            if(payload==3) assert(source>=rows/2);
             unsigned value_key=ordered==DICTIONARY_SORT?key:(source*1009)%rows;
             assert(source<rows && !visited[source]); visited[source]=1;
             if(source%97) {
@@ -371,12 +378,13 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
         }
     }
     if(!cancel) {
-        assert(seen==rows && (test_packed || (spill.stores && (!ordered || loads))) && peak<=budget);
+        assert(seen==(payload==3?rows-rows/2:rows) && (test_packed || (spill.stores && (!ordered || loads))) && peak<=budget);
+        if(payload==3) for(unsigned r=0;r<rows;++r) assert(visited[r]==(r>=rows/2));
         if(!ordered) assert(namespace_loads==raw_bytes/QS_PAGE);
         if(workers) assert(out->metrics.workers==workers && p->pipelines[1].worker_ns);
         if(qp_host_raw_projection(p)) assert(!out->metrics.dictionary_entries && !out->metrics.dictionary_bytes && !loads && !spill.stores);
         else assert((test_packed || out->metrics.dictionary_bytes>budget) && out->metrics.dictionary_entries==rows-(rows+96)/97+(payload?40:0)+(payload==2));
-        if(payload==2) assert(out->profile.operators[QS_FILTER].calls);
+        if(payload==2 || payload==3) assert(out->profile.operators[QS_FILTER].calls);
         if(ordered==DICTIONARY_SORT && budget>=64U*1024*1024)
             assert((uint64_t)loads*QS_SORT_IO_BYTES<out->metrics.dictionary_bytes*8);
         for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i]);
@@ -2343,6 +2351,7 @@ int main(int argc,char **argv)
         function run=(function)dlsym(library,"pg_sina_plan"); assert(run);
         dictionary_plan(run,0,4,DICTIONARY_ASYNC_SCAN,65536,64U*1024*1024,1);
         dictionary_plan(run,0,8,DICTIONARY_ASYNC_SCAN,8192,64U*1024*1024,2);
+        dictionary_plan(run,0,4,DICTIONARY_ASYNC_SCAN,8192,64U*1024*1024,3);
         return 0;
     }
     if(argc==3 && !strcmp(argv[2],"--dictionary-64m")) {

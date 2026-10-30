@@ -72,7 +72,18 @@ struct qp_plan {
 static inline int qp_host_raw_projection(const struct qp_plan *p)
 {
     const struct qp_node *n=&p->nodes[p->root];
-    if(p->packed_result<QP_TYPED_RESULT || n->kind!=QP_SCAN || n->ordered_index || n->expr.predicate>=0) return 0;
+    if(p->packed_result<QP_TYPED_RESULT || n->kind!=QP_SCAN || n->ordered_index) return 0;
+    if(n->expr.predicate>=0) {
+        /* A fixed-width column comparison leaves projected Numeric/text
+         * bodies untouched. Other predicates retain normal materialization. */
+        const struct qs_expr *e=&n->expr.exprs[n->expr.predicate];
+        if(e->op<Q_EQ || e->op>Q_GE || e->left<0 || e->right<0) return 0;
+        const struct qs_expr *col=&n->expr.exprs[e->left],*value=&n->expr.exprs[e->right];
+        if(col->op==Q_CONST) { const struct qs_expr *swap=col; col=value; value=swap; }
+        if(col->op!=Q_COLUMN || value->op!=Q_CONST || col->column<0 ||
+           (unsigned)col->column>=n->expr.nattrs || value->type==Q_STRING ||
+           n->expr.cols[col->column].type==Q_STRING || n->expr.cols[col->column].type==Q_DECIMAL) return 0;
+    }
     int variable=0;
     for(unsigned i=0;i<n->expr.nout;++i) {
         const struct qs_expr *e=&n->expr.exprs[n->expr.outputs[i].index];
