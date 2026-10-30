@@ -116,7 +116,7 @@ static unsigned device_workers(struct qp_plan *tree,double *fdm)
                     qp_scan_buffer_bytes(tree,n))+TYPEALIGN(4096,qs_chunk_bytes(
                     n->ordered_index?256:qp_scan_capacity(tree,n),n->expr.ncols));
             if(n->kind==QP_INDEX_JOIN)
-                input=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE+4096+TYPEALIGN(4096,
+                input=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE+qs_index_input_bytes()+TYPEALIGN(4096,
                     qs_chunk_bytes(256,tree->nodes[n->right].expr.ncols+2));
             arena+=input;
         }
@@ -131,7 +131,7 @@ static unsigned device_workers(struct qp_plan *tree,double *fdm)
                         n->ordered_index?256:qp_scan_capacity(tree,n),n->expr.ncols));
                     break;
                 }
-                if(n->kind==QP_INDEX_JOIN) bytes+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE+4096+
+                if(n->kind==QP_INDEX_JOIN) bytes+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE+qs_index_input_bytes()+
                     TYPEALIGN(4096,qs_chunk_bytes(256,tree->nodes[n->right].expr.ncols+2));
             }
             stride=Max(stride,bytes);

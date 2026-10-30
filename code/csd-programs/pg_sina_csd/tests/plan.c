@@ -418,7 +418,7 @@ static void *probe_worker(void *arg)
         assert(iteration<1000000);
         struct qp_control *c=t->control;
         if(!csIsReentry(&t->args)) t->args.cparam1=(t->worker<<1)|(t->args.cparam1&1);
-        if(t->next_offset && *t->need_input && !csIsReentry(&t->args)) {
+        if(t->next_offset && *t->need_input && !c->index_nreads && !csIsReentry(&t->args)) {
             const struct qp_node *n=&t->plan->nodes[t->scan_node-1];
             uint64_t offset=atomic_fetch_add(t->next_offset,t->plan->scan_bytes);
             if(offset>n->bytes) offset=n->bytes;
@@ -427,7 +427,7 @@ static void *probe_worker(void *arg)
             memcpy(t->arena+input,((t->scan_node-1==3 || t->scan_node-1==6)?t->heap:t->raw)+offset,bytes);
             t->args.cparam1|=QP_SCAN_INPUT | ((offset/QS_PAGE)<<QP_SCAN_PAGE_SHIFT);
             *t->need_input=false;
-        } else if(!t->next_offset && !csIsReentry(&t->args) && (c->index_nreads || c->bytes) && !c->ready) {
+        } else if(!csIsReentry(&t->args) && (c->index_nreads || (!t->next_offset && c->bytes)) && !c->ready) {
             assert(!t->plan->files[2].count); /* mapped workers must continue without host LOADs */
             const struct qp_node *n=&t->plan->nodes[c->node];
             size_t offset=t->worker>1?n->parallel_input+(t->worker-2)*t->plan->parallel_stride:n->input_offset;
@@ -464,7 +464,7 @@ static void *probe_worker(void *arg)
         assert(((status&QP_WORKER_FINISHED)!=0)==(t->out->finished!=0));
         assert(((status&QP_CONTROL_REQUIRED)!=0)==(!c->ready && (c->bytes || c->index_nreads)));
         if(t->next_offset) {
-            assert((unsigned)status<=7);
+            assert((unsigned)status<=15); /* A probe may request index pages. */
             *t->need_input=(status&QP_INPUT_DRAINED)!=0;
         }
         if(t->out->rows || t->out->finished) return NULL;
@@ -714,7 +714,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     for(unsigned i=0;i<plan->count;++i) if(plan->nodes[i].kind==QP_INDEX_JOIN) {
         struct qp_node *indexed=&plan->nodes[i];
         indexed->input_offset=bytes; bytes+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE;
-        indexed->vector_offset=bytes; bytes+=4096+((qs_chunk_bytes(256,4)+4095)&~(size_t)4095);
+        indexed->vector_offset=bytes; bytes+=qs_index_input_bytes()+((qs_chunk_bytes(256,4)+4095)&~(size_t)4095);
     }
     size_t parallel_bytes=bytes;
     if(parallel && parallel!=TEST_PARTITION_SERIAL) {
@@ -724,7 +724,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         for(unsigned i=0;i<plan->count;++i) if(plan->nodes[i].kind==QP_INDEX_JOIN) {
             struct qp_node *indexed=&plan->nodes[i];
             indexed->parallel_input=parallel_bytes; parallel_bytes+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE;
-            indexed->parallel_vector=parallel_bytes; parallel_bytes+=4096+((qs_chunk_bytes(256,4)+4095)&~(size_t)4095);
+            indexed->parallel_vector=parallel_bytes; parallel_bytes+=qs_index_input_bytes()+((qs_chunk_bytes(256,4)+4095)&~(size_t)4095);
         }
         if(parallel==TEST_BUILD_PHASE || parallel==TEST_BUILD_FALLBACK || grouped_build || wide_build) {
             plan->nodes[3].parallel=1;
@@ -886,7 +886,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     if(parallel==TEST_JOIN_QUAL && right_rows==150000) assert(spill.count);
     if(parallel==TEST_GROUP_SOURCE_SPILL) assert(spill.count && !plan->nodes[1].parallel);
     if(test_workers>4 && parallel) assert(out->metrics.workers==test_workers && control.epoch);
-    if(parallel==TEST_GROUP_SOURCE && !rows) assert(!got); else assert(got);
+    if((parallel==TEST_GROUP_SOURCE || parallel==TEST_INDEX_EXPR) && !rows) assert(!got); else assert(got);
     if(parallel!=TEST_COUNT_ROWS && !grouped_build && parallel<TEST_PARTITION)
         for(unsigned i=0;i<12;++i) assert(!seen[i]);
     if(args.cparam1&1) {
@@ -1202,7 +1202,7 @@ static void probe_payload(function run,unsigned limit,int strings,int indexed,in
     }
     if(indexed) {
         j->input_offset=bytes; bytes+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE;
-        j->vector_offset=bytes; bytes+=4096+qs_chunk_bytes(256,4);
+        j->vector_offset=bytes; bytes+=qs_index_input_bytes()+qs_chunk_bytes(256,4);
     }
     unsigned char *arena=calloc(1,bytes),*io=calloc(1,QS_SORT_IO_BYTES); assert(arena && io);
     *(struct qs_dict *)arena=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
@@ -1435,7 +1435,7 @@ static void set_join(function run,unsigned kind,int hash,int has_null)
     unsigned char *index=NULL;
     if(hash==2) {
         n->input_offset=bytes; bytes+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE;
-        n->vector_offset=bytes; bytes+=4096+qs_chunk_bytes(256,4);
+        n->vector_offset=bytes; bytes+=qs_index_input_bytes()+qs_chunk_bytes(256,4);
         index=calloc(2,QS_PAGE); assert(index); unsigned char *leaf=index+QS_PAGE;
         w16(leaf+12,24+right_rows*4); w16(leaf+14,QS_PAGE-16-right_rows*16);
         w16(leaf+16,QS_PAGE-16); w16(leaf+18,QS_PAGE|4); w16(leaf+QS_PAGE-4,3);
@@ -2262,6 +2262,20 @@ int main(int argc,char **argv)
     assert(qp_worker_mask(0)==0 && qp_worker_mask(32)==UINT32_MAX && qp_worker_mask(64)==UINT64_MAX);
     assert(argc==2 || argc==3 || argc==4); void *library=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(library);
     function capacity=(function)dlsym(library,"pg_sina_workmem_capacity"); assert(capacity);
+    if(argc==3 && !strcmp(argv[2],"--index-join-64m")) {
+        assert(!cs_work_init(64U*1024*1024)); test_workers=4;
+        function run=(function)dlsym(library,"pg_sina_plan"); assert(run);
+        for(unsigned scheduled=0;scheduled<2;++scheduled) {
+            test_scheduled=scheduled;
+            for(unsigned join=QP_INNER;join<=QP_ANTI;++join) {
+                fprintf(stderr,"index join scheduled=%u kind=%u\n",scheduled,join);
+                test(run,join,20003,23,64,2,TEST_INDEX_EXPR);
+            }
+            test(run,QP_LEFT,0,23,64,2,TEST_INDEX_EXPR);
+            test(run,QP_LEFT,31,0,64,2,TEST_INDEX_EXPR);
+        }
+        return 0;
+    }
     if(argc==3 && !strcmp(argv[2],"--packed-output-64m")) {
         test_packed=true; assert(!cs_work_init(64U*1024*1024));
         function run=(function)dlsym(library,"pg_sina_plan"); assert(run);

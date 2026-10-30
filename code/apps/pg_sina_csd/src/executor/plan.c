@@ -229,7 +229,7 @@ static size_t layout_buffers(PlanStateCsd *s,const bool *indexed)
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_INDEX_JOIN) {
         struct qp_node *n=&s->plan->nodes[i]; n->input_offset=arena;
         arena+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE; n->vector_offset=arena;
-        arena+=4096+((qs_chunk_bytes(256,s->plan->nodes[n->right].expr.ncols+2)+4095)&~(size_t)4095);
+        arena+=qs_index_input_bytes()+((qs_chunk_bytes(256,s->plan->nodes[n->right].expr.ncols+2)+4095)&~(size_t)4095);
     }
     size_t stride=0;
     if(s->workers>1) for(unsigned root=0;root<s->plan->count;++root) if(s->plan->nodes[root].parallel) {
@@ -245,7 +245,7 @@ static size_t layout_buffers(PlanStateCsd *s,const bool *indexed)
             }
             if(n->kind==QP_INDEX_JOIN) {
                 n->parallel_input=end; end+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE; n->parallel_vector=end;
-                end+=4096+((qs_chunk_bytes(256,s->plan->nodes[n->right].expr.ncols+2)+4095)&~(size_t)4095);
+                end+=qs_index_input_bytes()+((qs_chunk_bytes(256,s->plan->nodes[n->right].expr.ncols+2)+4095)&~(size_t)4095);
             }
         }
         stride=Max(stride,end-arena);
@@ -815,7 +815,7 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     ExplainPropertyInteger("CSD Device FDM","bytes",pg_sina_resources.fdm_bytes,es);
     ExplainPropertyInteger("CSD Device Workmem","bytes",pg_sina_resources.workmem_bytes,es);
     ExplainPropertyInteger("CSD Query Memory Limit","bytes",s->plan->nodes[s->plan->root].expr.work_mem_bytes,es);
-    ExplainPropertyText("CSD Plan Source","PostgreSQL selected Plan; original join tree",es);
+    ExplainPropertyText("CSD Plan Source","PostgreSQL selected Plan; CSD build/probe orientation",es);
     ExplainPropertyInteger("CSD Host Result Bytes","bytes",s->result_bytes,es);
     ExplainPropertyText("CSD Counter Scope","current PG backend; parallel workers have separate counters",es);
     ExplainPropertyInteger("CSD Host Result Requests",NULL,s->result_reads,es);

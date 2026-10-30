@@ -225,7 +225,7 @@ struct operator_state {
     struct qs_task index_task;
     struct qs_result *index_output;
     struct qs_cell *index_left;
-    uint64_t index_matches;
+    uint64_t index_matches[(QS_INDEX_KEYS+63)/64];
     unsigned index_count, index_unmatched;
     unsigned index_position;
     int index_resume, index_flush,index_active,index_projected;
@@ -3751,9 +3751,10 @@ int64_t qs_join_consume(unsigned stage,struct qs_chunk *chunk,const struct qs_pl
             }
         }
         if(match.isnull || !match.value) continue;
-        uint64_t bit=UINT64_C(1)<<source;
-        if(n->join_type==QP_SEMI && (o->index_matches&bit)) continue;
-        if(n->join_type==QP_ANTI) { o->index_matches|=bit; ++s->metrics.join_rows; continue; }
+        uint64_t bit=UINT64_C(1)<<(source%64);
+        uint64_t *matches=&o->index_matches[source/64];
+        if(n->join_type==QP_SEMI && (*matches&bit)) continue;
+        if(n->join_type==QP_ANTI) { *matches|=bit; ++s->metrics.join_rows; continue; }
         if(b) {
             /* Keep only columns needed by the fused expression DAG. The
              * index cursor retains the decoded chunk until this batch drains. */
@@ -3767,7 +3768,7 @@ int64_t qs_join_consume(unsigned stage,struct qs_chunk *chunk,const struct qs_pl
             if(status<0) return status;
             if(status) ++o->index_output->rows;
         }
-        o->index_matches|=bit; ++s->metrics.join_rows;
+        *matches|=bit; ++s->metrics.join_rows;
     }
     o->index_active=0; o->index_consume_position=0;
     if(o->index_qual) o->index_qual->preparing=o->index_qual->prepared=0;
@@ -3788,7 +3789,7 @@ static int64_t index_next(struct execution *s,unsigned id,struct qs_cell *row,st
     if(!o->index_plan) {
         struct qs_plan *p=cs_work_calloc(s->context,1,sizeof(*p));
         if(!b) o->index_output=cs_work_calloc(s->context,1,sizeof(*o->index_output));
-        o->index_left=cs_work_alloc(s->context,64*ln*sizeof(*o->index_left));
+        o->index_left=cs_work_alloc(s->context,QS_INDEX_KEYS*ln*sizeof(*o->index_left));
         if(!p || (!b && !o->index_output) || !o->index_left) return -4;
         o->index_plan=p; p->nattrs=right->expr.nattrs+2; p->ncols=right->expr.ncols+2; p->njoins=1;
         p->work_mem_parent=(uintptr_t)s->context;
@@ -3807,8 +3808,8 @@ static int64_t index_next(struct execution *s,unsigned id,struct qs_cell *row,st
         if(s->paged) { int bound=qs_index_paged_dictionary(&o->index_control,s->paged); if(bound) return bound; }
         else qs_index_dictionary(&o->index_control,s->dictionary);
         index_projection_init(s,id);
-        struct qs_chunk *input=(void *)(s->arena+vector_offset(s,n)),*output=(void *)(s->arena+vector_offset(s,n)+4096);
-        *input=(struct qs_chunk){.capacity=64,.ncols=2};
+        struct qs_chunk *input=(void *)(s->arena+vector_offset(s,n)),*output=(void *)(s->arena+vector_offset(s,n)+qs_index_input_bytes());
+        *input=(struct qs_chunk){.capacity=QS_INDEX_KEYS,.ncols=2};
         *output=(struct qs_chunk){.capacity=256,.ncols=p->ncols};
     }
     for(;;) {
@@ -3821,7 +3822,8 @@ static int64_t index_next(struct execution *s,unsigned id,struct qs_cell *row,st
         if(o->phase==2) {
             while(o->index_unmatched<o->index_count) {
                 unsigned at=o->index_unmatched++;
-                if((n->join_type!=QP_LEFT && n->join_type!=QP_ANTI) || (o->index_matches&(UINT64_C(1)<<at))) continue;
+                if((n->join_type!=QP_LEFT && n->join_type!=QP_ANTI) ||
+                   (o->index_matches[at/64]&(UINT64_C(1)<<(at%64)))) continue;
                 struct qs_cell values[QS_COLS]; memcpy(values,o->index_left+(size_t)at*ln,ln*sizeof(*values));
                 for(unsigned i=0;i<right->expr.nout;++i) values[ln+i]=(struct qs_cell){.isnull=1};
                 if(b) {
@@ -3834,7 +3836,7 @@ static int64_t index_next(struct execution *s,unsigned id,struct qs_cell *row,st
             if(b && b->input_count) return 2;
         }
         if(!o->phase) {
-            unsigned batch=n->sorted_input?1:64;
+            unsigned batch=n->sorted_input?1:QS_INDEX_KEYS;
             while(o->index_count<batch && !o->input_done) {
                 int64_t status=next_row(s,n->left,o->index_left+(size_t)o->index_count*ln);
                 if(status==QP_WAIT || status<0 || status>2) return status;
@@ -3848,13 +3850,14 @@ static int64_t index_next(struct execution *s,unsigned id,struct qs_cell *row,st
                 }
                 o->finished=1; return 0;
             }
-            o->index_matches=0; o->index_resume=0; o->index_flush=0; o->index_unmatched=0; o->phase=1;
+            memset(o->index_matches,0,sizeof(o->index_matches));
+            o->index_resume=0; o->index_flush=0; o->index_unmatched=0; o->phase=1;
             struct qs_chunk *input=(void *)(s->arena+vector_offset(s,n));
-            input->rows=input->selected=o->index_count; memset(qs_nulls(input),0,16);
+            input->rows=input->selected=o->index_count; memset(qs_nulls(input),0,2*((QS_INDEX_KEYS+7)/8));
             for(unsigned i=0;i<o->index_count;++i) {
                 struct qs_cell key=o->index_left[(size_t)i*ln+n->left_keys[0]];
                 if(key.value>INT64_MAX || key.value<INT64_MIN) return -5;
-                qs_values(input)[i]=key.value; qs_values(input)[64+i]=i;
+                qs_values(input)[i]=key.value; qs_values(input)[QS_INDEX_KEYS+i]=i;
                 if(key.isnull) qs_nulls(input)[i/8]|=1U<<(i%8);
                 qs_selection(input)[i]=i;
             }
@@ -3864,8 +3867,8 @@ static int64_t index_next(struct execution *s,unsigned id,struct qs_cell *row,st
         }
         struct qs_plan *p=o->index_plan;
         void *mr[]={s->arena+vector_offset(s,n),p,&o->index_task,&o->index_control,
-            s->arena+vector_offset(s,n)+4096,s->arena+input_offset(s,n)};
-        long long len[]={qs_chunk_bytes(64,2),sizeof(*p),sizeof(o->index_task),sizeof(o->index_control),
+            s->arena+vector_offset(s,n)+qs_index_input_bytes(),s->arena+input_offset(s,n)};
+        long long len[]={qs_chunk_bytes(QS_INDEX_KEYS,2),sizeof(*p),sizeof(o->index_task),sizeof(o->index_control),
             qs_chunk_bytes(256,p->ncols),QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE};
         struct femu_csd_args a={.numr=6,.mr_addr=mr,.mr_len=len,.cparam2=s->args->cparam2};
         if(s->paged) qs_index_spill_io(&o->index_control,0,s->io);
@@ -4311,8 +4314,9 @@ restart:
         s->control->scan_node=0;
         int scan=qp_probe_scan(p,root);
         bool scheduled=s->partition_join<0 && scan>=0 && !p->nodes[scan].ordered_index;
-        for(int id=root;scheduled && id!=scan;id=p->nodes[id].left)
-            if(p->nodes[id].kind==QP_INDEX_JOIN) scheduled=false;
+        /* Index probes retain their keys/payloads across namespace waits.
+         * They can consume the same independently scheduled scan morsels as
+         * hash probes; only the retained Heap window ends at a morsel edge. */
         if(scheduled) s->control->scan_node=scan+1;
         s->parallel_started=1; s->used_workers=p->workers;
         if(s->profiling) { s->pipeline_start=now_ns(CLOCK_MONOTONIC); s->pipeline_tick=now_ns(CLOCK_THREAD_CPUTIME_ID); }

@@ -2,6 +2,8 @@
 
 Guest PG 负责 SQL 解析、去关联和连接顺序。`src/planner/cost.c` 在 PG 选中物理树后，对节点逐层估计 HOST 和 CSD 成本，不按 TPC-H 查询编号选择路径。设备仍只接收通用 SNIA 请求/设备图，不参与 SQL 成本规划。
 
+设备编译保留 PG 的关系配对与连接层次；INNER Hash Join 可参考 DuckDB 按估计行数×行宽交换 build/probe，避免把较宽的输入构建为哈希表。这里不重新关联多表连接，也不改变 HOST 原生计划。RIGHT JOIN 在设备计划中交换两侧，复用 LEFT JOIN 的匹配与 NULL 补齐，表达式按交换后的输入重新绑定，输出列仍遵循原计划。
+
 ## 两种候选状态
 
 对节点 v，H(v) 表示该节点在 HOST 执行、其子树可按成本选址；D(v) 表示以 v 为根的完整子树在 CSD 内执行，结果尚未回到 HOST。边界成本 B(v) 是把 CSD 结果返回 PG、转换为 Datum 的成本。
@@ -66,3 +68,25 @@ bash tests/pg-sina-csd-test.sh paths
 该针对性回归使用正式 Q6/Q13 检查五种模式及结果相等，用 Q1/Q17 检查快路径和标量子查询；另改变模型参数验证纯 HOST 和 HOST Join+CSD 子树两种选择，并覆盖并行扫描边界及同时存在的归并输入流。人为改变成本的用例只验证编排结构和语义，不作为性能验收。每次执行 SQL 前都重启 PG、清除 Guest page cache，不运行完整 22 条基准。
 
 HPCP 名称统一到 `SNIA_FEMU_HPCP` 和 `test-hpcp`；内核模块 `femu_cache.ko`、设备 `/dev/femu-cache`、现有线格式和统计标签保留，避免为名称变化修改已部署的 DMA 协议。
+
+## 设备内部索引连接与 RIGHT JOIN 验证
+
+PG 的参数化 IndexScan 由其父 Nested Loop 编译成设备 Index Join。每个 CU 保留自己的 lookup 游标、页缓存和 AFDM，扫描过滤后将最多256个整数查找键组成一个向量；要求保持输入顺序时仍逐键处理。索引遍历、TID提取、所需Heap列解码及连接条件计算均在设备CSF中执行。缺页通过既有 `csNeedNvmRead` 请求交给设备图读取索引/Heap的映射范围，数据直接进入设备AFDM，不经过主机取回再传入。当前访问方式是PG12 B-tree前导整数等值查找，不宣称支持所有PG索引类型。
+
+Index Join 的上游扫描现在与 Hash Probe 共用独立任务块调度：空闲CU继续取得下一块，索引读取等待保留当前键和左侧载荷，挂起的索引页读取完成后才更换输入。每批256键需要8KiB输入AFDM，因此PG执行器、设备算子和FDM成本估计共同按实际批次计算缓冲偏移；不修改SNIA API或设备图协议。匹配位图相应覆盖全部256键，保持LEFT/SEMI/ANTI及NULL语义。聚合改用Hash、移除分组Sort后，取消该Sort遗留的索引逐键顺序要求；不会跨Merge Join取消其输入顺序。
+
+正式针对性冷启动结果在 `results/tpch.L53x7p/`，仅使用原始Q4/Q9/Q10/Q12/Q13。设备4CU、256MiB workmem、64MiB FDM，PG配置保持4 worker、2GB shared_buffers、16MB work_mem。所有结果与HOST逐行一致，均完整卸载，spill读写均为0：
+
+| 查询 | HOST（ms） | csd-without-hpcp（ms） |
+| --- | ---: | ---: |
+| Q4 | 1781.171 | 916.445 |
+| Q9 | 2558.822 | 1201.538 |
+| Q10 | 2114.956 | 2372.699 |
+| Q12 | 1577.865 | 1615.979 |
+| Q13 | 2696.926 | 480.368 |
+
+Q4/Q10/Q12的修正前CSD分别为1963.439/3092.929/4688.155ms（`results/tpch.4r6jA9/`）。Q13此前完整RIGHT JOIN编译失败，进入混合执行后结果错误；现可完整卸载。另在64MiB查询内存下，Q13为442.254ms、结果正确、无spill（`results/tpch.MZJzt9/`）。`results/tpch.ByuPy6/` 验证Q13的SQLerate也完整卸载且结果正确，原Q6快路径结果正确。
+
+PG两项CTest与设备 `pgSinaIndexJoin64MiB`、`pgSinaPackedOutput64MiB` 通过。索引连接测试覆盖内部/任务块两种调度、四种连接类型、重复/NULL键、跨64键匹配及两侧空输入。此次未运行全量TPC-H；只对本节查询和Q6作针对性回归。
+
+功能通过与性能通过分开：Q10仍比同轮HOST慢约12%，Q12也略慢，两者都没有spill，不能归因为物理工作内存不足，仍未达到性能验收要求。本阶段未解决filter-only独立混合执行中的丢行/AFDM失败，也未补全SQLerate对Index Join随机页访问的成本估计；Q13完整卸载成功不等于这些独立边界问题已修复。

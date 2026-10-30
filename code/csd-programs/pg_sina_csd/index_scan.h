@@ -10,7 +10,7 @@ int64_t qs_index_scan(struct qs_chunk *,struct qs_task *,struct qs_join_control 
 void qs_index_scan_range(struct qs_join_control *,unsigned first,unsigned end);
 void qs_index_reset(struct qs_join_control *,unsigned);
 /* Stop keys whose source-row bits were accepted by a semi/anti consumer. */
-void qs_index_skip(struct qs_join_control *,unsigned,uint64_t);
+void qs_index_skip(struct qs_join_control *,unsigned,const uint64_t *);
 void qs_index_close(struct qs_join_control *);
 /* Borrow a currently retained scan AFDM; pages outside it use the index cache. */
 void qs_index_heap_window(struct qs_join_control *,unsigned,const void *,uint32_t,uint32_t);

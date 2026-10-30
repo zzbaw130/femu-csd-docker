@@ -10,7 +10,7 @@
 #include <limits.h>
 #include <string.h>
 extern int64_t pg_sina_filter_impl(struct femu_csd_args *);
-#define INDEX_KEYS 64
+#define INDEX_KEYS QS_INDEX_KEYS
 struct page_tag { uint32_t block; uint16_t heap, state; }; /* 0 absent, 1 loaded, 2 requested */
 struct lookup { unsigned row, block, item, heap_block, heap_item, phase; int64_t key; };
 struct index_cursor {
@@ -28,7 +28,7 @@ struct index_cursor {
     uint64_t dictionary_completion;
     unsigned dictionary_pending,dictionary_key,spill_bound;
 };
-_Static_assert(sizeof(struct index_cursor)<=4096,"index cursor must fit its per-CU budget");
+_Static_assert(sizeof(struct index_cursor)<=16384,"index cursor must fit its per-CU budget");
 struct index_join {
     cs_work_context *context;
     struct qs_plan scan;
@@ -79,12 +79,15 @@ void qs_index_reset(struct qs_join_control *control,unsigned slot)
     struct index_join *h=(void *)(uintptr_t)control->state;
     if(h->cursors[slot]) memset(h->cursors[slot]->tags,0,sizeof(h->cursors[slot]->tags));
 }
-void qs_index_skip(struct qs_join_control *control,unsigned slot,uint64_t rows)
+void qs_index_skip(struct qs_join_control *control,unsigned slot,const uint64_t *rows)
 {
     struct index_join *h=(void *)(uintptr_t)control->state;
     struct index_cursor *c=index_cursor(h,slot);
     if(!c) return;
-    for(unsigned i=0;i<c->count;++i) if(rows&(UINT64_C(1)<<c->keys[i].row)) c->keys[i].phase=4;
+    for(unsigned i=0;i<c->count;++i) {
+        unsigned row=c->keys[i].row;
+        if(row<QS_INDEX_KEYS && (rows[row/64]&(UINT64_C(1)<<(row%64)))) c->keys[i].phase=4;
+    }
 }
 void qs_index_heap_window(struct qs_join_control *control,unsigned slot,const void *data,uint32_t first,uint32_t pages)
 {

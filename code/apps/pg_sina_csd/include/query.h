@@ -25,10 +25,11 @@
 #define QS_DICT_BIG_DATA (20U*1024U*1024U)
 #define QS_RESULT_STRING_BYTES (64U*1024U)
 #define QS_INDEX_READS 64
+#define QS_INDEX_KEYS 256 /* One expression vector of probe keys per batch. */
 #define QS_INDEX_CACHE 128
 #define QS_INDEX_WORK_BYTES (128U*1024) /* Base cursor/tag state; pages stay in AFDM. */
 static inline size_t qs_index_work_bytes(unsigned workers)
-{ return QS_INDEX_WORK_BYTES+(size_t)(workers?workers-1:0)*4096; }
+{ return QS_INDEX_WORK_BYTES+(size_t)(workers?workers-1:0)*16384; }
 #define QS_INDEX_WAIT 1 /* Private join continuation; never a SNIA status. */
 enum qs_type { Q_DECIMAL, Q_INTEGER, Q_DATE, Q_CHAR, Q_BOOLEAN, Q_STRING, Q_PREFIX, Q_PATTERN, Q_DICTIONARY };
 enum qs_op { Q_COLUMN, Q_CONST, Q_ADD, Q_SUB, Q_MUL, Q_EQ, Q_NE, Q_LT, Q_LE, Q_GT, Q_GE,
@@ -117,6 +118,8 @@ struct qs_heap_ref { uint32_t offset, bytes; };
 struct qs_chunk { uint32_t capacity, ncols, rows, selected; };
 static inline size_t qs_chunk_bytes(unsigned capacity, unsigned ncols)
 { return sizeof(struct qs_chunk)+(size_t)capacity*ncols*8+((capacity+7)/8)*(size_t)ncols+(size_t)capacity*ncols+7+(size_t)capacity*4; }
+static inline size_t qs_index_input_bytes(void)
+{ return (qs_chunk_bytes(QS_INDEX_KEYS,2)+4095)&~(size_t)4095; }
 static inline size_t qs_join_chunk_stride(const struct qs_plan *p)
 { return (qs_chunk_bytes(256,p->ncols)+7)&~(size_t)7; }
 static inline int64_t *qs_values(struct qs_chunk *c) { return (int64_t *)(c+1); }

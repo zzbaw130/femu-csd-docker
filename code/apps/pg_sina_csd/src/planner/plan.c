@@ -922,11 +922,16 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
         switch(j->jointype) {
         case JOIN_INNER:n->join_type=QP_INNER;break;
         case JOIN_LEFT:n->join_type=QP_LEFT;break;
+        /* RIGHT(A,B) is LEFT(B,A). Bind expressions against the swapped
+         * inputs below, retaining the original output targetlist. This also
+         * keeps unmatched-row handling in the existing LEFT join operator. */
+        case JOIN_RIGHT:n->join_type=QP_LEFT;break;
         case JOIN_SEMI:n->join_type=QP_SEMI;break;
         case JOIN_ANTI:n->join_type=QP_ANTI;break;
         default:return -1;
         }
         if(IsA(right,Hash)) right=right->lefttree;
+        if(j->jointype==JOIN_RIGHT) { Plan *swap=left; left=right; right=swap; }
         if(IsA(native,NestLoop) && prepare_index_join(root,(NestLoop *)native,&right,&index_extra,&index_lookup,&access))
             { n->kind=QP_INDEX_JOIN; n->sorted_input=ordered; }
         else {
@@ -968,6 +973,15 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
     else return -1;
     if(left && n->left<0) { n->left=compile_node(root,left,tree,left_order); if(n->left<0) return -1; }
     if(right) { n->right=compile_node(root,right,tree,right_order); if(n->right<0) return -1; }
+    /* DuckDB's build/probe selection prices cardinality AND row width.
+     * Commute only an INNER hash join: its relation pair stays unchanged,
+     * and expression binding below preserves the original output columns. */
+    if(n->kind==QP_JOIN && n->hash && n->join_type==QP_INNER && left && right &&
+       tree->nodes[n->left].estimated_rows*Max(1,left->plan_width)<
+       tree->nodes[n->right].estimated_rows*Max(1,right->plan_width)) {
+        int swap=n->left; n->left=n->right; n->right=swap;
+        Plan *input=left; left=right; right=input;
+    }
     b.left=left?left->targetlist:NIL; b.right=right?right->targetlist:NIL;
     if(n->kind!=QP_SCAN) {
         p->nattrs=list_length(b.left)+list_length(b.right);
@@ -1106,6 +1120,14 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
         }
         if(supported) {
             n->left=input; n->sorted_input=0; n->hash=1;
+            /* The removed grouping Sort imposed order on the probe stream.
+             * Hash aggregation no longer needs it: keep Index Join's vector
+             * batch instead of accidentally retaining one-key ordered probes. */
+            for(int at=input;at>=0;at=tree->nodes[at].left) {
+                struct qp_node *child=&tree->nodes[at];
+                if(child->kind==QP_INDEX_JOIN) child->sorted_input=0;
+                else if(child->kind!=QP_PROJECT && !(child->kind==QP_JOIN && child->hash)) break;
+            }
             if(ordered) {
                 tree->nodes[sort_id]=*n;
                 const struct qp_node *aggregate=&tree->nodes[sort_id];
