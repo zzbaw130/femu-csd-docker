@@ -238,7 +238,7 @@ SQLerate选择完整CSD树：lineitem Scan/Filter → orders Index Join → Hash
 
 ## 任务槽优化后的全量冷启动对照（旧SQL快照）
 
-此节对应当时的SQL版本。Q17/Q20随后已恢复原始相关子查询，表内这两条的旧成绩及包含它们的合计/加速比，不再作为当前版本的基线；恢复后的测试见本文末尾。
+此节对应当时的代码及默认SQL快照。当前Q17/Q20按用户要求再次默认采用等价预聚合写法，原始相关版本另存为original文件。历史成绩仍与当时的代码、配置和SQL版本绑定，不当作最新复测成绩，也不能与原始相关版本混算；两类版本说明见本文末尾。
 
 复用提交`98c0fee78`对应的现有部署，没有修改执行代码或重新编译。运行`PG_SINA_PROFILE=off sh /home/femu/tests/tpch-test.sh`，只使用正式22条SQL；每条、每种模式均单独重启PG并清除Guest page cache。设备4 CU、256MiB workmem、64MiB FDM，PG为shared_buffers=2GB、work_mem=16MB、max_parallel_workers_per_gather=4。完整记录为`results/tpch.BW5CB4/`，精确值及校验结果在`timings.csv`，配置和实际计划在同目录日志中。
 
@@ -317,13 +317,13 @@ Q11/Q22参数绑定修复时、恢复Q17/Q20之前的22条计划检查记录为`
 
 Q2的原生SubPlan索引条件仍引用外层`part.p_partkey`，完整CSD模式先将它改写为聚合连接。Q16的尺寸常量IN是ScalarArrayOpExpr展开的OR；供应商NOT IN在完整卸载时编成NULL-aware整数集合，在filter-only中仍由HOST执行。Q11/Q22在完整卸载时保留设备标量初始化，在filter-only时使用HOST初始化及扫描参数绑定。
 
-该次检查的Q17/Q20仍是手写GROUP BY派生表版本。现已恢复原始相关SQL，原生PG计划新增这两条的相关SubPlan；完整CSD模式的自动改写见下面的针对性验证。不能将先前旧SQL没有SubPlan的现象用于证明PG或本项目支持任意相关子查询。
+该次检查的Q17/Q20采用手写GROUP BY派生表，与当前默认版本的结构相同。原始相关SQL另存为original文件，其原生PG计划保留相关SubPlan；完整CSD模式的自动改写见下面的针对性验证。不能将默认SQL没有SubPlan的现象用于证明PG或本项目支持任意相关子查询。
 
-## Q17/Q20恢复原始相关子查询
+## Q17/Q20原始相关版本的验证
 
-`tests/guest/queries/17.sql`、`20.sql`及各自的explain脚本已恢复TPC-H相关子查询结构，对照仓库DuckDB dbgen的q17/q20模板核对。Q17保留`Brand#54`、`JUMBO BAG`、7.0及0.2；Q20保留`goldenrod%`、1996-01-01起的一年日期区间、`JORDAN`及0.5。未添加LIMIT，查询/explain正文一致，也未更改索引或PG配置。AGENTS.md明确要求验收SQL保留原始结构，去相关必须由扩展完成。
+提交`cf389b836`曾将默认Q17/Q20及各自explain脚本恢复为TPC-H相关结构，并对照仓库DuckDB dbgen的q17/q20模板核对。该原始版本现在逐字保留为`17.original.sql`、`20.original.sql`及对应`N.original.explain.sql`。Q17保留`Brand#54`、`JUMBO BAG`、7.0及0.2；Q20保留`goldenrod%`、1996-01-01起的一年日期区间、`JORDAN`及0.5。未添加LIMIT，也未更改索引或PG配置。
 
-本轮只使用现有部署，运行`PG_SINA_PROFILE=off TPCH_MODES='host-only csd-without-hpcp' sh /home/femu/tests/tpch-test.sh 17 20`。每个组合独立重启PG并清除Guest page cache，沿用脚本120秒statement_timeout；设备4 CU、256MiB workmem、64MiB FDM，PG shared_buffers=2GB、work_mem=16MB、max_parallel_workers_per_gather=4。记录在`results/tpch.TfoGfB/`：
+该次原始版本验证使用现有部署，当时运行`PG_SINA_PROFILE=off TPCH_MODES='host-only csd-without-hpcp' sh /home/femu/tests/tpch-test.sh 17 20`，文件当时仍名为`17.sql`、`20.sql`。每个组合独立重启PG并清除Guest page cache，沿用脚本120秒statement_timeout；设备4 CU、256MiB workmem、64MiB FDM，PG shared_buffers=2GB、work_mem=16MB、max_parallel_workers_per_gather=4。记录在`results/tpch.TfoGfB/`：
 
 | 查询 | 原生HOST | 完整CSD无HPCP |
 | --- | ---: | ---: |
@@ -337,3 +337,11 @@ Q2的原生SubPlan索引条件仍引用外层`part.p_partkey`，完整CSD模式�
 正确性与执行成功分开：本轮HOST均未完成，因此不能完成同轮HOST/CSD逐行结果验收；脚本`result_match=no`来自缺少HOST参考，不能解释成已观察到结果不一致。仅读取历史`tpch.BW5CB4`中等价旧SQL的既有HOST输出作辅助核对，两条CSD输出逐行一致，没有重新执行旧SQL替代验收。原始写法在当前120秒限制内的直接HOST结果比对仍未完成。
 
 本轮未运行其他TPC-H查询，也没有为获取更快HOST成绩添加索引、调整规划开关或延长超时。
+
+## 默认对照与original备份
+
+按用户指定，`17.sql`/`20.sql`及对应explain再次采用等价预聚合连接写法，所有参数不变；SQL头部已说明原生PG相关子查询重复扫描导致120秒超时，以及采用该写法完成host/CSD对照的原因。默认测试脚本仍只读取22个编号文件，original备份不会被自动执行；Q19保持原样。
+
+使用`N.sql`比较两侧对同一改写后计划的执行性能；验证扩展自身去相关能力时，显式用现有`cold-query.sh`运行`N.original.sql`，计划用`N.original.explain.sql`检查。不得将默认SQL中预先做好的去相关当成扩展收益。原始备份保持原始结构及相同参数，不回添非标准LIMIT。
+
+核对全部22条与最初导入版本及本地dbgen模板，除Q17/Q20外没有发现额外的手工结构改写。其他差异是参数化日期写法和非标准LIMIT修正；Q15的创建/删除视图属于原TPC-H写法，DuckDB模板的CTE是其自身适配，不因此替换本项目Q15或新增重复备份。本次只做文件一致性及针对性EXPLAIN检查，不重跑性能基准。
