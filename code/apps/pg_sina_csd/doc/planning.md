@@ -236,7 +236,9 @@ SQLerate选择完整CSD树：lineitem Scan/Filter → orders Index Join → Hash
 
 8槽实际workmem峰值173600384B（165.56MiB），此前为103780640B（98.97MiB）；FDM预留51007536B（48.64MiB）。spill读写均为0，不能归因于内存不足。阶段计时与正式延迟分开，结束后FDM_USED=0。本轮未运行其他TPC-H查询。
 
-## 任务槽优化后的全量冷启动对照
+## 任务槽优化后的全量冷启动对照（旧SQL快照）
+
+此节对应当时的SQL版本。Q17/Q20随后已恢复原始相关子查询，表内这两条的旧成绩及包含它们的合计/加速比，不再作为当前版本的基线；恢复后的测试见本文末尾。
 
 复用提交`98c0fee78`对应的现有部署，没有修改执行代码或重新编译。运行`PG_SINA_PROFILE=off sh /home/femu/tests/tpch-test.sh`，只使用正式22条SQL；每条、每种模式均单独重启PG并清除Guest page cache。设备4 CU、256MiB workmem、64MiB FDM，PG为shared_buffers=2GB、work_mem=16MB、max_parallel_workers_per_gather=4。完整记录为`results/tpch.BW5CB4/`，精确值及校验结果在`timings.csv`，配置和实际计划在同目录日志中。
 
@@ -306,7 +308,7 @@ HOST参数目前支持有限numeric、int2/int4/int8、boolean和date。numeric�
 
 HOST InitPlan自身仍由PG执行聚合/连接，其内部的独立扫描也按filter-only规则下推。每条扫描的设备初始化数为0，避免将整个InitPlan顺带编入扫描。根节点本身就是扫描时也保留HOST InitPlan；标准PG依赖机制继续负责并行参数传递和重新执行时的求值。
 
-当前22条的实际计划检查记录为`results/subplan-audit.ox4pU1/`，只运行现有22条explain脚本的host-only/filter-only/csd-without-hpcp，共66份计划，没有执行全量数据查询：
+Q11/Q22参数绑定修复时、恢复Q17/Q20之前的22条计划检查记录为`results/subplan-audit.ox4pU1/`，只运行当时22条explain脚本的host-only/filter-only/csd-without-hpcp，共66份计划，没有执行全量数据查询：
 
 | 模式 | 仍保留的PG子计划 |
 | --- | --- |
@@ -315,4 +317,23 @@ HOST InitPlan自身仍由PG执行聚合/连接，其内部的独立扫描也按f
 
 Q2的原生SubPlan索引条件仍引用外层`part.p_partkey`，完整CSD模式先将它改写为聚合连接。Q16的尺寸常量IN是ScalarArrayOpExpr展开的OR；供应商NOT IN在完整卸载时编成NULL-aware整数集合，在filter-only中仍由HOST执行。Q11/Q22在完整卸载时保留设备标量初始化，在filter-only时使用HOST初始化及扫描参数绑定。
 
-当前`tests/guest/queries/17.sql`和`20.sql`已经显式使用GROUP BY派生表，不能将它们没有相关SubPlan全归功于PG或本项目的去相关改写。这份结论只覆盖现有22条及当前配置，不等于支持任意相关子查询。
+该次检查的Q17/Q20仍是手写GROUP BY派生表版本。现已恢复原始相关SQL，原生PG计划新增这两条的相关SubPlan；完整CSD模式的自动改写见下面的针对性验证。不能将先前旧SQL没有SubPlan的现象用于证明PG或本项目支持任意相关子查询。
+
+## Q17/Q20恢复原始相关子查询
+
+`tests/guest/queries/17.sql`、`20.sql`及各自的explain脚本已恢复TPC-H相关子查询结构，对照仓库DuckDB dbgen的q17/q20模板核对。Q17保留`Brand#54`、`JUMBO BAG`、7.0及0.2；Q20保留`goldenrod%`、1996-01-01起的一年日期区间、`JORDAN`及0.5。未添加LIMIT，查询/explain正文一致，也未更改索引或PG配置。AGENTS.md明确要求验收SQL保留原始结构，去相关必须由扩展完成。
+
+本轮只使用现有部署，运行`PG_SINA_PROFILE=off TPCH_MODES='host-only csd-without-hpcp' sh /home/femu/tests/tpch-test.sh 17 20`。每个组合独立重启PG并清除Guest page cache，沿用脚本120秒statement_timeout；设备4 CU、256MiB workmem、64MiB FDM，PG shared_buffers=2GB、work_mem=16MB、max_parallel_workers_per_gather=4。记录在`results/tpch.TfoGfB/`：
+
+| 查询 | 原生HOST | 完整CSD无HPCP |
+| --- | ---: | ---: |
+| Q17 | 120秒超时，未完成 | 1378.759ms |
+| Q20 | 120秒超时，未完成 | 509.227ms |
+
+针对性计划在`results/q17-q20-correlated-plans.9jAqIE/`。原生PG两条均保留相关SubPlan，对lineitem重复顺序扫描；现有lineitem只有`(l_orderkey,l_linenumber)`主键索引，不能按相关的part/supplier键直接定位。超时不是完整查询的完成延迟，不将其填成120秒的正式成绩，也不重用旧派生表写法的HOST时间。
+
+两条完整CSD均成功执行。记录中的原始Query Text保留相关AVG/SUM、没有手写GROUP BY；CSD计划已经包含Hash Aggregate和Join。由此确认现有`src/planner/rewrite.c`在PG规划前完成了去相关，无需在测试脚本或设备固件中另写规则。Q17实际workmem峰值86412864B，Q20为88968976B，spill读写均为0，结束后FDM_USED=0。
+
+正确性与执行成功分开：本轮HOST均未完成，因此不能完成同轮HOST/CSD逐行结果验收；脚本`result_match=no`来自缺少HOST参考，不能解释成已观察到结果不一致。仅读取历史`tpch.BW5CB4`中等价旧SQL的既有HOST输出作辅助核对，两条CSD输出逐行一致，没有重新执行旧SQL替代验收。原始写法在当前120秒限制内的直接HOST结果比对仍未完成。
+
+本轮未运行其他TPC-H查询，也没有为获取更快HOST成绩添加索引、调整规划开关或延长超时。
