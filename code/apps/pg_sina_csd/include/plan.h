@@ -3,6 +3,7 @@
 #ifndef PG_SINA_PLAN_H
 #define PG_SINA_PLAN_H
 #include "query.h"
+#include "host_result.h"
 #define QP_NODES 96
 #define QP_PARAMS 128
 #define QP_SCAN_BYTES (1024U*1024)
@@ -55,13 +56,28 @@ struct qp_file_mapping {
 struct qp_plan {
     unsigned count, root, nparams, ninit;
     unsigned workers, scan_bytes;
-    unsigned packed_result; /* Host boundary only; internal worker batches stay unchanged. */
+    unsigned packed_result; /* 0: legacy, 1: projected cells, 2: typed HOST columns. */
     uint64_t parallel_stride;
     int param_nodes[QP_PARAMS],cte_nodes[QP_PARAMS],init_nodes[QP_PARAMS],init_params[QP_PARAMS];
     struct qp_node nodes[QP_NODES];
     struct qp_pipeline_profile pipelines[QP_NODES];
     struct qp_file_mapping files[QP_NODES],indexes[QP_NODES];
 };
+static inline int qp_host_raw_numeric(const struct qp_plan *p)
+{
+    const struct qp_node *n=&p->nodes[p->root];
+    if(p->packed_result!=QP_TYPED_RESULT || n->kind!=QP_SCAN || n->ordered_index || n->expr.predicate>=0) return 0;
+    int numeric=0;
+    for(unsigned i=0;i<n->expr.nout;++i) {
+        const struct qs_expr *e=&n->expr.exprs[n->expr.outputs[i].index];
+        if(n->expr.outputs[i].aggregate || e->op!=Q_COLUMN || e->column<0 || (unsigned)e->column>=n->expr.nattrs) return 0;
+        if(n->expr.outputs[i].type_oid==1700) {
+            if(n->expr.cols[e->column].type!=Q_DECIMAL) return 0;
+            numeric=1;
+        }
+    }
+    return numeric;
+}
 /* Only page addresses and lifecycle state cross to PG during execution. */
 struct qp_control {
     uint64_t state, offset;
@@ -140,6 +156,7 @@ static inline void qp_dictionary_size(const struct qp_plan *p,unsigned *entries,
  * by the current host ABI's 255-byte value limit and the 64KiB text arena. */
 static inline unsigned qp_result_capacity(const struct qs_plan *p,int packed)
 {
+    if(packed==QP_TYPED_RESULT) return qp_host_capacity(p);
     if(!packed) return QS_RESULT_ROWS;
     unsigned rows=QS_RESULT_ROWS*QS_OUT/(p->nout?p->nout:1),text=0;
     for(unsigned c=0;c<p->nout;++c) {

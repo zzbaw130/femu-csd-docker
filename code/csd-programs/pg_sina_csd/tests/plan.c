@@ -16,7 +16,8 @@
 typedef int64_t (*function)(struct femu_csd_args *);
 enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_INDEX_PIPELINE,TEST_INDEX_HASH,TEST_INDEX_CHAIN,TEST_INDEX_EXPR,TEST_DEVICE_IO,TEST_PACKED_KEYS,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL, TEST_VECTOR_AGG=-1,TEST_JOIN_QUAL=-2,TEST_GROUP_SOURCE=-3,TEST_GROUP_SOURCE_SPILL=-4,TEST_BUILD_GROUP_SOURCE=-5,TEST_BUILD_GROUP_HAVING=-6,TEST_BUILD_GROUP_DIRECT=-7 };
 static unsigned test_workers=4;
-static bool test_scheduled,test_packed;
+static bool test_scheduled;
+static unsigned test_packed;
 /* Reservations must cover physical input even when filters/NDV estimates
  * are tiny, while unused string columns must not consume AFDM. */
 static void dictionary_size(void)
@@ -306,8 +307,22 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
             epoch=c->epoch; available=done=0; atomic_store(&offset,0);
             for(unsigned w=0;w<workers;++w) need_input[w]=true;
         }
-        for(unsigned r=0;r<out->rows;++r) {
-            struct qs_cell *v=qp_result_row(out,r,p->nodes[p->root].expr.nout,p->packed_result); assert(seen<rows);
+        for(unsigned r=0;r<out->rows && (p->packed_result!=QP_TYPED_RESULT || c->output_rows);++r) {
+            struct qs_cell decoded[3],*v=decoded;
+            if(p->packed_result==QP_TYPED_RESULT) {
+                const struct qs_plan *result=&p->nodes[p->root].expr; v=decoded;
+                for(unsigned col=0;col<result->nout;++col) {
+                    v[col]=(struct qs_cell){.isnull=qp_host_isnull(out,result,r,col)};
+                    if(v[col].isnull) continue;
+                    const void *field=qp_host_values(out,result,out->rows,col)+(size_t)r*4;
+                    if(result->outputs[col].type_oid==23) { int32_t value; memcpy(&value,field,4); v[col].value=value; }
+                    else {
+                        unsigned bytes; const char *text=qp_host_var(out,field,&bytes); assert(text);
+                        qs_cell_set_string_ref(&v[col],text+4-out->str_data,bytes-4);
+                    }
+                }
+            } else v=qp_result_row(out,r,p->nodes[p->root].expr.nout,p->packed_result);
+            assert(seen<rows);
             if(ordered==DICTIONARY_SORT) while(key<rows && expected[key]%97==0) ++key;
             unsigned source=ordered==DICTIONARY_SORT?(key<rows?expected[key]:null_row):(unsigned)v[1].value;
             unsigned value_key=ordered==DICTIONARY_SORT?key:(source*1009)%rows;
@@ -2295,7 +2310,7 @@ int main(int argc,char **argv)
         return 0;
     }
     if(argc==3 && !strcmp(argv[2],"--packed-output-64m")) {
-        test_packed=true; assert(!cs_work_init(64U*1024*1024));
+        test_packed=QP_TYPED_RESULT; assert(!cs_work_init(64U*1024*1024));
         function run=(function)dlsym(library,"pg_sina_plan"); assert(run);
         dictionary_plan(run,0,0,0,8192,64U*1024*1024,1);
         dictionary_plan(run,0,4,1,8192,64U*1024*1024,1);

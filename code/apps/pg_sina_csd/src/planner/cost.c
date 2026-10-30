@@ -85,14 +85,30 @@ static Oid scan_relation(PlannerInfo *root,Plan *p)
     }
     return InvalidOid;
 }
+/* HOST columns use physical scalar widths and variable-value offsets.
+ * PG plan_width estimates average values; add the offset/null/header work
+ * of this boundary, instead of charging 32 bytes for every projected value. */
+static double output_variable_bytes(Plan *p,const struct qs_plan *output)
+{
+    unsigned fixed=0,variable=0;
+    for(unsigned col=0;col<output->nout;++col) {
+        unsigned oid=output->outputs[col].type_oid;
+        if(qp_host_variable(oid)) ++variable; else fixed+=qp_host_width(oid);
+    }
+    return variable?Max((int)(4*variable),p->plan_width-(int)fixed)+4*variable:0;
+}
+static double output_capacity(Plan *p,const struct qs_plan *output)
+{
+    double variable=output_variable_bytes(p,output),rows=qp_host_capacity(output);
+    if(variable>0) rows=Min(rows,Max(1,floor(QS_RESULT_STRING_BYTES/variable)));
+    return rows;
+}
 static double output_bytes(Plan *p,const struct qs_plan *output,double rows)
 {
-    /* Generic boundaries transfer projected cells and actual row counts;
-     * worker intermediates and legacy single-table CSFs retain their ABI. */
+    double width=(double)output->nout/8+output_variable_bytes(p,output);
+    for(unsigned col=0;col<output->nout;++col) width+=qp_host_width(output->outputs[col].type_oid);
     rows=Max(0,rows);
-    return rows*output->nout*sizeof(struct qs_cell)+
-        Max(1,ceil(rows/qp_result_capacity(output,1)))*offsetof(struct qs_result,data)+
-        rows*Max(0,p->plan_width-(int)output->nout*(int)sizeof(struct qs_cell));
+    return rows*width+Max(1,ceil(rows/output_capacity(p,output)))*offsetof(struct qs_result,data);
 }
 /* Match executor layout selection: try smaller input blocks before fewer CUs.
  * File-extent descriptors are not yet available here; allow one page/node. */
@@ -608,7 +624,7 @@ static void device_cost(struct placement *p,List **observations)
     scan->scan.plan.plan_rows=p->rows;
     p->boundary=transfer_ms(output_bytes(p->native,&tree->nodes[tree->root].expr,p->rows),pg_sina_pcie_mbps)+
         p->rows*cpu_tuple_cost*pg_sina_host_cost_ms+
-        Max(1,ceil(p->rows/qp_result_capacity(&tree->nodes[tree->root].expr,1)))*pg_sina_result_batch_ms;
+        Max(1,ceil(p->rows/output_capacity(p->native,&tree->nodes[tree->root].expr)))*pg_sina_result_batch_ms;
     memcpy(VARDATA(bytes),tree,sizeof(*tree));
     pfree(tree);
 }

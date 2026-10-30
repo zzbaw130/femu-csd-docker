@@ -1,6 +1,8 @@
 #!/bin/sh
 # Focused canonical SQL checks for scan output, CU scheduling and PG types.
 set -eu
+export PATH=/home/femu/opt/postgres/release/bin:$PATH
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT=$(mktemp -d /home/femu/results/filter-only.XXXXXX)
 chmod 755 "$OUT"
 COLD=/home/femu/scripts/cold-query.sh
@@ -18,4 +20,16 @@ for query in "$@"; do
         echo "Q$query $mode=$elapsed ms match=yes"
     done
     rm -f "$OUT/$query."*.rows
+done
+# ERROR can detach DSM before extension ResourceOwner cleanup. Cover both
+# initialization and an executing stream, without adding another query copy.
+for timeout in 100ms 1s; do
+    log=$OUT/cancel-$timeout
+    psql -X -q -A -t -v ON_ERROR_STOP=off -d tpch_s1 \
+        -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path='filter-only'; SET statement_timeout='$timeout'" \
+        -f "$ROOT/queries/17.sql" \
+        -c "SET statement_timeout=0; SELECT 'connection-alive'" > "$log.log" 2> "$log.err"
+    grep -q 'canceling statement due to statement timeout' "$log.err"
+    grep -qx 'connection-alive' "$log.log"
+    echo "Cancellation $timeout: connection alive"
 done

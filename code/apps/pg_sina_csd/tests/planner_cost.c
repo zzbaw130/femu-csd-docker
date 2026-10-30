@@ -34,6 +34,57 @@ int main(void)
     CHECK(qp_result_capacity(&output,1)==257);
     output.aggs[0].kind=Q_COUNT;
     CHECK(qp_result_capacity(&output,1)==2048);
+    /* Typed integer columns fit many more rows than 32-byte cell output.
+     * Compact a partial batch, including its final partial NULL byte. */
+    struct qs_plan typed={.nout=2}; typed.outputs[0].type_oid=23; typed.outputs[1].type_oid=20;
+    unsigned capacity=qp_host_capacity(&typed); CHECK(capacity>10000);
+    struct qs_result *packet=calloc(1,sizeof(*packet)); CHECK(packet);
+    packet->rows=513;
+    for(unsigned col=0;col<2;++col) for(unsigned row=0;row<packet->rows;++row) {
+        int64_t value=-(int64_t)row;
+        memcpy(qp_host_values(packet,&typed,capacity,col)+(size_t)row*qp_host_width(typed.outputs[col].type_oid),&value,qp_host_width(typed.outputs[col].type_oid));
+        if(row%17==0) qp_host_nulls(packet,&typed,capacity,col)[row/8]|=1U<<(row%8);
+    }
+    qp_host_compact(packet,&typed,capacity);
+    for(unsigned row=0;row<packet->rows;++row) {
+        CHECK(qp_host_isnull(packet,&typed,row,0)==(row%17==0));
+        int32_t narrow; int64_t wide;
+        memcpy(&narrow,qp_host_values(packet,&typed,packet->rows,0)+(size_t)row*4,4);
+        memcpy(&wide,qp_host_values(packet,&typed,packet->rows,1)+(size_t)row*8,8);
+        CHECK(narrow==-(int32_t)row && wide==-(int64_t)row);
+    }
+    struct qs_result *slice=calloc(1,sizeof(*slice)); CHECK(slice);
+    CHECK(!qp_host_slice(slice,packet,&typed,7,256));
+    for(unsigned row=0;row<256;++row) {
+        CHECK(qp_host_isnull(slice,&typed,row,1)==((row+7)%17==0));
+        int64_t value; memcpy(&value,qp_host_values(slice,&typed,256,1)+(size_t)row*8,8);
+        CHECK(value==-(int64_t)(row+7));
+    }
+    /* Native varlena values survive a claim with non-byte-aligned NULLs;
+     * consumers copy only the claimed strings, not the complete pool. */
+    typed.outputs[1].type_oid=25; packet->str_bytes=0;
+    for(unsigned row=0;row<packet->rows;++row) {
+        unsigned offset=(packet->str_bytes+3)&~3U,bytes=4+row%97;
+        uint32_t header=bytes<<2;
+        memcpy(packet->str_data+offset,&header,4);
+        memset(packet->str_data+offset+4,'a'+row%26,bytes-4);
+        memcpy(qp_host_values(packet,&typed,packet->rows,1)+(size_t)row*4,&offset,4);
+        packet->str_bytes=offset+bytes;
+    }
+    memset(qp_host_nulls(packet,&typed,packet->rows,1),0,(packet->rows+7)/8);
+    for(unsigned row=0;row<packet->rows;row+=17) qp_host_nulls(packet,&typed,packet->rows,1)[row/8]|=1U<<(row%8);
+    CHECK(!qp_host_slice(slice,packet,&typed,7,256));
+    CHECK(slice->str_bytes<packet->str_bytes);
+    for(unsigned row=0;row<slice->rows;++row) {
+        CHECK(qp_host_isnull(slice,&typed,row,1)==((row+7)%17==0));
+        if(qp_host_isnull(slice,&typed,row,1)) continue;
+        unsigned bytes;
+        const char *value=qp_host_var(slice,qp_host_values(slice,&typed,slice->rows,1)+(size_t)row*4,&bytes);
+        CHECK(value && bytes==4+(row+7)%97);
+        for(unsigned i=4;i<bytes;++i) CHECK(value[i]==(char)('a'+(row+7)%26));
+    }
+    free(slice);
+    free(packet);
     struct qp_plan scan={.count=1};
     scan.nodes[0].kind=QP_SCAN; scan.nodes[0].left=scan.nodes[0].right=-1; scan.nodes[0].bytes=8*1024*1024;
     qp_parallel_boundaries(&scan,0); CHECK(scan.nodes[0].parallel);

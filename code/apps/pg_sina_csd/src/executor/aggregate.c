@@ -1,4 +1,5 @@
 #include "pg_internal.h"
+#include "host_result.h"
 #include "executor/executor.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
@@ -38,28 +39,8 @@ static void begin(CustomScanState *node,EState *estate,int flags)
 }
 Datum pg_sina_decimal(struct qs_cell value)
 {
-    /* PG numeric.c NumericLong: varlena, sign/dscale, weight, base-10000
-     * int16 digits. Construct its native representation without numeric_in's
-     * decimal formatting/parsing. This is PG-side storage, never a CSF ABI. */
-    uint16_t digits[12]; unsigned count=0,first=0,scale=value.scale;
-    unsigned display=value.dscale<scale?value.dscale:scale;
-    unsigned __int128 magnitude=value.value<0?0-(unsigned __int128)value.value:(unsigned __int128)value.value;
-    while(scale>display) { magnitude/=10; --scale; }
-    do { digits[count++]=magnitude%10000; magnitude/=10000; } while(magnitude);
-    unsigned padding=(4-scale%4)%4,factor=1;
-    while(padding--) factor*=10;
-    unsigned carry=0;
-    for(unsigned i=0;i<count;++i) { unsigned n=digits[i]*factor+carry; digits[i]=n%10000; carry=n/10000; }
-    if(carry) digits[count++]=carry;
-    int16_t weight=(int)count-(scale+3)/4-1;
-    while(first<count && !digits[first]) ++first;
-    if(first==count) weight=0;
-    unsigned ndigits=count-first;
-    uint16_t header=display | (value.value<0 && ndigits?0x4000:0);
-    size_t bytes=VARHDRSZ+2*sizeof(uint16_t)+ndigits*sizeof(uint16_t);
-    void *numeric=palloc(bytes); SET_VARSIZE(numeric,bytes);
-    char *data=VARDATA(numeric); memcpy(data,&header,2); memcpy(data+2,&weight,2);
-    for(unsigned i=0;i<ndigits;++i) memcpy(data+4+2*i,&digits[count-1-i],2);
+    unsigned char bytes[32]; unsigned length=qp_host_numeric(bytes,value);
+    void *numeric=palloc(length); memcpy(numeric,bytes,length);
     return PointerGetDatum(numeric);
 }
 static TupleTableSlot *execute(CustomScanState *node)
