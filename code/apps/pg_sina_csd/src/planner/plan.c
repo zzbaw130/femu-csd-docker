@@ -1290,7 +1290,8 @@ Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
     if(pg_sina_exe_path==PG_SINA_FILTER && native->parallel_aware &&
        (!IsA(native,SeqScan) || pg_sina_resources.cus<2)) { pfree(tree); return native; }
     tree->nodes[result].expr.work_mem_bytes=pg_sina_query_memory();
-    bytea *bytes=palloc(VARHDRSZ+sizeof(*tree)); SET_VARSIZE(bytes,VARHDRSZ+sizeof(*tree)); memcpy(VARDATA(bytes),tree,sizeof(*tree)); pfree(tree);
+    size_t length=qp_plan_constant_bytes(tree);
+    bytea *bytes=palloc(VARHDRSZ+length); SET_VARSIZE(bytes,VARHDRSZ+length); memcpy(VARDATA(bytes),tree,length); pfree(tree);
     CustomScan *scan=makeNode(CustomScan);
     scan->scan.plan=*native; NodeSetTag(scan,T_CustomScan);
     scan->scan.plan.lefttree=scan->scan.plan.righttree=NULL;

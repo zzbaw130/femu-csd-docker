@@ -284,8 +284,11 @@ static void begin(CustomScanState *node,EState *estate,int flags)
 {
     PlanStateCsd *s=(void *)node; CustomScan *scan=(void *)node->ss.ps.plan;
     Const *constant=linitial_node(Const,scan->custom_private); bytea *bytes=DatumGetByteaP(constant->constvalue);
-    if(VARSIZE_ANY_EXHDR(bytes)!=sizeof(*s->plan)) elog(ERROR,"invalid CSD PG Plan");
-    s->plan=palloc(sizeof(*s->plan)); memcpy(s->plan,VARDATA_ANY(bytes),sizeof(*s->plan));
+    size_t length=VARSIZE_ANY_EXHDR(bytes);
+    if(length<offsetof(struct qp_plan,nodes) || length>sizeof(*s->plan)) elog(ERROR,"invalid CSD PG Plan");
+    s->plan=palloc0(sizeof(*s->plan)); memcpy(s->plan,VARDATA_ANY(bytes),length);
+    if(!s->plan->count || s->plan->count>QP_NODES || s->plan->root>=s->plan->count ||
+       (length!=sizeof(*s->plan) && length!=qp_plan_constant_bytes(s->plan))) elog(ERROR,"invalid CSD PG Plan");
     s->plan->packed_result=QP_TYPED_RESULT;
     const struct qs_plan *output=&s->plan->nodes[s->plan->root].expr;
     for(unsigned col=0;col<output->nout;++col) {

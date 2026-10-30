@@ -1575,7 +1575,8 @@ static int64_t join_next(struct execution *s,unsigned id,struct qs_cell *row)
  * rejected strings; InitPlan parameters retain their full numeric precision. */
 static int scan_filter_init(struct execution *s,const struct qs_plan *p,struct operator_state *o)
 {
-    if(!o->scan_filter_checked && s->raw_projection && p==&s->plan->nodes[s->plan->root].expr) {
+    int raw=s->raw_projection && p==&s->plan->nodes[s->plan->root].expr;
+    if(!o->scan_filter_checked && raw && p->predicate<0) {
         o->scan_filter=cs_work_alloc(s->context,sizeof(*p)); if(!o->scan_filter) return -4;
         *o->scan_filter=*p;
         for(unsigned col=0;col<p->nattrs;++col)
@@ -1586,7 +1587,8 @@ static int scan_filter_init(struct execution *s,const struct qs_plan *p,struct o
     if(!o->scan_filter_checked) {
         o->scan_filter_checked=1; uint8_t needed[QS_EXPRS]={0};
         if(p->predicate<0 && !o->defer_strings) return 0;
-        struct qs_plan *filter=cs_work_alloc(s->context,sizeof(*p)); if(!filter) return 0;
+        struct qs_plan *filter=cs_work_alloc(s->context,sizeof(*p));
+        if(!filter) { if(raw) s->raw_projection=0; return 0; }
         *filter=*p; filter->work_mem_parent=(uintptr_t)s->context;
         if(p->predicate<0) {
             for(unsigned col=0;col<p->nattrs;++col)
@@ -1620,8 +1622,8 @@ static int scan_filter_init(struct execution *s,const struct qs_plan *p,struct o
         for(unsigned col=0;col<filter->nattrs;++col) {
             struct qs_column *c=&filter->cols[col];
             if((c->type!=Q_DECIMAL && c->type!=Q_STRING) || c->slot<0) continue;
-            c->deferred=known?QS_FILTER_ONLY:QS_DEFERRED;
-            for(unsigned i=0;i<filter->nexprs;++i) if(projected[i] && filter->exprs[i].op==Q_COLUMN && filter->exprs[i].column==(int)col)
+            c->deferred=raw || known?QS_FILTER_ONLY:QS_DEFERRED;
+            for(unsigned i=0;!raw && i<filter->nexprs;++i) if(projected[i] && filter->exprs[i].op==Q_COLUMN && filter->exprs[i].column==(int)col)
                 c->deferred=QS_DEFERRED;
         }
         /* Reuse the baseline Filter path on borrowed Heap strings. Only its
@@ -1649,6 +1651,7 @@ static int scan_filter_init(struct execution *s,const struct qs_plan *p,struct o
         }
         o->scan_filter=filter; return 0;
 scalar:
+        if(raw) s->raw_projection=0;
         cs_work_free(s->context,o->filter_dictionary); o->filter_dictionary=NULL;
         cs_work_free(s->context,filter);
     }
@@ -1749,6 +1752,7 @@ static int64_t scan_chunk_next(struct execution *s,unsigned id)
                 if(status==-4) {
                     /* Keep the query budget: if vector scratch does not fit,
                      * decode this retained input eagerly and use scalar SQL. */
+                    s->raw_projection=0;
                     cs_work_free(s->context,o->scan_filter); o->scan_filter=NULL; mr[1]=(void *)p;
                     if(s->paged) {
                         if(!o->scan_cursor) o->scan_cursor=qs_scan_cursor_create(s->context,s->paged);

@@ -74,6 +74,13 @@ static void string_views(void)
     assert(qs_text_like("\\%",2,"%",1)==1);
     assert(qs_text_like("\\",1,"x",1)<0);
     assert(!qs_text_like("\\",1,"",0));
+    assert(qs_text_like("LARGE POLISHED%",15,"LARGE POLISHED COPPER",21)==1);
+    assert(!qs_text_like("LARGE POLISHED%",15,"LARGE BRUSHED COPPER",20));
+    assert(qs_text_like("abc%xyz",7,"abc-middle-xyz",14)==1);
+    assert(qs_text_like("abcdef",6,"abcdef",6)==1);
+    assert(!qs_text_like("abcdef",6,"abc",3));
+    assert(qs_text_like("abc\\%",5,"abc%",4)==1);
+    assert(qs_text_like("猫%魚",7,"猫狗魚",9)==1);
     const char *texts[]={"23-abc","21-xyz","abcdef","猫狗魚","","NULL"};
     const char *prefixes[]={"23","21","ab","猫狗",""};
     unsigned char raw[128]={0}; unsigned used=0;

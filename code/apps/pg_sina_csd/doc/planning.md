@@ -277,3 +277,29 @@ filter-only相对HOST仍有Q16（+41.2%）和Q21（+13.7%）的明显退化；Q1
 SQLerate不是逐条实测最低：相对五路径逐查询最小值，Q2/Q7/Q8分别高20.3%/19.5%/19.0%。Q2/Q21有HOST LIMIT边界，其余选择完整CSD；单次冷启动且关闭细分profiling，不能把额外延迟直接认定为规划误选、HPCP或某个算子的问题。本轮记录性能差距，不额外修改或复测。
 
 HPCP与无HPCP的22条SQL耗时合计相差约-0.12%，总体基本持平；单条最大增加约10.1%（Q11，约24ms）。部分查询开启后更快也不能据单轮测量推断填充必然加速；每次冷启动都清除此前页缓存，本轮不验证跨查询缓存利用收益。
+
+## 当前InitPlan、SubPlan与去相关的支持边界
+
+当前并不是执行任意PG SubPlan的通用设备解释器，而是先做受限的去相关，再编译PG选择的物理树。流程在PG扩展内完成，FEMU/SNIA不识别子查询语义：
+
+1. `src/extension.c:hooked_planner`仅在完整CSD/HPCP/SQLerate模式先复制Query，调用`src/planner/rewrite.c`。host-only和filter-only保持原始Query，交给PG正常规划。
+2. 本项目改写严格WHERE条件中的相关标量SUM/AVG/MIN/MAX：提取内外层整数等值键，将内层聚合改成按关联键分组，再与外层INNER JOIN，之后仍由PG选择物理Join顺序。只覆盖空集返回NULL的聚合及其严格表达式；COUNT、OR分支、SELECT输出位置、非等值相关、额外GROUP BY/HAVING/窗口/LIMIT等形态不做这项改写。它借鉴DuckDB的去相关思想，但不是DuckDB完整的Delim/Mark/Single Join实现。
+3. PG12自己的`prepjointree.c:pull_up_sublinks`会在满足条件的WHERE/JOIN ON位置，将ANY/EXISTS/NOT EXISTS转成Semi/Anti Join；不能保持NULL、相关或外连接语义时会保留子计划。`subselect.c:build_subplan`通常将非相关标量结果转成InitPlan/PARAM_EXEC，将适合哈希的非相关ANY保留为hashed SubPlan。不能期待所有子查询都消失，非相关标量只计算一次本来就是合理方案。
+4. 扩展的`src/planner/plan.c`编译上述物理节点；设备`code/csd-programs/pg_sina_csd/plan.c`执行注册的初始化子计划，再运行主流水线。
+
+| PG规划后的形态 | 当前完整CSD支持 |
+| --- | --- |
+| 已展开为普通/Semi/Anti Join | 编译为现有Hash/Merge/Index Join；Q21的EXISTS/NOT EXISTS属于这个类别 |
+| 非相关标量InitPlan | 要求EXPR_SUBLINK、无parParam/args、单setParam，且子树可编译；设备先求值一次并写入查询的params，主表达式用QP_PARAMETER引用，CU继承相同参数 |
+| 非相关hashed ANY SubPlan | 要求useHashTable、无parParam/args、单参数的int2/int4/int8等值判断；编成QP_SET，主表达式用QP_INSET探测；外层NOT保留NOT IN的NULL语义 |
+| 任意相关SubPlan | 不通用支持；未被改写/PG展开的parParam或args会使候选编译失败，保留HOST路径 |
+| ARRAY/EXISTS/MULTIEXPR等InitPlan | 不按上述标量协议通用支持；CTE另由CteScan处理 |
+| SubqueryScan/CTE | 支持的SubqueryScan变为投影；CteScan引用查询内共享的QP_MATERIALIZED状态，按现有内存/临时存储机制读回，并非一律消除物化 |
+
+`pg_sina_compile_subtree`将支持的root InitPlan登记到`init_nodes/init_params`，设备在主数据流水线之前执行：标量0行赋NULL、1行保存原值及数值scale、多行报错；集合初始化构建整数集合，并记录空集/NULL，后续探测不逐tuple重跑子查询。初始化阶段自身可使用现有并行算子，但多个初始化项按登记顺序推进。这是当前设备执行约定，并没有完整复制PG所有按需InitPlan调度行为。
+
+参数化Index Join也不是“支持任意相关SubPlan”：它只把已成为PG NestLoop的索引条件中的nestParams绑定回外层列，通过设备索引访问批量处理。不能将这个能力推广到任意SELECT标量子查询或相关表达式。
+
+混合执行仍有重要限制：只有与设备InitPlan绑定的PARAM_EXEC能进入CSD表达式；目前不从HOST取执行参数再绑定到设备扫描。`cost.c:estimate`的`eligible && (top || root->init_plans==NIL)`还会将含InitPlan上下文中的非根CSD岛全部跳过，Q11/Q22的filter-only因此没有卸载。这条限制过宽，但本轮没有放开，避免将HOST参数或整个聚合子计划偷偷塞进filter-only。修复应明确区分独立扫描、真正依赖HOST参数的扫描，以及Gather下必须私有重放的输入。
+
+TPC-H示例：Q2/Q17/Q20可受益于相关标量聚合改写；Q11/Q22在完整卸载时保留设备标量初始化；Q16的尺寸常量IN是ScalarArrayOpExpr展开的OR，不是SubPlan，而供应商NOT IN在完整卸载时可编成整数集合，在filter-only中仍由HOST执行。Q16优化与当前子查询边界分别记录，不因扫描更快而改变模式语义。

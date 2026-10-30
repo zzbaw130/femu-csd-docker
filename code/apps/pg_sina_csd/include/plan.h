@@ -69,21 +69,30 @@ struct qp_plan {
     struct qp_pipeline_profile pipelines[QP_NODES];
     struct qp_file_mapping files[QP_NODES],indexes[QP_NODES];
 };
+/* PG serializes this Const for parallel workers. Keep only actual nodes;
+ * runtime mappings/profiles are zero-filled when execution expands it back
+ * to the unchanged, full device record. */
+static inline size_t qp_plan_constant_bytes(const struct qp_plan *p)
+{ return offsetof(struct qp_plan,nodes)+(size_t)p->count*sizeof(p->nodes[0]); }
+/* These predicates can select borrowed Heap values without materializing
+ * projected text. Stateful sets/parameters and numeric conversion retain
+ * the existing general projection path. */
+static inline int qp_host_raw_filter(const struct qs_plan *p,int id)
+{
+    if(id<0 || (unsigned)id>=p->nexprs) return 0;
+    const struct qs_expr *e=&p->exprs[id];
+    if(e->op==Q_CONST) return 1;
+    if(e->op==Q_COLUMN) return e->column>=0 && (unsigned)e->column<p->nattrs && p->cols[e->column].type!=Q_DECIMAL;
+    if(e->op==Q_NOT || e->op==Q_IS_NULL || e->op==Q_IS_NOT_NULL) return qp_host_raw_filter(p,e->left);
+    if((e->op>=Q_EQ && e->op<=Q_OR) || e->op==Q_LIKE)
+        return qp_host_raw_filter(p,e->left) && qp_host_raw_filter(p,e->right);
+    return 0;
+}
 static inline int qp_host_raw_projection(const struct qp_plan *p)
 {
     const struct qp_node *n=&p->nodes[p->root];
     if(p->packed_result<QP_TYPED_RESULT || n->kind!=QP_SCAN || n->ordered_index) return 0;
-    if(n->expr.predicate>=0) {
-        /* A fixed-width column comparison leaves projected Numeric/text
-         * bodies untouched. Other predicates retain normal materialization. */
-        const struct qs_expr *e=&n->expr.exprs[n->expr.predicate];
-        if(e->op<Q_EQ || e->op>Q_GE || e->left<0 || e->right<0) return 0;
-        const struct qs_expr *col=&n->expr.exprs[e->left],*value=&n->expr.exprs[e->right];
-        if(col->op==Q_CONST) { const struct qs_expr *swap=col; col=value; value=swap; }
-        if(col->op!=Q_COLUMN || value->op!=Q_CONST || col->column<0 ||
-           (unsigned)col->column>=n->expr.nattrs || value->type==Q_STRING ||
-           n->expr.cols[col->column].type==Q_STRING || n->expr.cols[col->column].type==Q_DECIMAL) return 0;
-    }
+    if(n->expr.predicate>=0 && !qp_host_raw_filter(&n->expr,n->expr.predicate)) return 0;
     int variable=0;
     for(unsigned i=0;i<n->expr.nout;++i) {
         const struct qs_expr *e=&n->expr.exprs[n->expr.outputs[i].index];

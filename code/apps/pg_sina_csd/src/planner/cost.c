@@ -451,7 +451,7 @@ static void device_cost(struct placement *p,List **observations)
     if(scan->methods==&pg_sina_scan_methods) {
         fast_cost(p,(const struct qs_plan *)VARDATA(bytes),observations); return;
     }
-    struct qp_plan *tree=palloc(sizeof(*tree)); memcpy(tree,VARDATA(bytes),sizeof(*tree));
+    struct qp_plan *tree=palloc0(sizeof(*tree)); memcpy(tree,VARDATA(bytes),VARSIZE_ANY_EXHDR(bytes));
     bool used[QP_NODES]={0},indexed[QP_NODES]={0}; used[tree->root]=true;
     for(unsigned i=0;i<tree->ninit;++i) used[tree->init_nodes[i]]=true;
     for(unsigned pass=0;pass<tree->count;++pass) for(unsigned i=0;i<tree->count;++i) if(used[i]) {
@@ -627,7 +627,7 @@ static void device_cost(struct placement *p,List **observations)
     p->boundary=transfer_ms(output_bytes(p->native,&tree->nodes[tree->root].expr,p->rows),pg_sina_pcie_mbps)+
         p->rows*cpu_tuple_cost*pg_sina_host_cost_ms+
         Max(1,ceil(p->rows/output_capacity(p->native,&tree->nodes[tree->root].expr)))*pg_sina_result_batch_ms;
-    memcpy(VARDATA(bytes),tree,sizeof(*tree));
+    memcpy(VARDATA(bytes),tree,VARSIZE_ANY_EXHDR(bytes));
     pfree(tree);
 }
 static struct placement *estimate(PlannerInfo *root,Plan *native,Plan *scope,List **observations,bool top,bool mark_restore,bool parallel_region)
@@ -672,6 +672,10 @@ static struct placement *estimate(PlannerInfo *root,Plan *native,Plan *scope,Lis
      * example a private hash build). A shared device stream partitions rows;
      * it is not a broadcast/replay source. Keep those scans native. */
     if(pg_sina_exe_path==PG_SINA_FILTER && parallel_region && !native->parallel_aware) eligible=false;
+    /* The shared scan cursor supports parallel SeqScan only. Reject parallel
+     * index candidates before compiling their filters/SubPlans and metadata;
+     * compile_subtree already rejects the same shape at its final check. */
+    if(pg_sina_exe_path==PG_SINA_FILTER && native->parallel_aware && !IsA(native,SeqScan)) eligible=false;
     /* HOST HashJoin invokes MultiExec on its Hash child, and MergeJoin may
      * mark/restore its inner child. A tuple-stream CustomScan is neither.
      * Keep those native nodes; their inputs can still be device islands. */

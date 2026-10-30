@@ -63,5 +63,34 @@ int main(int argc,char **argv)
     p.exprs[6].op=Q_IS_NOT_NULL; compare(filter,&p,c,bytes);
     p.exprs[6].op=Q_AND; p.exprs[4].isnull=1; compare(filter,&p,c,bytes);
     p.exprs[4].isnull=0; p.exprs[4].constant=51; p.exprs[4].scale=3; compare(filter,&p,c,bytes);
+    /* An IN list behind a residual comparison must compact sparse rows
+     * safely across vector boundaries. Compare against scalar three-valued
+     * evaluation, including NULL list members and NOT around the whole OR. */
+    p.nexprs=3;
+    p.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.column=0,.type=Q_INTEGER};
+    p.exprs[1]=(struct qs_expr){.op=Q_COLUMN,.column=2,.type=Q_INTEGER};
+    p.exprs[2]=(struct qs_expr){.op=Q_LT,.left=0,.right=1,.type=Q_BOOLEAN};
+    int members=-1,constant=-1;
+    for(unsigned i=0;i<8;++i) {
+        constant=p.nexprs++;
+        p.exprs[constant]=(struct qs_expr){.op=Q_CONST,.constant=i*3,.type=Q_INTEGER};
+        int test=p.nexprs++;
+        p.exprs[test]=(struct qs_expr){.op=Q_EQ,.left=0,.right=constant,.type=Q_BOOLEAN};
+        if(members<0) members=test;
+        else {
+            int either=p.nexprs++;
+            p.exprs[either]=(struct qs_expr){.op=Q_OR,.left=members,.right=test,.type=Q_BOOLEAN}; members=either;
+        }
+    }
+    p.predicate=p.nexprs++;
+    p.exprs[p.predicate]=(struct qs_expr){.op=Q_AND,.left=2,.right=members,.type=Q_BOOLEAN};
+    for(unsigned row=0;row<c->rows;++row) qs_values(c)[row]=row%23;
+    compare(filter,&p,c,bytes);
+    p.exprs[constant].isnull=1; compare(filter,&p,c,bytes);
+    p.exprs[constant].isnull=0;
+    p.exprs[p.predicate].op=Q_OR; compare(filter,&p,c,bytes);
+    p.exprs[p.predicate]=(struct qs_expr){.op=Q_NOT,.left=members,.type=Q_BOOLEAN}; compare(filter,&p,c,bytes);
+    p.predicate=members;
+    for(unsigned i=0;i<sizeof(rows)/sizeof(*rows);++i) { c->rows=rows[i]; compare(filter,&p,c,bytes); }
     free(c); dlclose(so); puts("PASS column comparisons, signed limits, NULL, conjunctions, tails and exact evaluator fallback"); return 0;
 }

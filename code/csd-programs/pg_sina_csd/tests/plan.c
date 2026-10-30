@@ -382,7 +382,9 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
         if(payload==3) for(unsigned r=0;r<rows;++r) assert(visited[r]==(r>=rows/2));
         if(!ordered) assert(namespace_loads==raw_bytes/QS_PAGE);
         if(workers) assert(out->metrics.workers==workers && p->pipelines[1].worker_ns);
-        if(qp_host_raw_projection(p)) assert(!out->metrics.dictionary_entries && !out->metrics.dictionary_bytes && !loads && !spill.stores);
+        /* Raw output may retain its one immutable LIKE literal, but no
+         * projected row strings enter the shared device dictionary. */
+        if(qp_host_raw_projection(p)) assert(out->metrics.dictionary_entries==(unsigned)(payload==2) && !loads && !spill.stores);
         else assert((test_packed || out->metrics.dictionary_bytes>budget) && out->metrics.dictionary_entries==rows-(rows+96)/97+(payload?40:0)+(payload==2));
         if(payload==2 || payload==3) assert(out->profile.operators[QS_FILTER].calls);
         if(ordered==DICTIONARY_SORT && budget>=64U*1024*1024)

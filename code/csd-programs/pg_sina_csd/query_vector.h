@@ -312,7 +312,10 @@ static int qs_text_like(const char *pattern,unsigned pn,const char *text,unsigne
         return *pattern==*text?qs_text_like(pattern+1,pn-1,text+1,tn-1):0;
     }
     if(*pattern=='_') { unsigned n=qs_text_character(text,tn); return qs_text_like(pattern+1,pn-1,text+n,tn-n); }
-    return *pattern==*text?qs_text_like(pattern+1,pn-1,text+1,tn-1):0;
+    unsigned prefix=0;
+    while(prefix<pn && pattern[prefix]!='%' && pattern[prefix]!='_' && pattern[prefix]!='\\') ++prefix;
+    if(tn<prefix || memcmp(pattern,text,prefix)) return 0;
+    return qs_text_like(pattern+prefix,pn-prefix,text+prefix,tn-prefix);
 }
 /* errors==2 means this row has not been evaluated in this batch. It also
  * caches shared expressions reached through different AND/OR branches. */
