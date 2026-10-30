@@ -612,19 +612,18 @@ static void device_cost(struct placement *p,List **observations)
     memcpy(VARDATA(bytes),tree,sizeof(*tree));
     pfree(tree);
 }
-static struct placement *estimate(PlannerInfo *root,Plan *native,Plan *scope,List **observations,bool top,bool mark_restore)
+static struct placement *estimate(PlannerInfo *root,Plan *native,Plan *scope,List **observations,bool top,bool mark_restore,bool parallel_region)
 {
     struct placement *p=palloc0(sizeof(*p)); p->native=native; p->root=root; p->csd=DBL_MAX;
-    /* Adaptive placement keeps Gather indivisible. Filter-only may replace
-     * its scans using the executor's shared chunk allocator. */
+    bool parallel_children=parallel_region || IsA(native,Gather) || IsA(native,GatherMerge);
     {
-        if(native->lefttree) p->children=lappend(p->children,estimate(root,native->lefttree,scope,observations,false,false));
+        if(native->lefttree) p->children=lappend(p->children,estimate(root,native->lefttree,scope,observations,false,false,parallel_children));
         if(native->righttree) p->children=lappend(p->children,estimate(root,native->righttree,scope,observations,false,
-            IsA(native,MergeJoin) && !((MergeJoin *)native)->skip_mark_restore));
+            IsA(native,MergeJoin) && !((MergeJoin *)native)->skip_mark_restore,parallel_children));
         if(IsA(native,SubqueryScan)) {
             RelOptInfo *rel=root->simple_rel_array[((SubqueryScan *)native)->scan.scanrelid];
             if(rel && rel->subroot) p->children=lappend(p->children,
-                estimate(rel->subroot,((SubqueryScan *)native)->subplan,((SubqueryScan *)native)->subplan,observations,false,false));
+                estimate(rel->subroot,((SubqueryScan *)native)->subplan,((SubqueryScan *)native)->subplan,observations,false,false,parallel_children));
         }
     }
     double original_children=0,best_children=0,native_children=0;
@@ -651,6 +650,10 @@ static struct placement *estimate(PlannerInfo *root,Plan *native,Plan *scope,Lis
     p->native_host=local+native_children;
     bool eligible=pg_sina_exe_path!=PG_SINA_FILTER ||
         IsA(native,SeqScan) || IsA(native,IndexScan) || IsA(native,IndexOnlyScan);
+    /* Private inputs below Gather must be replayed by every PG worker (for
+     * example a private hash build). A shared device stream partitions rows;
+     * it is not a broadcast/replay source. Keep those scans native. */
+    if(pg_sina_exe_path==PG_SINA_FILTER && parallel_region && !native->parallel_aware) eligible=false;
     /* HOST HashJoin invokes MultiExec on its Hash child, and MergeJoin may
      * mark/restore its inner child. A tuple-stream CustomScan is neither.
      * Keep those native nodes; their inputs can still be device islands. */
@@ -790,7 +793,7 @@ const CustomScanMethods pg_sina_adaptive_methods={.CustomName="SQLeratePlan",.Cr
 Plan *pg_sina_adaptive_plan(PlannerInfo *root,Plan *native)
 {
     List *observations=NIL;
-    struct placement *p=estimate(root,native,native,&observations,true,false);
+    struct placement *p=estimate(root,native,native,&observations,true,false,false);
     StringInfoData decisions; initStringInfo(&decisions);
     StringInfoData costs; initStringInfo(&costs); node_costs(p,&costs);
     Plan *out=select_plan(p,true,&decisions);

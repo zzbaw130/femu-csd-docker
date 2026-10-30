@@ -4671,6 +4671,11 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
         out->rows=out->begin=out->finished=out->str_bytes=0; out->status=0;
     }
     s->args=a; s->io=a->mr_addr[4]; s->io_bytes=a->mr_len[4];
+    /* A new submission must not acknowledge an earlier worker batch again,
+     * including early returns while dictionary initialization/resume is BUSY.
+     * Device-internal I/O reentry still accumulates acknowledgements until
+     * the host observes this submission's single completion. */
+    if(!csIsReentry(a)) control->drained=0;
     if(s->buffered) { out->rows=s->buffered_rows; out->finished=s->buffered_finished; s->buffered=0; }
     if(s->closing) return finish_dictionary(s,a,out);
     int continuing=s->text_wait || s->dictionary_wait || s->initial_wait || s->pending_sort;
@@ -4699,9 +4704,6 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
     }
     /* The last AFDM is private to this CU, also for SNIA NEED_LOAD/STORE. */
     s->io=a->mr_addr[4]; s->io_bytes=a->mr_len[4];
-    /* SNIA may invoke us repeatedly inside one batch submission for spill.
-     * PG only observes completion once, so retain all consumed-buffer bits. */
-    if(!csIsReentry(a)) control->drained=0;
     if(s->pending_nvm) {
         if(!csIsReentry(a) || csReentryValue(a)!=s->pending_nvm) return -1;
         s->pending_nvm=0; control->ready=1;

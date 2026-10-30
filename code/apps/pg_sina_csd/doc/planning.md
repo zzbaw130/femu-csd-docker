@@ -16,7 +16,7 @@ D(v) = 可编译的设备子树的内部 I/O + CU 计算 + spill + 未被覆盖�
 
 每个位置必须先通过现有算子编译器的语义与映射检查。HOST 结果行重新送入设备解释器尚未实现，故 HOST→CSD 中间行边界为不可行；不能假定它已经能运行。CSD 候选从已准备的基表/索引开始，可有多个独立子树向 HOST 的 Join、Aggregate、Sort 等返回数据。返回位置遵守 PG 的目标列、顺序、NULL 与表达式语义，子树边界保留索引/排序顺序。HOST Hash Join 的 Hash 子节点必须保留 MultiExec 接口；Merge Join 需要标记/恢复的内侧节点也保留在 HOST，它们下方仍可接入 CSD 输入。
 
-PG Gather/GatherMerge 的 HOST 区域保留原并行执行，内部 HOST 成本仍递归观察缓存；SQLerate 不单独替换其 worker 扫描，若整个区域可编译，则可整体卸载。`filter-only` 保留 PG 原生并行计划：parallel-aware SeqScan 的参与者通过 PG 共享内存中的原子计数器领取互不重叠的设备输入块；每个参与者再通过现有 SNIA batch 驱动 CU。并行索引扫描暂留原生 PG，避免破坏其分片/顺序语义。PG 上层的 Partial/Final Aggregate、Gather 和 Join 不被强制串行化。
+PG Gather/GatherMerge 的 HOST 区域保留原并行执行，内部 HOST 成本仍递归观察缓存；SQLerate 不单独替换其 worker 扫描，若整个区域可编译，则可整体卸载。`filter-only` 保留 PG 原生并行计划：parallel-aware SeqScan 只有一个现有 PG 参与者通过 SNIA batch 驱动共享 CU 任务池；其他参与者从 DSM 领取已返回的行批次，不各自预留设备资源。Gather 下需要完整重读的私有 Scan 留在 HOST。并行索引扫描暂留原生 PG，避免破坏其分片/顺序语义。PG 上层的 Partial/Final Aggregate、Gather 和 Join 不被强制串行化。
 
 `csd-without-hpcp` 和 `csd-with-hpcp` 不按成本拒绝已支持的完整子树；完整编译失败时继续寻找可卸载的子树。不支持的语义继续由 PG 执行。`host-only` 不加设备节点或 SQLerate 外层节点。
 
@@ -89,4 +89,4 @@ Q4/Q10/Q12的修正前CSD分别为1963.439/3092.929/4688.155ms（`results/tpch.4
 
 PG两项CTest与设备 `pgSinaIndexJoin64MiB`、`pgSinaPackedOutput64MiB` 通过。索引连接测试覆盖内部/任务块两种调度、四种连接类型、重复/NULL键、跨64键匹配及两侧空输入。此次未运行全量TPC-H；只对本节查询和Q6作针对性回归。
 
-功能通过与性能通过分开：Q10仍比同轮HOST慢约12%，Q12也略慢，两者都没有spill，不能归因为物理工作内存不足，仍未达到性能验收要求。本阶段未解决filter-only独立混合执行中的丢行/AFDM失败，也未补全SQLerate对Index Join随机页访问的成本估计；Q13完整卸载成功不等于这些独立边界问题已修复。
+功能通过与性能通过分开：Q10仍比同轮HOST慢约12%，Q12也略慢，两者都没有spill，不能归因为物理工作内存不足，仍未达到性能验收要求。SQLerate对Index Join随机页访问的成本估计仍未补全。后续共享扫描修复已解决filter-only重复AFDM预留和协调CU旧确认位引起的丢行/超时，验证及剩余性能问题见[filter-only 执行](filter-only.md)。

@@ -4,19 +4,30 @@
 #include "catalog/pg_type_d.h"
 #include "executor/executor.h"
 #include "access/parallel.h"
+#include "storage/condition_variable.h"
+#include "storage/spin.h"
+#include "pgstat.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/resowner.h"
 #include <time.h>
 #include <stdatomic.h>
 #include <pthread.h>
 #include <stdlib.h>
 
 typedef struct PlanStateCsd PlanStateCsd;
-/* Native PG parallel scan participants claim disjoint device chunks. */
+/* One existing PG participant owns SNIA/CU state. Native parallel consumers
+ * take disjoint result rows, not independent copies of the device scan. */
 struct parallel_scan {
-    atomic_uint_fast64_t next_offset;
-    unsigned participants;
+    slock_t mutex;
+    ConditionVariable ready;
+    int producer;
+    unsigned rows,position,workers,scan_bytes;
+    bool finished;
+    uint64_t fdm_bytes,result_bytes,result_reads,result_rows;
+    struct pg_sina_resources resources;
+    struct qs_result batch;
 };
 struct plan_slot {
     struct qp_control control;
@@ -49,6 +60,7 @@ struct PlanStateCsd {
     unsigned workers, epoch, device_cus;
     atomic_uint_fast64_t next_scan_offset;
     struct parallel_scan *shared_scan;
+    int producer;
     atomic_uint_fast64_t batch_progress;
     unsigned retry_worker;
     atomic_bool stopping;
@@ -76,6 +88,7 @@ struct PlanStateCsd {
     unsigned row;
     bool started, explain_only, loaded, active, profiling;
     uint64_t start_ns;
+    ResourceOwner resource_owner;
     MemoryContextCallback cleanup;
 };
 static const CustomExecMethods methods;
@@ -201,6 +214,19 @@ static void close_state(void *arg)
     if(s->profiling) s->cleanup_ns+=clock_ns()-started;
     RESUME_INTERRUPTS();
 }
+/* Parallel workers can exit after ERROR without deleting their query memory
+ * context. Release device state during PG resource-owner abort as well. */
+static void release_resources(ResourceReleasePhase phase,bool isCommit,bool isTopLevel,void *arg)
+{
+    PlanStateCsd *s=arg;
+    if(phase==RESOURCE_RELEASE_BEFORE_LOCKS && CurrentResourceOwner==s->resource_owner)
+        close_state(s);
+}
+static void cleanup_state(void *arg)
+{
+    UnregisterResourceReleaseCallback(release_resources,arg);
+    close_state(arg);
+}
 static void begin(CustomScanState *node,EState *estate,int flags)
 {
     PlanStateCsd *s=(void *)node; CustomScan *scan=(void *)node->ss.ps.plan;
@@ -213,7 +239,9 @@ static void begin(CustomScanState *node,EState *estate,int flags)
     atomic_init(&s->stopping,false); atomic_init(&s->next_scan_offset,0);
     atomic_init(&s->load_ns,0); atomic_init(&s->load_calls,0);
     atomic_init(&s->completion_reads,0); atomic_init(&s->batch_progress,0);
-    s->cleanup.func=close_state; s->cleanup.arg=s;
+    s->resource_owner=CurrentResourceOwner;
+    RegisterResourceReleaseCallback(release_resources,s);
+    s->cleanup.func=cleanup_state; s->cleanup.arg=s;
     MemoryContextRegisterResetCallback(estate->es_query_cxt,&s->cleanup);
 }
 /* Compute offsets without allocating, so a larger I/O block can be tried
@@ -304,7 +332,6 @@ static void start(PlanStateCsd *s)
     bool indexed[QP_NODES]={0};
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_INDEX_JOIN) indexed[s->plan->nodes[i].right]=true;
     qp_parallel_boundaries(s->plan,s->plan->root);
-    if(s->shared_scan) s->plan->nodes[s->plan->root].parallel=1;
     for(unsigned i=0;i<s->plan->ninit;++i) qp_parallel_boundaries(s->plan,s->plan->init_nodes[i]);
     bool parallel=false;
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].parallel) parallel=true;
@@ -312,7 +339,6 @@ static void start(PlanStateCsd *s)
     s->device_cus=pg_sina_resources.cus;
     if(parallel) s->workers=Min(QS_WORKERS,s->device_cus);
     uint64_t capacity=pg_sina_resources.fdm_bytes;
-    if(s->shared_scan) capacity/=s->shared_scan->participants;
     if(s->workers<=1) s->workers=0;
     s->plan->scan_bytes=QS_CHUNK;
     size_t arena,sizes[5];
@@ -322,7 +348,7 @@ static void start(PlanStateCsd *s)
         size_t needed=arena+plan_bytes+(s->workers+1)*(sizeof(struct qp_control)+sizeof(*s->result)+QS_SORT_IO_BYTES)+65536;
         if(capacity && needed>capacity) {
             if(s->plan->scan_bytes>QP_SCAN_BYTES) { s->plan->scan_bytes/=2; continue; }
-            if(s->workers>(s->shared_scan?2U:0U)) { if(--s->workers==1) s->workers=0; continue; }
+            if(s->workers) { if(--s->workers==1) s->workers=0; continue; }
         }
         sizes[0]=plan_bytes; sizes[1]=(s->workers+1)*sizeof(struct qp_control);
         sizes[2]=(s->workers+1)*sizeof(*s->result); sizes[3]=arena; sizes[4]=QS_SORT_IO_BYTES;
@@ -342,7 +368,7 @@ static void start(PlanStateCsd *s)
         }
         if(status!=CS_NOT_ENOUGH_MEMORY && status!=CS_OUT_OF_RESOURCES) checked(status,"allocate AFDM");
         if(s->plan->scan_bytes>QP_SCAN_BYTES) { s->plan->scan_bytes/=2; continue; }
-        if(s->workers>(s->shared_scan?2U:0U)) { if(--s->workers==1) s->workers=0; continue; }
+        if(s->workers) { if(--s->workers==1) s->workers=0; continue; }
         checked(status,"allocate AFDM");
     }
     s->fdm_bytes=s->workers*QS_SORT_IO_BYTES;
@@ -418,8 +444,7 @@ static CS_STATUS queue_scan(struct plan_slot *slot)
     unsigned node=slot->scan_node-1,worker=slot->worker;
     const struct qp_node *n=&s->plan->nodes[node];
     const struct qs_request *file=&s->files[node];
-    atomic_uint_fast64_t *next=s->shared_scan?&s->shared_scan->next_offset:&s->next_scan_offset;
-    uint64_t offset=atomic_fetch_add_explicit(next,s->plan->scan_bytes,memory_order_relaxed);
+    uint64_t offset=atomic_fetch_add_explicit(&s->next_scan_offset,s->plan->scan_bytes,memory_order_relaxed);
     if(offset>n->bytes) offset=n->bytes;
     uint64_t bytes=Min((uint64_t)s->plan->scan_bytes,n->bytes-offset);
     size_t size=sizeof(CsBatchRequest)+(file->nextents+1)*sizeof(CSBlockRange);
@@ -746,16 +771,78 @@ static void fetch(PlanStateCsd *s)
     }
 }
 extern Datum pg_sina_decimal(struct qs_cell);
+static const struct qs_cell *shared_next(PlanStateCsd *s)
+{
+    struct parallel_scan *shared=s->shared_scan;
+    const struct qs_plan *root=&s->plan->nodes[s->plan->root].expr;
+    unsigned columns=root->nout;
+    if(s->row<s->result->rows) return qp_result_row(s->result,s->row++,columns,1);
+    for(;;) {
+        CHECK_FOR_INTERRUPTS();
+        SpinLockAcquire(&shared->mutex);
+        if(!shared->producer) shared->producer=MyProcPid;
+        bool producer=shared->producer==MyProcPid;
+        if(shared->position<shared->rows) {
+            /* PG workers own batches, just as CUs own input morsels. Their
+             * existing local result buffers retain rows after publication
+             * advances; no row needs a lock or a copied device state. */
+            unsigned rows=Min(256U,shared->rows-shared->position);
+            memcpy(s->result->data,qp_result_row(&shared->batch,shared->position,columns,1),
+                (size_t)rows*columns*sizeof(struct qs_cell));
+            memcpy(s->result->str_data,shared->batch.str_data,shared->batch.str_bytes);
+            s->result->str_bytes=shared->batch.str_bytes; s->result->rows=rows; s->row=1;
+            shared->position+=rows;
+            SpinLockRelease(&shared->mutex);
+            ConditionVariableCancelSleep();
+            return qp_result_row(s->result,0,columns,1);
+        }
+        bool finished=shared->finished;
+        SpinLockRelease(&shared->mutex);
+        if(finished) {
+            ConditionVariableCancelSleep();
+            return NULL;
+        }
+        if(!producer) {
+            ConditionVariableSleep(&shared->ready,PG_WAIT_EXTENSION);
+            continue;
+        }
+        ConditionVariableCancelSleep();
+        if(!s->started) start(s);
+        fetch(s);
+        /* The previous batch is drained. Only this backend writes the next
+         * one, outside the spinlock; consumers still see an empty batch. */
+        memcpy(shared->batch.data,s->result->data,(size_t)s->result->rows*columns*sizeof(struct qs_cell));
+        memcpy(shared->batch.str_data,s->result->str_data,s->result->str_bytes);
+        SpinLockAcquire(&shared->mutex);
+        memcpy(&shared->batch,s->result,offsetof(struct qs_result,data));
+        shared->batch.str_bytes=s->result->str_bytes;
+        shared->resources=pg_sina_resources;
+        shared->fdm_bytes=s->fdm_bytes; shared->workers=s->workers;
+        shared->scan_bytes=s->plan->scan_bytes;
+        shared->result_bytes=s->result_bytes; shared->result_reads=s->result_reads; shared->result_rows=s->result_rows;
+        shared->position=0; shared->rows=s->result->rows; shared->finished=s->result->finished;
+        SpinLockRelease(&shared->mutex);
+        ConditionVariableBroadcast(&shared->ready);
+        if(s->result->finished) close_state(s);
+        s->row=s->result->rows=0; /* Only a claimed batch is locally visible. */
+    }
+}
 static TupleTableSlot *execute(CustomScanState *node)
 {
     PlanStateCsd *s=(void *)node; TupleTableSlot *slot=node->ss.ss_ScanTupleSlot;
     if(s->explain_only) return ExecClearTuple(slot);
-    if(!s->started) { start(s); fetch(s); }
-    if(s->row==s->result->rows && !s->result->finished) fetch(s);
-    if(s->row==s->result->rows) { close_state(s); return ExecClearTuple(slot); }
-    ResetExprContext(node->ss.ps.ps_ExprContext); ExecClearTuple(slot);
     const struct qs_plan *root=&s->plan->nodes[s->plan->root].expr;
-    const struct qs_cell *row=qp_result_row(s->result,s->row++,root->nout,1);
+    const struct qs_cell *row;
+    if(s->shared_scan) {
+        row=shared_next(s);
+        if(!row) return ExecClearTuple(slot);
+    } else {
+        if(!s->started) { start(s); fetch(s); }
+        if(s->row==s->result->rows && !s->result->finished) fetch(s);
+        if(s->row==s->result->rows) { close_state(s); return ExecClearTuple(slot); }
+        row=qp_result_row(s->result,s->row++,root->nout,1);
+    }
+    ResetExprContext(node->ss.ps.ps_ExprContext); ExecClearTuple(slot);
     for(unsigned i=0;i<root->nout;++i) {
         struct qs_cell v=row[i]; slot->tts_isnull[i]=v.isnull; if(v.isnull) continue;
         Oid type=root->outputs[i].type_oid;
@@ -790,8 +877,9 @@ static void initialize_dsm(CustomScanState *node,ParallelContext *pcxt,void *coo
 {
     PlanStateCsd *s=(void *)node;
     s->shared_scan=coordinate;
-    atomic_init(&s->shared_scan->next_offset,0);
-    s->shared_scan->participants=pcxt->nworkers+1;
+    memset(s->shared_scan,0,sizeof(*s->shared_scan));
+    SpinLockInit(&s->shared_scan->mutex);
+    ConditionVariableInit(&s->shared_scan->ready);
 }
 static void initialize_worker(CustomScanState *node,shm_toc *toc,void *coordinate)
 { ((PlanStateCsd *)node)->shared_scan=coordinate; }
@@ -799,6 +887,17 @@ static void shutdown_scan(CustomScanState *node)
 {
     PlanStateCsd *s=(void *)node;
     close_state(s); /* Drain SNIA callbacks before PG detaches shared memory. */
+    if(s->shared_scan) {
+        struct parallel_scan *shared=s->shared_scan;
+        SpinLockAcquire(&shared->mutex);
+        s->producer=shared->producer;
+        pg_sina_resources=shared->resources;
+        s->fdm_bytes=shared->fdm_bytes; s->workers=shared->workers;
+        s->plan->scan_bytes=shared->scan_bytes;
+        s->result_bytes=shared->result_bytes; s->result_reads=shared->result_reads; s->result_rows=shared->result_rows;
+        memcpy(s->result,&shared->batch,offsetof(struct qs_result,data));
+        SpinLockRelease(&shared->mutex);
+    }
     s->shared_scan=NULL;
 }
 static void rescan(CustomScanState *node)
@@ -817,7 +916,8 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     ExplainPropertyInteger("CSD Query Memory Limit","bytes",s->plan->nodes[s->plan->root].expr.work_mem_bytes,es);
     ExplainPropertyText("CSD Plan Source","PostgreSQL selected Plan; CSD build/probe orientation",es);
     ExplainPropertyInteger("CSD Host Result Bytes","bytes",s->result_bytes,es);
-    ExplainPropertyText("CSD Counter Scope","current PG backend; parallel workers have separate counters",es);
+    ExplainPropertyText("CSD Counter Scope",s->producer?"one device producer shared by PG scan participants":"current PG backend",es);
+    if(s->producer) ExplainPropertyInteger("CSD Scan Producer PID",NULL,s->producer,es);
     ExplainPropertyInteger("CSD Host Result Requests",NULL,s->result_reads,es);
     ExplainPropertyInteger("CSD Returned Rows",NULL,s->result_rows,es);
     ExplainPropertyInteger("CSD Output Columns",NULL,s->plan->nodes[s->plan->root].expr.nout,es);

@@ -160,17 +160,24 @@ struct probe_test {
     bool *need_input;
     unsigned scan_node;
     struct test_spill *spill;
+    atomic_bool *completed;
 };
-/* Exercise the public native-plan entry, not a manually bound dictionary.
- * Unique heap strings exceed the entire query budget; Sort must revisit them
- * for lexical comparisons and final result encoding after eviction. */
 static void *probe_worker(void *arg);
+static void *probe_async(void *arg)
+{
+    struct probe_test *t=arg; probe_worker(t);
+    atomic_store_explicit(t->completed,true,memory_order_release); return NULL;
+}
+enum { DICTIONARY_SCAN, DICTIONARY_SORT, DICTIONARY_ASYNC_SCAN };
+/* Exercise the public native-plan entry, including dictionary eviction and
+ * final text encoding. ASYNC_SCAN lets the coordinator consume one CU while
+ * others are still inserting text, matching the real host scheduler. */
 static void dictionary_plan(function run,unsigned cancel,unsigned workers,int ordered,unsigned rows,size_t budget,int payload)
 {
     enum { width=160 };
     unsigned per_page=payload?16:32,tuple_bytes=payload?480:192;
     const size_t raw_bytes=(rows/per_page)*QS_PAGE;
-    size_t plan_bytes=sizeof(struct qp_plan)+(ordered?0:sizeof(struct qs_extent));
+    size_t plan_bytes=sizeof(struct qp_plan)+(ordered==DICTIONARY_SORT?0:sizeof(struct qs_extent));
     struct qp_plan *p=calloc(1,plan_bytes); assert(p);
     p->count=2; p->packed_result=test_packed; p->scan_bytes=ordered?QP_SCAN_BYTES:QS_PAGE;
     struct qp_node *leaf=&p->nodes[1]; scan(leaf);
@@ -201,8 +208,8 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
     root->expr.cols[0].length=4; root->expr.work_mem_bytes=budget; root->expr.predicate=-1;
     root->expr.norder=2; root->expr.order[0]=(struct qs_order){.output=0};
     root->expr.order[1]=(struct qs_order){.output=1}; root->expr.limit=-1;
-    if(!ordered) {
-        assert(!workers && !cancel); p->root=1; leaf->expr.work_mem_bytes=budget;
+    if(ordered!=DICTIONARY_SORT) {
+        assert(!cancel && (workers || !ordered)); p->root=1; leaf->expr.work_mem_bytes=budget;
         p->files[1]=(struct qp_file_mapping){.offset=sizeof(*p),.nsid=1,.lba_bytes=512,.count=1};
         *(struct qs_extent *)(p+1)=(struct qs_extent){.lba=4096,.bytes=raw_bytes};
     }
@@ -247,21 +254,30 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
     struct test_spill spill={.mutex=PTHREAD_MUTEX_INITIALIZER};
     unsigned seen=0,key=0,null_row=0,loads=0,epoch=0,namespace_loads=0; uint64_t peak=0,available=0,done=0; int cancelled=0;
     atomic_uint_fast64_t offset=0; bool need_input[QS_WORKERS]={0};
+    pthread_t threads[QS_WORKERS]; struct probe_test tasks[QS_WORKERS];
+    atomic_bool completed[QS_WORKERS]; uint64_t started=0;
+    unsigned iterations=0; unsigned char *visited=calloc(rows,1); assert(visited);
     while(!out->finished) {
+        assert(++iterations<1000000);
         if(c->parallel && !csIsReentry(&a)) {
-            pthread_t threads[QS_WORKERS]; struct probe_test tasks[QS_WORKERS]; uint64_t started=0;
-            for(unsigned w=0;w<workers;++w) if(!((available|done)&(UINT64_C(1)<<w))) {
-                tasks[w]=(struct probe_test){run,a,p,&controls[w+1],&out[w+1],arena,raw,raw,NULL,w+1,&offset,&need_input[w],c->scan_node,&spill};
+            for(unsigned w=0;w<workers;++w) if(!((available|done|started)&(UINT64_C(1)<<w))) {
+                tasks[w]=(struct probe_test){run,a,p,&controls[w+1],&out[w+1],arena,raw,raw,NULL,w+1,&offset,&need_input[w],c->scan_node,&spill,NULL};
                 tasks[w].args.cparam1=((w+1)<<1)|1;
-                assert(c->scan_node==2 && !pthread_create(&threads[w],NULL,probe_worker,&tasks[w])); started|=UINT64_C(1)<<w;
+                atomic_init(&completed[w],false); tasks[w].completed=&completed[w];
+                assert(c->scan_node==2 && !pthread_create(&threads[w],NULL,probe_async,&tasks[w])); started|=UINT64_C(1)<<w;
             }
-            for(unsigned w=0;w<workers;++w) if(started&(UINT64_C(1)<<w)) {
-                assert(!pthread_join(threads[w],NULL)); available|=UINT64_C(1)<<w;
+            for(unsigned w=0;w<workers;++w) if((started&(UINT64_C(1)<<w)) &&
+                (ordered!=DICTIONARY_ASYNC_SCAN || atomic_load_explicit(&completed[w],memory_order_acquire))) {
+                assert(!pthread_join(threads[w],NULL)); available|=UINT64_C(1)<<w; started&=~(UINT64_C(1)<<w);
                 if(out[w+1].finished) done|=UINT64_C(1)<<w;
             }
             c->available=available;
         }
+        /* A stale acknowledgement must be cleared even if dictionary
+         * resume returns BUSY before the next batch can be produced. */
+        if(ordered==DICTIONARY_ASYNC_SCAN && !csIsReentry(&a)) c->drained|=UINT64_C(1)<<63;
         int64_t status=run(&a);
+        if(ordered==DICTIONARY_ASYNC_SCAN) assert(!(c->drained&(UINT64_C(1)<<63)));
         if(status<0) fprintf(stderr,"dictionary plan status=%lld seen=%u node=%u error=%d stores=%u loads=%u\n",
             (long long)status,seen,c->error_node,c->error,spill.stores,loads);
         assert(status>=0);
@@ -292,18 +308,19 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
         }
         for(unsigned r=0;r<out->rows;++r) {
             struct qs_cell *v=qp_result_row(out,r,p->nodes[p->root].expr.nout,p->packed_result); assert(seen<rows);
-            if(ordered) while(key<rows && expected[key]%97==0) ++key;
-            unsigned source=ordered?(key<rows?expected[key]:null_row):seen;
-            unsigned value_key=ordered?key:(seen*1009)%rows;
+            if(ordered==DICTIONARY_SORT) while(key<rows && expected[key]%97==0) ++key;
+            unsigned source=ordered==DICTIONARY_SORT?(key<rows?expected[key]:null_row):(unsigned)v[1].value;
+            unsigned value_key=ordered==DICTIONARY_SORT?key:(source*1009)%rows;
+            assert(source<rows && !visited[source]); visited[source]=1;
             if(source%97) {
                 char want[width],prefix[48]; int n=snprintf(prefix,sizeof(prefix),payload?"shared-prefix-longer-than-twelve-%06u-":"key-%06u-",value_key);
                 memcpy(want,prefix,n); memset(want+n,'a'+value_key%26,width-n);
                 assert(!v[0].isnull && qs_cell_string(v)==width && qs_cell_is_string_ref(v));
                 assert(v[0].value>=0 && v[0].value+width<=out->str_bytes);
                 assert(!memcmp(out->str_data+(size_t)v[0].value,want,width));
-                assert(!v[1].isnull && v[1].value==source); if(ordered) ++key;
+                assert(!v[1].isnull && v[1].value==source); if(ordered==DICTIONARY_SORT) ++key;
             } else {
-                assert(v[0].isnull && !v[1].isnull && v[1].value==source); if(ordered) null_row+=97;
+                assert(v[0].isnull && !v[1].isnull && v[1].value==source); if(ordered==DICTIONARY_SORT) null_row+=97;
             }
             if(payload) {
                 static const unsigned sizes[]={0,5,20,255}; unsigned n=sizes[source%4];
@@ -338,8 +355,9 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
     }
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
     if(!cancel) printf("PASS default dictionary %s: %u rows, %llu bytes, STORE=%u LOAD=%u peak=%llu/%zu\n",
-        ordered?"Scan/Sort/output":"namespace Scan/output",seen,(unsigned long long)out->metrics.dictionary_bytes,spill.stores,loads,(unsigned long long)peak,budget);
+        ordered==DICTIONARY_SORT?"Scan/Sort/output":workers?"parallel Scan/output":"namespace Scan/output",seen,(unsigned long long)out->metrics.dictionary_bytes,spill.stores,loads,(unsigned long long)peak,budget);
     else printf("PASS default dictionary cancel after %s before CSF acknowledgement\n",cancel==1?"STORE":"LOAD");
+    assert(!started); free(visited);
     free(controls); free(spill.tokens); free(expected); free(raw); free(arena); free(io); free(out); free(p);
     assert(!pthread_mutex_destroy(&spill.mutex));
 }
@@ -814,7 +832,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         if(control.parallel && !csIsReentry(&args)) {
             pthread_t threads[QS_WORKERS]; struct probe_test tasks[QS_WORKERS]; uint64_t started=0;
             for(unsigned w=0;w<plan->workers;++w) if(!((available|done)&(UINT64_C(1)<<w))) {
-                tasks[w]=(struct probe_test){run,args,plan,&controls[w+1],&out[w+1],arena,raw[0],raw[1],index,w+1,NULL,NULL,0,&spill};
+                tasks[w]=(struct probe_test){run,args,plan,&controls[w+1],&out[w+1],arena,raw[0],raw[1],index,w+1,NULL,NULL,0,&spill,NULL};
                 tasks[w].args.cparam1=((w+1)<<1)|(args.cparam1&1);
                 if(test_scheduled && control.scan_node) {
                     tasks[w].next_offset=&host_offset; tasks[w].need_input=&need_input[w];
@@ -1890,7 +1908,7 @@ static void parallel_sort_spill(function run,unsigned workers,unsigned memory,in
         if(c->parallel && !csIsReentry(&args)) {
             pthread_t threads[QS_WORKERS]; struct probe_test tasks[QS_WORKERS]; uint64_t started=0;
             for(unsigned w=0;w<workers;++w) if(!((available|done)&(UINT64_C(1)<<w))) {
-                tasks[w]=(struct probe_test){run,args,p,&controls[w+1],&out[w+1],arena,raw,raw,NULL,w+1,&offset,&need_input[w],c->scan_node,&spill};
+                tasks[w]=(struct probe_test){run,args,p,&controls[w+1],&out[w+1],arena,raw,raw,NULL,w+1,&offset,&need_input[w],c->scan_node,&spill,NULL};
                 tasks[w].args.cparam1=((w+1)<<1)|1;
                 assert(c->scan_node==leaf_id+1 && !pthread_create(&threads[w],NULL,probe_worker,&tasks[w])); started|=UINT64_C(1)<<w;
             }
@@ -2119,7 +2137,7 @@ static void multiple_group_aggregates(function run,unsigned memory,unsigned kind
         if(control.parallel && !csIsReentry(&args)) {
             pthread_t threads[QS_WORKERS]; struct probe_test tasks[QS_WORKERS]; uint64_t started=0;
             for(unsigned w=0;w<p->workers;++w) if(!((available|done)&(UINT64_C(1)<<w))) {
-                tasks[w]=(struct probe_test){run,args,p,&controls[w+1],&out[w+1],arena,raw,raw,NULL,w+1,NULL,NULL,0,&spill};
+                tasks[w]=(struct probe_test){run,args,p,&controls[w+1],&out[w+1],arena,raw,raw,NULL,w+1,NULL,NULL,0,&spill,NULL};
                 tasks[w].args.cparam1=((w+1)<<1)|1;
                 if(test_scheduled && control.scan_node) {
                     tasks[w].next_offset=&host_offset; tasks[w].need_input=&need_input[w];
@@ -2281,6 +2299,7 @@ int main(int argc,char **argv)
         function run=(function)dlsym(library,"pg_sina_plan"); assert(run);
         dictionary_plan(run,0,0,0,8192,64U*1024*1024,1);
         dictionary_plan(run,0,4,1,8192,64U*1024*1024,1);
+        dictionary_plan(run,0,4,DICTIONARY_ASYNC_SCAN,65536,64U*1024*1024,1);
         return 0;
     }
     if(argc==3 && !strcmp(argv[2],"--dictionary-64m")) {
