@@ -90,3 +90,55 @@ Q4/Q10/Q12的修正前CSD分别为1963.439/3092.929/4688.155ms（`results/tpch.4
 PG两项CTest与设备 `pgSinaIndexJoin64MiB`、`pgSinaPackedOutput64MiB` 通过。索引连接测试覆盖内部/任务块两种调度、四种连接类型、重复/NULL键、跨64键匹配及两侧空输入。此次未运行全量TPC-H；只对本节查询和Q6作针对性回归。
 
 功能通过与性能通过分开：Q10仍比同轮HOST慢约12%，Q12也略慢，两者都没有spill，不能归因为物理工作内存不足，仍未达到性能验收要求。SQLerate对Index Join随机页访问的成本估计仍未补全。后续共享扫描修复已解决filter-only重复AFDM预留和协调CU旧确认位引起的丢行/超时，验证及剩余性能问题见[filter-only 执行](filter-only.md)。
+
+## Q10/Q12 的索引连接与内部读取诊断
+
+代码版本 `1e0b54b8a`，配置仍为 4 CU、256MiB workmem、64MiB FDM；PG 为 2GB shared_buffers、16MB work_mem、最多4个并行worker。本次只执行正式 Q10/Q12，每种组合重启 PG、清除 Guest page cache，没有修改查询、连接计划、参数或算子代码。
+
+`results/tpch.l0gE2d/` 开启已有 `pg_sina_csd.profile`，用于诊断，不混入此前关闭 profiling 的正式基准：
+
+| 查询 | HOST（ms） | filter-only（ms） | csd-without-hpcp（ms） | csd-with-hpcp（ms） | SQLerate（ms） |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q10 | 2227.307 | 1782.023 | 2483.165 | 2360.429 | 2448.800 |
+| Q12 | 1590.233 | 1117.749 | 1573.337 | 1584.088 | 1585.274 |
+
+十次执行均与对应 HOST 输出一致。Q10 的三种完整 CSD 路径都慢于 HOST/filter-only；Q12 更准确地说是与 HOST 基本持平、明显慢于 filter-only，不能将百分之一左右的差别解释为稳定退化。三种完整卸载模式使用同一设备连接树；HPCP 与 SQLerate 不会自动换一种 Index Join 算法。
+
+### 共同瓶颈：批量页读没有形成批内 I/O 并发
+
+Q10 是过滤 orders 后用 `lineitem_pkey` 做 Index Join，再连接 customer/nation。Q12 只有两张表，是过滤 lineitem 后用 `orders_pkey` 做 Index Join。它们都实现了索引扫描，不是因缺失索引而全表读取连接内侧。
+
+`index_scan.c` 一次保留256个查找键，最多请求64页。缺页通过 `namespace_wait → csNeedNvmRead → exec_graph` 在设备内部完成，页面不经过 HOST。但 `csd.c:csd_graph_io` 当前一次只处理一个物理连续范围，登记 `now + lat` 后进入 `GRAPH_IO_DONE`；`femu_csd_graph_poll` 等该事件到期才读取下一范围。因而同一 CSF 返回的多个独立范围逐段等待 NAND 模型延迟，没有批内并发。即使已有多个 CU/设备图，也不能把单个 CU 的64页请求当成64个同时在途的读取。
+
+额外使用现有 `SNIA_FEMU_PROFILE=1` 对无 HPCP 的 Q10/Q12 诊断，记录为 `tpch.YAzugN`，截取固件日志至 `tpch.l0gE2d/firmware-profile.log`。同一计算节点、两次计算之间的连续内部读段，Q10 32188 对、Q12 6522 对，下一段开始时间全部不早于上一段完成时间，和代码路径一致。固件统计如下，均为跨图/CU的累计量，不能相加或直接当成查询墙钟占比：
+
+| 固件累计指标 | Q10 | Q12 |
+| --- | ---: | ---: |
+| 内部 I/O 调用（含顺序输入） | 34037 | 7473 |
+| 模型 I/O 延迟累计 | 1414.395ms | 432.734ms |
+| I/O 软件处理墙钟累计 | 361.354ms | 293.633ms |
+| 其中数据复制 | 199.023ms | 227.370ms |
+| 其中 backend 锁等待 | 8.911ms | 6.927ms |
+| 其中 CSD 锁等待 | 2.641ms | 0.635ms |
+| 事件处理累计（包含 I/O 软件处理） | 715.152ms | 372.819ms |
+| 事件逾期累计 | 175.090ms | 141.379ms |
+
+内部 I/O 调用不是同等数量的 HOST NVMe 请求；相邻页可合并成一个范围。此轮仅包含 CSD 模式，测试脚本缺少同目录 HOST 基线而将 CSV 的 match 标为 no；已另与 `tpch.l0gE2d` 的正式 HOST 输出逐行比较，两条均一致，不将这个标记解释为计算错误。诊断结束后 PG 已恢复为不带 transport profiling 的进程。
+
+### Q10：主要卡在索引连接阶段，尚非内存或 Hash Join 本身限制
+
+无 HPCP 路径的执行树墙钟为2375.967ms；orders→lineitem 阶段为1955.275ms，协调 CPU 9.216ms、worker CPU 累计691.552ms，平均活跃计算约0.36个CU。后续 customer probe阶段320.327ms，聚合输出阶段80.118ms；Hash建表协调 CPU 11.844ms、最终Sort Sink CPU 57.026ms，结果只返回5651B、读取约0.064ms。不能将主要差距归于结果交付、最终排序或Hash建表。
+
+实际索引候选228021条。设备载入76445个8KiB索引/Heap页；独立 PG 诊断中同样执行56934次 lineitem 索引探测，shared_buffers 命中168428次、缺失读取63044次。设备每个CU的索引/Heap页缓存固定128页、约1MiB，跨CU不共享；PG可以在查询内复用已经读入的索引和Heap页。计数证明设备存在额外载入，但PG的shared read不是物理NVMe请求数，不能直接等同磁盘读次数。
+
+workmem 峰值103780640B（约99MiB），FDM预留28359496B，spill为0。当前统计不支持“256MiB实际计算内存不够”的解释；固定缓存策略、索引批次的等待以及后续阶段的串行部分仍可优化，也不能仅凭上述累计计数精确预测修改后的收益。
+
+### Q12：扫描过滤仍是主要CPU工作，索引等待降低其重叠程度
+
+完整 CSD 的主阶段1485.421ms，累计 worker CPU 3739.068ms，平均活跃约2.52个CU；filter-only 的扫描阶段900.338ms，累计 CPU 3246.777ms，平均活跃约3.61个CU。filter-only 中CSD扫描过滤可以和HOST索引探测/聚合重叠；完整卸载后同一组4个CU既承担过滤又承担索引连接，缺页挂起期间虽然不占CU，却仍保留该任务块的输入，不能假定它已经切换到另一个独立块继续扫描。
+
+完整 CSD 的 Scan Decode/Filter CPU 分别为1128.094/2444.455ms，filter-only 分别为1044.206/2165.420ms。复杂谓词仍是两边共有的热点，不能把整段Filter累计时间都算成完整卸载多出的开销。实际增量还包括orders索引读取、投影和较低的扫描/索引重叠程度。两条路径均处理31235次有效订单匹配，HOST索引读取21850页、设备载入24614页。
+
+完整 CSD workmem峰值3052672B（约2.91MiB），FDM预留24140568B，spill为0；聚合Sink CPU约1.4ms、Sort Sink CPU约0.06ms、结果读取约0.058ms，不是主要瓶颈。HOST逐节点诊断及buffer计数在 `results/q10-q12-joins.QizqKg/`，其中开启ANALYZE/BUFFERS/TIMING的耗时仅用于定位，不作为正式成绩。
+
+因此Q10/Q12有共同的内部随机读取问题，但主要CPU构成不同。应优先修正通用内部读的批内并发和完成归并，再核对索引缓存命中与任务块周转；Q12还可减少复杂谓词的CPU工作。未做实现前后A/B，不给出这几项优化的确定加速承诺。SQLerate也需把索引缺页及多轮读取计入候选成本，不能仅按总字节/带宽估价。本次只诊断，未修改固件或执行计划；结束后FDM_USED=0。
