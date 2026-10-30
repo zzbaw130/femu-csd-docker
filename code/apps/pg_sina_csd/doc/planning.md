@@ -93,6 +93,8 @@ PG两项CTest与设备 `pgSinaIndexJoin64MiB`、`pgSinaPackedOutput64MiB` 通过
 
 ## Q10/Q12 的索引连接与内部读取诊断
 
+本节记录下面批量内部读取修正前的定位依据，修正与复测见下一节。
+
 代码版本 `1e0b54b8a`，配置仍为 4 CU、256MiB workmem、64MiB FDM；PG 为 2GB shared_buffers、16MB work_mem、最多4个并行worker。本次只执行正式 Q10/Q12，每种组合重启 PG、清除 Guest page cache，没有修改查询、连接计划、参数或算子代码。
 
 `results/tpch.l0gE2d/` 开启已有 `pg_sina_csd.profile`，用于诊断，不混入此前关闭 profiling 的正式基准：
@@ -131,6 +133,8 @@ Q10 是过滤 orders 后用 `lineitem_pkey` 做 Index Join，再连接 customer/
 
 实际索引候选228021条。设备载入76445个8KiB索引/Heap页；独立 PG 诊断中同样执行56934次 lineitem 索引探测，shared_buffers 命中168428次、缺失读取63044次。设备每个CU的索引/Heap页缓存固定128页、约1MiB，跨CU不共享；PG可以在查询内复用已经读入的索引和Heap页。计数证明设备存在额外载入，但PG的shared read不是物理NVMe请求数，不能直接等同磁盘读次数。
 
+这里的63044次是HOST执行期间自身shared_buffers的缺失读取，不是CSD使用了PG缓存，也不是HPCP的收益。冷启动清除的是查询开始前的缓存；PG仍会在本次索引探测中逐渐填入并复用页面。HPCP写入的是Guest文件页缓存，不是shared_buffers；全CSD的Q10没有HOST基表读取消费者，本轮不能用它解释完整卸载性能。这个计数只用于对照两种索引实现的页访问行为。
+
 workmem 峰值103780640B（约99MiB），FDM预留28359496B，spill为0。当前统计不支持“256MiB实际计算内存不够”的解释；固定缓存策略、索引批次的等待以及后续阶段的串行部分仍可优化，也不能仅凭上述累计计数精确预测修改后的收益。
 
 ### Q12：扫描过滤仍是主要CPU工作，索引等待降低其重叠程度
@@ -142,3 +146,37 @@ workmem 峰值103780640B（约99MiB），FDM预留28359496B，spill为0。当前
 完整 CSD workmem峰值3052672B（约2.91MiB），FDM预留24140568B，spill为0；聚合Sink CPU约1.4ms、Sort Sink CPU约0.06ms、结果读取约0.058ms，不是主要瓶颈。HOST逐节点诊断及buffer计数在 `results/q10-q12-joins.QizqKg/`，其中开启ANALYZE/BUFFERS/TIMING的耗时仅用于定位，不作为正式成绩。
 
 因此Q10/Q12有共同的内部随机读取问题，但主要CPU构成不同。应优先修正通用内部读的批内并发和完成归并，再核对索引缓存命中与任务块周转；Q12还可减少复杂谓词的CPU工作。未做实现前后A/B，不给出这几项优化的确定加速承诺。SQLerate也需把索引缺页及多轮读取计入候选成本，不能仅按总字节/带宽估价。本次只诊断，未修改固件或执行计划；结束后FDM_USED=0。
+
+## 通用批量内部读取的并发与完成归并
+
+FEMU的普通多范围LOAD和CSF的`csNeedNvmRead`现在共用有界批量提交：同一窗口最多64个物理读段以共同到达时间交给原FTL，NAND/LUN/通道状态仍由原模型更新。窗口完成时间取各段完成时间的最大值，只登记一个完成事件；窗口全部完成后才继续下一窗口，整批读取结束后仅恢复一次CSF。软件复制仍由原FTL线程执行，不新增线程，也不修改SNIA/NVMe接口。
+
+同一物理LUN的竞争仍体现在模型完成时间中；FDM目标区域重叠时保留原有描述符顺序。HPCP为窗口中每个读段保留源AFDM、LBA、偏移和长度，完成归并后分别发布，不会只保留最后一段。读取覆盖活跃DMA区域时，先完成已提交窗口，再按现有周转规则等待或放弃可选填充，不能提前覆盖源数据。AFDM和程序的既有引用生命周期不变。
+
+部署前干净停止PG，将同一份SF1归档至`results/exec-graph-batch.aRjWGW/tpch_s1.tar`；重启新固件后恢复原数据、加载已有HPCP模块并恢复`/dev/femu-cache`访问权限，重新prepare八张表。visible/frozen仍覆盖全部基表。设备保持4 CU、256MiB workmem、64MiB FDM，PG参数不变。
+
+只使用正式Q10/Q12，各模式独立冷启动，关闭profiling，结果在`results/tpch.4wr0ie/`，十次全部与对应HOST输出一致：
+
+| 查询 | HOST（ms） | filter-only（ms） | csd-without-hpcp（ms） | csd-with-hpcp（ms） | SQLerate（ms） |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q10 | 2376.694 | 1748.387 | 1493.498 | 1497.387 | 1480.768 |
+| Q12 | 1622.912 | 1129.901 | 1505.277 | 1482.596 | 1558.515 |
+
+Q10三种完整卸载已快于同轮HOST/filter-only；对照此前关闭profiling的`tpch.gb3c93`，无HPCP由2357.234ms降至1493.498ms。这个跨轮比较不作为精确加速置信区间，HOST自身也有波动。Q12完整卸载仍明显慢于filter-only，不能将其判为最优编排，也不能据本次修改宣称所有剩余瓶颈已解决。
+
+同等PG阶段计时的独立诊断，修正前为`tpch.l0gE2d`、修正后为`tpch.fzdWWU`，不混入正式延迟：
+
+| 指标 | 修正前 | 修正后 |
+| --- | ---: | ---: |
+| Q10索引连接阶段墙钟 | 1955.275ms | 994.083ms |
+| Q10该阶段worker CPU累计 | 691.552ms | 677.536ms |
+| Q10索引/Heap载入页 | 76445 | 76384 |
+| Q12扫描/索引连接阶段墙钟 | 1485.421ms | 1447.731ms |
+| Q12该阶段worker CPU累计 | 3739.068ms | 3748.008ms |
+| Q12 Filter CPU累计 | 2444.455ms | 2456.772ms |
+
+Q10候选元组仍为228021，workmem峰值仍为103780640B，Q12峰值仍为3052672B，spill均为0；没有靠减少逻辑工作或增加缓存容量换取加速。Q10主要消除了读取串行等待；Q12的CPU过滤及与索引读取的重叠仍需优化，其阶段改善约2.5%，不能把原来相对filter-only的差距全部归于批内串行读。
+
+额外固件tracing单独保存在`tpch.2ZOtgx`和`exec-graph-batch.aRjWGW/firmware-profile.log`：Q10完成事件数由36079降至3920，Q12由8451降至1939。逐段日志会影响墙钟，只用于验证完成归并。共同到达时间下，每段模型延迟包含同LUN的排队，累加的`io_model_ns`不再等于原串行服务时间和，不能用于推算查询墙钟收益。
+
+针对性qtest通过：16路独立NAND读取、同LUN排队、重叠FDM有序覆盖、普通LOAD跨64段窗口（65段逐页校验）、原设备图、spill及4KiB LBA、取消，以及默认/双poller的HPCP DMA。多MR用例还验证描述符所在MR被读结果覆盖后快照仍有效、两个范围的HPCP内容和LBA均正确。查询结束后FDM_USED=0，PG已恢复为无transport tracing的正常进程。本轮没有运行全量TPC-H。

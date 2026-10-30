@@ -139,6 +139,10 @@ typedef struct FemuCsdSpill {
 
 enum { GRAPH_READY, GRAPH_COMPUTING, GRAPH_COMPUTED, GRAPH_IO, GRAPH_CACHE_WAIT,
        GRAPH_IO_DONE, GRAPH_DONE };
+typedef struct FemuCsdReadCompletion {
+    FemuCsdAfdm *afdm;
+    uint64_t lba, offset, bytes;
+} FemuCsdReadCompletion;
 typedef struct FemuCsdGraphNode {
     struct femu_graph_node wire;
     FemuCsdJob *job;
@@ -152,6 +156,9 @@ typedef struct FemuCsdGraphNode {
     uint64_t io_action, io_token, io_bytes;
     FemuCsdSpill *spill;
     struct femu_graph_read *reads;
+    FemuCsdReadCompletion *read_completions;
+    unsigned read_completed;
+    bool serial_reads;
     uint16_t status;
     FemuCsdGraph *graph;
     uint64_t dependents;
@@ -1846,6 +1853,7 @@ static void csd_graph_destroy_locked(FemuCsdState *csd, FemuCsdGraph *g)
     }
     for (unsigned i = 0; i < g->count; i++) {
         g_free(g->nodes[i].reads);
+        g_free(g->nodes[i].read_completions);
         if (g->nodes[i].pos) { pqueue_remove(csd->graph_events, &g->nodes[i]); }
         if (g->nodes[i].job) {
             csd_job_free_locked(g->nodes[i].job);
@@ -2525,6 +2533,18 @@ static uint16_t csd_graph_read_begin(FemuCsdGraph *g, FemuCsdGraphNode *v)
         }
         total += bytes;
     }
+    /* Aliased destinations keep descriptor order, including any HPCP DMA
+     * that must finish before the same bytes are overwritten. */
+    v->serial_reads = false;
+    for (unsigned i = 0; i < count; i++) {
+        for (unsigned j = 0; j < i; j++) {
+            if (job->afdms[reads[i].afdm_index] == job->afdms[reads[j].afdm_index] &&
+                reads[i].offset < reads[j].offset + ((uint64_t)reads[j].blocks << ns->lbaf.lbads) &&
+                reads[j].offset < reads[i].offset + ((uint64_t)reads[i].blocks << ns->lbaf.lbads)) {
+                v->serial_reads = true;
+            }
+        }
+    }
     v->reads = reads; v->range = 0; v->range_blocks = 0;
     v->io_action = 4; v->io_token = count; v->io_bytes = total;
     v->transferred = 0; v->state = GRAPH_IO;
@@ -2536,6 +2556,12 @@ static void csd_graph_io(FemuCsdState *csd, FemuCsdGraph *g, FemuCsdGraphNode *v
 {
     FemuCtrl *n = csd->n;
     NvmeNamespace *ns = g->session->ns;
+    bool batch_read = (v->job && v->io_action == 4 && !v->serial_reads) ||
+                      (!v->job && v->wire.operation == FEMU_GRAPH_LOAD);
+    uint64_t completed = now;
+    unsigned issued = 0;
+next_read:
+    if (g->status) { return; }
     uint64_t lat = 0, bytes = 0;
     uint64_t begin = (g->flags & FEMU_CSD_GRAPH_PROFILE) ?
         qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : 0;
@@ -2569,6 +2595,12 @@ static void csd_graph_io(FemuCsdState *csd, FemuCsdGraph *g, FemuCsdGraphNode *v
         }
         qemu_mutex_unlock(&csd->cache_lock);
         if(busy) {
+            if (issued) {
+                v->deadline = completed;
+                v->state = GRAPH_IO_DONE;
+                csd_graph_event_locked(csd, v);
+                return;
+            }
             if(!v->cache_wait_begin) v->cache_wait_begin=now;
             v->state=GRAPH_CACHE_WAIT;
             return;
@@ -2656,8 +2688,20 @@ static void csd_graph_io(FemuCsdState *csd, FemuCsdGraph *g, FemuCsdGraphNode *v
         v->transferred += bytes; v->range_blocks += blocks;
         if (v->range_blocks == le32_to_cpu(range.blocks)) { v->range++; v->range_blocks = 0; }
     }
+    /* FTL calls still have one owner. Their common arrival lets NAND/channel
+     * state schedule independent ranges concurrently; the batch completes
+     * at its slowest deadline, rather than summing per-range waits. */
     v->deadline = now + lat;
+    completed = MAX(completed, v->deadline);
     v->state = GRAPH_IO_DONE;
+    if (batch_read && v->cache_candidate) {
+        if (!v->read_completions) {
+            v->read_completions = g_new(FemuCsdReadCompletion, FEMU_CSD_GRAPH_MAX_NODES);
+        }
+        v->read_completions[v->read_completed++] = (FemuCsdReadCompletion){
+            v->cache_afdm, v->cache_lba, v->cache_offset, v->cache_bytes };
+        v->cache_candidate = false;
+    }
     if (begin) {
         g->session->io_calls++; g->session->io_ns += lat;
         clock_gettime(CLOCK_THREAD_CPUTIME_ID,&cpu_end);
@@ -2673,6 +2717,11 @@ static void csd_graph_io(FemuCsdState *csd, FemuCsdGraph *g, FemuCsdGraphNode *v
             timing.ftl_ns,timing.backend_lock_ns,timing.copy_ns,timing.csd_lock_ns);
         qemu_mutex_lock(&csd->lock);
     }
+    if (batch_read && ++issued < FEMU_CSD_GRAPH_MAX_NODES &&
+        (v->job ? v->transferred < v->io_bytes : v->range < v->wire.count)) {
+        goto next_read;
+    }
+    v->deadline = completed;
     csd_graph_event_locked(csd, v);
 }
 
@@ -2756,6 +2805,16 @@ void femu_csd_graph_poll(FemuCtrl *n)
                 if (g->status) { g->result = v - g->nodes + 1; csd_graph_node_done(csd, v); }
             } else { csd_graph_node_done(csd, v); }
         } else {
+            /* All ranges in this bounded window are complete. Keep every
+             * LOAD's HPCP metadata; only then resume/continue the parent. */
+            for (unsigned i = 0; i < v->read_completed; i++) {
+                const FemuCsdReadCompletion *r = &v->read_completions[i];
+                v->cache_afdm = r->afdm; v->cache_lba = r->lba;
+                v->cache_offset = r->offset; v->cache_bytes = r->bytes;
+                v->cache_candidate = true;
+                csd_cache_publish(csd, v, now);
+            }
+            v->read_completed = 0;
             csd_cache_publish(csd,v,now);
             bool done = v->job ? v->transferred == v->io_bytes : v->range == v->wire.count;
             if (!done) {
