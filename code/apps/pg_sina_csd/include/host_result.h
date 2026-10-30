@@ -4,6 +4,8 @@
 #define PG_SINA_HOST_RESULT_H
 #include "query.h"
 #define QP_TYPED_RESULT 2U
+/* An independent parallel Scan lets each CU encode its own HOST batch. */
+#define QP_DIRECT_RESULT 3U
 static inline unsigned qp_host_width(unsigned oid)
 {
     switch(oid) {
@@ -22,6 +24,16 @@ static inline unsigned qp_host_offset(const struct qs_plan *p,unsigned rows,unsi
 }
 static inline unsigned qp_host_bytes(const struct qs_plan *p,unsigned rows)
 { return qp_host_offset(p,rows,p->nout); }
+/* Direct CU packets place variable bytes immediately after typed columns,
+ * so a single AFDM read suffices. The packed payload can overlap str_bytes;
+ * its authoritative length is carried in the compute completion. */
+static inline void qp_host_pack(struct qs_result *r,const struct qs_plan *p,unsigned bytes)
+{ memmove((unsigned char *)r+offsetof(struct qs_result,data)+qp_host_bytes(p,r->rows),r->str_data,bytes); }
+static inline void qp_host_unpack(struct qs_result *r,const struct qs_plan *p,unsigned bytes)
+{
+    memmove(r->str_data,(unsigned char *)r+offsetof(struct qs_result,data)+qp_host_bytes(p,r->rows),bytes);
+    r->str_bytes=bytes;
+}
 static inline unsigned qp_host_capacity(const struct qs_plan *p)
 {
     unsigned low=0,high=sizeof(((struct qs_result *)0)->data);

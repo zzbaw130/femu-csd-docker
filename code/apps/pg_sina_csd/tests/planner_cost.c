@@ -26,6 +26,10 @@ int main(void)
     CHECK(cost_group_state(&group,113)>cost_group_state(&group,112));
     struct qs_plan output={.nout=2}; output.outputs[1].index=1;
     CHECK(qp_result_capacity(&output,0)==256);
+    uint64_t completion=QP_TYPED_OUTPUT|QP_OUTPUT_READY|QP_INPUT_DRAINED|
+        (UINT64_C(116508)<<5)|(UINT64_C(65536)<<22);
+    CHECK(qp_output_rows(completion)==116508 && qp_output_strings(completion)==65536);
+    CHECK((completion&31)==(QP_OUTPUT_READY|QP_INPUT_DRAINED));
     CHECK(qp_result_capacity(&output,1)==2048);
     output.exprs[0].type=Q_STRING; output.outputs[0].typmod=259;
     CHECK(qp_result_capacity(&output,1)==257); /* bounded 64KiB text */
@@ -93,6 +97,20 @@ int main(void)
                 CHECK(qp_host_isnull(slice,&typed,row,1)==((row+first)%17==0));
             if(rows%8) CHECK(!(qp_host_nulls(slice,&typed,rows,1)[rows/8]&~((1U<<(rows%8))-1)));
         }
+    /* A wide packet's packed payload crosses the old str_bytes position.
+     * The completion length, not that overwritten field, must drive unpack. */
+    struct qs_plan wide={.nout=QS_OUT};
+    for(unsigned col=0;col<QS_OUT;++col) wide.outputs[col].type_oid=col+1==QS_OUT?25:20;
+    packet->rows=1000;
+    unsigned fixed=qp_host_bytes(&wide,packet->rows),strings=32768;
+    CHECK(fixed<=sizeof(packet->data));
+    memset(packet->data,0x5a,fixed);
+    for(unsigned i=0;i<strings;++i) packet->str_data[i]=(unsigned char)i;
+    qp_host_pack(packet,&wide,strings);
+    memcpy(slice,packet,offsetof(struct qs_result,data)+fixed+strings);
+    qp_host_unpack(slice,&wide,strings);
+    CHECK(slice->str_bytes==strings && !memcmp(packet->data,slice->data,fixed));
+    for(unsigned i=0;i<strings;++i) CHECK((unsigned char)slice->str_data[i]==(unsigned char)i);
     free(slice);
     free(packet);
     struct qp_plan scan={.count=1};

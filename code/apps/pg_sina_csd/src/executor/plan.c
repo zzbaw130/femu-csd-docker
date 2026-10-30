@@ -73,6 +73,7 @@ struct PlanStateCsd {
     const char *execution_operation;
     atomic_uint_fast64_t batch_progress;
     unsigned retry_worker;
+    unsigned next_result_worker;
     atomic_bool stopping;
     bool parallel;
     atomic_uint_fast64_t load_ns, load_calls, completion_reads;
@@ -137,7 +138,7 @@ static void completed(void *context,CS_STATUS status,u64 value)
         uint64_t previous=slot->queued_ns;
         CS_STATUS next=CS_NOT_DONE;
         if(slot->scan_node) {
-            if(value==QP_INPUT_DRAINED) next=queue_scan(slot);
+            if((value&31)==QP_INPUT_DRAINED) next=queue_scan(slot);
         } else {
             PlanStateCsd *s=slot->owner;
             if(value&QP_CONTROL_REQUIRED) {
@@ -399,7 +400,7 @@ static void start(PlanStateCsd *s)
     s->profiling=pg_sina_profile; s->start_ns=clock_ns(); s->load_ns=s->load_calls=0;
     s->result_bytes=s->result_reads=s->result_rows=0;
     atomic_store(&s->stopping,false);
-    atomic_store(&s->batch_progress,0); s->retry_worker=0;
+    atomic_store(&s->batch_progress,0); s->retry_worker=s->next_result_worker=0;
     s->poll_ns=s->completion_copy_ns=s->submit_ns=s->queue_ns=s->control_write_ns=0;
     s->idle_ns=s->pending_ns=s->submits=s->polls=s->completions=0;
     s->completion_reads=s->control_writes=0;
@@ -459,6 +460,12 @@ static void start(PlanStateCsd *s)
     }
     s->fdm_bytes=s->workers*QS_SORT_IO_BYTES;
     for(unsigned i=0;i<5;++i) s->fdm_bytes+=sizes[i];
+    /* Independent unordered scans return CU batches directly. The same
+     * AFDM allocation/layout is retained; no input is shared across scans. */
+    const struct qp_node *root=&s->plan->nodes[s->plan->root];
+    if(s->async_scan && s->workers>1 && !s->plan->ninit && !root->ordered_index)
+        s->plan->packed_result=QP_DIRECT_RESULT;
+    else s->plan->packed_result=QP_TYPED_RESULT;
     checked(transfer(s->memory[0],0,s->plan,sizeof(*s->plan),true),"copy plan");
     for(unsigned i=0;i<s->plan->count;++i) {
         if(s->plan->files[i].count) checked(transfer(s->memory[0],s->plan->files[i].offset,s->extents[i],
@@ -725,9 +732,34 @@ static CS_STATUS submit(PlanStateCsd *s,unsigned worker)
  * completion workers for a scan. No PostgreSQL API is used on this path. */
 static int execution_failed(PlanStateCsd *s,CS_STATUS status,const char *operation)
 { s->execution_status=status; s->execution_operation=operation; return -1; }
+static CS_STATUS read_result(PlanStateCsd *s,unsigned worker,const struct qp_control *control,struct qs_result *result)
+{
+    const struct qs_plan *output=&s->plan->nodes[s->plan->root].expr;
+    if(control->output_rows>qp_host_capacity(output) || control->output_strings>sizeof(result->str_data))
+        return CS_INVALID_LENGTH;
+    size_t bytes=offsetof(struct qs_result,data)+qp_host_bytes(output,control->output_rows);
+    bool packed=worker && s->plan->packed_result==QP_DIRECT_RESULT;
+    if(packed) bytes+=control->output_strings;
+    uint64_t reading=s->profiling?clock_ns():0;
+    CS_STATUS status=transfer(s->memory[2],(size_t)worker*sizeof(*result),result,bytes,false);
+    s->result_bytes+=bytes; ++s->result_reads; s->result_rows+=control->output_rows;
+    if(status==CS_SUCCESS && result->rows!=control->output_rows) status=CS_INVALID_LENGTH;
+    if(status==CS_SUCCESS && packed) qp_host_unpack(result,output,control->output_strings);
+    else result->str_bytes=control->output_strings;
+    if(status==CS_SUCCESS && !packed && result->rows && result->str_bytes) {
+        status=transfer(s->memory[2],(size_t)worker*sizeof(*result)+offsetof(struct qs_result,str_data),
+            result->str_data,result->str_bytes,false);
+        s->result_bytes+=result->str_bytes; ++s->result_reads;
+    }
+    if(s->profiling) s->result_read_ns+=clock_ns()-reading;
+    return status;
+}
 static int advance(PlanStateCsd *s,struct qs_result *result)
 {
-    for(unsigned w=0;w<=s->workers;++w) {
+    bool direct=s->plan->packed_result==QP_DIRECT_RESULT;
+    unsigned first=s->next_result_worker;
+    for(unsigned step=0;step<=s->workers;++step) {
+        unsigned w=step && direct?1+(first+step-1)%s->workers:step;
         struct plan_slot *slot=&s->slots[w];
         if(!slot->pending) continue;
         uint64_t polled=s->profiling?clock_ns():0;
@@ -744,7 +776,8 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
         }
         slot->pending=NULL;
         if(w && slot->scan_node && status==CS_SUCCESS && !(value&QP_CONTROL_REQUIRED)) {
-            slot->control.output_rows=(value&QP_OUTPUT_READY)!=0;
+            slot->control.output_rows=value&QP_TYPED_OUTPUT?qp_output_rows(value):(value&QP_OUTPUT_READY)!=0;
+            slot->control.output_strings=value&QP_TYPED_OUTPUT?qp_output_strings(value):0;
             slot->control.finished=(value&QP_WORKER_FINISHED)!=0;
             slot->need_input=(value&QP_INPUT_DRAINED)!=0;
         } else {
@@ -756,20 +789,9 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
             }
             slot->control_copied=false;
         }
-        /* Only actual projected cells cross the device/host boundary.
-         * The control already supplies row/text counts; no header probe. */
-        const struct qs_plan *output=&s->plan->nodes[s->plan->root].expr;
-        size_t result_prefix=offsetof(struct qs_result,data)+qp_host_bytes(output,slot->control.output_rows);
         if(!w) { memset(result,0,offsetof(struct qs_result,data)); result->str_bytes=0; }
-        if(!w && status==CS_SUCCESS && (slot->control.output_rows || slot->control.finished)) {
-            if(slot->control.output_rows>qp_result_capacity(output,QP_TYPED_RESULT))
-                return execution_failed(s,CS_INVALID_LENGTH,"result row count");
-            uint64_t reading=s->profiling?clock_ns():0;
-            status=transfer(s->memory[2],0,result,result_prefix,false);
-            if(s->profiling) s->result_read_ns+=clock_ns()-reading;
-            s->result_bytes+=result_prefix; ++s->result_reads; s->result_rows+=slot->control.output_rows;
-            result->str_bytes=slot->control.output_strings;
-        }
+        if(status==CS_SUCCESS && (!w || direct) && (slot->control.output_rows || slot->control.finished))
+            status=read_result(s,w,&slot->control,result);
         if(s->profiling) s->completion_copy_ns+=clock_ns()-observed;
         if(status!=CS_SUCCESS) return execution_failed(s,status,"execute tree");
         if(slot->resume) {
@@ -781,6 +803,21 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
             slot->ready=slot->control.output_rows || slot->control.finished; slot->done=slot->control.finished;
             slot->yielded=(value&QP_RESOURCE_WAIT)!=0;
             slot->retry_progress=atomic_load_explicit(&s->batch_progress,memory_order_acquire);
+            if(direct) {
+                /* Its packet is now HOST-owned, so this CU can reuse its own
+                 * result/input without a coordinator acknowledgement. */
+                slot->ready=false;
+                result->finished=0; /* Only the coordinator's final EOF ends the stream. */
+                bool publish=slot->control.output_rows!=0;
+                if(!slot->done && !slot->yielded) {
+                    status=submit(s,w);
+                    if(status!=CS_SUCCESS) return execution_failed(s,status,"continue direct scan");
+                }
+                if(publish) {
+                    s->next_result_worker=w%s->workers;
+                    return 1;
+                }
+            }
             continue;
         }
         if(result->rows || result->finished || slot->control.drained)
@@ -799,15 +836,6 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
                  * zero except its private state pointer. PG never uses it. */
                 memset(&worker->control,0,sizeof(worker->control));
             }
-        }
-        if(result->rows>qp_result_capacity(output,QP_TYPED_RESULT)) return execution_failed(s,CS_INVALID_LENGTH,"result rows");
-        if(result->str_bytes>sizeof(result->str_data)) return execution_failed(s,CS_INVALID_LENGTH,"result strings");
-        if(result->rows && result->str_bytes) {
-            uint64_t reading=s->profiling?clock_ns():0;
-            status=transfer(s->memory[2],offsetof(struct qs_result,str_data),result->str_data,result->str_bytes,false);
-            if(s->profiling) s->result_read_ns+=clock_ns()-reading;
-            if(status!=CS_SUCCESS) return execution_failed(s,status,"read result strings");
-            s->result_bytes+=result->str_bytes; ++s->result_reads;
         }
         if(result->finished && s->profiling) {
             status=transfer(s->memory[0],offsetof(struct qp_plan,pipelines),s->plan->pipelines,sizeof(s->plan->pipelines),false);
@@ -842,11 +870,12 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
     struct plan_slot *main=&s->slots[0];
     if(!main->pending) {
         uint64_t ready=0;
-        for(unsigned w=1;w<=s->workers;++w) if(s->slots[w].ready) ready|=UINT64_C(1)<<(w-1);
+        for(unsigned w=1;w<=s->workers;++w)
+            if(direct?s->slots[w].done:s->slots[w].ready) ready|=UINT64_C(1)<<(w-1);
         /* Direct build/aggregate sinks share a bounded table. Its owner
          * may resize/spill only after the wave is idle. A yielded CU
          * still retains input/update state, so it is not at that barrier. */
-        bool idle=true;
+        bool idle=!direct || !s->parallel || ready==qp_worker_mask(s->workers);
         if(main->control.parallel==2)
             for(unsigned w=1;w<=s->workers;++w) {
                 struct plan_slot *slot=&s->slots[w];
@@ -1058,6 +1087,7 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     ExplainPropertyText("CSD Plan Source","PostgreSQL selected Plan; CSD build/probe orientation",es);
     ExplainPropertyInteger("CSD Host Result Bytes","bytes",s->result_bytes,es);
     ExplainPropertyText("CSD Counter Scope",s->delivery_shared?"shared device stream; do not sum PG participants":"current device stream",es);
+    ExplainPropertyBool("CSD Direct CU Output",s->plan->packed_result==QP_DIRECT_RESULT,es);
     ExplainPropertyText("CSD Result Delivery",s->async_scan?"SNIA callbacks; two bounded host batches":"synchronous",es);
 
     if(s->profiling && s->async_scan) {

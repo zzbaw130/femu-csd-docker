@@ -21,6 +21,12 @@
 #define QP_WORKER_FINISHED 4U
 #define QP_CONTROL_REQUIRED 8U
 #define QP_RESOURCE_WAIT 16U /* Retain input; retry after another batch advances. */
+/* Direct Scan completion: flags 0..4, row count 5..21, varlena bytes 22..38.
+ * Bit 39 distinguishes metadata from ordinary worker status. All remain
+ * below SNIA's reentry operation bits; 17 bits cover any typed batch. */
+#define QP_TYPED_OUTPUT (UINT64_C(1)<<39)
+static inline unsigned qp_output_rows(uint64_t value) { return (value>>5)&0x1ffff; }
+static inline unsigned qp_output_strings(uint64_t value) { return (value>>22)&0x1ffff; }
 enum qp_kind { QP_SCAN, QP_PROJECT, QP_JOIN, QP_AGGREGATE, QP_SORT, QP_LIMIT, QP_INDEX_JOIN, QP_CTE_SCAN, QP_MATERIALIZED, QP_SET };
 enum qp_join { QP_INNER, QP_LEFT, QP_SEMI, QP_ANTI };
 enum qp_expr { QP_PARAMETER=Q_PARAMETER, QP_LIKE=Q_LIKE, QP_SUBSTRING=Q_SUBSTRING,
@@ -56,7 +62,7 @@ struct qp_file_mapping {
 struct qp_plan {
     unsigned count, root, nparams, ninit;
     unsigned workers, scan_bytes;
-    unsigned packed_result; /* 0: legacy, 1: projected cells, 2: typed HOST columns. */
+    unsigned packed_result; /* 0: legacy, 1: projected cells, 2: typed, 3: CU-direct typed. */
     uint64_t parallel_stride;
     int param_nodes[QP_PARAMS],cte_nodes[QP_PARAMS],init_nodes[QP_PARAMS],init_params[QP_PARAMS];
     struct qp_node nodes[QP_NODES];
@@ -66,7 +72,7 @@ struct qp_plan {
 static inline int qp_host_raw_projection(const struct qp_plan *p)
 {
     const struct qp_node *n=&p->nodes[p->root];
-    if(p->packed_result!=QP_TYPED_RESULT || n->kind!=QP_SCAN || n->ordered_index || n->expr.predicate>=0) return 0;
+    if(p->packed_result<QP_TYPED_RESULT || n->kind!=QP_SCAN || n->ordered_index || n->expr.predicate>=0) return 0;
     int variable=0;
     for(unsigned i=0;i<n->expr.nout;++i) {
         const struct qs_expr *e=&n->expr.exprs[n->expr.outputs[i].index];
@@ -159,7 +165,7 @@ static inline void qp_dictionary_size(const struct qp_plan *p,unsigned *entries,
  * by the current host ABI's 255-byte value limit and the 64KiB text arena. */
 static inline unsigned qp_result_capacity(const struct qs_plan *p,int packed)
 {
-    if(packed==QP_TYPED_RESULT) return qp_host_capacity(p);
+    if(packed>=(int)QP_TYPED_RESULT) return qp_host_capacity(p);
     if(!packed) return QS_RESULT_ROWS;
     unsigned rows=QS_RESULT_ROWS*QS_OUT/(p->nout?p->nout:1),text=0;
     for(unsigned c=0;c<p->nout;++c) {

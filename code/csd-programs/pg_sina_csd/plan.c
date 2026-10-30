@@ -1783,23 +1783,34 @@ static int64_t scan_next(struct execution *s,unsigned id,struct qs_cell *row)
     struct qs_chunk *chunk=(void *)(s->arena+vector_offset(s,n));
     for(;;) {
         int64_t status=scan_chunk_next(s,id); if(status!=2) return status;
-        unsigned at=qs_selection(chunk)[o->scan_position++]; struct qs_cell values[QS_COLS];
+        unsigned at=qs_selection(chunk)[o->scan_position++];
+        if(id==s->plan->root && s->raw_projection) {
+            /* A pure projection reads the selected physical columns directly.
+             * Do not construct nattrs cells, walk nattrs again for borrowed
+             * values, then copy those same cells through a projection. */
+            const unsigned char *raw=s->arena+input_offset(s,n)+o->scan_raw;
+            for(unsigned col=0;col<p->nout;++col) {
+                const struct qs_column *spec=&p->cols[p->exprs[p->outputs[col].index].column];
+                unsigned slot=spec->slot;
+                row[col]=(struct qs_cell){.value=qs_values(chunk)[(size_t)slot*chunk->capacity+at],
+                    .scale=spec->scale,.dscale=qs_dscales(chunk)[(size_t)slot*chunk->capacity+at],
+                    .isnull=(qs_nulls(chunk)[(size_t)slot*((chunk->capacity+7)/8)+at/8]>>(at%8))&1};
+                if((spec->type==Q_DECIMAL || spec->type==Q_STRING) && !row[col].isnull) {
+                    struct qs_heap_ref ref; uint64_t bits=(uint64_t)row[col].value; memcpy(&ref,&bits,sizeof(ref));
+                    if(ref.offset>o->scan_raw_bytes || ref.bytes>o->scan_raw_bytes-ref.offset) return -3;
+                    if(spec->type==Q_STRING && spec->trim_spaces)
+                        while(ref.bytes && raw[ref.offset+ref.bytes-1]==' ') --ref.bytes;
+                    row[col].value=(unsigned __int128)(uintptr_t)(raw+ref.offset) | ((unsigned __int128)ref.bytes<<64);
+                }
+            }
+            ++s->metrics.matched; return 2;
+        }
+        struct qs_cell values[QS_COLS];
         for(unsigned i=0;i<p->nattrs;++i) if(p->cols[i].slot>=0) {
             unsigned slot=p->cols[i].slot;
             values[i]=(struct qs_cell){.value=qs_values(chunk)[(size_t)slot*chunk->capacity+at],
                 .scale=p->cols[i].scale,.dscale=qs_dscales(chunk)[(size_t)slot*chunk->capacity+at],
                 .isnull=(qs_nulls(chunk)[(size_t)slot*((chunk->capacity+7)/8)+at/8]>>(at%8))&1};
-        }
-        if(id==s->plan->root && s->raw_projection) {
-            const unsigned char *raw=s->arena+input_offset(s,n)+o->scan_raw;
-            for(unsigned i=0;i<p->nattrs;++i) if(p->cols[i].slot>=0 &&
-                (p->cols[i].type==Q_DECIMAL || p->cols[i].type==Q_STRING) && !values[i].isnull) {
-                struct qs_heap_ref ref; uint64_t bits=(uint64_t)values[i].value; memcpy(&ref,&bits,sizeof(ref));
-                if(ref.offset>o->scan_raw_bytes || ref.bytes>o->scan_raw_bytes-ref.offset) return -3;
-                if(p->cols[i].type==Q_STRING && p->cols[i].trim_spaces)
-                    while(ref.bytes && raw[ref.offset+ref.bytes-1]==' ') --ref.bytes;
-                values[i].value=(unsigned __int128)(uintptr_t)(raw+ref.offset) | ((unsigned __int128)ref.bytes<<64);
-            }
         }
         int count=project_filtered(s,n,values,NULL,row,o->scan_filter && o->scan_filter->predicate>=0); if(count<0) return count;
         if(count) { ++s->metrics.matched; return 2; }
@@ -4352,6 +4363,9 @@ restart:
     }
     for(unsigned w=0;w<p->workers;++w) if(s->control->available&(UINT64_C(1)<<w)) {
         struct qs_result *out=&s->outputs[w+1];
+        /* Direct HOST delivery has already consumed the CU's final packet.
+         * The coordinator only collects EOF/metrics, never its typed rows. */
+        if(p->packed_result==QP_DIRECT_RESULT) s->parallel_position[w]=out->rows;
         if(s->parallel_position[w]<out->rows) {
             if(!row) return 2; /* Borrow this batch without advancing it. */
             unsigned cols=p->nodes[root].expr.nout;
@@ -4741,7 +4755,7 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
         const struct qs_plan *output=&plan->nodes[plan->root].expr;
         for(unsigned col=0;col<output->nout;++col)
             text_columns+=output->exprs[output->outputs[col].index].type==Q_STRING;
-        if(text_columns && plan->packed_result!=QP_TYPED_RESULT) {
+        if(text_columns && plan->packed_result<QP_TYPED_RESULT) {
             s->output_order=cs_work_calloc(context,(size_t)qp_result_capacity(output,plan->packed_result)*text_columns,sizeof(*s->output_order));
             if(!s->output_order) { cs_work_end(context); return -4; }
         }
@@ -4763,7 +4777,7 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
     if(!csIsReentry(a)) control->drained=0;
     if(s->buffered) { out->rows=s->buffered_rows; out->finished=s->buffered_finished; s->buffered=0; }
     if(s->closing) return finish_dictionary(s,a,out);
-    int typed=!worker && plan->packed_result==QP_TYPED_RESULT;
+    int typed=plan->packed_result==QP_DIRECT_RESULT || (!worker && plan->packed_result==QP_TYPED_RESULT);
     int continuing=s->text_wait || s->dictionary_wait || s->initial_wait || s->pending_sort || (typed && s->host_building);
     int64_t imported=initialize_dictionary(s,a);
     if(imported) return dictionary_request(s,out,imported);
@@ -4814,7 +4828,7 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
     unsigned columns=plan->nodes[worker?(int)s->root:(int)plan->root].expr.nout;
     /* Internal buffers pack only the pipeline's projected columns. A two-column
      * pipeline fits 2048 rows in the same AFDM as 256 final sixteen-cell rows. */
-    unsigned capacity=worker?QS_RESULT_ROWS*QS_OUT/(columns?columns:1):
+    unsigned capacity=worker && !typed?QS_RESULT_ROWS*QS_OUT/(columns?columns:1):
         qp_result_capacity(&plan->nodes[plan->root].expr,plan->packed_result);
     int64_t status=0; int host_full=0,host_publish=0;
     if(typed && !s->host_building) {
@@ -4931,7 +4945,7 @@ produce:
     while(status>=0 && status!=QP_WAIT && status<=2 && out->rows<capacity) {
         struct qs_cell *row=typed?s->host_row:worker?(struct qs_cell *)out->data+(size_t)out->rows*columns:
             qp_result_row(out,out->rows,columns,plan->packed_result);
-        if(typed && !s->host_pending && plan->workers>1 && plan->nodes[plan->root].kind==QP_SCAN && plan->nodes[plan->root].parallel) {
+        if(typed && !worker && !s->host_pending && plan->workers>1 && plan->nodes[plan->root].kind==QP_SCAN && plan->nodes[plan->root].parallel) {
             /* Workers already evaluated this Scan's projection. Borrow a
              * whole canonical batch, rather than running the generic row
              * dispatcher and searching the ready CU mask for every tuple.
@@ -5013,7 +5027,7 @@ export_results:
 combined:
     if(typed) {
         host_publish=!s->text_wait && !s->dictionary_wait && status>=0 &&
-            (out->finished || host_full || out->rows==capacity);
+            (out->finished || host_full || out->rows==capacity || (worker && s->host_scan && s->scan_drained));
         if(host_publish) { qp_host_compact(out,&plan->nodes[plan->root].expr,capacity); s->host_building=0; }
         else s->host_building=out->rows!=0;
     }
@@ -5053,10 +5067,13 @@ combined:
     if(status<0) return status;
     if(s->text_wait==QS_DICTIONARY_BUSY || s->dictionary_wait==QS_DICTIONARY_BUSY ||
        (s->pending_sort && status==QS_DICTIONARY_BUSY)) return dictionary_request(s,out,QS_DICTIONARY_BUSY);
-    if(worker && status<=2)
-        return (control->output_rows?QP_OUTPUT_READY:0) | (s->host_scan && s->scan_drained?QP_INPUT_DRAINED:0) |
+    if(worker && status<=2) {
+        uint64_t metadata=typed?QP_TYPED_OUTPUT|((uint64_t)control->output_rows<<5)|((uint64_t)control->output_strings<<22):0;
+        if(typed && host_publish) qp_host_pack(out,&plan->nodes[plan->root].expr,control->output_strings);
+        return metadata | (control->output_rows?QP_OUTPUT_READY:0) | (s->host_scan && s->scan_drained?QP_INPUT_DRAINED:0) |
             (out->finished?QP_WORKER_FINISHED:0) |
             (!control->ready && (control->bytes || control->index_nreads)?QP_CONTROL_REQUIRED:0);
+    }
     if(out->finished && !worker) { s->closing=1; return finish_dictionary(s,a,out); }
     return status==QP_WAIT?0:status>2?status:0;
 }

@@ -223,6 +223,8 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
     }
     unsigned char *raw=calloc(1,raw_bytes),*arena=calloc(1,bytes),*io=calloc(workers+1,QS_SORT_IO_BYTES);
     struct qs_result *out=calloc(workers+1,sizeof(*out)); assert(raw && arena && io && out);
+    struct qs_result *host_packet=test_packed==QP_DIRECT_RESULT?calloc(1,sizeof(*host_packet)):NULL;
+    assert(test_packed!=QP_DIRECT_RESULT || host_packet);
     unsigned *expected=malloc(rows*sizeof(*expected)); assert(expected);
     for(unsigned r=0;r<rows;++r) {
         unsigned key=(r*1009)%rows; expected[key]=r;
@@ -272,7 +274,7 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
                 assert(!pthread_join(threads[w],NULL)); available|=UINT64_C(1)<<w; started&=~(UINT64_C(1)<<w);
                 if(out[w+1].finished) done|=UINT64_C(1)<<w;
             }
-            c->available=available;
+            c->available=test_packed==QP_DIRECT_RESULT?done&~available:available;
         }
         /* A stale acknowledgement must be cleared even if dictionary
          * resume returns BUSY before the next batch can be produced. */
@@ -307,21 +309,33 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
             epoch=c->epoch; available=done=0; atomic_store(&offset,0);
             for(unsigned w=0;w<workers;++w) need_input[w]=true;
         }
-        for(unsigned r=0;r<out->rows && (p->packed_result!=QP_TYPED_RESULT || c->output_rows);++r) {
+        struct qs_result *packet=out; unsigned published=c->output_rows,direct_worker=0;
+        if(test_packed==QP_DIRECT_RESULT) {
+            assert(!out->rows); /* The coordinator never merges data rows. */
+            for(unsigned w=0;w<workers;++w) if(available&(UINT64_C(1)<<w)) {
+                const struct qs_plan *output=&p->nodes[p->root].expr;
+                unsigned strings=controls[w+1].output_strings;
+                published=controls[w+1].output_rows; direct_worker=w+1;
+                memcpy(host_packet,&out[w+1],offsetof(struct qs_result,data)+qp_host_bytes(output,published)+strings);
+                qp_host_unpack(host_packet,output,strings); packet=host_packet;
+                assert(published==packet->rows); break;
+            }
+        }
+        for(unsigned r=0;r<packet->rows && (p->packed_result<QP_TYPED_RESULT || published);++r) {
             struct qs_cell decoded[3],*v=decoded;
-            if(p->packed_result==QP_TYPED_RESULT) {
+            if(p->packed_result>=QP_TYPED_RESULT) {
                 const struct qs_plan *result=&p->nodes[p->root].expr; v=decoded;
                 for(unsigned col=0;col<result->nout;++col) {
-                    v[col]=(struct qs_cell){.isnull=qp_host_isnull(out,result,r,col)};
+                    v[col]=(struct qs_cell){.isnull=qp_host_isnull(packet,result,r,col)};
                     if(v[col].isnull) continue;
-                    const void *field=qp_host_values(out,result,out->rows,col)+(size_t)r*4;
+                    const void *field=qp_host_values(packet,result,packet->rows,col)+(size_t)r*4;
                     if(result->outputs[col].type_oid==23) { int32_t value; memcpy(&value,field,4); v[col].value=value; }
                     else {
-                        unsigned bytes; const char *text=qp_host_var(out,field,&bytes); assert(text);
-                        qs_cell_set_string_ref(&v[col],text+4-out->str_data,bytes-4);
+                        unsigned bytes; const char *text=qp_host_var(packet,field,&bytes); assert(text);
+                        qs_cell_set_string_ref(&v[col],text+4-packet->str_data,bytes-4);
                     }
                 }
-            } else v=qp_result_row(out,r,p->nodes[p->root].expr.nout,p->packed_result);
+            } else v=qp_result_row(packet,r,p->nodes[p->root].expr.nout,p->packed_result);
             assert(seen<rows);
             if(ordered==DICTIONARY_SORT) while(key<rows && expected[key]%97==0) ++key;
             unsigned source=ordered==DICTIONARY_SORT?(key<rows?expected[key]:null_row):(unsigned)v[1].value;
@@ -331,8 +345,8 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
                 char want[width],prefix[48]; int n=snprintf(prefix,sizeof(prefix),payload?"shared-prefix-longer-than-twelve-%06u-":"key-%06u-",value_key);
                 memcpy(want,prefix,n); memset(want+n,'a'+value_key%26,width-n);
                 assert(!v[0].isnull && qs_cell_string(v)==width && qs_cell_is_string_ref(v));
-                assert(v[0].value>=0 && v[0].value+width<=out->str_bytes);
-                assert(!memcmp(out->str_data+(size_t)v[0].value,want,width));
+                assert(v[0].value>=0 && v[0].value+width<=packet->str_bytes);
+                assert(!memcmp(packet->str_data+(size_t)v[0].value,want,width));
                 assert(!v[1].isnull && v[1].value==source); if(ordered==DICTIONARY_SORT) ++key;
             } else {
                 assert(v[0].isnull && !v[1].isnull && v[1].value==source); if(ordered==DICTIONARY_SORT) null_row+=97;
@@ -342,13 +356,14 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
                 assert(v[2].isnull==(source%89==0));
                 if(!v[2].isnull) {
                     assert(qs_cell_string(&v[2])==n);
-                    const char *got=qs_cell_is_string_ref(&v[2])?out->str_data+(size_t)v[2].value:qs_cell_string_bytes(&v[2]);
-                    if(qs_cell_is_string_ref(&v[2])) assert(v[2].value>=0 && v[2].value+n<=out->str_bytes);
+                    const char *got=qs_cell_is_string_ref(&v[2])?packet->str_data+(size_t)v[2].value:qs_cell_string_bytes(&v[2]);
+                    if(qs_cell_is_string_ref(&v[2])) assert(v[2].value>=0 && v[2].value+n<=packet->str_bytes);
                     for(unsigned j=0;j<n;++j) assert(got[j]==(char)('a'+source%26));
                 }
             }
             ++seen;
         }
+        if(direct_worker) available&=~(UINT64_C(1)<<(direct_worker-1));
         if(out->metrics.work_peak>peak) peak=out->metrics.work_peak;
         if(c->bytes && !c->ready) {
             assert(c->offset+c->bytes<=raw_bytes);
@@ -374,7 +389,7 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
         ordered==DICTIONARY_SORT?"Scan/Sort/output":workers?"parallel Scan/output":"namespace Scan/output",seen,(unsigned long long)out->metrics.dictionary_bytes,spill.stores,loads,(unsigned long long)peak,budget);
     else printf("PASS default dictionary cancel after %s before CSF acknowledgement\n",cancel==1?"STORE":"LOAD");
     assert(!started); free(visited);
-    free(controls); free(spill.tokens); free(expected); free(raw); free(arena); free(io); free(out); free(p);
+    free(host_packet); free(controls); free(spill.tokens); free(expected); free(raw); free(arena); free(io); free(out); free(p);
     assert(!pthread_mutex_destroy(&spill.mutex));
 }
 /* Independent linear physical-range oracle; source extents deliberately use
@@ -492,6 +507,11 @@ static void *probe_worker(void *arg)
             assert(status==QP_RESOURCE_WAIT && !t->out->rows && !t->out->finished);
             sched_yield(); /* Let the CU completing dictionary I/O progress. */
             continue; /* The same input remains assigned to this CU. */
+        }
+        if((uint64_t)status&QP_TYPED_OUTPUT) {
+            assert(t->plan->packed_result==QP_DIRECT_RESULT);
+            assert(qp_output_rows(status)==c->output_rows && qp_output_strings(status)==c->output_strings);
+            status&=31;
         }
         assert((unsigned)status<=15);
         assert(((status&QP_OUTPUT_READY)!=0)==(t->out->rows!=0));
@@ -2316,6 +2336,13 @@ int main(int argc,char **argv)
         dictionary_plan(run,0,0,0,8192,64U*1024*1024,1);
         dictionary_plan(run,0,4,1,8192,64U*1024*1024,1);
         dictionary_plan(run,0,4,DICTIONARY_ASYNC_SCAN,65536,64U*1024*1024,1);
+        return 0;
+    }
+    if(argc==3 && !strcmp(argv[2],"--direct-output-64m")) {
+        test_packed=QP_DIRECT_RESULT; assert(!cs_work_init(64U*1024*1024));
+        function run=(function)dlsym(library,"pg_sina_plan"); assert(run);
+        dictionary_plan(run,0,4,DICTIONARY_ASYNC_SCAN,65536,64U*1024*1024,1);
+        dictionary_plan(run,0,8,DICTIONARY_ASYNC_SCAN,8192,64U*1024*1024,2);
         return 0;
     }
     if(argc==3 && !strcmp(argv[2],"--dictionary-64m")) {
