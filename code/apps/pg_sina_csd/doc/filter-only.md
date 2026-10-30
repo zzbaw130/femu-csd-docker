@@ -50,3 +50,9 @@ Q17 两遍 lineitem 的返回字节分别约 186.5/93.5MiB；Q21 返回 3793296 
 设备 `pgSinaPackedOutput64MiB` 覆盖类型打包、长字符串/NULL、并行排序，以及异步多 CU 的完整、不重复输出和旧确认位清理；`pgSinaIndexJoin64MiB` 验证索引连接。PG 的 `pgSinaPlannerCost` 验证类型容量、部分批次收紧、跨 NULL 位图的共享切片和变长偏移重定位，`pgSinaHeapLayout` 验证 Heap 布局；Numeric 模块的 14 个边界值用例通过。所有设备组件测试使用至少 64MiB workmem。
 
 初始化阶段 100ms 和执行阶段 1s 的 Q17 取消检查已加入 `tests/guest/filter-only-test.sh`：原连接均能继续执行 SQL，另用只读 GET_INFO 核对 FDM_USED 为 0。关闭 leader 扫描参与后的 Q6 输出一致；临时功能 SQL 验证 Scan 实际重扫三次（25 行×3，总和 900）和 LIMIT 提前结束的 EXPLAIN，结束后 FDM_USED 同样为 0。这些是生命周期检查，不作为 TPC-H 性能验收结果。
+
+## 交付计时
+
+`profile=on` 时增加按批次的计时，不在逐行 Datum 转换上加时钟。`CSD Consumer Queue Lock Sum` 是所有 PG 消费者获取结果队列锁的累计等待；`Consumer Batch Copy Sum` 是领取行时的复制累计时间；`Consumer Empty Sleep Sum` 单独统计发现队列为空后的休眠。`Delivery Advance Wall` 统计连续回调处理完成、读控制/结果、配置并提交请求的串行工作；`Result Read Wall`、`Control Read Sum` 是其中的读取部分。`Delivery Full Wait Sum` 包含多个完成回调等待 HOST 腾出空间的累计时间。这些累计量存在并行、嵌套和反压，不能直接相加或除以 SQL 总延迟当作阶段占比。
+
+修改前的细分诊断为 `results/tpch.T9D9zb/`：Q17 两个 lineitem 流等队列锁累计 5576.427ms、复制 559.929ms、结果读取 403.161ms；Q18 orders/customer 分别等锁 884.629/149.390ms，结果读取 47.685/10.890ms。确认完成回调持队列锁执行同步设备读与续交，会阻挡 PG 消费已就绪结果。这些是 filter-only 特有的交付成本；两边共有的 Q17 两次扫描/排序及 Q18 私有索引聚合不作为相对退化原因。
