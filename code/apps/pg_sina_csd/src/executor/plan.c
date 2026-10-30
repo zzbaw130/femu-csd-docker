@@ -8,6 +8,7 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/resowner.h"
+#include "utils/date.h"
 #include <time.h>
 #include <stdatomic.h>
 #include <pthread.h>
@@ -58,6 +59,8 @@ struct plan_slot {
 struct PlanStateCsd {
     CustomScanState css;
     struct qp_plan *plan;
+    List *parameter_exprs;
+    struct qs_cell *host_parameters;
     struct plan_slot slots[QS_WORKERS+1];
     unsigned workers, epoch, device_cus;
     atomic_uint_fast64_t next_scan_offset;
@@ -290,6 +293,9 @@ static void begin(CustomScanState *node,EState *estate,int flags)
     if(!s->plan->count || s->plan->count>QP_NODES || s->plan->root>=s->plan->count ||
        (length!=sizeof(*s->plan) && length!=qp_plan_constant_bytes(s->plan))) elog(ERROR,"invalid CSD PG Plan");
     s->plan->packed_result=QP_TYPED_RESULT;
+    s->parameter_exprs=ExecInitExprList(scan->custom_exprs,(PlanState *)node);
+    size_t parameter_bytes=qp_host_parameter_bytes(s->plan);
+    if(parameter_bytes) s->host_parameters=(void *)TYPEALIGN(16,(uintptr_t)palloc0(parameter_bytes+15));
     const struct qs_plan *output=&s->plan->nodes[s->plan->root].expr;
     for(unsigned col=0;col<output->nout;++col) {
         s->result_columns[col].type=output->outputs[col].type_oid;
@@ -371,8 +377,50 @@ static size_t layout_buffers(PlanStateCsd *s,const bool *indexed)
     s->plan->parallel_stride=stride; s->plan->workers=s->workers?s->workers:1;
     return arena+(s->workers?s->workers-1:0)*stride;
 }
+/* Preserve finite PG Numeric values as scaled int128, never through double
+ * or the int64 literal representation. NULL has no payload to dereference. */
+struct qs_cell pg_sina_parameter_cell(Datum value,Oid type,bool isnull)
+{
+    struct qs_cell result={.isnull=isnull};
+    if(isnull) return result;
+    switch(type) {
+    case INT2OID:result.value=DatumGetInt16(value);break;
+    case INT4OID:result.value=DatumGetInt32(value);break;
+    case INT8OID:result.value=DatumGetInt64(value);break;
+    case BOOLOID:result.value=DatumGetBool(value);break;
+    case DATEOID:
+        result.value=DatumGetInt32(value);
+        if(DATE_NOT_FINITE((int32)result.value)) elog(ERROR,"non-finite HOST date parameter is unsupported");
+        break;
+    case NUMERICOID: {
+        char *text=DatumGetCString(DirectFunctionCall1(numeric_out,value));
+        bool negative=*text=='-',point=false; unsigned scale=0;
+        for(char *at=text+negative;*at;++at) {
+            if(*at=='.' && !point) { point=true; continue; }
+            if(*at<'0' || *at>'9' ||
+               __builtin_mul_overflow(result.value,(__int128)10,&result.value) ||
+               (negative?__builtin_sub_overflow(result.value,(__int128)(*at-'0'),&result.value):
+                         __builtin_add_overflow(result.value,(__int128)(*at-'0'),&result.value)))
+                elog(ERROR,"HOST numeric parameter exceeds the finite CSD int128 representation");
+            if(point && ++scale>UINT8_MAX) elog(ERROR,"HOST numeric parameter scale exceeds the CSD representation");
+        }
+        result.scale=result.dscale=scale; pfree(text); break;
+    }
+    default:elog(ERROR,"unsupported HOST InitPlan parameter type %u",type);
+    }
+    return result;
+}
 static void start(PlanStateCsd *s)
 {
+    /* This runs only on the PG owner, before callbacks/consumers. Param
+     * evaluation uses PG's own lazy InitPlan executor and dependency rules. */
+    CustomScan *scan=(CustomScan *)s->css.ss.ps.plan;
+    ListCell *parameter,*expression;
+    forboth(parameter,scan->custom_exprs,expression,s->parameter_exprs) {
+        Param *p=lfirst(parameter); bool isnull;
+        Datum value=ExecEvalExprSwitchContext(lfirst(expression),s->css.ss.ps.ps_ExprContext,&isnull);
+        s->host_parameters[p->paramid]=pg_sina_parameter_cell(value,p->paramtype,isnull);
+    }
     const char *device=NULL;
     for(unsigned i=0;i<s->plan->count;++i) {
         struct qp_node *n=&s->plan->nodes[i];
@@ -390,7 +438,8 @@ static void start(PlanStateCsd *s)
     }
     if(!device) elog(ERROR,"CSD PG Plan has no prepared relation");
     pg_sina_read_resources(device);
-    size_t plan_bytes=sizeof(*s->plan);
+    size_t parameter_bytes=qp_host_parameter_bytes(s->plan);
+    size_t plan_bytes=sizeof(*s->plan)+parameter_bytes;
     for(unsigned i=0;i<s->plan->count;++i) {
         const struct qs_request *files[]={&s->files[i],&s->indexes[i]};
         struct qp_file_mapping *maps[]={&s->plan->files[i],&s->plan->indexes[i]};
@@ -470,6 +519,7 @@ static void start(PlanStateCsd *s)
         s->plan->packed_result=QP_DIRECT_RESULT;
     else s->plan->packed_result=QP_TYPED_RESULT;
     checked(transfer(s->memory[0],0,s->plan,sizeof(*s->plan),true),"copy plan");
+    if(parameter_bytes) checked(transfer(s->memory[0],sizeof(*s->plan),s->host_parameters,parameter_bytes,true),"copy HOST parameters");
     for(unsigned i=0;i<s->plan->count;++i) {
         if(s->plan->files[i].count) checked(transfer(s->memory[0],s->plan->files[i].offset,s->extents[i],
             (size_t)s->plan->files[i].count*sizeof(struct qs_extent),true),"copy heap mapping");
@@ -1085,6 +1135,8 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     pg_sina_explain_placement((CustomScan *)node->ss.ps.plan,es);
     ExplainPropertyText("Execution Path","csd",es);
     ExplainPropertyInteger("CSD Device CUs",NULL,pg_sina_resources.cus,es);
+    ExplainPropertyInteger("CSD HOST Parameter Count",NULL,list_length(s->parameter_exprs),es);
+    ExplainPropertyInteger("CSD Device Initializers",NULL,s->plan->ninit,es);
     ExplainPropertyInteger("CSD Device FDM","bytes",pg_sina_resources.fdm_bytes,es);
     ExplainPropertyInteger("CSD Device Workmem","bytes",pg_sina_resources.workmem_bytes,es);
     ExplainPropertyInteger("CSD Query Memory Limit","bytes",s->plan->nodes[s->plan->root].expr.work_mem_bytes,es);

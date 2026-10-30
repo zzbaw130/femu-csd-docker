@@ -156,9 +156,9 @@ Q21表现为HOST索引消费受阻，进一步使设备反压。与原生相比�
 
 原生l1扫描逐渐将lineitem Heap页放入shared_buffers及文件页缓存，后续l3可复用；filter-only的内部NVM读取没有将这些页带回HOST，只交付过滤后的列值，且该模式按定义关闭HPCP。冷启动只清空查询开始前的缓存，不禁止查询内复用。多出的81204次PG缺失块读取约合634.4MiB逻辑页访问；这里的页数不是NVMe命令数，I/O时间也包含多个PG参与者的并发，不与SQL墙钟相加。结果交付仍有额外成本，但不能用原生也存在的三组索引探测或设备约2秒的受反压源阶段，替代这个缓存差异解释。
 
-Q11/Q22都有Seq Scan，未卸载不是缺少扫描算子或FDM不足，而是`src/planner/cost.c:estimate`的`eligible && (top || root->init_plans==NIL)`规则：只要所在PlannerInfo有InitPlan，所有非根CSD子树都被跳过。Q11的HAVING阈值、Q22的AVG阈值都被PG编成`InitPlan 1 (returns $1)`。该规则为隔离HOST生成的执行参数而设，却连不使用$1的扫描一起挡住；此外Gather下非parallel-aware的私有Hash输入仍按既有规则保留HOST，这与共享流不是可重放源有关。
+修复前Q11/Q22虽有Seq Scan，仍被`src/planner/cost.c:estimate`的`eligible && (top || root->init_plans==NIL)`规则挡住：只要所在PlannerInfo有InitPlan，所有非根CSD子树都被跳过。Q11的HAVING阈值、Q22的AVG阈值都被PG编成`InitPlan 1 (returns $1)`。这条隔离HOST参数的旧规则连不使用$1的扫描一起拒绝；此外Gather下非parallel-aware的私有Hash输入仍按既有规则保留HOST，这与共享流不是可重放源有关。
 
-正确的修复边界应区分扫描是否真正依赖HOST参数。Q11的partsupp扫描、Q22不依赖$1的输入可独立处理；Q22的`c_acctbal > $1`确实需要HOST参数绑定或保留该剩余谓词。不能只去掉这个判断：当前`pg_sina_compile_subtree`会遍历并编译所在root的全部InitPlan，直接放开会把聚合/连接子计划偷偷塞入filter-only扫描程序，违背只卸载扫描过滤的边界。本轮仅确认原因，未改规则或新增协议。
+当时确认的修复边界是区分扫描是否真正依赖HOST参数。Q11的partsupp扫描、Q22不依赖$1的输入可独立处理；Q22的`c_acctbal > $1`确实需要HOST参数绑定或保留该剩余谓词。不能只去掉判断：旧编译器会遍历并编译所在root的全部InitPlan，直接放开会把聚合/连接子计划偷偷塞入filter-only扫描程序。后续实现与验证见本文“Q11/Q22：按实际依赖下推扫描，绑定HOST InitPlan结果”。
 
 ## Q16复杂过滤、CU供给和并行启动优化
 
@@ -195,3 +195,24 @@ filter-only比此前全量记录849.303ms低26.6%，但两轮HOST本身也有波
 扫描仍为200000行、返回29182行/1731802B，29次结果读取，4 CU、4任务槽、4MiB输入、FDM预留19536304B均不变。workmem实际峰值1287760B，spill为0；没有靠增加设备资源或减少结果换取加速。不能把累计CPU或多PG参与者的等待相加成SQL墙钟。
 
 PG的布局和规划成本两项测试通过；设备向量过滤、表达式、延迟解码、64MiB分页过滤、普通类型返回及4/8 CU直接交付六项通过。覆盖稀疏IN选择跨向量边界、NULL/NOT/OR、LIKE前缀/转义/UTF-8、复杂过滤后的原值返回和资源释放。结束后FDM_USED=0，未运行其他TPC-H查询。
+
+## Q11/Q22：按实际依赖下推扫描，绑定HOST InitPlan结果
+
+不再因为所在规划上下文存在InitPlan就拒绝所有扫描。编译器检查候选扫描的qual、投影及索引条件，只登记真正使用、由HOST InitPlan产生的执行参数；外层逐行参数或内嵌SubPlan仍拒绝，不会将它们误当成独立常量。编译扫描时不遍历并编译root的InitPlan；HOST初始化中的独立扫描另按同一规则检查，其聚合、连接仍由PG执行。私有Hash输入与共享结果流的原限制保持不变。
+
+参数登记在PG标准`custom_exprs`中，PG自己的初始化、并行依赖及重扫机制均能看到。PG owner在流启动时求值一次，按原类型转成`qs_cell`，附在计划AFDM后传入设备已有params数组；回调不访问PG，CU不调用HOST初始化。保留NULL和numeric的int128值/实际scale/显示scale，支持的标量类型见`planning.md`。EXPLAIN新增`CSD HOST Parameter Count`和`CSD Device Initializers`，分别确认绑定数量和没有夹带设备初始化子计划。
+
+最终只对正式Q11/Q22各模式独立重启PG、清Guest page cache，关闭profiling，记录在`results/tpch.Ic7q9X/`；设备仍为4 CU、256MiB workmem、64MiB FDM，PG参数不变，十次结果全部与对应HOST一致：
+
+| 查询 | host-only | filter-only | CSD无HPCP | CSD有HPCP | SQLerate |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q11 | 453.826ms | 468.324ms | 260.660ms | 264.802ms | 253.875ms |
+| Q22 | 835.202ms | 536.040ms | 388.270ms | 365.153ms | 364.936ms |
+
+Q11的main/InitPlan两次partsupp扫描都实际下推，各返回800000行，HOST聚合和HAVING保留；两条设备流参数数及初始化数均为0。Q22中HOST AVG继续保留，其customer输入扫描、主customer扫描及orders扫描下推；主customer扫描绑定1个HOST参数、返回19085行，平均值输入扫描返回38297行，orders返回1500000行。所有设备程序只含Scan，设备初始化数均为0，spill读写也均为0。
+
+Q22 filter-only比同轮HOST低35.8%。Q11完成了功能修复，但单轮仍慢3.2%，不把它判为已获得稳定性能收益，也不归因于内存不足。独立开启设备/交付计时的诊断保存在`tpch.a4awxP`，不与正式延迟合并或取最小值。
+
+PG布局、规划成本及已有数值边界入口通过，新增HOST numeric转换覆盖超过64位的正负数、scale、int128边界及NULL。设备新增`pgSinaHostParameters64MiB`覆盖精确参数、NULL、扫描/连接引用、截断输入拒绝与清理；原类型返回、CU直接交付、索引连接三项通过。会话内功能测试还覆盖根扫描保留InitPlan、多个参数及generic prepared plan多次重新绑定，并检查确实出现CSD扫描而不是回退；未新增测试SQL文件。最终FDM_USED=0。
+
+其余22条只做现有EXPLAIN脚本的计划检查，未重跑全量基准；相关SubPlan结论见`planning.md`当前支持边界。

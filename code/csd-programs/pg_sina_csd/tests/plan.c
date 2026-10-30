@@ -1565,11 +1565,13 @@ static void set_join(function run,unsigned kind,int hash,int has_null)
 }
 /* InitPlan parameters remain batch constants with their runtime precision,
  * both over a Heap scan and over retained Hash Join payload columns. */
-static void parameter_projection(function run,int joined,int wide,int null_parameter)
+static void parameter_projection(function run,int joined,int wide,int null_parameter,int host)
 {
     unsigned rows=20003,leaf=joined?3:1;
-    struct qp_plan *p=calloc(1,sizeof(*p)); assert(p);
-    p->count=joined?5:3; p->scan_bytes=QP_SCAN_BYTES; p->nparams=p->ninit=1;
+    size_t plan_bytes=sizeof(struct qp_plan)+(host?sizeof(struct qs_cell):0);
+    struct qp_plan *p=calloc(1,plan_bytes); assert(p);
+    p->count=joined?5:3; p->scan_bytes=QP_SCAN_BYTES; p->nparams=1; p->ninit=!host;
+    p->param_nodes[0]=host?QP_HOST_PARAMETER:2;
     p->init_nodes[0]=2; p->init_params[0]=0;
     scan(&p->nodes[leaf]);
     if(joined) {
@@ -1615,9 +1617,15 @@ static void parameter_projection(function run,int joined,int wide,int null_param
     }
     struct qp_control control={0}; struct qs_result *out=calloc(1,sizeof(*out)); assert(out);
     void *mr[]={p,&control,out,arena,io};
-    long long lengths[]={sizeof(*p),sizeof(control),sizeof(*out),bytes,QS_SORT_IO_BYTES};
+    long long lengths[]={plan_bytes,sizeof(control),sizeof(*out),bytes,QS_SORT_IO_BYTES};
     struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=lengths};
     __int128 parameter=wide?(__int128)INT64_MAX*INT64_MAX:12345; unsigned seen=0;
+    if(host) {
+        struct qs_cell value={.value=parameter,.scale=wide?4:2,.dscale=wide?6:3,.isnull=null_parameter};
+        memcpy((char *)p+sizeof(*p),&value,sizeof(value));
+        lengths[0]=sizeof(*p); assert(run(&args)<0 && !control.state);
+        lengths[0]=plan_bytes;
+    }
     while(!out->finished) {
         assert(!run(&args));
         for(unsigned r=0;r<out->rows;++r) {
@@ -2326,6 +2334,13 @@ int main(int argc,char **argv)
     assert(qp_worker_mask(0)==0 && qp_worker_mask(32)==UINT32_MAX && qp_worker_mask(64)==UINT64_MAX);
     assert(argc==2 || argc==3 || argc==4); void *library=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(library);
     function capacity=(function)dlsym(library,"pg_sina_workmem_capacity"); assert(capacity);
+    if(argc==3 && !strcmp(argv[2],"--host-params-64m")) {
+        assert(!cs_work_init(64U*1024*1024));
+        function run=(function)dlsym(library,"pg_sina_plan"); assert(run);
+        for(int joined=0;joined<2;++joined) for(int wide=0;wide<2;++wide) for(int nulls=0;nulls<2;++nulls)
+            parameter_projection(run,joined,wide,nulls,1);
+        puts("PASS HOST parameters: exact int128/scale, NULL, scan/join, bounded input and cleanup"); return 0;
+    }
     if(argc>=3 && !strcmp(argv[2],"--index-join-64m")) {
         assert(!cs_work_init(64U*1024*1024)); test_workers=argc==4?strtoul(argv[3],NULL,10):4;
         assert(test_workers && test_workers<=QS_WORKERS);
@@ -2477,9 +2492,9 @@ int main(int argc,char **argv)
     for(unsigned kind=QP_INNER;kind<=QP_ANTI;++kind) for(int hash=0;hash<=2;++hash)
         for(int nulls=0;nulls<=1;++nulls) set_join(run,kind,hash,nulls);
     for(int joined=0;joined<2;++joined) {
-        parameter_projection(run,joined,0,0);
-        parameter_projection(run,joined,1,0);
-        parameter_projection(run,joined,1,1);
+        parameter_projection(run,joined,0,0,0);
+        parameter_projection(run,joined,1,0,0);
+        parameter_projection(run,joined,1,1,0);
     }
     test_scheduled=true;
     for(unsigned join=QP_INNER;join<=QP_ANTI;++join) {

@@ -153,7 +153,7 @@ static unsigned device_workers(struct qp_plan *tree,double *fdm)
             stride=Max(stride,bytes);
         }
         unsigned slots=workers>1?workers+1:1;
-        *fdm=arena+(workers-1)*stride+sizeof(*tree)+tree->count*4096+
+        *fdm=arena+(workers-1)*stride+sizeof(*tree)+qp_host_parameter_bytes(tree)+tree->count*4096+
             slots*(sizeof(struct qp_control)+sizeof(struct qs_result)+QS_SORT_IO_BYTES)+65536;
         if(*fdm<=pg_sina_resources.fdm_bytes || (chunk==QP_SCAN_BYTES && workers==1)) break;
         if(chunk>QP_SCAN_BYTES) chunk/=2;
@@ -680,9 +680,9 @@ static struct placement *estimate(PlannerInfo *root,Plan *native,Plan *scope,Lis
      * mark/restore its inner child. A tuple-stream CustomScan is neither.
      * Keep those native nodes; their inputs can still be device islands. */
     eligible=eligible && !IsA(native,Hash) && !mark_restore;
-    /* An island cannot consume parameters produced in a different host
-     * InitPlan. Whole-query conversion keeps the existing device protocol. */
-    if(eligible && (top || root->init_plans==NIL)) {
+    /* Scan-only conversion binds only its actual HOST InitPlan dependencies;
+     * whole-subtree conversion still owns its complete initialization. */
+    if(eligible && (pg_sina_exe_path==PG_SINA_FILTER || top || root->init_plans==NIL)) {
         Plan *candidate=pg_sina_exe_path==PG_SINA_FILTER?pg_sina_project_scan(scope,native):native;
         Plan *device=top && pg_sina_exe_path!=PG_SINA_FILTER?pg_sina_fast_plan(root,native):NULL;
         if(!device) device=pg_sina_compile_subtree(root,candidate,!top);
@@ -723,7 +723,7 @@ static Plan *select_plan(struct placement *p,bool top,StringInfo decisions)
     else appendStringInfoString(decisions,"unsupported");
     if(p->offload) {
         Plan *out=p->device;
-        if(top) {
+        if(top && pg_sina_exe_path!=PG_SINA_FILTER) {
             p->root->init_plans=NIL;
         }
         CustomScan *scan=(CustomScan *)out;
@@ -815,6 +815,21 @@ const CustomScanMethods pg_sina_adaptive_methods={.CustomName="SQLeratePlan",.Cr
 Plan *pg_sina_adaptive_plan(PlannerInfo *root,Plan *native)
 {
     List *observations=NIL;
+    /* Keep InitPlan aggregate/join execution on PG. Its independent scans
+     * use the same filter-only rules; never compile the whole initializer. */
+    if(pg_sina_exe_path==PG_SINA_FILTER) {
+        ListCell *c;
+        foreach(c,root->init_plans) {
+            SubPlan *sub=lfirst(c);
+            if(sub->subLinkType==CTE_SUBLINK) continue;
+            Plan *input=list_nth(root->glob->subplans,sub->plan_id-1);
+            PlannerInfo *scope=list_nth(root->glob->subroots,sub->plan_id-1);
+            struct placement *init=estimate(scope,input,input,&observations,true,false,false);
+            StringInfoData decisions; initStringInfo(&decisions);
+            lfirst(list_nth_cell(root->glob->subplans,sub->plan_id-1))=select_plan(init,true,&decisions);
+            pfree(decisions.data);
+        }
+    }
     struct placement *p=estimate(root,native,native,&observations,true,false,false);
     StringInfoData decisions; initStringInfo(&decisions);
     StringInfoData costs; initStringInfo(&costs); node_costs(p,&costs);

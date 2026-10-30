@@ -4733,6 +4733,7 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
         a->mr_len[1]<(long long)sizeof(struct qp_control) || a->mr_len[2]<(long long)sizeof(struct qs_result) ||
         a->mr_len[4]<QS_SORT_IO_BYTES) return -1;
     struct qp_plan *plan=a->mr_addr[0]; unsigned worker=((uint64_t)a->cparam1>>1)&127;
+    if(plan->nparams>QP_PARAMS || (uint64_t)a->mr_len[0]<sizeof(*plan)+qp_host_parameter_bytes(plan)) return -1;
     if(plan->workers>QS_WORKERS || worker>plan->workers || a->mr_len[1]<(long long)((worker+1)*sizeof(struct qp_control)) ||
        a->mr_len[2]<(long long)((worker+1)*sizeof(struct qs_result))) return -1;
     struct qp_control *control=(struct qp_control *)a->mr_addr[1]+worker;
@@ -4748,6 +4749,12 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
         cs_work_context *context=cs_work_begin_limit(budget); if(!context) return -4;
         s=cs_work_calloc(context,1,sizeof(*s)); if(!s) { cs_work_end(context); return -4; }
         s->context=context; s->plan=plan; s->control=control; s->raw_projection=qp_host_raw_projection(plan);
+        if(qp_host_parameter_bytes(plan)) {
+            const char *values=(const char *)plan+sizeof(*plan);
+            for(unsigned i=0;i<plan->nparams;++i)
+                if(plan->param_nodes[i]==QP_HOST_PARAMETER)
+                    memcpy(&s->params[i],values+(size_t)i*sizeof(struct qs_cell),sizeof(struct qs_cell));
+        }
         s->partition_join=s->source_node=-1;
         s->arena=a->mr_addr[3]; s->io=a->mr_addr[4]; s->io_bytes=a->mr_len[4];
         s->nodes=cs_work_calloc(context,plan->count,sizeof(*s->nodes));

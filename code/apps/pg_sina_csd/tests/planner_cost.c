@@ -125,6 +125,10 @@ int main(void)
     CHECK(expanded->count==1 && expanded->packed_result==QP_DIRECT_RESULT);
     CHECK(!expanded->files[0].count && !expanded->pipelines[0].wall_ns);
     free(expanded);
+    filtered->nparams=3; filtered->param_nodes[2]=QP_HOST_PARAMETER;
+    CHECK(qp_host_parameter_bytes(filtered)==3*sizeof(struct qs_cell));
+    filtered->param_nodes[2]=0;
+    CHECK(!qp_host_parameter_bytes(filtered)); /* Device-owned InitPlans need no HOST snapshot. */
     struct qs_plan *projection=&filtered->nodes[0].expr;
     projection->nattrs=2; projection->nexprs=4; projection->nout=1; projection->predicate=3;
     projection->cols[0].type=Q_DECIMAL; projection->cols[1].type=Q_INTEGER;

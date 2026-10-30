@@ -300,6 +300,19 @@ HPCP与无HPCP的22条SQL耗时合计相差约-0.12%，总体基本持平；单�
 
 参数化Index Join也不是“支持任意相关SubPlan”：它只把已成为PG NestLoop的索引条件中的nestParams绑定回外层列，通过设备索引访问批量处理。不能将这个能力推广到任意SELECT标量子查询或相关表达式。
 
-混合执行仍有重要限制：只有与设备InitPlan绑定的PARAM_EXEC能进入CSD表达式；目前不从HOST取执行参数再绑定到设备扫描。`cost.c:estimate`的`eligible && (top || root->init_plans==NIL)`还会将含InitPlan上下文中的非根CSD岛全部跳过，Q11/Q22的filter-only因此没有卸载。这条限制过宽，但本轮没有放开，避免将HOST参数或整个聚合子计划偷偷塞进filter-only。修复应明确区分独立扫描、真正依赖HOST参数的扫描，以及Gather下必须私有重放的输入。
+filter-only现在按扫描实际表达式的依赖判断：不使用执行参数的扫描可以独立下推；引用HOST InitPlan结果的扫描，将对应Param登记到`CustomScan.custom_exprs`，由PG保留依赖并按需求值，再将值、NULL、numeric计算scale和显示scale写入一次设备快照。快照使用现有`qs_cell`/查询params数组，附在计划AFDM之后、文件extent之前；`param_nodes`中的`QP_HOST_PARAMETER`区分HOST值与设备初始化节点，CU仍继承查询参数。没有新增FEMU/SNIA命令或HOST中间行传输。
 
-TPC-H示例：Q2/Q17/Q20可受益于相关标量聚合改写；Q11/Q22在完整卸载时保留设备标量初始化；Q16的尺寸常量IN是ScalarArrayOpExpr展开的OR，不是SubPlan，而供应商NOT IN在完整卸载时可编成整数集合，在filter-only中仍由HOST执行。Q16优化与当前子查询边界分别记录，不因扫描更快而改变模式语义。
+HOST参数目前支持有限numeric、int2/int4/int8、boolean和date。numeric不经double/int64截断，以scaled int128传递；参数只在PG owner启动/重扫时读取，SNIA回调及设备线程不调用PG。外层NestLoop逐行参数、字符串/数组参数或扫描内嵌SubPlan不因此放开；Gather下需要私有重放的输入仍保留HOST。该修复针对filter-only，其他模式的整树设备初始化协议保持原样；HOST关系中间结果回传CSD仍未开放。
+
+HOST InitPlan自身仍由PG执行聚合/连接，其内部的独立扫描也按filter-only规则下推。每条扫描的设备初始化数为0，避免将整个InitPlan顺带编入扫描。根节点本身就是扫描时也保留HOST InitPlan；标准PG依赖机制继续负责并行参数传递和重新执行时的求值。
+
+当前22条的实际计划检查记录为`results/subplan-audit.ox4pU1/`，只运行现有22条explain脚本的host-only/filter-only/csd-without-hpcp，共66份计划，没有执行全量数据查询：
+
+| 模式 | 仍保留的PG子计划 |
+| --- | --- |
+| host-only / filter-only | Q2相关标量SubPlan；Q16非相关hashed SubPlan；Q11/Q15/Q22的InitPlan |
+| csd-without-hpcp | 无留在PG执行树中的相关SubPlan；22条均包含CSD执行节点，初始化/集合可在设备计划内部继续存在 |
+
+Q2的原生SubPlan索引条件仍引用外层`part.p_partkey`，完整CSD模式先将它改写为聚合连接。Q16的尺寸常量IN是ScalarArrayOpExpr展开的OR；供应商NOT IN在完整卸载时编成NULL-aware整数集合，在filter-only中仍由HOST执行。Q11/Q22在完整卸载时保留设备标量初始化，在filter-only时使用HOST初始化及扫描参数绑定。
+
+当前`tests/guest/queries/17.sql`和`20.sql`已经显式使用GROUP BY派生表，不能将它们没有相关SubPlan全归功于PG或本项目的去相关改写。这份结论只覆盖现有22条及当前配置，不等于支持任意相关子查询。

@@ -1239,12 +1239,49 @@ static Node *device_output_expression(Node *node,void *context)
     return expression_tree_mutator(node,device_output_expression,context);
 }
 
+struct scan_parameters { PlannerInfo *root; List *values; };
+/* Only parameters produced by a HOST InitPlan may cross this boundary.
+ * NestLoop's per-row parameters are not an InitPlan snapshot. */
+static bool scan_parameter(Node *node,struct scan_parameters *parameters)
+{
+    if(!node) return false;
+    if(IsA(node,SubPlan) || IsA(node,AlternativeSubPlan)) return true;
+    if(IsA(node,Param)) {
+        Param *v=(Param *)node; bool producer=false; ListCell *c;
+        if(v->paramkind!=PARAM_EXEC || v->paramid<0 || v->paramid>=QP_PARAMS) return true;
+        switch(v->paramtype) {
+        case INT2OID:case INT4OID:case INT8OID:case BOOLOID:case DATEOID:case NUMERICOID:break;
+        default:return true;
+        }
+        for(PlannerInfo *root=parameters->root;root && !producer;root=root->parent_root)
+            foreach(c,root->init_plans) {
+                SubPlan *sub=lfirst(c);
+                if(!sub->parParam && !sub->args && list_member_int(sub->setParam,v->paramid)) producer=true;
+            }
+        if(!producer) return true;
+        foreach(c,parameters->values) if(((Param *)lfirst(c))->paramid==v->paramid) return false;
+        parameters->values=lappend(parameters->values,copyObject(v)); return false;
+    }
+    return expression_tree_walker(node,scan_parameter,parameters);
+}
 Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
 {
+    bool host_scan=pg_sina_exe_path==PG_SINA_FILTER;
+    struct scan_parameters parameters={.root=root};
+    if(host_scan) {
+        if(!IsA(native,SeqScan) && !IsA(native,IndexScan) && !IsA(native,IndexOnlyScan)) return native;
+        if(scan_parameter((Node *)native->qual,&parameters) || scan_parameter((Node *)native->targetlist,&parameters)) return native;
+        if(IsA(native,IndexScan) && scan_parameter((Node *)((IndexScan *)native)->indexqualorig,&parameters)) return native;
+        if(IsA(native,IndexOnlyScan) && scan_parameter((Node *)((IndexOnlyScan *)native)->indexqual,&parameters)) return native;
+    }
     struct qp_plan *tree=palloc0(sizeof(*tree));
     for(unsigned i=0;i<QP_PARAMS;++i) tree->param_nodes[i]=tree->cte_nodes[i]=-1;
     ListCell *c;
-    foreach(c,root->init_plans) {
+    foreach(c,parameters.values) {
+        Param *v=lfirst(c); tree->param_nodes[v->paramid]=QP_HOST_PARAMETER;
+        tree->nparams=Max(tree->nparams,(unsigned)v->paramid+1);
+    }
+    foreach(c,host_scan?NIL:root->init_plans) {
         SubPlan *sub=lfirst(c);
         if(sub->subLinkType==CTE_SUBLINK) continue;
         if(sub->subLinkType!=EXPR_SUBLINK || sub->parParam || sub->args || list_length(sub->setParam)!=1 || tree->ninit==QP_PARAMS) { pfree(tree); return native; }
@@ -1267,7 +1304,7 @@ Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
         has_scan|=tree->nodes[i].kind==QP_SCAN;
         for(unsigned j=0;j<tree->nodes[i].expr.nexprs;++j) {
             struct qs_expr *e=&tree->nodes[i].expr.exprs[j];
-            if(e->op==QP_PARAMETER && tree->param_nodes[e->column]<0) { pfree(tree); return native; }
+            if(e->op==QP_PARAMETER && tree->param_nodes[e->column]<0 && tree->param_nodes[e->column]!=QP_HOST_PARAMETER) { pfree(tree); return native; }
         }
     }
     if(!has_scan) { pfree(tree); return native; }
@@ -1303,6 +1340,7 @@ Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
     /* PG projects device results; it must not retain removed InitPlan deps. */
     scan->scan.plan.targetlist=(List *)device_output_expression((Node *)native->targetlist,NULL);
     scan->custom_scan_tlist=copyObject(scan->scan.plan.targetlist);
+    scan->custom_exprs=parameters.values; /* PG tracks dependencies and evaluates InitPlans. */
     scan->custom_private=list_make1(makeConst(BYTEAOID,-1,InvalidOid,-1,PointerGetDatum(bytes),false,false));
     scan->methods=&pg_sina_plan_methods;
     return (Plan *)scan;

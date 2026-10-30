@@ -2,9 +2,11 @@
 #include "postgres.h"
 #include "fmgr.h"
 #include "utils/builtins.h"
+#include "catalog/pg_type_d.h"
 #include "query.h"
 PG_MODULE_MAGIC;
 extern Datum pg_sina_decimal(struct qs_cell);
+extern struct qs_cell pg_sina_parameter_cell(Datum,Oid,bool);
 PG_FUNCTION_INFO_V1(pg_sina_numeric_test);
 static void check_numeric(const char *text,unsigned scale,unsigned display,const char *expected)
 {
@@ -19,6 +21,15 @@ static void check_numeric(const char *text,unsigned scale,unsigned display,const
 }
 Datum pg_sina_numeric_test(PG_FUNCTION_ARGS)
 {
+    const char *parameters[]={"0.0000","12345.6789012345678901","-12345.6789012345678901",
+        "170141183460469231731687303715884105727","-170141183460469231731687303715884105728"};
+    for(unsigned i=0;i<sizeof(parameters)/sizeof(*parameters);++i) {
+        Datum numeric=DirectFunctionCall3(numeric_in,CStringGetDatum(parameters[i]),ObjectIdGetDatum(InvalidOid),Int32GetDatum(-1));
+        struct qs_cell cell=pg_sina_parameter_cell(numeric,NUMERICOID,false);
+        char *actual=DatumGetCString(DirectFunctionCall1(numeric_out,pg_sina_decimal(cell)));
+        if(strcmp(actual,parameters[i])) elog(ERROR,"HOST parameter numeric mismatch: %s",actual);
+    }
+    if(!pg_sina_parameter_cell((Datum)0,NUMERICOID,true).isnull) elog(ERROR,"HOST NULL parameter lost");
     check_numeric("0",6,2,"0.00");
     check_numeric("-1",4,2,"0.00");
     check_numeric("10000",0,0,"10000");

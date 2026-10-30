@@ -6,6 +6,7 @@
 #include "host_result.h"
 #define QP_NODES 96
 #define QP_PARAMS 128
+#define QP_HOST_PARAMETER (-2) /* Value supplied by PG, never a device InitPlan. */
 #define QP_SCAN_BYTES (1024U*1024)
 #define QP_VECTOR_ROWS 2048U
 /* cparam1: profile bit 0, CU slot bits 1..7. A scheduled heap input uses
@@ -74,6 +75,13 @@ struct qp_plan {
  * to the unchanged, full device record. */
 static inline size_t qp_plan_constant_bytes(const struct qp_plan *p)
 { return offsetof(struct qp_plan,nodes)+(size_t)p->count*sizeof(p->nodes[0]); }
+/* Only bound HOST values occupy this optional tail, before file extents. */
+static inline size_t qp_host_parameter_bytes(const struct qp_plan *p)
+{
+    for(unsigned i=0;i<p->nparams;++i) if(p->param_nodes[i]==QP_HOST_PARAMETER)
+        return (size_t)p->nparams*sizeof(struct qs_cell);
+    return 0;
+}
 /* These predicates can select borrowed Heap values without materializing
  * projected text. Stateful sets/parameters and numeric conversion retain
  * the existing general projection path. */
