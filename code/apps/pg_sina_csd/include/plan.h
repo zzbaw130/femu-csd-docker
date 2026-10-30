@@ -63,20 +63,23 @@ struct qp_plan {
     struct qp_pipeline_profile pipelines[QP_NODES];
     struct qp_file_mapping files[QP_NODES],indexes[QP_NODES];
 };
-static inline int qp_host_raw_numeric(const struct qp_plan *p)
+static inline int qp_host_raw_projection(const struct qp_plan *p)
 {
     const struct qp_node *n=&p->nodes[p->root];
     if(p->packed_result!=QP_TYPED_RESULT || n->kind!=QP_SCAN || n->ordered_index || n->expr.predicate>=0) return 0;
-    int numeric=0;
+    int variable=0;
     for(unsigned i=0;i<n->expr.nout;++i) {
         const struct qs_expr *e=&n->expr.exprs[n->expr.outputs[i].index];
         if(n->expr.outputs[i].aggregate || e->op!=Q_COLUMN || e->column<0 || (unsigned)e->column>=n->expr.nattrs) return 0;
-        if(n->expr.outputs[i].type_oid==1700) {
-            if(n->expr.cols[e->column].type!=Q_DECIMAL) return 0;
-            numeric=1;
-        }
+        unsigned oid=n->expr.outputs[i].type_oid,type=n->expr.cols[e->column].type;
+        if(type==Q_DECIMAL && oid!=1700) return 0;
+        if(oid==1700 && type!=Q_DECIMAL) return 0;
+        if(qp_host_variable(oid)) {
+            if(oid!=1700 && type!=Q_STRING && type!=Q_CHAR) return 0;
+            variable=1;
+        } else if(type==Q_STRING) return 0;
     }
-    return numeric;
+    return variable;
 }
 /* Only page addresses and lifecycle state cross to PG during execution. */
 struct qp_control {

@@ -64,6 +64,10 @@ struct PlanStateCsd {
     bool async_scan, delivery_shared, delivery_owner;
     struct result_delivery *delivery;
     dsm_segment *delivery_segment;
+    /* Local callback serialization is separate from the shared data queue:
+     * device requests must never hold up consumers of a published batch. */
+    pthread_mutex_t advance_mutex;
+    bool advance_mutex_ready;
     atomic_uint callbacks;
     CS_STATUS execution_status;
     const char *execution_operation;
@@ -88,6 +92,12 @@ struct PlanStateCsd {
     struct qs_request indexes[QP_NODES];
     struct qs_extent *index_extents[QP_NODES];
     struct qs_result *result;
+    /* Batch-local column views: resolve the typed layout once, not for each
+     * value exposed through PG's row-at-a-time TupleTableSlot interface. */
+    struct {
+        const unsigned char *values,*nulls;
+        unsigned width,type;
+    } result_columns[QS_OUT];
     CS_DEV_HANDLE device;
     CS_MEM_HANDLE memory[5];
     CS_MEM_HANDLE worker_io[QS_WORKERS];
@@ -200,6 +210,10 @@ static void close_state(void *arg)
         pthread_cond_broadcast(&s->delivery->ready);
         pthread_mutex_unlock(&s->delivery->mutex);
     }
+    if(s->advance_mutex_ready) {
+        pthread_mutex_lock(&s->advance_mutex);
+        pthread_mutex_unlock(&s->advance_mutex);
+    }
     for(unsigned w=0;w<=s->workers;++w) if(s->slots[w].pending) {
         pthread_mutex_lock(&s->slots[w].mutex);
         if(!atomic_load_explicit(&s->slots[w].completed,memory_order_acquire)) csAbortRequest(s->slots[w].inflight);
@@ -262,6 +276,7 @@ static void cleanup_state(void *arg)
         pthread_cond_destroy(&s->delivery->ready); pthread_mutex_destroy(&s->delivery->mutex);
         free(s->delivery);
     }
+    if(s->advance_mutex_ready) { pthread_mutex_destroy(&s->advance_mutex); s->advance_mutex_ready=false; }
     s->delivery=NULL;
 }
 static void begin(CustomScanState *node,EState *estate,int flags)
@@ -271,6 +286,11 @@ static void begin(CustomScanState *node,EState *estate,int flags)
     if(VARSIZE_ANY_EXHDR(bytes)!=sizeof(*s->plan)) elog(ERROR,"invalid CSD PG Plan");
     s->plan=palloc(sizeof(*s->plan)); memcpy(s->plan,VARDATA_ANY(bytes),sizeof(*s->plan));
     s->plan->packed_result=QP_TYPED_RESULT;
+    const struct qs_plan *output=&s->plan->nodes[s->plan->root].expr;
+    for(unsigned col=0;col<output->nout;++col) {
+        s->result_columns[col].type=output->outputs[col].type_oid;
+        s->result_columns[col].width=qp_host_width(output->outputs[col].type_oid);
+    }
     s->result=(void *)TYPEALIGN(16,(uintptr_t)palloc0(sizeof(*s->result)+15));
     s->explain_only=flags&EXEC_FLAG_EXPLAIN_ONLY; s->profiling=pg_sina_profile;
     atomic_init(&s->stopping,false); atomic_init(&s->next_scan_offset,0);
@@ -305,6 +325,10 @@ static void initialize_delivery(PlanStateCsd *s,struct result_delivery *shared)
     pthread_mutexattr_destroy(&mutex_attr); pthread_condattr_destroy(&cond_attr);
     if(status) { if(!shared) free(q); elog(ERROR,"cannot initialize CSD result delivery"); }
     s->delivery=q; s->delivery_shared=shared!=NULL; s->delivery_owner=true;
+    if(!s->advance_mutex_ready) {
+        if(pthread_mutex_init(&s->advance_mutex,NULL)) elog(ERROR,"cannot initialize CSD callback serialization");
+        s->advance_mutex_ready=true;
+    }
 }
 /* Compute offsets without allocating, so a larger I/O block can be tried
  * before reducing CU concurrency. Small relations need only their own bytes. */
@@ -849,6 +873,7 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
 static void deliver(PlanStateCsd *s,bool callback)
 {
     struct result_delivery *q=s->delivery;
+    pthread_mutex_lock(&s->advance_mutex);
     pthread_mutex_lock(&q->mutex);
     while(!atomic_load_explicit(&s->stopping,memory_order_acquire) &&
           s->execution_status==CS_SUCCESS && !q->eof) {
@@ -860,9 +885,15 @@ static void deliver(PlanStateCsd *s,bool callback)
             continue;
         }
         struct qs_result *next=&q->batches[(q->head+q->count)%lengthof(q->batches)];
+        /* The producer owns the unpublished tail. Consuming the head keeps
+         * (head + count) unchanged, so this slot remains private while I/O
+         * and request configuration run outside the shared queue lock. */
+        pthread_mutex_unlock(&q->mutex);
         uint64_t advancing=s->profiling?clock_ns():0;
         int produced=advance(s,next);
-        if(s->profiling) q->timing.advance_ns+=clock_ns()-advancing;
+        uint64_t advanced=s->profiling?clock_ns():0;
+        pthread_mutex_lock(&q->mutex);
+        if(s->profiling) q->timing.advance_ns+=advanced-advancing;
         q->status=s->execution_status;
         if(produced<=0) break;
         ++q->count; q->eof=next->finished;
@@ -871,6 +902,7 @@ static void deliver(PlanStateCsd *s,bool callback)
     }
     if(q->status!=CS_SUCCESS) pthread_cond_broadcast(&q->ready);
     pthread_mutex_unlock(&q->mutex);
+    pthread_mutex_unlock(&s->advance_mutex);
 }
 static void fetch(PlanStateCsd *s)
 {
@@ -928,12 +960,17 @@ static TupleTableSlot *execute(CustomScanState *node)
     if(!s->started && !s->delivery_shared) start(s);
     if(s->row==s->result->rows && !s->result->finished) fetch(s);
     if(s->row==s->result->rows) { close_state(s); return ExecClearTuple(slot); }
+    if(!s->row) for(unsigned i=0;i<root->nout;++i) {
+        s->result_columns[i].values=qp_host_values(s->result,root,s->result->rows,i);
+        s->result_columns[i].nulls=s->result_columns[i].values+(size_t)s->result->rows*s->result_columns[i].width;
+    }
     ResetExprContext(node->ss.ps.ps_ExprContext); ExecClearTuple(slot);
     unsigned row=s->row++;
     for(unsigned i=0;i<root->nout;++i) {
-        slot->tts_isnull[i]=qp_host_isnull(s->result,root,row,i); if(slot->tts_isnull[i]) continue;
-        Oid type=root->outputs[i].type_oid;
-        const void *field=qp_host_values(s->result,root,s->result->rows,i)+(size_t)row*qp_host_width(type);
+        bool isnull=(s->result_columns[i].nulls[row/8]>>(row%8))&1;
+        slot->tts_isnull[i]=isnull; if(isnull) continue;
+        Oid type=s->result_columns[i].type;
+        const void *field=s->result_columns[i].values+(size_t)row*s->result_columns[i].width;
         if(qp_host_variable(type)) {
             unsigned bytes; const void *value=qp_host_var(s->result,field,&bytes);
             if(!value) elog(ERROR,"invalid CSD variable result");

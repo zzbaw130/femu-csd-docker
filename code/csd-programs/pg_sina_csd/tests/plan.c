@@ -359,9 +359,10 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
         assert(seen==rows && (test_packed || (spill.stores && (!ordered || loads))) && peak<=budget);
         if(!ordered) assert(namespace_loads==raw_bytes/QS_PAGE);
         if(workers) assert(out->metrics.workers==workers && p->pipelines[1].worker_ns);
-        assert((test_packed || out->metrics.dictionary_bytes>budget) && out->metrics.dictionary_entries==rows-(rows+96)/97+(payload?40:0)+(payload==2));
+        if(qp_host_raw_projection(p)) assert(!out->metrics.dictionary_entries && !out->metrics.dictionary_bytes && !loads && !spill.stores);
+        else assert((test_packed || out->metrics.dictionary_bytes>budget) && out->metrics.dictionary_entries==rows-(rows+96)/97+(payload?40:0)+(payload==2));
         if(payload==2) assert(out->profile.operators[QS_FILTER].calls);
-        if(ordered && budget>=64U*1024*1024)
+        if(ordered==DICTIONARY_SORT && budget>=64U*1024*1024)
             assert((uint64_t)loads*QS_SORT_IO_BYTES<out->metrics.dictionary_bytes*8);
         for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i]);
     } else {

@@ -84,10 +84,17 @@ static inline int qp_host_slice(struct qs_result *to,struct qs_result *from,cons
         unsigned width=qp_host_width(p->outputs[col].type_oid);
         unsigned char *values=qp_host_values(to,p,rows,col),*nulls=qp_host_nulls(to,p,rows,col);
         memcpy(values,qp_host_values(from,p,from->rows,col)+(size_t)start*width,(size_t)rows*width);
-        memset(nulls,0,(rows+7)/8);
+        const unsigned char *source_nulls=qp_host_nulls(from,p,from->rows,col);
+        unsigned first=start/8,shift=start%8,source_bytes=(from->rows+7)/8,bytes=(rows+7)/8;
+        for(unsigned b=0;b<bytes;++b) {
+            unsigned bits=source_nulls[first+b]>>shift;
+            if(shift && first+b+1<source_bytes) bits|=(unsigned)source_nulls[first+b+1]<<(8-shift);
+            nulls[b]=bits;
+        }
+        if(rows%8) nulls[bytes-1]&=(1U<<(rows%8))-1;
+        if(!qp_host_variable(p->outputs[col].type_oid)) continue;
         for(unsigned row=0;row<rows;++row) {
-            if(qp_host_isnull(from,p,start+row,col)) { nulls[row/8]|=1U<<(row%8); continue; }
-            if(qp_host_variable(p->outputs[col].type_oid)) {
+            if(!((nulls[row/8]>>(row%8))&1)) {
                 unsigned bytes; const void *value=qp_host_var(from,values+(size_t)row*width,&bytes);
                 unsigned offset=(to->str_bytes+3)&~3U;
                 if(!value || offset>sizeof(to->str_data) || bytes>sizeof(to->str_data)-offset) return -1;

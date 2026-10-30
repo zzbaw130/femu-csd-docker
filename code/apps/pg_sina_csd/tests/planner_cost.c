@@ -83,6 +83,16 @@ int main(void)
         CHECK(value && bytes==4+(row+7)%97);
         for(unsigned i=4;i<bytes;++i) CHECK(value[i]==(char)('a'+(row+7)%26));
     }
+    const unsigned starts[]={0,1,7,8,255,512},lengths[]={1,7,8,9,256,513};
+    for(unsigned i=0;i<sizeof(starts)/sizeof(*starts);++i)
+        for(unsigned j=0;j<sizeof(lengths)/sizeof(*lengths);++j) {
+            unsigned first=starts[i],rows=lengths[j];
+            if(rows>packet->rows-first) rows=packet->rows-first;
+            CHECK(!qp_host_slice(slice,packet,&typed,first,rows));
+            for(unsigned row=0;row<rows;++row)
+                CHECK(qp_host_isnull(slice,&typed,row,1)==((row+first)%17==0));
+            if(rows%8) CHECK(!(qp_host_nulls(slice,&typed,rows,1)[rows/8]&~((1U<<(rows%8))-1)));
+        }
     free(slice);
     free(packet);
     struct qp_plan scan={.count=1};
