@@ -37,7 +37,7 @@ struct placement {
     double serial,parallel,schedule,combine,dictionary,fdm;
     unsigned workers;
     StringInfo stages;
-    bool offload;
+    bool offload,details;
 };
 static double transfer_ms(double bytes,double mbps) { return bytes/(mbps*1000); }
 /* mincore on PROT_NONE mappings observes OS residency without reading Heap.
@@ -478,15 +478,16 @@ static void fast_cost(struct placement *p,const struct qs_plan *plan,List **obse
     p->csd=Max(p->io+p->cpu,p->population)+2;
     p->boundary=transfer_ms(Max(1,ceil(rows/QS_RESULT_ROWS))*offsetof(struct qs_result,str_data),pg_sina_pcie_mbps)+
         rows*cpu_tuple_cost*pg_sina_host_cost_ms+Max(1,ceil(rows/QS_RESULT_ROWS))*pg_sina_result_batch_ms;
-    p->stages=makeStringInfo();
-    appendStringInfo(p->stages,"fused Scan/Filter/Aggregate tasks=%.0f groups=%.0f partial_rows=%.0f state=%.0fB spill=%.0fB",
+    if(p->details) p->stages=makeStringInfo();
+    if(p->details) appendStringInfo(p->stages,"fused Scan/Filter/Aggregate tasks=%.0f groups=%.0f partial_rows=%.0f state=%.0fB spill=%.0fB",
         tasks,groups,partial,p->peak,p->spill);
 }
-static void device_cost(struct placement *p,List **observations,struct qp_plan *lowered)
+static void device_cost(struct placement *p,List **observations,struct qp_plan *lowered,const struct qs_plan *fast)
 {
     CustomScan *scan=(CustomScan *)p->device;
     bytea *bytes=NULL;
     if(scan->methods==&pg_sina_scan_methods) {
+        if(fast) { fast_cost(p,fast,observations); return; }
         Const *constant=linitial_node(Const,scan->custom_private);
         bytes=DatumGetByteaP(constant->constvalue);
         fast_cost(p,(const struct qs_plan *)VARDATA(bytes),observations); return;
@@ -514,7 +515,7 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
     unsigned slots=device_workers(tree,&p->fdm); p->workers=slots;
     /* Suspended task contexts consume buffers/state, never extra CPU cores. */
     unsigned cus=Min(slots,Max(1,pg_sina_resources.cus));
-    p->stages=makeStringInfo();
+    if(p->details) p->stages=makeStringInfo();
     double tasks[QP_NODES]={0},peak[QP_NODES]={0},live[QP_NODES]={0},retained[QP_NODES]={0};
     pipeline_tasks(tree,tasks);
     double io=0,population_bytes=0,cache_bytes=0,scan_bytes=0,blocks=0;
@@ -652,7 +653,7 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
         double dictionary_live=Min(p->dictionary,Max(dictionary_meta,memory-peak[i]));
         dictionary_evicted=Max(dictionary_evicted,p->dictionary-dictionary_live);
         p->peak=Max(p->peak,peak[i]+dictionary_live);
-        appendStringInfo(p->stages,"%s%d/%s rows=%.0f groups=%.0f tasks=%.0f cpu=%.3fms state=%.0fB resident=%.0fB available=%.0fB spill=%.0fB",
+        if(p->details) appendStringInfo(p->stages,"%s%d/%s rows=%.0f groups=%.0f tasks=%.0f cpu=%.3fms state=%.0fB resident=%.0fB available=%.0fB spill=%.0fB",
             p->stages->len?"; ":"",i,device_kind(n->kind),rows,n->estimated_groups,tasks[i],
             p->serial+p->parallel+p->schedule+p->combine-previous_cpu,state,resident,available,spill);
     }
@@ -679,7 +680,7 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
 }
 static struct placement *estimate(PlannerInfo *root,Plan *native,Plan *scope,List **observations,bool top,bool mark_restore,bool parallel_region)
 {
-    struct placement *p=palloc0(sizeof(*p)); p->native=native; p->root=root; p->csd=DBL_MAX;
+    struct placement *p=palloc0(sizeof(*p)); p->native=native; p->root=root; p->csd=DBL_MAX; p->details=true;
     bool parallel_children=parallel_region || IsA(native,Gather) || IsA(native,GatherMerge);
     {
         if(native->lefttree) p->children=lappend(p->children,estimate(root,native->lefttree,scope,observations,false,false,parallel_children));
@@ -729,7 +730,7 @@ static struct placement *estimate(PlannerInfo *root,Plan *native,Plan *scope,Lis
         Plan *candidate=pg_sina_exe_path==PG_SINA_FILTER?pg_sina_project_scan(scope,native):native;
         Plan *device=top && pg_sina_exe_path!=PG_SINA_FILTER?pg_sina_fast_plan(root,native):NULL;
         if(!device) device=pg_sina_compile_subtree(root,candidate,!top);
-        if(device!=candidate) { p->device=device; device_cost(p,observations,NULL); }
+        if(device!=candidate) { p->device=device; device_cost(p,observations,NULL,NULL); }
     }
     p->offload=p->device && (pg_sina_exe_path!=PG_SINA_ADAPTIVE || p->csd+p->boundary<p->host);
     return p;
@@ -776,32 +777,83 @@ static void annotate_device(struct placement *p)
     costs=lappend(costs,makeFloat(psprintf("%.9g",p->dictionary)));
     costs=lappend(costs,makeFloat(psprintf("%.9g",p->fdm)));
     costs=lappend(costs,makeInteger(p->workers));
-    costs=lappend(costs,makeString(p->stages->data));
+    costs=lappend(costs,makeString(p->stages?p->stages->data:pstrdup("")));
     scan->custom_private=lappend(scan->custom_private,costs);
 }
-/* Cost the same compiled representation used by forced device execution.
- * The caller keeps internal cost separate from the HOST delivery edge. */
+static bool output_ordered(const struct qp_plan *tree,int id)
+{
+    if(id<0) return false;
+    const struct qp_node *n=&tree->nodes[id];
+    if(n->kind==QP_SORT) return true;
+    if(n->kind==QP_SCAN) return (n->ordered_index&1) && !(n->ordered_index&8);
+    if(n->kind==QP_JOIN) return !n->hash;
+    if(n->kind==QP_AGGREGATE && (n->hash || n->distinct || n->distinct_aggs || !n->sorted_input)) return false;
+    if(n->kind==QP_INDEX_JOIN && !n->sorted_input) return false;
+    return output_ordered(tree,n->left);
+}
+/* Decide physical properties in Path search, without encoding instructions.
+ * Only numeric costs survive for discarded/shared-search candidates. */
 Plan *pg_sina_cost_device(PlannerInfo *root,Plan *native,bool top,List **observations,
-                         double *internal,double *boundary,StringInfo estimates)
+                         double *internal,double *boundary)
 {
     struct placement p={.native=native,.root=root,.host=native->total_cost*pg_sina_host_cost_ms};
     if(!top && root->init_plans) return NULL;
     double mark=pg_sina_planner_clock();
+    Plan *chosen=pg_sina_prepare_candidate(root,native,!top || root->parse->sortClause!=NIL);
+    if(!chosen) {
+        if(pg_sina_planning) pg_sina_planning->properties+=pg_sina_planner_clock()-mark;
+        return NULL;
+    }
+    p.native=chosen;
     struct qp_plan *lowered=NULL;
-    p.device=top?pg_sina_fast_plan(root,native):NULL;
-    if(!p.device) p.device=pg_sina_native_search?pg_sina_compile_subtree(root,native,!top):
-        pg_sina_lower_subtree(root,native,!top,&lowered);
-    if(pg_sina_planning) pg_sina_planning->compile+=pg_sina_planner_clock()-mark;
-    if(p.device==native || !p.device) return NULL;
+    struct qs_plan *fast=NULL;
+    p.device=top?pg_sina_fast_properties(root,chosen,&fast):NULL;
+    if(!p.device) p.device=pg_sina_describe_candidate(root,chosen,!top,&lowered);
+    if(p.device && p.device!=chosen && lowered && top && root->parse->sortClause && !output_ordered(lowered,lowered->root)) {
+        chosen=pg_sina_require_output_order(root,chosen);
+        p.native=chosen;
+        p.device=chosen?pg_sina_describe_candidate(root,chosen,false,&lowered):NULL;
+    }
+    if(pg_sina_planning) pg_sina_planning->properties+=pg_sina_planner_clock()-mark;
+    if(p.device==chosen || !p.device) return NULL;
     mark=pg_sina_planner_clock();
-    device_cost(&p,observations,lowered);
+    device_cost(&p,observations,lowered,fast);
     if(pg_sina_planning) pg_sina_planning->estimate+=pg_sina_planner_clock()-mark;
     mark=pg_sina_planner_clock();
     annotate_device(&p);
     *internal=p.csd; *boundary=p.boundary;
-    node_costs(&p,estimates);
+    ((CustomScan *)p.device)->custom_private=lappend(((CustomScan *)p.device)->custom_private,chosen);
+    List *choices=NIL;
+    /* Per node: frozen algorithms/rewrite flags and its two input IDs. */
+    if(lowered) for(unsigned i=0;i<lowered->count;++i) choices=lappend(choices,list_make3(
+        makeInteger(pg_sina_candidate_choices()[i]),makeInteger(lowered->nodes[i].left),makeInteger(lowered->nodes[i].right)));
+    ((CustomScan *)p.device)->custom_private=lappend(((CustomScan *)p.device)->custom_private,choices);
+    ((CustomScan *)p.device)->custom_private=lappend(((CustomScan *)p.device)->custom_private,
+        makeInteger(fast?fast->norder!=0:output_ordered(lowered,lowered->root)));
     if(pg_sina_planning) pg_sina_planning->format+=pg_sina_planner_clock()-mark;
     return p.device;
+}
+/* Explain text is not a cost input. Recreate it once for a selected Path;
+ * keep the numeric costs that PG actually compared, without repricing it. */
+List *pg_sina_selected_costs(PlannerInfo *root,Plan *native,bool top,bool fast,List *costs)
+{
+    volatile double mark=pg_sina_planner_clock(); bool compiling=pg_sina_compiling_plan;
+    struct placement p={.native=native,.root=root,.details=true};
+    struct qp_plan *properties=NULL; struct qs_plan *fused=NULL;
+    pg_sina_compiling_plan=true;
+    PG_TRY();
+    {
+        p.device=fast?pg_sina_fast_properties(root,native,&fused):pg_sina_describe_candidate(root,native,!top,&properties);
+        if(!p.device || p.device==native) elog(ERROR,"selected device properties no longer describe");
+        device_cost(&p,pg_sina_search_observations(),properties,fused);
+    }
+    PG_CATCH();
+    { pg_sina_compiling_plan=compiling; PG_RE_THROW(); }
+    PG_END_TRY();
+    pg_sina_compiling_plan=compiling;
+    List *result=copyObject(costs); lfirst(list_tail(result))=makeString(p.stages->data);
+    if(pg_sina_planning) pg_sina_planning->format+=pg_sina_planner_clock()-mark;
+    return result;
 }
 static Plan *select_plan(struct placement *p,bool top,StringInfo decisions)
 {
@@ -878,7 +930,8 @@ static void adaptive_explain(CustomScanState *s,List *ancestors,ExplainState *es
     ExplainPropertyText("HPCP",pg_sina_hpcp_enabled()?"enabled for CSD islands":"disabled",es);
     ExplainPropertyText("Placement Costs","milliseconds; estimates, not execution timings",es);
     ExplainPropertyText("Placement",strVal(linitial(scan->custom_private)),es);
-    ExplainPropertyText("Node Cost Estimates",strVal(lsecond(scan->custom_private)),es);
+    const char *costs=strVal(lsecond(scan->custom_private));
+    if(*costs) ExplainPropertyText("Node Cost Estimates",costs,es);
 }
 static const CustomExecMethods adaptive_exec={.CustomName="SQLeratePlan",.BeginCustomScan=adaptive_begin,
     .ExecCustomScan=adaptive_exec_scan,.EndCustomScan=adaptive_end,.ReScanCustomScan=adaptive_rescan,.ExplainCustomScan=adaptive_explain};

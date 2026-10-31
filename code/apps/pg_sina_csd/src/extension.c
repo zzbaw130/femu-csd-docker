@@ -72,6 +72,9 @@ static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,Param
                 lfirst(list_head(info))=makeString(psprintf("%s; original HOST=%.3fms original CSD=%s shared search=%.3fms",
                     strVal(linitial(info)),host_cost,original,candidate));
             }
+            pg_sina_finish_device_plans(plan->planTree);
+            ListCell *cell;
+            foreach(cell,plan->subplans) pg_sina_finish_device_plans(lfirst(cell));
         }
     }
     PG_CATCH();
@@ -80,14 +83,14 @@ static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,Param
     pg_sina_path_search=saved; pg_sina_native_search=native_search;
     if(pg_sina_planning) {
         double total=pg_sina_planner_clock()-started;
-        double other=total-counters.rewrite-counters.preview-counters.compile-counters.estimate-
+        double other=total-counters.rewrite-counters.preview-counters.properties-counters.compile-counters.estimate-
             counters.format-counters.retain-counters.host_cache-counters.stmt_copy;
         pg_sina_planning=saved_profile;
-        ereport(NOTICE,(errmsg("SQLerate planner total_ms=%.3f pg_other_ms=%.3f rewrite_ms=%.3f preview_ms=%.3f compile_ms=%.3f estimate_ms=%.3f format_ms=%.3f retain_ms=%.3f host_cache_ms=%.3f stmt_copy_ms=%.3f native_pg_inclusive_ms=%.3f adaptive_pg_inclusive_ms=%.3f candidates=%u accepted=%u index_calls=%u index_queries=%u index_inclusive_ms=%.3f resources_inclusive_ms=%.3f lower_calls=%u lower_hits=%u reused_nodes=%u serialized_plans=%u",
-            total,other,counters.rewrite,counters.preview,counters.compile,counters.estimate,counters.format,
+        ereport(NOTICE,(errmsg("SQLerate planner total_ms=%.3f pg_other_ms=%.3f rewrite_ms=%.3f preview_ms=%.3f properties_ms=%.3f compile_ms=%.3f estimate_ms=%.3f format_ms=%.3f retain_ms=%.3f host_cache_ms=%.3f stmt_copy_ms=%.3f native_pg_inclusive_ms=%.3f adaptive_pg_inclusive_ms=%.3f candidates=%u accepted=%u index_calls=%u index_queries=%u index_inclusive_ms=%.3f resources_inclusive_ms=%.3f property_nodes=%u encoded_nodes=%u serialized_plans=%u fast_records=%u",
+            total,other,counters.rewrite,counters.preview,counters.properties,counters.compile,counters.estimate,counters.format,
             counters.retain,counters.host_cache,counters.stmt_copy,counters.native_pg,counters.adaptive_pg,
             counters.candidates,counters.accepted,counters.index_calls,counters.index_queries,counters.indexes,counters.resources,
-            counters.lower_calls,counters.lower_hits,counters.lower_reused_nodes,counters.serialized_plans)));
+            counters.property_nodes,counters.encoded_nodes,counters.serialized_plans,counters.fast_records)));
     }
     pg_sina_planning=saved_profile;
     return plan;

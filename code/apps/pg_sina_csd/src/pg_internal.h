@@ -18,11 +18,11 @@ extern bool pg_sina_profile;
 /* Existing profile switch also measures planner work; all fields are ms.
  * The pointer is query-local and restored for nested planner invocations. */
 struct pg_sina_planner_profile {
-    double rewrite,preview,compile,estimate,format,retain,host_cache,stmt_copy;
+    double rewrite,preview,properties,compile,estimate,format,retain,host_cache,stmt_copy;
     double native_pg,adaptive_pg;
     double indexes,resources;
     unsigned candidates,accepted,index_calls,index_queries;
-    unsigned lower_calls,lower_hits,lower_reused_nodes,serialized_plans;
+    unsigned property_nodes,encoded_nodes,serialized_plans,fast_records;
 };
 extern struct pg_sina_planner_profile *pg_sina_planning;
 static inline double pg_sina_planner_clock(void)
@@ -52,14 +52,22 @@ void pg_sina_start_path_search(void);
 MemoryContext pg_sina_search_context(void);
 List **pg_sina_search_observations(void);
 List **pg_sina_search_index_metadata(void);
-List **pg_sina_search_lowering_cache(void);
-struct qp_plan *pg_sina_lowering_workspace(void);
+struct qp_plan *pg_sina_cost_workspace(void);
+enum { PG_SINA_GROUP_FILTER=1U<<8, PG_SINA_LEFT_COUNT=1U<<9, PG_SINA_DISTINCT=1U<<10, PG_SINA_DISTINCT_SORT=1U<<11 };
+/* Query-local choice, never a wire field: low bits select relational rewrites;
+ * high bits freeze the node/access algorithms checked by the final encoder. */
+static inline unsigned pg_sina_physical_choice(const struct qp_node *n)
+{ return ((n->kind+1)<<16)|(n->hash<<24)|(n->sorted_input<<25)|(n->ordered_index<<26); }
+unsigned *pg_sina_candidate_choices(void);
+unsigned pg_sina_encoding_choice(unsigned);
+bool pg_sina_encoding_matches(unsigned,const struct qp_node *);
 PlannedStmt *pg_sina_original_device_statement(PlannedStmt *);
 bool pg_sina_prepared_device(Oid,Oid,char *,size_t);
 void pg_sina_rel_paths(PlannerInfo *,RelOptInfo *,Index,RangeTblEntry *);
 void pg_sina_join_paths(PlannerInfo *,RelOptInfo *,RelOptInfo *,RelOptInfo *,JoinType,JoinPathExtraData *);
 void pg_sina_search_upper_paths(PlannerInfo *,UpperRelationKind,RelOptInfo *,RelOptInfo *);
-Plan *pg_sina_cost_device(PlannerInfo *,Plan *,bool,List **,double *,double *,StringInfo);
+Plan *pg_sina_cost_device(PlannerInfo *,Plan *,bool,List **,double *,double *);
+List *pg_sina_selected_costs(PlannerInfo *,Plan *,bool,bool,List *);
 double pg_sina_host_scan_cost(Oid,bool,double,double,List **);
 double pg_sina_host_statement_cost(PlannedStmt *);
 Plan *pg_sina_wrap_placement(Plan *,const char *,const char *);
@@ -70,14 +78,19 @@ void pg_sina_upper_paths(PlannerInfo *, UpperRelationKind, RelOptInfo *, RelOptI
 bool pg_sina_rewrite_query(Query *q);
 Plan *pg_sina_rewrite_plan(PlannerInfo *,Plan *);
 Plan *pg_sina_compile_subtree(PlannerInfo *,Plan *,bool);
-/* Cost-only metadata and a borrowed aligned tree, valid until the next
- * candidate. The returned CustomScan has no executable Const. */
-Plan *pg_sina_lower_subtree(PlannerInfo *,Plan *,bool,struct qp_plan **);
+Plan *pg_sina_prepare_candidate(PlannerInfo *,Plan *,bool);
+Plan *pg_sina_require_output_order(PlannerInfo *,Plan *);
+/* Cost properties and a borrowed workspace, valid until the next candidate.
+ * Scalar metadata contains no executable program; CustomScan has no Const. */
+Plan *pg_sina_describe_candidate(PlannerInfo *,Plan *,bool,struct qp_plan **);
+Plan *pg_sina_candidate_scan(Plan *,bool);
+void pg_sina_finish_device_plans(Plan *);
 void pg_sina_refine_groups(struct qp_plan *);
 Plan *pg_sina_adaptive_plan(PlannerInfo *,Plan *);
 void pg_sina_explain_placement(CustomScan *,ExplainState *);
 extern const CustomScanMethods pg_sina_adaptive_methods;
 Plan *pg_sina_fast_plan(PlannerInfo *,Plan *);
+Plan *pg_sina_fast_properties(PlannerInfo *,Plan *,struct qs_plan **);
 Plan *pg_sina_native_plan(Plan *);
 Plan *pg_sina_native_wrapper(Plan *);
 extern const CustomScanMethods pg_sina_plan_methods;

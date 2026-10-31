@@ -21,17 +21,27 @@ grep -q 'CSD Stage Estimates:.*Join' "$OUT/joins.plan"
 if grep -q 'SQLerate planner total_ms=' "$OUT/joins.err"; then exit 1; fi
 plan 9 SQLerate timed 'SET pg_sina_csd.profile=on'
 grep -q 'SQLerate planner total_ms=.*compile_ms=.*estimate_ms=' "$OUT/timed.err"
-# Repeated scans should reuse lowering; executable records must not grow
-# with the hundreds of accepted Q9 cost candidates.
+# Hundreds of Q9 candidates inspect properties without encoding a program.
+# Only the final device island may receive its executable record.
 awk '/SQLerate planner total_ms=/ {
     for (i=1; i<=NF; ++i) {
         split($i, field, "=")
         if (field[1]=="accepted") accepted=field[2]+0
-        if (field[1]=="lower_hits") hits=field[2]+0
+        if (field[1]=="property_nodes") properties=field[2]+0
+        if (field[1]=="encoded_nodes") encoded=field[2]+0
         if (field[1]=="serialized_plans") serialized=field[2]+0
     }
-    ok=(hits>0 && serialized>0 && serialized<accepted)
+    ok=(properties>encoded && encoded>0 && encoded<accepted && serialized==1)
 } END {exit !ok}' "$OUT/timed.err"
+plan 14 SQLerate timed-host 'SET pg_sina_csd.profile=on; SET pg_sina_csd.csd_cpu_ratio=1000'
+grep -q 'encoded_nodes=0 serialized_plans=0 fast_records=0' "$OUT/timed-host.err"
+# The fused algorithm must be recognized before costing, while its execution
+# record is generated only for the selected statement.
+for query in 1 6; do
+    plan "$query" SQLerate "fused.$query" 'SET pg_sina_csd.profile=on; SET pg_sina_csd.csd_cpu_ratio=0.001'
+    grep -q 'CSD Stage Estimates: fused Scan/Filter/Aggregate' "$OUT/fused.$query.plan"
+    grep -q 'serialized_plans=0 fast_records=1' "$OUT/fused.$query.err"
+done
 # A common rewrite may also produce a better HOST candidate. It must not
 # silently replace the original native-PG baseline or require a CSD operator.
 plan 17.original host-only original

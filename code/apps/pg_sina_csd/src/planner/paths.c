@@ -20,21 +20,85 @@ struct path_relation {
     List *pending;
 };
 struct prepared_relation { Oid relid,filenode; bool prepared; char device[128]; };
+struct root_state { PlannerInfo *root; PlannerInfo saved; };
+static void save_roots(PlannerInfo *,List **);
+static void restore_roots(List *);
+struct device_program { PlannerInfo root; PlannerGlobal globals; Plan *native; List *choices; bool fast,boundary; };
 struct pg_sina_path_search {
-    List *relations,*observations,*prepared,*indexes,*lowered;
-    StringInfo estimates;
+    List *relations,*observations,*prepared,*indexes,*programs;
     MemoryContext memory;
     struct qp_plan *workspace;
+    unsigned choices[QP_NODES];
+    List *encoding_choices;
 };
 struct pg_sina_path_search *pg_sina_path_search;
 bool pg_sina_native_search,pg_sina_previewing_path;
 static const CustomPathMethods device_methods,final_methods;
 
+/* This marker survives PG setrefs but cannot reach the executor. Only the
+ * globally selected statement gets its final CSF record in finish below. */
+static Plan *defer_program(PlannerInfo *root,Plan *native,bool fast,bool boundary,List *costs,List *choices)
+{
+    MemoryContext previous=MemoryContextSwitchTo(pg_sina_search_context());
+    struct device_program *program=palloc(sizeof(*program));
+    program->root=*root; program->native=native; program->fast=fast; program->boundary=boundary;
+    program->choices=choices;
+    /* PG setrefs rewrites SubPlan expressions after create_plan. Preserve
+     * their original Vars for the final device encoder. */
+    program->globals=*root->glob; program->globals.subplans=copyObject(root->glob->subplans);
+    program->root.glob=&program->globals;
+    program->root.init_plans=copyObject(root->init_plans);
+    program->root.processed_tlist=copyObject(root->processed_tlist);
+    unsigned id=list_length(pg_sina_path_search->programs);
+    pg_sina_path_search->programs=lappend(pg_sina_path_search->programs,program);
+    MemoryContextSwitchTo(previous);
+    CustomScan *scan=(CustomScan *)pg_sina_candidate_scan(native,fast);
+    scan->custom_private=list_make2(makeInteger(id),copyObject(costs));
+    return (Plan *)scan;
+}
+void pg_sina_finish_device_plans(Plan *plan)
+{
+    if(!plan) return;
+    if(IsA(plan,CustomScan)) {
+        CustomScan *volatile scan=(CustomScan *)plan;
+        if((scan->methods==&pg_sina_plan_methods || scan->methods==&pg_sina_scan_methods) &&
+           scan->custom_private && IsA(linitial(scan->custom_private),Integer)) {
+            struct device_program *program=list_nth(pg_sina_path_search->programs,intVal(linitial(scan->custom_private)));
+            bool compiling=pg_sina_compiling_plan; volatile double mark=pg_sina_planner_clock();
+            List *states=NIL; save_roots(&program->root,&states);
+            ListCell *cell; foreach(cell,program->globals.subroots) save_roots(lfirst(cell),&states);
+            foreach(cell,states) ((struct root_state *)lfirst(cell))->root->glob=&program->globals;
+            List *previous=pg_sina_path_search->encoding_choices;
+            pg_sina_path_search->encoding_choices=program->choices;
+            Plan *volatile encoded=NULL; pg_sina_compiling_plan=true;
+            PG_TRY();
+            {
+                lfirst(list_nth_cell(scan->custom_private,1))=pg_sina_selected_costs(&program->root,program->native,
+                    !program->boundary,program->fast,lsecond(scan->custom_private));
+                mark=pg_sina_planner_clock();
+                encoded=program->fast?pg_sina_fast_plan(&program->root,program->native):
+                    pg_sina_compile_subtree(&program->root,program->native,program->boundary);
+            }
+            PG_CATCH();
+            { restore_roots(states); pg_sina_compiling_plan=compiling; pg_sina_path_search->encoding_choices=previous; PG_RE_THROW(); }
+            PG_END_TRY();
+            pg_sina_compiling_plan=compiling;
+            restore_roots(states);
+            pg_sina_path_search->encoding_choices=previous;
+            if(!encoded || encoded==program->native) elog(ERROR,"selected device candidate no longer encodes");
+            if(pg_sina_planning) pg_sina_planning->compile+=pg_sina_planner_clock()-mark;
+            lfirst(list_head(scan->custom_private))=linitial(((CustomScan *)encoded)->custom_private);
+        }
+        ListCell *c; foreach(c,scan->custom_plans) pg_sina_finish_device_plans(lfirst(c));
+    }
+    pg_sina_finish_device_plans(plan->lefttree); pg_sina_finish_device_plans(plan->righttree);
+    if(IsA(plan,SubqueryScan)) pg_sina_finish_device_plans(((SubqueryScan *)plan)->subplan);
+}
+
 void pg_sina_start_path_search(void)
 {
     pg_sina_path_search=palloc0(sizeof(*pg_sina_path_search));
     pg_sina_path_search->memory=CurrentMemoryContext;
-    pg_sina_path_search->estimates=makeStringInfo();
 }
 MemoryContext pg_sina_search_context(void)
 { return pg_sina_path_search?pg_sina_path_search->memory:CurrentMemoryContext; }
@@ -42,13 +106,25 @@ List **pg_sina_search_observations(void)
 { return pg_sina_path_search?&pg_sina_path_search->observations:NULL; }
 List **pg_sina_search_index_metadata(void)
 { return pg_sina_path_search?&pg_sina_path_search->indexes:NULL; }
-List **pg_sina_search_lowering_cache(void)
-{ return pg_sina_path_search?&pg_sina_path_search->lowered:NULL; }
-struct qp_plan *pg_sina_lowering_workspace(void)
+struct qp_plan *pg_sina_cost_workspace(void)
 {
     if(!pg_sina_path_search->workspace)
         pg_sina_path_search->workspace=MemoryContextAlloc(pg_sina_search_context(),sizeof(struct qp_plan));
     return pg_sina_path_search->workspace;
+}
+unsigned *pg_sina_candidate_choices(void) { return pg_sina_path_search->choices; }
+unsigned pg_sina_encoding_choice(unsigned id)
+{
+    List *choices=pg_sina_path_search?pg_sina_path_search->encoding_choices:NIL;
+    return id<(unsigned)list_length(choices)?intVal(linitial((List *)list_nth(choices,id))):0;
+}
+bool pg_sina_encoding_matches(unsigned id,const struct qp_node *node)
+{
+    List *choices=pg_sina_path_search->encoding_choices;
+    if(id>=(unsigned)list_length(choices)) return false;
+    List *expected=list_nth(choices,id);
+    return ((unsigned)intVal(linitial(expected))&~0xffffU)==pg_sina_physical_choice(node) &&
+        intVal(lsecond(expected))==node->left && intVal(lthird(expected))==node->right;
 }
 /* A planning invocation may compile hundreds of overlapping subtrees. The
  * immutable mapping is the same for all of them; query SPI once per table. */
@@ -96,7 +172,6 @@ static bool eligible(PlannerInfo *root)
         !q->hasTargetSRFs && !q->rowMarks && !q->windowClause && !q->groupingSets &&
         !q->setOperations && !root->append_rel_list;
 }
-struct root_state { PlannerInfo *root; PlannerInfo saved; };
 static void save_roots(PlannerInfo *root,List **states)
 {
     ListCell *c;
@@ -159,20 +234,8 @@ static Plan *device_plan(PlannerInfo *root,RelOptInfo *rel,CustomPath *path,List
     Plan *copy=copyObject(native);
     apply_tlist_labeling(copy->targetlist,tlist);
     bool top=intVal(lthird(path->custom_private)),fast=intVal(lfourth(path->custom_private));
-    bool compiling=pg_sina_compiling_plan;
-    Plan *volatile device=NULL;
-    double mark=pg_sina_planner_clock();
-    pg_sina_compiling_plan=true;
-    PG_TRY();
-    { device=fast?pg_sina_fast_plan(root,copy):pg_sina_compile_subtree(root,copy,!top); }
-    PG_CATCH();
-    { pg_sina_compiling_plan=compiling; PG_RE_THROW(); }
-    PG_END_TRY();
-    pg_sina_compiling_plan=compiling;
-    if(pg_sina_planning) pg_sina_planning->compile+=pg_sina_planner_clock()-mark;
-    if(!device || device==copy) elog(ERROR,"selected CSD Path no longer compiles");
+    Plan *device=defer_program(root,copy,fast,!top,lsecond(path->custom_private),list_nth(path->custom_private,4));
     if(top) root->init_plans=NIL;
-    ((CustomScan *)device)->custom_private=lappend(((CustomScan *)device)->custom_private,copyObject(lsecond(path->custom_private)));
     device->plan_rows=path->path.rows;
     /* PG may add grouping/sort labels after the base/join hook. The stored
      * expressions stay unchanged, but upper Paths need their current labels. */
@@ -204,7 +267,7 @@ static void add_device_path(PlannerInfo *root,RelOptInfo *rel,Path *native,bool 
         if(pg_sina_planning) pg_sina_planning->preview+=pg_sina_planner_clock()-mark;
         pg_sina_compiling_plan=true;
         device=pg_sina_cost_device(root,plan,top,&pg_sina_path_search->observations,
-                                  &internal,&boundary,pg_sina_path_search->estimates);
+                                  &internal,&boundary);
     }
     PG_CATCH();
     { pg_sina_compiling_plan=compiling; MemoryContextSwitchTo(owner); MemoryContextDelete(temporary); PG_RE_THROW(); }
@@ -216,11 +279,12 @@ static void add_device_path(PlannerInfo *root,RelOptInfo *rel,Path *native,bool 
     if(pg_sina_planning) ++pg_sina_planning->accepted;
     CustomPath *path=makeNode(CustomPath); path->path=*native;
     NodeSetTag(path,T_CustomPath); path->path.pathtype=T_CustomScan;
+    if(!intVal(list_nth(((CustomScan *)device)->custom_private,4))) path->path.pathkeys=NIL;
     path->path.parallel_aware=path->path.parallel_safe=false; path->path.parallel_workers=0;
     path->path.rows=device->plan_rows;
     path->path.startup_cost=path->path.total_cost=(internal+boundary)/pg_sina_host_cost_ms;
-    path->custom_private=list_make4(copyObject(plan),copyObject(lsecond(((CustomScan *)device)->custom_private)),
-        makeInteger(top),makeInteger(((CustomScan *)device)->methods==&pg_sina_scan_methods));
+    path->custom_private=list_make5(copyObject(lthird(((CustomScan *)device)->custom_private)),copyObject(lsecond(((CustomScan *)device)->custom_private)),
+        makeInteger(top),makeInteger(((CustomScan *)device)->methods==&pg_sina_scan_methods),copyObject(lfourth(((CustomScan *)device)->custom_private)));
     path->methods=&device_methods;
     MemoryContextDelete(temporary);
     /* PG may prune the delivered path. Keep a distinct object for parent
@@ -310,7 +374,7 @@ static Plan *final_plan(PlannerInfo *root,RelOptInfo *rel,CustomPath *path,List 
     Plan *plan=linitial(plans);
     StringInfo text=makeStringInfo(); placement(plan,text);
     appendStringInfo(text,"; query=%s",pg_sina_native_search?"original HOST":"shared PG Path search");
-    Plan *wrapper=pg_sina_wrap_placement(plan,text->data,pg_sina_path_search->estimates->data);
+    Plan *wrapper=pg_sina_wrap_placement(plan,text->data,"");
     if(pg_sina_native_search) {
         /* Keep PG's original optimum as another physical device candidate.
          * Both children go through this statement's own setrefs/permissions;
@@ -322,15 +386,17 @@ static Plan *final_plan(PlannerInfo *root,RelOptInfo *rel,CustomPath *path,List 
         pg_sina_compiling_plan=true;
         PG_TRY();
         { device=pg_sina_cost_device(root,native,true,&pg_sina_path_search->observations,
-                                     &internal,&boundary,pg_sina_path_search->estimates); }
+                                     &internal,&boundary); }
         PG_CATCH();
         { pg_sina_compiling_plan=compiling; PG_RE_THROW(); }
         PG_END_TRY();
         pg_sina_compiling_plan=compiling;
-        lfirst(list_nth_cell(((CustomScan *)wrapper)->custom_private,1))=
-            makeString(pstrdup(pg_sina_path_search->estimates->data));
         if(device) {
             CustomScan *scan=(CustomScan *)wrapper;
+            CustomScan *candidate=(CustomScan *)device;
+            double rows=device->plan_rows;
+            device=defer_program(root,lthird(candidate->custom_private),candidate->methods==&pg_sina_scan_methods,false,lsecond(candidate->custom_private),lfourth(candidate->custom_private));
+            device->plan_rows=rows;
             scan->custom_plans=lappend(scan->custom_plans,device);
             scan->custom_private=lappend(scan->custom_private,makeFloat(psprintf("%.17g",internal+boundary)));
         }

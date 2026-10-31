@@ -583,7 +583,7 @@ static bool compile(PlannerInfo *root,List *relations,List *joins,List *quals,st
 }
 /* The single-table fused pipeline is still compiled from PG's chosen Plan.
  * It changes execution batching, not access paths or join order. */
-Plan *pg_sina_fast_plan(PlannerInfo *root,Plan *native)
+static Plan *fast_plan(PlannerInfo *root,Plan *native,struct qs_plan **properties)
 {
     Query *q=root->parse;
     if(!q->hasAggs || q->hasSubLinks || q->havingQual || q->cteList || q->windowClause ||
@@ -607,6 +607,11 @@ Plan *pg_sina_fast_plan(PlannerInfo *root,Plan *native)
     char device[128]={0};
     if(!pg_sina_prepared_device(plan.relid,plan.relfilenode,device,sizeof(device))) return NULL;
     pg_sina_read_resources(device); plan.work_mem_bytes=pg_sina_query_memory();
+    if(properties) {
+        *properties=palloc(sizeof(plan)); **properties=plan;
+        return pg_sina_candidate_scan(native,true);
+    }
+    if(pg_sina_planning) ++pg_sina_planning->fast_records;
     bytea *bytes=palloc(VARHDRSZ+sizeof(plan)); SET_VARSIZE(bytes,VARHDRSZ+sizeof(plan)); memcpy(VARDATA(bytes),&plan,sizeof(plan));
     CustomScan *scan=makeNode(CustomScan); scan->scan.plan=*native; NodeSetTag(scan,T_CustomScan);
     scan->scan.plan.lefttree=scan->scan.plan.righttree=NULL; scan->scan.plan.qual=NIL;
@@ -615,3 +620,7 @@ Plan *pg_sina_fast_plan(PlannerInfo *root,Plan *native)
     scan->custom_private=list_make1(makeConst(BYTEAOID,-1,InvalidOid,-1,PointerGetDatum(bytes),false,false));
     scan->methods=&pg_sina_scan_methods; return (Plan *)scan;
 }
+Plan *pg_sina_fast_plan(PlannerInfo *root,Plan *native)
+{ return fast_plan(root,native,NULL); }
+Plan *pg_sina_fast_properties(PlannerInfo *root,Plan *native,struct qs_plan **properties)
+{ return fast_plan(root,native,properties); }

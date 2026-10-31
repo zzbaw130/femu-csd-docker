@@ -15,6 +15,7 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/tlist.h"
+#include "parser/parse_oper.h"
 #include "parser/parsetree.h"
 #include "utils/builtins.h"
 #include "utils/array.h"
@@ -29,13 +30,15 @@
 struct binding {
     PlannerInfo *root;
     Plan *plan;
-    List *left, *right, *aggregates;
+    List *left, *right, *aggregates,*literals;
     Index scan;
     struct qp_node *node;
     struct qp_plan *tree;
+    bool properties;
 };
 static int compile_node(PlannerInfo *,Plan *,struct qp_plan *,bool);
 static int compile_tree(PlannerInfo *,Plan *,struct qp_plan *);
+static int describe_expression(struct binding *,Node *);
 static bool function_is(Oid id,const char *name)
 { char *s=get_func_name(id); return s && get_func_namespace(id)==PG_CATALOG_NAMESPACE && !strcmp(s,name); }
 static int add_expr(struct qs_plan *p,struct qs_expr e)
@@ -126,6 +129,19 @@ static int literal(struct qs_plan *p,const char *bytes,unsigned length)
     struct qs_string *s=&p->strings[p->nstrings];
     s->length=length; memcpy(s->bytes,bytes,length); return p->nstrings++;
 }
+static bool numeric_literal(Datum value,int64 *number,unsigned *scale)
+{
+    char *text=DatumGetCString(DirectFunctionCall1(numeric_out,value)),digits[64];
+    unsigned n=0; bool point=false; *scale=0;
+    for(char *at=text;*at;++at) {
+        if(*at=='.' && !point) { point=true; continue; }
+        if(n+1==sizeof(digits) || ((*at<'0'||*at>'9') && !(at==text && *at=='-'))) return false;
+        digits[n++]=*at; if(point) ++*scale;
+    }
+    if(*scale>18) return false;
+    digits[n]=0; char *end; errno=0; *number=strtoll(digits,&end,10);
+    return !errno && !*end && end!=digits;
+}
 static int expression(struct binding *b,Node *node)
 {
     if(!node) return -1;
@@ -196,16 +212,8 @@ static int expression(struct binding *b,Node *node)
             break;
         }
         case NUMERICOID: {
-            char *s=DatumGetCString(DirectFunctionCall1(numeric_out,c->constvalue)),digits[64];
-            unsigned n=0,scale=0; bool point=false;
-            for(char *at=s;*at;++at) {
-                if(*at=='.' && !point) { point=true; continue; }
-                if(n+1==sizeof(digits) || ((*at<'0'||*at>'9') && !(at==s && *at=='-'))) return -1;
-                digits[n++]=*at; if(point) ++scale;
-            }
-            if(scale>18) return -1;
-            digits[n]=0; char *end; errno=0; e.constant=strtoll(digits,&end,10);
-            if(errno || *end || end==digits) return -1;
+            unsigned scale;
+            if(!numeric_literal(c->constvalue,&e.constant,&scale)) return -1;
             e.scale=e.dscale=scale; break;
         }
         default:return -1;
@@ -707,10 +715,146 @@ static bool prune_columns(Plan *plan,Bitmapset *keep,bool all)
 }
 static int compile_tree(PlannerInfo *root,Plan *native,struct qp_plan *tree)
 {
+    if(pg_sina_exe_path==PG_SINA_ADAPTIVE) {
+        Plan *chosen=pg_sina_prepare_candidate(root,native,root->parse->sortClause!=NIL);
+        return chosen?compile_node(root,chosen,tree,root->parse->sortClause!=NIL):-1;
+    }
     Plan *copy=copyObject(native);
     global_parallel_rows(copy,1);
     if(!normalize_parallel_aggregate(&copy) || !prune_columns(copy,NULL,true)) return -1;
     return compile_node(root,copy,tree,root->parse->sortClause!=NIL);
+}
+
+/* These are physical choices, made before candidate costing. Encoding below
+ * must honor them; it cannot silently turn a Merge/Aggregate into Hash. */
+struct candidate_group { bool supported; List *aggregates; };
+static bool simple_group(Node *node,void *context)
+{
+    struct candidate_group *group=context;
+    if(!node || !group->supported) return false;
+    if(IsA(node,Aggref)) {
+        Aggref *a=(Aggref *)node;
+        if(a->aggdistinct || a->aggorder || a->aggfilter) group->supported=false;
+        group->aggregates=list_append_unique(group->aggregates,a);
+        return false;
+    }
+    return expression_tree_walker(node,simple_group,context);
+}
+static bool identity_target(Plan *a,Plan *b)
+{
+    if(!a || !b || list_length(a->targetlist)!=list_length(b->targetlist)) return false;
+    ListCell *x,*y;
+    forboth(x,a->targetlist,y,b->targetlist)
+        if(!equal(lfirst_node(TargetEntry,x)->expr,lfirst_node(TargetEntry,y)->expr)) return false;
+    return true;
+}
+struct group_payload { Agg *aggregate; bool supported; };
+/* PG may omit functionally dependent payload from GROUP BY. The device
+ * stores keys and aggregate states, so retain that payload as physical keys.
+ * PG has already proved the dependency; this does not invent extra groups. */
+static bool retain_group_payload(Node *node,struct group_payload *context)
+{
+    if(!node || !context->supported || IsA(node,Aggref) || IsA(node,Const)) return false;
+    Agg *a=context->aggregate;
+    TargetEntry *entry=matching_entry(a->plan.lefttree->targetlist,(Expr *)node);
+    if(entry) {
+        for(int i=0;i<a->numCols;++i) if(a->grpColIdx[i]==entry->resno) return false;
+        if(a->numCols==QS_KEYS) { context->supported=false; return false; }
+        Oid equality; bool hashable;
+        get_sort_group_operators(exprType(node),false,true,false,NULL,&equality,NULL,&hashable);
+        if(!hashable) { context->supported=false; return false; }
+        int i=a->numCols++; a->grpColIdx[i]=entry->resno; a->grpOperators[i]=equality; a->grpCollations[i]=exprCollation(node);
+        return false;
+    }
+    if(IsA(node,Var)) { context->supported=false; return false; }
+    return expression_tree_walker(node,retain_group_payload,context);
+}
+static bool choose_algorithms(PlannerInfo *root,Plan **slot,bool ordered)
+{
+    Plan *p=*slot; if(!p) return true;
+    /* Rows were already restored to the whole stream. Do not leave a PG
+     * Gather behind to multiply those rows again when a parent reuses this
+     * candidate. A child Sort now sorts the entire device stream. */
+    if(IsA(p,Gather) || IsA(p,GatherMerge)) {
+        if(identity_target(p,p->lefttree)) { *slot=p->lefttree; return choose_algorithms(root,slot,ordered); }
+        Result *projection=makeNode(Result); projection->plan=*p; NodeSetTag(projection,T_Result);
+        *slot=p=(Plan *)projection;
+    }
+    /* A child Path may have needed order at its HOST boundary. Once fused
+     * below a Hash/unsorted pipeline that delivery Sort is unnecessary. Keep
+     * its projection; Limit requires order and Merge sorts its own inputs. */
+    if(IsA(p,Sort) && !ordered) {
+        if(identity_target(p,p->lefttree)) { *slot=p->lefttree; return choose_algorithms(root,slot,false); }
+        Result *projection=makeNode(Result); projection->plan=*p; NodeSetTag(projection,T_Result);
+        *slot=p=(Plan *)projection;
+    }
+    if(IsA(p,SubqueryScan)) {
+        RelOptInfo *r=root->simple_rel_array[((SubqueryScan *)p)->scan.scanrelid];
+        if(!r || !r->subroot || !choose_algorithms(r->subroot,&((SubqueryScan *)p)->subplan,ordered)) return false;
+    }
+    if(IsA(p,NestLoop)) {
+        Plan *right=p->righttree; List *extra=NIL; Node *lookup=NULL; struct qs_join access={0};
+        if(!prepare_index_join(root,(NestLoop *)p,&right,&extra,&lookup,&access)) {
+            List *keys=NIL; ListCell *c;
+            foreach(c,((Join *)p)->joinqual) {
+                Node *q=lfirst(c); Oid left_hash,right_hash;
+                if(IsA(q,OpExpr) && get_op_hash_functions(((OpExpr *)q)->opno,&left_hash,&right_hash)) keys=lappend(keys,q);
+            }
+            if(ordered || !keys) return false;
+            HashJoin *hash=makeNode(HashJoin); hash->join=*(Join *)p; NodeSetTag(hash,T_HashJoin);
+            hash->hashclauses=keys; hash->join.joinqual=list_difference_ptr(hash->join.joinqual,keys);
+            *slot=p=(Plan *)hash;
+        }
+    }
+    if(IsA(p,HashJoin) && IsA(p->righttree,Hash)) p->righttree=p->righttree->lefttree;
+    if(IsA(p,HashJoin) && ((Join *)p)->jointype==JOIN_INNER &&
+       p->lefttree->plan_rows*Max(1,p->lefttree->plan_width)<p->righttree->plan_rows*Max(1,p->righttree->plan_width)) {
+        Plan *swap=p->lefttree; p->lefttree=p->righttree; p->righttree=swap;
+    }
+    if(IsA(p,Agg)) {
+        Agg *a=(Agg *)p;
+        struct candidate_group group={.supported=a->numCols>0 && a->numCols<=QS_KEYS};
+        simple_group((Node *)p->targetlist,&group); simple_group((Node *)p->qual,&group);
+        bool supported=group.supported && group.aggregates && a->numCols+2*list_length(group.aggregates)<=QS_OUT;
+        bool sort=IsA(p->lefttree,Sort);
+        Sort *output=supported && sort && ordered?aggregate_output_sort(p):NULL;
+        if(supported && (a->aggstrategy==AGG_HASHED || (sort && (!ordered || output)))) {
+            a->aggstrategy=AGG_HASHED;
+            if(sort) {
+                Plan *input=p->lefttree;
+                if(identity_target(input,input->lefttree)) p->lefttree=input->lefttree;
+                else {
+                    Result *projection=makeNode(Result); projection->plan=*input; NodeSetTag(projection,T_Result);
+                    p->lefttree=(Plan *)projection;
+                }
+            }
+            if(output) *slot=(Plan *)output;
+            AttrNumber *columns=palloc0(QS_KEYS*sizeof(*columns));
+            Oid *operators=palloc0(QS_KEYS*sizeof(*operators)),*collations=palloc0(QS_KEYS*sizeof(*collations));
+            memcpy(columns,a->grpColIdx,a->numCols*sizeof(*columns));
+            memcpy(operators,a->grpOperators,a->numCols*sizeof(*operators));
+            memcpy(collations,a->grpCollations,a->numCols*sizeof(*collations));
+            a->grpColIdx=columns; a->grpOperators=operators; a->grpCollations=collations;
+            struct group_payload payload={.aggregate=a,.supported=true};
+            retain_group_payload((Node *)p->targetlist,&payload); retain_group_payload((Node *)p->qual,&payload);
+            if(!payload.supported) return false;
+            if(a->numCols+2*list_length(group.aggregates)>QS_OUT) a->aggstrategy=AGG_SORTED;
+        }
+        else if(a->aggstrategy==AGG_HASHED && !supported) a->aggstrategy=AGG_SORTED;
+    }
+    bool left_order=ordered;
+    if(IsA(p,Sort) || IsA(p,HashJoin) || IsA(p,MergeJoin)) left_order=false;
+    if(IsA(p,Limit)) left_order=true;
+    if(IsA(p,Agg)) left_order=((Agg *)p)->aggstrategy==AGG_SORTED;
+    return choose_algorithms(root,&p->lefttree,left_order) && choose_algorithms(root,&p->righttree,false);
+}
+Plan *pg_sina_prepare_candidate(PlannerInfo *root,Plan *native,bool ordered)
+{
+    Plan *copy=copyObject(native);
+    global_parallel_rows(copy,1);
+    if(!normalize_parallel_aggregate(&copy) || !prune_columns(copy,NULL,true) ||
+       !choose_algorithms(root,&copy,ordered)) return NULL;
+    return copy;
 }
 static Node *heap_index_var(Node *node,List *tlist)
 {
@@ -721,6 +865,23 @@ static Node *heap_index_var(Node *node,List *tlist)
     }
     return expression_tree_mutator(node,heap_index_var,tlist);
 }
+Plan *pg_sina_require_output_order(PlannerInfo *root,Plan *input)
+{
+    unsigned count=list_length(root->parse->sortClause); if(!count || count>QS_OUT) return NULL;
+    Sort *sort=makeNode(Sort); sort->plan=*input; NodeSetTag(sort,T_Sort);
+    sort->plan.lefttree=input; sort->plan.righttree=NULL; sort->plan.qual=NIL;
+    sort->numCols=count; sort->sortColIdx=palloc(count*sizeof(AttrNumber));
+    sort->sortOperators=palloc(count*sizeof(Oid)); sort->collations=palloc(count*sizeof(Oid));
+    sort->nullsFirst=palloc(count*sizeof(bool)); unsigned i=0; ListCell *c;
+    foreach(c,root->parse->sortClause) {
+        SortGroupClause *key=lfirst(c); TargetEntry *entry=get_sortgroupclause_tle(key,input->targetlist);
+        if(!entry) return NULL;
+        sort->sortColIdx[i]=entry->resno; sort->sortOperators[i]=key->sortop;
+        sort->collations[i]=exprCollation((Node *)entry->expr); sort->nullsFirst[i]=key->nulls_first; ++i;
+    }
+    return (Plan *)sort;
+}
+
 /* Validate expressions over group keys and the aggregate result. When
  * lowering a PG-validated group, dependent output columns can be retained
  * as additional physical keys without changing the SQL groups. */
@@ -830,7 +991,7 @@ static void push_left_join_count(struct qp_plan *tree,struct qp_node *aggregate)
     relation_close(index,NoLock); if(!unique) return;
     unsigned id=tree->count++; struct qp_node *count=&tree->nodes[id];
     *count=(struct qp_node){.kind=QP_AGGREGATE,.left=join->right,.right=-1,.hash=1,.nkeys=1,
-        .estimated_rows=left->estimated_rows};
+        .estimated_rows=left->estimated_rows,.estimated_groups=left->estimated_rows};
     count->left_keys[0]=key; count->expr.nkeys=1; count->expr.keys[0]=0;
     count->expr.predicate=count->expr.having=-1; count->expr.limit=-1;
     count->expr.nattrs=count->expr.ncols=right->expr.nout; count->expr.nexprs=3; count->expr.nout=2;
@@ -856,6 +1017,53 @@ static void push_left_join_count(struct qp_plan *tree,struct qp_node *aggregate)
         p->exprs[i]=(struct qs_expr){.op=QP_COALESCE,.left=input,.right=zero,.type=Q_INTEGER};
     aggregate->kind=QP_PROJECT; aggregate->hash=aggregate->nkeys=aggregate->sorted_input=0;
     p->naggs=p->nkeys=0;
+}
+static void bypass_distinct_sort(struct qp_plan *tree,struct qp_node *n)
+{
+    /* DISTINCT already sorts by group keys plus its argument inside the
+     * aggregate. Bypass PG's grouping-only Sort when it is a pure identity. */
+    if(n->kind==QP_AGGREGATE && n->distinct && n->left>=0 && tree->nodes[n->left].kind==QP_SORT) {
+        struct qp_node *sort=&tree->nodes[n->left];
+        bool identity=sort->left>=0 && sort->expr.nout==tree->nodes[sort->left].expr.nout;
+        for(unsigned i=0;identity && i<sort->expr.nout;++i) {
+            const struct qs_expr *x=&sort->expr.exprs[sort->expr.outputs[i].index];
+            if(x->op!=Q_COLUMN || x->column!=(int)i) identity=false;
+        }
+        if(identity) { n->left=sort->left; n->sorted_input=0; }
+    }
+}
+static void choose_distinct(struct qp_plan *tree,struct qp_node *n)
+{
+    struct qs_plan *p=&n->expr;
+    /* Like DuckDB's DISTINCT table, first deduplicate (group, argument), then
+     * COUNT the non-NULL arguments. Both stages use the existing bounded Hash
+     * Aggregate and spill protocol. Restrict this to an exact key projection. */
+    if(n->kind==QP_AGGREGATE && n->distinct && n->nkeys<QS_KEYS && p->naggs==1 &&
+       p->aggs[0].kind==Q_COUNT && p->predicate<0 && p->having<0 && tree->count<QP_NODES) {
+        unsigned width=tree->nodes[n->left].expr.nout,mask=1U<<(n->distinct-1);
+        bool supported=width==n->nkeys+1;
+        for(unsigned k=0;k<n->nkeys;++k) mask|=1U<<n->left_keys[k];
+        if(mask!=((1U<<width)-1)) supported=false;
+        for(unsigned i=0;i<p->nout;++i) if(!group_output(p,p->outputs[i].index,n,false)) supported=false;
+        if(supported) {
+            unsigned dedup=tree->count++; struct qp_node *d=&tree->nodes[dedup];
+            *d=(struct qp_node){.kind=QP_AGGREGATE,.left=n->left,.right=-1,.hash=1,
+                .estimated_rows=tree->nodes[n->left].estimated_rows,.estimated_groups=tree->nodes[n->left].estimated_rows};
+            d->expr.predicate=d->expr.having=-1; d->expr.limit=-1;
+            d->expr.nattrs=d->expr.ncols=d->expr.nexprs=d->expr.nout=width;
+            for(unsigned i=0;i<width;++i) {
+                const struct qs_output *out=&tree->nodes[n->left].expr.outputs[i];
+                d->expr.outputs[i]=*out; d->expr.outputs[i].index=i;
+                d->expr.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.column=i,
+                    .type=tree->nodes[n->left].expr.exprs[out->index].type};
+                d->expr.cols[i]=(struct qs_column){.slot=i,.type=d->expr.exprs[i].type};
+                d->left_keys[i]=d->expr.keys[i]=i;
+            }
+            d->nkeys=d->expr.nkeys=width; d->expr.naggs=1;
+            d->expr.aggs[0]=(struct qs_agg){.kind=Q_COUNT_STAR,.expr=-1};
+            n->left=dedup; n->distinct=n->distinct_aggs=n->sorted_input=0; n->hash=1;
+        }
+    }
 }
 static int ordered_heap_scan(struct binding *b,struct qp_plan *tree,unsigned id,Oid indexid,ScanDirection direction,bool ordered,bool index_only)
 {
@@ -903,6 +1111,7 @@ static int ordered_heap_scan(struct binding *b,struct qp_plan *tree,unsigned id,
     unsigned out=tree->count++,original=b->node->expr.nout;
     struct qp_node *sort=&tree->nodes[out];
     memset(sort,0,sizeof(*sort)); sort->kind=QP_SORT; sort->left=id; sort->right=-1;
+    sort->estimated_rows=b->node->estimated_rows;
     sort->expr.predicate=-1; sort->expr.limit=-1;
     struct qs_plan *scan=&b->node->expr;
     for(int k=0;k<index->rd_index->indnkeyatts;++k) {
@@ -911,7 +1120,8 @@ static int ordered_heap_scan(struct binding *b,struct qp_plan *tree,unsigned id,
         Oid type,collation; int32 mod;
         get_atttypetypmodcoll(scan->relid,att,&type,&mod,&collation);
         Var *v=makeVar(b->scan,att,type,mod,collation,0);
-        int expr=expression(b,(Node *)v); if(expr<0) { relation_close(index,NoLock); return -1; }
+        int expr=b->properties?describe_expression(b,(Node *)v):expression(b,(Node *)v);
+        if(expr<0) { relation_close(index,NoLock); return -1; }
         unsigned col=0; while(col<scan->nout && scan->outputs[col].index!=expr) ++col;
         if(col==scan->nout) {
             if(scan->nout==QS_OUT) { relation_close(index,NoLock); return -1; }
@@ -1010,7 +1220,7 @@ static int compile_node_impl(PlannerInfo *root,Plan *native,struct qp_plan *tree
     /* DuckDB's build/probe selection prices cardinality AND row width.
      * Commute only an INNER hash join: its relation pair stays unchanged,
      * and expression binding below preserves the original output columns. */
-    if(n->kind==QP_JOIN && n->hash && n->join_type==QP_INNER && left && right &&
+    if(pg_sina_exe_path!=PG_SINA_ADAPTIVE && n->kind==QP_JOIN && n->hash && n->join_type==QP_INNER && left && right &&
        tree->nodes[n->left].estimated_rows*Max(1,left->plan_width)<
        tree->nodes[n->right].estimated_rows*Max(1,right->plan_width)) {
         int swap=n->left; n->left=n->right; n->right=swap;
@@ -1065,7 +1275,7 @@ static int compile_node_impl(PlannerInfo *root,Plan *native,struct qp_plan *tree
         if(!n->nkeys) return -1;
         /* Keep PG's join order, but equality joins whose output need not be
          * ordered can use Hash without sorting both complete inputs. */
-        if(!ordered) n->hash=1;
+        if(!ordered && pg_sina_exe_path!=PG_SINA_ADAPTIVE) n->hash=1;
         if(IsA(native,MergeJoin)) {
             MergeJoin *m=(MergeJoin *)native;
             for(unsigned i=0;i<n->nkeys;++i)
@@ -1076,6 +1286,7 @@ static int compile_node_impl(PlannerInfo *root,Plan *native,struct qp_plan *tree
     }
     if(n->kind==QP_AGGREGATE) {
         Agg *a=(Agg *)native;
+        if(pg_sina_exe_path==PG_SINA_ADAPTIVE) n->hash=a->aggstrategy==AGG_HASHED;
         if(a->numCols>QS_KEYS) return -1;
         for(int i=0;i<a->numCols;++i) {
             TargetEntry *t=get_tle_by_resno(native->lefttree->targetlist,a->grpColIdx[i]);
@@ -1115,7 +1326,7 @@ static int compile_node_impl(PlannerInfo *root,Plan *native,struct qp_plan *tree
     }
     /* Keep PG HashAggregate or replace grouping-only sorting with bounded
      * states. Required output order is reapplied above the aggregate. */
-    if(n->kind==QP_AGGREGATE && qp_hash_aggregate_supported(n) && !n->distinct && !n->distinct_aggs &&
+    if(pg_sina_exe_path!=PG_SINA_ADAPTIVE && n->kind==QP_AGGREGATE && qp_hash_aggregate_supported(n) && !n->distinct && !n->distinct_aggs &&
        p->having<0 && n->left>=0 && (tree->nodes[n->left].kind==QP_SORT ||
         (!ordered && IsA(native,Agg) && ((Agg *)native)->aggstrategy==AGG_HASHED))) {
         bool remove_sort=tree->nodes[n->left].kind==QP_SORT;
@@ -1177,46 +1388,8 @@ static int compile_node_impl(PlannerInfo *root,Plan *native,struct qp_plan *tree
             }
         }
     }
-    /* DISTINCT already sorts by group keys plus its argument inside the
-     * aggregate. Bypass PG's grouping-only Sort when it is a pure identity. */
-    if(n->kind==QP_AGGREGATE && n->distinct && n->left>=0 && tree->nodes[n->left].kind==QP_SORT) {
-        struct qp_node *sort=&tree->nodes[n->left];
-        bool identity=sort->left>=0 && sort->expr.nout==tree->nodes[sort->left].expr.nout;
-        for(unsigned i=0;identity && i<sort->expr.nout;++i) {
-            const struct qs_expr *x=&sort->expr.exprs[sort->expr.outputs[i].index];
-            if(x->op!=Q_COLUMN || x->column!=(int)i) identity=false;
-        }
-        if(identity) { n->left=sort->left; n->sorted_input=0; }
-    }
-    /* Like DuckDB's DISTINCT table, first deduplicate (group, argument), then
-     * COUNT the non-NULL arguments. Both stages use the existing bounded Hash
-     * Aggregate and spill protocol. Restrict this to an exact key projection. */
-    if(n->kind==QP_AGGREGATE && n->distinct && n->nkeys<QS_KEYS && p->naggs==1 &&
-       p->aggs[0].kind==Q_COUNT && p->predicate<0 && p->having<0 && tree->count<QP_NODES) {
-        unsigned width=tree->nodes[n->left].expr.nout,mask=1U<<(n->distinct-1);
-        bool supported=width==n->nkeys+1;
-        for(unsigned k=0;k<n->nkeys;++k) mask|=1U<<n->left_keys[k];
-        if(mask!=((1U<<width)-1)) supported=false;
-        for(unsigned i=0;i<p->nout;++i) if(!group_output(p,p->outputs[i].index,n,false)) supported=false;
-        if(supported) {
-            unsigned dedup=tree->count++; struct qp_node *d=&tree->nodes[dedup];
-            *d=(struct qp_node){.kind=QP_AGGREGATE,.left=n->left,.right=-1,.hash=1,
-                .estimated_rows=tree->nodes[n->left].estimated_rows};
-            d->expr.predicate=d->expr.having=-1; d->expr.limit=-1;
-            d->expr.nattrs=d->expr.ncols=d->expr.nexprs=d->expr.nout=width;
-            for(unsigned i=0;i<width;++i) {
-                const struct qs_output *out=&tree->nodes[n->left].expr.outputs[i];
-                d->expr.outputs[i]=*out; d->expr.outputs[i].index=i;
-                d->expr.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.column=i,
-                    .type=tree->nodes[n->left].expr.exprs[out->index].type};
-                d->expr.cols[i]=(struct qs_column){.slot=i,.type=d->expr.exprs[i].type};
-                d->left_keys[i]=d->expr.keys[i]=i;
-            }
-            d->nkeys=d->expr.nkeys=width; d->expr.naggs=1;
-            d->expr.aggs[0]=(struct qs_agg){.kind=Q_COUNT_STAR,.expr=-1};
-            n->left=dedup; n->distinct=n->distinct_aggs=n->sorted_input=0; n->hash=1;
-        }
-    }
+    if(pg_sina_exe_path!=PG_SINA_ADAPTIVE || (pg_sina_encoding_choice(id)&PG_SINA_DISTINCT_SORT)) bypass_distinct_sort(tree,n);
+    if(pg_sina_exe_path!=PG_SINA_ADAPTIVE || (pg_sina_encoding_choice(id)&PG_SINA_DISTINCT)) choose_distinct(tree,n);
     if(n->kind==QP_SCAN && IsA(native,IndexScan)) {
         int extra=conditions(&b,((IndexScan *)native)->indexqualorig); if(extra==-2) return -1;
         if(extra>=0) p->predicate=p->predicate<0?extra:add_expr(p,(struct qs_expr){.op=Q_AND,.type=Q_BOOLEAN,.left=p->predicate,.right=extra});
@@ -1229,12 +1402,14 @@ static int compile_node_impl(PlannerInfo *root,Plan *native,struct qp_plan *tree
         if(extra>=0) p->predicate=p->predicate<0?extra:add_expr(p,(struct qs_expr){.op=Q_AND,.type=Q_BOOLEAN,.left=p->predicate,.right=extra});
         return ordered_heap_scan(&b,tree,id,index->indexid,index->indexorderdir,ordered,true);
     }
-    if(n->kind==QP_JOIN && !ordered && ((Join *)native)->inner_unique) push_group_key_filter(tree,n);
-    if(n->kind==QP_AGGREGATE) push_left_join_count(tree,n);
+    if(n->kind==QP_JOIN && !ordered && ((Join *)native)->inner_unique &&
+       (pg_sina_exe_path!=PG_SINA_ADAPTIVE || (pg_sina_encoding_choice(id)&PG_SINA_GROUP_FILTER))) push_group_key_filter(tree,n);
+    if(n->kind==QP_AGGREGATE &&
+       (pg_sina_exe_path!=PG_SINA_ADAPTIVE || (pg_sina_encoding_choice(id)&PG_SINA_LEFT_COUNT))) push_left_join_count(tree,n);
     /* If no consumer requires group order, avoid sorting the full input or
      * serializing an unfiltered Heap scan through a non-covering index.
      * Keep PG's join tree and the input target list; use bounded Hash Group. */
-    if(n->kind==QP_AGGREGATE && !ordered && n->sorted_input && n->nkeys &&
+    if(pg_sina_exe_path!=PG_SINA_ADAPTIVE && n->kind==QP_AGGREGATE && !ordered && n->sorted_input && n->nkeys &&
        qp_hash_aggregate_supported(n) && !n->distinct && !n->distinct_aggs && p->having<0 && n->left>=0) {
         struct qp_node *input=&tree->nodes[n->left];
         bool sorting=input->kind==QP_SORT && input->expr.limit<0 && !input->expr.offset;
@@ -1258,77 +1433,10 @@ static int compile_node_impl(PlannerInfo *root,Plan *native,struct qp_plan *tree
     return id;
 }
 
-/* Cache only closed device fragments, before whole-plan statistics refinement.
- * The starting slot is part of the key: optional rewrites depend on remaining
- * node capacity, and retaining it also avoids renumbering device references. */
-struct lowered_fragment {
-    PlannerInfo *root;
-    unsigned first,ninit,nparams,count;
-    bool ordered;
-    int result;
-    Plan *key;
-    struct qp_node *nodes;
-};
-/* Scan/filter projections recur under many join alternatives. Their local
- * expressions do not depend on a parent's build/probe layout. Other nodes
- * continue through normal lowering so cross-operator rewrites stay intact. */
-static bool memo_plan(Plan *p)
-{
-    return p && !p->initPlan && !p->lefttree && !p->righttree &&
-        (IsA(p,SeqScan) || IsA(p,IndexScan) || IsA(p,IndexOnlyScan));
-}
-static bool same_lowering_plan(const Plan *a,const Plan *b)
-{
-    if(nodeTag(a)!=nodeTag(b) || ((const Scan *)a)->scanrelid!=((const Scan *)b)->scanrelid ||
-       a->plan_rows!=b->plan_rows || a->plan_width!=b->plan_width || a->parallel_aware!=b->parallel_aware ||
-       !equal(a->targetlist,b->targetlist) || !equal(a->qual,b->qual)) return false;
-    if(IsA(a,IndexScan)) {
-        const IndexScan *x=(const IndexScan *)a,*y=(const IndexScan *)b;
-        return x->indexid==y->indexid && x->indexorderdir==y->indexorderdir &&
-            equal(x->indexqualorig,y->indexqualorig) && equal(x->indexqual,y->indexqual) &&
-            equal(x->indexorderby,y->indexorderby) && equal(x->indexorderbyorig,y->indexorderbyorig);
-    }
-    if(IsA(a,IndexOnlyScan)) {
-        const IndexOnlyScan *x=(const IndexOnlyScan *)a,*y=(const IndexOnlyScan *)b;
-        return x->indexid==y->indexid && x->indexorderdir==y->indexorderdir && equal(x->indexqual,y->indexqual) &&
-            equal(x->indextlist,y->indextlist) && equal(x->recheckqual,y->recheckqual) && equal(x->indexorderby,y->indexorderby);
-    }
-    return true;
-}
 static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool ordered)
 {
-    if(pg_sina_planning) ++pg_sina_planning->lower_calls;
-    List **cache=pg_sina_search_lowering_cache();
-    if(!cache || pg_sina_native_search || !native || !memo_plan(native))
-        return compile_node_impl(root,native,tree,ordered);
-    unsigned first=tree->count,ninit=tree->ninit,nparams=tree->nparams;
-    ListCell *c;
-    foreach(c,*cache) {
-        const struct lowered_fragment *m=lfirst(c);
-        if(m->root!=root || m->first!=first || m->ordered!=ordered ||
-           m->ninit!=ninit || m->nparams!=nparams || !same_lowering_plan(native,m->key)) continue;
-        memcpy(tree->nodes+first,m->nodes,m->count*sizeof(*m->nodes)); tree->count+=m->count;
-        if(pg_sina_planning) { ++pg_sina_planning->lower_hits; pg_sina_planning->lower_reused_nodes+=m->count; }
-        return m->result;
-    }
-    int result=compile_node_impl(root,native,tree,ordered);
-    bool closed=result>=(int)first && tree->ninit==ninit && tree->nparams==nparams;
-    for(unsigned i=first;closed && i<tree->count;++i) {
-        const struct qp_node *n=&tree->nodes[i];
-        if((n->left>=0 && (unsigned)n->left<first) || (n->right>=0 && (unsigned)n->right<first) ||
-           n->kind==QP_CTE_SCAN || n->kind==QP_SET) closed=false;
-        for(unsigned j=0;closed && j<n->expr.nexprs;++j)
-            if(n->expr.exprs[j].op==QP_PARAMETER || n->expr.exprs[j].op==QP_INSET) closed=false;
-    }
-    if(closed) {
-        MemoryContext previous=MemoryContextSwitchTo(pg_sina_search_context());
-        struct lowered_fragment *m=palloc(sizeof(*m));
-        *m=(struct lowered_fragment){.root=root,.first=first,.ordered=ordered,
-            .ninit=ninit,.nparams=nparams,.count=tree->count-first,.result=result,.key=copyObject(native)};
-        m->nodes=palloc(m->count*sizeof(*m->nodes)); memcpy(m->nodes,tree->nodes+first,m->count*sizeof(*m->nodes));
-        *cache=lappend(*cache,m); MemoryContextSwitchTo(previous);
-    }
-    return result;
+    if(pg_sina_planning) ++pg_sina_planning->encoded_nodes;
+    return compile_node_impl(root,native,tree,ordered);
 }
 
 /* These expressions describe device output slots, not host computation.
@@ -1344,6 +1452,361 @@ static Node *device_output_expression(Node *node,void *context)
             param->paramtypmod,param->paramcollid,COERCE_IMPLICIT_CAST);
     }
     return expression_tree_mutator(node,device_output_expression,context);
+}
+
+/* Candidate properties use the existing cost-model workspace, not a device
+ * program: expressions retain only type/column lineage and a count. Literal
+ * values, executable predicates and scalar instruction operands are omitted.
+ * A selected candidate goes through expression() exactly once afterwards. */
+static int describe_tree(PlannerInfo *,Plan *,struct qp_plan *,bool);
+static int describe_expression(struct binding *b,Node *node)
+{
+    if(!node) return -1;
+    while(IsA(node,RelabelType)) node=(Node *)((RelabelType *)node)->arg;
+    struct qs_plan *p=&b->node->expr;
+    unsigned type=type_kind(exprType(node),exprTypmod(node));
+    if(type==255 || ((type==Q_STRING || type==Q_CHAR) && !byte_order(exprCollation(node)))) return -1;
+    struct qs_expr e={.op=Q_AGGREF,.left=-1,.right=-1,.otherwise=-1,.column=-1,.type=type};
+    int col=input_column(b,node);
+    if(col>=0) { e.op=Q_COLUMN; e.column=col; return add_expr(p,e); }
+    if(IsA(node,Var)) {
+        Var *v=(Var *)node;
+        if(v->varlevelsup || v->varno!=b->scan || v->varattno<=0 || (unsigned)v->varattno>p->nattrs) return -1;
+        e.op=Q_COLUMN; e.column=v->varattno-1;
+        if(p->cols[e.column].type==255 || (type==Q_STRING && p->cols[e.column].type!=Q_STRING)) return -1;
+        if(p->cols[e.column].slot<0) p->cols[e.column].slot=p->ncols++;
+        return add_expr(p,e);
+    }
+    if(IsA(node,Param)) {
+        Param *v=(Param *)node;
+        if(v->paramkind!=PARAM_EXEC || v->paramid>=QP_PARAMS || b->tree->param_nodes[v->paramid]<0) return -1;
+        e.op=QP_PARAMETER; e.column=v->paramid; return add_expr(p,e);
+    }
+    if(IsA(node,Const)) {
+        Const *c=(Const *)node;
+        if(!c->constisnull) switch(c->consttype) {
+        case INT2OID:case INT4OID:case INT8OID:case BOOLOID:case DATEOID:case TIMESTAMPOID:
+        case NUMERICOID:case BPCHAROID:case VARCHAROID:case TEXTOID:break;
+        default:return -1;
+        }
+        ListCell *at; foreach(at,b->literals) if(equal(c,lfirst(at))) {
+            e.op=Q_CONST; e.constant=(intptr_t)lfirst(at); return add_expr(p,e);
+        }
+        b->literals=lappend(b->literals,c);
+        if(!c->constisnull && c->consttype==NUMERICOID) {
+            int64 value; unsigned scale; if(!numeric_literal(c->constvalue,&value,&scale)) return -1;
+        }
+        if(!c->constisnull && c->consttype==DATEOID && DATE_NOT_FINITE(DatumGetInt32(c->constvalue))) return -1;
+        if(!c->constisnull && c->consttype==TIMESTAMPOID && DatumGetInt64(c->constvalue)%INT64CONST(86400000000)) return -1;
+        if(!c->constisnull && (type==Q_STRING || type==Q_CHAR)) {
+            text *value=DatumGetTextPP(c->constvalue); unsigned bytes=VARSIZE_ANY_EXHDR(value);
+            if(c->consttype==BPCHAROID) while(bytes && VARDATA_ANY(value)[bytes-1]==' ') --bytes;
+            if(bytes>=sizeof(p->strings[0].bytes) || p->nstrings==QS_STRINGS) return -1;
+            p->strings[p->nstrings++].length=bytes;
+        }
+        e.op=Q_CONST; e.constant=(intptr_t)node; /* Distinguish syntax, never an execution value. */
+        return add_expr(p,e);
+    }
+    if(IsA(node,ScalarArrayOpExpr)) {
+        ScalarArrayOpExpr *s=(ScalarArrayOpExpr *)node;
+        if(list_length(s->args)!=2 || !IsA(lsecond(s->args),Const)) return -1;
+        Const *array=lsecond_node(Const,s->args); if(array->constisnull) return -1;
+        ArrayType *data=DatumGetArrayTypeP(array->constvalue); Oid type=ARR_ELEMTYPE(data);
+        int16 length; bool byval; char align; Datum *values; bool *nulls; int count;
+        get_typlenbyvalalign(type,&length,&byval,&align);
+        deconstruct_array(data,type,length,byval,align,&values,&nulls,&count);
+        for(int i=0;i<count;++i) {
+            Const *value=makeConst(type,-1,array->constcollid,length,values[i],nulls[i],byval);
+            OpExpr *op=(OpExpr *)make_opclause(s->opno,BOOLOID,false,linitial(s->args),(Expr *)value,InvalidOid,s->inputcollid);
+            if(describe_expression(b,(Node *)op)<0) return -1;
+            if(i>0) { e.constant=(intptr_t)value; if(add_expr(p,e)<0) return -1; }
+        }
+        e.constant=(intptr_t)node; return add_expr(p,e);
+    }
+    if(IsA(node,Aggref)) {
+        Aggref *a=(Aggref *)node; int at=0; ListCell *c;
+        foreach(c,b->aggregates) { if(equal(a,lfirst(c))) { e.column=at; return add_expr(p,e); } ++at; }
+        if(a->aggfilter || a->aggorder || a->agglevelsup || a->aggvariadic || a->aggtype==BPCHAROID ||
+           a->aggtype==FLOAT8OID || p->naggs==QS_AGGS) return -1;
+        const char *name=get_func_name(a->aggfnoid); unsigned kind;
+        if(!name || get_func_namespace(a->aggfnoid)!=PG_CATALOG_NAMESPACE) return -1;
+        if(!strcmp(name,"sum")) kind=Q_SUM; else if(!strcmp(name,"avg")) kind=Q_AVG;
+        else if(!strcmp(name,"count")) kind=a->aggstar?Q_COUNT_STAR:Q_COUNT;
+        else if(!strcmp(name,"min")) kind=Q_MIN; else if(!strcmp(name,"max")) kind=Q_MAX; else return -1;
+        int arg=-1;
+        if(kind!=Q_COUNT_STAR) {
+            if(list_length(a->args)!=1) return -1;
+            arg=describe_expression(b,(Node *)linitial_node(TargetEntry,a->args)->expr); if(arg<0) return -1;
+        }
+        if(a->aggdistinct) {
+            if(list_length(a->aggdistinct)!=1 || kind!=Q_COUNT || p->exprs[arg].op!=Q_COLUMN) return -1;
+            unsigned column=p->exprs[arg].column+1;
+            if(b->node->distinct && b->node->distinct!=column) return -1;
+            b->node->distinct=column; b->node->distinct_aggs|=1U<<p->naggs;
+        }
+        e.column=p->naggs; p->aggs[p->naggs++]=(struct qs_agg){.kind=kind,.expr=arg};
+        b->aggregates=lappend(b->aggregates,a); return add_expr(p,e);
+    }
+    if(IsA(node,SubPlan)) {
+        SubPlan *s=(SubPlan *)node;
+        if(s->subLinkType!=ANY_SUBLINK || !s->useHashTable || s->parParam || s->args ||
+           list_length(s->paramIds)!=1 || !IsA(s->testexpr,OpExpr)) return -1;
+        OpExpr *op=(OpExpr *)s->testexpr;
+        if(list_length(op->args)!=2) return -1;
+        Node *input=linitial(op->args),*param=lsecond(op->args);
+        if(IsA(input,Param)) { Node *swap=input; input=param; param=swap; }
+        if(!IsA(param,Param) || ((Param *)param)->paramid!=linitial_int(s->paramIds)) return -1;
+        Oid fn=get_opcode(op->opno);
+        if(!function_is(fn,"int2eq") && !function_is(fn,"int4eq") && !function_is(fn,"int8eq")) return -1;
+        if(describe_expression(b,input)<0 || b->tree->ninit==QP_PARAMS) return -1;
+        PlannerInfo *root=list_nth(b->root->glob->subroots,s->plan_id-1);
+        Plan *chosen=pg_sina_prepare_candidate(root,list_nth(b->root->glob->subplans,s->plan_id-1),false);
+        int child=chosen?describe_tree(root,chosen,b->tree,false):-1;
+        if(child<0 || b->tree->count==QP_NODES) return -1;
+        unsigned set=b->tree->count++;
+        b->tree->nodes[set]=(struct qp_node){.kind=QP_SET,.left=child,.right=-1,.expr=b->tree->nodes[child].expr};
+        unsigned init=b->tree->ninit++; b->tree->init_nodes[init]=set; b->tree->init_params[init]=-1;
+        e.op=QP_INSET; e.column=set; return add_expr(p,e);
+    }
+    List *args=NIL; const char *name=NULL;
+    if(IsA(node,OpExpr) || IsA(node,FuncExpr)) {
+        Oid fn;
+        if(IsA(node,OpExpr)) { args=((OpExpr *)node)->args; fn=get_opcode(((OpExpr *)node)->opno); }
+        else { args=((FuncExpr *)node)->args; fn=((FuncExpr *)node)->funcid; }
+        if(get_func_namespace(fn)!=PG_CATALOG_NAMESPACE || !(name=get_func_name(fn))) return -1;
+        bool supported=false;
+        static const char *functions[]={"numeric_add","numeric_sub","numeric_mul","numeric_div","textlike","textnlike",
+            "bpcharlike","bpcharnlike","text","numeric","int2_numeric","int4_numeric","int8_numeric","date_timestamp",
+            "timestamp_date","timestamp_timestamp","timestamp","bpchar","date_part","substring","text_substr","text_substr_no_len"};
+        for(unsigned i=0;i<lengthof(functions);++i) if(!strcmp(name,functions[i])) supported=true;
+        static const char *prefix[]={"numeric_","int2","int4","int8","int24","int28","int42","int48","int82","int84","date_","bpchar","bool","text","text_","float8"};
+        static const char *suffix[]={"eq","ne","lt","le","gt","ge"};
+        for(unsigned i=0;i<lengthof(prefix);++i) {
+            size_t length=strlen(prefix[i]); if(strncmp(name,prefix[i],length)) continue;
+            for(unsigned j=0;j<lengthof(suffix);++j) if(!strcmp(name+length,suffix[j])) supported=true;
+        }
+        static const char *timestamp[]={"date_eq_timestamp","date_ne_timestamp","date_lt_timestamp","date_le_timestamp","date_gt_timestamp","date_ge_timestamp"};
+        for(unsigned i=0;i<lengthof(timestamp);++i) if(!strcmp(name,timestamp[i])) supported=true;
+        if(!supported) return -1;
+        unsigned arity=list_length(args);
+        bool cast=!strcmp(name,"text") || !strcmp(name,"numeric") || !strcmp(name,"int2_numeric") ||
+            !strcmp(name,"int4_numeric") || !strcmp(name,"int8_numeric") || !strcmp(name,"date_timestamp") ||
+            !strcmp(name,"timestamp_date") || !strcmp(name,"timestamp_timestamp") || !strcmp(name,"timestamp") || !strcmp(name,"bpchar");
+        bool substring=!strcmp(name,"substring") || !strcmp(name,"text_substr") || !strcmp(name,"text_substr_no_len");
+        if(arity!=(cast?1U:substring?3U:2U)) return -1;
+        /* The cost of a predicate-only LIKE is boolean decoding, not a
+         * dictionary containing every input string. No pattern is encoded. */
+        if(b->scan && strstr(name,"like") && list_length(args)==2) {
+            Node *value=linitial(args),*pattern=lsecond(args);
+            bool trim=false;
+            while(IsA(value,RelabelType)) value=(Node *)((RelabelType *)value)->arg;
+            if(IsA(value,FuncExpr) && list_length(((FuncExpr *)value)->args)==1 && function_is(((FuncExpr *)value)->funcid,"text")) {
+                value=linitial(((FuncExpr *)value)->args); trim=true;
+            }
+            if(IsA(value,Var) && IsA(pattern,Const) && !((Const *)pattern)->constisnull) {
+                Var *v=(Var *)value; text *literal_text=DatumGetTextPP(((Const *)pattern)->constvalue);
+                unsigned bytes=VARSIZE_ANY_EXHDR(literal_text); const char *data=VARDATA_ANY(literal_text);
+                if(v->varno==b->scan && v->varattno>0 && (unsigned)v->varattno<=p->nattrs &&
+                   bytes<=32 && !memchr(data,'_',bytes) && !memchr(data,'\\',bytes)) {
+                    struct qs_column *column=&p->cols[v->varattno-1];
+                    if((column->type==Q_STRING && column->slot<0) || (column->type==Q_PATTERN &&
+                       column->trim_spaces==trim && column->prefix_len==bytes && !memcmp(column->prefix,data,bytes))) {
+                        column->type=Q_PATTERN; column->trim_spaces=trim; column->prefix_len=bytes;
+                        memcpy(column->prefix,data,bytes); if(column->slot<0) column->slot=p->ncols++;
+                        e.op=Q_COLUMN; e.column=v->varattno-1; e.type=Q_BOOLEAN;
+                        int decoded=add_expr(p,e); if(decoded<0 || !strstr(name,"nlike")) return decoded;
+                        e.op=Q_AGGREF; e.column=-1; e.constant=(intptr_t)node; return add_expr(p,e);
+                    }
+                }
+            }
+        }
+        if(!strcmp(name,"date_part")) {
+            if(list_length(args)!=2 || !IsA(linitial(args),Const)) return -1;
+            Const *part=linitial_node(Const,args);
+            if(part->constisnull || part->consttype!=TEXTOID || strcmp(TextDatumGetCString(part->constvalue),"year")) return -1;
+            e.op=Q_YEAR; e.left=describe_expression(b,lsecond(args)); return e.left<0?-1:add_expr(p,e);
+        }
+    } else if(IsA(node,NullTest)) {
+        if(((NullTest *)node)->argisrow) return -1;
+        args=list_make1(((NullTest *)node)->arg);
+    } else if(IsA(node,BoolExpr)) args=((BoolExpr *)node)->args;
+    else if(IsA(node,CoalesceExpr)) args=((CoalesceExpr *)node)->args;
+    else if(IsA(node,CaseExpr)) {
+        CaseExpr *v=(CaseExpr *)node; if(v->arg) return -1;
+        args=list_make1(v->defresult); ListCell *c;
+        foreach(c,v->args) { CaseWhen *w=lfirst(c); args=lappend(args,w->expr); args=lappend(args,w->result); }
+    } else return -1;
+    int first=-1; ListCell *c;
+    foreach(c,args) { int child=describe_expression(b,lfirst(c)); if(child<0) return -1; if(first<0) first=child; }
+    /* Transparent casts preserve column lineage for NDV/text-width proofs. */
+    if(name && list_length(args)==1) return first;
+    e.constant=(intptr_t)node; return add_expr(p,e);
+}
+static bool describe_list(struct binding *b,List *expressions)
+{
+    ListCell *c; foreach(c,expressions) if(describe_expression(b,lfirst(c))<0) return false;
+    /* conditions() combines a list with AND. Count those operations without
+     * constructing their executable operands. */
+    for(int i=1;i<list_length(expressions);++i) {
+        struct qs_expr conjunction={.op=Q_AGGREF,.type=Q_BOOLEAN,.column=-1-i,.constant=(intptr_t)expressions};
+        if(add_expr(&b->node->expr,conjunction)<0) return false;
+    }
+    return true;
+}
+static int describe_tree(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool ordered)
+{
+    if(pg_sina_planning) ++pg_sina_planning->property_nodes;
+    if(!native || native->initPlan || tree->count==QP_NODES) return -1;
+    unsigned id=tree->count++; struct qp_node *n=&tree->nodes[id]; memset(n,0,sizeof(*n));
+    n->left=n->right=n->join_qual=-1; n->estimated_rows=native->plan_rows;
+    struct qs_plan *p=&n->expr; p->predicate=native->qual?0:-1; p->having=-1; p->limit=-1;
+    struct binding b={.root=root,.plan=native,.node=n,.tree=tree,.properties=true};
+    Plan *left=native->lefttree,*right=native->righttree; List *extra=NIL; Node *lookup=NULL; struct qs_join access={0};
+    if(IsA(native,SeqScan) || IsA(native,IndexScan) || IsA(native,IndexOnlyScan)) {
+        n->kind=QP_SCAN; b.scan=((Scan *)native)->scanrelid;
+        if(!describe_scan(root,(Scan *)native,p)) return -1;
+        if(native->parallel_aware && root->simple_rel_array[b.scan]) n->estimated_rows=root->simple_rel_array[b.scan]->rows;
+    } else if(IsA(native,HashJoin) || IsA(native,MergeJoin) || IsA(native,NestLoop)) {
+        Join *j=(Join *)native; n->kind=QP_JOIN; n->hash=IsA(native,HashJoin);
+        switch(j->jointype) {
+        case JOIN_INNER:n->join_type=QP_INNER;break; case JOIN_LEFT:case JOIN_RIGHT:n->join_type=QP_LEFT;break;
+        case JOIN_SEMI:n->join_type=QP_SEMI;break; case JOIN_ANTI:n->join_type=QP_ANTI;break; default:return -1;
+        }
+        if(IsA(right,Hash)) right=right->lefttree;
+        if(j->jointype==JOIN_RIGHT) { Plan *swap=left; left=right; right=swap; }
+        if(IsA(native,NestLoop)) {
+            if(!prepare_index_join(root,(NestLoop *)native,&right,&extra,&lookup,&access)) return -1;
+            n->kind=QP_INDEX_JOIN; n->sorted_input=ordered;
+        }
+        n->join_qual=j->joinqual?0:-1;
+    } else if(IsA(native,Agg)) {
+        Agg *a=(Agg *)native; if(a->chain || a->groupingSets || a->aggsplit!=AGGSPLIT_SIMPLE) return -1;
+        n->kind=QP_AGGREGATE; n->hash=a->aggstrategy==AGG_HASHED; n->sorted_input=a->aggstrategy==AGG_SORTED;
+        n->estimated_groups=a->numGroups;
+    } else if(IsA(native,Sort)) n->kind=QP_SORT;
+    else if(IsA(native,Limit)) n->kind=QP_LIMIT;
+    else if(IsA(native,SubqueryScan)) {
+        RelOptInfo *r=root->simple_rel_array[((SubqueryScan *)native)->scan.scanrelid];
+        if(!r || !r->subroot) return -1;
+        n->kind=QP_PROJECT; n->left=describe_tree(r->subroot,((SubqueryScan *)native)->subplan,tree,ordered); if(n->left<0) return -1;
+        left=((SubqueryScan *)native)->subplan;
+    } else if(IsA(native,CteScan)) {
+        int plan=((CteScan *)native)->ctePlanId;
+        if(plan<=0 || plan>QP_PARAMS) return -1;
+        n->kind=QP_CTE_SCAN;
+        if(tree->cte_nodes[plan-1]<0) {
+            if(tree->count==QP_NODES) return -1;
+            unsigned materialized=tree->count++; tree->cte_nodes[plan-1]=materialized;
+            PlannerInfo *subroot=list_nth(root->glob->subroots,plan-1);
+            Plan *chosen=pg_sina_prepare_candidate(subroot,list_nth(root->glob->subplans,plan-1),false);
+            int child=chosen?describe_tree(subroot,chosen,tree,false):-1; if(child<0) return -1;
+            tree->nodes[materialized]=(struct qp_node){.kind=QP_MATERIALIZED,.left=child,.right=-1,.expr=tree->nodes[child].expr};
+        }
+        n->left=tree->cte_nodes[plan-1];
+    } else if(IsA(native,Result) || IsA(native,Gather) || IsA(native,GatherMerge) || IsA(native,Material) || IsA(native,Hash)) n->kind=QP_PROJECT;
+    else return -1;
+    bool left_order=n->kind==QP_SORT || (n->kind==QP_JOIN && n->hash)?false:n->kind==QP_AGGREGATE?n->sorted_input:ordered;
+    if(IsA(native,MergeJoin)) left_order=false;
+    if(IsA(native,Limit)) left_order=ordered || root->parse->sortClause!=NIL;
+    if(left && n->left<0) { n->left=describe_tree(root,left,tree,left_order); if(n->left<0) return -1; }
+    if(right) { n->right=describe_tree(root,right,tree,false); if(n->right<0) return -1; }
+    b.left=left?left->targetlist:NIL; b.right=right?right->targetlist:NIL;
+    if(n->kind!=QP_SCAN) {
+        p->nattrs=p->ncols=list_length(b.left)+list_length(b.right); if(p->nattrs>QS_COLS) return -1;
+        unsigned at=0; List *lists[]={b.left,b.right};
+        for(unsigned side=0;side<2;++side) { ListCell *c; foreach(c,lists[side]) {
+            Node *value=(Node *)lfirst_node(TargetEntry,c)->expr;
+            p->cols[at]=(struct qs_column){.slot=at,.type=type_kind(exprType(value),exprTypmod(value))}; ++at;
+        }}
+    }
+    if(n->kind==QP_JOIN || n->kind==QP_INDEX_JOIN) {
+        List *keys=IsA(native,HashJoin)?((HashJoin *)native)->hashclauses:IsA(native,MergeJoin)?((MergeJoin *)native)->mergeclauses:NIL;
+        if(n->kind==QP_INDEX_JOIN) {
+            int key=describe_expression(&b,lookup); if(key<0 || p->exprs[key].op!=Q_COLUMN) return -1;
+            n->left_keys[n->nkeys++]=p->exprs[key].column; tree->nodes[n->right].expr.join=access;
+        }
+        ListCell *c; foreach(c,keys) {
+            if(n->nkeys==QS_KEYS || !IsA(lfirst(c),OpExpr)) return -1;
+            OpExpr *key=lfirst(c); if(list_length(key->args)!=2) return -1;
+            int a=describe_expression(&b,linitial(key->args)),z=describe_expression(&b,lsecond(key->args));
+            if(a<0 || z<0 || p->exprs[a].op!=Q_COLUMN || p->exprs[z].op!=Q_COLUMN) return -1;
+            unsigned width=list_length(b.left);
+            if((unsigned)p->exprs[a].column>=width) { int swap=a; a=z; z=swap; }
+            n->left_keys[n->nkeys]=p->exprs[a].column; n->right_keys[n->nkeys++]=p->exprs[z].column-width;
+        }
+        if(!n->nkeys || !describe_list(&b,list_concat(list_copy(((Join *)native)->joinqual),extra))) return -1;
+    }
+    if(n->kind==QP_AGGREGATE) {
+        Agg *a=(Agg *)native; if(a->numCols>QS_KEYS) return -1;
+        for(int i=0;i<a->numCols;++i) {
+            TargetEntry *key=get_tle_by_resno(left->targetlist,a->grpColIdx[i]);
+            int value=key?describe_expression(&b,(Node *)key->expr):-1;
+            if(value<0 || p->exprs[value].op!=Q_COLUMN) return -1;
+            p->keys[p->nkeys++]=value; n->left_keys[n->nkeys++]=p->exprs[value].column;
+        }
+        if(tree->nodes[n->left].kind!=QP_SORT && !tree->nodes[n->left].ordered_index) n->sorted_input=0;
+    }
+    ListCell *c; foreach(c,native->targetlist) {
+        TargetEntry *entry=lfirst(c); Node *value=(Node *)entry->expr;
+        if(p->nout==QS_OUT) return -1;
+        int property=describe_expression(&b,value); if(property<0) return -1;
+        p->outputs[p->nout++]=(struct qs_output){.index=property,.type_oid=exprType(value),.typmod=exprTypmod(value)};
+    }
+    if(!describe_list(&b,native->qual)) return -1;
+    if(IsA(native,Result) && ((Result *)native)->resconstantqual) {
+        Node *qual=((Result *)native)->resconstantqual;
+        if(IsA(qual,List)?!describe_list(&b,(List *)qual):describe_expression(&b,qual)<0) return -1;
+        p->predicate=0;
+    }
+    if(IsA(native,IndexScan)) {
+        if(!describe_list(&b,((IndexScan *)native)->indexqualorig)) return -1;
+        if(((IndexScan *)native)->indexqualorig) p->predicate=0;
+        return ordered_heap_scan(&b,tree,id,((IndexScan *)native)->indexid,((IndexScan *)native)->indexorderdir,ordered,false);
+    }
+    if(IsA(native,IndexOnlyScan)) {
+        IndexOnlyScan *index=(IndexOnlyScan *)native;
+        if(!describe_list(&b,(List *)heap_index_var((Node *)index->recheckqual,index->indextlist))) return -1;
+        if(index->recheckqual) p->predicate=0;
+        return ordered_heap_scan(&b,tree,id,index->indexid,index->indexorderdir,ordered,true);
+    }
+    if(n->kind==QP_SORT) {
+        Sort *sort=(Sort *)native; if(sort->numCols>QS_OUT) return -1;
+        for(int i=0;i<sort->numCols;++i) {
+            Oid family,type; int16 strategy;
+            if(!get_ordering_op_properties(sort->sortOperators[i],&family,&type,&strategy)) return -1;
+            p->order[p->norder++]=(struct qs_order){.output=sort->sortColIdx[i]-1,.descending=strategy==5,.nulls_first=sort->nullsFirst[i]};
+        }
+    }
+    if(n->kind==QP_LIMIT) {
+        Limit *limit=(Limit *)native;
+        if(limit->limitCount) { if(!IsA(limit->limitCount,Const)) return -1; if(!((Const *)limit->limitCount)->constisnull) p->limit=DatumGetInt64(((Const *)limit->limitCount)->constvalue); }
+        if(limit->limitOffset) { if(!IsA(limit->limitOffset,Const)) return -1; if(!((Const *)limit->limitOffset)->constisnull) p->offset=DatumGetInt64(((Const *)limit->limitOffset)->constvalue); }
+    }
+    unsigned *choices=pg_sina_candidate_choices();
+    if(n->kind==QP_JOIN && !ordered && ((Join *)native)->inner_unique) {
+        push_group_key_filter(tree,n);
+        if(n->kind!=QP_JOIN) choices[id]|=PG_SINA_GROUP_FILTER;
+    }
+    if(n->kind==QP_AGGREGATE) {
+        push_left_join_count(tree,n);
+        if(n->kind!=QP_AGGREGATE) choices[id]|=PG_SINA_LEFT_COUNT;
+        int left=n->left; bypass_distinct_sort(tree,n);
+        if(n->left!=left) choices[id]|=PG_SINA_DISTINCT_SORT;
+        unsigned count=tree->count; choose_distinct(tree,n);
+        if(tree->count!=count) choices[id]|=PG_SINA_DISTINCT;
+    }
+    return id;
+}
+
+Plan *pg_sina_candidate_scan(Plan *native,bool fast)
+{
+    CustomScan *scan=makeNode(CustomScan); scan->scan.plan=*native; NodeSetTag(scan,T_CustomScan);
+    scan->scan.plan.lefttree=scan->scan.plan.righttree=NULL; scan->scan.plan.qual=NIL;
+    scan->scan.plan.parallel_aware=scan->scan.plan.parallel_safe=false;
+    scan->scan.plan.targetlist=(List *)device_output_expression((Node *)native->targetlist,NULL);
+    scan->custom_scan_tlist=copyObject(scan->scan.plan.targetlist);
+    scan->custom_private=list_make1(NULL); scan->methods=fast?&pg_sina_scan_methods:&pg_sina_plan_methods;
+    return (Plan *)scan;
 }
 
 struct scan_parameters { PlannerInfo *root; List *values; };
@@ -1371,7 +1834,7 @@ static bool scan_parameter(Node *node,struct scan_parameters *parameters)
     }
     return expression_tree_walker(node,scan_parameter,parameters);
 }
-static Plan *compile_subtree(PlannerInfo *root,Plan *native,bool boundary,struct qp_plan **lowered)
+Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
 {
     bool host_scan=pg_sina_exe_path==PG_SINA_FILTER;
     struct scan_parameters parameters={.root=root};
@@ -1381,12 +1844,8 @@ static Plan *compile_subtree(PlannerInfo *root,Plan *native,bool boundary,struct
         if(IsA(native,IndexScan) && scan_parameter((Node *)((IndexScan *)native)->indexqualorig,&parameters)) return native;
         if(IsA(native,IndexOnlyScan) && scan_parameter((Node *)((IndexOnlyScan *)native)->indexqual,&parameters)) return native;
     }
-    /* Nodes are initialized when appended. Clearing the complete runtime
-     * record (96 nodes plus execution-only arrays) for every Path is costly. */
-    /* Candidate estimation is serial. Its aligned tree lives until the next
-     * candidate, and never backs an executable Const or a cached fragment. */
-    bool reusable=lowered && pg_sina_path_search;
-    struct qp_plan *tree=reusable?pg_sina_lowering_workspace():palloc(sizeof(*tree));
+    /* This allocation is only for a selected executable subtree. */
+    struct qp_plan *tree=palloc(sizeof(*tree));
     memset(tree,0,offsetof(struct qp_plan,nodes));
     for(unsigned i=0;i<QP_PARAMS;++i) tree->param_nodes[i]=tree->cte_nodes[i]=-1;
     ListCell *c;
@@ -1436,15 +1895,17 @@ static Plan *compile_subtree(PlannerInfo *root,Plan *native,bool boundary,struct
     if(pg_sina_exe_path==PG_SINA_FILTER && native->parallel_aware &&
        (!IsA(native,SeqScan) || pg_sina_resources.cus<2)) { goto failed; }
     tree->nodes[result].expr.work_mem_bytes=pg_sina_query_memory();
-    Const *program=NULL;
-    if(lowered) *lowered=tree;
-    else {
-        if(pg_sina_planning) ++pg_sina_planning->serialized_plans;
-        size_t length=qp_plan_constant_bytes(tree);
-        bytea *bytes=palloc(VARHDRSZ+length); SET_VARSIZE(bytes,VARHDRSZ+length);
-        memcpy(VARDATA(bytes),tree,length); pfree(tree);
-        program=makeConst(BYTEAOID,-1,InvalidOid,-1,PointerGetDatum(bytes),false,false);
+    if(pg_sina_exe_path==PG_SINA_ADAPTIVE) {
+        if(pg_sina_encoding_choice(tree->count)) elog(ERROR,"device encoder omitted a planned operator");
+        for(unsigned i=0;i<tree->count;++i) {
+            if(!pg_sina_encoding_matches(i,&tree->nodes[i])) elog(ERROR,"device operator %u differs from its selected physical choice",i);
+        }
     }
+    if(pg_sina_planning) ++pg_sina_planning->serialized_plans;
+    size_t length=qp_plan_constant_bytes(tree);
+    bytea *bytes=palloc(VARHDRSZ+length); SET_VARSIZE(bytes,VARHDRSZ+length);
+    memcpy(VARDATA(bytes),tree,length); pfree(tree);
+    Const *program=makeConst(BYTEAOID,-1,InvalidOid,-1,PointerGetDatum(bytes),false,false);
     CustomScan *scan=makeNode(CustomScan);
     scan->scan.plan=*native; NodeSetTag(scan,T_CustomScan);
     scan->scan.plan.lefttree=scan->scan.plan.righttree=NULL;
@@ -1461,13 +1922,44 @@ static Plan *compile_subtree(PlannerInfo *root,Plan *native,bool boundary,struct
     scan->methods=&pg_sina_plan_methods;
     return (Plan *)scan;
 failed:
-    if(!reusable) pfree(tree);
+    pfree(tree);
     return native;
 }
-Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
-{ return compile_subtree(root,native,boundary,NULL); }
-Plan *pg_sina_lower_subtree(PlannerInfo *root,Plan *native,bool boundary,struct qp_plan **lowered)
-{ return compile_subtree(root,native,boundary,lowered); }
+Plan *pg_sina_describe_candidate(PlannerInfo *root,Plan *native,bool boundary,struct qp_plan **lowered)
+{
+    struct qp_plan *tree=pg_sina_cost_workspace();
+    memset(pg_sina_candidate_choices(),0,QP_NODES*sizeof(unsigned));
+    memset(tree,0,offsetof(struct qp_plan,nodes));
+    for(unsigned i=0;i<QP_PARAMS;++i) tree->param_nodes[i]=tree->cte_nodes[i]=-1;
+    ListCell *c;
+    foreach(c,root->init_plans) {
+        SubPlan *s=lfirst(c); if(s->subLinkType==CTE_SUBLINK) continue;
+        if(s->subLinkType!=EXPR_SUBLINK || s->parParam || s->args || list_length(s->setParam)!=1 || tree->ninit==QP_PARAMS) return native;
+        int param=linitial_int(s->setParam); if(param<0 || param>=QP_PARAMS) return native;
+        PlannerInfo *subroot=list_nth(root->glob->subroots,s->plan_id-1);
+        Plan *chosen=pg_sina_prepare_candidate(subroot,list_nth(root->glob->subplans,s->plan_id-1),false);
+        int child=chosen?describe_tree(subroot,chosen,tree,false):-1; if(child<0) return native;
+        tree->param_nodes[param]=child; tree->nparams=Max(tree->nparams,(unsigned)param+1);
+        unsigned init=tree->ninit++; tree->init_nodes[init]=child; tree->init_params[init]=param;
+    }
+    int result=describe_tree(root,native,tree,boundary || root->parse->sortClause!=NIL); if(result<0) return native;
+    bool has_scan=false; char device[128]={0};
+    Oid ns=get_namespace_oid("sina_csd",true);
+    if(!OidIsValid(ns) || !OidIsValid(get_relname_relid("relations",ns))) return native;
+    for(unsigned i=0;i<tree->count;++i) if(tree->nodes[i].kind==QP_SCAN) {
+        struct qs_plan *scan=&tree->nodes[i].expr; char path[128]={0}; has_scan=true;
+        if(!pg_sina_prepared_device(scan->relid,scan->relfilenode,path,sizeof(path))) return native;
+        if(!device[0]) strlcpy(device,path,sizeof(device));
+    }
+    if(!has_scan) return native;
+    tree->root=result; pg_sina_refine_groups(tree); pg_sina_read_resources(device);
+    for(unsigned i=0;i<tree->count;++i) {
+        const struct qp_node *n=&tree->nodes[i];
+        pg_sina_candidate_choices()[i]|=pg_sina_physical_choice(n);
+    }
+    tree->nodes[result].expr.work_mem_bytes=pg_sina_query_memory();
+    *lowered=tree; return pg_sina_candidate_scan(native,false);
+}
 Plan *pg_sina_rewrite_plan(PlannerInfo *root,Plan *native)
 { return pg_sina_compile_subtree(root,native,false); }
 
