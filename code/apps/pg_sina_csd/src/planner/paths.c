@@ -16,6 +16,7 @@ struct path_relation {
     PlannerInfo *root;
     RelOptInfo *rel;
     CustomPath *internal; /* Best complete device subtree, without delivery. */
+    CustomPath *scan[2]; /* Private/shared source, retained across PG pruning. */
     double internal_cost;
     List *pending;
 };
@@ -298,7 +299,8 @@ static void add_device_path(PlannerInfo *root,RelOptInfo *rel,Path *native,bool 
     /* The device stream has global rows. A partial PG Path describes each
      * consumer's share; all consumers read the same DSM delivery queue. */
     path->path.rows=native->parallel_aware?native->rows:device->plan_rows;
-    path->path.startup_cost=path->path.total_cost=(internal+boundary)/pg_sina_host_cost_ms;
+    path->path.total_cost=(internal+boundary)/pg_sina_host_cost_ms;
+    path->path.startup_cost=pg_sina_is_scan(plan)?Min(path->path.total_cost,device->startup_cost):path->path.total_cost;
     path->custom_private=list_make5(lthird(((CustomScan *)device)->custom_private),copyObject(lsecond(((CustomScan *)device)->custom_private)),
         makeInteger(top),makeInteger(((CustomScan *)device)->methods==&pg_sina_scan_methods),copyObject(lfourth(((CustomScan *)device)->custom_private)));
     path->methods=&device_methods;
@@ -314,6 +316,12 @@ static void add_device_path(PlannerInfo *root,RelOptInfo *rel,Path *native,bool 
         state->internal->path.startup_cost=state->internal->path.total_cost=internal/pg_sina_host_cost_ms;
         state->internal_cost=internal;
     }
+    if(native->pathtype==T_SeqScan) {
+        unsigned shared=native->parallel_aware;
+        if(!state->scan[shared] || path->path.total_cost<state->scan[shared]->path.total_cost) {
+            state->scan[shared]=palloc(sizeof(*path)); *state->scan[shared]=*path;
+        }
+    }
     state->pending=lappend(state->pending,path);
     if(pg_sina_planning) pg_sina_planning->retain_publish+=pg_sina_planner_clock()-freed;
     if(pg_sina_planning) pg_sina_planning->retain+=pg_sina_planner_clock()-mark;
@@ -324,10 +332,46 @@ static void publish_paths(PlannerInfo *root,RelOptInfo *rel)
     List *pending=state->pending; state->pending=NIL;
     ListCell *c; foreach(c,pending) {
         Path *path=lfirst(c);
-        if(path->parallel_aware) add_partial_path(rel,path);
+        if(path->parallel_workers>0) add_partial_path(rel,path);
         else add_path(rel,path);
     }
     list_free(pending);
+}
+/* PG's scalar cost prunes a device source before seeing the independent
+ * HOST CPU work that can overlap it. Retain that source and compare it at
+ * the immediate HOST join, preserving PG's algorithm and cardinalities. */
+static void add_scan_join_paths(PlannerInfo *root,RelOptInfo *rel,JoinPath *native)
+{
+    bool hash=IsA(native,HashPath);
+    if(!hash && !IsA(native,NestPath)) return;
+    if(hash && ((HashPath *)native)->num_batches!=1) return;
+    Path *inputs[]={native->outerjoinpath,native->innerjoinpath},*sources[2]={NULL,NULL};
+    for(unsigned side=0;side<2;++side) {
+        Path *input=inputs[side];
+        if(input->pathtype!=T_SeqScan || input->param_info || (!hash && side)) continue;
+        CustomPath *source=relation_paths(root,input->parent)->scan[input->parallel_aware];
+        if(source && source->path.rows==input->rows &&
+           (!native->path.parallel_safe || source->path.parallel_safe) &&
+           equal(source->path.pathkeys,input->pathkeys)) sources[side]=&source->path;
+    }
+    double repeats=hash?1:Max(1,inputs[0]->rows);
+    double cpu=Max(0,native->path.total_cost-inputs[0]->total_cost-inputs[1]->total_cost*repeats);
+    for(unsigned mask=1;mask<4;++mask) {
+        if(((mask&1) && !sources[0]) || ((mask&2) && !sources[1])) continue;
+        JoinPath *join=hash?(JoinPath *)palloc(sizeof(HashPath)):(JoinPath *)palloc(sizeof(NestPath));
+        memcpy(join,native,hash?sizeof(HashPath):sizeof(NestPath));
+        double independent=0;
+        for(unsigned side=0;side<2;++side) if(mask&(1U<<side)) {
+            double count=side?repeats:1;
+            join->path.total_cost+=(sources[side]->total_cost-inputs[side]->total_cost)*count;
+            join->path.startup_cost+=hash && side?sources[side]->total_cost-inputs[side]->total_cost:
+                sources[side]->startup_cost-inputs[side]->startup_cost;
+            independent+=(sources[side]->total_cost-sources[side]->startup_cost)*count;
+            if(side) join->innerjoinpath=sources[side]; else join->outerjoinpath=sources[side];
+        }
+        join->path.total_cost=Max(join->path.startup_cost,join->path.total_cost-Min(cpu,independent));
+        relation_paths(root,rel)->pending=lappend(relation_paths(root,rel)->pending,join);
+    }
 }
 void pg_sina_rel_paths(PlannerInfo *root,RelOptInfo *rel,Index rti,RangeTblEntry *rte)
 {
@@ -348,12 +392,15 @@ void pg_sina_join_paths(PlannerInfo *root,RelOptInfo *joinrel,RelOptInfo *outerr
 {
     if(!eligible(root)) return;
     /* Inspect PG's current alternatives too, preserving Index/Merge choices. */
-    List *paths=list_copy(joinrel->pathlist); ListCell *c;
+    List *paths=list_concat(list_copy(joinrel->pathlist),list_copy(joinrel->partial_pathlist)); ListCell *c;
     foreach(c,paths) {
         Path *p=lfirst(c);
         if((IsA(p,HashPath) || IsA(p,MergePath) || IsA(p,NestPath)) &&
            ((JoinPath *)p)->outerjoinpath->parent==outerrel &&
-           ((JoinPath *)p)->innerjoinpath->parent==innerrel) add_device_path(root,joinrel,p,false);
+           ((JoinPath *)p)->innerjoinpath->parent==innerrel) {
+            add_scan_join_paths(root,joinrel,(JoinPath *)p);
+            add_device_path(root,joinrel,p,false);
+        }
     }
     list_free(paths);
     publish_paths(root,joinrel);

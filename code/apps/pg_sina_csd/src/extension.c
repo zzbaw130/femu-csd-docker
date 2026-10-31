@@ -187,7 +187,7 @@ double pg_sina_host_cost_ms=0.02,pg_sina_csd_cpu_ratio=0.35;
 double pg_sina_parallel_task_ms=0.02;
 double pg_sina_internal_mbps=5000,pg_sina_pcie_mbps=3500,pg_sina_cache_mbps=10000;
 double pg_sina_internal_write_mbps=1000;
-double pg_sina_result_batch_ms=1;
+double pg_sina_result_batch_ms=0.25;
 static void assign_cost(double value,void *extra) { ResetPlanCache(); }
 void _PG_init(void);
 void _PG_init(void)
@@ -217,7 +217,7 @@ void _PG_init(void)
     DefineCustomRealVariable("pg_sina_csd.cache_mbps","Native host cached scan bandwidth in decimal MB/s",NULL,
         &pg_sina_cache_mbps,10000,1,1000000,PGC_USERSET,0,NULL,assign_cost,NULL);
     DefineCustomRealVariable("pg_sina_csd.result_batch_ms","Delivery/materialization cost per device result batch",NULL,
-        &pg_sina_result_batch_ms,1,0,1000,PGC_USERSET,0,NULL,assign_cost,NULL);
+        &pg_sina_result_batch_ms,0.25,0,1000,PGC_USERSET,0,NULL,assign_cost,NULL);
     if(process_shared_preload_libraries_in_progress)
         elog(ERROR,"load pg_sina_csd per connection using session_preload_libraries, not shared_preload_libraries");
     if(!IsParallelWorker()) { pg_sina_init_device(); pg_sina_cache_init(); }

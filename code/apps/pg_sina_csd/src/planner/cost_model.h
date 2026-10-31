@@ -11,6 +11,13 @@ static inline double cost_min(double a,double b) { return a<b?a:b; }
  * caller retains CPU costs; only file-only hits pay the extra page copy. */
 static inline double cost_host_cached_io(double io,double shared,double file,double copy_ratio)
 { return io*(1-cost_max(shared,file))+io*cost_max(0,file-shared)*copy_ratio; }
+/* LOAD and compute remain serial within one task, but independent CU tasks
+ * overlap. Retain one participant's fill/drain share of the shorter stage. */
+static inline double cost_scan_overlap(double io,double cpu,double tasks,unsigned cus)
+{
+    double lanes=cost_max(1,cost_min(tasks,cus));
+    return cost_min(io,cpu)*(1-1/lanes);
+}
 static inline double cost_slots(double count,double minimum)
 {
     double slots=minimum;

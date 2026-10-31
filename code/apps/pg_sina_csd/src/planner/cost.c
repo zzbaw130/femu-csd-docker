@@ -113,7 +113,7 @@ void pg_sina_cost_host_path(PlannerInfo *root,Path *path,Oid oid,List **observat
     if(oid<FirstNormalObjectId || get_rel_persistence(oid)==RELPERSISTENCE_TEMP ||
        get_rel_namespace(oid)==get_namespace_oid("sina_csd",true)) return;
     struct residency *heap=residency(oid,observations),*index=NULL;
-    double before=path->total_cost,heap_io=0,index_io=0,seq,random,index_random=0;
+    double before=path->total_cost,heap_io=0,index_io=0,descent=0,seq,random,index_random=0;
     Oid indexid=InvalidOid;
     get_tablespace_page_costs(path->parent->reltablespace,&random,&seq);
     if(path->pathtype==T_SeqScan) heap_io=Min(before-path->startup_cost,path->parent->pages*seq);
@@ -133,18 +133,25 @@ void pg_sina_cost_host_path(PlannerInfo *root,Path *path,Oid oid,List **observat
         index_cpu_cost(&cpu,root);
         index_io=Max(0,original->indextotalcost-cpu.indextotalcost);
         heap_io=Max(0,before-cpu.path.total_cost-index_io);
+        /* PG12 prices each B-tree level at 50 operator calls. A resident
+         * buffer lookup/pin has tuple bookkeeping, not 50 comparisons.
+         * Keep binary search, tuple/qual CPU and every nonresident cost. */
+        descent=Min(cpu.indextotalcost,Max(0,50*cpu_operator_cost-cpu_tuple_cost)*
+            (original->indexinfo->tree_height+1)*index->shared);
     }
-    double after=Max(path->startup_cost,before-heap_io-index_io+
+    double startup=Max(0,path->startup_cost-descent);
+    double after=Max(startup,before-heap_io-index_io-descent+
         cached_io(heap_io,path->pathtype==T_SeqScan?seq:random,heap)+
         (index?cached_io(index_io,index_random,index):0));
     if(apply) {
-        if(index) ((IndexPath *)path)->indextotalcost-=index_io-cached_io(index_io,index_random,index);
+        if(index) ((IndexPath *)path)->indextotalcost-=index_io-cached_io(index_io,index_random,index)+descent;
+        path->startup_cost=startup;
         path->total_cost=after;
     }
     {
         struct host_scan_cost *scan=MemoryContextAlloc(pg_sina_search_context(),sizeof(*scan));
         *scan=(struct host_scan_cost){.type=path->pathtype,.index=indexid,.rows=path->rows,.before=before,.after=after,
-            .cpu=Max(0,before-heap_io-index_io-path->startup_cost),.workers=path->parallel_workers};
+            .cpu=Max(0,before-heap_io-index_io-descent-startup),.workers=path->parallel_workers};
         MemoryContext previous=MemoryContextSwitchTo(pg_sina_search_context());
         heap->scans=lappend(heap->scans,scan); MemoryContextSwitchTo(previous);
     }
@@ -694,7 +701,7 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
     pipeline_tasks(tree,tasks);
     if(pg_sina_planning) pg_sina_planning->cost_buffers+=pg_sina_planner_clock()-mark;
     mark=pg_sina_planner_clock();
-    double io=0,population_bytes=0,cache_bytes=0,scan_bytes=0,blocks=0;
+    double io=0,overlap=0,population_bytes=0,cache_bytes=0,scan_bytes=0,blocks=0;
     double memory=Max(1,pg_sina_query_memory()),unit=pg_sina_host_cost_ms*pg_sina_csd_cpu_ratio;
     p->dictionary=dictionary_state(tree,observations);
     if(pg_sina_planning) pg_sina_planning->cost_dictionary+=pg_sina_planner_clock()-mark;
@@ -739,10 +746,21 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
                 }
             }
             scan_bytes+=read; cache_bytes+=hit; population_bytes+=read;
-            io+=transfer_ms(read,pg_sina_internal_mbps);
+            double read_ms=transfer_ms(read,pg_sina_internal_mbps);
+            io+=read_ms;
             blocks+=read/(n->ordered_index?QS_PAGE:tree->scan_bytes);
-            work=(input*(cpu_tuple_cost+expression)+rows*cpu_tuple_cost)*unit;
+            /* References, literals and bound parameters do not execute a
+             * scalar operator. Charge actual operations, not all IR nodes. */
+            bool direct=tree->count==1 && tree->nodes[tree->root].kind==QP_SCAN && !tree->ninit;
+            unsigned operations=direct?0:n->expr.nexprs;
+            for(unsigned j=0;direct && j<n->expr.nexprs;++j) {
+                unsigned op=n->expr.exprs[j].op;
+                operations+=op!=Q_COLUMN && op!=Q_CONST && op!=QP_PARAMETER;
+            }
+            work=(input*(cpu_tuple_cost+cpu_operator_cost*operations)+rows*cpu_tuple_cost)*unit;
+            double before=p->parallel+p->serial;
             parallel_cpu(p,work,tasks[i],cus);
+            if(direct) overlap+=cost_scan_overlap(read_ms,p->parallel+p->serial-before,tasks[i],cus);
         } else if(n->kind==QP_JOIN && n->hash && right) {
             double build=Max(0,right->estimated_rows),width=cost_hash_row(&right->expr);
             available=Max((double)QS_SORT_IO_BYTES,Min(available,memory-2*quota));
@@ -903,7 +921,7 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
     p->schedule+=ceil(p->spill/QS_SORT_IO_BYTES)*pg_sina_parallel_task_ms;
     p->io=io; p->cpu=p->serial+p->parallel+p->schedule+p->combine;
     p->population=pg_sina_hpcp_enabled() || pg_sina_dcp?transfer_ms(population_bytes,pg_sina_pcie_mbps):0;
-    double device=io+p->cpu;
+    double device=io+p->cpu-overlap;
     if(pg_sina_hpcp_enabled() || pg_sina_dcp) device=Max(device,p->population)+blocks*0.002;
     p->csd=device+2;
     p->rows=tree->nodes[tree->root].estimated_rows;
@@ -912,9 +930,14 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
         Max(1.0,p->rows/Max(1.0,p->native->plan_rows)):1;
     /* Shared CSD I/O/transfer occurs once. Only HOST tuple conversion is
      * distributed among PG consumers, using PG's partial-row estimate. */
+    double batches=Max(1,ceil(p->rows/output_capacity(p->native,&tree->nodes[tree->root].expr)));
+    if(tree->count==1 && tree->nodes[tree->root].kind==QP_SCAN && !tree->nodes[tree->root].ordered_index)
+        batches=Max(batches,tasks[tree->root]); /* CU flushes at each input block. */
     p->boundary=transfer_ms(output_bytes(p->native,&tree->nodes[tree->root].expr,p->rows),pg_sina_pcie_mbps)+
-        p->rows/consumers*cpu_tuple_cost*pg_sina_host_cost_ms+
-        Max(1,ceil(p->rows/output_capacity(p->native,&tree->nodes[tree->root].expr)))*pg_sina_result_batch_ms;
+        p->rows/consumers*cpu_operator_cost*pg_sina_host_cost_ms+batches*pg_sina_result_batch_ms;
+    if(tree->count==1 && tree->nodes[tree->root].kind==QP_SCAN && !tree->ninit)
+        scan->scan.plan.startup_cost=Min(p->csd+p->boundary,2+
+            Max(0,p->csd-2)*Min(1.0,cus/Max(1.0,tasks[tree->root]))+p->boundary/batches)/pg_sina_host_cost_ms;
     if(bytes) { memcpy(VARDATA(bytes),tree,VARSIZE_ANY_EXHDR(bytes)); pfree(tree); }
     if(pg_sina_planning) pg_sina_planning->cost_finish+=pg_sina_planner_clock()-mark;
 }
@@ -1068,6 +1091,9 @@ Plan *pg_sina_cost_device(PlannerInfo *root,Plan *native,bool top,List **observa
     if(p.device==chosen || !p.device) { MemoryContextDelete(retained); return NULL; }
     mark=pg_sina_planner_clock();
     device_cost(&p,observations,lowered,fast);
+    if(pg_sina_planning && pg_sina_is_scan(chosen)) ereport(NOTICE,(errmsg(
+        "SQLerate scan candidate relid=%u parallel=%d rows=%.0f host=%.3f device=%.3f boundary=%.3f cpu=%.3f io=%.3f",
+        scan_relation(root,chosen),chosen->parallel_aware,p.rows,p.host,p.csd,p.boundary,p.cpu,p.io)));
     if(pg_sina_planning) pg_sina_planning->estimate+=pg_sina_planner_clock()-mark;
     mark=pg_sina_planner_clock();
     annotate_device(&p,true);

@@ -32,6 +32,10 @@ int main(void)
     CHECK(cost_parallel(90,9,4,0)>90.0/4);
     CHECK(cost_parallel(80,8,4,0.02)>20);
     CHECK(cost_parallel(80,8,4,0.02)<cost_parallel(80,8,2,0.02));
+    CHECK(cost_scan_overlap(40,80,8,4)==30);
+    CHECK(cost_scan_overlap(40,80,1,4)==0);
+    CHECK(cost_scan_overlap(40,80,8,1)==0);
+    CHECK(cost_scan_overlap(40,0,8,4)==0);
     /* 4-byte PG integer + NULL, 8-byte integer + NULL, 128-bit numeric with
      * scale/dscale/NULL: packed 33 bytes, not three 32-byte cells. */
     struct qs_plan row={.nout=3};
