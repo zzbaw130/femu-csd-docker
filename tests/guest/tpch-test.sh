@@ -1,5 +1,5 @@
 #!/bin/sh
-# 正式 22 条查询，每次测量前独立冷启动；默认验证五种路径。
+# 正式22条查询，每次独立重启；默认冷缓存，PG_SINA_CACHE=warm全缓存。
 # auto_explain 只记录实际执行树，不开启逐节点 ANALYZE/TIMING 插桩。
 set -eu
 export PATH=/home/femu/opt/postgres/release/bin:$PATH
@@ -15,6 +15,7 @@ printf 'query,mode,latency_ms,result_match,execution_ok\n' > "$RESULTS/timings.c
 # CustomScan boundaries, device plan and runtime workmem/spill counters.
 export PGOPTIONS="${PGOPTIONS:-} -c session_preload_libraries=pg_sina_csd,auto_explain -c auto_explain.log_min_duration=0 -c auto_explain.log_level=notice -c auto_explain.log_analyze=off -c auto_explain.log_timing=off -c auto_explain.log_format=json"
 printf '%s\n' "$PGOPTIONS" > "$RESULTS/pgoptions.txt"
+printf '%s\n' "${PG_SINA_CACHE:-cold}" > "$RESULTS/cache-mode.txt"
 if [ "$#" -eq 0 ]; then set -- 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22; fi
 failed=0
 for query in "$@"; do

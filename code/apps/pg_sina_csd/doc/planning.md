@@ -522,3 +522,25 @@ Index Join原先跳过右侧整表扫描，却没有单独计入探测和回表�
 Q10/Q18的SQLerate与强制CSD最终设备图相同，执行主体分别约1461/795ms，对照强制HPCP约1482/811ms；Q18已不再走全量有序索引聚合。三条SQLerate均无实际spill。Q21仍选择先Hash连接orders、再进行两次lineitem索引探测，最终LIMIT留在HOST；强制CSD将orders索引探测放在后面。两者内部读取约2.262/1.552GB，执行主体1114/943ms，总时间仍相差约186ms。规则统一和严重回退修复已完成，但Q21候选排序仍非实测最优；20%兜底、均匀缓存及CPU校准仍有近似，不能宣称SQLerate总是最快，也不能把差距归因于物理内存不足。
 
 原始计时、CSV及实际计划见`results/tpch.Y91s4R/`。两项CTest通过；`results/planner-paths.8mMbBe/`增加两模式Q18聚合选择和Index Join读页估价回归，原有融合路径、HOST选择、original Q17/Q20及CTE仍通过。`results/planner-cost.nUoyRT/`验证正式Q13在64MiB查询预算下结果及估价字段；旧测试中已失效的Node Cost Estimates断言更新为当前CSD Stage Estimates。未运行完整TPC-H或低于64MiB的场景。
+
+## 三轮冷缓存与全热缓存对照
+
+本轮固定设备实现为b25f64645，沿用4CU、256MiB workmem、64MiB FDM及上述PG配置。仅为测试脚本加入`PG_SINA_CACHE=warm`，不改规划器、算子或查询。每条件、每查询、每模式独立测量3次，共660次，查询采用既定22条编号SQL；条件与非HOST模式次序按轮交替。热测每次仍先重启PG并清缓存，再顺序预热表/索引文件，用官方pg_prewarm填充shared_buffers，分别以fincore及pg_buffercache核验100%驻留。约1.43GiB文件可同时放入8GiB Guest的文件缓存及2GiB PG缓冲；预热、核验和连接初始化不计入查询时间。
+
+下表是22条查询各自总时间中位数之和，单位秒，不是连续执行一组查询的实测时间。profile统一开启，auto_explain不启用逐节点ANALYZE/TIMING。
+
+| 模式 | 冷缓存 | 全热缓存 |
+| --- | ---: | ---: |
+| host-only | 48.034 | 25.023 |
+| filter-only | 35.797 | 23.696 |
+| csd-without-hpcp | 14.549 | 14.120 |
+| csd-with-hpcp | 14.731 | 14.301 |
+| SQLerate | 15.935 | 14.880 |
+
+660份输出跨模式、轮次及冷热条件一致，330次热测缓存核验均通过，实际CSD spill读写全部为零。选中设备子树的文件驻留观测由冷测约0–0.14%升至热测100%；每个条件内三轮路径和物理计划形状均一致。冷测为19条全CSD，Q2/Q21的LIMIT留在HOST，Q20为混合；热测为17条全CSD，Q2/Q20仍混合，Q8/Q19/Q21改为全HOST。Q20两种条件下均由CSD处理lineitem/part/partsupp/supplier，HOST处理nation索引扫描、Nested Loop和最终Sort。
+
+缓存感知有效，但最优路径选择未达标。SQLerate冷测22条均快于原生PG，热测仅13条更快。热测Q3/Q4/Q5/Q7/Q10仍选CSD，而原生HOST执行主体更快；Q10的HOST/SQ总时间为631.801/1101.494ms、执行主体为571.014/1020.596ms，模型却估HOST2931.132ms、共享CSD700.793ms。HOST修正目前基于文件驻留及估算扫描量，没有单独建模PG shared_buffers；不能仅因观测到100%就认为HOST成本准确。
+
+Q8热测虽选全HOST，但共享搜索从lineitem全扫描及part Hash Join开始，原生PG则先过滤orders等关系后用lineitem_pkey探测。两者执行主体800.953/448.749ms，SQLerate总时间895.996ms，原生470.961ms；这是HOST物理候选排序问题，不只是81.681ms规划开销。Q19/Q21采用原生HOST树，Q21主体736.058ms接近原生712.978ms，但91.520ms规划使总时间增至846.387ms，对照749.093ms。Q20混合路径的热测主体831.846ms，完整HPCP卸载434.083ms，模型仍错误地偏好混合候选；差距不能归于内存不足。
+
+SQLerate规划中位数逐查询合计由冷676.504ms升到热995.211ms，其中缓存观测由3.326ms升到460.445ms，后者包含在前者内。阶段中位数独立计算，不能要求相加等于总时间中位数。设备始终内部NVM→FDM，不输入主机缓存数据。原始六组数据、全部均值/中位数/范围、阶段时间、实际计划、复现脚本与图见`results/tpch-cache.lYsAOh/`；本轮没有修正成本模型，也不将正确性通过当作性能验收通过。
