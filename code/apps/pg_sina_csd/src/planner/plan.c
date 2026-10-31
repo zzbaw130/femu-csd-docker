@@ -929,7 +929,7 @@ static int ordered_heap_scan(struct binding *b,struct qp_plan *tree,unsigned id,
     }
     return out;
 }
-static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool ordered)
+static int compile_node_impl(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool ordered)
 {
     if(!native || tree->count==QP_NODES || native->initPlan) return -1;
     unsigned id=tree->count++;
@@ -1258,6 +1258,79 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
     return id;
 }
 
+/* Cache only closed device fragments, before whole-plan statistics refinement.
+ * The starting slot is part of the key: optional rewrites depend on remaining
+ * node capacity, and retaining it also avoids renumbering device references. */
+struct lowered_fragment {
+    PlannerInfo *root;
+    unsigned first,ninit,nparams,count;
+    bool ordered;
+    int result;
+    Plan *key;
+    struct qp_node *nodes;
+};
+/* Scan/filter projections recur under many join alternatives. Their local
+ * expressions do not depend on a parent's build/probe layout. Other nodes
+ * continue through normal lowering so cross-operator rewrites stay intact. */
+static bool memo_plan(Plan *p)
+{
+    return p && !p->initPlan && !p->lefttree && !p->righttree &&
+        (IsA(p,SeqScan) || IsA(p,IndexScan) || IsA(p,IndexOnlyScan));
+}
+static bool same_lowering_plan(const Plan *a,const Plan *b)
+{
+    if(nodeTag(a)!=nodeTag(b) || ((const Scan *)a)->scanrelid!=((const Scan *)b)->scanrelid ||
+       a->plan_rows!=b->plan_rows || a->plan_width!=b->plan_width || a->parallel_aware!=b->parallel_aware ||
+       !equal(a->targetlist,b->targetlist) || !equal(a->qual,b->qual)) return false;
+    if(IsA(a,IndexScan)) {
+        const IndexScan *x=(const IndexScan *)a,*y=(const IndexScan *)b;
+        return x->indexid==y->indexid && x->indexorderdir==y->indexorderdir &&
+            equal(x->indexqualorig,y->indexqualorig) && equal(x->indexqual,y->indexqual) &&
+            equal(x->indexorderby,y->indexorderby) && equal(x->indexorderbyorig,y->indexorderbyorig);
+    }
+    if(IsA(a,IndexOnlyScan)) {
+        const IndexOnlyScan *x=(const IndexOnlyScan *)a,*y=(const IndexOnlyScan *)b;
+        return x->indexid==y->indexid && x->indexorderdir==y->indexorderdir && equal(x->indexqual,y->indexqual) &&
+            equal(x->indextlist,y->indextlist) && equal(x->recheckqual,y->recheckqual) && equal(x->indexorderby,y->indexorderby);
+    }
+    return true;
+}
+static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool ordered)
+{
+    if(pg_sina_planning) ++pg_sina_planning->lower_calls;
+    List **cache=pg_sina_search_lowering_cache();
+    if(!cache || pg_sina_native_search || !native || !memo_plan(native))
+        return compile_node_impl(root,native,tree,ordered);
+    unsigned first=tree->count,ninit=tree->ninit,nparams=tree->nparams;
+    ListCell *c;
+    foreach(c,*cache) {
+        const struct lowered_fragment *m=lfirst(c);
+        if(m->root!=root || m->first!=first || m->ordered!=ordered ||
+           m->ninit!=ninit || m->nparams!=nparams || !same_lowering_plan(native,m->key)) continue;
+        memcpy(tree->nodes+first,m->nodes,m->count*sizeof(*m->nodes)); tree->count+=m->count;
+        if(pg_sina_planning) { ++pg_sina_planning->lower_hits; pg_sina_planning->lower_reused_nodes+=m->count; }
+        return m->result;
+    }
+    int result=compile_node_impl(root,native,tree,ordered);
+    bool closed=result>=(int)first && tree->ninit==ninit && tree->nparams==nparams;
+    for(unsigned i=first;closed && i<tree->count;++i) {
+        const struct qp_node *n=&tree->nodes[i];
+        if((n->left>=0 && (unsigned)n->left<first) || (n->right>=0 && (unsigned)n->right<first) ||
+           n->kind==QP_CTE_SCAN || n->kind==QP_SET) closed=false;
+        for(unsigned j=0;closed && j<n->expr.nexprs;++j)
+            if(n->expr.exprs[j].op==QP_PARAMETER || n->expr.exprs[j].op==QP_INSET) closed=false;
+    }
+    if(closed) {
+        MemoryContext previous=MemoryContextSwitchTo(pg_sina_search_context());
+        struct lowered_fragment *m=palloc(sizeof(*m));
+        *m=(struct lowered_fragment){.root=root,.first=first,.ordered=ordered,
+            .ninit=ninit,.nparams=nparams,.count=tree->count-first,.result=result,.key=copyObject(native)};
+        m->nodes=palloc(m->count*sizeof(*m->nodes)); memcpy(m->nodes,tree->nodes+first,m->count*sizeof(*m->nodes));
+        *cache=lappend(*cache,m); MemoryContextSwitchTo(previous);
+    }
+    return result;
+}
+
 /* These expressions describe device output slots, not host computation.
  * A relabelled NULL keeps parameter type metadata and remains a non-Const
  * expression that setrefs will replace by the matching output slot. */
@@ -1298,7 +1371,7 @@ static bool scan_parameter(Node *node,struct scan_parameters *parameters)
     }
     return expression_tree_walker(node,scan_parameter,parameters);
 }
-Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
+static Plan *compile_subtree(PlannerInfo *root,Plan *native,bool boundary,struct qp_plan **lowered)
 {
     bool host_scan=pg_sina_exe_path==PG_SINA_FILTER;
     struct scan_parameters parameters={.root=root};
@@ -1310,7 +1383,10 @@ Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
     }
     /* Nodes are initialized when appended. Clearing the complete runtime
      * record (96 nodes plus execution-only arrays) for every Path is costly. */
-    struct qp_plan *tree=palloc(sizeof(*tree));
+    /* Candidate estimation is serial. Its aligned tree lives until the next
+     * candidate, and never backs an executable Const or a cached fragment. */
+    bool reusable=lowered && pg_sina_path_search;
+    struct qp_plan *tree=reusable?pg_sina_lowering_workspace():palloc(sizeof(*tree));
     memset(tree,0,offsetof(struct qp_plan,nodes));
     for(unsigned i=0;i<QP_PARAMS;++i) tree->param_nodes[i]=tree->cte_nodes[i]=-1;
     ListCell *c;
@@ -1321,12 +1397,12 @@ Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
     foreach(c,host_scan?NIL:root->init_plans) {
         SubPlan *sub=lfirst(c);
         if(sub->subLinkType==CTE_SUBLINK) continue;
-        if(sub->subLinkType!=EXPR_SUBLINK || sub->parParam || sub->args || list_length(sub->setParam)!=1 || tree->ninit==QP_PARAMS) { pfree(tree); return native; }
+        if(sub->subLinkType!=EXPR_SUBLINK || sub->parParam || sub->args || list_length(sub->setParam)!=1 || tree->ninit==QP_PARAMS) { goto failed; }
         int param=linitial_int(sub->setParam);
-        if(param<0 || param>=QP_PARAMS) { pfree(tree); return native; }
+        if(param<0 || param>=QP_PARAMS) { goto failed; }
         int id=compile_tree(list_nth(root->glob->subroots,sub->plan_id-1),
             list_nth(root->glob->subplans,sub->plan_id-1),tree);
-        if(id<0) { pfree(tree); return native; }
+        if(id<0) { goto failed; }
         tree->param_nodes[param]=id; tree->nparams=Max(tree->nparams,(unsigned)param+1);
         unsigned init=tree->ninit++; tree->init_nodes[init]=id; tree->init_params[init]=param;
     }
@@ -1335,33 +1411,40 @@ Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
     int result=-1;
     if(normalize_parallel_aggregate(&copy) && prune_columns(copy,NULL,true))
         result=compile_node(root,copy,tree,boundary || root->parse->sortClause!=NIL);
-    if(result<0) { pfree(tree); return native; }
+    if(result<0) { goto failed; }
     bool has_scan=false;
     for(unsigned i=0;i<tree->count;++i) {
         has_scan|=tree->nodes[i].kind==QP_SCAN;
         for(unsigned j=0;j<tree->nodes[i].expr.nexprs;++j) {
             struct qs_expr *e=&tree->nodes[i].expr.exprs[j];
-            if(e->op==QP_PARAMETER && tree->param_nodes[e->column]<0 && tree->param_nodes[e->column]!=QP_HOST_PARAMETER) { pfree(tree); return native; }
+            if(e->op==QP_PARAMETER && tree->param_nodes[e->column]<0 && tree->param_nodes[e->column]!=QP_HOST_PARAMETER) { goto failed; }
         }
     }
-    if(!has_scan) { pfree(tree); return native; }
+    if(!has_scan) { goto failed; }
     Oid ns=get_namespace_oid("sina_csd",true);
-    if(!OidIsValid(ns) || !OidIsValid(get_relname_relid("relations",ns))) { pfree(tree); return native; }
+    if(!OidIsValid(ns) || !OidIsValid(get_relname_relid("relations",ns))) { goto failed; }
     bool prepared=true; char device[128]={0};
     for(unsigned i=0;i<tree->count && prepared;++i) if(tree->nodes[i].kind==QP_SCAN) {
         char path[128]={0};
         prepared=pg_sina_prepared_device(tree->nodes[i].expr.relid,tree->nodes[i].expr.relfilenode,path,sizeof(path));
         if(prepared && !device[0]) strlcpy(device,path,sizeof(device));
     }
-    if(!prepared) { pfree(tree); return native; }
+    if(!prepared) { goto failed; }
     tree->root=result;
     pg_sina_refine_groups(tree);
     pg_sina_read_resources(device);
     if(pg_sina_exe_path==PG_SINA_FILTER && native->parallel_aware &&
-       (!IsA(native,SeqScan) || pg_sina_resources.cus<2)) { pfree(tree); return native; }
+       (!IsA(native,SeqScan) || pg_sina_resources.cus<2)) { goto failed; }
     tree->nodes[result].expr.work_mem_bytes=pg_sina_query_memory();
-    size_t length=qp_plan_constant_bytes(tree);
-    bytea *bytes=palloc(VARHDRSZ+length); SET_VARSIZE(bytes,VARHDRSZ+length); memcpy(VARDATA(bytes),tree,length); pfree(tree);
+    Const *program=NULL;
+    if(lowered) *lowered=tree;
+    else {
+        if(pg_sina_planning) ++pg_sina_planning->serialized_plans;
+        size_t length=qp_plan_constant_bytes(tree);
+        bytea *bytes=palloc(VARHDRSZ+length); SET_VARSIZE(bytes,VARHDRSZ+length);
+        memcpy(VARDATA(bytes),tree,length); pfree(tree);
+        program=makeConst(BYTEAOID,-1,InvalidOid,-1,PointerGetDatum(bytes),false,false);
+    }
     CustomScan *scan=makeNode(CustomScan);
     scan->scan.plan=*native; NodeSetTag(scan,T_CustomScan);
     scan->scan.plan.lefttree=scan->scan.plan.righttree=NULL;
@@ -1374,10 +1457,17 @@ Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
     scan->scan.plan.targetlist=(List *)device_output_expression((Node *)native->targetlist,NULL);
     scan->custom_scan_tlist=copyObject(scan->scan.plan.targetlist);
     scan->custom_exprs=parameters.values; /* PG tracks dependencies and evaluates InitPlans. */
-    scan->custom_private=list_make1(makeConst(BYTEAOID,-1,InvalidOid,-1,PointerGetDatum(bytes),false,false));
+    scan->custom_private=list_make1(program);
     scan->methods=&pg_sina_plan_methods;
     return (Plan *)scan;
+failed:
+    if(!reusable) pfree(tree);
+    return native;
 }
+Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
+{ return compile_subtree(root,native,boundary,NULL); }
+Plan *pg_sina_lower_subtree(PlannerInfo *root,Plan *native,bool boundary,struct qp_plan **lowered)
+{ return compile_subtree(root,native,boundary,lowered); }
 Plan *pg_sina_rewrite_plan(PlannerInfo *root,Plan *native)
 { return pg_sina_compile_subtree(root,native,false); }
 

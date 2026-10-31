@@ -21,6 +21,17 @@ grep -q 'CSD Stage Estimates:.*Join' "$OUT/joins.plan"
 if grep -q 'SQLerate planner total_ms=' "$OUT/joins.err"; then exit 1; fi
 plan 9 SQLerate timed 'SET pg_sina_csd.profile=on'
 grep -q 'SQLerate planner total_ms=.*compile_ms=.*estimate_ms=' "$OUT/timed.err"
+# Repeated scans should reuse lowering; executable records must not grow
+# with the hundreds of accepted Q9 cost candidates.
+awk '/SQLerate planner total_ms=/ {
+    for (i=1; i<=NF; ++i) {
+        split($i, field, "=")
+        if (field[1]=="accepted") accepted=field[2]+0
+        if (field[1]=="lower_hits") hits=field[2]+0
+        if (field[1]=="serialized_plans") serialized=field[2]+0
+    }
+    ok=(hits>0 && serialized>0 && serialized<accepted)
+} END {exit !ok}' "$OUT/timed.err"
 # A common rewrite may also produce a better HOST candidate. It must not
 # silently replace the original native-PG baseline or require a CSD operator.
 plan 17.original host-only original

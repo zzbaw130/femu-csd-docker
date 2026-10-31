@@ -22,6 +22,7 @@ struct pg_sina_planner_profile {
     double native_pg,adaptive_pg;
     double indexes,resources;
     unsigned candidates,accepted,index_calls,index_queries;
+    unsigned lower_calls,lower_hits,lower_reused_nodes,serialized_plans;
 };
 extern struct pg_sina_planner_profile *pg_sina_planning;
 static inline double pg_sina_planner_clock(void)
@@ -51,6 +52,8 @@ void pg_sina_start_path_search(void);
 MemoryContext pg_sina_search_context(void);
 List **pg_sina_search_observations(void);
 List **pg_sina_search_index_metadata(void);
+List **pg_sina_search_lowering_cache(void);
+struct qp_plan *pg_sina_lowering_workspace(void);
 PlannedStmt *pg_sina_original_device_statement(PlannedStmt *);
 bool pg_sina_prepared_device(Oid,Oid,char *,size_t);
 void pg_sina_rel_paths(PlannerInfo *,RelOptInfo *,Index,RangeTblEntry *);
@@ -67,6 +70,9 @@ void pg_sina_upper_paths(PlannerInfo *, UpperRelationKind, RelOptInfo *, RelOptI
 bool pg_sina_rewrite_query(Query *q);
 Plan *pg_sina_rewrite_plan(PlannerInfo *,Plan *);
 Plan *pg_sina_compile_subtree(PlannerInfo *,Plan *,bool);
+/* Cost-only metadata and a borrowed aligned tree, valid until the next
+ * candidate. The returned CustomScan has no executable Const. */
+Plan *pg_sina_lower_subtree(PlannerInfo *,Plan *,bool,struct qp_plan **);
 void pg_sina_refine_groups(struct qp_plan *);
 Plan *pg_sina_adaptive_plan(PlannerInfo *,Plan *);
 void pg_sina_explain_placement(CustomScan *,ExplainState *);

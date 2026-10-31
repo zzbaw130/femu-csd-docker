@@ -482,18 +482,24 @@ static void fast_cost(struct placement *p,const struct qs_plan *plan,List **obse
     appendStringInfo(p->stages,"fused Scan/Filter/Aggregate tasks=%.0f groups=%.0f partial_rows=%.0f state=%.0fB spill=%.0fB",
         tasks,groups,partial,p->peak,p->spill);
 }
-static void device_cost(struct placement *p,List **observations)
+static void device_cost(struct placement *p,List **observations,struct qp_plan *lowered)
 {
     CustomScan *scan=(CustomScan *)p->device;
-    Const *constant=linitial_node(Const,scan->custom_private);
-    bytea *bytes=DatumGetByteaP(constant->constvalue);
+    bytea *bytes=NULL;
     if(scan->methods==&pg_sina_scan_methods) {
+        Const *constant=linitial_node(Const,scan->custom_private);
+        bytes=DatumGetByteaP(constant->constvalue);
         fast_cost(p,(const struct qs_plan *)VARDATA(bytes),observations); return;
     }
-    /* Costing reads only the serialized header/nodes. Runtime file mappings
-     * and profiling arrays are not present in this planner representation. */
-    struct qp_plan *tree=palloc(VARSIZE_ANY_EXHDR(bytes));
-    memcpy(tree,VARDATA(bytes),VARSIZE_ANY_EXHDR(bytes));
+    /* Search candidates borrow an aligned tree directly. Retained executable
+     * plans own a Const, which must be copied before changing cost metadata. */
+    struct qp_plan *tree=lowered;
+    if(!tree) {
+        Const *constant=linitial_node(Const,scan->custom_private);
+        bytes=DatumGetByteaP(constant->constvalue);
+        tree=palloc(VARSIZE_ANY_EXHDR(bytes));
+        memcpy(tree,VARDATA(bytes),VARSIZE_ANY_EXHDR(bytes));
+    }
     bool used[QP_NODES]={0},indexed[QP_NODES]={0}; used[tree->root]=true;
     for(unsigned i=0;i<tree->ninit;++i) used[tree->init_nodes[i]]=true;
     for(unsigned pass=0;pass<tree->count;++pass) for(unsigned i=0;i<tree->count;++i) if(used[i]) {
@@ -669,8 +675,7 @@ static void device_cost(struct placement *p,List **observations)
     p->boundary=transfer_ms(output_bytes(p->native,&tree->nodes[tree->root].expr,p->rows),pg_sina_pcie_mbps)+
         p->rows*cpu_tuple_cost*pg_sina_host_cost_ms+
         Max(1,ceil(p->rows/output_capacity(p->native,&tree->nodes[tree->root].expr)))*pg_sina_result_batch_ms;
-    memcpy(VARDATA(bytes),tree,VARSIZE_ANY_EXHDR(bytes));
-    pfree(tree);
+    if(bytes) { memcpy(VARDATA(bytes),tree,VARSIZE_ANY_EXHDR(bytes)); pfree(tree); }
 }
 static struct placement *estimate(PlannerInfo *root,Plan *native,Plan *scope,List **observations,bool top,bool mark_restore,bool parallel_region)
 {
@@ -724,7 +729,7 @@ static struct placement *estimate(PlannerInfo *root,Plan *native,Plan *scope,Lis
         Plan *candidate=pg_sina_exe_path==PG_SINA_FILTER?pg_sina_project_scan(scope,native):native;
         Plan *device=top && pg_sina_exe_path!=PG_SINA_FILTER?pg_sina_fast_plan(root,native):NULL;
         if(!device) device=pg_sina_compile_subtree(root,candidate,!top);
-        if(device!=candidate) { p->device=device; device_cost(p,observations); }
+        if(device!=candidate) { p->device=device; device_cost(p,observations,NULL); }
     }
     p->offload=p->device && (pg_sina_exe_path!=PG_SINA_ADAPTIVE || p->csd+p->boundary<p->host);
     return p;
@@ -782,12 +787,14 @@ Plan *pg_sina_cost_device(PlannerInfo *root,Plan *native,bool top,List **observa
     struct placement p={.native=native,.root=root,.host=native->total_cost*pg_sina_host_cost_ms};
     if(!top && root->init_plans) return NULL;
     double mark=pg_sina_planner_clock();
+    struct qp_plan *lowered=NULL;
     p.device=top?pg_sina_fast_plan(root,native):NULL;
-    if(!p.device) p.device=pg_sina_compile_subtree(root,native,!top);
+    if(!p.device) p.device=pg_sina_native_search?pg_sina_compile_subtree(root,native,!top):
+        pg_sina_lower_subtree(root,native,!top,&lowered);
     if(pg_sina_planning) pg_sina_planning->compile+=pg_sina_planner_clock()-mark;
     if(p.device==native || !p.device) return NULL;
     mark=pg_sina_planner_clock();
-    device_cost(&p,observations);
+    device_cost(&p,observations,lowered);
     if(pg_sina_planning) pg_sina_planning->estimate+=pg_sina_planner_clock()-mark;
     mark=pg_sina_planner_clock();
     annotate_device(&p);

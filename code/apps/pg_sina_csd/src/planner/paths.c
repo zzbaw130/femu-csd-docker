@@ -20,7 +20,12 @@ struct path_relation {
     List *pending;
 };
 struct prepared_relation { Oid relid,filenode; bool prepared; char device[128]; };
-struct pg_sina_path_search { List *relations,*observations,*prepared,*indexes; StringInfo estimates; MemoryContext memory; };
+struct pg_sina_path_search {
+    List *relations,*observations,*prepared,*indexes,*lowered;
+    StringInfo estimates;
+    MemoryContext memory;
+    struct qp_plan *workspace;
+};
 struct pg_sina_path_search *pg_sina_path_search;
 bool pg_sina_native_search,pg_sina_previewing_path;
 static const CustomPathMethods device_methods,final_methods;
@@ -37,6 +42,14 @@ List **pg_sina_search_observations(void)
 { return pg_sina_path_search?&pg_sina_path_search->observations:NULL; }
 List **pg_sina_search_index_metadata(void)
 { return pg_sina_path_search?&pg_sina_path_search->indexes:NULL; }
+List **pg_sina_search_lowering_cache(void)
+{ return pg_sina_path_search?&pg_sina_path_search->lowered:NULL; }
+struct qp_plan *pg_sina_lowering_workspace(void)
+{
+    if(!pg_sina_path_search->workspace)
+        pg_sina_path_search->workspace=MemoryContextAlloc(pg_sina_search_context(),sizeof(struct qp_plan));
+    return pg_sina_path_search->workspace;
+}
 /* A planning invocation may compile hundreds of overlapping subtrees. The
  * immutable mapping is the same for all of them; query SPI once per table. */
 bool pg_sina_prepared_device(Oid relid,Oid filenode,char *device,size_t length)

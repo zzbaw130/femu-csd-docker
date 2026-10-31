@@ -354,7 +354,7 @@ Q2的原生SubPlan索引条件仍引用外层`part.p_partkey`，完整CSD模式�
 
 ## HOST/CSD 共享路径搜索验证
 
-本阶段只修改 Guest 扩展的规划结构，不改变 SNIA、固件、设备算子或设备成本系数。候选预览使用隔离的 PG 规划状态；落选候选的编译内存在临时 MemoryContext 中回收，只保留原生计划与成本信息，最终选中后重新编译。表映射在一次搜索内按关系/文件节点复用，搜索结束即失效，避免为重叠子树反复执行同一 SPI 查询。
+本阶段只修改 Guest 扩展的规划结构，不改变 SNIA、固件、设备算子或设备成本系数。候选预览使用隔离的 PG 规划状态；候选的临时内存在估价后回收，只保留原生计划与成本信息，最终选中后生成执行记录。扫描转换和估价工作区的查询内复用见下节。表映射在一次搜索内按关系/文件节点复用，搜索结束即失效，避免为重叠子树反复执行同一 SPI 查询。
 
 已有 HeapLayout、PlannerCost 两个 CTest 通过。新增 `tests/guest/planner-path-test.sh` 只执行正式查询的 EXPLAIN：昂贵设备选 HOST、便宜设备可选 CSD；原始 Q17 的 host-only 保留 SubPlan，而昂贵设备条件下 SQLerate 选择去相关后的全 HOST；原始 Q17/Q20 的设备候选可生成。最终结构记录为 `results/planner-paths.AEuDWW/`。
 
@@ -388,3 +388,22 @@ Q2的原生SubPlan索引条件仍引用外层`part.p_partkey`，完整CSD模式�
 候选数/成功数仍分别为Q2的323/248、Q9的308/306，优化前后各3份计划的执行位置与设备算子图一致。剩余明显成本是估价约22/35ms，以及每个新backend一次的容量发现约23ms（包含在编译中，同backend后续查询可复用）。这仍不是固定20ms的规划器，也不保证选中实测最快路径。
 
 记录在 `results/planner-profile-before.lxA4gL/`、`results/planner-profile-final.SoycuI/`；后者含逐次CSV、统计JSON及报告。关闭profile后，仅对正式Q2/Q9/Q16/Q18做三模式冷启动实际执行，`results/tpch.MX3Jiv/`的12次均成功且结果一致。HeapLayout/PlannerCost单元测试和计时开关/路径结构回归通过。节点初始化还用微型MATERIALIZED CTE核对三模式均返回4，并修正了预览过早清除CTE生产者登记的问题；临时SQL已删除。未运行完整TPC-H。
+
+## 候选转换复用
+
+这里的“编译”是把 PG Plan 转成设备算子记录，不是编译 CSF 的 `.so`。SQLerate 必须比较不同 Join 算法、输入布局及目标列，不能把第一份完整设备计划直接用于所有候选。本轮只消除这些候选之间确实相同的工作，保持搜索空间与成本公式不变：
+
+1. 共享 Path 搜索的通用候选在一份对齐工作区中生成临时算子树，估价器直接读取它。省去每个候选先生成执行 Const、再复制出来估价、再写回的往返。工作区只供当前候选使用，下一候选重置；保留的原始完整设备候选及最终选中的设备子树才生成执行 Const。专用 Scan/Aggregate 继续使用既有小型记录。
+2. 同一规划内复用扫描、过滤和列投影的转换结果。匹配 PlannerInfo、扫描/索引、表达式、目标列、基数、顺序要求、节点起始位置和参数计数；只保存不引用其他片段、参数或集合状态的闭合片段。Param、SubPlan、CTE 等共享状态不进入此缓存。保存的是全树统计修正及父算子改写前的副本，命中后复制到当前候选，父节点仍可正常调整 build/probe、下推条件和聚合。
+3. 缓存与工作区仅存活于一次规划，不跨 SQL 复用。不同 Join/Aggregate 布局仍需转换，不能声称所有设备候选只编译一次。
+
+相同 RelWithDebInfo 构建、4 CU/256MiB workmem/64MiB FDM，修改前后交替顺序各测4次正式 Q2/Q9 冷启动 EXPLAIN。表中为各项自身的中位数：
+
+| 查询 | 总规划前→后 ms | 转换＋估价前→后 ms，不含设备发现 | 扫描转换复用命中 | 通用执行 Const 数 |
+| --- | ---: | ---: | ---: | ---: |
+| Q2 | 122.900→122.864 | 60.604→48.406 | 903 | 1 |
+| Q9 | 130.560→129.483 | 63.854→53.448 | 973 | 2 |
+
+“转换＋估价”逐次按 `compile_ms - resources_inclusive_ms + estimate_ms` 计算，分别下降约20%/16%，不是总规划加速。总规划收益仍有限；候选保留/回收阶段约9ms，PG搜索、首次设备发现及最终执行记录生成也仍有开销。不能将局部收益解释为查询总延迟下降20%。
+
+Q2/Q9 的候选数/成功数保持323/248、308/306；修改前后各4份计划的执行位置、设备算子图及阶段估计完全一致。原始日志、逐次CSV、统计JSON及报告在 `results/planner-lowering-paired.3ImULC/`。正式Q2/Q9/Q16/Q18的host-only、csd-with-hpcp、SQLerate共12次冷启动执行全部成功且结果一致，记录在 `results/tpch.gC7gxJ/`；HeapLayout/PlannerCost及路径、profile开关、复用断言、original Q17/Q20和CTE结构回归通过，记录在 `results/planner-paths.yFFBGF/`。微型MATERIALIZED CTE三模式实际执行均返回4，临时SQL已删除。本轮未运行完整TPC-H。
