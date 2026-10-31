@@ -215,10 +215,11 @@ static void close_state(void *arg)
         pthread_mutex_unlock(&s->advance_mutex);
     }
     for(unsigned w=0;w<=s->workers;++w) if(s->slots[w].pending) {
-        pthread_mutex_lock(&s->slots[w].mutex);
-        if(!atomic_load_explicit(&s->slots[w].completed,memory_order_acquire)) csAbortRequest(s->slots[w].inflight);
-        pthread_mutex_unlock(&s->slots[w].mutex);
-        while(!atomic_load_explicit(&s->slots[w].completed,memory_order_acquire)) pg_usleep(50L);
+        /* The stopping flag prevents callbacks from claiming another block.
+         * Drain current bounded blocks so their input DMA references finish. */
+        while(!atomic_load_explicit(&s->slots[w].completed,memory_order_acquire)) {
+            pg_sina_dcp_poll(); pg_usleep(50L);
+        }
         s->slots[w].pending=NULL;
     }
     /* completed is published before a callback advances peer slots. Wait for
@@ -1001,6 +1002,7 @@ static void fetch(PlanStateCsd *s)
             if(produced<0) checked(s->execution_status,s->execution_operation);
             if(produced>0) { s->row=0; return; }
         }
+        pg_sina_dcp_poll();
         uint64_t idle=s->profiling?clock_ns():0;
         pg_usleep(50L);
         if(s->profiling) { uint64_t slept=clock_ns()-idle; s->idle_ns+=slept; empty+=slept; }

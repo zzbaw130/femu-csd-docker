@@ -727,7 +727,7 @@ static void fast_cost(struct placement *p,const struct qs_plan *plan,List **obse
         cost_spill_io(p->spill,pg_sina_internal_mbps,pg_sina_internal_write_mbps);
     p->schedule+=ceil(p->spill/QS_SORT_IO_BYTES)*pg_sina_parallel_task_ms;
     p->cpu=p->parallel+p->schedule+p->combine;
-    p->population=pg_sina_hpcp_enabled()?transfer_ms(r->bytes,pg_sina_pcie_mbps):0;
+    p->population=pg_sina_hpcp_enabled() || pg_sina_dcp?transfer_ms(r->bytes,pg_sina_pcie_mbps):0;
     p->csd=Max(p->io+p->cpu,p->population)+2;
     p->boundary=transfer_ms(Max(1,ceil(rows/QS_RESULT_ROWS))*offsetof(struct qs_result,str_data),pg_sina_pcie_mbps)+
         rows*cpu_tuple_cost*pg_sina_host_cost_ms+Max(1,ceil(rows/QS_RESULT_ROWS))*pg_sina_result_batch_ms;
@@ -977,9 +977,9 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
     io+=cost_spill_io(p->spill,pg_sina_internal_mbps,pg_sina_internal_write_mbps);
     p->schedule+=ceil(p->spill/QS_SORT_IO_BYTES)*pg_sina_parallel_task_ms;
     p->io=io; p->cpu=p->serial+p->parallel+p->schedule+p->combine;
-    p->population=pg_sina_hpcp_enabled()?transfer_ms(population_bytes,pg_sina_pcie_mbps):0;
+    p->population=pg_sina_hpcp_enabled() || pg_sina_dcp?transfer_ms(population_bytes,pg_sina_pcie_mbps):0;
     double device=io+p->cpu;
-    if(pg_sina_hpcp_enabled()) device=Max(device,p->population)+blocks*0.002;
+    if(pg_sina_hpcp_enabled() || pg_sina_dcp) device=Max(device,p->population)+blocks*0.002;
     p->csd=device+2;
     p->rows=tree->nodes[tree->root].estimated_rows;
     scan->scan.plan.plan_rows=p->rows;
@@ -1213,6 +1213,7 @@ void pg_sina_explain_placement(CustomScan *scan,ExplainState *es)
 {
     ExplainPropertyText("Execution Mode",pg_sina_path_name(),es);
     ExplainPropertyText("HPCP",pg_sina_hpcp_enabled()?"enabled":"disabled",es);
+    ExplainPropertyText("DCP",pg_sina_dcp?"shared_buffers":"disabled",es);
     ExplainPropertyText("Input Source","internal NVM to FDM",es);
     if(list_length(scan->custom_private)>1) {
         List *v=lsecond(scan->custom_private);
@@ -1253,6 +1254,7 @@ static void adaptive_explain(CustomScanState *s,List *ancestors,ExplainState *es
     CustomScan *scan=(void *)s->ss.ps.plan;
     ExplainPropertyText("Execution Mode",pg_sina_path_name(),es);
     ExplainPropertyText("HPCP",pg_sina_hpcp_enabled()?"enabled for CSD islands":"disabled",es);
+    ExplainPropertyText("DCP",pg_sina_dcp?"shared_buffers":"disabled",es);
     ExplainPropertyText("Placement Costs","milliseconds; estimates, not execution timings",es);
     ExplainPropertyText("Placement",strVal(linitial(scan->custom_private)),es);
     const char *costs=strVal(lsecond(scan->custom_private));

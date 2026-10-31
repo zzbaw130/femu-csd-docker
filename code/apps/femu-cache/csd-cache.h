@@ -38,4 +38,14 @@ struct femu_cache_mapping { int fd; fc_u32 nsid; fc_u64 lba_bytes, file_offset, 
 #define FEMU_CACHE_RX_PUBLISH _IO(0xfc,4)
 #define FEMU_CACHE_RX_BIND _IO(0xfc,5)
 #define FEMU_CACHE_RX_UNBIND _IO(0xfc,6)
+/* External database consumer: mmap data at this offset, then ACQUIRE/RELEASE
+ * one complete slot. RELEASE may also publish the same bytes to file cache. */
+#define FEMU_CACHE_DATA_OFFSET FEMU_CACHE_PAGE_BYTES
+#define FEMU_CACHE_DATA_BYTES (FEMU_CACHE_RX_SLOTS*FEMU_CACHE_BLOCK_BYTES)
+#define FEMU_CACHE_RX_ACQUIRE _IO(0xfc,7)
+#define FEMU_CACHE_RX_RELEASE _IO(0xfc,8)
+#define FEMU_CACHE_RELEASE_HPCP 0x100U
+/* FEMU csConfig(CS_VENDOR_SPECIFIC) input: borrow this prepared receiver.
+ * The adapter duplicates the fd; the caller consumes its data, not a thread. */
+struct femu_cache_config { int receive_fd; };
 #endif

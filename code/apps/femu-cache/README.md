@@ -39,6 +39,16 @@ sudo chown "$(id -un):$(id -gn)" /dev/femu-cache
 
 需要匹配的 FEMU 固件和 SNIA 插件，使用发行版原生 NVMe 驱动，无需修改内核 NVMe 模块。
 
+## 数据库缓存消费者（DCP）
+
+PG扩展可选择把设备返回的原始页填入自身的shared_buffers，称为Database Cache Population（DCP）。设备DMA和现有32MiB接收环保持不变，不需要重新编译FEMU固件。模块的接收数据使用可映射的零初始化vmalloc内存；除原有完成记录外，允许在`FEMU_CACHE_DATA_OFFSET`偏移以只读方式映射整个数据区。
+
+调用者先SETUP、映射接收环，再通过SNIA `csConfig(CS_VENDOR_SPECIFIC)`传入`struct femu_cache_config { receive_fd; }`。这是本项目FEMU插件的厂商配置，不是SNIA定义的DCP API。适配器复制这个fd，绑定设备图会话；此模式不启动库内HPCP消费线程，接收槽由调用者独占消费。未配置外部消费者时，原HPCP后台线程行为保持不变。
+
+每个ready槽依次执行`FEMU_CACHE_RX_ACQUIRE(slot)`、从只读映射使用数据、`FEMU_CACHE_RX_RELEASE(slot)`。ACQUIRE/RELEASE只做Guest端DMA同步和内存所有权交接，不提交逐块NVMe请求；RELEASE携带`FEMU_CACHE_RELEASE_HPCP`时，还会把同一份接收数据发布到文件页缓存，然后归还槽位。因此DCP-only不写文件页缓存，双开也只传输一份数据。调用者结束时先停止设备DMA，再排空已接收槽位并解除映射/关闭fd。
+
+PG缓冲管理接口只能由PG backend调用，不能放进SNIA pthread；PG的具体导入逻辑在`pg_sina_csd/src/executor/cache.c`。当前使用PG12 `ReadBufferExtended(RBM_ZERO_AND_LOCK)`避免重新读盘，保留已有有效/脏页，仅安装完整且校验通过的8KiB页，不拼装跨接收块或extent的残缺页。只读镜像保证磁盘页与数据库版本一致。
+
 SNIA 按其 [README](../snia/README.md) 编译安装。应用仍只包含 `cs.h`、链接 `-lsnia`；文件映射注册接口由本目录头文件提供，PG 已使用此接口。
 
 ## 验证与计时

@@ -1,5 +1,6 @@
 /* SNIA CSF download, activation and device-property queries. */
 #include "femu_internal.h"
+#include "csd-cache.h"
 #include <stdio.h>
 CS_STATUS femu_CSFDownload(void *device, const CsCSFDownloadInfo *info, u32 *out)
 {
@@ -77,6 +78,15 @@ CS_STATUS femu_config(void *device, int *length, const CsConfigInfo *info, CsCon
     if (!info || !length)
         return CS_INVALID_ARG;
     struct cs_device *d = device;
+    if(info->Type==CS_VENDOR_SPECIFIC) {
+        if(!info->u.VSInfo.VSData) return CS_INVALID_ARG;
+        CS_STATUS status=cs_output(length,out,sizeof(*out));
+        if(status!=CS_SUCCESS) return status;
+        const struct femu_cache_config *cache=info->u.VSInfo.VSData;
+        status=femu_hpcp_configure(d,cache->receive_fd);
+        if(status==CS_SUCCESS) memset(out,0,sizeof(*out));
+        return status;
+    }
     CS_STATUS s;
     pthread_mutex_lock(&cs_catalog_lock);
     if (info->Type != CS_CSF_ACTIVATE) {

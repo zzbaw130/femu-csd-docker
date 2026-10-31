@@ -12,7 +12,7 @@ struct cs_cache_receiver {
     int fd;
     struct femu_cache_slot *slots;
     pthread_t worker;
-    bool stopping,profile;
+    bool stopping,profile,external;
     uint64_t calls,ioctl_ns,sleep_ns,worker_ns,worker_cpu_ns;
     uint64_t setup_ns,bind_ns,stop_ns,join_ns;
 };
@@ -54,20 +54,25 @@ static void *receive_cache(void *opaque)
 CS_STATUS femu_hpcp_start(struct cs_device *d)
 {
     const char *enabled=getenv("SNIA_FEMU_HPCP");
-    if(d->cache || !enabled || strcmp(enabled,"1")) return CS_SUCCESS;
+    if(d->cache || (!d->cache_external && (!enabled || strcmp(enabled,"1")))) return CS_SUCCESS;
     struct cs_cache_receiver *r=calloc(1,sizeof(*r));
     if(!r) return CS_OUT_OF_RESOURCES;
     r->profile=d->profile;
     uint64_t start=r->profile?cache_clock(CLOCK_MONOTONIC):0;
-    r->fd=open("/dev/femu-cache",O_RDWR|O_CLOEXEC);
+    r->external=d->cache_external;
+    r->fd=r->external?d->cache_fd:open("/dev/femu-cache",O_RDWR|O_CLOEXEC);
+    if(r->external) d->cache_fd=-1;
     r->slots=MAP_FAILED;
-    if(r->fd<0 || ioctl(r->fd,FEMU_CACHE_RX_SETUP)<0) goto fail;
-    r->slots=mmap(NULL,FEMU_CACHE_PAGE_BYTES,PROT_READ|PROT_WRITE,MAP_SHARED,r->fd,0);
-    if(r->slots==MAP_FAILED) goto fail;
+    if(r->fd<0) goto fail;
+    if(!r->external) {
+        if(ioctl(r->fd,FEMU_CACHE_RX_SETUP)<0) goto fail;
+        r->slots=mmap(NULL,FEMU_CACHE_PAGE_BYTES,PROT_READ|PROT_WRITE,MAP_SHARED,r->fd,0);
+        if(r->slots==MAP_FAILED) goto fail;
+    }
     if(r->profile) { r->setup_ns=cache_clock(CLOCK_MONOTONIC)-start; start=cache_clock(CLOCK_MONOTONIC); }
     if(ioctl(r->fd,FEMU_CACHE_RX_BIND,(unsigned long)d->graph_session)<0) goto fail;
     if(r->profile) r->bind_ns=cache_clock(CLOCK_MONOTONIC)-start;
-    if(pthread_create(&r->worker,NULL,receive_cache,r)) goto fail;
+    if(!r->external && pthread_create(&r->worker,NULL,receive_cache,r)) goto fail;
     d->cache=r;
     return CS_SUCCESS;
 fail:
@@ -76,17 +81,37 @@ fail:
     if(r->fd>=0) close(r->fd);
     free(r); return CS_DEVICE_NOT_AVAILABLE;
 }
+CS_STATUS femu_hpcp_configure(struct cs_device *d,int fd)
+{
+    if(fd<0) return CS_INVALID_ARG;
+    pthread_mutex_lock(&d->graph_lock);
+    CS_STATUS status=CS_SUCCESS;
+    if(d->graph_session || d->cache || d->cache_external) status=CS_HANDLE_IN_USE;
+    else {
+        int copy=fcntl(fd,F_DUPFD_CLOEXEC,0);
+        if(copy<0) status=CS_INVALID_ARG;
+        else { d->cache_fd=copy; d->cache_external=true; }
+    }
+    pthread_mutex_unlock(&d->graph_lock);
+    return status;
+}
 void femu_hpcp_stop(struct cs_device *d)
 {
     struct cs_cache_receiver *r=d->cache;
-    if(!r) return;
+    if(!r) {
+        if(d->cache_external && d->cache_fd>=0) close(d->cache_fd);
+        d->cache_external=false; d->cache_fd=-1;
+        return;
+    }
     /* STOP waits out software DMA and cancels pending publications. The
      * module also performs STOP on fd release, including abnormal exit. */
     uint64_t start=r->profile?cache_clock(CLOCK_MONOTONIC):0;
     ioctl(r->fd,FEMU_CACHE_RX_UNBIND);
     if(r->profile) { r->stop_ns=cache_clock(CLOCK_MONOTONIC)-start; start=cache_clock(CLOCK_MONOTONIC); }
-    __atomic_store_n(&r->stopping,true,__ATOMIC_RELEASE);
-    pthread_join(r->worker,NULL);
+    if(!r->external) {
+        __atomic_store_n(&r->stopping,true,__ATOMIC_RELEASE);
+        pthread_join(r->worker,NULL);
+    }
     if(r->profile) {
         r->join_ns=cache_clock(CLOCK_MONOTONIC)-start;
         fprintf(stderr,"PROFILE CACHE_RX setup_ns=%llu bind_ns=%llu stop_ns=%llu join_ns=%llu calls=%llu ioctl_ns=%llu sleep_ns=%llu worker_ns=%llu worker_cpu_ns=%llu\n",
@@ -94,6 +119,8 @@ void femu_hpcp_stop(struct cs_device *d)
             (unsigned long long)r->join_ns,(unsigned long long)r->calls,(unsigned long long)r->ioctl_ns,
             (unsigned long long)r->sleep_ns,(unsigned long long)r->worker_ns,(unsigned long long)r->worker_cpu_ns);
     }
-    munmap(r->slots,FEMU_CACHE_PAGE_BYTES); close(r->fd);
+    if(r->slots!=MAP_FAILED) munmap(r->slots,FEMU_CACHE_PAGE_BYTES);
+    close(r->fd);
     free(r); d->cache=NULL;
+    d->cache_external=false; d->cache_fd=-1;
 }

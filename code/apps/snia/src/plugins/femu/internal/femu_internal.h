@@ -21,6 +21,8 @@ struct cs_device {
     struct cs_graph_scope *graph_scopes;
     uint32_t graph_session;
     struct cs_cache_receiver *cache;
+    int cache_fd;
+    bool cache_external;
     uint64_t next_graph;
     char path[4096];
     struct { uint32_t workers; uint64_t fdm_bytes, features; } caps;
@@ -48,6 +50,7 @@ CS_STATUS femu_graph_close(struct cs_device *);
 CS_STATUS femu_reset(void *,CS_RESOURCE_TYPE,u32);
 CS_STATUS femu_hpcp_start(struct cs_device *);
 void femu_hpcp_stop(struct cs_device *);
+CS_STATUS femu_hpcp_configure(struct cs_device *,int);
 CS_STATUS femu_queueBatchRequest(void *,CS_BATCH_MODE,unsigned,const struct cs_backend_batch_entry *,bool (*)(void *),void *,u64 *);
 CS_STATUS femu_abortBatchRequest(void *,void *);
 void femu_finishBatchExecution(void *,void *,bool);

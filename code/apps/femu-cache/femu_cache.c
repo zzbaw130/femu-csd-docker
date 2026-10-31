@@ -84,7 +84,7 @@ static int receiver_allocate(struct receiver *r)
     int ret=-ENOMEM;
     if(r->slots) return -EBUSY;
     r->slots=dma_alloc_coherent(dma_device,PAGE_SIZE,&r->descriptor_dma,GFP_KERNEL);
-    r->data=vzalloc((size_t)FEMU_CACHE_RX_SLOTS*FEMU_CACHE_BLOCK_BYTES);
+    r->data=vmalloc_user((size_t)FEMU_CACHE_RX_SLOTS*FEMU_CACHE_BLOCK_BYTES);
     if(!r->slots || !r->data) goto fail;
     memset(r->slots,0,PAGE_SIZE);
     for(unsigned i=0;i<FEMU_CACHE_RX_SLOTS*FEMU_CACHE_RX_PAGES;i++) {
@@ -143,7 +143,19 @@ static int receiver_bind(struct receiver *r,unsigned session)
     if(!ret) r->session=session;
     return ret>0?-EIO:ret;
 }
-static int publish_slot(struct receiver *r,unsigned index)
+static int acquire_slot(struct receiver *r,unsigned index)
+{
+    if(!r->slots || index>=FEMU_CACHE_RX_SLOTS) return -EINVAL;
+    struct femu_cache_slot *slot=&r->slots[index];
+    if(le64_to_cpu(smp_load_acquire(&slot->ready))!=1) return -EAGAIN;
+    dma_rmb();
+    u64 bytes=le64_to_cpu(slot->bytes);
+    if(le32_to_cpu(slot->error) || !bytes || bytes>FEMU_CACHE_BLOCK_BYTES || bytes%PAGE_SIZE) return -EINVAL;
+    for(unsigned p=0;p<bytes/PAGE_SIZE;p++)
+        dma_sync_single_for_cpu(dma_device,r->pages[index][p],PAGE_SIZE,DMA_FROM_DEVICE);
+    return 0;
+}
+static int publish_slot(struct receiver *r,unsigned index,bool hpcp,bool acquired)
 {
     if(!r->slots || index>=FEMU_CACHE_RX_SLOTS) return -EINVAL;
     struct femu_cache_slot *slot=&r->slots[index];
@@ -158,11 +170,11 @@ static int publish_slot(struct receiver *r,unsigned index)
         atomic64_inc(&errors); goto done;
     }
     unsigned count=bytes/PAGE_SIZE;
-    for(unsigned p=0;p<count;p++)
+    if(!acquired) for(unsigned p=0;p<count;p++)
         dma_sync_single_for_cpu(dma_device,r->pages[index][p],PAGE_SIZE,DMA_FROM_DEVICE);
     if(timing) { u64 now=ktime_get_ns(); atomic64_add(now-mark,&sync_cpu_ns); mark=now; }
     u64 physical=lba*bdev_logical_block_size(bdev->bdev);
-    for(unsigned p=0;p<count;p++) {
+    if(hpcp) for(unsigned p=0;p<count;p++) {
         if(timing) mark=ktime_get_ns();
         struct file *file=NULL;
         u64 offset=0,at=physical+(u64)p*PAGE_SIZE;
@@ -219,11 +231,13 @@ static long cache_ioctl(struct file *file,unsigned cmd,unsigned long arg)
     struct femu_cache_mapping range;
     struct mapping *map;
     if(!capable(CAP_SYS_ADMIN)) return -EPERM;
-    if(cmd==FEMU_CACHE_RX_SETUP || cmd==FEMU_CACHE_RX_PUBLISH ||
+    if(cmd==FEMU_CACHE_RX_SETUP || cmd==FEMU_CACHE_RX_PUBLISH || cmd==FEMU_CACHE_RX_ACQUIRE || cmd==FEMU_CACHE_RX_RELEASE ||
        cmd==FEMU_CACHE_RX_BIND || cmd==FEMU_CACHE_RX_UNBIND) {
         mutex_lock(&r->lock);
         int ret=cmd==FEMU_CACHE_RX_SETUP?receiver_setup(r):
-            cmd==FEMU_CACHE_RX_PUBLISH?publish_slot(r,arg):
+            cmd==FEMU_CACHE_RX_PUBLISH?publish_slot(r,arg,true,false):
+            cmd==FEMU_CACHE_RX_ACQUIRE?acquire_slot(r,arg):
+            cmd==FEMU_CACHE_RX_RELEASE?publish_slot(r,arg&~FEMU_CACHE_RELEASE_HPCP,(arg&FEMU_CACHE_RELEASE_HPCP)!=0,true):
             receiver_bind(r,cmd==FEMU_CACHE_RX_BIND?arg:0);
         mutex_unlock(&r->lock); return ret;
     }
@@ -258,8 +272,13 @@ static int cache_open(struct inode *inode,struct file *file)
 static int cache_mmap(struct file *file,struct vm_area_struct *vma)
 {
     struct receiver *r=file->private_data;
-    if(!r->slots || vma->vm_pgoff || vma->vm_end-vma->vm_start!=PAGE_SIZE) return -EINVAL;
-    return dma_mmap_coherent(dma_device,vma,r->slots,r->descriptor_dma,PAGE_SIZE);
+    if(!r->slots) return -EINVAL;
+    if(!vma->vm_pgoff && vma->vm_end-vma->vm_start==PAGE_SIZE)
+        return dma_mmap_coherent(dma_device,vma,r->slots,r->descriptor_dma,PAGE_SIZE);
+    if(vma->vm_pgoff!=FEMU_CACHE_DATA_OFFSET/PAGE_SIZE ||
+       vma->vm_end-vma->vm_start!=FEMU_CACHE_DATA_BYTES || (vma->vm_flags&VM_WRITE)) return -EINVAL;
+    vm_flags_set(vma,VM_DONTEXPAND|VM_DONTDUMP);
+    return remap_vmalloc_range(vma,r->data,0);
 }
 static int cache_release(struct inode *inode,struct file *file)
 {

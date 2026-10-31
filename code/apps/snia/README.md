@@ -68,6 +68,8 @@ FEMU 插件用 Identify 校验 CSD 身份及 namespace 格式，用 GET_INFO 查
 
 只读文件的实验性主机页缓存填充通过 `SNIA_FEMU_HPCP=1` 开启，默认关闭。FEMU 插件通过 Guest 内核模块预注册 8 个 4MiB 接收槽位，设备主动 DMA，库内线程将收到的数据交给模块填入文件缓存；缓冲满则跳过HPCP，不使用 AER 或逐块 NVMe Read/ACK。需要文件 extent 注册和匹配固件，使用发行版原生 NVMe 驱动即可；生命周期、编译及逐块测量见 [femu-cache](../femu-cache/README.md)。它不改变标准 SNIA API。
 
+数据库缓存填充可通过本项目FEMU厂商配置借用调用者准备的接收fd：`csConfig`的`Type=CS_VENDOR_SPECIFIC`，`VSInfo.VSData`指向`csd-cache.h`中的`struct femu_cache_config`。适配器复制fd并开启相同的设备DMA，调用者负责消费，不再由库内线程同时操作槽位。该头文件是[femu-cache](../femu-cache/README.md)的私有接口；SNIA不依赖PG、不操作shared_buffers，也没有新增标准函数。无在途图时配置，每轮`csReset(..., CS_VENDOR_SPECIFIC_TYPE, 0)`后重新配置；生命周期遵循接收模块的ACQUIRE/RELEASE约定。
+
 ## 二、上层应用：参数按算子约定填写
 
 ```c

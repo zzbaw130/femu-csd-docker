@@ -13,6 +13,8 @@
 PG_MODULE_MAGIC;
 int pg_sina_exe_path = 0;
 bool pg_sina_profile = false;
+bool pg_sina_dcp = false;
+static bool hpcp = true;
 int pg_sina_max_memory = 0; /* KiB; 0 uses the device workmem capacity. */
 bool pg_sina_compiling_plan = false;
 struct pg_sina_planner_profile *pg_sina_planning;
@@ -148,7 +150,7 @@ static void join_hook(PlannerInfo *root,RelOptInfo *joinrel,RelOptInfo *outerrel
 static void assign_path(int value,void *extra)
 {
     if(value!=pg_sina_exe_path) ResetPlanCache();
-    setenv("SNIA_FEMU_HPCP",value==PG_SINA_HPCP || value==PG_SINA_ADAPTIVE?"1":"0",1);
+    setenv("SNIA_FEMU_HPCP",hpcp && (value==PG_SINA_HPCP || value==PG_SINA_ADAPTIVE)?"1":"0",1);
 }
 const char *pg_sina_path_name(void)
 {
@@ -156,7 +158,13 @@ const char *pg_sina_path_name(void)
     return names[pg_sina_exe_path];
 }
 bool pg_sina_hpcp_enabled(void)
-{ return pg_sina_exe_path==PG_SINA_HPCP || pg_sina_exe_path==PG_SINA_ADAPTIVE; }
+{ return hpcp && (pg_sina_exe_path==PG_SINA_HPCP || pg_sina_exe_path==PG_SINA_ADAPTIVE); }
+static void assign_hpcp(bool value,void *extra)
+{
+    setenv("SNIA_FEMU_HPCP",value && (pg_sina_exe_path==PG_SINA_HPCP || pg_sina_exe_path==PG_SINA_ADAPTIVE)?"1":"0",1);
+    ResetPlanCache();
+}
+static void assign_dcp(bool value,void *extra) { ResetPlanCache(); }
 static void assign_memory(int value,void *extra)
 {
     if(value!=pg_sina_max_memory) ResetPlanCache();
@@ -186,6 +194,10 @@ void _PG_init(void)
         &pg_sina_exe_path, 0, execution_paths, PGC_USERSET, 0, NULL, assign_path, NULL);
     DefineCustomBoolVariable("pg_sina_csd.profile", "Collect planner and device operator timings", NULL,
         &pg_sina_profile, false, PGC_USERSET, 0, NULL, NULL, NULL);
+    DefineCustomBoolVariable("pg_sina_csd.hpcp", "Allow host file page cache population in HPCP modes", NULL,
+        &hpcp,true,PGC_USERSET,0,NULL,assign_hpcp,NULL);
+    DefineCustomBoolVariable("pg_sina_csd.dcp", "Populate PostgreSQL shared_buffers from device receive data", NULL,
+        &pg_sina_dcp,false,PGC_USERSET,0,NULL,assign_dcp,NULL);
     DefineCustomIntVariable("pg_sina_csd.max_memory", "Maximum device work memory per query", NULL,
         &pg_sina_max_memory, 0, 0, MAX_KILOBYTES, PGC_USERSET, GUC_UNIT_KB, check_memory, assign_memory, NULL);
     DefineCustomRealVariable("pg_sina_csd.host_cost_ms","Milliseconds per PG cost unit",NULL,

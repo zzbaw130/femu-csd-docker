@@ -177,7 +177,11 @@ void pg_sina_read_resources(const char *path)
     if(!connection_device || strcmp(path,connection_path)) elog(ERROR,"CSD namespace was not initialized for this connection: %s",path);
 }
 CS_DEV_HANDLE pg_sina_device(const char *path)
-{ pg_sina_read_resources(path); ++connection_users; return connection_device; }
+{
+    pg_sina_read_resources(path);
+    if(!connection_users) pg_sina_dcp_start(connection_device);
+    ++connection_users; return connection_device;
+}
 void pg_sina_release_device(void)
 {
     Assert(connection_users>0);
@@ -185,6 +189,7 @@ void pg_sina_release_device(void)
     /* Query data is gone. Release any abandoned hidden tokens, not the code
      * or transport. Do not reset while another subtree/cursor still uses it. */
     CS_STATUS status=csReset(connection_device,CS_VENDOR_SPECIFIC_TYPE,0);
+    pg_sina_dcp_finish();
     if(status!=CS_SUCCESS) elog(WARNING,"CSD execution context cleanup failed: status=%d",status);
 }
 CS_CSF_ID pg_sina_function(const char *symbol)
@@ -571,7 +576,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
                 if(!inflight) break;
                 void *completed=NULL;
                 CS_STATUS status=csPollEvent(event,&completed,NULL);
-                if(status==CS_NOT_DONE) { pg_usleep(50L); continue; }
+                if(status==CS_NOT_DONE) { pg_sina_dcp_poll(); pg_usleep(50L); continue; }
                 --inflight; struct slot *slot=completed; slot->request=NULL;
                 if(status!=CS_SUCCESS) {
                     result->status=status; snprintf(result->error,sizeof(result->error),"csPollEvent(build scan): status=%d",status); goto cleanup;
@@ -682,7 +687,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
         if(!inflight) break;
         void *completed=NULL;
         CS_STATUS status=csPollEvent(event,&completed,NULL);
-        if(status==CS_NOT_DONE) { pg_usleep(50L); continue; }
+        if(status==CS_NOT_DONE) { pg_sina_dcp_poll(); pg_usleep(50L); continue; }
         --inflight; ((struct slot *)completed)->request=NULL;
         if(status!=CS_SUCCESS) {
             result->status=status; snprintf(result->error,sizeof(result->error),"csPollEvent: status=%d",status); goto cleanup;
@@ -810,12 +815,12 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     }
 cleanup:
     if(profiling && !cleanup_start) cleanup_start=clock_ns();
-    /* Requests already executing cannot be forcibly aborted by this backend.
-     * Stop refilling, abort queued requests where possible, and drain every
-     * completion before freeing buffers or reading/freeing aggregate states. */
+    /* Stop refilling and drain the bounded, already submitted input blocks.
+     * Their normal completion also releases DMA references to these inputs;
+     * forcibly cancelling a device graph can strand those references. */
     if(event) {
-        for(unsigned i=0;i<workers;++i) if(slots[i].request) csAbortRequest(slots[i].request);
         while(inflight) {
+            pg_sina_dcp_poll();
             CS_STATUS status=csPollEvent(event,NULL,NULL);
             if(status==CS_NOT_DONE) pg_usleep(50L);
             else --inflight;

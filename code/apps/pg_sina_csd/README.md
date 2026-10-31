@@ -16,6 +16,20 @@
 
 HPCP 全称 **Host Page Cache Population（主机页缓存填充）**。它把设备读入的数据填充到 Guest 文件页缓存；两种 CSD 模式目前都从内部 NVM 读入 FDM，不会因为命中主机缓存就默认上传。SQLerate 分别观测 PG shared_buffers 和文件页缓存：前者命中免除读盘及内核到 PG 缓冲区的复制，后者命中仍保留复制成本；CPU、谓词和索引查找成本继续保留。这里只改变估价，HPCP 仍填充文件页缓存。成本公式、参数及当前执行边界见 [规划说明](doc/planning.md)。
 
+DCP（Database Cache Population，数据库缓存填充）把同一份设备接收数据填入 PG 的 `shared_buffers`，默认关闭。`pg_sina_csd.hpcp` 默认开启，作为原有 HPCP 模式的允许开关；关闭后，即使选择 `csd-with-hpcp` 或 `SQLerate` 也不填文件页缓存。`pg_sina_csd.dcp` 独立控制 DCP，在产生设备读取的执行路径上生效，`host-only` 不产生设备填充。
+
+```sql
+SET pg_sina_csd.exe_path = 'csd-without-hpcp';
+SET pg_sina_csd.hpcp = off;
+SET pg_sina_csd.dcp = on;
+```
+
+同时填充两层缓存时，选择 `csd-with-hpcp` 并开启两个布尔选项。设备只做一次 DMA；DCP 模式由执行 SQL 的 PG backend 消费接收槽，按原始8KiB页复制到缺失的数据库缓冲，随后按需把同一槽交给内核填文件缓存。现有有效页不覆盖，导入页不标脏、不产生 WAL；不调用 `pg_prewarm(buffer)` 重新读文件。该实现针对已准备映射的只读镜像，不新增进程或PG worker。
+
+优先交付结果和续交就绪任务，等待设备时每次最多处理一个4MiB接收槽。接收槽满或关闭会话时允许放弃尚未传输的数据，因此填充是尽力而为，不能把累计读取量当作缓存驻留量。首次写入 shared_buffers 可能产生大量匿名内存 minor fault，DCP 不保证加速当前 CSD 查询。profile 的 `SQLerate DCP` 单独报告接收块、导入/已有页、无效页、跳过字节、填充累计时间和 minor/major fault；EXPLAIN 显示 DCP 开关。PCIe填充成本进入既有模型，PG缓冲分配/复制的CPU尚未单独校准，当前实验宜用强制路径比较。
+
+依赖更新后的 SNIA FEMU 插件及 [femu-cache 接收模块](../femu-cache/README.md)。仅检查开关隔离、原生PG读取导入页和取消恢复，可在Guest运行 `sh /home/femu/tests/database-cache-test.sh`，使用正式Q6。缓存统计仍在规划时真实观测；本轮没有引入仅按填充量累加的驻留账本。
+
 两种强制完整卸载模式保留 PG 选定的连接顺序。SQLerate 在 PG 枚举合法连接组合时加入设备子树，因此设备成本能影响连接顺序，HOST 上层也能根据设备输入重新选择算法；仍受 PG 的合法性、路径剪枝和 GEQO 范围限制。
 
 去关联改写的是解析后的 `Query` 树，不修改 SQL 文件。SQLerate 同时保留原始 Query 的原生 HOST 计划、该 PG 优选树可转换的完整 CSD 计划，并与经过安全改写的 HOST/CSD 共享搜索结果比较。改写后的树同样允许全部由 HOST 执行；不把去关联当成仅供 CSD 使用的优化。`host-only` 始终是未经扩展改写的原生 PG 基线。`filter-only` 也保留原始 Query，仅转换支持的扫描叶节点。

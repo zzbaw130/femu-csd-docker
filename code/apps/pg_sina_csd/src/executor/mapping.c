@@ -22,6 +22,7 @@ static void close_cache_registration(void *arg)
 }
 static void register_cache(const struct qs_request *request,const struct qs_extent *extents)
 {
+    pg_sina_dcp_register(request,extents);
     if(!pg_sina_hpcp_enabled() || !request->nextents) return;
     struct cache_registration *r=palloc0(sizeof(*r));
     r->fd=open("/dev/femu-cache",O_RDWR|O_CLOEXEC);
