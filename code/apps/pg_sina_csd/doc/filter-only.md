@@ -1,6 +1,8 @@
-# filter-only 执行与返回
+# 扫描执行与返回
 
 该模式只卸载基表扫描、过滤和必要的列提取；Join、Sort、Aggregate 继续由 PG 执行，不按查询编号选择算法。扫描参考仓库 DuckDB `src/execution/operator/scan/physical_table_scan.cpp` 的全局扫描状态、线程局部状态和投影列处理，复用现有 CU 输入块任务池。
+
+独立扫描返回 HOST 时，filter-only、SQLerate 和完整卸载回退子树共用以下实现。是否异步续交、由 CU 直接编码或由 PG 并行消费，只取决于设备树、顺序要求和 PG 物理边界，不依赖执行模式。共享内部 InitPlan 状态的完整设备程序仍使用原有交付。
 
 ## 调用流程与职责
 

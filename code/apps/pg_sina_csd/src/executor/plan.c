@@ -291,7 +291,7 @@ static void begin(CustomScanState *node,EState *estate,int flags)
     s->explain_only=flags&EXEC_FLAG_EXPLAIN_ONLY; s->profiling=pg_sina_profile;
     atomic_init(&s->stopping,false); atomic_init(&s->next_scan_offset,0);
     atomic_init(&s->callbacks,0); atomic_init(&s->control_read_ns,0);
-    s->async_scan=pg_sina_exe_path==PG_SINA_FILTER && s->plan->nodes[s->plan->root].kind==QP_SCAN;
+    s->async_scan=s->plan->count==1 && s->plan->nodes[s->plan->root].kind==QP_SCAN && !s->plan->ninit;
     atomic_init(&s->load_ns,0); atomic_init(&s->load_calls,0);
     atomic_init(&s->completion_reads,0); atomic_init(&s->batch_progress,0);
     s->resource_owner=CurrentResourceOwner;

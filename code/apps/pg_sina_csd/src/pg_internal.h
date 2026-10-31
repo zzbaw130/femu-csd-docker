@@ -138,6 +138,10 @@ void pg_sina_upper_paths(PlannerInfo *, UpperRelationKind, RelOptInfo *, RelOptI
 bool pg_sina_rewrite_query(Query *q);
 Plan *pg_sina_rewrite_plan(PlannerInfo *,Plan *);
 Plan *pg_sina_compile_subtree(PlannerInfo *,Plan *,bool);
+static inline bool pg_sina_is_scan(Plan *plan)
+{ return IsA(plan,SeqScan) || IsA(plan,IndexScan) || IsA(plan,IndexOnlyScan); }
+/* Validate and collect only the HOST InitPlan values used by this scan. */
+bool pg_sina_scan_parameters(PlannerInfo *,Plan *,List **);
 Plan *pg_sina_prepare_candidate(PlannerInfo *,Plan *,bool);
 Plan *pg_sina_require_output_order(PlannerInfo *,Plan *);
 /* Cost properties and a borrowed workspace, valid until the next candidate.

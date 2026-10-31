@@ -1469,7 +1469,8 @@ static int describe_expression(struct binding *b,Node *node)
     }
     if(IsA(node,Param)) {
         Param *v=(Param *)node;
-        if(v->paramkind!=PARAM_EXEC || v->paramid>=QP_PARAMS || b->tree->param_nodes[v->paramid]<0) return -1;
+        if(v->paramkind!=PARAM_EXEC || v->paramid<0 || v->paramid>=QP_PARAMS ||
+           (b->tree->param_nodes[v->paramid]<0 && b->tree->param_nodes[v->paramid]!=QP_HOST_PARAMETER)) return -1;
         e.op=QP_PARAMETER; e.column=v->paramid; return add_expr(p,e);
     }
     if(IsA(node,Const)) {
@@ -1796,7 +1797,7 @@ Plan *pg_sina_candidate_scan(Plan *native,bool fast,bool output)
 {
     CustomScan *scan=makeNode(CustomScan); scan->scan.plan=*native; NodeSetTag(scan,T_CustomScan);
     scan->scan.plan.lefttree=scan->scan.plan.righttree=NULL; scan->scan.plan.qual=NIL;
-    scan->scan.plan.parallel_aware=scan->scan.plan.parallel_safe=false;
+    scan->scan.plan.parallel_aware=scan->scan.plan.parallel_safe=IsA(native,SeqScan) && native->parallel_aware;
     /* Cost-only markers never reach PG setrefs/execution. Construct the
      * translated output expressions only for the selected CustomScan. */
     if(output) {
@@ -1832,22 +1833,28 @@ static bool scan_parameter(Node *node,struct scan_parameters *parameters)
     }
     return expression_tree_walker(node,scan_parameter,parameters);
 }
+bool pg_sina_scan_parameters(PlannerInfo *root,Plan *native,List **values)
+{
+    struct scan_parameters parameters={.root=root};
+    if(!pg_sina_is_scan(native) ||
+       scan_parameter((Node *)native->qual,&parameters) || scan_parameter((Node *)native->targetlist,&parameters) ||
+       (IsA(native,IndexScan) && scan_parameter((Node *)((IndexScan *)native)->indexqualorig,&parameters)) ||
+       (IsA(native,IndexOnlyScan) && scan_parameter((Node *)((IndexOnlyScan *)native)->indexqual,&parameters))) return false;
+    *values=parameters.values;
+    return true;
+}
 Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
 {
-    bool host_scan=pg_sina_exe_path==PG_SINA_FILTER;
-    struct scan_parameters parameters={.root=root};
-    if(host_scan) {
-        if(!IsA(native,SeqScan) && !IsA(native,IndexScan) && !IsA(native,IndexOnlyScan)) return native;
-        if(scan_parameter((Node *)native->qual,&parameters) || scan_parameter((Node *)native->targetlist,&parameters)) return native;
-        if(IsA(native,IndexScan) && scan_parameter((Node *)((IndexScan *)native)->indexqualorig,&parameters)) return native;
-        if(IsA(native,IndexOnlyScan) && scan_parameter((Node *)((IndexOnlyScan *)native)->indexqual,&parameters)) return native;
-    }
+    bool host_scan=boundary && pg_sina_is_scan(native);
+    List *parameters=NIL;
+    if(host_scan && !pg_sina_scan_parameters(root,native,&parameters)) return native;
+    if(native->parallel_aware && host_scan && !IsA(native,SeqScan)) return native;
     /* This allocation is only for a selected executable subtree. */
     struct qp_plan *tree=palloc(sizeof(*tree));
     memset(tree,0,offsetof(struct qp_plan,nodes));
     for(unsigned i=0;i<QP_PARAMS;++i) tree->param_nodes[i]=tree->cte_nodes[i]=-1;
     ListCell *c;
-    foreach(c,parameters.values) {
+    foreach(c,parameters) {
         Param *v=lfirst(c); tree->param_nodes[v->paramid]=QP_HOST_PARAMETER;
         tree->nparams=Max(tree->nparams,(unsigned)v->paramid+1);
     }
@@ -1893,7 +1900,7 @@ Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
     tree->root=result;
     pg_sina_refine_groups(tree);
     pg_sina_read_resources(device);
-    if(pg_sina_exe_path==PG_SINA_FILTER && native->parallel_aware &&
+    if(host_scan && native->parallel_aware &&
        (!IsA(native,SeqScan) || pg_sina_resources.cus<2)) { goto failed; }
     tree->nodes[result].expr.work_mem_bytes=pg_sina_query_memory();
     if(pg_sina_exe_path==PG_SINA_ADAPTIVE) {
@@ -1911,14 +1918,14 @@ Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
     scan->scan.plan=*native; NodeSetTag(scan,T_CustomScan);
     scan->scan.plan.lefttree=scan->scan.plan.righttree=NULL;
     scan->scan.plan.qual=NIL; scan->scan.plan.initPlan=NIL; scan->scan.plan.parallel_aware=false; scan->scan.plan.parallel_safe=false;
-    if(pg_sina_exe_path==PG_SINA_FILTER) {
+    if(host_scan && IsA(native,SeqScan) && native->parallel_aware) {
         scan->scan.plan.parallel_safe=native->parallel_safe;
         scan->scan.plan.parallel_aware=native->parallel_aware;
     }
     /* PG projects device results; it must not retain removed InitPlan deps. */
     scan->scan.plan.targetlist=(List *)device_output_expression((Node *)native->targetlist,NULL);
     scan->custom_scan_tlist=copyObject(scan->scan.plan.targetlist);
-    scan->custom_exprs=parameters.values; /* PG tracks dependencies and evaluates InitPlans. */
+    scan->custom_exprs=parameters; /* PG tracks dependencies and evaluates InitPlans. */
     scan->custom_private=list_make1(program);
     scan->methods=&pg_sina_plan_methods;
     return (Plan *)scan;
@@ -1928,13 +1935,20 @@ failed:
 }
 Plan *pg_sina_describe_candidate(PlannerInfo *root,Plan *native,bool boundary,struct qp_plan **lowered)
 {
+    bool host_scan=boundary && pg_sina_is_scan(native);
+    List *parameters=NIL;
+    if(host_scan && !pg_sina_scan_parameters(root,native,&parameters)) return native;
     double mark=pg_sina_planner_clock();
     struct qp_plan *tree=pg_sina_cost_workspace();
     memset(pg_sina_candidate_choices(),0,QP_NODES*sizeof(unsigned));
     memset(tree,0,offsetof(struct qp_plan,nodes));
     for(unsigned i=0;i<QP_PARAMS;++i) tree->param_nodes[i]=tree->cte_nodes[i]=-1;
     ListCell *c;
-    foreach(c,root->init_plans) {
+    foreach(c,parameters) {
+        Param *v=lfirst(c); tree->param_nodes[v->paramid]=QP_HOST_PARAMETER;
+        tree->nparams=Max(tree->nparams,(unsigned)v->paramid+1);
+    }
+    foreach(c,host_scan?NIL:root->init_plans) {
         SubPlan *s=lfirst(c); if(s->subLinkType==CTE_SUBLINK) continue;
         if(s->subLinkType!=EXPR_SUBLINK || s->parParam || s->args || list_length(s->setParam)!=1 || tree->ninit==QP_PARAMS) return native;
         int param=linitial_int(s->setParam); if(param<0 || param>=QP_PARAMS) return native;

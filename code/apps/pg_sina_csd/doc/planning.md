@@ -22,7 +22,7 @@ D(v) = 可编译的设备子树的内部 I/O + CU 计算 + spill + 未被覆盖�
 
 每个位置必须先通过算子能力、类型/表达式和映射检查。HOST 结果行重新送入设备解释器尚未实现，故 HOST→CSD 中间行边界为不可行；不能假定它已经能运行。CSD 候选从已准备的基表/索引开始，可有多个独立子树向 HOST 的 Join、Aggregate、Sort 等返回数据。返回位置遵守 PG 的目标列、顺序、NULL 与表达式语义，子树边界保留索引/排序顺序。HOST Hash Join 的 Hash 子节点必须保留 MultiExec 接口；Merge Join 需要标记/恢复的内侧节点也保留在 HOST，它们下方仍可接入 CSD 输入。
 
-设备 CustomPath 不标记为 parallel-safe，不放进 PG worker 私有/共享扫描中；原生 PG partial Path 和 Gather/GatherMerge 仍参与搜索，完整区域可编译时也可整体卸载。设备内部候选按不含返回边界的成本单独保留，不能仅因中间结果返回很贵就丢弃其与上层继续融合的机会。`filter-only` 保持既有共享设备扫描和原生并行边界，见 [filter-only 执行](filter-only.md)。
+独立 parallel-aware SeqScan 的设备 CustomPath 进入 PG partial Path 搜索，使用同一个设备流及 DSM 交付队列；PG 可继续为它规划原生并行 Join/Aggregate 与 Gather。其他私有设备输入不标记 parallel-safe，避免每个 PG worker 重复执行或把共享分片误当成私有完整输入。完整并行区域仍可作为一个整体卸载。设备内部候选按不含返回边界的成本单独保留；partial Path 只表示交付给 PG 的分片消费，不作为完整设备 Join 的内部子树复用。扫描的交付机制与 filter-only 共用，见 [扫描执行与返回](filter-only.md)。
 
 `csd-without-hpcp` 和 `csd-with-hpcp` 不按成本拒绝已支持的完整子树；完整编译失败时继续寻找可卸载的子树。不支持的语义继续由 PG 执行。`host-only` 不加设备节点或 SQLerate 外层节点。
 
@@ -696,3 +696,31 @@ DCP allocate_ms实际包住ReadBufferExtended的查找/取得缓冲、pin/锁/�
 设备图取消或失败后，下游消费者不会再执行，原缓存项却一直等消费者完成；图又等缓存项释放，形成引用无法回收。现在先等已经提交的 CU/I/O 停止，再撤销该图的可选缓存填充、解除未执行消费者的等待。实际 DMA 尚在进行时仍保留 AFDM 引用，只有 DMA worker 退出后才能回收，避免释放后使用。
 
 `results/afdm-fix.ljsg6i/` 的同一回归在旧固件超时、新固件通过，覆盖 LOAD 已发布而消费者尚未执行时取消图，并在结束检查 FDM_USED=0。2/4 poller 缓存 DMA、图取消及批量内部读回归均通过。业务 Guest 部署新固件、恢复相同数据库并重新映射后，正式 Q2/Q9 的 filter-only 热缓存结果与原生参考逐行一致，每次结束 FDM_USED 均为0。没有缩减设备配置来掩盖历史占用，也未重跑全量 TPC-H。
+
+#### 共享扫描交付与定向热缓存验证
+
+独立单 Scan、没有设备初始化且向 HOST 返回时，统一使用异步回调续交；无序多 CU 输出由 CU 直接编码，顺序游标保留其顺序。选择依据为设备树和物理属性，不再检查是否 filter-only。参考 DuckDB 的全局 source/线程局部状态划分，沿用原输入块任务池和双批次 HOST 队列，不新增调度线程或进程。带内部 SubPlan/InitPlan 的完整设备程序继续使用原初始化和收尾，未将它误当成独立 Scan。
+
+SQLerate 的共享 SeqScan 加入 PG partial Path 搜索，设备行数保持全局值，PG Path 行数按其每参与者口径。返回边界只对 PG 的元组转换按消费者分摊，内部 I/O/CU/PCIe 不再除一次 PG worker 数。私有 Join 输入、并行索引和需要 mark/restore 的边界继续保留原限制；partial Path 不参与完整设备 Join 内部子树复用，防止把每参与者行数当全局输入。局部改写可进入 Gather 下的共享 SeqScan，投影及位置映射也共用。
+
+Scan 的 HOST InitPlan 参数验证、收集和 custom_exprs 依赖登记统一；候选属性分析接受 QP_HOST_PARAMETER，选中后编码的判定一致。结构回归验证了 SQLerate 私有/共享扫描携带1个 HOST numeric 参数、设备初始化数为0，结果在浮点聚合允许的1e-12相对误差内一致；人为成本只用于选择待测边界，不纳入性能比较。完整根扫描携带 IN 哈希子计划的回归也通过。
+
+`results/scan-paths.G4vsJL/` 仅运行下表11条正式查询，五模式各三轮，共165次结果逐行一致、330次查询前后 FDM_USED=0；热组只开始预热一次，三轮边界两级缓存始终100%驻留。4 CU/256MiB workmem/64MiB FDM，PG 4 worker上限/2GiB shared_buffers/16MiB work_mem。HPCP/DCP 在强制填充和 SQLerate 中双开。下表单位ms，逐样本扣除前台 ExecutorEnd 驻留维护后取中位数，仍包含规划与实际填充；原始总时间及SQLerate规划/执行/路径见该目录 report.md、raw.csv、summary.csv。
+
+| Q | HOST | Filter-only | CSD无填充 | CSD双填充 | SQLerate |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q2 | 551.3 | 487.8 | 278.5 | 278.6 | 311.3 |
+| Q3 | 544.1 | 445.6 | 546.5 | 629.1 | 691.6 |
+| Q4 | 305.7 | 185.4 | 414.5 | 445.4 | 304.3 |
+| Q5 | 363.9 | 248.7 | 406.5 | 443.4 | 389.6 |
+| Q6 | 502.7 | 361.1 | 475.6 | 442.0 | 505.3 |
+| Q7 | 503.7 | 410.0 | 526.9 | 607.8 | 720.1 |
+| Q8 | 461.0 | 364.9 | 541.3 | 591.4 | 487.8 |
+| Q9 | 1370.7 | 1673.0 | 1125.3 | 1126.9 | 1146.1 |
+| Q10 | 578.9 | 520.2 | 1489.1 | 1511.1 | 472.5 |
+| Q12 | 670.0 | 525.6 | 632.4 | 627.6 | 682.2 |
+| Q14 | 559.3 | 441.9 | 506.8 | 484.5 | 545.6 |
+
+SQLerate：Q2主体CSD、Limit在HOST；Q3/Q9全CSD；Q10仅orders扫描在CSD，其余为PG原生并行连接/聚合等；其余7条全HOST。Q10实际启用相同的CU直接输出及SNIA回调交付，三轮主体中位472.5ms，HOST578.9ms、filter-only520.2ms。最终构建追加Q2/Q9/Q10/Q12两模式结果核验，均正确且FDM归零；Q10双填充的共享扫描取消后同一连接可继续查询，FDM也归零。PG两个组件CTest通过。
+
+所有成功设备执行实际spill均为0，不能将剩余慢查询归因于工作内存不足。Q12已消除约9秒的串行索引误选，但682.2ms的HOST选择仍不及525.6ms的扫描下推；Q3与Q7等也存在物理候选成本排序误差。扫描实现对齐通过，整体最优路径和所有查询的性能验收仍未通过。旧全量记录含23MiB遗留占用，不将跨环境差值当作全部来自本次优化；没有重跑全量22条。

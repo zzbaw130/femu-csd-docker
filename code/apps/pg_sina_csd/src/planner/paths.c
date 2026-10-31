@@ -54,6 +54,8 @@ static Plan *defer_program(PlannerInfo *root,Plan *native,bool fast,bool boundar
     pg_sina_path_search->programs=lappend(pg_sina_path_search->programs,program);
     MemoryContextSwitchTo(previous);
     CustomScan *scan=(CustomScan *)pg_sina_candidate_scan(native,fast,true);
+    if(boundary && pg_sina_is_scan(native) && !pg_sina_scan_parameters(root,native,&scan->custom_exprs))
+        elog(ERROR,"selected scan has unsupported HOST parameters");
     scan->custom_private=list_make2(makeInteger(id),copyObject(costs));
     if(pg_sina_planning) pg_sina_planning->freeze+=pg_sina_planner_clock()-mark;
     return (Plan *)scan;
@@ -253,7 +255,11 @@ static const CustomPathMethods device_methods={.CustomName="SniaDevicePath",.Pla
 
 static void add_device_path(PlannerInfo *root,RelOptInfo *rel,Path *native,bool top)
 {
-    if(native->param_info || native->parallel_aware ||
+    /* Only SeqScan supplies a shared, partitioned PG stream. A partial Join
+     * or a worker-private subtree cannot be replaced by that single stream. */
+    if(native->param_info ||
+       (native->parallel_workers>0 && (!native->parallel_aware || native->pathtype!=T_SeqScan)) ||
+       (native->parallel_aware && native->pathtype!=T_SeqScan) ||
        (IsA(native,CustomPath) && (((CustomPath *)native)->methods==&device_methods ||
                                  ((CustomPath *)native)->methods==&final_methods))) return;
     struct path_relation *state=relation_paths(root,rel);
@@ -287,8 +293,11 @@ static void add_device_path(PlannerInfo *root,RelOptInfo *rel,Path *native,bool 
     CustomPath *path=makeNode(CustomPath); path->path=*native;
     NodeSetTag(path,T_CustomPath); path->path.pathtype=T_CustomScan;
     if(!intVal(list_nth(((CustomScan *)device)->custom_private,4))) path->path.pathkeys=NIL;
-    path->path.parallel_aware=path->path.parallel_safe=false; path->path.parallel_workers=0;
-    path->path.rows=device->plan_rows;
+    path->path.parallel_aware=path->path.parallel_safe=native->parallel_aware;
+    path->path.parallel_workers=native->parallel_aware?native->parallel_workers:0;
+    /* The device stream has global rows. A partial PG Path describes each
+     * consumer's share; all consumers read the same DSM delivery queue. */
+    path->path.rows=native->parallel_aware?native->rows:device->plan_rows;
     path->path.startup_cost=path->path.total_cost=(internal+boundary)/pg_sina_host_cost_ms;
     path->custom_private=list_make5(lthird(((CustomScan *)device)->custom_private),copyObject(lsecond(((CustomScan *)device)->custom_private)),
         makeInteger(top),makeInteger(((CustomScan *)device)->methods==&pg_sina_scan_methods),copyObject(lfourth(((CustomScan *)device)->custom_private)));
@@ -300,7 +309,7 @@ static void add_device_path(PlannerInfo *root,RelOptInfo *rel,Path *native,bool 
     freed=pg_sina_planner_clock();
     /* PG may prune the delivered path. Keep a distinct object for parent
      * device joins: their inputs stay in device memory and pay no boundary. */
-    if(internal<state->internal_cost) {
+    if(!native->parallel_aware && internal<state->internal_cost) {
         state->internal=palloc(sizeof(*path)); *state->internal=*path;
         state->internal->path.startup_cost=state->internal->path.total_cost=internal/pg_sina_host_cost_ms;
         state->internal_cost=internal;
@@ -313,7 +322,11 @@ static void publish_paths(PlannerInfo *root,RelOptInfo *rel)
 {
     struct path_relation *state=relation_paths(root,rel);
     List *pending=state->pending; state->pending=NIL;
-    ListCell *c; foreach(c,pending) add_path(rel,lfirst(c));
+    ListCell *c; foreach(c,pending) {
+        Path *path=lfirst(c);
+        if(path->parallel_aware) add_partial_path(rel,path);
+        else add_path(rel,path);
+    }
     list_free(pending);
 }
 void pg_sina_rel_paths(PlannerInfo *root,RelOptInfo *rel,Index rti,RangeTblEntry *rte)

@@ -908,8 +908,12 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
     p->csd=device+2;
     p->rows=tree->nodes[tree->root].estimated_rows;
     scan->scan.plan.plan_rows=p->rows;
+    double consumers=IsA(p->native,SeqScan) && p->native->parallel_aware?
+        Max(1.0,p->rows/Max(1.0,p->native->plan_rows)):1;
+    /* Shared CSD I/O/transfer occurs once. Only HOST tuple conversion is
+     * distributed among PG consumers, using PG's partial-row estimate. */
     p->boundary=transfer_ms(output_bytes(p->native,&tree->nodes[tree->root].expr,p->rows),pg_sina_pcie_mbps)+
-        p->rows*cpu_tuple_cost*pg_sina_host_cost_ms+
+        p->rows/consumers*cpu_tuple_cost*pg_sina_host_cost_ms+
         Max(1,ceil(p->rows/output_capacity(p->native,&tree->nodes[tree->root].expr)))*pg_sina_result_batch_ms;
     if(bytes) { memcpy(VARDATA(bytes),tree,VARSIZE_ANY_EXHDR(bytes)); pfree(tree); }
     if(pg_sina_planning) pg_sina_planning->cost_finish+=pg_sina_planner_clock()-mark;
@@ -935,8 +939,7 @@ static struct placement *estimate(PlannerInfo *root,Plan *native,Plan *scope,Lis
         double repeats=IsA(native,NestLoop) && child->native==native->righttree && !IsA(child->native,Material)?Max(1,native->lefttree->plan_rows):1;
         original_children+=child->native->total_cost*pg_sina_host_cost_ms*repeats;
         native_children+=child->native_host*repeats;
-        best_children+=((IsA(native,Gather) || IsA(native,GatherMerge))?child->native_host:
-            child->offload?child->csd+child->boundary:child->host)*repeats;
+        best_children+=(child->offload?child->csd+child->boundary:child->host)*repeats;
     }
     double local=Max(0,native->total_cost*pg_sina_host_cost_ms-original_children);
     Oid oid=scan_relation(root,native);
@@ -950,21 +953,21 @@ static struct placement *estimate(PlannerInfo *root,Plan *native,Plan *scope,Lis
     /* Private inputs below Gather must be replayed by every PG worker (for
      * example a private hash build). A shared device stream partitions rows;
      * it is not a broadcast/replay source. Keep those scans native. */
-    if(pg_sina_exe_path==PG_SINA_FILTER && parallel_region && !native->parallel_aware) eligible=false;
+    if(parallel_region && (!native->parallel_aware || !IsA(native,SeqScan))) eligible=false;
     /* The shared scan cursor supports parallel SeqScan only. Reject parallel
      * index candidates before compiling their filters/SubPlans and metadata;
      * compile_subtree already rejects the same shape at its final check. */
-    if(pg_sina_exe_path==PG_SINA_FILTER && native->parallel_aware && !IsA(native,SeqScan)) eligible=false;
+    if(native->parallel_aware && pg_sina_is_scan(native) && !IsA(native,SeqScan)) eligible=false;
     /* HOST HashJoin invokes MultiExec on its Hash child, and MergeJoin may
      * mark/restore its inner child. A tuple-stream CustomScan is neither.
      * Keep those native nodes; their inputs can still be device islands. */
     eligible=eligible && !IsA(native,Hash) && !mark_restore;
     /* Scan-only conversion binds only its actual HOST InitPlan dependencies;
      * whole-subtree conversion still owns its complete initialization. */
-    if(eligible && (pg_sina_exe_path==PG_SINA_FILTER || top || root->init_plans==NIL)) {
-        Plan *candidate=pg_sina_exe_path==PG_SINA_FILTER?pg_sina_project_scan(scope,native):native;
+    if(eligible && (pg_sina_is_scan(native) || top || root->init_plans==NIL)) {
+        Plan *candidate=pg_sina_is_scan(native)?pg_sina_project_scan(scope,native):native;
         Plan *device=top && pg_sina_exe_path!=PG_SINA_FILTER?pg_sina_fast_plan(root,native):NULL;
-        if(!device) device=pg_sina_compile_subtree(root,candidate,!top);
+        if(!device) device=pg_sina_compile_subtree(root,candidate,!top || pg_sina_exe_path==PG_SINA_FILTER);
         if(device!=candidate) { p->device=device; device_cost(p,observations,NULL,NULL); }
     }
     p->offload=p->device && (pg_sina_exe_path!=PG_SINA_ADAPTIVE || p->csd+p->boundary<p->host);
@@ -1036,7 +1039,7 @@ Plan *pg_sina_cost_device(PlannerInfo *root,Plan *native,bool top,List **observa
                          double *internal,double *boundary)
 {
     struct placement p={.native=native,.root=root,.host=native->total_cost*pg_sina_host_cost_ms};
-    if(!top && root->init_plans) return NULL;
+    if(!top && root->init_plans && !pg_sina_is_scan(native)) return NULL;
     double mark=pg_sina_planner_clock();
     /* Keep the prepared tree itself, rather than copying it again when the
      * estimate workspace is deleted. Rejected candidates release this context. */
@@ -1120,11 +1123,10 @@ static Plan *select_plan(struct placement *p,bool top,StringInfo decisions)
         return out;
     }
     Plan *out=p->native; ListCell *c;
-    if(pg_sina_exe_path!=PG_SINA_FILTER && (IsA(out,Gather) || IsA(out,GatherMerge))) return out;
     foreach(c,p->children) {
         struct placement *child=lfirst(c); Plan *chosen=select_plan(child,false,decisions);
         if(child->native==out->lefttree) {
-            if(pg_sina_exe_path==PG_SINA_FILTER && chosen!=child->native)
+            if(chosen!=child->native && pg_sina_is_scan(child->native))
                 pg_sina_remap_input(out,child->native->targetlist,chosen->targetlist);
             out->lefttree=chosen;
         }
