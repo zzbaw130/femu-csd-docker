@@ -189,13 +189,15 @@ PG_SINA_CACHE=warm sh /home/femu/tests/tpch-test.sh
 
 需要继续定位时，同一开关还输出 `SQLerate planner breakdown` 和 `SQLerate cache observation`。前者拆开设备打开、属性读取、探测 CSF 的下载/执行/卸载、候选复制/裁列/描述、估价及保留；`native_core/adaptive_core` 从两次 PG 规划墙钟中扣除已计时的扩展工作，`hook_other` 是扩展 hook 的其余工作。`cpu_ms` 使用当前 backend 线程 CPU 时钟，区别于包含等待的墙钟。设备打开的 `open_major_faults` 用于识别首次加载插件的磁盘缺页；资源细项已包含在 `resources_inclusive`，不能重复相加。
 
-`cache_probe`现在是本次规划读取驻留记录及PG关系元数据的时间。同一OID在规划内复用结果；`files/residency/count/pages/cachestat_calls/mincore_calls`在规划阶段应为零，PG普通统计和文件大小元数据仍正常读取。`SQLerate cache ledger refresh`另外报告连接初始化和ExecutorEnd的快照构建时间，不与规划时间混为一谈。ExecutorEnd刷新目前由PG backend同步完成，会计入原始客户端端到端时间。按实验口径另报“查询主体时间”：每次样本用原始总时间减去该次已测得的ExecutorEnd刷新时间，再求均值/中位数；刷新时间单列为缓存维护成本。该指标含规划，不能称为原生执行器时间，也不表示当前刷新已经后台异步化。
+`cache_probe`现在是本次规划读取驻留记录及PG关系元数据的时间。同一OID在规划内复用结果；`files/residency/count/pages/cachestat_calls/mincore_calls`在规划阶段应为零，PG普通统计和文件大小元数据仍正常读取。`SQLerate cache ledger refresh`报告连接初始化及ExecutorEnd的主线程维护时间；`SQLerate cache file publish`另报后台文件观测时间。查询端到端时间仍保留；另报的“查询主体时间”仅逐样本扣除主线程ExecutorEnd维护时间，再做统计，仍包含规划。后台观测与查询可以重叠，不能把后台耗时再加到或从SQL耗时中扣除。
 
 连接初始化按物理RelFileNode建立普通用户表及索引main fork的两张位图：shared_buffers按8KiB块，文件缓存按Guest系统页（当前4KiB）。共享页位来自有效BufferTag，文件位来自`mmap(PROT_NONE)+mincore`，不读入缺失页；cachestat只有数量，不能用来恢复页面身份。规划器使用位图派生的去重页数。一个8KiB数据库页对应两个4KiB文件页，可分别驻留；这只是记录粒度，不改变8KiB数据库页或4MiB DMA。用一个8KiB缓存位会丢失半页命中状态；即使记录时聚合，mincore仍按Linux系统页返回结果。DCP每次导入后根据buffer_id的旧BufferTag清除旧页位，再置新页位，不能只累计新页。
 
-顶层ExecutorEnd在设备接收和执行器清理后刷新全部记录，也捕获HOST读取造成的装入、淘汰和HPCP发布。内部SPI及parallel worker不重复刷新。记录限于本连接，上一次完成的快照不跟踪其他连接和Linux独立回收；查询异常中止后标为无效，下一次成功语句结束重建，失效期间规划按未知缓存保守估价。不新增后台进程、跨连接共享框架，也不修改PG源码。
+连接初始化同步建立完整记录，随后每个连接保留一个文件观测线程。顶层ExecutorEnd在设备接收及执行器清理后，由PG主线程采集全部用户关系元数据、共享缓冲描述符并更新DCP位图，将文件路径和大小的独立副本交给后台。后台自行执行open/mmap/mincore及文件位图处理，不调用PG API；查询结束和下次规划均不等待它。主线程在规划入口、现有DCP轮询点及下次刷新时只发布已经完成的文件结果，未完成时直接使用旧文件位图，允许短暂滞后。`generation`表示共享快照版本，`file_generation`表示该关系已发布的文件观测版本；后台发布不覆盖DCP位图。主线程仍有元数据及共享描述符采集成本，并非整个ExecutorEnd零开销。
 
-仅正式Q6的位图核验：在Guest执行`sh /home/femu/tests/cache-residency-test.sh`。它在2GiB及临时64MiB的PG缓冲中逐页对比真实驻留，验证DCP替换旧页及HOST/HPCP后的刷新，结束后恢复PG默认配置。设备workmem不变，不把64MiB PG替换场景当作正常性能测量。
+后台最多处理一份运行任务和最新一份待处理任务，连续语句替换尚未开始的旧任务，不积压队列；只有连接退出时等待线程释放。内部SPI及parallel worker不重复刷新。记录限于本连接，不跟踪其他连接和Linux独立回收；查询异常中止后标为无效，下一次成功语句结束重建，失效期间规划按未知缓存保守估价。没有后台进程、代理、PG源码修改或跨连接同步框架。
+
+仅正式Q6的位图核验：在Guest执行`sh /home/femu/tests/cache-residency-test.sh`。它在2GiB及临时64MiB的PG缓冲中逐页对比真实驻留，验证DCP替换旧页及HOST/HPCP后的刷新，结束后恢复PG默认配置。准确性检查模块仅在测试中等待文件版本追上已提交版本，再比较每一位；正式执行和性能测试没有这个等待。脚本另用未加载检查模块的连续语句验证异步发布、任务合并及取消恢复。设备workmem不变，不把64MiB PG替换场景当作正常性能测量。
 
 `schema_reads/schema_reuses` 记录规划内表列布局读取和复用次数。只缓存关系锁保护的列定义与文件节点，每个候选仍复制自己的列槽和限制信息；行数、谓词、物理选择和缓存比例按原流程计算。候选标记只借用输出列描述，实际交付给PG的输出表达式在选中后构造，预览标记在setrefs前移除；不改变PG和设备候选的搜索范围。
 

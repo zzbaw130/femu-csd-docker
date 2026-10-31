@@ -63,8 +63,8 @@ static struct residency *residency(Oid oid,List **observations)
         r->shared=entry->blocks?Min(1.0,(double)entry->shared_pages/entry->blocks):0;
         r->fraction=entry->file_known && entry->file_total?Min(1.0,(double)entry->file_pages/entry->file_total):0;
     }
-    if(pg_sina_planning) ereport(NOTICE,(errmsg("SQLerate relation cache relid=%u shared_percent=%.2f file_percent=%.2f pages=%.0f generation=%u",
-        oid,r->shared*100,r->fraction*100,r->bytes/BLCKSZ,entry?entry->generation:0)));
+    if(pg_sina_planning) ereport(NOTICE,(errmsg("SQLerate relation cache relid=%u shared_percent=%.2f file_percent=%.2f pages=%.0f generation=%u file_generation=%u",
+        oid,r->shared*100,r->fraction*100,r->bytes/BLCKSZ,entry?entry->generation:0,entry?entry->file_generation:0)));
     relation_close(rel,AccessShareLock);
     MemoryContext previous=MemoryContextSwitchTo(pg_sina_search_context());
     *observations=lappend(*observations,r);

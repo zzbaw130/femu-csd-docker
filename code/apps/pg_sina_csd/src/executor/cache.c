@@ -169,6 +169,7 @@ static void fill_slot(unsigned slot,bool whole_slot)
 }
 bool pg_sina_dcp_poll(bool whole_slot)
 {
+    pg_sina_cache_poll();
     if(receiver.fd<0 || receiver.slots==MAP_FAILED || receiver.data==MAP_FAILED) return false;
     uint64 start=now_ns();
     struct rusage before,after;

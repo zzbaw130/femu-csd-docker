@@ -16,10 +16,12 @@ struct pg_sina_cache_entry {
     Oid relid;
     uint64 blocks,file_total,shared_pages,file_pages;
     unsigned char *shared_bits,*file_bits;
-    unsigned generation;
+    unsigned generation,file_generation;
     bool file_known;
 };
 void pg_sina_cache_init(void);
+/* Publish only an already completed observation; never wait for the worker. */
+void pg_sina_cache_poll(void);
 const struct pg_sina_cache_entry *pg_sina_cache_lookup(RelFileNode);
 void pg_sina_cache_buffer(int buffer);
 extern int pg_sina_exe_path;

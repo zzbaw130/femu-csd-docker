@@ -2,6 +2,7 @@
  * mincore observations, without refreshing the extension's snapshot first. */
 #include "pg_internal.h"
 #include "fmgr.h"
+#include "miscadmin.h"
 #include "executor/executor.h"
 #include "access/relation.h"
 #include "storage/bufmgr.h"
@@ -20,10 +21,22 @@ static bool armed;
 static unsigned ending;
 static ExecutorEnd_hook_type previous_end;
 static bool resident_bit(const unsigned char *bits,uint64 i) { return (bits[i/8]>>(i%8))&1; }
-static void check_pages(const char *phase)
+static void check_pages(const char *phase,bool wait_files)
 {
     const struct pg_sina_cache_entry *entry=pg_sina_cache_lookup(checked_node);
-    if(!entry || !entry->file_known) elog(ERROR,"cache snapshot is missing or incomplete");
+    if(!entry) elog(ERROR,"cache snapshot is missing");
+    /* Only this correctness observer waits. Production query/plan hooks
+     * always consume the last completed file snapshot without a barrier. */
+    if(wait_files) {
+        unsigned target=entry->generation;
+        for(unsigned i=0;i<2000 && entry->file_generation<target;++i) {
+            pg_sina_cache_poll(); entry=pg_sina_cache_lookup(checked_node);
+            if(entry->file_generation<target) pg_usleep(1000L);
+            CHECK_FOR_INTERRUPTS();
+        }
+        if(entry->file_generation<target || !entry->file_known)
+            elog(ERROR,"file snapshot did not eventually reach the submitted generation");
+    }
     unsigned char *actual=palloc0(Max((entry->blocks+7)/8,1));
     uint64 shared=0,file=0,shared_mismatch=0,file_mismatch=0;
     for(int i=0;i<NBuffers;++i) {
@@ -41,7 +54,8 @@ static void check_pages(const char *phase)
     long os_page=sysconf(_SC_PAGESIZE);
     char *base=relpathperm(checked_node,MAIN_FORKNUM);
     uint64 total=entry->blocks*BLCKSZ,segment_bytes=(uint64)RELSEG_SIZE*BLCKSZ;
-    for(uint64 at=0;at<total;) {
+    if(!wait_files) file=entry->file_pages;
+    for(uint64 at=0;wait_files && at<total;) {
         unsigned segment=at/segment_bytes;
         char *path=segment?psprintf("%s.%u",base,segment):base;
         int fd=OpenTransientFile(path,O_RDONLY|PG_BINARY);
@@ -62,8 +76,8 @@ static void check_pages(const char *phase)
         elog(ERROR,"cache bitmap mismatch: shared=%llu file=%llu counts=%d",
             (unsigned long long)shared_mismatch,(unsigned long long)file_mismatch,
             shared!=entry->shared_pages || file!=entry->file_pages);
-    ereport(NOTICE,(errmsg("CACHE_CHECK phase=%s generation=%u shared_pages=%llu file_pages=%llu shared_mismatches=0 file_mismatches=0",
-        phase,entry->generation,(unsigned long long)shared,(unsigned long long)file)));
+    ereport(NOTICE,(errmsg("CACHE_CHECK phase=%s generation=%u file_generation=%u file_checked=%d shared_pages=%llu file_pages=%llu shared_mismatches=0 file_mismatches=0",
+        phase,entry->generation,entry->file_generation,wait_files,(unsigned long long)shared,(unsigned long long)file)));
     pfree(actual); pfree(base);
 }
 
@@ -77,11 +91,11 @@ static void check_end(QueryDesc *query)
     }
     bool outer=!ending && target;
     if(outer && armed && pg_sina_dcp &&
-       (pg_sina_exe_path==PG_SINA_CSD || pg_sina_exe_path==PG_SINA_HPCP)) check_pages("before_end");
+       (pg_sina_exe_path==PG_SINA_CSD || pg_sina_exe_path==PG_SINA_HPCP)) check_pages("before_end",false);
     ++ending;
     if(previous_end) previous_end(query); else standard_ExecutorEnd(query);
     --ending;
-    if(outer && armed) check_pages("after_end");
+    if(outer && armed) check_pages("after_end",true);
 }
 void _PG_init(void);
 void _PG_init(void)

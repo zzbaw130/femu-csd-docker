@@ -1,5 +1,5 @@
-/* Page identities live for one connection. Only the backend touches this
- * snapshot: initialize before planning; refresh after the outer executor ends. */
+/* The backend owns PG snapshots and DCP updates. A worker observes file pages
+ * in C-owned storage; the backend publishes completed results without waiting. */
 #include "pg_internal.h"
 #include "access/parallel.h"
 #include "access/relation.h"
@@ -9,7 +9,7 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/buf_internals.h"
-#include "storage/fd.h"
+#include "storage/ipc.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -17,6 +17,12 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <signal.h>
+#include <stdatomic.h>
 
 static struct {
     MemoryContext context;
@@ -62,30 +68,150 @@ void pg_sina_cache_buffer(int buffer)
         bit_change(after->shared_bits,tag.blockNum,true,&after->shared_pages);
     snapshot.tags[buffer-1]=tag; ++dcp_updates;
 }
-static void file_pages(struct pg_sina_cache_entry *entry)
+/* The worker owns ordinary C allocations only. It never follows a PG hash
+ * entry, BufferDesc, MemoryContext or ResourceOwner pointer. */
+struct file_result {
+    RelFileNode node;
+    uint64 blocks,total,pages;
+    unsigned char *bits;
+    bool known;
+    char base[MAXPGPATH];
+};
+struct file_job {
+    unsigned generation,count;
+    uint64 submitted_ns,started_ns,finished_ns;
+    struct file_result files[];
+};
+static _Atomic(struct file_job *) queued_files,completed_files;
+static atomic_bool file_stopping=ATOMIC_VAR_INIT(false);
+static sem_t file_wake;
+static pthread_t file_worker;
+static bool worker_started;
+static uint64 coalesced_files;
+static uint64 monotonic_ns(void)
 {
-    char *base=relpathperm(entry->node,MAIN_FORKNUM);
-    uint64 total=entry->blocks*BLCKSZ,segment_bytes=(uint64)RELSEG_SIZE*BLCKSZ;
-    entry->file_known=true;
-    for(uint64 at=0;at<total;) {
-        unsigned segment=at/segment_bytes;
-        char *path=segment?psprintf("%s.%u",base,segment):base;
-        int fd=OpenTransientFile(path,O_RDONLY|PG_BINARY);
-        if(segment) pfree(path);
-        if(fd<0) { entry->file_known=false; break; }
-        size_t bytes=Min(total-at,segment_bytes),pages=(bytes+os_page-1)/os_page;
-        unsigned char *vector=palloc(pages);
-        void *map=mmap(NULL,bytes,PROT_NONE,MAP_SHARED,fd,0);
-        if(map==MAP_FAILED) entry->file_known=false;
-        else {
-            if(mincore(map,bytes,vector)) entry->file_known=false;
-            else for(size_t i=0;i<pages;++i)
-                if(vector[i]&1) bit_change(entry->file_bits,at/os_page+i,true,&entry->file_pages);
-            munmap(map,bytes);
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+    return (uint64)t.tv_sec*1000000000+t.tv_nsec;
+}
+static void free_files(struct file_job *job)
+{
+    if(!job) return;
+    for(unsigned i=0;i<job->count;++i) free(job->files[i].bits);
+    free(job);
+}
+static struct file_job *make_files(void)
+{
+    unsigned count=hash_get_num_entries(snapshot.entries);
+    struct file_job *job=calloc(1,sizeof(*job)+(size_t)count*sizeof(job->files[0]));
+    if(!job) elog(ERROR,"cannot allocate cache file observation");
+    job->count=count; job->generation=snapshot.generation;
+    HASH_SEQ_STATUS scan; hash_seq_init(&scan,snapshot.entries);
+    volatile bool scanning=true;
+    PG_TRY();
+    {
+        struct pg_sina_cache_entry *entry; unsigned i=0;
+        while((entry=hash_seq_search(&scan))) {
+            struct file_result *f=&job->files[i++];
+            f->node=entry->node; f->blocks=entry->blocks; f->total=entry->file_total;
+            char *base=relpathperm(entry->node,MAIN_FORKNUM);
+            strlcpy(f->base,base,sizeof(f->base)); pfree(base);
+            f->bits=calloc(Max((f->total+7)/8,1),1);
+            if(!f->bits) elog(ERROR,"cannot allocate file residency bits");
         }
-        pfree(vector); CloseTransientFile(fd); at+=bytes;
+        scanning=false;
     }
-    pfree(base);
+    PG_CATCH();
+    { if(scanning) hash_seq_term(&scan); free_files(job); PG_RE_THROW(); }
+    PG_END_TRY();
+    return job;
+}
+static void observe_files(struct file_job *job)
+{
+    job->started_ns=monotonic_ns();
+    for(unsigned i=0;i<job->count && !atomic_load_explicit(&file_stopping,memory_order_relaxed);++i) {
+        struct file_result *f=&job->files[i];
+        uint64 total=f->blocks*BLCKSZ,segment_bytes=(uint64)RELSEG_SIZE*BLCKSZ;
+        f->known=true;
+        for(uint64 at=0;at<total;) {
+            if(atomic_load_explicit(&file_stopping,memory_order_relaxed)) break;
+            unsigned segment=at/segment_bytes;
+            char path[MAXPGPATH+32];
+            if(segment) snprintf(path,sizeof(path),"%s.%u",f->base,segment);
+            else snprintf(path,sizeof(path),"%s",f->base);
+            int fd=open(path,O_RDONLY|O_CLOEXEC);
+            if(fd<0) { f->known=false; break; }
+            size_t bytes=Min(total-at,segment_bytes),pages=(bytes+os_page-1)/os_page;
+            unsigned char *vector=malloc(pages);
+            if(!vector) { close(fd); f->known=false; break; }
+            void *map=mmap(NULL,bytes,PROT_NONE,MAP_SHARED,fd,0);
+            if(map==MAP_FAILED) f->known=false;
+            else {
+                if(mincore(map,bytes,vector)) f->known=false;
+                else for(size_t j=0;j<pages;++j) if(vector[j]&1) {
+                    uint64 bit=at/os_page+j;
+                    f->bits[bit/8]|=1U<<(bit%8); ++f->pages;
+                }
+                munmap(map,bytes);
+            }
+            free(vector); close(fd); at+=bytes;
+        }
+    }
+    job->finished_ns=monotonic_ns();
+}
+static void publish_files(struct file_job *job)
+{
+    unsigned applied=0,generation=job->generation;
+    uint64 submitted=job->submitted_ns,finished=job->finished_ns,started=job->started_ns;
+    for(unsigned i=0;i<job->count;++i) {
+        const struct file_result *f=&job->files[i];
+        struct pg_sina_cache_entry *entry=hash_search(snapshot.entries,&f->node,HASH_FIND,NULL);
+        if(!entry || entry->blocks!=f->blocks || entry->file_total!=f->total || entry->file_generation>generation) continue;
+        memcpy(entry->file_bits,f->bits,(f->total+7)/8);
+        entry->file_pages=f->pages; entry->file_known=f->known;
+        entry->file_generation=generation; ++applied;
+    }
+    free_files(job);
+    if(pg_sina_profile) ereport(NOTICE,(errmsg("SQLerate cache file publish generation=%u shared_generation=%u relations=%u observe_ms=%.3f submitted_ns=%llu finished_ns=%llu published_ns=%llu",
+        generation,snapshot.generation,applied,(finished-started)/1e6,
+        (unsigned long long)submitted,(unsigned long long)finished,(unsigned long long)monotonic_ns())));
+}
+void pg_sina_cache_poll(void)
+{
+    if(!snapshot.entries || !atomic_load_explicit(&completed_files,memory_order_acquire)) return;
+    struct file_job *job=atomic_exchange_explicit(&completed_files,NULL,memory_order_acq_rel);
+    if(job) publish_files(job);
+}
+static void *observe_loop(void *unused)
+{
+    for(;;) {
+        while(sem_wait(&file_wake)<0 && errno==EINTR) {}
+        if(atomic_load_explicit(&file_stopping,memory_order_relaxed)) break;
+        struct file_job *job=atomic_exchange_explicit(&queued_files,NULL,memory_order_acq_rel);
+        if(!job) continue;
+        observe_files(job);
+        if(atomic_load_explicit(&file_stopping,memory_order_relaxed)) { free_files(job); break; }
+        free_files(atomic_exchange_explicit(&completed_files,job,memory_order_acq_rel));
+    }
+    return NULL;
+}
+static void stop_files(int code,Datum arg)
+{
+    if(!worker_started) return;
+    atomic_store_explicit(&file_stopping,true,memory_order_relaxed);
+    sem_post(&file_wake); pthread_join(file_worker,NULL);
+    free_files(atomic_exchange_explicit(&queued_files,NULL,memory_order_acq_rel));
+    free_files(atomic_exchange_explicit(&completed_files,NULL,memory_order_acq_rel));
+    sem_destroy(&file_wake); worker_started=false;
+}
+static void submit_files(struct file_job *job)
+{
+    job->submitted_ns=monotonic_ns();
+    if(!worker_started) { observe_files(job); publish_files(job); return; }
+    /* One running job plus the latest queued job. Pointer exchange and wakeup
+     * never wait for file observation; superseded metadata can be discarded. */
+    struct file_job *old=atomic_exchange_explicit(&queued_files,job,memory_order_acq_rel);
+    if(old) { ++coalesced_files; free_files(old); }
+    else sem_post(&file_wake);
 }
 static HTAB *build_snapshot(MemoryContext context,BufferTag *tags,unsigned generation)
 {
@@ -105,12 +231,16 @@ static HTAB *build_snapshot(MemoryContext context,BufferTag *tags,unsigned gener
         entry->file_total=(entry->blocks*BLCKSZ+os_page-1)/os_page;
         entry->shared_bits=MemoryContextAllocZero(context,Max((entry->blocks+7)/8,1));
         entry->file_bits=MemoryContextAllocZero(context,Max((entry->file_total+7)/8,1));
+        const struct pg_sina_cache_entry *old=snapshot.entries?hash_search(snapshot.entries,&entry->node,HASH_FIND,NULL):NULL;
+        if(old && old->blocks==entry->blocks) {
+            memcpy(entry->file_bits,old->file_bits,(entry->file_total+7)/8);
+            entry->file_pages=old->file_pages; entry->file_known=old->file_known;
+            entry->file_generation=old->file_generation;
+        }
         relation_close(rel,AccessShareLock);
     }
     SPI_finish();
-    HASH_SEQ_STATUS scan; hash_seq_init(&scan,entries);
     struct pg_sina_cache_entry *entry;
-    while((entry=hash_seq_search(&scan))) file_pages(entry);
     /* Metadata access above may itself replace buffers. Observe descriptors
      * last so the published snapshot includes those replacements too. */
     for(int i=0;i<NBuffers;++i) {
@@ -138,6 +268,7 @@ static uint64 differences(const unsigned char *a,uint64 na,const unsigned char *
 static void refresh(const char *reason)
 {
     instr_time begin,end; INSTR_TIME_SET_CURRENT(begin);
+    pg_sina_cache_poll();
     MemoryContext context=AllocSetContextCreate(TopMemoryContext,"SQLerate cache residency",ALLOCSET_DEFAULT_SIZES);
     MemoryContext previous=CurrentMemoryContext;
     BufferTag *tags=MemoryContextAllocZero(context,(Size)NBuffers*sizeof(BufferTag));
@@ -164,18 +295,20 @@ static void refresh(const char *reason)
         while((entry=hash_seq_search(&scan))) {
             const struct pg_sina_cache_entry *old=snapshot.entries?hash_search(snapshot.entries,&entry->node,HASH_FIND,NULL):NULL;
             uint64 delta=old?differences(old->shared_bits,old->blocks,entry->shared_bits,entry->blocks):entry->shared_pages;
-            ereport(NOTICE,(errmsg("SQLerate cache ledger relation generation=%u relid=%u blocks=%llu shared_pages=%llu file_pages=%llu file_total=%llu file_known=%d shared_delta_pages=%llu",
+            ereport(NOTICE,(errmsg("SQLerate cache ledger relation generation=%u relid=%u blocks=%llu shared_pages=%llu file_pages=%llu file_total=%llu file_known=%d file_generation=%u shared_delta_pages=%llu",
                 entry->generation,entry->relid,(unsigned long long)entry->blocks,(unsigned long long)entry->shared_pages,
-                (unsigned long long)entry->file_pages,(unsigned long long)entry->file_total,entry->file_known,(unsigned long long)delta)));
+                (unsigned long long)entry->file_pages,(unsigned long long)entry->file_total,entry->file_known,entry->file_generation,(unsigned long long)delta)));
         }
     }
     if(snapshot.context) MemoryContextDelete(snapshot.context);
     snapshot.context=context; snapshot.entries=(HTAB *)entries; snapshot.tags=tags;
     snapshot.valid=true; ++snapshot.generation;
+    submit_files(make_files());
     INSTR_TIME_SET_CURRENT(end); INSTR_TIME_SUBTRACT(end,begin);
-    if(pg_sina_profile) ereport(NOTICE,(errmsg("SQLerate cache ledger refresh reason=%s generation=%u wall_ms=%.3f relations=%ld dcp_updates=%llu dcp_evictions=%llu",
+    if(pg_sina_profile) ereport(NOTICE,(errmsg("SQLerate cache ledger refresh reason=%s generation=%u wall_ms=%.3f relations=%ld dcp_updates=%llu dcp_evictions=%llu coalesced=%llu returned_ns=%llu",
         reason,snapshot.generation,INSTR_TIME_GET_MILLISEC(end),hash_get_num_entries(snapshot.entries),
-        (unsigned long long)dcp_updates,(unsigned long long)dcp_evictions)));
+        (unsigned long long)dcp_updates,(unsigned long long)dcp_evictions,
+        (unsigned long long)coalesced_files,(unsigned long long)monotonic_ns())));
     dcp_updates=dcp_evictions=0;
 }
 static void start(QueryDesc *query,int flags)
@@ -222,6 +355,14 @@ void pg_sina_cache_init(void)
     refresh("connection_init");
     if(own_snapshot) PopActiveSnapshot();
     if(own_transaction) CommitTransactionCommand();
+    if(sem_init(&file_wake,0,0)) elog(ERROR,"cannot initialize cache observer: %m");
+    on_proc_exit(stop_files,0);
+    sigset_t blocked,previous;
+    sigfillset(&blocked); pthread_sigmask(SIG_BLOCK,&blocked,&previous);
+    int error=pthread_create(&file_worker,NULL,observe_loop,NULL);
+    if(!error) worker_started=true;
+    pthread_sigmask(SIG_SETMASK,&previous,NULL);
+    if(error) { sem_destroy(&file_wake); elog(ERROR,"cannot start cache observer: %s",strerror(error)); }
     RegisterXactCallback(transaction_end,NULL);
     previous_start=ExecutorStart_hook; ExecutorStart_hook=start;
     previous_run=ExecutorRun_hook; ExecutorRun_hook=run;
