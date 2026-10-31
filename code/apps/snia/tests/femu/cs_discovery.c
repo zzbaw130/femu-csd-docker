@@ -160,6 +160,24 @@ int main(void)
     device->profile = false;
     struct nvme_passthru_cmd unprofiled = {.opcode = 0xd0};
     assert(cs_io(device, false, &unprofiled) == CS_SUCCESS && device->io_timing[1].calls == 1);
+    /* Vendor resource 0 owns temporary execution state, not the transport or
+     * downloaded code. A busy or failed reset must leave its session intact. */
+    unsigned old_opens=opens,old_closes=closes;
+    assert(femu_reset(dev,CS_CSE_TYPE,0)==CS_UNSUPPORTED);
+    assert(femu_reset(dev,CS_VENDOR_SPECIFIC_TYPE,1)==CS_UNSUPPORTED);
+    device->graph_session=17; device->next_graph=23;
+    device->graphs=(void *)1;
+    assert(femu_reset(dev,CS_VENDOR_SPECIFIC_TYPE,0)==CS_HANDLE_IN_USE);
+    device->graphs=NULL;
+    fail_io=true;
+    assert(femu_reset(dev,CS_VENDOR_SPECIFIC_TYPE,0)==CS_NO_PERMISSIONS);
+    assert(device->graph_session==17);
+    fail_io=false;
+    assert(femu_reset(dev,CS_VENDOR_SPECIFIC_TYPE,0)==CS_SUCCESS);
+    assert(!device->graph_session && !device->next_graph);
+    assert(opens==old_opens && closes==old_closes);
+    assert(device->caps.workers==4 && device->caps.fdm_bytes==(64U<<20));
+    assert(femu_reset(dev,CS_VENDOR_SPECIFIC_TYPE,0)==CS_SUCCESS);
     femu_closeCSx(dev);
     unsetenv("SNIA_FEMU_PROFILE");
     assert(opens == closes);

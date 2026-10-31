@@ -37,7 +37,7 @@ static const CustomPathMethods device_methods,final_methods;
 
 /* This marker survives PG setrefs but cannot reach the executor. Only the
  * globally selected statement gets its final CSF record in finish below. */
-static Plan *defer_program(PlannerInfo *root,Plan *native,bool fast,bool boundary,List *costs,List *choices)
+static Plan *defer_program(PlannerInfo *root,Plan *native,bool fast,bool boundary,Node *costs,List *choices)
 {
     double mark=pg_sina_planner_clock();
     MemoryContext previous=MemoryContextSwitchTo(pg_sina_search_context());
@@ -285,7 +285,7 @@ static void add_device_path(PlannerInfo *root,RelOptInfo *rel,Path *native,bool 
     path->path.parallel_aware=path->path.parallel_safe=false; path->path.parallel_workers=0;
     path->path.rows=device->plan_rows;
     path->path.startup_cost=path->path.total_cost=(internal+boundary)/pg_sina_host_cost_ms;
-    path->custom_private=list_make5(copyObject(lthird(((CustomScan *)device)->custom_private)),copyObject(lsecond(((CustomScan *)device)->custom_private)),
+    path->custom_private=list_make5(lthird(((CustomScan *)device)->custom_private),copyObject(lsecond(((CustomScan *)device)->custom_private)),
         makeInteger(top),makeInteger(((CustomScan *)device)->methods==&pg_sina_scan_methods),copyObject(lfourth(((CustomScan *)device)->custom_private)));
     path->methods=&device_methods;
     if(pg_sina_planning) pg_sina_planning->retain_copy+=pg_sina_planner_clock()-mark;
@@ -405,7 +405,8 @@ static Plan *final_plan(PlannerInfo *root,RelOptInfo *rel,CustomPath *path,List 
             device=defer_program(root,lthird(candidate->custom_private),candidate->methods==&pg_sina_scan_methods,false,lsecond(candidate->custom_private),lfourth(candidate->custom_private));
             device->plan_rows=rows;
             scan->custom_plans=lappend(scan->custom_plans,device);
-            scan->custom_private=lappend(scan->custom_private,makeFloat(psprintf("%.17g",internal+boundary)));
+            scan->custom_private=lappend(scan->custom_private,makeConst(FLOAT8OID,-1,InvalidOid,sizeof(double),
+                Float8GetDatum((internal+boundary)/pg_sina_host_cost_ms),false,FLOAT8PASSBYVAL));
         }
     }
     return wrapper;
@@ -419,7 +420,7 @@ PlannedStmt *pg_sina_original_device_statement(PlannedStmt *host)
     CustomScan *out=(CustomScan *)device->planTree;
     out->custom_plans=list_make1(lsecond(out->custom_plans));
     out->scan.plan.initPlan=NIL;
-    out->scan.plan.startup_cost=out->scan.plan.total_cost=floatVal(lthird(out->custom_private))/pg_sina_host_cost_ms;
+    out->scan.plan.startup_cost=out->scan.plan.total_cost=DatumGetFloat8(lthird_node(Const,out->custom_private)->constvalue);
     lfirst(list_head(out->custom_private))=makeString("subtree:CSD; query=original PG physical tree");
     scan->custom_plans=list_make1(linitial(scan->custom_plans));
     return device;

@@ -21,6 +21,7 @@
 #include "utils/rel.h"
 #include "utils/date.h"
 #include "utils/datetime.h"
+#include "utils/memutils.h"
 #include <float.h>
 #include <math.h>
 #include <fcntl.h>
@@ -787,26 +788,30 @@ static void node_costs(struct placement *p,StringInfo text)
     ListCell *c;
     foreach(c,p->children) node_costs(lfirst(c),text);
 }
-static void annotate_device(struct placement *p)
+/* Candidate metadata is binary and copyObject-safe. Only selected plans turn
+ * these diagnostic numbers into PG Float strings for EXPLAIN. PG Paths keep
+ * their ordinary numeric Cost fields, in PG cost units, throughout search. */
+struct candidate_costs { double values[15]; int workers; };
+static List *format_costs(const struct candidate_costs *costs,const char *stages)
+{
+    List *out=NIL;
+    for(unsigned i=0;i<lengthof(costs->values);++i)
+        out=lappend(out,makeFloat(psprintf("%.9g",costs->values[i])));
+    out=lappend(out,makeInteger(costs->workers));
+    return lappend(out,makeString(pstrdup(stages)));
+}
+static void annotate_device(struct placement *p,bool candidate)
 {
     CustomScan *scan=(CustomScan *)p->device;
-    List *costs=list_make5(
-        makeFloat(psprintf("%.9g",p->host)),makeFloat(psprintf("%.9g",p->csd)),
-        makeFloat(psprintf("%.9g",p->boundary)),makeFloat(psprintf("%.9g",p->cache)),
-        makeFloat(psprintf("%.9g",p->spill)));
-    costs=lappend(costs,makeFloat(psprintf("%.9g",p->cpu)));
-    costs=lappend(costs,makeFloat(psprintf("%.9g",p->io)));
-    costs=lappend(costs,makeFloat(psprintf("%.9g",p->peak)));
-    costs=lappend(costs,makeFloat(psprintf("%.9g",p->population)));
-    costs=lappend(costs,makeFloat(psprintf("%.9g",p->serial)));
-    costs=lappend(costs,makeFloat(psprintf("%.9g",p->parallel)));
-    costs=lappend(costs,makeFloat(psprintf("%.9g",p->schedule)));
-    costs=lappend(costs,makeFloat(psprintf("%.9g",p->combine)));
-    costs=lappend(costs,makeFloat(psprintf("%.9g",p->dictionary)));
-    costs=lappend(costs,makeFloat(psprintf("%.9g",p->fdm)));
-    costs=lappend(costs,makeInteger(p->workers));
-    costs=lappend(costs,makeString(p->stages?p->stages->data:pstrdup("")));
-    scan->custom_private=lappend(scan->custom_private,costs);
+    struct candidate_costs costs={{p->host,p->csd,p->boundary,p->cache,p->spill,p->cpu,p->io,p->peak,
+        p->population,p->serial,p->parallel,p->schedule,p->combine,p->dictionary,p->fdm},p->workers};
+    Node *saved;
+    if(candidate) {
+        bytea *record=palloc0(VARHDRSZ+sizeof(costs)); SET_VARSIZE(record,VARHDRSZ+sizeof(costs));
+        memcpy(VARDATA(record),&costs,sizeof(costs));
+        saved=(Node *)makeConst(BYTEAOID,-1,InvalidOid,-1,PointerGetDatum(record),false,false);
+    } else saved=(Node *)format_costs(&costs,p->stages?p->stages->data:"");
+    scan->custom_private=lappend(scan->custom_private,saved);
 }
 static bool output_ordered(const struct qp_plan *tree,int id)
 {
@@ -827,10 +832,16 @@ Plan *pg_sina_cost_device(PlannerInfo *root,Plan *native,bool top,List **observa
     struct placement p={.native=native,.root=root,.host=native->total_cost*pg_sina_host_cost_ms};
     if(!top && root->init_plans) return NULL;
     double mark=pg_sina_planner_clock();
+    /* Keep the prepared tree itself, rather than copying it again when the
+     * estimate workspace is deleted. Rejected candidates release this context. */
+    MemoryContext workspace=CurrentMemoryContext;
+    MemoryContext retained=AllocSetContextCreate(pg_sina_search_context(),"CSD candidate plan",ALLOCSET_DEFAULT_SIZES);
+    MemoryContextSwitchTo(retained);
     Plan *chosen=pg_sina_prepare_candidate(root,native,!top || root->parse->sortClause!=NIL);
+    MemoryContextSwitchTo(workspace);
     if(!chosen) {
         if(pg_sina_planning) pg_sina_planning->properties+=pg_sina_planner_clock()-mark;
-        return NULL;
+        MemoryContextDelete(retained); return NULL;
     }
     p.native=chosen;
     struct qp_plan *lowered=NULL;
@@ -838,17 +849,19 @@ Plan *pg_sina_cost_device(PlannerInfo *root,Plan *native,bool top,List **observa
     p.device=top?pg_sina_fast_properties(root,chosen,&fast):NULL;
     if(!p.device) p.device=pg_sina_describe_candidate(root,chosen,!top,&lowered);
     if(p.device && p.device!=chosen && lowered && top && root->parse->sortClause && !output_ordered(lowered,lowered->root)) {
+        MemoryContextSwitchTo(retained);
         chosen=pg_sina_require_output_order(root,chosen);
+        MemoryContextSwitchTo(workspace);
         p.native=chosen;
         p.device=chosen?pg_sina_describe_candidate(root,chosen,false,&lowered):NULL;
     }
     if(pg_sina_planning) pg_sina_planning->properties+=pg_sina_planner_clock()-mark;
-    if(p.device==chosen || !p.device) return NULL;
+    if(p.device==chosen || !p.device) { MemoryContextDelete(retained); return NULL; }
     mark=pg_sina_planner_clock();
     device_cost(&p,observations,lowered,fast);
     if(pg_sina_planning) pg_sina_planning->estimate+=pg_sina_planner_clock()-mark;
     mark=pg_sina_planner_clock();
-    annotate_device(&p);
+    annotate_device(&p,true);
     *internal=p.csd; *boundary=p.boundary;
     ((CustomScan *)p.device)->custom_private=lappend(((CustomScan *)p.device)->custom_private,chosen);
     List *choices=NIL;
@@ -863,7 +876,7 @@ Plan *pg_sina_cost_device(PlannerInfo *root,Plan *native,bool top,List **observa
 }
 /* Explain text is not a cost input. Recreate it once for a selected Path;
  * keep the numeric costs that PG actually compared, without repricing it. */
-List *pg_sina_selected_costs(PlannerInfo *root,Plan *native,bool top,bool fast,List *costs)
+List *pg_sina_selected_costs(PlannerInfo *root,Plan *native,bool top,bool fast,Node *costs)
 {
     volatile double mark=pg_sina_planner_clock(); bool compiling=pg_sina_compiling_plan;
     struct placement p={.native=native,.root=root,.details=true};
@@ -879,7 +892,10 @@ List *pg_sina_selected_costs(PlannerInfo *root,Plan *native,bool top,bool fast,L
     { pg_sina_compiling_plan=compiling; PG_RE_THROW(); }
     PG_END_TRY();
     pg_sina_compiling_plan=compiling;
-    List *result=copyObject(costs); lfirst(list_tail(result))=makeString(p.stages->data);
+    struct candidate_costs saved;
+    Const *record=castNode(Const,costs);
+    memcpy(&saved,VARDATA(DatumGetByteaP(record->constvalue)),sizeof(saved));
+    List *result=format_costs(&saved,p.stages->data);
     if(pg_sina_planning) pg_sina_planning->format+=pg_sina_planner_clock()-mark;
     return result;
 }
@@ -894,7 +910,7 @@ static Plan *select_plan(struct placement *p,bool top,StringInfo decisions)
         if(top && pg_sina_exe_path!=PG_SINA_FILTER) {
             p->root->init_plans=NIL;
         }
-        annotate_device(p);
+        annotate_device(p,false);
         return out;
     }
     Plan *out=p->native; ListCell *c;

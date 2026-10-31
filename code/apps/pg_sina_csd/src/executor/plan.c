@@ -106,9 +106,8 @@ struct PlanStateCsd {
     CS_MEM_HANDLE memory[5];
     CS_MEM_HANDLE worker_io[QS_WORKERS];
     CS_CSF_ID function;
-    unsigned program_index;
     unsigned row;
-    bool started, explain_only, loaded, active, profiling;
+    bool started, explain_only, active, profiling;
     uint64_t start_ns;
     ResourceOwner resource_owner;
     MemoryContextCallback cleanup;
@@ -116,9 +115,6 @@ struct PlanStateCsd {
 static const CustomExecMethods methods;
 static void shutdown_scan(CustomScanState *node);
 static void detach_delivery(dsm_segment *segment,Datum arg);
-/* Mixed plans can keep several device streams open at once. Each program
- * retains its own device-global ID until EOF/rescan/error cleanup. */
-static bool program_slots[11];
 static uint64_t clock_ns(void)
 { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000ULL+t.tv_nsec; }
 static void deliver(PlanStateCsd *s,bool callback);
@@ -243,19 +239,8 @@ static void close_state(void *arg)
     for(unsigned w=0;w<s->workers;++w) if(s->worker_io[w]) {
         csFreeMem(s->worker_io[w],&flags); s->worker_io[w]=NULL;
     }
-    if(s->active) {
-        CsConfigInfo c={.Type=CS_CSF_ACTIVATE,.u.CSFActivateInfo={.CSFId=s->program_index,.EEIId=1,.State=CS_INACTIVE_STATE}};
-        CsConfigData data; int size=sizeof(data); csConfig(s->device,&size,&c,&data); s->active=false;
-    }
-    if(s->loaded) {
-        CsCSFDownloadInfo d={.CSEEId=1,.Index=s->program_index,.common.Unload=1}; u32 id;
-        csCSFDownload(s->device,&d,&id); s->loaded=false;
-    }
-    if(s->program_index) {
-        program_slots[s->program_index-pg_sina_program_index(500)]=false;
-        s->program_index=0;
-    }
-    if(s->device) { csCloseCSx(s->device); s->device=NULL; }
+    s->active=false;
+    if(s->device) { pg_sina_release_device(); s->device=NULL; }
     if(s->profiling) s->cleanup_ns+=clock_ns()-started;
     RESUME_INTERRUPTS();
 }
@@ -461,11 +446,7 @@ static void start(PlanStateCsd *s)
     s->setup_ns=s->cleanup_ns=s->result_read_ns=0; s->control_read_ns=0;
     memset(s->plan->pipelines,0,sizeof(s->plan->pipelines));
     s->plan->nodes[s->plan->root].expr.work_mem_bytes=pg_sina_query_memory();
-    for(unsigned i=0;i<lengthof(program_slots);++i) if(!program_slots[i]) {
-        program_slots[i]=true; s->program_index=pg_sina_program_index(500+i); break;
-    }
-    if(!s->program_index) elog(ERROR,"too many simultaneously active CSD subtrees");
-    checked(csOpenCSx(device,NULL,&s->device),"open");
+    s->device=pg_sina_device(device);
     unsigned entries,data;
     qp_dictionary_size(s->plan,&entries,&data);
     bool indexed[QP_NODES]={0};
@@ -536,17 +517,7 @@ static void start(PlanStateCsd *s)
     }
     for(unsigned w=0;w<s->workers;++w)
         checked(transfer(s->memory[1],(w+1)*sizeof(struct qp_control),&s->slots[w+1].control,sizeof(struct qp_control),true),"initialize worker control");
-    char descriptor[]="pg-sina-plan.so\0pg_sina_plan";
-    CsCSFDownloadInfo download={.Type=CS_CSF_VENDOR_SPECIFIC,.SubType=CS_SUBTYPE_VENDOR_SPECIFIC,.CSEEId=1,.Index=s->program_index};
-    snprintf(download.common.UniqueName,sizeof(download.common.UniqueName),"pg-sina-plan-%u",s->program_index);
-    download.common.DataBuffer=descriptor; download.common.Length=sizeof(descriptor);
-    u32 id; checked(csCSFDownload(s->device,&download,&id),"download"); s->loaded=true;
-    CsConfigInfo config={.Type=CS_CSF_ACTIVATE,.u.CSFActivateInfo={.CSFId=s->program_index,.EEIId=1,.State=CS_ACTIVE_STATE}};
-    CsConfigData result; int length=sizeof(result); checked(csConfig(s->device,&length,&config,&result),"activate"); s->active=true;
-    length=0; int count=0; CS_STATUS status=csGetCSFId(s->device,download.common.UniqueName,0,&length,&count,NULL);
-    if(status!=CS_LENGTH_RETURNED) checked(status,"lookup function length");
-    CSFIdInfo *functions=palloc(length); checked(csGetCSFId(s->device,download.common.UniqueName,0,&length,&count,functions),"lookup function");
-    s->function=functions[0].CSFId; pfree(functions);
+    s->function=pg_sina_function("pg_sina_plan"); s->active=true;
     size_t size=sizeof(CsBatchRequest)+6*sizeof(CsComputeArg); CsBatchRequest *request=palloc0(size);
     request->ReqType=CS_QUEUE_COMPUTE; request->u.Compute.CSFId=s->function; request->u.Compute.NumArgs=6;
     for(unsigned i=0;i<5;++i) csHelperSetComputeArg(&request->u.Compute.Args[i],CS_AFDM_TYPE,s->memory[i],0UL);

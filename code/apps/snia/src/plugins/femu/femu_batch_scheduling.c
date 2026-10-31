@@ -15,14 +15,30 @@ static CS_STATUS session_command(struct cs_device *d, unsigned action, uint64_t 
     if(value) *value=cmd.result;
     return s;
 }
-void femu_graph_close(struct cs_device *d)
+CS_STATUS femu_graph_close(struct cs_device *d)
 {
     femu_hpcp_stop(d);
-    if(d->graph_session) session_command(d,FEMU_GRAPH_CLOSE,0,NULL);
+    if(d->graph_session) {
+        CS_STATUS status=session_command(d,FEMU_GRAPH_CLOSE,0,NULL);
+        if(status!=CS_SUCCESS) return status;
+        d->graph_session=0; d->next_graph=0;
+    }
     while(d->graph_scopes) {
         struct cs_graph_scope *next=d->graph_scopes->next;
         free(d->graph_scopes); d->graph_scopes=next;
     }
+    return CS_SUCCESS;
+}
+/* Project-specific resource 0: reset the idle graph execution context, keeping
+ * the open transport and downloaded CSFs. Other vendor resources are unsupported. */
+CS_STATUS femu_reset(void *device,CS_RESOURCE_TYPE type,u32 id)
+{
+    if(type!=CS_VENDOR_SPECIFIC_TYPE || id) return CS_UNSUPPORTED;
+    struct cs_device *d=device;
+    pthread_mutex_lock(&d->graph_lock);
+    CS_STATUS status=d->graphs?CS_HANDLE_IN_USE:femu_graph_close(d);
+    pthread_mutex_unlock(&d->graph_lock);
+    return status;
 }
 void femu_finishBatchExecution(void *device,void *scope,bool success)
 {

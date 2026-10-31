@@ -7,6 +7,7 @@
 #include <time.h>
 #include "query.h"
 #include "plan.h"
+#include "cs.h"
 extern int pg_sina_exe_path;
 enum pg_sina_path { PG_SINA_HOST, PG_SINA_FILTER, PG_SINA_CSD, PG_SINA_HPCP, PG_SINA_ADAPTIVE };
 const char *pg_sina_path_name(void);
@@ -63,7 +64,11 @@ extern struct pg_sina_resources {
     unsigned cus;
     uint64_t fdm_bytes,workmem_bytes;
 } pg_sina_resources;
+void pg_sina_init_device(void);
 void pg_sina_read_resources(const char *device);
+CS_DEV_HANDLE pg_sina_device(const char *);
+void pg_sina_release_device(void);
+CS_CSF_ID pg_sina_function(const char *);
 unsigned pg_sina_program_index(unsigned index);
 static inline uint64_t pg_sina_query_memory(void)
 {
@@ -93,7 +98,7 @@ void pg_sina_rel_paths(PlannerInfo *,RelOptInfo *,Index,RangeTblEntry *);
 void pg_sina_join_paths(PlannerInfo *,RelOptInfo *,RelOptInfo *,RelOptInfo *,JoinType,JoinPathExtraData *);
 void pg_sina_search_upper_paths(PlannerInfo *,UpperRelationKind,RelOptInfo *,RelOptInfo *);
 Plan *pg_sina_cost_device(PlannerInfo *,Plan *,bool,List **,double *,double *);
-List *pg_sina_selected_costs(PlannerInfo *,Plan *,bool,bool,List *);
+List *pg_sina_selected_costs(PlannerInfo *,Plan *,bool,bool,Node *);
 double pg_sina_host_scan_cost(Oid,bool,double,double,List **);
 double pg_sina_host_statement_cost(PlannedStmt *);
 Plan *pg_sina_wrap_placement(Plan *,const char *,const char *);
@@ -107,7 +112,7 @@ Plan *pg_sina_compile_subtree(PlannerInfo *,Plan *,bool);
 Plan *pg_sina_prepare_candidate(PlannerInfo *,Plan *,bool);
 Plan *pg_sina_require_output_order(PlannerInfo *,Plan *);
 /* Cost properties and a borrowed workspace, valid until the next candidate.
- * Scalar metadata contains no executable program; CustomScan has no Const. */
+ * Candidate Const holds binary cost metadata, never an executable program. */
 Plan *pg_sina_describe_candidate(PlannerInfo *,Plan *,bool,struct qp_plan **);
 Plan *pg_sina_candidate_scan(Plan *,bool);
 void pg_sina_finish_device_plans(Plan *);

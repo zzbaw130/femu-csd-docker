@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <float.h>
 #include "pg_internal.h"
+#include "miscadmin.h"
+#include "access/parallel.h"
 PG_MODULE_MAGIC;
 int pg_sina_exe_path = 0;
 bool pg_sina_profile = false;
@@ -201,6 +203,9 @@ void _PG_init(void)
         &pg_sina_cache_mbps,10000,1,1000000,PGC_USERSET,0,NULL,assign_cost,NULL);
     DefineCustomRealVariable("pg_sina_csd.result_batch_ms","Delivery/materialization cost per device result batch",NULL,
         &pg_sina_result_batch_ms,1,0,1000,PGC_USERSET,0,NULL,assign_cost,NULL);
+    if(process_shared_preload_libraries_in_progress)
+        elog(ERROR,"load pg_sina_csd per connection using session_preload_libraries, not shared_preload_libraries");
+    if(!IsParallelWorker()) pg_sina_init_device();
     RegisterCustomScanMethods(&pg_sina_scan_methods);
     RegisterCustomScanMethods(&pg_sina_order_methods);
     RegisterCustomScanMethods(&pg_sina_plan_methods);

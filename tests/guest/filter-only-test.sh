@@ -6,7 +6,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT=$(mktemp -d /home/femu/results/filter-only.XXXXXX)
 chmod 755 "$OUT"
 COLD=/home/femu/scripts/cold-query.sh
-export PGOPTIONS="${PGOPTIONS:-} -c session_preload_libraries=auto_explain -c auto_explain.log_min_duration=0 -c auto_explain.log_level=notice -c auto_explain.log_analyze=off -c auto_explain.log_timing=off -c auto_explain.log_format=json"
+export PGOPTIONS="${PGOPTIONS:-} -c session_preload_libraries=pg_sina_csd,auto_explain -c auto_explain.log_min_duration=0 -c auto_explain.log_level=notice -c auto_explain.log_analyze=off -c auto_explain.log_timing=off -c auto_explain.log_format=json"
 printf 'query,mode,latency_ms,result_match\n' > "$OUT/timings.csv"
 echo "Results: $OUT"
 if [ "$#" -eq 0 ]; then set -- 6 1 9; fi

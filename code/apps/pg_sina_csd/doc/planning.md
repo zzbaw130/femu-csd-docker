@@ -429,3 +429,30 @@ Q9的页缓存驻留观测累计16.313ms，其中`mmap/mincore`13.840ms、驻留
 Q2/Q9仍检查323/288个候选，只最终编码21/13个节点及一份程序。属性分析仍有PG树复制、裁列、列来源/表达式描述；候选保留中的复制为8.252/6.888ms。每个候选还把15个浮点成本格式化为PG Float字符串，再随候选复制，形成约6ms开销。用户态CPU采样中`AllocSetAlloc/copyObjectImpl/equal/annotate_device`频繁出现，与墙钟细分相符。因此后续应优先减少候选树复制、复用共享属性、延迟成本字符串生成，以及降低缓存观测成本；最终编码已经不是大头。保留两轮PG搜索的语义，不能靠删候选或跳过缓存修正降低计时。
 
 原始计时、缺页栈、CPU采样及CSV/JSON见`results/planner-bottleneck.zn6b1R/`。四次计划去掉客户端Time行完全一致。客户端EXPLAIN还比hook多约24/21ms，包含hook外工作，未逐函数归因，不将其称为设备或纯规划时间。HeapLayout/PlannerCost两项CTest及现有路径回归`results/planner-paths.CckPDv/`通过。只运行Q2/Q9冷启动规划，未重跑执行结果对照或全量TPC-H。
+
+## 连接初始化与数值候选成本
+
+设备连接与程序现在属于PG backend，在`_PG_init`中完成发现、打开、CU/FDM查询、14个CSF入口下载/激活和workmem容量探测；`on_proc_exit`统一停用、卸载并关闭。当前Guest的`tpch_s1`已配置`session_preload_libraries=pg_sina_csd`，无需查询前显式LOAD；不能在postmaster的shared_preload阶段建立SNIA设备连接。并行PG worker只注册扩展方法，主连接负责设备资源。普通LOAD同样立即初始化，不再由planner或执行器首次触发。
+
+CSF代码与每查询生成的设备执行记录不是同一对象。前者连接内复用；后者仍在选中计划后编码，并随查询参数、AFDM、batch及算子私有状态管理。多个设备子树共享同一CSF，状态由独立AFDM隔离，不再按子树重复下载代码。
+
+为保留原先异常结束时的spill兜底清理，最后一个活跃设备子树释放后调用`csReset(device, CS_VENDOR_SPECIFIC_TYPE, 0)`。这是FEMU厂商资源0的项目约定，只关闭空闲的临时设备图会话、回收遗留token及HPCP接收状态，不关闭NVMe描述符或卸载CSF；有在途设备图时拒绝reset。PG按仍活跃的子树/游标计数，不提前重置其他执行中的状态。既有固件命令足够，无需改变SQL算子或设备线协议。
+
+候选成本改为二进制数值元数据，使用PG可复制的Const容器保存，只有全局选中后才转为PG Float字符串及详细EXPLAIN说明。`Path.startup_cost/total_cost`继续用PG成本单位；保留已有CPU/带宽/spill校准参数与公式，内部分项诊断仍可用ms。原始PG树设备候选的比较成本也直接保存数值，不再提前字符串化。
+
+准备后的候选树在独立规划内存上下文中保存，拒绝时删除、接受时直接保留，消除原先临时估价结束前再次深复制整个树的步骤。为修改隔离、构造预览和PG setrefs保留的复制仍存在，本轮不重写整个Path属性系统。
+
+相同RelWithDebInfo构建，4CU、256MiB workmem、64MiB FDM及前述PG参数；正式Q2/Q9各四次前后交替冷启动EXPLAIN，每次重启PG并清Guest页缓存。以下为算术平均，初始化单列，不将移动边界称为消除工作：
+
+| 查询 | 规划前→后 ms | 规划线程CPU前→后 ms | 新连接初始化 ms | 格式化前→后 ms | 候选保留前→后 ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q2 | 101.266→59.020 | 63.712→52.343 | 41.517 | 5.741→1.553 | 8.762→1.873 |
+| Q9 | 110.118→64.048 | 71.678→58.601 | 40.796 | 6.170→1.137 | 7.152→1.369 |
+
+旧资源发现30.885/34.562ms已从规划移出，新初始化还加载全部CSF。初始化加规划约100.537/104.844ms，不是连接端到端计时；不能声称冷启动整体下降42%。可确认减少的是每查询规划CPU约18%、候选字符串格式化与深复制。Q2候选/接受仍为323/248，Q9仍为288/285；最终分别编码21/13个节点、各一份执行程序。前后各四份计划去掉客户端Time行完全相同，包括路径、连接顺序和估价。
+
+缓存观测方法未改，仍是必要成本；Q9本轮约16.357→13.646ms的差异不归为缓存算法优化收益。剩余主要是属性分析、PG搜索和缓存观测；最终设备编码仍非主要瓶颈。
+
+PG两项CTest、规划路径回归`results/planner-paths.yZHj17/`及SNIA的`csDiscoveryIdentify`通过，未运行低于64MiB的压力场景。新`tests/guest/connection-lifecycle-test.sh`验证一次连接初始化、两轮正式Q2/Q9、取消后重跑与HOST输出一致；最终记录为`results/connection-lifecycle.2Mp6Qh/`。单连接下载CSF计数为14，激活/退出停用合计28，无逐查询重复加载。额外开发排序验证使用64MiB预算，同连接连续两次spill读写各33MiB成功，临时SQL已删除，不作为TPC-H验收。
+
+最终正式Q2/Q9在HOST、CSD无HPCP、SQLerate和filter-only共8次冷启动执行均正确，见`results/tpch.OaANdF/`；Q1/Q6融合路径另有三模式正确性对照和最终清理复核。未跑全量。原始前后计时、CSV/JSON及报告见`results/planner-connection.FgBQhq/`。

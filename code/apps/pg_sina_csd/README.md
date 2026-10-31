@@ -83,7 +83,7 @@ HPCP 实验需先加载 Guest 内核模块并配置 `/dev/femu-cache` 权限，�
 
 ## 访问路径和内存
 
-查询不持有 namespace 执行锁。每个 PG 后端使用独立的 CSF 程序编号段（原编号加 `BackendId * 16`）；同时存活的通用执行子树分别借用 500–510 中的编号，511 用于资源探测。AFDM 和算子状态按执行独立分配、释放，避免不同连接覆盖彼此的程序和缓冲区。FEMU 的程序编号为 16 位，当前分段支持 BackendId 1–4064；并发请求仍受设备实际 AFDM/workmem 总容量约束，分配失败会返回错误，不会把整条查询串行化等待。
+查询不持有 namespace 执行锁。每个 PG 后端使用独立的 CSF 程序编号段（原编号加 `BackendId * 16`）；连接级入口统一使用基础编号500–513；同时存活的子树复用同一入口，不再为子树另占程序编号。AFDM 和算子状态按执行独立分配、释放，避免不同连接覆盖彼此的程序和缓冲区。FEMU 的程序编号为 16 位，当前分段支持 BackendId 1–4063；并发请求仍受设备实际 AFDM/workmem 总容量约束，分配失败会返回错误，不会把整条查询串行化等待。
 
 Heap 扫描从页内行指针直接取得各 tuple 的起点，不依赖前一个 tuple 的长度。读取块分配给不同 CU 并行解码；CU 内每批最多收集 64 个 tuple，按列定位字段、转换并连续写入列向量，参考 pg_duckdb 的批量 tuple 转换方式。变长字段之后的偏移仍依赖同一 tuple 的前置字段，各 tuple 各自保存偏移；这不表示 Heap 解码已全部使用 SIMD，也不在 CSF 内另起线程。
 
@@ -97,17 +97,29 @@ SET pg_sina_csd.max_memory=0;      -- 默认值，自动使用设备 workmem 总
 SET pg_sina_csd.profile=on;       -- 开发时开启，默认 off
 ```
 
-扩展在每个 PG backend 首次规划已映射设备的 CSD 查询时，读取并保存该设备的 CU 数、FDM 容量及 workmem 总容量，供规划和两条执行路径共用。同一 backend 后续查询复用这些容量；设备重新配置后建立新 PG 连接即可重新发现，不需要修改扩展源码。CU/FDM 通过 `csQueryDeviceProperties` 获取；当前 SNIA 资源结构没有本项目分配器的 workmem 字段，因此调用 `pg-sina-plan.so` 中零参数的 `pg_sina_workmem_capacity`，通过 64 位 CompValue 返回 `cs_work_get_stats().capacity_bytes`。这是一条普通设备计算请求，不创建辅助进程，也不读取 Guest 的内存配置。
+扩展在每个连接加载 C 库时完成设备初始化：通过 SNIA 发现当前实验的唯一 CSD namespace，打开设备，读取 CU/FDM 容量，下载并激活全部14个 CSF 入口，再通过 `pg_sina_workmem_capacity` 获取共享分配器总容量。连接正常退出时统一停用、卸载 CSF 并关闭设备。当前实验要求只有一个可发现的 CSD namespace，不增加额外设备路径配置。所有已映射表仍须属于这个 namespace。
 
-自动模式下，CSD 查询总内存预算等于设备 workmem；显式设置非零 `max_memory` 时取两者较小值。例如设备为 32 MiB，即使设置 64 MiB，查询也只能使用 32 MiB。EXPLAIN 显示 `CSD Device CUs`、`CSD Device Workmem` 和 `CSD Query Memory Limit`，普通 EXPLAIN 即可核对。查询的所有并行 CU 和阻塞节点共享该总预算。实际执行槽数还受 FDM、内存及数据量约束；支持 1–64 个 SQL 执行槽，与当前 FEMU 允许的 CU 范围一致，使用 `min(设备 CU 数, 64)` 作为初始候选，按实际缓冲和算子需要减少。完成标记采用 64 位位图，64 槽完整掩码单独处理，避免移位溢出。设备 CU 和 workmem 增加后，新连接自动重新编排，不需要修改扩展源码。
+`LOAD 'pg_sina_csd'` 会立即完成上述初始化；为了在建立连接时自动完成，可由管理员执行以下配置，新连接生效：
+
+```sql
+ALTER DATABASE tpch_s1 SET session_preload_libraries='pg_sina_csd';
+```
+
+如还使用 `auto_explain`，保留为 `'pg_sina_csd,auto_explain'`。不要使用 `shared_preload_libraries` 创建会被 fork 继承的 SNIA 连接和线程。PG 并行 worker 只注册扩展方法，不重复创建连接级设备资源。启用数据库级预加载前须先安装设备程序并配置设备权限。
+
+planner 和执行器复用连接持有的设备句柄、CSF ID及资源快照，不再打开/关闭设备或下载/卸载程序。查询仅分配自己的 AFDM、batch、参数和执行状态，并在完成、取消或出错时回收；多个设备子树可调用同一 CSF，其状态仍由各自 AFDM 隔离。设备重新配置后建立新连接即可重新发现。CU/FDM 通过 `csQueryDeviceProperties` 获取；当前 SNIA 资源结构没有分配器 workmem 字段，因此零参数容量 CSF 通过64位 CompValue返回 `cs_work_get_stats().capacity_bytes`。不创建辅助进程。
+
+开启 profile 时，初始化单独输出 `SQLerate connection init total_ms=... programs=14 ...`，不计入查询规划计时。可通过连接选项 `PGOPTIONS='-c pg_sina_csd.profile=on'` 在预加载前启用；已有冷启动脚本已处理。初始化仍有实际成本，论文应单列连接初始化时间，不能将计时前移解释为消除了冷启动总成本。
+
+自动模式下，CSD 查询总内存预算等于设备 workmem；显式设置非零 `max_memory` 时取两者较小值。例如设备为 256 MiB，设置 64 MiB 后该查询只能使用 64 MiB。EXPLAIN 显示 `CSD Device CUs`、`CSD Device Workmem` 和 `CSD Query Memory Limit`，普通 EXPLAIN 即可核对。查询的所有并行 CU 和阻塞节点共享该总预算。实际执行槽数还受 FDM、内存及数据量约束；支持 1–64 个 SQL 执行槽，与当前 FEMU 允许的 CU 范围一致，使用 `min(设备 CU 数, 64)` 作为初始候选，按实际缓冲和算子需要减少。完成标记采用 64 位位图，64 槽完整掩码单独处理，避免移位溢出。设备 CU 和 workmem 增加后，新连接自动重新编排，不需要修改扩展源码。
 
 Hash Probe 和索引游标仅为实际用到的槽分配，避免扩大槽容量后每个节点都预留 64 份游标；共享索引状态的预算按槽数增加。Sort source 归并时会跳过未生成 run 的空闲槽。
 
 工作内存来自共享 `libcs-workmem`，查询根 context 和子排序/索引 context 同时记账，总量不超过查询设置和物理池容量。不是为每个节点各给一个完整的 `max_memory`。FDM 只放页输入、列批次、字符串交接和最终输出；Hash 表、run 描述和游标来自 workmem。排序优先保留内存 run，分配下一段将超过配额时请求 spill，而非等待某个固定的空闲百分比。
 
-spill 使用现有 SNIA batch 的 NEED_STORE/NEED_LOAD/NEED_FREE 重入协议，经设备内部 AFDM↔NVM 短路径存取临时 token。多路归并按缓存预算分轮合并；输入缓存不足时先 spill 驻留 run，为读缓存留出空间。查询正常完成、提前 Limit、取消和错误都要回收工作内存，关闭本查询 SNIA 会话时回收剩余临时 token。
+spill 使用现有 SNIA batch 的 NEED_STORE/NEED_LOAD/NEED_FREE 重入协议，经设备内部 AFDM↔NVM 短路径存取临时 token。多路归并按缓存预算分轮合并；输入缓存不足时先 spill 驻留 run，为读缓存留出空间。查询正常完成、提前 Limit、取消和错误都要回收工作内存，算子关闭阶段释放自身临时 token；最后一个活跃设备子树释放后，通过 `csReset(device, CS_VENDOR_SPECIFIC_TYPE, 0)` 关闭临时设备图会话，兜底回收遗留 token；设备连接和 CSF 保留。此厂商资源约定见 [SNIA 说明](../snia/README.md)。若另一个子树或游标仍持有设备资源，则延迟到它释放，避免误删其 token。
 
-设备程序的基础索引 510 供通用树使用，旧快路径使用 501–509，511 供容量查询使用；实际编号按前述 BackendId 规则分段，不持有 namespace 文件锁。SNIA 不能强制中断正在执行的 CSF，取消要等待当前请求完成再回收。
+连接级程序使用基础索引500–513，分别覆盖通用树、扫描/过滤、聚合、排序、Limit、连接及容量查询；实际编号按前述 BackendId 规则分段，不持有 namespace 文件锁。SNIA 不能强制中断正在执行的 CSF，取消要等待当前请求完成再回收。
 
 通用执行器中的 Scan 和无额外过滤的连续 Project，直接在列批次上求值：输入列保留引用，常量保留常量向量，算术表达式复用现有向量/SIMD 求值器，仅在需要行接口的边界组装 `qs_cell`。不支持的表达式或 scratch 分配失败时保留原来的逐行路径；scratch 由查询 workmem context 记账，输入结束后释放。
 
@@ -151,11 +163,11 @@ TPCH_MODES=host-only sh /home/femu/tests/tpch-test.sh
 
 同一 `profile` 开关还会在 SQLerate 重新规划时输出一条 `SQLerate planner` NOTICE。只执行正式查询的 EXPLAIN 脚本即可测规划。`total_ms` 是 planner hook 墙钟；`properties_ms` 包含候选物理算法确定、支持性/映射检查与成本属性提取，`compile_ms` 只包含最终选中设备子树的执行记录编码，`estimate_ms` 是数字成本计算，`format_ms` 包含成本摘要和选中节点的 EXPLAIN 说明。它们与 `preview/retain/host_cache/stmt_copy/rewrite/pg_other` 可相加；`pg_other` 包含 PG 搜索及未单列管理工作。`native_pg_inclusive/adaptive_pg_inclusive` 是两次 PG 规划的包含式计时；`index_inclusive/resources_inclusive` 已计入属性分析等阶段，不能再次相加。与旧版本比较时，应将新的 `properties_ms + compile_ms` 对照原来的 `compile_ms`，不能把阶段拆分当成全部工作消失。
 
-`candidates/accepted` 记录候选数，`index_calls/index_queries` 区分索引元数据调用与实际 SPI 查询数。`property_nodes` 记录属性分析访问的节点数，`encoded_nodes` 记录最终通用编码器访问的节点数；`serialized_plans/fast_records` 分别记录最终通用设备记录和专用融合记录的生成次数。全 HOST 选择应均为零。成本估价不为落选候选生成执行 Const 或逐节点长文本；选中后的详细成本仍附在对应 CSD 子树上，见 [规划设计](doc/planning.md)。关闭 profile 不读取阶段时钟，也不输出 NOTICE；复用缓存计划时不会重新产生规划计时。
+`candidates/accepted` 记录候选数，`index_calls/index_queries` 区分索引元数据调用与实际 SPI 查询数。`property_nodes` 记录属性分析访问的节点数，`encoded_nodes` 记录最终通用编码器访问的节点数；`serialized_plans/fast_records` 分别记录最终通用设备记录和专用融合记录的生成次数。全 HOST 选择时 `encoded_nodes/serialized_plans/fast_records` 应为零。成本估价不为落选候选生成执行 Const 或逐节点长文本；选中后的详细成本仍附在对应 CSD 子树上，见 [规划设计](doc/planning.md)。候选成本保留为二进制数值，只有最终选中后才格式化说明；PG Path 的成本字段仍为 PG 成本单位。关闭 profile 不读取阶段时钟，也不输出 NOTICE；复用缓存计划时不会重新产生规划计时。
 
 需要继续定位时，同一开关还输出 `SQLerate planner breakdown` 和 `SQLerate cache observation`。前者拆开设备打开、属性读取、探测 CSF 的下载/执行/卸载、候选复制/裁列/描述、估价及保留；`native_core/adaptive_core` 从两次 PG 规划墙钟中扣除已计时的扩展工作，`hook_other` 是扩展 hook 的其余工作。`cpu_ms` 使用当前 backend 线程 CPU 时钟，区别于包含等待的墙钟。设备打开的 `open_major_faults` 用于识别首次加载插件的磁盘缺页；资源细项已包含在 `resources_inclusive`，不能重复相加。
 
-`cache_probe` 是本次规划内首次观测各关系/索引页缓存驻留的累计墙钟；同一 OID 后续访问复用该观测。缓存 NOTICE 中 `metadata/files/residency/count` 分别表示关系元数据、打开文件与 fstat、mmap/mincore、统计返回驻留位的时间，另有少量释放/关闭等余项；`pages` 是检查的 4KiB 页数，不是读取的数据量。它们已包含在 `cache_probe`，后者又分布在 HOST 修正及设备估价等阶段，均不能叠加到总规划时间。首次插件加载和资源发现按 backend 缓存，不是每条查询都重复发生。
+`cache_probe` 是本次规划内首次观测各关系/索引页缓存驻留的累计墙钟；同一 OID 后续访问复用该观测。缓存 NOTICE 中 `metadata/files/residency/count` 分别表示关系元数据、打开文件与 fstat、mmap/mincore、统计返回驻留位的时间，另有少量释放/关闭等余项；`pages` 是检查的 4KiB 页数，不是读取的数据量。它们已包含在 `cache_probe`，后者又分布在 HOST 修正及设备估价等阶段，均不能叠加到总规划时间。设备初始化已移到连接加载阶段，查询期间资源细项应为零。
 
 通用树的 profile 同时记录 PG 调度线程的墙钟：`CSD Host Completion Copy` 是请求完成后同步读取 AFDM 控制记录及结果头的时间，`CSD Host Submit` 是 PG 主线程准备和提交请求的时间，不包含 callback 续交。其中 `Queue`、`Control Write` 及已有的 `LOAD Preparation` 均包含在 Submit 中，不能再次相加。`Poll` 是检查完成标志的时间，`Idle Sleep` 是没有可推进任务时的休眠时间。`Pending Requests Sum` 累计各请求提交到 callback 的时间，最终返回 PG 的请求还包含完成观察等待；跨并发请求求和，不是查询延迟或纯 I/O 时间。Host Submissions/Completions 只计 PG 提交和观察的次数，Callback Submissions 另计自动续交次数。关闭 profile 时不采集这些计时。
 

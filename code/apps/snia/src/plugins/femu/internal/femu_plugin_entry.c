@@ -19,7 +19,7 @@ static const struct cs_backend_ops ops = {
     .queueBatchRequest = femu_queueBatchRequest, .abortBatchRequest = femu_abortBatchRequest,
     .finishBatchExecution = femu_finishBatchExecution,
     .queryDeviceProperties = femu_queryDeviceProperties,
-    .CSFDownload = femu_CSFDownload, .config = femu_config
+    .CSFDownload = femu_CSFDownload, .config = femu_config, .reset = femu_reset
 };
 __attribute__((visibility("default")))
 const struct cs_backend_ops *cs_backend_create(void) { return &ops; }
