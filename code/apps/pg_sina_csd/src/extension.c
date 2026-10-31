@@ -31,7 +31,7 @@ static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,Param
         return plan_query(parse,cursorOptions,boundParams);
     struct pg_sina_planner_profile counters={0},*saved_profile=pg_sina_planning;
     pg_sina_planning=pg_sina_profile && pg_sina_exe_path==PG_SINA_ADAPTIVE?&counters:NULL;
-    double started=pg_sina_planner_clock(),mark=started;
+    double started=pg_sina_planner_clock(),mark=started,cpu_started=pg_sina_planner_cpu();
     Query *volatile query=parse;
     struct pg_sina_path_search *saved=pg_sina_path_search;
     bool native_search=pg_sina_native_search;
@@ -47,9 +47,13 @@ static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,Param
         if(pg_sina_exe_path==PG_SINA_ADAPTIVE) {
             pg_sina_start_path_search();
             pg_sina_native_search=true;
+            double attributed=pg_sina_planner_attributed(),hooks=counters.hook_other;
             mark=pg_sina_planner_clock();
             host=plan_query(copyObject(parse),cursorOptions,boundParams);
-            if(pg_sina_planning) counters.native_pg=pg_sina_planner_clock()-mark;
+            if(pg_sina_planning) {
+                counters.native_pg=pg_sina_planner_clock()-mark;
+                counters.native_core=counters.native_pg-(pg_sina_planner_attributed()-attributed)-(counters.hook_other-hooks);
+            }
             mark=pg_sina_planner_clock();
             original_device=pg_sina_original_device_statement(host);
             if(pg_sina_planning) counters.stmt_copy=pg_sina_planner_clock()-mark;
@@ -58,9 +62,13 @@ static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,Param
             if(pg_sina_planning) counters.host_cache=pg_sina_planner_clock()-mark;
             pg_sina_native_search=false;
         }
+        double attributed=pg_sina_planner_attributed(),hooks=counters.hook_other;
         mark=pg_sina_planner_clock();
         plan=plan_query(query,cursorOptions,boundParams);
-        if(pg_sina_planning) counters.adaptive_pg=pg_sina_planner_clock()-mark;
+        if(pg_sina_planning) {
+            counters.adaptive_pg=pg_sina_planner_clock()-mark;
+            counters.adaptive_core=counters.adaptive_pg-(pg_sina_planner_attributed()-attributed)-(counters.hook_other-hooks);
+        }
         if(host) {
             double candidate=plan->planTree->total_cost*pg_sina_host_cost_ms;
             double original_cost=original_device?original_device->planTree->total_cost*pg_sina_host_cost_ms:DBL_MAX;
@@ -83,6 +91,7 @@ static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,Param
     pg_sina_path_search=saved; pg_sina_native_search=native_search;
     if(pg_sina_planning) {
         double total=pg_sina_planner_clock()-started;
+        counters.cpu=pg_sina_planner_cpu()-cpu_started;
         double other=total-counters.rewrite-counters.preview-counters.properties-counters.compile-counters.estimate-
             counters.format-counters.retain-counters.host_cache-counters.stmt_copy;
         pg_sina_planning=saved_profile;
@@ -91,6 +100,17 @@ static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,Param
             counters.retain,counters.host_cache,counters.stmt_copy,counters.native_pg,counters.adaptive_pg,
             counters.candidates,counters.accepted,counters.index_calls,counters.index_queries,counters.indexes,counters.resources,
             counters.property_nodes,counters.encoded_nodes,counters.serialized_plans,counters.fast_records)));
+        ereport(NOTICE,(errmsg("SQLerate planner breakdown cpu_ms=%.3f resource_cpu_ms=%.3f resource_open_ms=%.3f resource_properties_ms=%.3f resource_load_ms=%.3f resource_compute_ms=%.3f resource_unload_ms=%.3f resource_close_ms=%.3f download_ms=%.3f activate_ms=%.3f function_id_ms=%.3f deactivate_ms=%.3f unload_ms=%.3f prepare_copy_ms=%.3f prepare_normalize_ms=%.3f prepare_prune_ms=%.3f prepare_algorithms_ms=%.3f describe_ms=%.3f mapping_ms=%.3f refine_ms=%.3f cost_reach_ms=%.3f cost_buffers_ms=%.3f cost_dictionary_ms=%.3f cost_operators_ms=%.3f cost_finish_ms=%.3f retain_copy_ms=%.3f retain_free_ms=%.3f retain_publish_ms=%.3f freeze_ms=%.3f hook_other_ms=%.3f native_core_ms=%.3f adaptive_core_ms=%.3f cache_probe_ms=%.3f cache_probes=%u open_major_faults=%u open_minor_faults=%u",
+            counters.cpu,counters.resource_cpu,counters.resource_open,counters.resource_properties,counters.resource_load,
+            counters.resource_compute,counters.resource_unload,counters.resource_close,counters.download,counters.activate,
+            counters.function_id,counters.deactivate,counters.unload,counters.prepare_copy,counters.prepare_normalize,
+            counters.prepare_prune,counters.prepare_algorithms,counters.describe,counters.mapping,counters.refine,
+            counters.cost_reach,counters.cost_buffers,counters.cost_dictionary,counters.cost_operators,counters.cost_finish,
+            counters.retain_copy,counters.retain_free,counters.retain_publish,counters.freeze,counters.hook_other,
+            counters.native_core,counters.adaptive_core,counters.cache_probe,counters.cache_probes,counters.open_major_faults,counters.open_minor_faults)));
+        ereport(NOTICE,(errmsg("SQLerate cache observation cpu_ms=%.3f metadata_ms=%.3f files_ms=%.3f residency_ms=%.3f count_ms=%.3f pages=%llu",
+            counters.cache_cpu,counters.cache_metadata,counters.cache_files,counters.cache_residency,counters.cache_count,
+            (unsigned long long)counters.cache_pages)));
     }
     pg_sina_planning=saved_profile;
     return plan;
@@ -99,20 +119,28 @@ static void upper_hook(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *inp
 {
     if(previous_upper_hook) previous_upper_hook(root,stage,input,output,extra);
     if(!pg_sina_compiling_plan) {
+        double mark=pg_sina_planner_clock(),attributed=pg_sina_planner_attributed();
         if(pg_sina_exe_path==PG_SINA_ADAPTIVE) pg_sina_search_upper_paths(root,stage,input,output);
         else pg_sina_upper_paths(root,stage,input,output,extra);
+        if(pg_sina_planning) pg_sina_planning->hook_other+=pg_sina_planner_clock()-mark-(pg_sina_planner_attributed()-attributed);
     }
 }
 static void rel_hook(PlannerInfo *root,RelOptInfo *rel,Index rti,RangeTblEntry *rte)
 {
     if(previous_rel_hook) previous_rel_hook(root,rel,rti,rte);
+    bool measure=pg_sina_planning && !pg_sina_compiling_plan;
+    double mark=measure?pg_sina_planner_clock():0,attributed=measure?pg_sina_planner_attributed():0;
     pg_sina_rel_paths(root,rel,rti,rte);
+    if(measure) pg_sina_planning->hook_other+=pg_sina_planner_clock()-mark-(pg_sina_planner_attributed()-attributed);
 }
 static void join_hook(PlannerInfo *root,RelOptInfo *joinrel,RelOptInfo *outerrel,RelOptInfo *innerrel,
                       JoinType jointype,JoinPathExtraData *extra)
 {
     if(previous_join_hook) previous_join_hook(root,joinrel,outerrel,innerrel,jointype,extra);
+    bool measure=pg_sina_planning && !pg_sina_compiling_plan;
+    double mark=measure?pg_sina_planner_clock():0,attributed=measure?pg_sina_planner_attributed():0;
     pg_sina_join_paths(root,joinrel,outerrel,innerrel,jointype,extra);
+    if(measure) pg_sina_planning->hook_other+=pg_sina_planner_clock()-mark-(pg_sina_planner_attributed()-attributed);
 }
 static void assign_path(int value,void *extra)
 {

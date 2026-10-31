@@ -153,6 +153,10 @@ TPCH_MODES=host-only sh /home/femu/tests/tpch-test.sh
 
 `candidates/accepted` 记录候选数，`index_calls/index_queries` 区分索引元数据调用与实际 SPI 查询数。`property_nodes` 记录属性分析访问的节点数，`encoded_nodes` 记录最终通用编码器访问的节点数；`serialized_plans/fast_records` 分别记录最终通用设备记录和专用融合记录的生成次数。全 HOST 选择应均为零。成本估价不为落选候选生成执行 Const 或逐节点长文本；选中后的详细成本仍附在对应 CSD 子树上，见 [规划设计](doc/planning.md)。关闭 profile 不读取阶段时钟，也不输出 NOTICE；复用缓存计划时不会重新产生规划计时。
 
+需要继续定位时，同一开关还输出 `SQLerate planner breakdown` 和 `SQLerate cache observation`。前者拆开设备打开、属性读取、探测 CSF 的下载/执行/卸载、候选复制/裁列/描述、估价及保留；`native_core/adaptive_core` 从两次 PG 规划墙钟中扣除已计时的扩展工作，`hook_other` 是扩展 hook 的其余工作。`cpu_ms` 使用当前 backend 线程 CPU 时钟，区别于包含等待的墙钟。设备打开的 `open_major_faults` 用于识别首次加载插件的磁盘缺页；资源细项已包含在 `resources_inclusive`，不能重复相加。
+
+`cache_probe` 是本次规划内首次观测各关系/索引页缓存驻留的累计墙钟；同一 OID 后续访问复用该观测。缓存 NOTICE 中 `metadata/files/residency/count` 分别表示关系元数据、打开文件与 fstat、mmap/mincore、统计返回驻留位的时间，另有少量释放/关闭等余项；`pages` 是检查的 4KiB 页数，不是读取的数据量。它们已包含在 `cache_probe`，后者又分布在 HOST 修正及设备估价等阶段，均不能叠加到总规划时间。首次插件加载和资源发现按 backend 缓存，不是每条查询都重复发生。
+
 通用树的 profile 同时记录 PG 调度线程的墙钟：`CSD Host Completion Copy` 是请求完成后同步读取 AFDM 控制记录及结果头的时间，`CSD Host Submit` 是 PG 主线程准备和提交请求的时间，不包含 callback 续交。其中 `Queue`、`Control Write` 及已有的 `LOAD Preparation` 均包含在 Submit 中，不能再次相加。`Poll` 是检查完成标志的时间，`Idle Sleep` 是没有可推进任务时的休眠时间。`Pending Requests Sum` 累计各请求提交到 callback 的时间，最终返回 PG 的请求还包含完成观察等待；跨并发请求求和，不是查询延迟或纯 I/O 时间。Host Submissions/Completions 只计 PG 提交和观察的次数，Callback Submissions 另计自动续交次数。关闭 profile 时不采集这些计时。
 
 `CSD Host Assigned LOADs` 记录提前分配的顺序输入块数；开启 profile 时，`Completion Reads` 和 `Control Writes` 分别记录调度期间实际进行的控制记录读写次数，不包含初始化、结束清理和最终字符串结果复制。

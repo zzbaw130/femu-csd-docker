@@ -4,6 +4,7 @@
 #include "nodes/extensible.h"
 #include "lib/stringinfo.h"
 #include "portability/instr_time.h"
+#include <time.h>
 #include "query.h"
 #include "plan.h"
 extern int pg_sina_exe_path;
@@ -23,12 +24,37 @@ struct pg_sina_planner_profile {
     double indexes,resources;
     unsigned candidates,accepted,index_calls,index_queries;
     unsigned property_nodes,encoded_nodes,serialized_plans,fast_records;
+    double cpu,resource_cpu;
+    double resource_open,resource_properties,resource_load,resource_compute,resource_unload,resource_close;
+    double download,activate,function_id,deactivate,unload;
+    double prepare_copy,prepare_normalize,prepare_prune,prepare_algorithms;
+    double describe,mapping,refine;
+    double cost_reach,cost_buffers,cost_dictionary,cost_operators,cost_finish;
+    double retain_copy,retain_free,retain_publish,freeze,hook_other,native_core,adaptive_core,cache_probe;
+    unsigned cache_probes;
+    double cache_cpu,cache_metadata,cache_files,cache_residency,cache_count;
+    uint64_t cache_pages;
+    unsigned open_major_faults,open_minor_faults;
 };
 extern struct pg_sina_planner_profile *pg_sina_planning;
 static inline double pg_sina_planner_clock(void)
 {
     if(!pg_sina_planning) return 0;
     instr_time now; INSTR_TIME_SET_CURRENT(now); return INSTR_TIME_GET_MILLISEC(now);
+}
+static inline double pg_sina_planner_cpu(void)
+{
+    if(!pg_sina_planning) return 0;
+    struct timespec now; clock_gettime(CLOCK_THREAD_CPUTIME_ID,&now);
+    return now.tv_sec*1000.0+now.tv_nsec/1e6;
+}
+/* Already attributed exclusive work. Inclusive index/resource counters are
+ * deliberately excluded; freeze is otherwise part of the old PG remainder. */
+static inline double pg_sina_planner_attributed(void)
+{
+    const struct pg_sina_planner_profile *p=pg_sina_planning;
+    return p?p->preview+p->properties+p->compile+p->estimate+p->format+p->retain+
+        p->host_cache+p->stmt_copy+p->freeze:0;
 }
 extern int pg_sina_max_memory;
 /* Per-backend device capacities, populated before finalizing an offloaded plan.

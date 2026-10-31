@@ -10,6 +10,7 @@
 #include "utils/rel.h"
 #include <stdlib.h>
 #include <time.h>
+#include <sys/resource.h>
 enum { SCAN,FILTER,SINK,SOURCE,SORT,LIMIT,JOIN_BUILD,JOIN_LOAD,JOIN_CLOSE,FUNCTIONS };
 /* One SERIAL batch and one reusable set of buffers per execution slot. */
 struct slot { CS_BATCH_HANDLE batch,resume; CS_REQ_HANDLE request; CS_BATCH_INDEX load; unsigned bytes; };
@@ -69,18 +70,33 @@ static CS_STATUS load_program(CS_DEV_HANDLE device,struct program *p)
     CsCSFDownloadInfo download={.Type=CS_CSF_VENDOR_SPECIFIC,.SubType=CS_SUBTYPE_VENDOR_SPECIFIC,.CSEEId=1,.Index=p->index};
     snprintf(download.common.UniqueName,sizeof(download.common.UniqueName),"pg-sina-%u",p->index);
     download.common.DataBuffer=descriptor; download.common.Length=size+strlen(p->symbol)+1;
-    u32 id; CS_STATUS s=csCSFDownload(device,&download,&id); if(s!=CS_SUCCESS) return s; p->loaded=1;
+    double mark=pg_sina_planner_clock();
+    u32 id; CS_STATUS s=csCSFDownload(device,&download,&id);
+    if(pg_sina_planning) pg_sina_planning->download+=pg_sina_planner_clock()-mark;
+    if(s!=CS_SUCCESS) return s;
+    p->loaded=1;
     CsConfigInfo config={.Type=CS_CSF_ACTIVATE,.u.CSFActivateInfo={.CSFId=p->index,.EEIId=1,.State=CS_ACTIVE_STATE}};
-    CsConfigData result; int length=sizeof(result); s=csConfig(device,&length,&config,&result); if(s!=CS_SUCCESS) return s; p->active=1;
+    mark=pg_sina_planner_clock();
+    CsConfigData result; int length=sizeof(result); s=csConfig(device,&length,&config,&result);
+    if(pg_sina_planning) pg_sina_planning->activate+=pg_sina_planner_clock()-mark;
+    if(s!=CS_SUCCESS) return s;
+    p->active=1;
+    mark=pg_sina_planner_clock();
     int count=0; length=0; s=csGetCSFId(device,download.common.UniqueName,0,&length,&count,NULL); if(s!=CS_LENGTH_RETURNED) return s;
     CSFIdInfo *functions=malloc(length); if(!functions) return CS_OUT_OF_RESOURCES;
     s=csGetCSFId(device,download.common.UniqueName,0,&length,&count,functions); if(s==CS_SUCCESS) p->function=functions[0].CSFId;
-    free(functions); return s;
+    free(functions);
+    if(pg_sina_planning) pg_sina_planning->function_id+=pg_sina_planner_clock()-mark;
+    return s;
 }
 static void unload_program(CS_DEV_HANDLE device,struct program *p)
 {
+    double mark=pg_sina_planner_clock();
     if(p->active) { CsConfigInfo c={.Type=CS_CSF_ACTIVATE,.u.CSFActivateInfo={.CSFId=p->index,.EEIId=1,.State=CS_INACTIVE_STATE}}; CsConfigData r; int len=sizeof(r); csConfig(device,&len,&c,&r); }
+    if(pg_sina_planning) pg_sina_planning->deactivate+=pg_sina_planner_clock()-mark;
+    mark=pg_sina_planner_clock();
     if(p->loaded) { CsCSFDownloadInfo d={.CSEEId=1,.Index=p->index,.common.Unload=1};u32 id;csCSFDownload(device,&d,&id); }
+    if(pg_sina_planning) pg_sina_planning->unload+=pg_sina_planner_clock()-mark;
 }
 static CsProperties *properties(CS_DEV_HANDLE device,CS_RESOURCE_TYPE type)
 {
@@ -93,18 +109,31 @@ void pg_sina_read_resources(const char *path)
 {
     static char cached_device[128];
     if(pg_sina_resources.workmem_bytes && !strcmp(cached_device,path)) return;
-    double started=pg_sina_planner_clock();
+    double started=pg_sina_planner_clock(),cpu=pg_sina_planner_cpu(),mark=started;
     CS_DEV_HANDLE device=NULL;
     struct program probe={.file="pg-sina-plan.so",.symbol="pg_sina_workmem_capacity",.index=pg_sina_program_index(511)};
     CsProperties *cus=NULL,*fdm=NULL; u64 bytes=0;
     struct pg_sina_resources found={0};
+    struct rusage faults_before={0},faults_after={0};
+    if(pg_sina_planning) getrusage(RUSAGE_SELF,&faults_before);
     HOLD_INTERRUPTS();
     CS_STATUS status=csOpenCSx(path,NULL,&device);
+    if(pg_sina_planning) {
+        pg_sina_planning->resource_open+=pg_sina_planner_clock()-mark;
+        getrusage(RUSAGE_SELF,&faults_after);
+        pg_sina_planning->open_major_faults+=faults_after.ru_majflt-faults_before.ru_majflt;
+        pg_sina_planning->open_minor_faults+=faults_after.ru_minflt-faults_before.ru_minflt;
+    }
+    mark=pg_sina_planner_clock();
     if(status==CS_SUCCESS) {
         cus=properties(device,CS_CSE_TYPE); fdm=properties(device,CS_FDM_TYPE);
         if(!cus || !fdm) status=CS_DEVICE_ERROR;
     }
+    if(pg_sina_planning) pg_sina_planning->resource_properties+=pg_sina_planner_clock()-mark;
+    mark=pg_sina_planner_clock();
     if(status==CS_SUCCESS) status=load_program(device,&probe);
+    if(pg_sina_planning) pg_sina_planning->resource_load+=pg_sina_planner_clock()-mark;
+    mark=pg_sina_planner_clock();
     if(status==CS_SUCCESS) {
         CsComputeRequest request={.CSFId=probe.function,.NumArgs=0};
         status=csQueueComputeRequest(&request,NULL,NULL,NULL,NULL,&bytes);
@@ -114,12 +143,21 @@ void pg_sina_read_resources(const char *path)
             if(!found.cus || !found.fdm_bytes || !bytes || bytes>INT64_MAX) status=CS_DEVICE_ERROR;
         }
     }
-    if(device) { unload_program(device,&probe); csCloseCSx(device); }
+    if(pg_sina_planning) pg_sina_planning->resource_compute+=pg_sina_planner_clock()-mark;
+    mark=pg_sina_planner_clock();
+    if(device) unload_program(device,&probe);
+    if(pg_sina_planning) pg_sina_planning->resource_unload+=pg_sina_planner_clock()-mark;
+    mark=pg_sina_planner_clock();
+    if(device) csCloseCSx(device);
+    if(pg_sina_planning) pg_sina_planning->resource_close+=pg_sina_planner_clock()-mark;
     free(cus); free(fdm);
     RESUME_INTERRUPTS(); CHECK_FOR_INTERRUPTS();
     if(status!=CS_SUCCESS) elog(ERROR,"CSD resource query failed: status=%d",status);
     pg_sina_resources=found; strlcpy(cached_device,path,sizeof(cached_device));
-    if(pg_sina_planning) pg_sina_planning->resources+=pg_sina_planner_clock()-started;
+    if(pg_sina_planning) {
+        pg_sina_planning->resources+=pg_sina_planner_clock()-started;
+        pg_sina_planning->resource_cpu+=pg_sina_planner_cpu()-cpu;
+    }
 }
 static void compute_request(CsBatchRequest *b,CS_CSF_ID function,CS_MEM_HANDLE *memories,unsigned count,CS_MEM_HANDLE counters)
 {

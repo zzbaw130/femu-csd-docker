@@ -850,10 +850,20 @@ static bool choose_algorithms(PlannerInfo *root,Plan **slot,bool ordered)
 }
 Plan *pg_sina_prepare_candidate(PlannerInfo *root,Plan *native,bool ordered)
 {
+    double mark=pg_sina_planner_clock();
     Plan *copy=copyObject(native);
+    if(pg_sina_planning) pg_sina_planning->prepare_copy+=pg_sina_planner_clock()-mark;
+    mark=pg_sina_planner_clock();
     global_parallel_rows(copy,1);
-    if(!normalize_parallel_aggregate(&copy) || !prune_columns(copy,NULL,true) ||
-       !choose_algorithms(root,&copy,ordered)) return NULL;
+    bool supported=normalize_parallel_aggregate(&copy);
+    if(pg_sina_planning) pg_sina_planning->prepare_normalize+=pg_sina_planner_clock()-mark;
+    if(!supported) return NULL;
+    mark=pg_sina_planner_clock(); supported=prune_columns(copy,NULL,true);
+    if(pg_sina_planning) pg_sina_planning->prepare_prune+=pg_sina_planner_clock()-mark;
+    if(!supported) return NULL;
+    mark=pg_sina_planner_clock(); supported=choose_algorithms(root,&copy,ordered);
+    if(pg_sina_planning) pg_sina_planning->prepare_algorithms+=pg_sina_planner_clock()-mark;
+    if(!supported) return NULL;
     return copy;
 }
 static Node *heap_index_var(Node *node,List *tlist)
@@ -1927,6 +1937,7 @@ failed:
 }
 Plan *pg_sina_describe_candidate(PlannerInfo *root,Plan *native,bool boundary,struct qp_plan **lowered)
 {
+    double mark=pg_sina_planner_clock();
     struct qp_plan *tree=pg_sina_cost_workspace();
     memset(pg_sina_candidate_choices(),0,QP_NODES*sizeof(unsigned));
     memset(tree,0,offsetof(struct qp_plan,nodes));
@@ -1942,7 +1953,10 @@ Plan *pg_sina_describe_candidate(PlannerInfo *root,Plan *native,bool boundary,st
         tree->param_nodes[param]=child; tree->nparams=Max(tree->nparams,(unsigned)param+1);
         unsigned init=tree->ninit++; tree->init_nodes[init]=child; tree->init_params[init]=param;
     }
-    int result=describe_tree(root,native,tree,boundary || root->parse->sortClause!=NIL); if(result<0) return native;
+    int result=describe_tree(root,native,tree,boundary || root->parse->sortClause!=NIL);
+    if(pg_sina_planning) pg_sina_planning->describe+=pg_sina_planner_clock()-mark;
+    if(result<0) return native;
+    mark=pg_sina_planner_clock();
     bool has_scan=false; char device[128]={0};
     Oid ns=get_namespace_oid("sina_csd",true);
     if(!OidIsValid(ns) || !OidIsValid(get_relname_relid("relations",ns))) return native;
@@ -1952,7 +1966,11 @@ Plan *pg_sina_describe_candidate(PlannerInfo *root,Plan *native,bool boundary,st
         if(!device[0]) strlcpy(device,path,sizeof(device));
     }
     if(!has_scan) return native;
-    tree->root=result; pg_sina_refine_groups(tree); pg_sina_read_resources(device);
+    if(pg_sina_planning) pg_sina_planning->mapping+=pg_sina_planner_clock()-mark;
+    tree->root=result; mark=pg_sina_planner_clock();
+    pg_sina_refine_groups(tree);
+    if(pg_sina_planning) pg_sina_planning->refine+=pg_sina_planner_clock()-mark;
+    pg_sina_read_resources(device);
     for(unsigned i=0;i<tree->count;++i) {
         const struct qp_node *n=&tree->nodes[i];
         pg_sina_candidate_choices()[i]|=pg_sina_physical_choice(n);

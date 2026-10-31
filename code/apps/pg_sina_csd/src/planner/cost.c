@@ -46,13 +46,16 @@ static struct residency *residency(Oid oid,List **observations)
 {
     ListCell *c;
     foreach(c,*observations) { struct residency *r=lfirst(c); if(r->oid==oid) return r; }
+    double mark=pg_sina_planner_clock(),cpu=pg_sina_planner_cpu(),part=mark;
     struct residency *r=MemoryContextAllocZero(pg_sina_search_context(),sizeof(*r)); r->oid=oid;
     Relation rel=relation_open(oid,AccessShareLock);
     r->bytes=(double)RelationGetNumberOfBlocks(rel)*BLCKSZ;
     r->tuples=Max(1,rel->rd_rel->reltuples);
     char *base=relpathperm(rel->rd_node,MAIN_FORKNUM);
+    if(pg_sina_planning) pg_sina_planning->cache_metadata+=pg_sina_planner_clock()-part;
     double hit=0,seen=0;
     for(uint64 at=0;at<(uint64)r->bytes;) {
+        part=pg_sina_planner_clock();
         unsigned segment=at/((uint64)RELSEG_SIZE*BLCKSZ);
         char *path=segment?psprintf("%s.%u",base,segment):base;
         int fd=OpenTransientFile(path,O_RDONLY|PG_BINARY);
@@ -63,13 +66,22 @@ static struct residency *residency(Oid oid,List **observations)
         size_t bytes=Min((uint64)st.st_size,(uint64)r->bytes-at);
         if(!bytes) { CloseTransientFile(fd); break; }
         size_t pages=(bytes+4095)/4096;
+        if(pg_sina_planning) pg_sina_planning->cache_files+=pg_sina_planner_clock()-part;
         unsigned char *vector=palloc(pages);
+        part=pg_sina_planner_clock();
         void *map=mmap(NULL,bytes,PROT_NONE,MAP_SHARED,fd,0);
         if(map!=MAP_FAILED) {
-            if(!mincore(map,bytes,vector)) {
+            int status=mincore(map,bytes,vector);
+            if(pg_sina_planning) {
+                pg_sina_planning->cache_residency+=pg_sina_planner_clock()-part;
+                pg_sina_planning->cache_pages+=pages;
+            }
+            part=pg_sina_planner_clock();
+            if(!status) {
                 for(size_t i=0;i<pages;++i) hit+=(vector[i]&1)!=0;
                 seen+=pages;
             }
+            if(pg_sina_planning) pg_sina_planning->cache_count+=pg_sina_planner_clock()-part;
             munmap(map,bytes);
         }
         pfree(vector); CloseTransientFile(fd); at+=bytes;
@@ -78,7 +90,13 @@ static struct residency *residency(Oid oid,List **observations)
     pfree(base); relation_close(rel,AccessShareLock);
     MemoryContext previous=MemoryContextSwitchTo(pg_sina_search_context());
     *observations=lappend(*observations,r);
-    MemoryContextSwitchTo(previous); return r;
+    MemoryContextSwitchTo(previous);
+    if(pg_sina_planning) {
+        pg_sina_planning->cache_probe+=pg_sina_planner_clock()-mark;
+        pg_sina_planning->cache_cpu+=pg_sina_planner_cpu()-cpu;
+        ++pg_sina_planning->cache_probes;
+    }
+    return r;
 }
 static Oid scan_relation(PlannerInfo *root,Plan *p)
 {
@@ -501,6 +519,7 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
         tree=palloc(VARSIZE_ANY_EXHDR(bytes));
         memcpy(tree,VARDATA(bytes),VARSIZE_ANY_EXHDR(bytes));
     }
+    double mark=pg_sina_planner_clock();
     bool used[QP_NODES]={0},indexed[QP_NODES]={0}; used[tree->root]=true;
     for(unsigned i=0;i<tree->ninit;++i) used[tree->init_nodes[i]]=true;
     for(unsigned pass=0;pass<tree->count;++pass) for(unsigned i=0;i<tree->count;++i) if(used[i]) {
@@ -510,6 +529,8 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
         if(n->kind==QP_INDEX_JOIN) indexed[n->right]=true;
         if(n->kind==QP_SCAN) n->bytes=residency(n->expr.relid,observations)->bytes;
     }
+    if(pg_sina_planning) pg_sina_planning->cost_reach+=pg_sina_planner_clock()-mark;
+    mark=pg_sina_planner_clock();
     qp_parallel_boundaries(tree,tree->root);
     for(unsigned i=0;i<tree->ninit;++i) qp_parallel_boundaries(tree,tree->init_nodes[i]);
     unsigned slots=device_workers(tree,&p->fdm); p->workers=slots;
@@ -518,9 +539,13 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
     if(p->details) p->stages=makeStringInfo();
     double tasks[QP_NODES]={0},peak[QP_NODES]={0},live[QP_NODES]={0},retained[QP_NODES]={0};
     pipeline_tasks(tree,tasks);
+    if(pg_sina_planning) pg_sina_planning->cost_buffers+=pg_sina_planner_clock()-mark;
+    mark=pg_sina_planner_clock();
     double io=0,population_bytes=0,cache_bytes=0,scan_bytes=0,blocks=0;
     double memory=Max(1,pg_sina_query_memory()),unit=pg_sina_host_cost_ms*pg_sina_csd_cpu_ratio;
     p->dictionary=dictionary_state(tree,observations);
+    if(pg_sina_planning) pg_sina_planning->cost_dictionary+=pg_sina_planner_clock()-mark;
+    mark=pg_sina_planner_clock();
     /* Dictionary pages are evictable; descriptors remain resident. This is a
      * one-write/one-read lower bound, not a prediction of random reloads. */
     double dictionary_meta=ceil(p->dictionary/QS_SORT_IO_BYTES)*48;
@@ -657,6 +682,8 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
             p->stages->len?"; ":"",i,device_kind(n->kind),rows,n->estimated_groups,tasks[i],
             p->serial+p->parallel+p->schedule+p->combine-previous_cpu,state,resident,available,spill);
     }
+    if(pg_sina_planning) pg_sina_planning->cost_operators+=pg_sina_planner_clock()-mark;
+    mark=pg_sina_planner_clock();
     /* One CSF task executes a whole pipeline, not one request per SQL node.
      * Charge its wave dispatch once even when several nodes share tasks. */
     if(cus>1) for(unsigned i=0;i<tree->count;++i)
@@ -677,6 +704,7 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
         p->rows*cpu_tuple_cost*pg_sina_host_cost_ms+
         Max(1,ceil(p->rows/output_capacity(p->native,&tree->nodes[tree->root].expr)))*pg_sina_result_batch_ms;
     if(bytes) { memcpy(VARDATA(bytes),tree,VARSIZE_ANY_EXHDR(bytes)); pfree(tree); }
+    if(pg_sina_planning) pg_sina_planning->cost_finish+=pg_sina_planner_clock()-mark;
 }
 static struct placement *estimate(PlannerInfo *root,Plan *native,Plan *scope,List **observations,bool top,bool mark_restore,bool parallel_region)
 {

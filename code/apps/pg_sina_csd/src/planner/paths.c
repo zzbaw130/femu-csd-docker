@@ -39,6 +39,7 @@ static const CustomPathMethods device_methods,final_methods;
  * globally selected statement gets its final CSF record in finish below. */
 static Plan *defer_program(PlannerInfo *root,Plan *native,bool fast,bool boundary,List *costs,List *choices)
 {
+    double mark=pg_sina_planner_clock();
     MemoryContext previous=MemoryContextSwitchTo(pg_sina_search_context());
     struct device_program *program=palloc(sizeof(*program));
     program->root=*root; program->native=native; program->fast=fast; program->boundary=boundary;
@@ -54,6 +55,7 @@ static Plan *defer_program(PlannerInfo *root,Plan *native,bool fast,bool boundar
     MemoryContextSwitchTo(previous);
     CustomScan *scan=(CustomScan *)pg_sina_candidate_scan(native,fast);
     scan->custom_private=list_make2(makeInteger(id),copyObject(costs));
+    if(pg_sina_planning) pg_sina_planning->freeze+=pg_sina_planner_clock()-mark;
     return (Plan *)scan;
 }
 void pg_sina_finish_device_plans(Plan *plan)
@@ -286,7 +288,11 @@ static void add_device_path(PlannerInfo *root,RelOptInfo *rel,Path *native,bool 
     path->custom_private=list_make5(copyObject(lthird(((CustomScan *)device)->custom_private)),copyObject(lsecond(((CustomScan *)device)->custom_private)),
         makeInteger(top),makeInteger(((CustomScan *)device)->methods==&pg_sina_scan_methods),copyObject(lfourth(((CustomScan *)device)->custom_private)));
     path->methods=&device_methods;
+    if(pg_sina_planning) pg_sina_planning->retain_copy+=pg_sina_planner_clock()-mark;
+    double freed=pg_sina_planner_clock();
     MemoryContextDelete(temporary);
+    if(pg_sina_planning) pg_sina_planning->retain_free+=pg_sina_planner_clock()-freed;
+    freed=pg_sina_planner_clock();
     /* PG may prune the delivered path. Keep a distinct object for parent
      * device joins: their inputs stay in device memory and pay no boundary. */
     if(internal<state->internal_cost) {
@@ -295,6 +301,7 @@ static void add_device_path(PlannerInfo *root,RelOptInfo *rel,Path *native,bool 
         state->internal_cost=internal;
     }
     state->pending=lappend(state->pending,path);
+    if(pg_sina_planning) pg_sina_planning->retain_publish+=pg_sina_planner_clock()-freed;
     if(pg_sina_planning) pg_sina_planning->retain+=pg_sina_planner_clock()-mark;
 }
 static void publish_paths(PlannerInfo *root,RelOptInfo *rel)
