@@ -744,3 +744,15 @@ SQLerate：Q2主体CSD、Limit在HOST；Q3/Q9全CSD；Q10仅orders扫描在CSD�
 Q7选择CSD扫描orders，HOST保留customer等扫描、lineitem索引连接及聚合排序；Q12选择CSD扫描过滤lineitem，HOST索引连接orders及聚合排序。Q3改选原PG物理树转换的完整CSD Index Join，比原Hash Join方案有所改善，但仍慢于扫描下推，尚未合格。
 
 Q3主要残差来自基数：PG估计最终315648组、Gather约305466行，节点诊断实际11272组；连接估计约315648行，实际29866行。跨表日期相关性不在现有单表统计中，放大了HOST上层成本。当前原HOST估1859.866ms、完整CSD估1817.070ms，仍误选全CSD。按用户决定，本阶段保持纯统计模型，只使用现有PG统计、物理属性及缓存驻留记录，不加入Join采样，也不以实测行数或查询编号修正估计。Q3的跨表相关基数误差及路径误选作为当前已知限制保留，不将其判为性能通过。两个组件CTest及扫描重叠边界检查通过；没有运行全量TPC-H。全部逐轮、路径、规划/执行/填充计时、缓存和资源核验见 `results/scan-cost.19aFBP/`。
+
+#### Q4缓存估价与Q10内部索引查找
+
+Q4的SEMI索引连接缓存扣费已修复，具体公式见cost-model.md。热测三轮查询主体中位数：HOST306.3ms、filter-only181.1ms、修改前SQLerate316.0ms、修改后175.1ms。SQLerate改选CSD扫描orders，HOST保留lineitem索引连接及聚合排序。
+
+Q10设备Index Join的128页缓存原以线性扫描查找标签，现在改用固定哈希桶和槽链；页容量、根页保留、替换、待完成I/O保护、256键批次和对外ABI不变。回归补充超过缓存容量后清空再用的用例。无填充完整CSD三轮主体中位数1499.8→1406.5ms，双填充1517.8→1432.0ms；无填充索引连接阶段1022.1→932.0ms，累计worker CPU686.7→593.9ms。更小批次未获收益，已回退。
+
+Q10完整卸载仍未性能合格：最终HOST585.4ms、filter-only517.9ms、SQLerate470.6ms，SQLerate仍选orders扫描下推、HOST保留连接和聚合。完整CSD索引阶段平均活跃CU约0.65，后续customer阶段约331.0ms、平均活跃CU约0.98；候选228021个Heap元组、约7.6万次页加载。峰值约165.3MiB低于256MiB、spill为0，不能归因于内存不足或多表连接本身。保留有益的小范围改动，剩余查找/等待与串行阶段明确列为未解决问题。
+
+同环境历史Q9原始SQL总时间：`results/tpch-cache.lYsAOh/`冷HOST/filter-only=2487.3/1718.7ms，热1398.9/1677.6ms；近期`results/scan-paths.G4vsJL/`热1396.294/1695.706ms。热缓存下filter-only较慢已存在，不能把冷热差异当作本次新回退。
+
+本阶段仅正式Q4/Q10定向验证，共52份结果逐行一致、104次前后FDM检查为0；两项PG及三项设备组件测试通过，设备测试全局workmem至少64MiB，未运行全量。只预热一次、逐轮两级缓存均100%驻留；填充模式双开HPCP/DCP。上面主体为每次SQL总时间扣除前台驻留维护后取中位数。原始总时间、各轮/分项、构建测试与Q9历史来源见`results/q4-q10-fix.GZzqtM/report.md`，未将历史总时间与本次主体时间混比。

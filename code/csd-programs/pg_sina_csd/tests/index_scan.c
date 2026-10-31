@@ -12,6 +12,7 @@ typedef int64_t (*function)(struct femu_csd_args *);
 static unsigned key_bytes=4;
 static int empty_index,large_index,retained_window,pair_keys;
 static void (*heap_window)(struct qs_join_control *,unsigned,const void *,uint32_t,uint32_t);
+static void (*reset_cache)(struct qs_join_control *,unsigned);
 static unsigned char index_pages[4][QS_PAGE],heap[256][QS_PAGE];
 static unsigned test_slot;
 static void w16(void *p,uint16_t v) { memcpy(p,&v,2); }
@@ -91,6 +92,9 @@ static void check(function build,function probe,function close,function source,i
     void *args[]={c,&p,&task,&control,out,io}; long long sizes[]={len[0],sizeof(p),sizeof(task),sizeof(control),qs_chunk_bytes(256,3),io_bytes};
     a=(struct femu_csd_args){.numr=6,.mr_addr=args,.mr_len=sizes};
     unsigned resumes=0,root_reads=0,heap_reads=0; int failed=0;
+    unsigned passes=large_index && !cancel && !retained_window?2:1;
+    for(unsigned pass=0;pass<passes;++pass) {
+    if(pass) reset_cache(&control,test_slot);
     do {
         int64_t value=probe(&a);
         if(value) { assert(cancel==2 && value==-2); failed=1; break; }
@@ -106,11 +110,13 @@ static void check(function build,function probe,function close,function source,i
         }
         assert(++resumes<5000);
     } while(task.index_pending);
+    }
+    expected_count*=passes; expected_sum*=passes;
     assert(cancel!=2 || failed);
     if(large_index && !cancel && !retained_window) {
         /* More heap pages than cache slots, but the root is reused every
          * lookup batch and must stay resident across those streaming reads. */
-        assert(root_reads==1);
+        assert(root_reads==passes);
         printf("index cache: filtered=%d root_reads=%u heap_reads=%u resumes=%u\n",filtered,root_reads,heap_reads,resumes);
     }
     struct qs_group group={.count=1,.states={task.state}};
@@ -169,10 +175,11 @@ static void ordered_scan(void *library,unsigned rows,int empty,int flags)
 }
 int main(int argc,char **argv)
 {
-    assert(argc==3 || argc==4); assert(!cs_work_init((argc==4?256U:4U)*1024*1024));
+    assert(argc==3 || argc==4); assert(!cs_work_init((argc==4?256U:64U)*1024*1024));
     void *join=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL),*agg=dlopen(argv[2],RTLD_NOW|RTLD_LOCAL); assert(join && agg);
     function build=(function)dlsym(join,"pg_sina_join_build"),probe=(function)dlsym(join,"pg_sina_join_probe"),close=(function)dlsym(join,"pg_sina_join_close"),source=(function)dlsym(agg,"pg_sina_aggregate_source"); assert(build && probe && close && source);
     heap_window=(void (*)(struct qs_join_control *,unsigned,const void *,uint32_t,uint32_t))dlsym(join,"qs_index_heap_window"); assert(heap_window);
+    reset_cache=(void (*)(struct qs_join_control *,unsigned))dlsym(join,"qs_index_reset"); assert(reset_cache);
     key_bytes=4; pages(); ordered_scan(join,8,0,0); ordered_scan(join,8,1,2); ordered_scan(join,8,0,4);
     ordered_scan(join,8,0,12);
     ordered_scan(join,8,0,20); ordered_scan(join,8,0,28);

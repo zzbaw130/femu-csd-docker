@@ -11,10 +11,13 @@
 #include <string.h>
 extern int64_t pg_sina_filter_impl(struct femu_csd_args *);
 #define INDEX_KEYS QS_INDEX_KEYS
+#define INDEX_BUCKETS (2*QS_INDEX_CACHE)
+_Static_assert(!(INDEX_BUCKETS&(INDEX_BUCKETS-1)),"index buckets must be a power of two");
 struct page_tag { uint32_t block; uint16_t heap, state; }; /* 0 absent, 1 loaded, 2 requested */
 struct lookup { unsigned row, block, item, heap_block, heap_item, phase; int64_t key; };
 struct index_cursor {
     struct page_tag tags[QS_INDEX_CACHE];
+    uint16_t heads[INDEX_BUCKETS],next[QS_INDEX_CACHE]; /* slot+1; zero ends a chain */
     struct lookup keys[INDEX_KEYS];
     unsigned position, count, hand, waiting, pending, last_slot, root;
     const unsigned char *heap_window;
@@ -77,7 +80,11 @@ int qs_index_init(const struct qs_plan *p,struct qs_join_control *control)
 void qs_index_reset(struct qs_join_control *control,unsigned slot)
 {
     struct index_join *h=(void *)(uintptr_t)control->state;
-    if(h->cursors[slot]) memset(h->cursors[slot]->tags,0,sizeof(h->cursors[slot]->tags));
+    if(h->cursors[slot]) {
+        memset(h->cursors[slot]->tags,0,sizeof(h->cursors[slot]->tags));
+        memset(h->cursors[slot]->heads,0,sizeof(h->cursors[slot]->heads));
+        memset(h->cursors[slot]->next,0,sizeof(h->cursors[slot]->next));
+    }
 }
 void qs_index_skip(struct qs_join_control *control,unsigned slot,const uint64_t *rows)
 {
@@ -134,6 +141,8 @@ static int64_t decode_tuple(struct index_join *h,struct index_cursor *c,const un
     c->dictionary_completion=0; c->dictionary_pending=status>0;
     return status;
 }
+static unsigned page_bucket(unsigned block,unsigned heap)
+{ return (block*UINT32_C(0x9e3779b1)^(heap?UINT32_C(0x85ebca6b):0))&(INDEX_BUCKETS-1); }
 static const unsigned char *page_at(struct index_cursor *c,struct qs_task *task,void *io,unsigned block,unsigned heap)
 {
     if(heap && block>=c->heap_first && block-c->heap_first<c->heap_pages)
@@ -141,8 +150,14 @@ static const unsigned char *page_at(struct index_cursor *c,struct qs_task *task,
     const struct page_tag *last=&c->tags[c->last_slot];
     if(last->state && last->block==block && last->heap==heap)
         return last->state==1?(unsigned char *)io+QS_SORT_IO_BYTES+(size_t)c->last_slot*QS_PAGE:NULL;
-    for(unsigned i=0;i<QS_INDEX_CACHE;++i) if(c->tags[i].state && c->tags[i].block==block && c->tags[i].heap==heap)
-        { c->last_slot=i; return c->tags[i].state==1?(unsigned char *)io+QS_SORT_IO_BYTES+(size_t)i*QS_PAGE:NULL; }
+    unsigned bucket=page_bucket(block,heap);
+    for(unsigned at=c->heads[bucket];at;at=c->next[at-1]) {
+        unsigned i=at-1;
+        if(c->tags[i].block==block && c->tags[i].heap==heap) {
+            c->last_slot=i;
+            return c->tags[i].state==1?(unsigned char *)io+QS_SORT_IO_BYTES+(size_t)i*QS_PAGE:NULL;
+        }
+    }
     if(task->index_nreads==QS_INDEX_READS) return NULL;
     for(unsigned n=0;n<QS_INDEX_CACHE;++n) {
         unsigned slot=c->hand++%QS_INDEX_CACHE;
@@ -150,7 +165,13 @@ static const unsigned char *page_at(struct index_cursor *c,struct qs_task *task,
         /* Every lookup batch revisits the root. Keep its one existing slot;
          * rotate the rest so LOAD destinations remain mostly contiguous. */
         if(tag->state==2 || (tag->state && !tag->heap && tag->block==c->root)) continue;
+        if(tag->state) {
+            uint16_t *link=&c->heads[page_bucket(tag->block,tag->heap)];
+            while(*link && *link!=slot+1) link=&c->next[*link-1];
+            if(*link) *link=c->next[slot];
+        }
         c->tags[slot]=(struct page_tag){block,heap,2};
+        c->next[slot]=c->heads[bucket]; c->heads[bucket]=slot+1;
         task->index_reads[task->index_nreads++]=(struct qs_index_read){block,slot,heap};
         return NULL;
     }
