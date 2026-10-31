@@ -726,8 +726,13 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
             double read=relation->bytes,hit=read*relation->fraction;
             input=relation->tuples;
             if(n->ordered_index) {
-                double fraction=Min(1.0,Max(1,rows)/relation->tuples*4);
-                read=(n->ordered_index&4)?0:read*fraction; hit=read*relation->fraction; input=rows;
+                /* This cursor walks every leaf entry; its predicates do not
+                 * position an index range. Output selectivity cannot reduce
+                 * visited tuples, predicate CPU or non-covering Heap reads. */
+                if(n->ordered_index&4) read=0;
+                else if(!(n->ordered_index&2))
+                    read=BLCKSZ*cost_index_pages(input,relation->bytes/BLCKSZ,QS_INDEX_CACHE,1);
+                hit=read*relation->fraction;
                 if(n->expr.join.indexid) {
                     struct residency *index=residency(n->expr.join.indexid,observations);
                     read+=index->bytes; hit+=index->bytes*index->fraction;
@@ -876,6 +881,8 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
         if(p->details) appendStringInfo(p->stages,"%s%d/%s rows=%.0f groups=%.0f tasks=%.0f cpu=%.3fms state=%.0fB resident=%.0fB available=%.0fB spill=%.0fB",
             p->stages->len?"; ":"",i,device_kind(n->kind),rows,n->estimated_groups,tasks[i],
             p->serial+p->parallel+p->schedule+p->combine-previous_cpu,state,resident,available,spill);
+        if(p->details && n->kind==QP_SCAN)
+            appendStringInfo(p->stages," visited=%.0f",input);
         if(p->details && (n->kind==QP_JOIN || n->kind==QP_INDEX_JOIN)) {
             static const char *names[]={"inner","left","semi","anti"};
             appendStringInfo(p->stages," join=%s",names[n->join_type]);
