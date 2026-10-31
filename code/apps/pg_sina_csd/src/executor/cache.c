@@ -31,6 +31,7 @@ static struct {
     const unsigned char *data;
     unsigned next;
     int active;
+    bool failed;
     uint64 position;
     uint64 filled,cached,skipped,invalid,blocks,ns,minor_faults,major_faults;
     uint64 steps,max_step_ns,lookup_ns,allocate_ns,copy_ns;
@@ -62,7 +63,7 @@ void pg_sina_dcp_finish(void)
     if(receiver.fd<0) return;
     /* The caller has stopped device DMA before draining these last slots. */
     for(unsigned i=0;i<FEMU_CACHE_RX_SLOTS;i++)
-        do { pg_sina_dcp_poll(); } while(receiver.active>=0);
+        do { pg_sina_dcp_poll(true); } while(receiver.active>=0);
     if(pg_sina_profile) ereport(NOTICE,(errmsg("SQLerate DCP blocks=%llu filled_pages=%llu cached_pages=%llu skipped_bytes=%llu invalid_pages=%llu wall_ms=%.3f minor_faults=%llu major_faults=%llu steps=%llu max_step_ms=%.3f lookup_ms=%.3f allocate_ms=%.3f copy_ms=%.3f",
         (unsigned long long)receiver.blocks,(unsigned long long)receiver.filled,
         (unsigned long long)receiver.cached,(unsigned long long)receiver.skipped,
@@ -109,7 +110,7 @@ static int in_buffer_pool(Relation rel,BlockNumber block)
     LWLockRelease(lock);
     return exists;
 }
-static void fill_slot(unsigned slot)
+static void fill_slot(unsigned slot,bool whole_slot)
 {
     const struct femu_cache_slot *s=&receiver.slots[slot];
     uint64 physical=le64toh(s->lba),bytes=le64toh(s->bytes);
@@ -118,8 +119,8 @@ static void fill_slot(unsigned slot)
     PGAlignedBlock checked;
     bool checksums=DataChecksumsEnabled();
     Relation rel=NULL;
-    uint64 position=receiver.position,end=Min(bytes,position+256*1024);
-    uint64 deadline=now_ns()+250000;
+    uint64 position=receiver.position,end=whole_slot?bytes:Min(bytes,position+256*1024);
+    uint64 deadline=whole_slot?0:now_ns()+250000;
     for(;position<end;) {
         struct cache_relation *match=NULL; uint64 logical=0,available=0;
         for(struct cache_relation *r=relations;r && !match;r=r->next) {
@@ -174,15 +175,15 @@ static void fill_slot(unsigned slot)
             UnlockReleaseBuffer(buffer);
             /* Yield only between complete pages, with no buffer pin held.
              * Retain the DMA slot until every slice has been consumed. */
-            if(now_ns()>=deadline) { take=offset+BLCKSZ; break; }
+            if(!whole_slot && now_ns()>=deadline) { take=offset+BLCKSZ; break; }
         }
         position+=take;
-        if(now_ns()>=deadline) break;
+        if(!whole_slot && now_ns()>=deadline) break;
     }
     if(rel) relation_close(rel,AccessShareLock);
     receiver.position=position;
 }
-bool pg_sina_dcp_poll(void)
+bool pg_sina_dcp_poll(bool whole_slot)
 {
     if(receiver.fd<0 || receiver.slots==MAP_FAILED || receiver.data==MAP_FAILED) return false;
     uint64 start=now_ns();
@@ -201,11 +202,11 @@ bool pg_sina_dcp_poll(void)
         unsigned slot=receiver.active;
         PG_TRY();
         {
-            if(IsTransactionState() && !QueryCancelPending && !ProcDiePending) fill_slot(slot);
+            if(!receiver.failed && IsTransactionState() && !QueryCancelPending && !ProcDiePending) fill_slot(slot,whole_slot);
             else receiver.position=le64toh(receiver.slots[slot].bytes);
         }
         PG_CATCH();
-        { ioctl(receiver.fd,FEMU_CACHE_RX_RELEASE,slot); receiver.active=-1; PG_RE_THROW(); }
+        { ioctl(receiver.fd,FEMU_CACHE_RX_RELEASE,slot); receiver.active=-1; receiver.failed=true; PG_RE_THROW(); }
         PG_END_TRY();
         if(receiver.position>=le64toh(receiver.slots[slot].bytes)) {
             unsigned flags=slot|(pg_sina_hpcp_enabled()?FEMU_CACHE_RELEASE_HPCP:0);

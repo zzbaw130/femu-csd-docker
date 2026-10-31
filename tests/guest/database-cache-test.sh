@@ -16,6 +16,7 @@ for policy in none hpcp dcp both; do
         sh "$COLD" csd-with-hpcp "$QUERY" > "$OUT/$policy.log" 2> "$OUT/$policy.err"
     sed '/^Time:/d; /^Timing is /d' "$OUT/$policy.log" > "$OUT/current.rows"
     cmp "$OUT/reference.rows" "$OUT/current.rows"
+    grep -q 'SQLerate scan callbacks continuations=[1-9]' "$OUT/$policy.err"
     state=$(psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 -c \
         "SELECT count(*),count(*) FILTER (WHERE isdirty) FROM pg_buffercache
          WHERE relfilenode=pg_relation_filenode('public.lineitem') AND relforknumber=0

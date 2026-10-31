@@ -10,10 +10,31 @@
 #include "utils/rel.h"
 #include <stdlib.h>
 #include <time.h>
+#include <stdatomic.h>
 #include "storage/ipc.h"
 enum { SCAN,FILTER,SINK,SOURCE,SORT,LIMIT,JOIN_BUILD,JOIN_LOAD,JOIN_CLOSE,FUNCTIONS };
 /* One SERIAL batch and one reusable set of buffers per execution slot. */
-struct slot { CS_BATCH_HANDLE batch,resume; CS_REQ_HANDLE request; CS_BATCH_INDEX load; unsigned bytes; };
+struct scan_chain {
+    const struct qs_request *request;
+    const struct qs_extent *extents;
+    CS_DEV_HANDLE device;
+    unsigned chunk;
+    bool profiling;
+    atomic_bool stopping;
+    atomic_uint callbacks,continuations;
+    atomic_uint_fast64_t next,refill_ns;
+};
+struct slot {
+    CS_BATCH_HANDLE batch,resume;
+    CS_REQ_HANDLE request;
+    CS_BATCH_INDEX load;
+    unsigned bytes;
+    struct scan_chain *chain;
+    CS_MEM_HANDLE input,task;
+    CsBatchRequest *next_load;
+    atomic_bool done;
+    CS_STATUS status;
+};
 struct program { const char *file,*symbol; CS_CSF_ID function; unsigned index; int loaded,active; };
 struct pg_sina_stream {
     CS_DEV_HANDLE device;
@@ -290,6 +311,66 @@ static void build_storage_request(CsBatchRequest *load,CS_DEV_HANDLE device,CS_M
         .u.BlockIo={.Type=CS_STORAGE_LOAD_TYPE,.DevMem={memory,0}}};
     append_ranges(&load->u.StorageIo.u.BlockIo,request,extents,cursor,bytes);
 }
+/* Immutable mappings and SNIA only: no PG API, memory context or signal state
+ * is accessed on library threads. Each slot has at most one device batch in
+ * flight. Reserve the initial range per CU before callbacks claim more work. */
+static void scan_completed(void *context,CS_STATUS status,u64 value)
+{
+    struct slot *slot=context;
+    struct scan_chain *chain=slot->chain;
+    atomic_fetch_add_explicit(&chain->callbacks,1,memory_order_acq_rel);
+    uint64_t started=chain->profiling?clock_ns():0;
+    if(status==CS_SUCCESS && !atomic_load_explicit(&chain->stopping,memory_order_acquire)) {
+        uint64_t at=atomic_fetch_add_explicit(&chain->next,chain->chunk,memory_order_relaxed);
+        if(at<chain->request->bytes) {
+            unsigned bytes=Min((uint64_t)chain->chunk,chain->request->bytes-at);
+            if(bytes!=slot->bytes) {
+                status=copy(slot->task,offsetof(struct qs_task,input_bytes),&bytes,sizeof(bytes),1);
+                slot->bytes=bytes;
+            }
+            if(status==CS_SUCCESS) {
+                build_storage_request(slot->next_load,chain->device,slot->input,chain->request,chain->extents,at,bytes);
+                status=csConfigureBatchEntry(slot->batch,CS_BATCH_RECONFIG,slot->next_load,slot->load,0,NULL);
+            }
+            if(status==CS_SUCCESS) status=csQueueBatchRequest(slot->batch,slot,scan_completed,NULL,NULL,NULL);
+            if(status==CS_QUEUED) {
+                /* A successor can already finish on another library thread.
+                 * Touch no mutable slot fields after publishing that request. */
+                atomic_fetch_add_explicit(&chain->continuations,1,memory_order_relaxed);
+                if(chain->profiling) atomic_fetch_add_explicit(&chain->refill_ns,clock_ns()-started,memory_order_relaxed);
+                atomic_fetch_sub_explicit(&chain->callbacks,1,memory_order_release);
+                return;
+            }
+            if(status==CS_SUCCESS) status=CS_ERROR_IN_EXECUTION;
+        }
+    }
+    if(status!=CS_SUCCESS) atomic_store_explicit(&chain->stopping,true,memory_order_release);
+    slot->status=status;
+    atomic_store_explicit(&slot->done,true,memory_order_release);
+    atomic_fetch_sub_explicit(&chain->callbacks,1,memory_order_release);
+}
+static bool scans_done(struct slot *slots,unsigned workers)
+{
+    for(unsigned i=0;i<workers;++i)
+        if(slots[i].chain && !atomic_load_explicit(&slots[i].done,memory_order_acquire)) return false;
+    return true;
+}
+/* Buffer APIs may ERROR. Keep the callback contexts alive until normal
+ * device completion, then let the backend rethrow after resource cleanup. */
+static bool poll_callback_cache(ErrorData **error)
+{
+    MemoryContext context=CurrentMemoryContext;
+    volatile bool worked=false;
+    PG_TRY();
+    { worked=pg_sina_dcp_poll(true); }
+    PG_CATCH();
+    {
+        MemoryContextSwitchTo(context);
+        *error=CopyErrorData(); FlushErrorState();
+    }
+    PG_END_TRY();
+    return worked;
+}
 static void drop_source(CS_CSF_ID source,CS_MEM_HANDLE group,CsBatchRequest *compute)
 {
     CS_MEM_HANDLE memory[]={group}; compute_request(compute,source,memory,1,NULL);
@@ -347,6 +428,9 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     result->status=1; strcpy(result->error,"CSD execution interrupted or initialization failed");
     CS_DEV_HANDLE device=NULL; CS_BATCH_HANDLE batch=NULL,build_batch=NULL,load_batch=NULL; CS_EVT_HANDLE event=NULL;
     struct slot slots[QS_WORKERS]={{0}}; unsigned inflight=0;
+    struct scan_chain chain={0};
+    bool callback_scan=false;
+    ErrorData *cache_error=NULL;
     CS_MEM_HANDLE plan_mem=NULL,out_mem=NULL,group_mem=NULL,scan_mem=NULL,join_mem=NULL,build_mem=NULL,dict_mem=NULL;
     CS_MEM_HANDLE joined[QS_WORKERS]={0},controls_mem[QS_JOINS]={0};
     struct qs_join_control join_control[QS_JOINS]={{0}};
@@ -429,6 +513,14 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     }
     group.count=workers;
     bool has_filter=request->plan.predicate>=0;
+    callback_scan=!joining && !streaming && request->bytes;
+    if(callback_scan) {
+        chain.request=request; chain.extents=extents; chain.device=device;
+        chain.chunk=chunk; chain.profiling=profiling;
+        atomic_init(&chain.stopping,false); atomic_init(&chain.callbacks,0);
+        atomic_init(&chain.continuations,0); atomic_init(&chain.refill_ns,0);
+        atomic_init(&chain.next,(uint64_t)workers*chunk);
+    }
     for(unsigned i=0;i<njoins;++i) has_filter=has_filter || qs_join_at(&request->plan,i)->predicate>=0;
     for(unsigned i=0;i<FUNCTIONS;++i) {
         if((!joining && i>=JOIN_BUILD) || (streaming && (i==SORT || i==LIMIT)) ||
@@ -576,7 +668,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
                 if(!inflight) break;
                 void *completed=NULL;
                 CS_STATUS status=csPollEvent(event,&completed,NULL);
-                if(status==CS_NOT_DONE) { if(!pg_sina_dcp_poll()) pg_usleep(50L); continue; }
+                if(status==CS_NOT_DONE) { if(!pg_sina_dcp_poll(false)) pg_usleep(50L); continue; }
                 --inflight; struct slot *slot=completed; slot->request=NULL;
                 if(status!=CS_SUCCESS) {
                     result->status=status; snprintf(result->error,sizeof(result->error),"csPollEvent(build scan): status=%d",status); goto cleanup;
@@ -677,17 +769,39 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
                 else compute_request(compute,programs[SINK].function,aggregate,3,counters[i]);
                 TRY(csConfigureBatchEntry(slot->batch,CS_BATCH_ADD,compute,0,previous,&current));
             }
-            CS_STATUS status=csQueueBatchRequest(slot->batch,slot,NULL,event,&slot->request,NULL);
+            CS_STATUS status;
+            if(callback_scan) {
+                slot->next_load=calloc(1,sizeof(*load)+(request->nextents+1)*sizeof(CSBlockRange));
+                if(!slot->next_load) { strcpy(result->error,"cannot allocate callback LOAD request"); goto cleanup; }
+                slot->input=input[i]; slot->task=tasks[i];
+                atomic_init(&slot->done,false); slot->chain=&chain;
+                status=csQueueBatchRequest(slot->batch,slot,scan_completed,NULL,NULL,NULL);
+                if(status!=CS_QUEUED) atomic_store_explicit(&slot->done,true,memory_order_release);
+            } else status=csQueueBatchRequest(slot->batch,slot,NULL,event,&slot->request,NULL);
             if(status!=CS_QUEUED) {
                 result->status=status==CS_SUCCESS?CS_ERROR_IN_EXECUTION:status;
                 snprintf(result->error,sizeof(result->error),"csQueueBatchRequest: status=%d",status); goto cleanup;
             }
-            ++inflight; cursor+=bytes;
+            if(!callback_scan) ++inflight;
+            cursor+=bytes;
+        }
+        if(callback_scan) {
+            while(!scans_done(slots,workers) || atomic_load_explicit(&chain.callbacks,memory_order_acquire)) {
+                if(QueryCancelPending || ProcDiePending) goto cleanup;
+                bool worked=poll_callback_cache(&cache_error);
+                if(cache_error) goto cleanup;
+                if(!worked) pg_usleep(50L);
+            }
+            for(unsigned i=0;i<workers;++i) if(slots[i].status!=CS_SUCCESS) {
+                result->status=slots[i].status;
+                snprintf(result->error,sizeof(result->error),"scan callback: status=%d",result->status); goto cleanup;
+            }
+            break;
         }
         if(!inflight) break;
         void *completed=NULL;
         CS_STATUS status=csPollEvent(event,&completed,NULL);
-        if(status==CS_NOT_DONE) { if(!pg_sina_dcp_poll()) pg_usleep(50L); continue; }
+        if(status==CS_NOT_DONE) { if(!pg_sina_dcp_poll(false)) pg_usleep(50L); continue; }
         --inflight; ((struct slot *)completed)->request=NULL;
         if(status!=CS_SUCCESS) {
             result->status=status; snprintf(result->error,sizeof(result->error),"csPollEvent: status=%d",status); goto cleanup;
@@ -815,19 +929,31 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     }
 cleanup:
     if(profiling && !cleanup_start) cleanup_start=clock_ns();
+    if(callback_scan) {
+        atomic_store_explicit(&chain.stopping,true,memory_order_release);
+        while(!scans_done(slots,workers) || atomic_load_explicit(&chain.callbacks,memory_order_acquire))
+            if(!pg_sina_dcp_poll(true)) pg_usleep(50L);
+        if(profiling) ereport(NOTICE,(errmsg("SQLerate scan callbacks continuations=%u refill_ms=%.3f",
+            atomic_load_explicit(&chain.continuations,memory_order_relaxed),
+            atomic_load_explicit(&chain.refill_ns,memory_order_relaxed)/1e6)));
+    }
     /* Stop refilling and drain the bounded, already submitted input blocks.
      * Their normal completion also releases DMA references to these inputs;
      * forcibly cancelling a device graph can strand those references. */
     if(event) {
         while(inflight) {
-            pg_sina_dcp_poll();
+            pg_sina_dcp_poll(false);
             CS_STATUS status=csPollEvent(event,NULL,NULL);
             if(status==CS_NOT_DONE) pg_usleep(50L);
             else --inflight;
         }
         csDeleteEvent(event);
     }
-    for(unsigned i=0;i<workers;++i) { if(slots[i].batch) csFreeBatchRequest(slots[i].batch); if(slots[i].resume) csFreeBatchRequest(slots[i].resume); }
+    for(unsigned i=0;i<workers;++i) {
+        if(slots[i].batch) csFreeBatchRequest(slots[i].batch);
+        if(slots[i].resume) csFreeBatchRequest(slots[i].resume);
+        free(slots[i].next_load);
+    }
     if(batch) csFreeBatchRequest(batch);
     if(build_batch) csFreeBatchRequest(build_batch);
     if(load_batch) csFreeBatchRequest(load_batch);
@@ -868,6 +994,7 @@ cleanup:
         if(*stream) (*stream)->profile=stats;
     }
     RESUME_INTERRUPTS();
+    if(cache_error) ReThrowError(cache_error);
     CHECK_FOR_INTERRUPTS();
     if(result->status) ereport(ERROR,(errmsg("CSD execution failed: %s",result->error)));
 }
