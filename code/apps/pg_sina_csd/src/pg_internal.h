@@ -8,6 +8,20 @@
 #include "query.h"
 #include "plan.h"
 #include "cs.h"
+#include "storage/relfilenode.h"
+/* Connection-local main-fork residency. Counts are derived from page bits,
+ * never from bytes submitted for cache population. */
+struct pg_sina_cache_entry {
+    RelFileNode node;
+    Oid relid;
+    uint64 blocks,file_total,shared_pages,file_pages;
+    unsigned char *shared_bits,*file_bits;
+    unsigned generation;
+    bool file_known;
+};
+void pg_sina_cache_init(void);
+const struct pg_sina_cache_entry *pg_sina_cache_lookup(RelFileNode);
+void pg_sina_cache_buffer(int buffer);
 extern int pg_sina_exe_path;
 enum pg_sina_path { PG_SINA_HOST, PG_SINA_FILTER, PG_SINA_CSD, PG_SINA_HPCP, PG_SINA_ADAPTIVE };
 const char *pg_sina_path_name(void);

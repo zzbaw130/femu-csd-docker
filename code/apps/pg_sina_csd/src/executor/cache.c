@@ -154,6 +154,7 @@ static void fill_slot(unsigned slot,bool whole_slot)
                 memcpy(BufferGetPage(buffer),page,BLCKSZ); ++receiver.filled;
                 if(pg_sina_profile) receiver.copy_ns+=now_ns()-mark;
             } else ++receiver.cached;
+            pg_sina_cache_buffer(buffer);
             /* These are existing immutable disk bytes: no WAL or dirty mark. */
             UnlockReleaseBuffer(buffer);
             /* Yield only between complete pages, with no buffer pin held.

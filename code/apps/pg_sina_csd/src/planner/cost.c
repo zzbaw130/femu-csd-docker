@@ -21,7 +21,6 @@
 #include "optimizer/paths.h"
 #include "parser/parsetree.h"
 #include "storage/bufmgr.h"
-#include "storage/buf_internals.h"
 #include "storage/fd.h"
 #include "utils/rel.h"
 #include "utils/date.h"
@@ -30,19 +29,11 @@
 #include "utils/spccache.h"
 #include <float.h>
 #include <math.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/syscall.h>
-#include <linux/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 struct host_scan_cost { NodeTag type; Oid index; double rows,before,after,cpu; int workers; };
-struct shared_pages { RelFileNode node; uint64 pages; };
 struct residency {
     Oid oid;
     double bytes,tuples,fraction,shared;
-    HTAB *buffers;
     List *scans;
 };
 struct placement {
@@ -56,105 +47,32 @@ struct placement {
     bool offload,details;
 };
 static double transfer_ms(double bytes,double mbps) { return bytes/(mbps*1000); }
-/* One descriptor pass per planning invocation, including tables and indexes.
- * Like pg_buffercache, each tag/state is consistent; the whole pass is not a
- * globally locked snapshot. No page contents are read or pinned. */
-static HTAB *shared_residency(void)
-{
-    HASHCTL control={.keysize=sizeof(RelFileNode),.entrysize=sizeof(struct shared_pages),
-        .hcxt=pg_sina_search_context()};
-    HTAB *table=hash_create("SQLerate shared buffer residency",128,&control,HASH_ELEM|HASH_BLOBS|HASH_CONTEXT);
-    double begin=pg_sina_planner_clock(); uint64 valid=0;
-    for(int i=0;i<NBuffers;++i) {
-        BufferDesc *buffer=GetBufferDescriptor(i);
-        if((pg_atomic_read_u32(&buffer->state)&(BM_VALID|BM_TAG_VALID))!=(BM_VALID|BM_TAG_VALID)) continue;
-        uint32 state=LockBufHdr(buffer); BufferTag tag=buffer->tag;
-        UnlockBufHdr(buffer,state);
-        if((state&(BM_VALID|BM_TAG_VALID))==(BM_VALID|BM_TAG_VALID) && tag.forkNum==MAIN_FORKNUM) {
-            bool found;
-            struct shared_pages *entry=hash_search(table,&tag.rnode,HASH_ENTER,&found);
-            if(!found) entry->pages=0;
-            ++entry->pages; ++valid;
-        }
-        if(!(i%1024)) CHECK_FOR_INTERRUPTS();
-    }
-    if(pg_sina_planning) ereport(NOTICE,(errmsg("SQLerate shared buffers observation ms=%.3f descriptors=%d valid_main_pages=%llu",
-        pg_sina_planner_clock()-begin,NBuffers,(unsigned long long)valid)));
-    return table;
-}
-/* Observe file-cache residency without reading Heap or sampling pages. Use
- * the kernel summary where supported; retain mincore for older kernels/files.
- * Cache observations only within this planning invocation, never across queries. */
+/* Read the connection snapshot only. Catalog row counts/physical sizes remain
+ * PG planner metadata; descriptor scans and mincore run outside planning. */
 static struct residency *residency(Oid oid,List **observations)
 {
     ListCell *c;
     foreach(c,*observations) { struct residency *r=lfirst(c); if(r->oid==oid) return r; }
-    double mark=pg_sina_planner_clock(),cpu=pg_sina_planner_cpu(),part=mark;
+    double mark=pg_sina_planner_clock(),cpu=pg_sina_planner_cpu();
     struct residency *r=MemoryContextAllocZero(pg_sina_search_context(),sizeof(*r)); r->oid=oid;
-    if(pg_sina_path_search)
-        r->buffers=*observations?((struct residency *)linitial(*observations))->buffers:shared_residency();
     Relation rel=relation_open(oid,AccessShareLock);
     r->bytes=(double)RelationGetNumberOfBlocks(rel)*BLCKSZ;
     r->tuples=Max(1,rel->rd_rel->reltuples);
-    if(r->buffers) {
-        struct shared_pages *entry=hash_search(r->buffers,&rel->rd_node,HASH_FIND,NULL);
-        r->shared=entry && r->bytes?Min(1.0,entry->pages*BLCKSZ/r->bytes):0;
+    const struct pg_sina_cache_entry *entry=pg_sina_cache_lookup(rel->rd_node);
+    if(entry) {
+        r->shared=entry->blocks?Min(1.0,(double)entry->shared_pages/entry->blocks):0;
+        r->fraction=entry->file_known && entry->file_total?Min(1.0,(double)entry->file_pages/entry->file_total):0;
     }
-    char *base=relpathperm(rel->rd_node,MAIN_FORKNUM);
-    if(pg_sina_planning) pg_sina_planning->cache_metadata+=pg_sina_planner_clock()-part;
-    uint64_t hit=0,seen=0;
-    for(uint64 at=0;at<(uint64)r->bytes;) {
-        part=pg_sina_planner_clock();
-        unsigned segment=at/((uint64)RELSEG_SIZE*BLCKSZ);
-        char *path=segment?psprintf("%s.%u",base,segment):base;
-        int fd=OpenTransientFile(path,O_RDONLY|PG_BINARY);
-        if(segment) pfree(path);
-        if(fd<0) break;
-        struct stat st;
-        if(fstat(fd,&st)) { CloseTransientFile(fd); break; }
-        size_t bytes=Min((uint64)st.st_size,(uint64)r->bytes-at);
-        if(!bytes) { CloseTransientFile(fd); break; }
-        size_t pages=(bytes+4095)/4096;
-        if(pg_sina_planning) pg_sina_planning->cache_files+=pg_sina_planner_clock()-part;
-        part=pg_sina_planner_clock();
-#ifdef SYS_cachestat
-        struct cachestat_range range={.off=0,.len=bytes}; struct cachestat stats;
-        if(!syscall(SYS_cachestat,fd,&range,&stats,0)) {
-            hit+=Min(stats.nr_cache,pages); seen+=pages;
-            if(pg_sina_planning) {
-                pg_sina_planning->cache_residency+=pg_sina_planner_clock()-part;
-                pg_sina_planning->cache_pages+=pages; ++pg_sina_planning->cache_stats_calls;
-            }
-            CloseTransientFile(fd); at+=bytes; continue;
-        }
-#endif
-        unsigned char *vector=palloc(pages);
-        void *map=mmap(NULL,bytes,PROT_NONE,MAP_SHARED,fd,0);
-        if(map!=MAP_FAILED) {
-            int status=mincore(map,bytes,vector);
-            if(pg_sina_planning) {
-                pg_sina_planning->cache_residency+=pg_sina_planner_clock()-part;
-                pg_sina_planning->cache_pages+=pages; ++pg_sina_planning->cache_mincore_calls;
-            }
-            part=pg_sina_planner_clock();
-            if(!status) {
-                for(size_t i=0;i<pages;++i) hit+=vector[i]&1;
-                seen+=pages;
-            }
-            if(pg_sina_planning) pg_sina_planning->cache_count+=pg_sina_planner_clock()-part;
-            munmap(map,bytes);
-        }
-        pfree(vector); CloseTransientFile(fd); at+=bytes;
-    }
-    r->fraction=seen?(double)hit/seen:0;
-    if(pg_sina_planning) ereport(NOTICE,(errmsg("SQLerate relation cache relid=%u shared_percent=%.2f file_percent=%.2f pages=%.0f",
-        oid,r->shared*100,r->fraction*100,r->bytes/BLCKSZ)));
-    pfree(base); relation_close(rel,AccessShareLock);
+    if(pg_sina_planning) ereport(NOTICE,(errmsg("SQLerate relation cache relid=%u shared_percent=%.2f file_percent=%.2f pages=%.0f generation=%u",
+        oid,r->shared*100,r->fraction*100,r->bytes/BLCKSZ,entry?entry->generation:0)));
+    relation_close(rel,AccessShareLock);
     MemoryContext previous=MemoryContextSwitchTo(pg_sina_search_context());
     *observations=lappend(*observations,r);
     MemoryContextSwitchTo(previous);
     if(pg_sina_planning) {
-        pg_sina_planning->cache_probe+=pg_sina_planner_clock()-mark;
+        double elapsed=pg_sina_planner_clock()-mark;
+        pg_sina_planning->cache_metadata+=elapsed;
+        pg_sina_planning->cache_probe+=elapsed;
         pg_sina_planning->cache_cpu+=pg_sina_planner_cpu()-cpu;
         ++pg_sina_planning->cache_probes;
     }

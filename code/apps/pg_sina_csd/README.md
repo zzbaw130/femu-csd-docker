@@ -30,7 +30,7 @@ SET pg_sina_csd.dcp = on;
 
 PG 集成保持非侵入式：不修改 PostgreSQL 源码，不替换运行时缓冲函数。DCP直接调用现有 `ReadBufferExtended(RBM_ZERO_AND_LOCK)`，不再先做一遍独立的缓冲哈希查找；已有页在PG原生pin和页锁保护下识别并跳过，不覆盖其内容。PG内部查找计入profile的 `allocate_ms`，`lookup_ms=0` 表示扩展的额外查找已删除。该接口的清零和首次物理页触碰仍保留，不能据此宣称消除了主要分配成本。
 
-依赖更新后的 SNIA FEMU 插件及 [femu-cache 接收模块](../femu-cache/README.md)。仅检查开关隔离、原生PG读取导入页和取消恢复，可在Guest运行 `sh /home/femu/tests/database-cache-test.sh`，使用正式Q6。缓存统计仍在规划时真实观测；本轮没有引入仅按填充量累加的驻留账本。
+依赖更新后的 SNIA FEMU 插件及 [femu-cache 接收模块](../femu-cache/README.md)。仅检查开关隔离、原生PG读取导入页和取消恢复，可在Guest运行 `sh /home/femu/tests/database-cache-test.sh`，使用正式Q6。缓存驻留使用连接级页面位图，初始化及顶层ExecutorEnd刷新；规划阶段只读取记录。详见下文及doc/planning.md。
 
 两种强制完整卸载模式保留 PG 选定的连接顺序。SQLerate 在 PG 枚举合法连接组合时加入设备子树，因此设备成本能影响连接顺序，HOST 上层也能根据设备输入重新选择算法；仍受 PG 的合法性、路径剪枝和 GEQO 范围限制。
 
@@ -189,9 +189,13 @@ PG_SINA_CACHE=warm sh /home/femu/tests/tpch-test.sh
 
 需要继续定位时，同一开关还输出 `SQLerate planner breakdown` 和 `SQLerate cache observation`。前者拆开设备打开、属性读取、探测 CSF 的下载/执行/卸载、候选复制/裁列/描述、估价及保留；`native_core/adaptive_core` 从两次 PG 规划墙钟中扣除已计时的扩展工作，`hook_other` 是扩展 hook 的其余工作。`cpu_ms` 使用当前 backend 线程 CPU 时钟，区别于包含等待的墙钟。设备打开的 `open_major_faults` 用于识别首次加载插件的磁盘缺页；资源细项已包含在 `resources_inclusive`，不能重复相加。
 
-`cache_probe` 是本次规划内首次观测各关系/索引页缓存驻留的累计墙钟；同一 OID 后续访问复用该观测。缓存 NOTICE 中 `metadata/files/residency/count` 分别表示关系元数据、打开文件与 fstat、内核驻留查询、回退路径统计驻留位的时间，另有少量释放/关闭等余项；`pages` 是覆盖的 4KiB 页数，不是读取的数据量。它们已包含在 `cache_probe`，后者又分布在 HOST 修正及设备估价等阶段，均不能叠加到总规划时间。设备初始化已移到连接加载阶段，查询期间资源细项应为零。
+`cache_probe`现在是本次规划读取驻留记录及PG关系元数据的时间。同一OID在规划内复用结果；`files/residency/count/pages/cachestat_calls/mincore_calls`在规划阶段应为零，PG普通统计和文件大小元数据仍正常读取。`SQLerate cache ledger refresh`另外报告连接初始化和ExecutorEnd的快照构建时间，不与规划时间混为一谈。ExecutorEnd刷新仍计入SQL端到端时间。
 
-缓存观测优先使用 Linux [`cachestat`](https://www.man7.org/linux/man-pages/man2/cachestat.2.html) 的文件范围汇总计数，不采样、不读取表；头文件或运行内核不支持、文件查询失败时保留 `mmap(PROT_NONE)+mincore` 回退。`cachestat_calls/mincore_calls` 标明实际路径。每次规划仍重新观测，保留HPCP填充及缓存驱逐后的反馈；热缓存较多时内核汇总也有遍历开销，不能把冷缓存下的亚毫秒耗时推广到所有状态。
+连接初始化按物理RelFileNode建立普通用户表及索引main fork的两张位图：shared_buffers按8KiB块，文件缓存按Guest系统页（当前4KiB）。共享页位来自有效BufferTag，文件位来自`mmap(PROT_NONE)+mincore`，不读入缺失页；cachestat只有数量，不能用来恢复页面身份。规划器使用位图派生的去重页数。DCP每次导入后根据buffer_id的旧BufferTag清除旧页位，再置新页位，不能只累计新页。
+
+顶层ExecutorEnd在设备接收和执行器清理后刷新全部记录，也捕获HOST读取造成的装入、淘汰和HPCP发布。内部SPI及parallel worker不重复刷新。记录限于本连接，上一次完成的快照不跟踪其他连接和Linux独立回收；查询异常中止后标为无效，下一次成功语句结束重建，失效期间规划按未知缓存保守估价。不新增后台进程、跨连接共享框架，也不修改PG源码。
+
+仅正式Q6的位图核验：在Guest执行`sh /home/femu/tests/cache-residency-test.sh`。它在2GiB及临时64MiB的PG缓冲中逐页对比真实驻留，验证DCP替换旧页及HOST/HPCP后的刷新，结束后恢复PG默认配置。设备workmem不变，不把64MiB PG替换场景当作正常性能测量。
 
 `schema_reads/schema_reuses` 记录规划内表列布局读取和复用次数。只缓存关系锁保护的列定义与文件节点，每个候选仍复制自己的列槽和限制信息；行数、谓词、物理选择和缓存比例按原流程计算。候选标记只借用输出列描述，实际交付给PG的输出表达式在选中后构造，预览标记在setrefs前移除；不改变PG和设备候选的搜索范围。
 

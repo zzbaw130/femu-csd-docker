@@ -463,7 +463,7 @@ PG两项CTest、规划路径回归`results/planner-paths.yZHj17/`及SNIA的`csDi
 
 成本候选不再提前翻译、复制交付PG的输出表达式；全局选中后才构造setrefs所需输出。仅供预览的包装在setrefs前移除，借用其私有子树已有targetlist。保留完整准备副本以隔离裁列/物理改写，不改变算法选择、参数处理和搜索空间。
 
-缓存观测首选Linux cachestat，向内核查询完整文件范围的驻留页数，不采样、不读取Heap；不支持时保留mincore回退。观测仍每次规划重做，能反映HPCP和驱逐变化。内核汇总不意味着全热文件也是常数开销。接口参考：[Linux cachestat](https://www.man7.org/linux/man-pages/man2/cachestat.2.html)。
+当前缓存驻留观测已移到连接初始化与ExecutorEnd，规划只读取页面位图记录，具体生命周期和最新Q6验证见后文“页面驻留记录表”。下表为此前属性分析优化的测量记录。
 
 相同RelWithDebInfo构建、4CU/256MiB workmem/64MiB FDM及前述PG参数。最终版本与47c55c764交替测试正式Q2/Q9，每版本每查询四次独立冷启动EXPLAIN；以下为算术平均，均为规划阶段ms：
 
@@ -547,11 +547,11 @@ SQLerate规划中位数逐查询合计由冷676.504ms升到热995.211ms，其中
 
 ## shared_buffers感知与热缓存候选估价修正
 
-每次SQLerate规划只遍历一次PG缓冲描述符，按RelFileNode统计有效MAIN页，区分表和索引；复用本次规划内的结果，不跨查询保存。每个描述符在短暂头锁内读取tag/state，不读页内容、不pin、不加载缺失页。与pg_buffercache相同，这是各项自洽的观测，不是全局锁定的瞬时快照。内部sina_csd元数据及临时表不触发整池观测。现有profile新增整池观测耗时/数量及逐关系shared/file驻留比例；没有新增GUC、进程或缓存填充机制。
+shared_buffers驻留来自连接初始化及ExecutorEnd的缓冲描述符快照，按RelFileNode和MAIN块编号保存位图，规划不再遍历整池。每个描述符在短暂头锁内读取tag/state，不读页内容、不pin、不加载缺失页；与pg_buffercache相同，各项自洽但不锁定整个缓存池。当前实验不考虑其他连接和Linux独立回收。详见后文位图的增量维护和刷新记录。
 
 HOST扫描估价保留PG的CPU、表达式、目标列及索引查找成本，只替换I/O部分。顺序扫描直接采用PG的页数和tablespace页价格；B-tree在私有IndexPath上复用PG12 cost_index，以临时置零的backend私有默认页价格取得CPU底价，异常时也恢复原价格。原Path中的I/O包含PG对相关性、重复探测及index-only可见性的估计，分别按Heap和索引驻留修正；参数化索引路径也参与，不再用输出行数反推读取字节。显式tablespace页价格仍留在底价中，属于保守项；其他索引AM/Bitmap暂保留PG成本，不宣称已精确建模。
 
-设shared_buffers及文件页缓存驻留比例为s、f。HOST扫描成本为`PG_CPU + PG_IO*(1-max(s,f)) + 文件页到PG缓冲的复制成本*max(f-s,0)`，对Heap/索引分别计算。没有逐页交集信息时以max而非相加作为保守并集，避免重复扣除I/O；shared命中不再收取内核复制，元组解码/过滤/索引下降等CPU工作仍保留。原生HOST候选通过选中扫描的原始Path记录取得同一修正，保持其物理计划不变；共享搜索在PG比较路径前更新扫描及索引自身成本。
+设shared_buffers及文件页缓存驻留比例为s、f。HOST扫描成本为`PG_CPU + PG_IO*(1-max(s,f)) + 文件页到PG缓冲的复制成本*max(f-s,0)`，对Heap/索引分别计算。当前估价仍以max而非相加作为保守并集，避免重复扣除I/O；本轮位图改动没有另改并集成本公式；shared命中不再收取内核复制，元组解码/过滤/索引下降等CPU工作仍保留。原生HOST候选通过选中扫描的原始Path记录取得同一修正，保持其物理计划不变；共享搜索在PG比较路径前更新扫描及索引自身成本。
 
 Q8还存在HOST并行度估价不一致：共享树内部扫描/Parallel Hash子树按4个worker估价，最终Gather仅2个。比较最终候选时，按PG包含leader参与的divisor补计这些局部CPU工作，保留I/O及私有输入，不在父节点重复收取整个子树。Q20已有分组键成员过滤下推，但此前估价仍沿用完整聚合规模；现用PG原成员连接行数与原聚合行数的比例更新过滤输入、分组数及中间投影，并补齐IN集合行数。只传播估计，不改变谓词/SQL或新增执行算法；参考本地DuckDB按分组键向聚合前下推过滤的规则，避免把聚合后条件错当成可下推条件。
 
@@ -618,12 +618,33 @@ DCP累计处理437.307ms，其中缓冲映射查询14.667ms、分配/清零357.1
 
 15次正式计时结果均正确，DCP-only文件缓存为0、无脏页/无效页；两项PG CTest及仅Q6的四开关/取消恢复通过。另在已有缓存页下连续两次执行正式Q6，确认cached_pages非零、结果一致且无脏页；该项只做功能验证，不作为冷启动性能样本。完整记录见`results/dcp-page-import.UTy4OI/`，没有运行全量TPC-H。
 
-### 页面驻留记录表建议（本轮仅设计）
+### 页面驻留记录表
 
-记录的是页面集合，不是累计传输量。在本实验暂不考虑其他连接和Linux外部回收的约束下，推荐按关系物理标识RelFileNode（表空间/数据库/文件编号）及fork组织记录；范围与当前规划观测一致，覆盖映射的基表和索引main fork。记录文件长度，文件重建或重新映射时重建对应位图。
+实现位于`src/cache_residency.c`，是连接级MemoryContext中的记录，不是累计填充计数。每个普通永久用户表/索引的main fork按RelFileNode（表空间、数据库、物理文件编号）保存两张位图：PG以8KiB块编号，文件缓存以Guest实际系统页大小编号（当前4KiB）。1GiB数据约需48KiB位图；置位、清位同步维护去重页数，供规划O(1)读取。物理文件节点及长度随刷新重新枚举，不混用重建前的页面身份。
 
-每个关系维护两张位图：数据库缓存按PG的8KiB块编号置位；文件页缓存按Guest实际系统页大小置位（当前4KiB），与mincore和Linux页缓存粒度一致。1GiB关系两张位图合计48KiB，计数由位图的置位/清位或popcount得到。PG扫描shared_buffers描述符，以BM_VALID/BM_TAG_VALID、BufferTag中的文件标识和blockNum恢复数据库位图；文件位图通过mincore获取，cachestat只有总量，不能恢复页面身份。将两类缓存分别保留，可准确区分shared命中、仅文件命中和两者均缺失，避免重复相加。
+使用`session_preload_libraries=pg_sina_csd`时，库加载会在连接初始化建立快照。目录读取安排在有效事务与活动快照内；初始化不借助辅助进程。共享缓冲快照读取有效BufferTag，文件快照用PROT_NONE映射和mincore，不触发表数据读取。为记录页面身份不再使用只有汇总数量的cachestat。规划器保留PG行数及大小元数据读取，但只查记录，不扫描描述符、不为驻留检测打开/mmap文件、不调用mincore/cachestat。
 
-最简单的首版是连接初始化在具有事务和目录访问条件后取得快照；每条顶层语句完成标准ExecutorEnd及扩展DCP清理后，在ExecutorEnd_hook中清空并重建位图。HOST读取导致哪张表装入或淘汰，都由这一次全量刷新体现，不能只重扫该SQL引用的表。忽略内部SPI和parallel worker，外层leader只刷新一次。规划器直接读取已完成的快照及派生计数。这样不必先新增后台线程回调协议，也不依赖跨连接共享状态；记录表可保存在连接级MemoryContext。取消或ERROR后将快照标为失效，下次使用前重建。快照只代表上次刷新时刻，完整扫描成本被移到语句结束，仍须计入端到端时间。
+ExecutorStart/Run/Finish的嵌套深度仅用于识别外层ExecutorEnd，排除内部SPI、重复观测及parallel worker。顶层执行器先正常清理（包括DCP接收），之后刷新全部用户关系的两层位图，捕获HOST装入/淘汰和HPCP发布；只刷新该SQL引用的表会漏掉别的表被淘汰，因此不这样做。新快照完整构建后替换旧快照，元数据读取可能引起的缓冲替换也包含在最后的描述符扫描中。
 
-如需要纯CSD语句只做增量维护，DCP导入时既要置新页bit，也要清被替换的旧页bit：还需按buffer_id保存上一次的BufferTag，缓冲复用后从旧关系位图删除该块。仅新增页置位仍会高估驻留。HPCP只能根据文件页实际发布成功的范围置位，DMA完成本身不等于页缓存已填充；当前发布接口不返回逐页结果，首版继续使用语句结束后的全量刷新即可。后续增量维护仍限于扩展和现有接口，不修改PG源码。当前规划器仍执行真实观测，尚未接入记录表。
+DCP导入后立即按buffer_id维护增量：反向表保存该缓冲上次观察到的BufferTag，复用时先清除旧关系/旧块的bit，再设置新页bit。每个buffer_id只指向一页，重复命中不会重复计数。2GiB shared_buffers配置下反向表约5MiB，刷新时新旧快照短暂共存。后台SNIA线程不调用PG、不写这份记录；HPCP和HOST变化由ExecutorEnd全量观测。异常中止使快照失效，之后的规划不把旧位图当作真实缓存，而是保守按未知处理，下一次成功ExecutorEnd重建。没有修改PG源码或引入跨连接同步框架。
+
+#### Q6准确性验证
+
+`tests/guest/cache-residency-test.sh`只执行正式Q6，配合`tests/cache_residency.c`在同一语句结束边界用独立描述符扫描及mincore逐页比较两张位图，不先刷新再把修正后的计数冒充DCP增量正确。常规PG shared_buffers=2GiB下DCP/HPCP及随后HOST执行的逐位差异均为零。
+
+另临时使用64MiB PG shared_buffers强制替换，设备仍为4CU、256MiB workmem、64MiB FDM。Q6 DCP产生53,623次缓冲映射更新，其中45,431次清除旧页。全量刷新前的8,192个共享页逐位一致；全量快照枚举元数据自身又淘汰17页，记录随最终扫描更新为8,175页，逐位仍一致。之后HOST执行的两层记录也一致，再次规划SQLerate时确实读取generation=4：2GiB下shared/file为27.90%/72.92%，64MiB下为7.21%/93.13%。这只验证替换正确性，测试后已恢复2GiB，不是设备低内存/spill压力或正常性能样本。
+
+四种缓存开关及取消恢复的原有Q6回归也通过，两项PG CTest通过。测试源码没有修改PG。没有运行其他TPC-H查询或全量基准。
+
+#### Q6规划时间
+
+正式Q6在修改前后各三轮独立冷启动，SQLerate模式，HPCP关闭；常规4CU/256MiB workmem/64MiB FDM、PG shared_buffers=2GiB/work_mem=16MiB/max_parallel_workers_per_gather=4。连接初始化不计入SQL计时，ExecutorEnd计入。执行路径前后均为完整CSD的SniaCsdPlan。下表为中位数ms，缓存读取时间包含在规划内，不可重复相加。
+
+| 条件 | 规划前→后 | 规划内驻留读取前→后 | 新版ExecutorEnd刷新 | 新版连接初始化观测 | SQL总时间前→后 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 无DCP | 26.727→4.171 | 6.439→0.051 | 22.985 | 131.062 | 388.146→409.260 |
+| DCP | 15.850→4.098 | 5.606→0.046 | 24.461 | 83.047 | 422.578→441.987 |
+
+规划中的驻留系统查询均为零，且所有查询使用初始化的generation=1记录，结束后才发布generation=2，证明未在planner或内部SPI中重做观测。规划时间降低还包含初始化已准备关系元数据的收益，不能把全部变化都归因于去掉6ms扫描。
+
+全量刷新成本转移后仍存在：记录覆盖24个用户关系/索引，比旧Q6规划只观察lineitem范围更多，profile记录输出也包含在刷新计时内。此轮端到端总时间略增，不能将较低规划时间宣称为整条SQL更快。15份正式计时结果一致，驻留逐页核对与取消恢复记录、原始样本、部署库及统计见`results/cache-ledger.Cv8mBS/`。

@@ -1,0 +1,230 @@
+/* Page identities live for one connection. Only the backend touches this
+ * snapshot: initialize before planning; refresh after the outer executor ends. */
+#include "pg_internal.h"
+#include "access/parallel.h"
+#include "access/relation.h"
+#include "access/xact.h"
+#include "executor/executor.h"
+#include "executor/spi.h"
+#include "miscadmin.h"
+#include "storage/bufmgr.h"
+#include "storage/buf_internals.h"
+#include "storage/fd.h"
+#include "utils/hsearch.h"
+#include "utils/memutils.h"
+#include "utils/rel.h"
+#include "utils/snapmgr.h"
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+static struct {
+    MemoryContext context;
+    HTAB *entries;
+    BufferTag *tags; /* buffer_id -> last observed page, including other forks */
+    unsigned generation;
+    bool valid;
+} snapshot;
+static unsigned depth;
+static bool refreshing;
+static long os_page;
+static uint64 dcp_updates,dcp_evictions;
+static ExecutorStart_hook_type previous_start;
+static ExecutorRun_hook_type previous_run;
+static ExecutorFinish_hook_type previous_finish;
+static ExecutorEnd_hook_type previous_end;
+
+static bool bit_change(unsigned char *bits,uint64 bit,bool set,uint64 *count)
+{
+    unsigned char mask=1U<<(bit%8);
+    bool present=(bits[bit/8]&mask)!=0;
+    if(present==set) return false;
+    if(set) { bits[bit/8]|=mask; ++*count; }
+    else { bits[bit/8]&=~mask; --*count; }
+    return true;
+}
+const struct pg_sina_cache_entry *pg_sina_cache_lookup(RelFileNode node)
+{
+    return snapshot.valid?hash_search(snapshot.entries,&node,HASH_FIND,NULL):NULL;
+}
+void pg_sina_cache_buffer(int buffer)
+{
+    if(!snapshot.valid || buffer<=0) return;
+    BufferTag tag,old=snapshot.tags[buffer-1];
+    BufferGetTag(buffer,&tag.rnode,&tag.forkNum,&tag.blockNum);
+    if(BUFFERTAGS_EQUAL(old,tag)) return;
+    struct pg_sina_cache_entry *before=hash_search(snapshot.entries,&old.rnode,HASH_FIND,NULL);
+    if(before && old.forkNum==MAIN_FORKNUM && old.blockNum<before->blocks)
+        if(bit_change(before->shared_bits,old.blockNum,false,&before->shared_pages)) ++dcp_evictions;
+    struct pg_sina_cache_entry *after=RelFileNodeEquals(old.rnode,tag.rnode)?before:
+        hash_search(snapshot.entries,&tag.rnode,HASH_FIND,NULL);
+    if(after && tag.forkNum==MAIN_FORKNUM && tag.blockNum<after->blocks)
+        bit_change(after->shared_bits,tag.blockNum,true,&after->shared_pages);
+    snapshot.tags[buffer-1]=tag; ++dcp_updates;
+}
+static void file_pages(struct pg_sina_cache_entry *entry)
+{
+    char *base=relpathperm(entry->node,MAIN_FORKNUM);
+    uint64 total=entry->blocks*BLCKSZ,segment_bytes=(uint64)RELSEG_SIZE*BLCKSZ;
+    entry->file_known=true;
+    for(uint64 at=0;at<total;) {
+        unsigned segment=at/segment_bytes;
+        char *path=segment?psprintf("%s.%u",base,segment):base;
+        int fd=OpenTransientFile(path,O_RDONLY|PG_BINARY);
+        if(segment) pfree(path);
+        if(fd<0) { entry->file_known=false; break; }
+        size_t bytes=Min(total-at,segment_bytes),pages=(bytes+os_page-1)/os_page;
+        unsigned char *vector=palloc(pages);
+        void *map=mmap(NULL,bytes,PROT_NONE,MAP_SHARED,fd,0);
+        if(map==MAP_FAILED) entry->file_known=false;
+        else {
+            if(mincore(map,bytes,vector)) entry->file_known=false;
+            else for(size_t i=0;i<pages;++i)
+                if(vector[i]&1) bit_change(entry->file_bits,at/os_page+i,true,&entry->file_pages);
+            munmap(map,bytes);
+        }
+        pfree(vector); CloseTransientFile(fd); at+=bytes;
+    }
+    pfree(base);
+}
+static HTAB *build_snapshot(MemoryContext context,BufferTag *tags,unsigned generation)
+{
+    HASHCTL control={.keysize=sizeof(RelFileNode),.entrysize=sizeof(struct pg_sina_cache_entry),.hcxt=context};
+    HTAB *entries=hash_create("SQLerate cache page bitmaps",128,&control,HASH_ELEM|HASH_BLOBS|HASH_CONTEXT);
+    if(SPI_connect()!=SPI_OK_CONNECT) elog(ERROR,"cannot enumerate cache relations");
+    int status=SPI_execute("SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "WHERE c.relkind IN ('r','i','m') AND c.relpersistence='p' "
+        "AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' ORDER BY c.oid",true,0);
+    if(status!=SPI_OK_SELECT) elog(ERROR,"cannot enumerate cache relations");
+    for(uint64 i=0;i<SPI_processed;++i) {
+        bool isnull; Oid oid=DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i],SPI_tuptable->tupdesc,1,&isnull));
+        Relation rel=relation_open(oid,AccessShareLock);
+        struct pg_sina_cache_entry *entry=hash_search(entries,&rel->rd_node,HASH_ENTER,NULL);
+        *entry=(struct pg_sina_cache_entry){.node=rel->rd_node,.relid=oid,
+            .blocks=RelationGetNumberOfBlocks(rel),.generation=generation};
+        entry->file_total=(entry->blocks*BLCKSZ+os_page-1)/os_page;
+        entry->shared_bits=MemoryContextAllocZero(context,Max((entry->blocks+7)/8,1));
+        entry->file_bits=MemoryContextAllocZero(context,Max((entry->file_total+7)/8,1));
+        relation_close(rel,AccessShareLock);
+    }
+    SPI_finish();
+    HASH_SEQ_STATUS scan; hash_seq_init(&scan,entries);
+    struct pg_sina_cache_entry *entry;
+    while((entry=hash_seq_search(&scan))) file_pages(entry);
+    /* Metadata access above may itself replace buffers. Observe descriptors
+     * last so the published snapshot includes those replacements too. */
+    for(int i=0;i<NBuffers;++i) {
+        BufferDesc *buffer=GetBufferDescriptor(i);
+        if((pg_atomic_read_u32(&buffer->state)&(BM_VALID|BM_TAG_VALID))!=(BM_VALID|BM_TAG_VALID)) continue;
+        uint32 state=LockBufHdr(buffer); BufferTag tag=buffer->tag;
+        UnlockBufHdr(buffer,state);
+        if((state&(BM_VALID|BM_TAG_VALID))==(BM_VALID|BM_TAG_VALID)) {
+            tags[i]=tag;
+            entry=hash_search(entries,&tag.rnode,HASH_FIND,NULL);
+            if(entry && tag.forkNum==MAIN_FORKNUM && tag.blockNum<entry->blocks)
+                bit_change(entry->shared_bits,tag.blockNum,true,&entry->shared_pages);
+        }
+        if(!(i%1024)) CHECK_FOR_INTERRUPTS();
+    }
+    return entries;
+}
+static uint64 differences(const unsigned char *a,uint64 na,const unsigned char *b,uint64 nb)
+{
+    uint64 changed=0;
+    for(uint64 i=0;i<Max((na+7)/8,(nb+7)/8);++i)
+        changed+=__builtin_popcount((i<(na+7)/8?a[i]:0)^(i<(nb+7)/8?b[i]:0));
+    return changed;
+}
+static void refresh(const char *reason)
+{
+    instr_time begin,end; INSTR_TIME_SET_CURRENT(begin);
+    MemoryContext context=AllocSetContextCreate(TopMemoryContext,"SQLerate cache residency",ALLOCSET_DEFAULT_SIZES);
+    MemoryContext previous=CurrentMemoryContext;
+    BufferTag *tags=MemoryContextAllocZero(context,(Size)NBuffers*sizeof(BufferTag));
+    HTAB *volatile entries=NULL;
+    bool compiling=pg_sina_compiling_plan;
+    bool own_snapshot=!ActiveSnapshotSet();
+    refreshing=true; pg_sina_compiling_plan=true;
+    PG_TRY();
+    {
+        if(own_snapshot) PushActiveSnapshot(GetTransactionSnapshot());
+        entries=build_snapshot(context,tags,snapshot.generation+1);
+        if(own_snapshot) PopActiveSnapshot();
+    }
+    PG_CATCH();
+    {
+        MemoryContextSwitchTo(previous); MemoryContextDelete(context);
+        refreshing=false; pg_sina_compiling_plan=compiling; snapshot.valid=false; PG_RE_THROW();
+    }
+    PG_END_TRY();
+    pg_sina_compiling_plan=compiling; refreshing=false;
+    if(pg_sina_profile) {
+        HASH_SEQ_STATUS scan; hash_seq_init(&scan,(HTAB *)entries);
+        struct pg_sina_cache_entry *entry;
+        while((entry=hash_seq_search(&scan))) {
+            const struct pg_sina_cache_entry *old=snapshot.entries?hash_search(snapshot.entries,&entry->node,HASH_FIND,NULL):NULL;
+            uint64 delta=old?differences(old->shared_bits,old->blocks,entry->shared_bits,entry->blocks):entry->shared_pages;
+            ereport(NOTICE,(errmsg("SQLerate cache ledger relation generation=%u relid=%u blocks=%llu shared_pages=%llu file_pages=%llu file_total=%llu file_known=%d shared_delta_pages=%llu",
+                entry->generation,entry->relid,(unsigned long long)entry->blocks,(unsigned long long)entry->shared_pages,
+                (unsigned long long)entry->file_pages,(unsigned long long)entry->file_total,entry->file_known,(unsigned long long)delta)));
+        }
+    }
+    if(snapshot.context) MemoryContextDelete(snapshot.context);
+    snapshot.context=context; snapshot.entries=(HTAB *)entries; snapshot.tags=tags;
+    snapshot.valid=true; ++snapshot.generation;
+    INSTR_TIME_SET_CURRENT(end); INSTR_TIME_SUBTRACT(end,begin);
+    if(pg_sina_profile) ereport(NOTICE,(errmsg("SQLerate cache ledger refresh reason=%s generation=%u wall_ms=%.3f relations=%ld dcp_updates=%llu dcp_evictions=%llu",
+        reason,snapshot.generation,INSTR_TIME_GET_MILLISEC(end),hash_get_num_entries(snapshot.entries),
+        (unsigned long long)dcp_updates,(unsigned long long)dcp_evictions)));
+    dcp_updates=dcp_evictions=0;
+}
+static void start(QueryDesc *query,int flags)
+{
+    ++depth;
+    PG_TRY(); { if(previous_start) previous_start(query,flags); else standard_ExecutorStart(query,flags); }
+    PG_CATCH(); { --depth; PG_RE_THROW(); } PG_END_TRY();
+    --depth;
+}
+static void run(QueryDesc *query,ScanDirection direction,uint64 count,bool once)
+{
+    ++depth;
+    PG_TRY(); { if(previous_run) previous_run(query,direction,count,once); else standard_ExecutorRun(query,direction,count,once); }
+    PG_CATCH(); { --depth; PG_RE_THROW(); } PG_END_TRY();
+    --depth;
+}
+static void finish(QueryDesc *query)
+{
+    ++depth;
+    PG_TRY(); { if(previous_finish) previous_finish(query); else standard_ExecutorFinish(query); }
+    PG_CATCH(); { --depth; PG_RE_THROW(); } PG_END_TRY();
+    --depth;
+}
+static void end(QueryDesc *query)
+{
+    bool outer=!depth && !refreshing && !pg_sina_compiling_plan && !IsParallelWorker();
+    ++depth;
+    PG_TRY(); { if(previous_end) previous_end(query); else standard_ExecutorEnd(query); }
+    PG_CATCH(); { --depth; PG_RE_THROW(); } PG_END_TRY();
+    --depth;
+    if(outer) refresh("executor_end");
+}
+static void transaction_end(XactEvent event,void *arg)
+{
+    if(event==XACT_EVENT_ABORT || event==XACT_EVENT_PARALLEL_ABORT) snapshot.valid=false;
+}
+void pg_sina_cache_init(void)
+{
+    os_page=sysconf(_SC_PAGESIZE);
+    bool own_transaction=!IsTransactionState();
+    if(own_transaction) StartTransactionCommand();
+    bool own_snapshot=!ActiveSnapshotSet();
+    if(own_snapshot) PushActiveSnapshot(GetTransactionSnapshot());
+    refresh("connection_init");
+    if(own_snapshot) PopActiveSnapshot();
+    if(own_transaction) CommitTransactionCommand();
+    RegisterXactCallback(transaction_end,NULL);
+    previous_start=ExecutorStart_hook; ExecutorStart_hook=start;
+    previous_run=ExecutorRun_hook; ExecutorRun_hook=run;
+    previous_finish=ExecutorFinish_hook; ExecutorFinish_hook=finish;
+    previous_end=ExecutorEnd_hook; ExecutorEnd_hook=end;
+}
