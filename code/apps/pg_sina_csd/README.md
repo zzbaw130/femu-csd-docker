@@ -167,7 +167,11 @@ TPCH_MODES=host-only sh /home/femu/tests/tpch-test.sh
 
 需要继续定位时，同一开关还输出 `SQLerate planner breakdown` 和 `SQLerate cache observation`。前者拆开设备打开、属性读取、探测 CSF 的下载/执行/卸载、候选复制/裁列/描述、估价及保留；`native_core/adaptive_core` 从两次 PG 规划墙钟中扣除已计时的扩展工作，`hook_other` 是扩展 hook 的其余工作。`cpu_ms` 使用当前 backend 线程 CPU 时钟，区别于包含等待的墙钟。设备打开的 `open_major_faults` 用于识别首次加载插件的磁盘缺页；资源细项已包含在 `resources_inclusive`，不能重复相加。
 
-`cache_probe` 是本次规划内首次观测各关系/索引页缓存驻留的累计墙钟；同一 OID 后续访问复用该观测。缓存 NOTICE 中 `metadata/files/residency/count` 分别表示关系元数据、打开文件与 fstat、mmap/mincore、统计返回驻留位的时间，另有少量释放/关闭等余项；`pages` 是检查的 4KiB 页数，不是读取的数据量。它们已包含在 `cache_probe`，后者又分布在 HOST 修正及设备估价等阶段，均不能叠加到总规划时间。设备初始化已移到连接加载阶段，查询期间资源细项应为零。
+`cache_probe` 是本次规划内首次观测各关系/索引页缓存驻留的累计墙钟；同一 OID 后续访问复用该观测。缓存 NOTICE 中 `metadata/files/residency/count` 分别表示关系元数据、打开文件与 fstat、内核驻留查询、回退路径统计驻留位的时间，另有少量释放/关闭等余项；`pages` 是覆盖的 4KiB 页数，不是读取的数据量。它们已包含在 `cache_probe`，后者又分布在 HOST 修正及设备估价等阶段，均不能叠加到总规划时间。设备初始化已移到连接加载阶段，查询期间资源细项应为零。
+
+缓存观测优先使用 Linux [`cachestat`](https://www.man7.org/linux/man-pages/man2/cachestat.2.html) 的文件范围汇总计数，不采样、不读取表；头文件或运行内核不支持、文件查询失败时保留 `mmap(PROT_NONE)+mincore` 回退。`cachestat_calls/mincore_calls` 标明实际路径。每次规划仍重新观测，保留HPCP填充及缓存驱逐后的反馈；热缓存较多时内核汇总也有遍历开销，不能把冷缓存下的亚毫秒耗时推广到所有状态。
+
+`schema_reads/schema_reuses` 记录规划内表列布局读取和复用次数。只缓存关系锁保护的列定义与文件节点，每个候选仍复制自己的列槽和限制信息；行数、谓词、物理选择和缓存比例按原流程计算。候选标记只借用输出列描述，实际交付给PG的输出表达式在选中后构造，预览标记在setrefs前移除；不改变PG和设备候选的搜索范围。
 
 通用树的 profile 同时记录 PG 调度线程的墙钟：`CSD Host Completion Copy` 是请求完成后同步读取 AFDM 控制记录及结果头的时间，`CSD Host Submit` 是 PG 主线程准备和提交请求的时间，不包含 callback 续交。其中 `Queue`、`Control Write` 及已有的 `LOAD Preparation` 均包含在 Submit 中，不能再次相加。`Poll` 是检查完成标志的时间，`Idle Sleep` 是没有可推进任务时的休眠时间。`Pending Requests Sum` 累计各请求提交到 callback 的时间，最终返回 PG 的请求还包含完成观察等待；跨并发请求求和，不是查询延迟或纯 I/O 时间。Host Submissions/Completions 只计 PG 提交和观察的次数，Callback Submissions 另计自动续交次数。关闭 profile 时不采集这些计时。
 

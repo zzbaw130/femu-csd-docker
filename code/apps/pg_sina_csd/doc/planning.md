@@ -456,3 +456,26 @@ CSF代码与每查询生成的设备执行记录不是同一对象。前者连�
 PG两项CTest、规划路径回归`results/planner-paths.yZHj17/`及SNIA的`csDiscoveryIdentify`通过，未运行低于64MiB的压力场景。新`tests/guest/connection-lifecycle-test.sh`验证一次连接初始化、两轮正式Q2/Q9、取消后重跑与HOST输出一致；最终记录为`results/connection-lifecycle.2Mp6Qh/`。单连接下载CSF计数为14，激活/退出停用合计28，无逐查询重复加载。额外开发排序验证使用64MiB预算，同连接连续两次spill读写各33MiB成功，临时SQL已删除，不作为TPC-H验收。
 
 最终正式Q2/Q9在HOST、CSD无HPCP、SQLerate和filter-only共8次冷启动执行均正确，见`results/tpch.OaANdF/`；Q1/Q6融合路径另有三模式正确性对照和最终清理复核。未跑全量。原始前后计时、CSV/JSON及报告见`results/planner-connection.FgBQhq/`。
+
+## 候选属性与缓存观测的进一步优化
+
+本轮仅修改Guest规划层，不改SNIA、固件或设备SQL算子。参照本地DuckDB的列绑定解析与裁列实现，先快速排除不同NodeTag/Var绑定，再由PG equal检查完整类型、collation等字段。函数身份检查改为一次pg_proc syscache访问，不再反复分配函数名。关系锁保护的列布局和文件节点在一次规划内复用，候选自己的列槽/谓词限制仍独立；不跨查询缓存统计或布局。
+
+成本候选不再提前翻译、复制交付PG的输出表达式；全局选中后才构造setrefs所需输出。仅供预览的包装在setrefs前移除，借用其私有子树已有targetlist。保留完整准备副本以隔离裁列/物理改写，不改变算法选择、参数处理和搜索空间。
+
+缓存观测首选Linux cachestat，向内核查询完整文件范围的驻留页数，不采样、不读取Heap；不支持时保留mincore回退。观测仍每次规划重做，能反映HPCP和驱逐变化。内核汇总不意味着全热文件也是常数开销。接口参考：[Linux cachestat](https://www.man7.org/linux/man-pages/man2/cachestat.2.html)。
+
+相同RelWithDebInfo构建、4CU/256MiB workmem/64MiB FDM及前述PG参数。最终版本与47c55c764交替测试正式Q2/Q9，每版本每查询四次独立冷启动EXPLAIN；以下为算术平均，均为规划阶段ms：
+
+| 查询 | 规划前→后 | 规划CPU前→后 | 属性分析前→后 | 缓存观测前→后 |
+| --- | ---: | ---: | ---: | ---: |
+| Q2 | 61.932→55.863 | 52.735→49.532 | 29.743→25.642 | 2.319→0.275 |
+| Q9 | 68.023→51.227 | 59.983→44.428 | 22.108→19.025 | 13.892→0.299 |
+
+总规划下降约9.8%/24.7%，CPU下降约6.1%/25.9%。属性下降包含冷映射检查波动；扣除mapping_ms后，属性分析约24.046→22.517ms、18.419→16.615ms，不将全部墙钟下降归因于元数据复用。缓存计时包含在估价/HOST修正等父阶段中，不能再次相加。Q2只读取5次表列布局、复用1187次；Q9为6/1059。最终版本均走cachestat，没有mincore回退。
+
+前后各4份冷计划完全一致，包括Join顺序、路径及成本；候选/接受仍为323/248、288/285，最终编码21/13节点、各一份程序。128MiB临时文件在冷、部分驻留、非整页范围、全热和驱逐后，两个内核API计数均一致，探针与数据已删除。正式Q9经HPCP填充后的单次准确性检查中，Q2/Q9驻留86.02%/94.25%，前后完整计划与成本仍相同；观测耗时约5.136→3.546ms、37.950→25.240ms。这些暖缓存检查不加入冷启动统计，也不作为稳定的多轮性能收益；高驻留观测仍是剩余热点。
+
+PG两项CTest、路径回归`results/planner-paths.c9afD8/`和连接复用/取消恢复`results/connection-lifecycle.CekELo/`通过。正式Q2/Q9四种相关模式共8次冷启动结果一致，见`results/tpch.xoDncq/`。没有优化前端到端多轮基线，不宣称执行器加速；未跑全量TPC-H或低于64MiB压力场景。原始数据、CSV/JSON及报告见`results/planner-observation.GJojw4/`。
+
+本轮最终版本另执行正式Q1/Q6的SQLerate路径，均与既有同快照HOST结果一致，记录在上述结果目录的`fused.*`，不将复用参考结果当成新的主机性能测量。

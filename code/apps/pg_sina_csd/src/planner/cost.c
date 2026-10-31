@@ -26,6 +26,8 @@
 #include <math.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <linux/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -41,8 +43,9 @@ struct placement {
     bool offload,details;
 };
 static double transfer_ms(double bytes,double mbps) { return bytes/(mbps*1000); }
-/* mincore on PROT_NONE mappings observes OS residency without reading Heap.
- * Cache it only within this planning invocation, never across executions. */
+/* Observe file-cache residency without reading Heap or sampling pages. Use
+ * the kernel summary where supported; retain mincore for older kernels/files.
+ * Cache observations only within this planning invocation, never across queries. */
 static struct residency *residency(Oid oid,List **observations)
 {
     ListCell *c;
@@ -54,7 +57,7 @@ static struct residency *residency(Oid oid,List **observations)
     r->tuples=Max(1,rel->rd_rel->reltuples);
     char *base=relpathperm(rel->rd_node,MAIN_FORKNUM);
     if(pg_sina_planning) pg_sina_planning->cache_metadata+=pg_sina_planner_clock()-part;
-    double hit=0,seen=0;
+    uint64_t hit=0,seen=0;
     for(uint64 at=0;at<(uint64)r->bytes;) {
         part=pg_sina_planner_clock();
         unsigned segment=at/((uint64)RELSEG_SIZE*BLCKSZ);
@@ -68,18 +71,29 @@ static struct residency *residency(Oid oid,List **observations)
         if(!bytes) { CloseTransientFile(fd); break; }
         size_t pages=(bytes+4095)/4096;
         if(pg_sina_planning) pg_sina_planning->cache_files+=pg_sina_planner_clock()-part;
-        unsigned char *vector=palloc(pages);
         part=pg_sina_planner_clock();
+#ifdef SYS_cachestat
+        struct cachestat_range range={.off=0,.len=bytes}; struct cachestat stats;
+        if(!syscall(SYS_cachestat,fd,&range,&stats,0)) {
+            hit+=Min(stats.nr_cache,pages); seen+=pages;
+            if(pg_sina_planning) {
+                pg_sina_planning->cache_residency+=pg_sina_planner_clock()-part;
+                pg_sina_planning->cache_pages+=pages; ++pg_sina_planning->cache_stats_calls;
+            }
+            CloseTransientFile(fd); at+=bytes; continue;
+        }
+#endif
+        unsigned char *vector=palloc(pages);
         void *map=mmap(NULL,bytes,PROT_NONE,MAP_SHARED,fd,0);
         if(map!=MAP_FAILED) {
             int status=mincore(map,bytes,vector);
             if(pg_sina_planning) {
                 pg_sina_planning->cache_residency+=pg_sina_planner_clock()-part;
-                pg_sina_planning->cache_pages+=pages;
+                pg_sina_planning->cache_pages+=pages; ++pg_sina_planning->cache_mincore_calls;
             }
             part=pg_sina_planner_clock();
             if(!status) {
-                for(size_t i=0;i<pages;++i) hit+=(vector[i]&1)!=0;
+                for(size_t i=0;i<pages;++i) hit+=vector[i]&1;
                 seen+=pages;
             }
             if(pg_sina_planning) pg_sina_planning->cache_count+=pg_sina_planner_clock()-part;
@@ -87,7 +101,7 @@ static struct residency *residency(Oid oid,List **observations)
         }
         pfree(vector); CloseTransientFile(fd); at+=bytes;
     }
-    r->fraction=seen?hit/seen:0;
+    r->fraction=seen?(double)hit/seen:0;
     pfree(base); relation_close(rel,AccessShareLock);
     MemoryContext previous=MemoryContextSwitchTo(pg_sina_search_context());
     *observations=lappend(*observations,r);

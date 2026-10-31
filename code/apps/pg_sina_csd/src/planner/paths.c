@@ -25,7 +25,7 @@ static void save_roots(PlannerInfo *,List **);
 static void restore_roots(List *);
 struct device_program { PlannerInfo root; PlannerGlobal globals; Plan *native; List *choices; bool fast,boundary; };
 struct pg_sina_path_search {
-    List *relations,*observations,*prepared,*indexes,*programs;
+    List *relations,*observations,*prepared,*indexes,*schemas,*programs;
     MemoryContext memory;
     struct qp_plan *workspace;
     unsigned choices[QP_NODES];
@@ -53,7 +53,7 @@ static Plan *defer_program(PlannerInfo *root,Plan *native,bool fast,bool boundar
     unsigned id=list_length(pg_sina_path_search->programs);
     pg_sina_path_search->programs=lappend(pg_sina_path_search->programs,program);
     MemoryContextSwitchTo(previous);
-    CustomScan *scan=(CustomScan *)pg_sina_candidate_scan(native,fast);
+    CustomScan *scan=(CustomScan *)pg_sina_candidate_scan(native,fast,true);
     scan->custom_private=list_make2(makeInteger(id),copyObject(costs));
     if(pg_sina_planning) pg_sina_planning->freeze+=pg_sina_planner_clock()-mark;
     return (Plan *)scan;
@@ -108,6 +108,8 @@ List **pg_sina_search_observations(void)
 { return pg_sina_path_search?&pg_sina_path_search->observations:NULL; }
 List **pg_sina_search_index_metadata(void)
 { return pg_sina_path_search?&pg_sina_path_search->indexes:NULL; }
+List **pg_sina_search_scan_schemas(void)
+{ return pg_sina_path_search?&pg_sina_path_search->schemas:NULL; }
 struct qp_plan *pg_sina_cost_workspace(void)
 {
     if(!pg_sina_path_search->workspace)

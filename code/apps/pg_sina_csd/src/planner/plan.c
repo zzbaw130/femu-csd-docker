@@ -6,6 +6,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_type_d.h"
 #include "catalog/pg_namespace_d.h"
+#include "catalog/pg_proc.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_collation_d.h"
 #include "catalog/pg_statistic.h"
@@ -40,7 +41,13 @@ static int compile_node(PlannerInfo *,Plan *,struct qp_plan *,bool);
 static int compile_tree(PlannerInfo *,Plan *,struct qp_plan *);
 static int describe_expression(struct binding *,Node *);
 static bool function_is(Oid id,const char *name)
-{ char *s=get_func_name(id); return s && get_func_namespace(id)==PG_CATALOG_NAMESPACE && !strcmp(s,name); }
+{
+    HeapTuple tuple=SearchSysCache1(PROCOID,ObjectIdGetDatum(id));
+    if(!HeapTupleIsValid(tuple)) return false;
+    Form_pg_proc function=(Form_pg_proc)GETSTRUCT(tuple);
+    bool match=function->pronamespace==PG_CATALOG_NAMESPACE && !strcmp(NameStr(function->proname),name);
+    ReleaseSysCache(tuple); return match;
+}
 static int add_expr(struct qs_plan *p,struct qs_expr e)
 {
     for(unsigned i=0;i<p->nexprs;++i) if(!memcmp(&p->exprs[i],&e,sizeof(e))) return i;
@@ -66,6 +73,16 @@ static bool byte_order(Oid collation)
     return collation==DEFAULT_COLLATION_OID && locale &&
         (!strcmp(locale,"C.UTF-8") || !strcmp(locale,"C.utf8"));
 }
+/* Reject different column bindings before entering PG's recursive equality
+ * walker. PG still checks types, collations and all remaining Var fields. */
+static bool expression_equal(const Node *a,const Node *b)
+{
+    if(a==b) return true;
+    if(!a || !b || nodeTag(a)!=nodeTag(b)) return false;
+    if(IsA(a,Var) && (((const Var *)a)->varno!=((const Var *)b)->varno ||
+                      ((const Var *)a)->varattno!=((const Var *)b)->varattno)) return false;
+    return equal(a,b);
+}
 static int input_column(struct binding *b,Node *expr)
 {
     if(b->plan && IsA(expr,Var)) {
@@ -79,7 +96,7 @@ static int input_column(struct binding *b,Node *expr)
         ListCell *c;
         foreach(c,inputs[side]) {
             TargetEntry *t=lfirst_node(TargetEntry,c);
-            if(equal(expr,t->expr)) return base+t->resno-1;
+            if(expression_equal(expr,(Node *)t->expr)) return base+t->resno-1;
         }
         base+=list_length(inputs[side]);
     }
@@ -352,23 +369,53 @@ static int conditions(struct binding *b,List *list)
     }
     return result;
 }
+/* The planning locks keep a relation's tuple layout stable. Cache only the
+ * immutable descriptor in this search; each candidate still owns its slots,
+ * predicate restrictions and other mutable column properties. */
+struct scan_schema {
+    Oid relid,filenode;
+    unsigned nattrs;
+    bool supported;
+    struct qs_column cols[QS_COLS];
+};
 static bool describe_scan(PlannerInfo *root,Scan *scan,struct qs_plan *p)
 {
     RangeTblEntry *rte=rt_fetch(scan->scanrelid,root->parse->rtable);
     if(rte->rtekind!=RTE_RELATION || rte->tablesample || rte->securityQuals) return false;
-    Relation table=table_open(rte->relid,NoLock); TupleDesc d=RelationGetDescr(table);
-    bool ok=d->natts<=QS_COLS;
-    if(ok) {
-        p->relid=rte->relid; p->relfilenode=table->rd_node.relNode; p->nattrs=d->natts;
-        for(int i=0;i<d->natts;++i) {
-            Form_pg_attribute a=TupleDescAttr(d,i);
-            p->cols[i]=(struct qs_column){.slot=-1,.length=a->attlen,.align=a->attalign=='d'?8:a->attalign=='i'?4:a->attalign=='s'?2:1,
-                .type=type_kind(a->atttypid,a->atttypmod),.scale=a->atttypid==NUMERICOID?2:0,.trim_spaces=a->atttypid==BPCHAROID};
-            if(a->atttypid==TIMESTAMPOID || a->atttypid==FLOAT8OID) p->cols[i].type=255;
-            if(a->attisdropped || (a->attlen<0 && a->attlen!=-1)) ok=false;
-        }
+    List **cache=pg_sina_search_scan_schemas(); ListCell *c;
+    struct scan_schema *schema=NULL;
+    if(cache) foreach(c,*cache) {
+        struct scan_schema *entry=lfirst(c);
+        if(entry->relid==rte->relid) { schema=entry; break; }
     }
-    table_close(table,NoLock); return ok;
+    if(schema) { if(pg_sina_planning) ++pg_sina_planning->schema_reuses; }
+    else {
+        schema=MemoryContextAllocZero(pg_sina_search_context(),sizeof(*schema)); schema->relid=rte->relid;
+        Relation table=table_open(rte->relid,NoLock); TupleDesc d=RelationGetDescr(table);
+        schema->filenode=table->rd_node.relNode; schema->nattrs=d->natts; schema->supported=d->natts<=QS_COLS;
+        if(schema->supported) for(int i=0;i<d->natts;++i) {
+            Form_pg_attribute a=TupleDescAttr(d,i);
+            schema->cols[i]=(struct qs_column){.slot=-1,.length=a->attlen,
+                .align=a->attalign=='d'?8:a->attalign=='i'?4:a->attalign=='s'?2:1,
+                .type=type_kind(a->atttypid,a->atttypmod),.scale=a->atttypid==NUMERICOID?2:0,
+                .trim_spaces=a->atttypid==BPCHAROID};
+            if(a->atttypid==TIMESTAMPOID || a->atttypid==FLOAT8OID) schema->cols[i].type=255;
+            if(a->attisdropped || (a->attlen<0 && a->attlen!=-1)) schema->supported=false;
+        }
+        table_close(table,NoLock);
+        if(cache) {
+            MemoryContext previous=MemoryContextSwitchTo(pg_sina_search_context());
+            *cache=lappend(*cache,schema); MemoryContextSwitchTo(previous);
+        }
+        if(pg_sina_planning) ++pg_sina_planning->schema_reads;
+    }
+    bool ok=schema->supported;
+    if(ok) {
+        p->relid=schema->relid; p->relfilenode=schema->filenode; p->nattrs=schema->nattrs;
+        memcpy(p->cols,schema->cols,schema->nattrs*sizeof(*p->cols));
+    }
+    if(!cache) pfree(schema);
+    return ok;
 }
 static bool has_param(Node *node,void *context)
 {
@@ -490,7 +537,7 @@ static Plan *partial_input(Plan *p)
 static TargetEntry *matching_entry(List *list,Expr *expr)
 {
     ListCell *c;
-    foreach(c,list) { TargetEntry *t=lfirst(c); if(equal(t->expr,expr)) return t; }
+    foreach(c,list) { TargetEntry *t=lfirst(c); if(expression_equal((Node *)t->expr,(Node *)expr)) return t; }
     return NULL;
 }
 /* Collect HOST consumers, not the physical Scan/pass-through targetlists
@@ -745,7 +792,7 @@ static bool identity_target(Plan *a,Plan *b)
     if(!a || !b || list_length(a->targetlist)!=list_length(b->targetlist)) return false;
     ListCell *x,*y;
     forboth(x,a->targetlist,y,b->targetlist)
-        if(!equal(lfirst_node(TargetEntry,x)->expr,lfirst_node(TargetEntry,y)->expr)) return false;
+        if(!expression_equal((Node *)lfirst_node(TargetEntry,x)->expr,(Node *)lfirst_node(TargetEntry,y)->expr)) return false;
     return true;
 }
 struct group_payload { Agg *aggregate; bool supported; };
@@ -1808,13 +1855,17 @@ static int describe_tree(PlannerInfo *root,Plan *native,struct qp_plan *tree,boo
     return id;
 }
 
-Plan *pg_sina_candidate_scan(Plan *native,bool fast)
+Plan *pg_sina_candidate_scan(Plan *native,bool fast,bool output)
 {
     CustomScan *scan=makeNode(CustomScan); scan->scan.plan=*native; NodeSetTag(scan,T_CustomScan);
     scan->scan.plan.lefttree=scan->scan.plan.righttree=NULL; scan->scan.plan.qual=NIL;
     scan->scan.plan.parallel_aware=scan->scan.plan.parallel_safe=false;
-    scan->scan.plan.targetlist=(List *)device_output_expression((Node *)native->targetlist,NULL);
-    scan->custom_scan_tlist=copyObject(scan->scan.plan.targetlist);
+    /* Cost-only markers never reach PG setrefs/execution. Construct the
+     * translated output expressions only for the selected CustomScan. */
+    if(output) {
+        scan->scan.plan.targetlist=(List *)device_output_expression((Node *)native->targetlist,NULL);
+        scan->custom_scan_tlist=copyObject(scan->scan.plan.targetlist);
+    }
     scan->custom_private=list_make1(NULL); scan->methods=fast?&pg_sina_scan_methods:&pg_sina_plan_methods;
     return (Plan *)scan;
 }
@@ -1976,12 +2027,12 @@ Plan *pg_sina_describe_candidate(PlannerInfo *root,Plan *native,bool boundary,st
         pg_sina_candidate_choices()[i]|=pg_sina_physical_choice(n);
     }
     tree->nodes[result].expr.work_mem_bytes=pg_sina_query_memory();
-    *lowered=tree; return pg_sina_candidate_scan(native,false);
+    *lowered=tree; return pg_sina_candidate_scan(native,false,false);
 }
 Plan *pg_sina_rewrite_plan(PlannerInfo *root,Plan *native)
 { return pg_sina_compile_subtree(root,native,false); }
 
-/* Planner-only wrapper, removed after setrefs if conversion is rejected. */
+/* Preview-only wrapper, stripped before setrefs. */
 static const CustomScanMethods native_methods={.CustomName="SniaNativePlan"};
 Plan *pg_sina_native_wrapper(Plan *native)
 {
@@ -1989,7 +2040,9 @@ Plan *pg_sina_native_wrapper(Plan *native)
     scan->scan.plan=*native; NodeSetTag(scan,T_CustomScan);
     scan->scan.plan.lefttree=scan->scan.plan.righttree=NULL;
     scan->scan.plan.qual=NIL; scan->scan.plan.initPlan=NIL;
-    scan->custom_scan_tlist=copyObject(native->targetlist);
+    /* Preview strips this wrapper before setrefs; the private child already
+     * owns its targetlist. No second copy is needed for this temporary view. */
+    scan->custom_scan_tlist=native->targetlist;
     scan->custom_plans=list_make1(native); scan->methods=&native_methods;
     return (Plan *)scan;
 }

@@ -609,7 +609,7 @@ static Plan *fast_plan(PlannerInfo *root,Plan *native,struct qs_plan **propertie
     pg_sina_read_resources(device); plan.work_mem_bytes=pg_sina_query_memory();
     if(properties) {
         *properties=palloc(sizeof(plan)); **properties=plan;
-        return pg_sina_candidate_scan(native,true);
+        return pg_sina_candidate_scan(native,true,false);
     }
     if(pg_sina_planning) ++pg_sina_planning->fast_records;
     bytea *bytes=palloc(VARHDRSZ+sizeof(plan)); SET_VARSIZE(bytes,VARHDRSZ+sizeof(plan)); memcpy(VARDATA(bytes),&plan,sizeof(plan));

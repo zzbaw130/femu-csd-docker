@@ -32,7 +32,8 @@ struct pg_sina_planner_profile {
     double describe,mapping,refine;
     double cost_reach,cost_buffers,cost_dictionary,cost_operators,cost_finish;
     double retain_copy,retain_free,retain_publish,freeze,hook_other,native_core,adaptive_core,cache_probe;
-    unsigned cache_probes;
+    unsigned cache_probes,cache_stats_calls,cache_mincore_calls;
+    unsigned schema_reads,schema_reuses;
     double cache_cpu,cache_metadata,cache_files,cache_residency,cache_count;
     uint64_t cache_pages;
     unsigned open_major_faults,open_minor_faults;
@@ -83,6 +84,7 @@ void pg_sina_start_path_search(void);
 MemoryContext pg_sina_search_context(void);
 List **pg_sina_search_observations(void);
 List **pg_sina_search_index_metadata(void);
+List **pg_sina_search_scan_schemas(void);
 struct qp_plan *pg_sina_cost_workspace(void);
 enum { PG_SINA_GROUP_FILTER=1U<<8, PG_SINA_LEFT_COUNT=1U<<9, PG_SINA_DISTINCT=1U<<10, PG_SINA_DISTINCT_SORT=1U<<11 };
 /* Query-local choice, never a wire field: low bits select relational rewrites;
@@ -114,7 +116,7 @@ Plan *pg_sina_require_output_order(PlannerInfo *,Plan *);
 /* Cost properties and a borrowed workspace, valid until the next candidate.
  * Candidate Const holds binary cost metadata, never an executable program. */
 Plan *pg_sina_describe_candidate(PlannerInfo *,Plan *,bool,struct qp_plan **);
-Plan *pg_sina_candidate_scan(Plan *,bool);
+Plan *pg_sina_candidate_scan(Plan *,bool,bool);
 void pg_sina_finish_device_plans(Plan *);
 void pg_sina_refine_groups(struct qp_plan *);
 Plan *pg_sina_adaptive_plan(PlannerInfo *,Plan *);
