@@ -60,7 +60,7 @@ static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,Param
             original_device=pg_sina_original_device_statement(host);
             if(pg_sina_planning) counters.stmt_copy=pg_sina_planner_clock()-mark;
             mark=pg_sina_planner_clock();
-            host_cost=pg_sina_host_statement_cost(host);
+            host_cost=pg_sina_host_statement_cost(host)+pg_sina_host_parallel_cost(host);
             if(pg_sina_planning) counters.host_cache=pg_sina_planner_clock()-mark;
             pg_sina_native_search=false;
         }
@@ -72,7 +72,8 @@ static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,Param
             counters.adaptive_core=counters.adaptive_pg-(pg_sina_planner_attributed()-attributed)-(counters.hook_other-hooks);
         }
         if(host) {
-            double candidate=plan->planTree->total_cost*pg_sina_host_cost_ms;
+            double candidate=plan->planTree->total_cost*pg_sina_host_cost_ms+pg_sina_host_parallel_cost(plan);
+            plan->planTree->total_cost=candidate/pg_sina_host_cost_ms;
             double original_cost=original_device?original_device->planTree->total_cost*pg_sina_host_cost_ms:DBL_MAX;
             if(original_device && original_cost<=candidate) plan=original_device;
             if(host_cost<Min(candidate,original_cost)) plan=host;

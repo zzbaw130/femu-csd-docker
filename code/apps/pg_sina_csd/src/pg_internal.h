@@ -103,8 +103,10 @@ void pg_sina_join_paths(PlannerInfo *,RelOptInfo *,RelOptInfo *,RelOptInfo *,Joi
 void pg_sina_search_upper_paths(PlannerInfo *,UpperRelationKind,RelOptInfo *,RelOptInfo *);
 Plan *pg_sina_cost_device(PlannerInfo *,Plan *,bool,List **,double *,double *);
 List *pg_sina_selected_costs(PlannerInfo *,Plan *,bool,bool,Node *);
-double pg_sina_host_scan_cost(Oid,bool,double,double,List **);
+void pg_sina_cost_host_path(PlannerInfo *,Path *,Oid,List **,bool);
+double pg_sina_host_scan_cost(Plan *,Oid,double,List **);
 double pg_sina_host_statement_cost(PlannedStmt *);
+double pg_sina_host_parallel_cost(PlannedStmt *);
 Plan *pg_sina_wrap_placement(Plan *,const char *,const char *);
 extern const CustomScanMethods pg_sina_scan_methods;
 extern const CustomScanMethods pg_sina_order_methods;

@@ -4,24 +4,30 @@
  * Host-produced intermediate rows cannot yet enter the device interpreter;
  * that edge has infinite cost, rather than pretending it is executable. */
 #include "pg_internal.h"
+#include "miscadmin.h"
 #include "cost_model.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_constraint.h"
+#include "catalog/namespace.h"
 #include "utils/syscache.h"
 #include "utils/lsyscache.h"
 #include "access/relation.h"
 #include "catalog/pg_type_d.h"
+#include "catalog/pg_am_d.h"
 #include "executor/executor.h"
 #include "nodes/makefuncs.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/paths.h"
 #include "parser/parsetree.h"
 #include "storage/bufmgr.h"
+#include "storage/buf_internals.h"
 #include "storage/fd.h"
 #include "utils/rel.h"
 #include "utils/date.h"
 #include "utils/datetime.h"
 #include "utils/memutils.h"
+#include "utils/spccache.h"
 #include <float.h>
 #include <math.h>
 #include <fcntl.h>
@@ -31,7 +37,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-struct residency { Oid oid; double bytes,tuples,fraction; };
+struct host_scan_cost { NodeTag type; Oid index; double rows,before,after,cpu; int workers; };
+struct shared_pages { RelFileNode node; uint64 pages; };
+struct residency {
+    Oid oid;
+    double bytes,tuples,fraction,shared;
+    HTAB *buffers;
+    List *scans;
+};
 struct placement {
     Plan *native,*device;
     PlannerInfo *root;
@@ -43,6 +56,32 @@ struct placement {
     bool offload,details;
 };
 static double transfer_ms(double bytes,double mbps) { return bytes/(mbps*1000); }
+/* One descriptor pass per planning invocation, including tables and indexes.
+ * Like pg_buffercache, each tag/state is consistent; the whole pass is not a
+ * globally locked snapshot. No page contents are read or pinned. */
+static HTAB *shared_residency(void)
+{
+    HASHCTL control={.keysize=sizeof(RelFileNode),.entrysize=sizeof(struct shared_pages),
+        .hcxt=pg_sina_search_context()};
+    HTAB *table=hash_create("SQLerate shared buffer residency",128,&control,HASH_ELEM|HASH_BLOBS|HASH_CONTEXT);
+    double begin=pg_sina_planner_clock(); uint64 valid=0;
+    for(int i=0;i<NBuffers;++i) {
+        BufferDesc *buffer=GetBufferDescriptor(i);
+        if((pg_atomic_read_u32(&buffer->state)&(BM_VALID|BM_TAG_VALID))!=(BM_VALID|BM_TAG_VALID)) continue;
+        uint32 state=LockBufHdr(buffer); BufferTag tag=buffer->tag;
+        UnlockBufHdr(buffer,state);
+        if((state&(BM_VALID|BM_TAG_VALID))==(BM_VALID|BM_TAG_VALID) && tag.forkNum==MAIN_FORKNUM) {
+            bool found;
+            struct shared_pages *entry=hash_search(table,&tag.rnode,HASH_ENTER,&found);
+            if(!found) entry->pages=0;
+            ++entry->pages; ++valid;
+        }
+        if(!(i%1024)) CHECK_FOR_INTERRUPTS();
+    }
+    if(pg_sina_planning) ereport(NOTICE,(errmsg("SQLerate shared buffers observation ms=%.3f descriptors=%d valid_main_pages=%llu",
+        pg_sina_planner_clock()-begin,NBuffers,(unsigned long long)valid)));
+    return table;
+}
 /* Observe file-cache residency without reading Heap or sampling pages. Use
  * the kernel summary where supported; retain mincore for older kernels/files.
  * Cache observations only within this planning invocation, never across queries. */
@@ -52,9 +91,15 @@ static struct residency *residency(Oid oid,List **observations)
     foreach(c,*observations) { struct residency *r=lfirst(c); if(r->oid==oid) return r; }
     double mark=pg_sina_planner_clock(),cpu=pg_sina_planner_cpu(),part=mark;
     struct residency *r=MemoryContextAllocZero(pg_sina_search_context(),sizeof(*r)); r->oid=oid;
+    if(pg_sina_path_search)
+        r->buffers=*observations?((struct residency *)linitial(*observations))->buffers:shared_residency();
     Relation rel=relation_open(oid,AccessShareLock);
     r->bytes=(double)RelationGetNumberOfBlocks(rel)*BLCKSZ;
     r->tuples=Max(1,rel->rd_rel->reltuples);
+    if(r->buffers) {
+        struct shared_pages *entry=hash_search(r->buffers,&rel->rd_node,HASH_FIND,NULL);
+        r->shared=entry && r->bytes?Min(1.0,entry->pages*BLCKSZ/r->bytes):0;
+    }
     char *base=relpathperm(rel->rd_node,MAIN_FORKNUM);
     if(pg_sina_planning) pg_sina_planning->cache_metadata+=pg_sina_planner_clock()-part;
     uint64_t hit=0,seen=0;
@@ -102,6 +147,8 @@ static struct residency *residency(Oid oid,List **observations)
         pfree(vector); CloseTransientFile(fd); at+=bytes;
     }
     r->fraction=seen?(double)hit/seen:0;
+    if(pg_sina_planning) ereport(NOTICE,(errmsg("SQLerate relation cache relid=%u shared_percent=%.2f file_percent=%.2f pages=%.0f",
+        oid,r->shared*100,r->fraction*100,r->bytes/BLCKSZ)));
     pfree(base); relation_close(rel,AccessShareLock);
     MemoryContext previous=MemoryContextSwitchTo(pg_sina_search_context());
     *observations=lappend(*observations,r);
@@ -121,14 +168,141 @@ static Oid scan_relation(PlannerInfo *root,Plan *p)
     }
     return InvalidOid;
 }
-/* Reuse the existing cache correction before PG compares HOST Paths. */
-double pg_sina_host_scan_cost(Oid oid,bool sequential,double rows,double cost,List **observations)
+/* Retain PG's CPU/qual/parallel costs. Only replace its actual scan I/O
+ * component. Shared hits need no kernel->buffer copy; file-only hits do.
+ * Aggregate residency does not identify overlap, so max(shared,file) is a
+ * conservative union, never shared+file counted twice. */
+static double cached_io(double io,double page_cost,struct residency *r)
 {
-    struct residency *r=residency(oid,observations);
-    double read=r->bytes;
-    if(!sequential) read*=Min(1.0,Max(1,rows)/r->tuples*4);
-    return cost-Min(cost,read/BLCKSZ*seq_page_cost*pg_sina_host_cost_ms)*r->fraction+
-        transfer_ms(read*r->fraction,pg_sina_cache_mbps);
+    double copy=page_cost>0?transfer_ms(BLCKSZ,pg_sina_cache_mbps)/(page_cost*pg_sina_host_cost_ms):0;
+    return cost_host_cached_io(io,r->shared,r->fraction,copy);
+}
+static pg_noinline void index_cpu_cost(IndexPath *path,PlannerInfo *root)
+{
+    double saved_seq=seq_page_cost,saved_random=random_page_cost;
+    /* Backend-local prices; never leak a temporary price through ERROR. */
+    PG_TRY();
+    { seq_page_cost=random_page_cost=0; cost_index(path,root,1,false); }
+    PG_CATCH();
+    { seq_page_cost=saved_seq; random_page_cost=saved_random; PG_RE_THROW(); }
+    PG_END_TRY();
+    seq_page_cost=saved_seq; random_page_cost=saved_random;
+}
+void pg_sina_cost_host_path(PlannerInfo *root,Path *path,Oid oid,List **observations,bool apply)
+{
+    if(path->pathtype!=T_SeqScan && !IsA(path,IndexPath)) return;
+    /* Internal SPI/temp relations cannot become immutable device inputs. */
+    if(oid<FirstNormalObjectId || get_rel_persistence(oid)==RELPERSISTENCE_TEMP ||
+       get_rel_namespace(oid)==get_namespace_oid("sina_csd",true)) return;
+    struct residency *heap=residency(oid,observations),*index=NULL;
+    double before=path->total_cost,heap_io=0,index_io=0,seq,random,index_random=0;
+    Oid indexid=InvalidOid;
+    get_tablespace_page_costs(path->parent->reltablespace,&random,&seq);
+    if(path->pathtype==T_SeqScan) heap_io=Min(before-path->startup_cost,path->parent->pages*seq);
+    else {
+        IndexPath *original=(IndexPath *)path;
+        if(original->indexinfo->relam!=BTREE_AM_OID) return;
+        indexid=original->indexinfo->indexoid;
+        index=residency(indexid,observations);
+        get_tablespace_page_costs(original->indexinfo->reltablespace,&index_random,NULL);
+        IndexPath cpu=*original;
+        /* PG12 has no public cost_index CPU/I/O breakdown. Recost a private
+         * Path with zero default page prices, leaving all CPU prices intact.
+         * These globals are backend-local; restore even if PG raises ERROR.
+         * Explicit tablespace prices remain in the floor (conservative).
+         * B-tree CPU costs do not depend on loop_count; its original I/O
+         * estimates, including repeated-probe caching, come from original. */
+        index_cpu_cost(&cpu,root);
+        index_io=Max(0,original->indextotalcost-cpu.indextotalcost);
+        heap_io=Max(0,before-cpu.path.total_cost-index_io);
+    }
+    double after=Max(path->startup_cost,before-heap_io-index_io+
+        cached_io(heap_io,path->pathtype==T_SeqScan?seq:random,heap)+
+        (index?cached_io(index_io,index_random,index):0));
+    if(apply) {
+        if(index) ((IndexPath *)path)->indextotalcost-=index_io-cached_io(index_io,index_random,index);
+        path->total_cost=after;
+    }
+    {
+        struct host_scan_cost *scan=MemoryContextAlloc(pg_sina_search_context(),sizeof(*scan));
+        *scan=(struct host_scan_cost){.type=path->pathtype,.index=indexid,.rows=path->rows,.before=before,.after=after,
+            .cpu=Max(0,before-heap_io-index_io-path->startup_cost),.workers=path->parallel_workers};
+        MemoryContext previous=MemoryContextSwitchTo(pg_sina_search_context());
+        heap->scans=lappend(heap->scans,scan); MemoryContextSwitchTo(previous);
+    }
+}
+/* Preserve the unmodified native PG plan as a candidate. Look up the same
+ * selected scan's Path estimate, instead of inferring I/O from output rows. */
+double pg_sina_host_scan_cost(Plan *plan,Oid oid,double cost,List **observations)
+{
+    struct residency *r=NULL; ListCell *cell;
+    foreach(cell,*observations) { struct residency *candidate=lfirst(cell); if(candidate->oid==oid) { r=candidate; break; } }
+    if(!r) return cost;
+    Oid index=IsA(plan,IndexScan)?((IndexScan *)plan)->indexid:
+        IsA(plan,IndexOnlyScan)?((IndexOnlyScan *)plan)->indexid:InvalidOid;
+    foreach(cell,r->scans) {
+        const struct host_scan_cost *scan=lfirst(cell);
+        if(scan->type==nodeTag(plan) && scan->index==index && scan->rows==plan->plan_rows && scan->before==plan->total_cost) {
+            if(pg_sina_planning) ereport(NOTICE,(errmsg("SQLerate HOST scan relid=%u indexid=%u rows=%.0f original=%.3fms cached=%.3fms",
+                oid,index,plan->plan_rows,scan->before*pg_sina_host_cost_ms,scan->after*pg_sina_host_cost_ms)));
+            return Max(0,cost+(scan->after-scan->before)*pg_sina_host_cost_ms);
+        }
+    }
+    return cost;
+}
+static double host_parallel_divisor(int workers)
+{
+    return workers+(parallel_leader_participation?Max(0,1-0.3*workers):0);
+}
+/* A PG partial subtree may have been priced for more workers than its final
+ * Gather launches (e.g. a 4-worker inner Parallel Hash below a 2-worker join).
+ * Reconcile that CPU work before comparing final statements. Do not divide
+ * I/O, serial/private inputs, or charge the whole subtree again at parents. */
+static double host_parallel_cost(Plan *plan,List *rtable,List **observations,int workers,double *divisor)
+{
+    *divisor=0;
+    if(!plan) return 0;
+    bool gather=IsA(plan,Gather) || IsA(plan,GatherMerge);
+    if(gather) workers=IsA(plan,Gather)?((Gather *)plan)->num_workers:((GatherMerge *)plan)->num_workers;
+    double left=0,right=0;
+    double extra=host_parallel_cost(plan->lefttree,rtable,observations,workers,&left);
+    double repeats=IsA(plan,NestLoop) && plan->righttree && !IsA(plan->righttree,Material)?Max(1,plan->lefttree->plan_rows):1;
+    extra+=host_parallel_cost(plan->righttree,rtable,observations,workers,&right)*repeats;
+    double local=Max(0,plan->total_cost-(plan->lefttree?plan->lefttree->total_cost:0)-
+        (plan->righttree?plan->righttree->total_cost*repeats:0));
+    if(IsA(plan,SeqScan) || IsA(plan,IndexScan) || IsA(plan,IndexOnlyScan)) {
+        RangeTblEntry *entry=rt_fetch(((Scan *)plan)->scanrelid,rtable);
+        ListCell *c; foreach(c,*observations) {
+            struct residency *r=lfirst(c); if(r->oid!=entry->relid) continue;
+            ListCell *s; foreach(s,r->scans) {
+                struct host_scan_cost *scan=lfirst(s);
+                if(scan->type==nodeTag(plan) && scan->rows==plan->plan_rows &&
+                   (scan->before==plan->total_cost || scan->after==plan->total_cost)) {
+                    if(scan->workers) { left=host_parallel_divisor(scan->workers); local=scan->cpu; }
+                    break;
+                }
+            }
+        }
+    }
+    if(workers && left>0 && !gather) {
+        double ratio=Max(1,left/host_parallel_divisor(workers));
+        extra+=local*(ratio-1);
+    }
+    if(IsA(plan,CustomScan)) {
+        ListCell *c; foreach(c,((CustomScan *)plan)->custom_plans) {
+            double child=0; extra+=host_parallel_cost(lfirst(c),rtable,observations,workers,&child);
+        }
+    }
+    if(IsA(plan,SubqueryScan)) {
+        double child=0; extra+=host_parallel_cost(((SubqueryScan *)plan)->subplan,rtable,observations,workers,&child);
+    }
+    *divisor=gather?0:left;
+    return extra;
+}
+double pg_sina_host_parallel_cost(PlannedStmt *stmt)
+{
+    List **observations=pg_sina_search_observations(); double divisor=0;
+    return observations?host_parallel_cost(stmt->planTree,stmt->rtable,observations,0,&divisor)*pg_sina_host_cost_ms:0;
 }
 static double statement_cache_cost(Plan *p,List *rtable,List **observations,double repeats)
 {
@@ -138,8 +312,7 @@ static double statement_cache_cost(Plan *p,List *rtable,List **observations,doub
         RangeTblEntry *r=rt_fetch(((Scan *)p)->scanrelid,rtable);
         if(r->rtekind==RTE_RELATION) {
             double cost=p->total_cost*pg_sina_host_cost_ms;
-            Oid oid=IsA(p,IndexOnlyScan)?((IndexOnlyScan *)p)->indexid:r->relid;
-            correction=(pg_sina_host_scan_cost(oid,IsA(p,SeqScan),p->plan_rows,cost,observations)-cost)*repeats;
+            correction=(pg_sina_host_scan_cost(p,r->relid,cost,observations)-cost)*repeats;
         }
     }
     correction+=statement_cache_cost(p->lefttree,rtable,observations,repeats);
@@ -842,9 +1015,8 @@ static struct placement *estimate(PlannerInfo *root,Plan *native,Plan *scope,Lis
     }
     double local=Max(0,native->total_cost*pg_sina_host_cost_ms-original_children);
     Oid oid=scan_relation(root,native);
-    if(IsA(native,IndexOnlyScan)) oid=((IndexOnlyScan *)native)->indexid;
     if(OidIsValid(oid)) {
-        local=pg_sina_host_scan_cost(oid,IsA(native,SeqScan),native->plan_rows,local,observations);
+        local=pg_sina_host_scan_cost(native,oid,local,observations);
     }
     p->host=local+best_children;
     p->native_host=local+native_children;

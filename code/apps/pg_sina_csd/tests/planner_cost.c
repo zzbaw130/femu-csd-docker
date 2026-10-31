@@ -5,6 +5,14 @@
 #define CHECK(test) do { if(!(test)) { fprintf(stderr,"line %d: %s\n",__LINE__,#test); return EXIT_FAILURE; } } while(0)
 int main(void)
 {
+    /* Shared hits remove I/O, not CPU. File-only hits still copy pages;
+     * overlapping cache fractions must not discount the same I/O twice. */
+    CHECK(30+cost_host_cached_io(100,0,0,0.1)==130);
+    CHECK(30+cost_host_cached_io(100,1,0,0.1)==30);
+    CHECK(30+cost_host_cached_io(100,1,1,0.1)==30);
+    CHECK(30+cost_host_cached_io(100,0,1,0.1)==40);
+    CHECK(cost_host_cached_io(100,0.5,0.5,0.1)==50);
+    CHECK(cost_host_cached_io(100,0.5,1,0.1)==5);
     /* Bounded index caches must not make repeated random I/O free. A small
      * table can fit; clustered matching tuples share a Heap page. */
     CHECK(cost_index_pages(0,10000,64,256)==0);

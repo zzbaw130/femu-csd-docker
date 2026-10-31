@@ -14,7 +14,7 @@
 | `csd-with-hpcp` | 同上 | 开启 |
 | `SQLerate` | 将 HOST/CSD 候选加入 PG 的扫描、连接及上层路径搜索，选择混合计划 | CSD 子树开启 |
 
-HPCP 全称 **Host Page Cache Population（主机页缓存填充）**。它把设备读入的数据填充到 Guest 文件页缓存；两种 CSD 模式目前都从内部 NVM 读入 FDM，不会因为命中主机缓存就默认上传。SQLerate 会考虑缓存驻留对 HOST 成本的影响。成本公式、参数及当前执行边界见 [规划说明](doc/planning.md)。
+HPCP 全称 **Host Page Cache Population（主机页缓存填充）**。它把设备读入的数据填充到 Guest 文件页缓存；两种 CSD 模式目前都从内部 NVM 读入 FDM，不会因为命中主机缓存就默认上传。SQLerate 分别观测 PG shared_buffers 和文件页缓存：前者命中免除读盘及内核到 PG 缓冲区的复制，后者命中仍保留复制成本；CPU、谓词和索引查找成本继续保留。这里只改变估价，HPCP 仍填充文件页缓存。成本公式、参数及当前执行边界见 [规划说明](doc/planning.md)。
 
 两种强制完整卸载模式保留 PG 选定的连接顺序。SQLerate 在 PG 枚举合法连接组合时加入设备子树，因此设备成本能影响连接顺序，HOST 上层也能根据设备输入重新选择算法；仍受 PG 的合法性、路径剪枝和 GEQO 范围限制。
 

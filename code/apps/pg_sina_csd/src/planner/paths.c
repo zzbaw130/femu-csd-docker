@@ -318,19 +318,17 @@ static void publish_paths(PlannerInfo *root,RelOptInfo *rel)
 }
 void pg_sina_rel_paths(PlannerInfo *root,RelOptInfo *rel,Index rti,RangeTblEntry *rte)
 {
-    if(!eligible(root)) return;
+    if(!pg_sina_path_search || pg_sina_exe_path!=PG_SINA_ADAPTIVE || pg_sina_compiling_plan) return;
+    bool device=eligible(root);
     List *paths=list_concat(list_copy(rel->pathlist),list_copy(rel->partial_pathlist)); ListCell *c;
     foreach(c,paths) {
         Path *path=lfirst(c);
-        if(rte->rtekind==RTE_RELATION && !path->param_info) {
-            Oid oid=IsA(path,IndexPath) && path->pathtype==T_IndexOnlyScan?((IndexPath *)path)->indexinfo->indexoid:rte->relid;
-            path->total_cost=Max(path->startup_cost,pg_sina_host_scan_cost(oid,path->pathtype==T_SeqScan,
-                path->rows,path->total_cost*pg_sina_host_cost_ms,&pg_sina_path_search->observations)/pg_sina_host_cost_ms);
-        }
-        add_device_path(root,rel,path,false);
+        if(rte->rtekind==RTE_RELATION)
+            pg_sina_cost_host_path(root,path,rte->relid,&pg_sina_path_search->observations,!pg_sina_native_search);
+        if(device) add_device_path(root,rel,path,false);
     }
     list_free(paths);
-    publish_paths(root,rel);
+    if(device) publish_paths(root,rel);
 }
 void pg_sina_join_paths(PlannerInfo *root,RelOptInfo *joinrel,RelOptInfo *outerrel,
                         RelOptInfo *innerrel,JoinType jointype,JoinPathExtraData *extra)

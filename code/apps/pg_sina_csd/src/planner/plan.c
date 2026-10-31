@@ -1018,10 +1018,19 @@ static void push_group_key_filter(struct qp_plan *tree,struct qp_node *join)
         if(x->op==Q_COLUMN && x->column>=(int)width && x->column!=(int)width) return;
     }
     unsigned set=tree->count++,filter=tree->count++;
-    tree->nodes[set]=(struct qp_node){.kind=QP_SET,.left=join->right,.right=-1,.expr=right->expr};
+    tree->nodes[set]=(struct qp_node){.kind=QP_SET,.left=join->right,.right=-1,.expr=right->expr,
+        .estimated_rows=right->estimated_rows};
     unsigned init=tree->ninit++; tree->init_nodes[init]=set; tree->init_params[init]=-1;
     struct qp_node *f=&tree->nodes[filter];
-    *f=(struct qp_node){.kind=QP_PROJECT,.left=aggregate->left,.right=-1,.estimated_rows=input->estimated_rows};
+    /* PG already estimated this group-key membership join. Moving its
+     * predicate below the aggregate retains the same fraction of groups.
+     * Reprice the filtered physical graph, not the old full aggregation. */
+    double selectivity=Min(1.0,join->estimated_rows/Max(1,aggregate->estimated_rows));
+    *f=(struct qp_node){.kind=QP_PROJECT,.left=aggregate->left,.right=-1,.estimated_rows=input->estimated_rows*selectivity};
+    for(int node=join->left;node>=0;node=tree->nodes[node].left) {
+        tree->nodes[node].estimated_rows*=selectivity;
+        if(node==id) { tree->nodes[node].estimated_groups*=selectivity; break; }
+    }
     f->expr.nattrs=f->expr.ncols=f->expr.nout=f->expr.nexprs=input->expr.nout;
     f->expr.having=-1; f->expr.limit=-1;
     for(unsigned i=0;i<f->expr.nout;++i) {

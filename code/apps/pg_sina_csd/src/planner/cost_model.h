@@ -7,6 +7,10 @@
 
 static inline double cost_max(double a,double b) { return a>b?a:b; }
 static inline double cost_min(double a,double b) { return a<b?a:b; }
+/* Overlap of the two caches is unknown: use the conservative union. The
+ * caller retains CPU costs; only file-only hits pay the extra page copy. */
+static inline double cost_host_cached_io(double io,double shared,double file,double copy_ratio)
+{ return io*(1-cost_max(shared,file))+io*cost_max(0,file-shared)*copy_ratio; }
 static inline double cost_slots(double count,double minimum)
 {
     double slots=minimum;
