@@ -1310,16 +1310,12 @@ Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
     if(!has_scan) { pfree(tree); return native; }
     Oid ns=get_namespace_oid("sina_csd",true);
     if(!OidIsValid(ns) || !OidIsValid(get_relname_relid("relations",ns))) { pfree(tree); return native; }
-    if(SPI_connect()!=SPI_OK_CONNECT) elog(ERROR,"SPI_connect failed");
     bool prepared=true; char device[128]={0};
     for(unsigned i=0;i<tree->count && prepared;++i) if(tree->nodes[i].kind==QP_SCAN) {
-        Oid types[]={OIDOID,OIDOID};
-        Datum values[]={ObjectIdGetDatum(tree->nodes[i].expr.relid),ObjectIdGetDatum(tree->nodes[i].expr.relfilenode)};
-        int status=SPI_execute_with_args("SELECT device FROM sina_csd.relations WHERE relid=$1 AND relfilenode=$2",2,types,values,NULL,true,1);
-        prepared=status==SPI_OK_SELECT && SPI_processed==1;
-        if(prepared && !device[0]) strlcpy(device,SPI_getvalue(SPI_tuptable->vals[0],SPI_tuptable->tupdesc,1),sizeof(device));
+        char path[128]={0};
+        prepared=pg_sina_prepared_device(tree->nodes[i].expr.relid,tree->nodes[i].expr.relfilenode,path,sizeof(path));
+        if(prepared && !device[0]) strlcpy(device,path,sizeof(device));
     }
-    SPI_finish();
     if(!prepared) { pfree(tree); return native; }
     tree->root=result;
     pg_sina_refine_groups(tree);
@@ -1350,14 +1346,30 @@ Plan *pg_sina_rewrite_plan(PlannerInfo *root,Plan *native)
 
 /* Planner-only wrapper, removed after setrefs if conversion is rejected. */
 static const CustomScanMethods native_methods={.CustomName="SniaNativePlan"};
+Plan *pg_sina_native_wrapper(Plan *native)
+{
+    CustomScan *scan=makeNode(CustomScan);
+    scan->scan.plan=*native; NodeSetTag(scan,T_CustomScan);
+    scan->scan.plan.lefttree=scan->scan.plan.righttree=NULL;
+    scan->scan.plan.qual=NIL; scan->scan.plan.initPlan=NIL;
+    scan->custom_scan_tlist=copyObject(native->targetlist);
+    scan->custom_plans=list_make1(native); scan->methods=&native_methods;
+    return (Plan *)scan;
+}
 Plan *pg_sina_native_plan(Plan *plan)
 {
+    if(!plan) return NULL;
     if(IsA(plan,CustomScan) && ((CustomScan *)plan)->methods==&native_methods) {
         Plan *native=linitial(((CustomScan *)plan)->custom_plans);
         native->initPlan=list_concat(plan->initPlan,native->initPlan);
         native->extParam=bms_union(native->extParam,plan->extParam);
         native->allParam=bms_union(native->allParam,plan->allParam);
-        return native;
+        return pg_sina_native_plan(native);
+    }
+    if(pg_sina_previewing_path) {
+        plan->lefttree=pg_sina_native_plan(plan->lefttree);
+        plan->righttree=pg_sina_native_plan(plan->righttree);
+        if(IsA(plan,SubqueryScan)) ((SubqueryScan *)plan)->subplan=pg_sina_native_plan(((SubqueryScan *)plan)->subplan);
     }
     return plan;
 }

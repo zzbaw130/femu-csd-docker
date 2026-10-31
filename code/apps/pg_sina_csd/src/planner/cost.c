@@ -1,4 +1,5 @@
-/* Bottom-up placement of the PG-selected tree. Costs are milliseconds.
+/* Compiled device costs and the legacy filter/forced subtree placement.
+ * SQLerate adds these costs to PG Paths in paths.c. Costs are milliseconds.
  * A device island starts at immutable base tables and returns rows to PG.
  * Host-produced intermediate rows cannot yet enter the device interpreter;
  * that edge has infinite cost, rather than pretending it is executable. */
@@ -45,7 +46,7 @@ static struct residency *residency(Oid oid,List **observations)
 {
     ListCell *c;
     foreach(c,*observations) { struct residency *r=lfirst(c); if(r->oid==oid) return r; }
-    struct residency *r=palloc0(sizeof(*r)); r->oid=oid;
+    struct residency *r=MemoryContextAllocZero(pg_sina_search_context(),sizeof(*r)); r->oid=oid;
     Relation rel=relation_open(oid,AccessShareLock);
     r->bytes=(double)RelationGetNumberOfBlocks(rel)*BLCKSZ;
     r->tuples=Max(1,rel->rd_rel->reltuples);
@@ -75,7 +76,9 @@ static struct residency *residency(Oid oid,List **observations)
     }
     r->fraction=seen?hit/seen:0;
     pfree(base); relation_close(rel,AccessShareLock);
-    *observations=lappend(*observations,r); return r;
+    MemoryContext previous=MemoryContextSwitchTo(pg_sina_search_context());
+    *observations=lappend(*observations,r);
+    MemoryContextSwitchTo(previous); return r;
 }
 static Oid scan_relation(PlannerInfo *root,Plan *p)
 {
@@ -84,6 +87,41 @@ static Oid scan_relation(PlannerInfo *root,Plan *p)
         if(r->rtekind==RTE_RELATION) return r->relid;
     }
     return InvalidOid;
+}
+/* Reuse the existing cache correction before PG compares HOST Paths. */
+double pg_sina_host_scan_cost(Oid oid,bool sequential,double rows,double cost,List **observations)
+{
+    struct residency *r=residency(oid,observations);
+    double read=r->bytes;
+    if(!sequential) read*=Min(1.0,Max(1,rows)/r->tuples*4);
+    return cost-Min(cost,read/BLCKSZ*seq_page_cost*pg_sina_host_cost_ms)*r->fraction+
+        transfer_ms(read*r->fraction,pg_sina_cache_mbps);
+}
+static double statement_cache_cost(Plan *p,List *rtable,List **observations,double repeats)
+{
+    if(!p) return 0;
+    double correction=0;
+    if(IsA(p,SeqScan) || IsA(p,IndexScan) || IsA(p,IndexOnlyScan) || IsA(p,BitmapHeapScan)) {
+        RangeTblEntry *r=rt_fetch(((Scan *)p)->scanrelid,rtable);
+        if(r->rtekind==RTE_RELATION) {
+            double cost=p->total_cost*pg_sina_host_cost_ms;
+            Oid oid=IsA(p,IndexOnlyScan)?((IndexOnlyScan *)p)->indexid:r->relid;
+            correction=(pg_sina_host_scan_cost(oid,IsA(p,SeqScan),p->plan_rows,cost,observations)-cost)*repeats;
+        }
+    }
+    correction+=statement_cache_cost(p->lefttree,rtable,observations,repeats);
+    double inner=IsA(p,NestLoop) && p->righttree && !IsA(p->righttree,Material)?Max(1,p->lefttree->plan_rows):1;
+    correction+=statement_cache_cost(p->righttree,rtable,observations,repeats*inner);
+    if(IsA(p,SubqueryScan)) correction+=statement_cache_cost(((SubqueryScan *)p)->subplan,rtable,observations,repeats);
+    if(IsA(p,CustomScan)) { ListCell *c; foreach(c,((CustomScan *)p)->custom_plans)
+        correction+=statement_cache_cost(lfirst(c),rtable,observations,repeats); }
+    return correction;
+}
+double pg_sina_host_statement_cost(PlannedStmt *stmt)
+{
+    List *observations=NIL;
+    return Max(0,stmt->planTree->total_cost*pg_sina_host_cost_ms+
+        statement_cache_cost(stmt->planTree,stmt->rtable,&observations,1));
 }
 /* HOST columns use physical scalar widths and variable-value offsets.
  * PG plan_width estimates average values; add the offset/null/header work
@@ -451,7 +489,10 @@ static void device_cost(struct placement *p,List **observations)
     if(scan->methods==&pg_sina_scan_methods) {
         fast_cost(p,(const struct qs_plan *)VARDATA(bytes),observations); return;
     }
-    struct qp_plan *tree=palloc0(sizeof(*tree)); memcpy(tree,VARDATA(bytes),VARSIZE_ANY_EXHDR(bytes));
+    /* Costing reads only the serialized header/nodes. Runtime file mappings
+     * and profiling arrays are not present in this planner representation. */
+    struct qp_plan *tree=palloc(VARSIZE_ANY_EXHDR(bytes));
+    memcpy(tree,VARDATA(bytes),VARSIZE_ANY_EXHDR(bytes));
     bool used[QP_NODES]={0},indexed[QP_NODES]={0}; used[tree->root]=true;
     for(unsigned i=0;i<tree->ninit;++i) used[tree->init_nodes[i]]=true;
     for(unsigned pass=0;pass<tree->count;++pass) for(unsigned i=0;i<tree->count;++i) if(used[i]) {
@@ -658,11 +699,7 @@ static struct placement *estimate(PlannerInfo *root,Plan *native,Plan *scope,Lis
     Oid oid=scan_relation(root,native);
     if(IsA(native,IndexOnlyScan)) oid=((IndexOnlyScan *)native)->indexid;
     if(OidIsValid(oid)) {
-        struct residency *r=residency(oid,observations);
-        double read=r->bytes;
-        if(!IsA(native,SeqScan)) read*=Min(1.0,Max(1,native->plan_rows)/r->tuples*4);
-        local-=Min(local,read/BLCKSZ*seq_page_cost*pg_sina_host_cost_ms)*r->fraction;
-        local+=transfer_ms(read*r->fraction,pg_sina_cache_mbps);
+        local=pg_sina_host_scan_cost(oid,IsA(native,SeqScan),native->plan_rows,local,observations);
     }
     p->host=local+best_children;
     p->native_host=local+native_children;
@@ -715,6 +752,43 @@ static void node_costs(struct placement *p,StringInfo text)
     ListCell *c;
     foreach(c,p->children) node_costs(lfirst(c),text);
 }
+static void annotate_device(struct placement *p)
+{
+    CustomScan *scan=(CustomScan *)p->device;
+    List *costs=list_make5(
+        makeFloat(psprintf("%.9g",p->host)),makeFloat(psprintf("%.9g",p->csd)),
+        makeFloat(psprintf("%.9g",p->boundary)),makeFloat(psprintf("%.9g",p->cache)),
+        makeFloat(psprintf("%.9g",p->spill)));
+    costs=lappend(costs,makeFloat(psprintf("%.9g",p->cpu)));
+    costs=lappend(costs,makeFloat(psprintf("%.9g",p->io)));
+    costs=lappend(costs,makeFloat(psprintf("%.9g",p->peak)));
+    costs=lappend(costs,makeFloat(psprintf("%.9g",p->population)));
+    costs=lappend(costs,makeFloat(psprintf("%.9g",p->serial)));
+    costs=lappend(costs,makeFloat(psprintf("%.9g",p->parallel)));
+    costs=lappend(costs,makeFloat(psprintf("%.9g",p->schedule)));
+    costs=lappend(costs,makeFloat(psprintf("%.9g",p->combine)));
+    costs=lappend(costs,makeFloat(psprintf("%.9g",p->dictionary)));
+    costs=lappend(costs,makeFloat(psprintf("%.9g",p->fdm)));
+    costs=lappend(costs,makeInteger(p->workers));
+    costs=lappend(costs,makeString(p->stages->data));
+    scan->custom_private=lappend(scan->custom_private,costs);
+}
+/* Cost the same compiled representation used by forced device execution.
+ * The caller keeps internal cost separate from the HOST delivery edge. */
+Plan *pg_sina_cost_device(PlannerInfo *root,Plan *native,bool top,List **observations,
+                         double *internal,double *boundary,StringInfo estimates)
+{
+    struct placement p={.native=native,.root=root,.host=native->total_cost*pg_sina_host_cost_ms};
+    if(!top && root->init_plans) return NULL;
+    p.device=top?pg_sina_fast_plan(root,native):NULL;
+    if(!p.device) p.device=pg_sina_compile_subtree(root,native,!top);
+    if(p.device==native || !p.device) return NULL;
+    device_cost(&p,observations);
+    annotate_device(&p);
+    *internal=p.csd; *boundary=p.boundary;
+    node_costs(&p,estimates);
+    return p.device;
+}
 static Plan *select_plan(struct placement *p,bool top,StringInfo decisions)
 {
     appendStringInfo(decisions,"%s%s:%s host=%.3f device=",decisions->len?"; ":"",
@@ -726,24 +800,7 @@ static Plan *select_plan(struct placement *p,bool top,StringInfo decisions)
         if(top && pg_sina_exe_path!=PG_SINA_FILTER) {
             p->root->init_plans=NIL;
         }
-        CustomScan *scan=(CustomScan *)out;
-        List *costs=list_make5(
-            makeFloat(psprintf("%.9g",p->host)),makeFloat(psprintf("%.9g",p->csd)),
-            makeFloat(psprintf("%.9g",p->boundary)),makeFloat(psprintf("%.9g",p->cache)),
-            makeFloat(psprintf("%.9g",p->spill)));
-        costs=lappend(costs,makeFloat(psprintf("%.9g",p->cpu)));
-        costs=lappend(costs,makeFloat(psprintf("%.9g",p->io)));
-        costs=lappend(costs,makeFloat(psprintf("%.9g",p->peak)));
-        costs=lappend(costs,makeFloat(psprintf("%.9g",p->population)));
-        costs=lappend(costs,makeFloat(psprintf("%.9g",p->serial)));
-        costs=lappend(costs,makeFloat(psprintf("%.9g",p->parallel)));
-        costs=lappend(costs,makeFloat(psprintf("%.9g",p->schedule)));
-        costs=lappend(costs,makeFloat(psprintf("%.9g",p->combine)));
-        costs=lappend(costs,makeFloat(psprintf("%.9g",p->dictionary)));
-        costs=lappend(costs,makeFloat(psprintf("%.9g",p->fdm)));
-        costs=lappend(costs,makeInteger(p->workers));
-        costs=lappend(costs,makeString(p->stages->data));
-        scan->custom_private=lappend(scan->custom_private,costs);
+        annotate_device(p);
         return out;
     }
     Plan *out=p->native; ListCell *c;
@@ -835,15 +892,18 @@ Plan *pg_sina_adaptive_plan(PlannerInfo *root,Plan *native)
     StringInfoData costs; initStringInfo(&costs); node_costs(p,&costs);
     Plan *out=select_plan(p,true,&decisions);
     if(pg_sina_exe_path!=PG_SINA_ADAPTIVE) return out;
+    out->total_cost=(p->offload?p->csd+p->boundary:p->host)/pg_sina_host_cost_ms;
+    return pg_sina_wrap_placement(out,decisions.data,costs.data);
+}
+Plan *pg_sina_wrap_placement(Plan *out,const char *decisions,const char *costs)
+{
     CustomScan *scan=makeNode(CustomScan); scan->scan.plan=*out;
     NodeSetTag(scan,T_CustomScan);
     scan->scan.plan.lefttree=scan->scan.plan.righttree=NULL; scan->scan.plan.qual=NIL;
     scan->scan.plan.initPlan=NIL;
     scan->scan.plan.parallel_safe=scan->scan.plan.parallel_aware=false;
-    scan->scan.plan.startup_cost=0;
-    scan->scan.plan.total_cost=(p->offload?p->csd+p->boundary:p->host)/pg_sina_host_cost_ms;
     scan->custom_scan_tlist=copyObject(out->targetlist);
-    scan->custom_plans=list_make1(out); scan->custom_private=list_make2(makeString(decisions.data),makeString(costs.data));
+    scan->custom_plans=list_make1(out); scan->custom_private=list_make2(makeString(pstrdup(decisions)),makeString(pstrdup(costs)));
     scan->methods=&pg_sina_adaptive_methods;
     return (Plan *)scan;
 }

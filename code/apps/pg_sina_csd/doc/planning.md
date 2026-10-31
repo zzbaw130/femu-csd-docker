@@ -1,12 +1,18 @@
 # SQLerate 节点级路径规划
 
-Guest PG 负责 SQL 解析、去关联和连接顺序。`src/planner/cost.c` 在 PG 选中物理树后，对节点逐层估计 HOST 和 CSD 成本，不按 TPC-H 查询编号选择路径。设备仍只接收通用 SNIA 请求/设备图，不参与 SQL 成本规划。
+Guest PG 负责 SQL 解析、去关联和合法连接枚举。SQLerate 的 `src/planner/paths.c` 通过 PG 的扫描、连接和上层 Path hook 加入设备候选；`cost.c` 对编译后的设备表示计价。PG 在路径比较阶段就能看到设备输入成本，不再先固定一棵 HOST 树再做选址。设备仍只接收通用 SNIA 请求/设备图，不参与 SQL 成本规划。
 
-设备编译保留 PG 的关系配对与连接层次；INNER Hash Join 可参考 DuckDB 按估计行数×行宽交换 build/probe，避免把较宽的输入构建为哈希表。这里不重新关联多表连接，也不改变 HOST 原生计划。RIGHT JOIN 在设备计划中交换两侧，复用 LEFT JOIN 的匹配与 NULL 补齐，表达式按交换后的输入重新绑定，输出列仍遵循原计划。
+参考 DuckDB 按关系集合枚举/比较子树的做法，复用 PG 已完成的连接合法性判断：每次 PG 提供一个合法的 outer/inner 关系组合，除其 Index/Merge/Hash 候选外，再组合两侧保留的最佳完整设备子树，生成设备 Hash Join 候选。设备编译再按行数×行宽调整 build/probe；RIGHT JOIN 复用 LEFT JOIN 的匹配与 NULL 补齐。没有另写一套关系合法性搜索，也不声称穷尽 PG 已剪枝、GEQO 未访问或当前编译器不支持的候选。
+
+当前每个关系集合单独保留一份内部成本最低的设备子树；交付给 HOST 的候选仍由 PG 按成本、顺序等属性剪枝。这不是同时枚举所有内存峰值、启动延迟和有序性的多目标最优搜索。
+
+SQLerate 保留三类完整候选：原始 Query 的原生 HOST 计划、将该 PG 优选树转换后的完整 CSD 计划（能编译时），以及安全改写 Query 后的 HOST/CSD 共享 Path 搜索结果。最后统一按毫秒比较。保留第二项是为了防止共享搜索提前剪枝时丢失原先完整卸载使用的物理树。设备子树均先编译后计价，不以 PG Join 节点名称直接猜测设备算法。
+
+去关联修改的是解析后的 Query 对象，不是 SQL 文本。改写 Query 的 HOST 路径与 CSD 路径参与同一次搜索，因此 HOST 同样可以享受改写；原始 HOST 候选则确保该改写不是强制替代。`host-only` 不调用扩展去关联，以保留原生 PG 对照。
 
 ## 两种候选状态
 
-对节点 v，H(v) 表示该节点在 HOST 执行、其子树可按成本选址；D(v) 表示以 v 为根的完整子树在 CSD 内执行，结果尚未回到 HOST。边界成本 B(v) 是把 CSD 结果返回 PG、转换为 Datum 的成本。
+对同一个关系集合/上层结果，H 表示 PG 的 HOST Path（输入可来自设备）；D 表示完整设备子树，结果尚未回到 HOST。边界成本 B 是返回 PG 并转换为 Datum 的成本。以下仍是选址的简化递推，但现在 PG 同时枚举不同连接配对和 HOST 算法，不只比较一棵固定物理树的节点。
 
 ```text
 H(v) = HOST 本节点成本 + Σ min(H(child), D(child) + B(child))
@@ -16,7 +22,7 @@ D(v) = 可编译的设备子树的内部 I/O + CU 计算 + spill + 未被覆盖�
 
 每个位置必须先通过现有算子编译器的语义与映射检查。HOST 结果行重新送入设备解释器尚未实现，故 HOST→CSD 中间行边界为不可行；不能假定它已经能运行。CSD 候选从已准备的基表/索引开始，可有多个独立子树向 HOST 的 Join、Aggregate、Sort 等返回数据。返回位置遵守 PG 的目标列、顺序、NULL 与表达式语义，子树边界保留索引/排序顺序。HOST Hash Join 的 Hash 子节点必须保留 MultiExec 接口；Merge Join 需要标记/恢复的内侧节点也保留在 HOST，它们下方仍可接入 CSD 输入。
 
-PG Gather/GatherMerge 的 HOST 区域保留原并行执行，内部 HOST 成本仍递归观察缓存；SQLerate 不单独替换其 worker 扫描，若整个区域可编译，则可整体卸载。`filter-only` 的共享设备扫描在查询主进程初始化，随后由 SNIA 完成回调推进，直接填入两个有界 HOST 批次；PG 原生 workers 仅消费数据、执行 HOST 算子，不申请 AFDM 或续交设备请求，没有“PG 提交者”选举。Gather 下需要完整重读的私有 Scan 留在 HOST，并行索引扫描保留原生分片/顺序语义。PG 上层 Partial/Final Aggregate、Gather 和 Join 的原有并行保留，执行与验证见 [filter-only 执行](filter-only.md)。
+设备 CustomPath 不标记为 parallel-safe，不放进 PG worker 私有/共享扫描中；原生 PG partial Path 和 Gather/GatherMerge 仍参与搜索，完整区域可编译时也可整体卸载。设备内部候选按不含返回边界的成本单独保留，不能仅因中间结果返回很贵就丢弃其与上层继续融合的机会。`filter-only` 保持既有共享设备扫描和原生并行边界，见 [filter-only 执行](filter-only.md)。
 
 `csd-without-hpcp` 和 `csd-with-hpcp` 不按成本拒绝已支持的完整子树；完整编译失败时继续寻找可卸载的子树。不支持的语义继续由 PG 执行。`host-only` 不加设备节点或 SQLerate 外层节点。
 
@@ -24,7 +30,7 @@ PG Gather/GatherMerge 的 HOST 区域保留原并行执行，内部 HOST 成本�
 
 所有 SQLerate 成本以毫秒表示，和 EXPLAIN 原有 PG cost 单位区分。
 
-- **HOST**：以 PG 节点增量成本为基础，减去子树避免重复计费。Nested Loop 对重复内侧执行估计重复次数。扫描按文件缓存驻留比例减少存储读取成本、加入缓存扫描成本。
+- **HOST**：复用 PG 的 Path 成本计算；把设备输入的成本换算成 PG 单位后，PG 正常重算各 Join/上层候选。扫描在加入路径比较前按现有公式修正文件缓存驻留；原始 HOST 对照不修改其物理计划，仅在最终比较时做同样的缓存成本修正。Nested Loop 内侧重复、Gather、Hash 构建等继续由 PG 路径模型处理。
 - **缓存**：规划时按关系文件段只读建立 PROT_NONE 映射并调用 mincore，不读取 Heap。观察结果只在本次规划内复用，不保存在跨查询全局缓存。它是 Guest OS 文件页缓存的快照，不是精确的 PG shared_buffers 命中率，也不保证执行时页面仍驻留。
 - **设备资源**：通过现有 SNIA 查询 CU/FDM，并调用已有 workmem 容量 CSF 读取计算内存。设备 CPU 成本按串行、可并行任务波次、调度和合并阶段分别估计；结合 4/2/1MiB 输入和列向量/控制/结果缓冲估计 FDM 可支撑的并行度。排序归并等串行阶段不按全部 CU 数等比例缩短。
 - **内部 I/O**：按估计的 Heap/索引读取字节和内部带宽计费；不是再加一次主机 NVMe Read。索引估计目前是按行选择率、物理页面和索引大小推算，不是逐页执行模拟。
@@ -345,3 +351,23 @@ Q2的原生SubPlan索引条件仍引用外层`part.p_partkey`，完整CSD模式�
 使用`N.sql`比较两侧对同一改写后计划的执行性能；验证扩展自身去相关能力时，显式用现有`cold-query.sh`运行`N.original.sql`，计划用`N.original.explain.sql`检查。不得将默认SQL中预先做好的去相关当成扩展收益。原始备份保持原始结构及相同参数，不回添非标准LIMIT。
 
 核对全部22条与最初导入版本及本地dbgen模板，除Q17/Q20外没有发现额外的手工结构改写。其他差异是参数化日期写法和非标准LIMIT修正；Q15的创建/删除视图属于原TPC-H写法，DuckDB模板的CTE是其自身适配，不因此替换本项目Q15或新增重复备份。本次只做文件一致性及针对性EXPLAIN检查，不重跑性能基准。
+
+## HOST/CSD 共享路径搜索验证
+
+本阶段只修改 Guest 扩展的规划结构，不改变 SNIA、固件、设备算子或设备成本系数。候选预览使用隔离的 PG 规划状态；落选候选的编译内存在临时 MemoryContext 中回收，只保留原生计划与成本信息，最终选中后重新编译。表映射在一次搜索内按关系/文件节点复用，搜索结束即失效，避免为重叠子树反复执行同一 SPI 查询。
+
+已有 HeapLayout、PlannerCost 两个 CTest 通过。新增 `tests/guest/planner-path-test.sh` 只执行正式查询的 EXPLAIN：昂贵设备选 HOST、便宜设备可选 CSD；原始 Q17 的 host-only 保留 SubPlan，而昂贵设备条件下 SQLerate 选择去相关后的全 HOST；原始 Q17/Q20 的设备候选可生成。最终结构记录为 `results/planner-paths.AEuDWW/`。
+
+原始相关语句的执行验证在 `results/planner-rewrite.fOnfKR/`：Q17/Q20 的 original SQL 经 SQLerate 改写后与同参数默认等价 SQL 的 HOST 输出一致；Q17 还提高设备 CPU 成本，实际选择无 CSD 节点的改写 HOST 计划，结果同样一致。这是改写正确性验证，不将不同结构 SQL 的计时作为原生相关查询的性能对照。
+
+针对性冷启动结果如下，4 CU、256MiB workmem、64MiB FDM，PG 参数仍为4 worker上限/2GB shared_buffers/16MB work_mem；只使用编号 SQL，各模式结果均一致、实际 spill 均为0。Q2/Q9 来自 `results/tpch.92vGb7/`，其余三条来自同阶段 `results/tpch.urb67t/`；不声称是全量或多轮统计。
+
+| 查询 | HOST ms | 强制 CSD+HPCP ms | SQLerate ms | SQLerate 执行器 ms | 选中路径 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Q2 | 915.930 | 335.417 | 615.749 | 258.681 | HOST Limit，其余 CSD，共享搜索 |
+| Q9 | 2559.128 | 1150.805 | 1346.266 | 1096.984 | 原 PG 优选树的完整 CSD 转换 |
+| Q11 | 447.557 | 293.442 | 262.445 | 183.293 | 原 PG 优选树的完整 CSD 转换，含初始化 |
+| Q13 | 2651.835 | 471.410 | 485.838 | 407.977 | 原 PG 优选树的完整 CSD 转换 |
+| Q18 | 8530.768 | 862.003 | 971.767 | 801.938 | 共享搜索的完整 CSD 树 |
+
+执行器数值来自本轮关闭逐节点 TIMING 的 auto_explain。总耗时减执行器耗时还包含规划、初始化、协议和日志交付，不能直接命名为 Planning Time。Q9/Q2 的规划时映射查询已分别限制到12/5次，但复杂候选搜索仍有明显额外成本：两条总耗时与执行器之差约249/357ms，不能再假定 SQLerate 只增加固定20ms。结构与结果检查通过，不代表已达到最小实测延迟；设备估价和搜索开销后续仍需校准、精简。本阶段没有重跑完整 TPC-H。

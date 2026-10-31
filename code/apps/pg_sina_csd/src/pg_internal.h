@@ -2,6 +2,7 @@
 #define PG_SINA_INTERNAL_H
 #include "postgres.h"
 #include "nodes/extensible.h"
+#include "lib/stringinfo.h"
 #include "query.h"
 #include "plan.h"
 extern int pg_sina_exe_path;
@@ -28,6 +29,20 @@ static inline uint64_t pg_sina_query_memory(void)
     return pg_sina_max_memory?Min(physical,(uint64_t)pg_sina_max_memory*1024):physical;
 }
 extern bool pg_sina_compiling_plan;
+/* Query-local Path search; the pointer is saved/restored around planner hooks. */
+extern struct pg_sina_path_search *pg_sina_path_search;
+extern bool pg_sina_native_search, pg_sina_previewing_path;
+void pg_sina_start_path_search(void);
+MemoryContext pg_sina_search_context(void);
+PlannedStmt *pg_sina_original_device_statement(PlannedStmt *);
+bool pg_sina_prepared_device(Oid,Oid,char *,size_t);
+void pg_sina_rel_paths(PlannerInfo *,RelOptInfo *,Index,RangeTblEntry *);
+void pg_sina_join_paths(PlannerInfo *,RelOptInfo *,RelOptInfo *,RelOptInfo *,JoinType,JoinPathExtraData *);
+void pg_sina_search_upper_paths(PlannerInfo *,UpperRelationKind,RelOptInfo *,RelOptInfo *);
+Plan *pg_sina_cost_device(PlannerInfo *,Plan *,bool,List **,double *,double *,StringInfo);
+double pg_sina_host_scan_cost(Oid,bool,double,double,List **);
+double pg_sina_host_statement_cost(PlannedStmt *);
+Plan *pg_sina_wrap_placement(Plan *,const char *,const char *);
 extern const CustomScanMethods pg_sina_scan_methods;
 extern const CustomScanMethods pg_sina_order_methods;
 struct pg_sina_stream;
@@ -41,6 +56,7 @@ void pg_sina_explain_placement(CustomScan *,ExplainState *);
 extern const CustomScanMethods pg_sina_adaptive_methods;
 Plan *pg_sina_fast_plan(PlannerInfo *,Plan *);
 Plan *pg_sina_native_plan(Plan *);
+Plan *pg_sina_native_wrapper(Plan *);
 extern const CustomScanMethods pg_sina_plan_methods;
 struct qs_extent *pg_sina_mapping(struct qs_request *request);
 void pg_sina_execute(struct qs_request *,struct qs_extent *,struct qs_result *,bool,struct pg_sina_stream **);

@@ -12,11 +12,13 @@
 | `filter-only` | 支持的基表扫描及过滤在 CSD，其余在 PG | 关闭 |
 | `csd-without-hpcp` | 尽可能完整卸载，未支持的节点在 PG | 关闭 |
 | `csd-with-hpcp` | 同上 | 开启 |
-| `SQLerate` | 对 PG 选中的树自底向上比较 HOST/CSD 成本，选择可执行的混合计划 | CSD 子树开启 |
+| `SQLerate` | 将 HOST/CSD 候选加入 PG 的扫描、连接及上层路径搜索，选择混合计划 | CSD 子树开启 |
 
 HPCP 全称 **Host Page Cache Population（主机页缓存填充）**。它把设备读入的数据填充到 Guest 文件页缓存；两种 CSD 模式目前都从内部 NVM 读入 FDM，不会因为命中主机缓存就默认上传。SQLerate 会考虑缓存驻留对 HOST 成本的影响。成本公式、参数及当前执行边界见 [规划说明](doc/planning.md)。
 
-非 `host-only` 模式保留 PG 选定的连接顺序。完整卸载和 SQLerate 在规划前进行已支持的安全子查询去关联；`filter-only` 保留原 SQL，仅转换支持的扫描叶节点，不卸载 Join、Aggregate 或 Sort。
+两种强制完整卸载模式保留 PG 选定的连接顺序。SQLerate 在 PG 枚举合法连接组合时加入设备子树，因此设备成本能影响连接顺序，HOST 上层也能根据设备输入重新选择算法；仍受 PG 的合法性、路径剪枝和 GEQO 范围限制。
+
+去关联改写的是解析后的 `Query` 树，不修改 SQL 文件。SQLerate 同时保留原始 Query 的原生 HOST 计划、该 PG 优选树可转换的完整 CSD 计划，并与经过安全改写的 HOST/CSD 共享搜索结果比较。改写后的树同样允许全部由 HOST 执行；不把去关联当成仅供 CSD 使用的优化。`host-only` 始终是未经扩展改写的原生 PG 基线。`filter-only` 也保留原始 Query，仅转换支持的扫描叶节点。
 
 `filter-only` 只解码、返回 HOST 后续节点需要的列，使用设备多 CU 扫描过滤，并保留 PG 原生并行聚合/连接。parallel-aware 顺序扫描通过 PG 共享计数器分配不同输入块，不重复返回整表。结果按实际列数打包，直接构造 PG Numeric；实现及针对性测量见 [filter-only 执行](doc/filter-only.md)。
 
