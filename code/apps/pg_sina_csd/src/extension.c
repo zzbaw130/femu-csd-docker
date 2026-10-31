@@ -13,6 +13,7 @@ int pg_sina_exe_path = 0;
 bool pg_sina_profile = false;
 int pg_sina_max_memory = 0; /* KiB; 0 uses the device workmem capacity. */
 bool pg_sina_compiling_plan = false;
+struct pg_sina_planner_profile *pg_sina_planning;
 static create_upper_paths_hook_type previous_upper_hook;
 static planner_hook_type previous_planner_hook;
 static set_rel_pathlist_hook_type previous_rel_hook;
@@ -28,27 +29,38 @@ static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,Param
     /* SPI mapping lookups are PG queries too, not new placement searches. */
     if(pg_sina_compiling_plan || parse->commandType!=CMD_SELECT || parse->hasModifyingCTE)
         return plan_query(parse,cursorOptions,boundParams);
+    struct pg_sina_planner_profile counters={0},*saved_profile=pg_sina_planning;
+    pg_sina_planning=pg_sina_profile && pg_sina_exe_path==PG_SINA_ADAPTIVE?&counters:NULL;
+    double started=pg_sina_planner_clock(),mark=started;
     Query *volatile query=parse;
-    if(pg_sina_exe_path>=PG_SINA_CSD) {
-        Query *candidate=copyObject(parse);
-        if(pg_sina_rewrite_query(candidate)) query=candidate;
-    }
     struct pg_sina_path_search *saved=pg_sina_path_search;
     bool native_search=pg_sina_native_search;
     PlannedStmt *volatile plan=NULL;
     PG_TRY();
     {
+        if(pg_sina_exe_path>=PG_SINA_CSD) {
+            Query *candidate=copyObject(parse);
+            if(pg_sina_rewrite_query(candidate)) query=candidate;
+        }
+        if(pg_sina_planning) counters.rewrite=pg_sina_planner_clock()-mark;
         PlannedStmt *host=NULL,*original_device=NULL; double host_cost=0;
         if(pg_sina_exe_path==PG_SINA_ADAPTIVE) {
             pg_sina_start_path_search();
             pg_sina_native_search=true;
+            mark=pg_sina_planner_clock();
             host=plan_query(copyObject(parse),cursorOptions,boundParams);
+            if(pg_sina_planning) counters.native_pg=pg_sina_planner_clock()-mark;
+            mark=pg_sina_planner_clock();
             original_device=pg_sina_original_device_statement(host);
+            if(pg_sina_planning) counters.stmt_copy=pg_sina_planner_clock()-mark;
+            mark=pg_sina_planner_clock();
             host_cost=pg_sina_host_statement_cost(host);
-            pg_sina_start_path_search();
+            if(pg_sina_planning) counters.host_cache=pg_sina_planner_clock()-mark;
             pg_sina_native_search=false;
         }
+        mark=pg_sina_planner_clock();
         plan=plan_query(query,cursorOptions,boundParams);
+        if(pg_sina_planning) counters.adaptive_pg=pg_sina_planner_clock()-mark;
         if(host) {
             double candidate=plan->planTree->total_cost*pg_sina_host_cost_ms;
             double original_cost=original_device?original_device->planTree->total_cost*pg_sina_host_cost_ms:DBL_MAX;
@@ -63,9 +75,20 @@ static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,Param
         }
     }
     PG_CATCH();
-    { pg_sina_path_search=saved; pg_sina_native_search=native_search; PG_RE_THROW(); }
+    { pg_sina_path_search=saved; pg_sina_native_search=native_search; pg_sina_planning=saved_profile; PG_RE_THROW(); }
     PG_END_TRY();
     pg_sina_path_search=saved; pg_sina_native_search=native_search;
+    if(pg_sina_planning) {
+        double total=pg_sina_planner_clock()-started;
+        double other=total-counters.rewrite-counters.preview-counters.compile-counters.estimate-
+            counters.format-counters.retain-counters.host_cache-counters.stmt_copy;
+        pg_sina_planning=saved_profile;
+        ereport(NOTICE,(errmsg("SQLerate planner total_ms=%.3f pg_other_ms=%.3f rewrite_ms=%.3f preview_ms=%.3f compile_ms=%.3f estimate_ms=%.3f format_ms=%.3f retain_ms=%.3f host_cache_ms=%.3f stmt_copy_ms=%.3f native_pg_inclusive_ms=%.3f adaptive_pg_inclusive_ms=%.3f candidates=%u accepted=%u index_calls=%u index_queries=%u index_inclusive_ms=%.3f resources_inclusive_ms=%.3f",
+            total,other,counters.rewrite,counters.preview,counters.compile,counters.estimate,counters.format,
+            counters.retain,counters.host_cache,counters.stmt_copy,counters.native_pg,counters.adaptive_pg,
+            counters.candidates,counters.accepted,counters.index_calls,counters.index_queries,counters.indexes,counters.resources)));
+    }
+    pg_sina_planning=saved_profile;
     return plan;
 }
 static void upper_hook(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *input,RelOptInfo *output,void *extra)
@@ -126,7 +149,7 @@ void _PG_init(void)
 {
     DefineCustomEnumVariable("pg_sina_csd.exe_path", "Choose SQLerate placement and HPCP policy", NULL,
         &pg_sina_exe_path, 0, execution_paths, PGC_USERSET, 0, NULL, assign_path, NULL);
-    DefineCustomBoolVariable("pg_sina_csd.profile", "Collect device operator timings for EXPLAIN ANALYZE", NULL,
+    DefineCustomBoolVariable("pg_sina_csd.profile", "Collect planner and device operator timings", NULL,
         &pg_sina_profile, false, PGC_USERSET, 0, NULL, NULL, NULL);
     DefineCustomIntVariable("pg_sina_csd.max_memory", "Maximum device work memory per query", NULL,
         &pg_sina_max_memory, 0, 0, MAX_KILOBYTES, PGC_USERSET, GUC_UNIT_KB, check_memory, assign_memory, NULL);

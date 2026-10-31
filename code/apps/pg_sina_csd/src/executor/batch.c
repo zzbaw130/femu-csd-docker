@@ -93,6 +93,7 @@ void pg_sina_read_resources(const char *path)
 {
     static char cached_device[128];
     if(pg_sina_resources.workmem_bytes && !strcmp(cached_device,path)) return;
+    double started=pg_sina_planner_clock();
     CS_DEV_HANDLE device=NULL;
     struct program probe={.file="pg-sina-plan.so",.symbol="pg_sina_workmem_capacity",.index=pg_sina_program_index(511)};
     CsProperties *cus=NULL,*fdm=NULL; u64 bytes=0;
@@ -118,6 +119,7 @@ void pg_sina_read_resources(const char *path)
     RESUME_INTERRUPTS(); CHECK_FOR_INTERRUPTS();
     if(status!=CS_SUCCESS) elog(ERROR,"CSD resource query failed: status=%d",status);
     pg_sina_resources=found; strlcpy(cached_device,path,sizeof(cached_device));
+    if(pg_sina_planning) pg_sina_planning->resources+=pg_sina_planner_clock()-started;
 }
 static void compute_request(CsBatchRequest *b,CS_CSF_ID function,CS_MEM_HANDLE *memories,unsigned count,CS_MEM_HANDLE counters)
 {

@@ -169,6 +169,7 @@ static int expression(struct binding *b,Node *node)
             list_nth(b->root->glob->subplans,sub->plan_id-1),b->tree);
         if(id<0 || b->tree->count==QP_NODES || b->tree->ninit==QP_PARAMS) return -1;
         unsigned set=b->tree->count++; struct qp_node *n=&b->tree->nodes[set];
+        memset(n,0,sizeof(*n));
         n->kind=QP_SET; n->left=id; n->right=-1; n->expr=b->tree->nodes[id].expr;
         unsigned init=b->tree->ninit++; b->tree->init_nodes[init]=set; b->tree->init_params[init]=-1;
         e.op=QP_INSET; e.column=set; return add_expr(p,e);
@@ -378,15 +379,36 @@ static Node *index_params(Node *node,List *params)
     }
     return expression_tree_mutator(node,index_params,params);
 }
+struct planned_index {
+    Oid indexid,heap;
+    int attnum;
+    bool found,described; /* A mapped row can exist while live-index checks reject it. */
+    uint32 indexnode,indexroot;
+    uint8 key_bytes;
+};
 static bool index_metadata(Oid indexid,Oid heap,int attnum,struct qs_join *j)
 {
+    double started=pg_sina_planner_clock();
+    if(pg_sina_planning) ++pg_sina_planning->index_calls;
+    List **cached=pg_sina_search_index_metadata(); ListCell *c;
+    if(cached) foreach(c,*cached) {
+        const struct planned_index *m=lfirst(c);
+        if(m->indexid!=indexid || m->heap!=heap || m->attnum!=attnum) continue;
+        if(m->described) {
+            j->indexid=indexid; j->indexnode=m->indexnode; j->indexroot=m->indexroot; j->index_key_bytes=m->key_bytes;
+        }
+        if(pg_sina_planning) pg_sina_planning->indexes+=pg_sina_planner_clock()-started;
+        return m->found;
+    }
     Oid ns=get_namespace_oid("sina_csd",true);
     if(!OidIsValid(ns) || !OidIsValid(get_relname_relid("indexes",ns))) return false;
     if(SPI_connect()!=SPI_OK_CONNECT) elog(ERROR,"SPI_connect failed");
+    if(pg_sina_planning) ++pg_sina_planning->index_queries;
     Oid types[]={OIDOID,OIDOID,INT2OID};
     Datum values[]={ObjectIdGetDatum(indexid),ObjectIdGetDatum(heap),Int16GetDatum(attnum)};
     int status=SPI_execute_with_args("SELECT r.relfilenode,i.root,i.key_bytes FROM sina_csd.indexes i JOIN sina_csd.relations r ON r.relid=i.indexid WHERE i.indexid=$1 AND i.heaprelid=$2 AND i.attnum=$3",3,types,values,NULL,true,1);
     bool found=status==SPI_OK_SELECT && SPI_processed==1;
+    bool described=found;
     if(found) {
         bool null; HeapTuple t=SPI_tuptable->vals[0]; TupleDesc d=SPI_tuptable->tupdesc;
         j->indexid=indexid; j->indexnode=DatumGetObjectId(SPI_getbinval(t,d,1,&null));
@@ -397,7 +419,16 @@ static bool index_metadata(Oid indexid,Oid heap,int attnum,struct qs_join *j)
             !RelationGetIndexPredicate(index) && !RelationGetIndexExpressions(index);
         relation_close(index,NoLock);
     }
-    SPI_finish(); return found;
+    SPI_finish();
+    if(cached) {
+        MemoryContext previous=MemoryContextSwitchTo(pg_sina_search_context());
+        struct planned_index *m=palloc0(sizeof(*m));
+        m->indexid=indexid; m->heap=heap; m->attnum=attnum; m->found=found; m->described=described;
+        if(described) { m->indexnode=j->indexnode; m->indexroot=j->indexroot; m->key_bytes=j->index_key_bytes; }
+        *cached=lappend(*cached,m); MemoryContextSwitchTo(previous);
+    }
+    if(pg_sina_planning) pg_sina_planning->indexes+=pg_sina_planner_clock()-started;
+    return found;
 }
 /* Preserve a parameterized PG B-tree lookup at any depth in the join tree.
  * Outer-dependent inner filters become this join's residual, not scan filters. */
@@ -870,7 +901,8 @@ static int ordered_heap_scan(struct binding *b,struct qp_plan *tree,unsigned id,
     if(index->rd_rel->relam!=BTREE_AM_OID || RelationGetIndexPredicate(index) || RelationGetIndexExpressions(index) ||
        index->rd_index->indnkeyatts>QS_OUT) { relation_close(index,NoLock); return -1; }
     unsigned out=tree->count++,original=b->node->expr.nout;
-    struct qp_node *sort=&tree->nodes[out]; sort->kind=QP_SORT; sort->left=id; sort->right=-1;
+    struct qp_node *sort=&tree->nodes[out];
+    memset(sort,0,sizeof(*sort)); sort->kind=QP_SORT; sort->left=id; sort->right=-1;
     sort->expr.predicate=-1; sort->expr.limit=-1;
     struct qs_plan *scan=&b->node->expr;
     for(int k=0;k<index->rd_index->indnkeyatts;++k) {
@@ -901,7 +933,8 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
 {
     if(!native || tree->count==QP_NODES || native->initPlan) return -1;
     unsigned id=tree->count++;
-    struct qp_node *n=&tree->nodes[id]; n->left=n->right=-1; n->join_qual=-1;
+    struct qp_node *n=&tree->nodes[id]; memset(n,0,sizeof(*n));
+    n->left=n->right=-1; n->join_qual=-1;
     struct qs_plan *p=&n->expr; p->predicate=p->having=-1; p->limit=-1; n->estimated_rows=native->plan_rows;
     struct binding b={.root=root,.plan=native,.node=n,.tree=tree};
     Plan *left=native->lefttree,*right=native->righttree;
@@ -965,7 +998,8 @@ static int compile_node(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool
             materialized=tree->count++; tree->cte_nodes[cte->ctePlanId-1]=materialized;
             int child=compile_tree(list_nth(root->glob->subroots,cte->ctePlanId-1),left,tree);
             if(child<0) return -1;
-            struct qp_node *m=&tree->nodes[materialized]; m->kind=QP_MATERIALIZED; m->left=child; m->right=-1; m->expr=tree->nodes[child].expr;
+            struct qp_node *m=&tree->nodes[materialized]; memset(m,0,sizeof(*m));
+            m->kind=QP_MATERIALIZED; m->left=child; m->right=-1; m->expr=tree->nodes[child].expr;
         }
         n->left=materialized;
     } else if(IsA(native,Result) || IsA(native,Gather) || IsA(native,GatherMerge) || IsA(native,Material) || IsA(native,Hash))
@@ -1274,7 +1308,10 @@ Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
         if(IsA(native,IndexScan) && scan_parameter((Node *)((IndexScan *)native)->indexqualorig,&parameters)) return native;
         if(IsA(native,IndexOnlyScan) && scan_parameter((Node *)((IndexOnlyScan *)native)->indexqual,&parameters)) return native;
     }
-    struct qp_plan *tree=palloc0(sizeof(*tree));
+    /* Nodes are initialized when appended. Clearing the complete runtime
+     * record (96 nodes plus execution-only arrays) for every Path is costly. */
+    struct qp_plan *tree=palloc(sizeof(*tree));
+    memset(tree,0,offsetof(struct qp_plan,nodes));
     for(unsigned i=0;i<QP_PARAMS;++i) tree->param_nodes[i]=tree->cte_nodes[i]=-1;
     ListCell *c;
     foreach(c,parameters.values) {

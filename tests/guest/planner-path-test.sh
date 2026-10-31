@@ -1,5 +1,5 @@
 #!/bin/sh
-# Only planning structure: canonical SQL is never edited or executed here.
+# Planning only: canonical SQL plus a small MATERIALIZED CTE regression.
 set -eu
 PG=/home/femu/opt/postgres/release/bin/psql
 QUERIES=/home/femu/tests/queries
@@ -18,6 +18,9 @@ grep -q 'Custom Scan (SniaCsd' "$OUT/cheap.plan"
 grep -q 'original HOST=.*original CSD=.*shared search=' "$OUT/cheap.plan"
 plan 9 SQLerate joins
 grep -q 'CSD Stage Estimates:.*Join' "$OUT/joins.plan"
+if grep -q 'SQLerate planner total_ms=' "$OUT/joins.err"; then exit 1; fi
+plan 9 SQLerate timed 'SET pg_sina_csd.profile=on'
+grep -q 'SQLerate planner total_ms=.*compile_ms=.*estimate_ms=' "$OUT/timed.err"
 # A common rewrite may also produce a better HOST candidate. It must not
 # silently replace the original native-PG baseline or require a CSD operator.
 plan 17.original host-only original
@@ -30,4 +33,9 @@ for query in 17.original 20.original; do
     grep -q 'Custom Scan (SniaCsd' "$OUT/$query.plan"
     grep -q 'original HOST=' "$OUT/$query.plan"
 done
+"$PG" -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
+    -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path='SQLerate'" \
+    -c 'EXPLAIN WITH x AS MATERIALIZED (SELECT p_partkey FROM part WHERE p_partkey <= 4) SELECT count(*) FROM x' \
+    > "$OUT/cte.plan" 2> "$OUT/cte.err"
+grep -q 'Custom Scan (SQLeratePlan)' "$OUT/cte.plan"
 echo "Planner Path regression passed: $OUT"

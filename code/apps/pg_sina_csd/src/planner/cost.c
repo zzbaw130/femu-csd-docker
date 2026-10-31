@@ -120,8 +120,9 @@ static double statement_cache_cost(Plan *p,List *rtable,List **observations,doub
 double pg_sina_host_statement_cost(PlannedStmt *stmt)
 {
     List *observations=NIL;
+    List **shared=pg_sina_search_observations();
     return Max(0,stmt->planTree->total_cost*pg_sina_host_cost_ms+
-        statement_cache_cost(stmt->planTree,stmt->rtable,&observations,1));
+        statement_cache_cost(stmt->planTree,stmt->rtable,shared?shared:&observations,1));
 }
 /* HOST columns use physical scalar widths and variable-value offsets.
  * PG plan_width estimates average values; add the offset/null/header work
@@ -780,13 +781,19 @@ Plan *pg_sina_cost_device(PlannerInfo *root,Plan *native,bool top,List **observa
 {
     struct placement p={.native=native,.root=root,.host=native->total_cost*pg_sina_host_cost_ms};
     if(!top && root->init_plans) return NULL;
+    double mark=pg_sina_planner_clock();
     p.device=top?pg_sina_fast_plan(root,native):NULL;
     if(!p.device) p.device=pg_sina_compile_subtree(root,native,!top);
+    if(pg_sina_planning) pg_sina_planning->compile+=pg_sina_planner_clock()-mark;
     if(p.device==native || !p.device) return NULL;
+    mark=pg_sina_planner_clock();
     device_cost(&p,observations);
+    if(pg_sina_planning) pg_sina_planning->estimate+=pg_sina_planner_clock()-mark;
+    mark=pg_sina_planner_clock();
     annotate_device(&p);
     *internal=p.csd; *boundary=p.boundary;
     node_costs(&p,estimates);
+    if(pg_sina_planning) pg_sina_planning->format+=pg_sina_planner_clock()-mark;
     return p.device;
 }
 static Plan *select_plan(struct placement *p,bool top,StringInfo decisions)

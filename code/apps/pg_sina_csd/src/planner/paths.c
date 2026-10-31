@@ -20,7 +20,7 @@ struct path_relation {
     List *pending;
 };
 struct prepared_relation { Oid relid,filenode; bool prepared; char device[128]; };
-struct pg_sina_path_search { List *relations,*observations,*prepared; StringInfo estimates; MemoryContext memory; };
+struct pg_sina_path_search { List *relations,*observations,*prepared,*indexes; StringInfo estimates; MemoryContext memory; };
 struct pg_sina_path_search *pg_sina_path_search;
 bool pg_sina_native_search,pg_sina_previewing_path;
 static const CustomPathMethods device_methods,final_methods;
@@ -33,6 +33,10 @@ void pg_sina_start_path_search(void)
 }
 MemoryContext pg_sina_search_context(void)
 { return pg_sina_path_search?pg_sina_path_search->memory:CurrentMemoryContext; }
+List **pg_sina_search_observations(void)
+{ return pg_sina_path_search?&pg_sina_path_search->observations:NULL; }
+List **pg_sina_search_index_metadata(void)
+{ return pg_sina_path_search?&pg_sina_path_search->indexes:NULL; }
 /* A planning invocation may compile hundreds of overlapping subtrees. The
  * immutable mapping is the same for all of them; query SPI once per table. */
 bool pg_sina_prepared_device(Oid relid,Oid filenode,char *device,size_t length)
@@ -113,12 +117,16 @@ static Plan *preview_plan(PlannerInfo *root,Path *path)
      * the isolated global workspace, then restore their transient fields. */
     *shared=globals; preview.glob=shared;
     preview.processed_tlist=make_tlist_from_pathtarget(path->pathtarget);
-    preview.init_plans=NIL;
     bool compiling=pg_sina_compiling_plan,previewing=pg_sina_previewing_path;
     Plan *volatile plan=NULL;
     pg_sina_compiling_plan=true; pg_sina_previewing_path=true;
     PG_TRY();
-    { plan=pg_sina_native_plan(create_plan(&preview,path)); }
+    {
+        plan=pg_sina_native_plan(create_plan(&preview,path));
+        /* CteScan needs its producer in init_plans while PG builds the Plan.
+         * Detach only after construction; device compilation owns init work. */
+        plan->initPlan=NIL;
+    }
     PG_CATCH();
     { restore_roots(states); *shared=saved;
       pg_sina_compiling_plan=compiling; pg_sina_previewing_path=previewing; PG_RE_THROW(); }
@@ -140,6 +148,7 @@ static Plan *device_plan(PlannerInfo *root,RelOptInfo *rel,CustomPath *path,List
     bool top=intVal(lthird(path->custom_private)),fast=intVal(lfourth(path->custom_private));
     bool compiling=pg_sina_compiling_plan;
     Plan *volatile device=NULL;
+    double mark=pg_sina_planner_clock();
     pg_sina_compiling_plan=true;
     PG_TRY();
     { device=fast?pg_sina_fast_plan(root,copy):pg_sina_compile_subtree(root,copy,!top); }
@@ -147,6 +156,7 @@ static Plan *device_plan(PlannerInfo *root,RelOptInfo *rel,CustomPath *path,List
     { pg_sina_compiling_plan=compiling; PG_RE_THROW(); }
     PG_END_TRY();
     pg_sina_compiling_plan=compiling;
+    if(pg_sina_planning) pg_sina_planning->compile+=pg_sina_planner_clock()-mark;
     if(!device || device==copy) elog(ERROR,"selected CSD Path no longer compiles");
     if(top) root->init_plans=NIL;
     ((CustomScan *)device)->custom_private=lappend(((CustomScan *)device)->custom_private,copyObject(lsecond(path->custom_private)));
@@ -164,6 +174,7 @@ static void add_device_path(PlannerInfo *root,RelOptInfo *rel,Path *native,bool 
        (IsA(native,CustomPath) && (((CustomPath *)native)->methods==&device_methods ||
                                  ((CustomPath *)native)->methods==&final_methods))) return;
     struct path_relation *state=relation_paths(root,rel);
+    if(pg_sina_planning) ++pg_sina_planning->candidates;
     /* Retain a PG plan and small cost metadata, not a serialized device
      * program for every discarded candidate. Compile the winner once later. */
     MemoryContext owner=CurrentMemoryContext;
@@ -175,7 +186,9 @@ static void add_device_path(PlannerInfo *root,RelOptInfo *rel,Path *native,bool 
     Plan *volatile device=NULL;
     PG_TRY();
     {
+        double mark=pg_sina_planner_clock();
         plan=preview_plan(root,native);
+        if(pg_sina_planning) pg_sina_planning->preview+=pg_sina_planner_clock()-mark;
         pg_sina_compiling_plan=true;
         device=pg_sina_cost_device(root,plan,top,&pg_sina_path_search->observations,
                                   &internal,&boundary,pg_sina_path_search->estimates);
@@ -186,6 +199,8 @@ static void add_device_path(PlannerInfo *root,RelOptInfo *rel,Path *native,bool 
     pg_sina_compiling_plan=compiling;
     MemoryContextSwitchTo(owner);
     if(!device) { MemoryContextDelete(temporary); return; }
+    double mark=pg_sina_planner_clock();
+    if(pg_sina_planning) ++pg_sina_planning->accepted;
     CustomPath *path=makeNode(CustomPath); path->path=*native;
     NodeSetTag(path,T_CustomPath); path->path.pathtype=T_CustomScan;
     path->path.parallel_aware=path->path.parallel_safe=false; path->path.parallel_workers=0;
@@ -203,6 +218,7 @@ static void add_device_path(PlannerInfo *root,RelOptInfo *rel,Path *native,bool 
         state->internal_cost=internal;
     }
     state->pending=lappend(state->pending,path);
+    if(pg_sina_planning) pg_sina_planning->retain+=pg_sina_planner_clock()-mark;
 }
 static void publish_paths(PlannerInfo *root,RelOptInfo *rel)
 {

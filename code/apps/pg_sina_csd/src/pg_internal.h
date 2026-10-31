@@ -3,6 +3,7 @@
 #include "postgres.h"
 #include "nodes/extensible.h"
 #include "lib/stringinfo.h"
+#include "portability/instr_time.h"
 #include "query.h"
 #include "plan.h"
 extern int pg_sina_exe_path;
@@ -14,6 +15,20 @@ extern double pg_sina_internal_mbps, pg_sina_pcie_mbps, pg_sina_cache_mbps;
 extern double pg_sina_internal_write_mbps;
 extern double pg_sina_result_batch_ms, pg_sina_parallel_task_ms;
 extern bool pg_sina_profile;
+/* Existing profile switch also measures planner work; all fields are ms.
+ * The pointer is query-local and restored for nested planner invocations. */
+struct pg_sina_planner_profile {
+    double rewrite,preview,compile,estimate,format,retain,host_cache,stmt_copy;
+    double native_pg,adaptive_pg;
+    double indexes,resources;
+    unsigned candidates,accepted,index_calls,index_queries;
+};
+extern struct pg_sina_planner_profile *pg_sina_planning;
+static inline double pg_sina_planner_clock(void)
+{
+    if(!pg_sina_planning) return 0;
+    instr_time now; INSTR_TIME_SET_CURRENT(now); return INSTR_TIME_GET_MILLISEC(now);
+}
 extern int pg_sina_max_memory;
 /* Per-backend device capacities, populated before finalizing an offloaded plan.
  * Workmem is private compute memory; fdm_bytes is only the I/O buffer pool. */
@@ -34,6 +49,8 @@ extern struct pg_sina_path_search *pg_sina_path_search;
 extern bool pg_sina_native_search, pg_sina_previewing_path;
 void pg_sina_start_path_search(void);
 MemoryContext pg_sina_search_context(void);
+List **pg_sina_search_observations(void);
+List **pg_sina_search_index_metadata(void);
 PlannedStmt *pg_sina_original_device_statement(PlannedStmt *);
 bool pg_sina_prepared_device(Oid,Oid,char *,size_t);
 void pg_sina_rel_paths(PlannerInfo *,RelOptInfo *,Index,RangeTblEntry *);
