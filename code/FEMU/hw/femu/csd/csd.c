@@ -2858,6 +2858,22 @@ void femu_csd_graph_poll(FemuCtrl *n)
         uint64_t all = UINT64_MAX >> (64 - g->count);
         if (g->active || (!g->status && g->done != all)) { continue; }
         if (g->status) {
+            /* All issued CU/I/O work has stopped. Consumers below a failed
+             * node will never run, so they cannot acknowledge cached input.
+             * Drop optional population, but keep each reference until its
+             * actual DMA worker leaves (cache_poll checks dma_active). */
+            if (g->cache_pending) {
+                qemu_mutex_lock(&csd->cache_lock);
+                for (unsigned i=0;i<ARRAY_SIZE(csd->cache);i++) {
+                    FemuCacheItem *item=&csd->cache[i];
+                    if (!item->event.token || item->graph!=g) { continue; }
+                    item->consumers=0;
+                    if (!item->cu_ns) { item->cu_ns=now; }
+                    item->dropped=true;
+                }
+                qatomic_set(&csd->cache_dirty,1);
+                qemu_mutex_unlock(&csd->cache_lock);
+            }
             GHashTableIter it; gpointer value;
             for (;;) {
                 FemuCsdSpill *found = NULL;

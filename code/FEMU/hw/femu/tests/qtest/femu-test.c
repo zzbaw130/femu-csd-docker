@@ -18791,6 +18791,46 @@ static void femu_test_csd_cache_dma(void *obj, void *data, QGuestAllocator *allo
         qtest_writeq(qts,descriptors+i*sizeof(slot),0);
     }
     g_assert_cmpuint(returned,==,2); g_assert_cmpuint(sources,==,3);
+    /* A published LOAD can name a dependent CSF that cancellation never
+     * starts. That consumer must not pin the graph and its AFDM forever. */
+    uint32_t control=femu_graph_alloc(&c,4096);
+    qtest_memset(qts,descriptors,0,4096);
+    struct {
+        struct femu_graph_header h;
+        struct femu_graph_node n[3];
+        uint32_t mr[16];
+        struct femu_graph_range range;
+    } cancelled={
+        .h={.bytes=cpu_to_le32(sizeof(cancelled)),.count=cpu_to_le32(3),
+            .flags=cpu_to_le32(FEMU_CSD_GRAPH_CACHE),.session=cpu_to_le64(session),
+            .cookie=cpu_to_le64(20)},
+        .n={
+            {.operation=cpu_to_le32(FEMU_GRAPH_EXEC),.program=cpu_to_le32(1),
+             .count=cpu_to_le32(1),.cparam1=cpu_to_le64(500),
+             .payload=cpu_to_le32(offsetof(typeof(cancelled),mr))},
+            {.operation=cpu_to_le32(FEMU_GRAPH_LOAD),.afdm=cpu_to_le32(id),
+             .count=cpu_to_le32(1),.payload=cpu_to_le32(offsetof(typeof(cancelled),range))},
+            {.operation=cpu_to_le32(FEMU_GRAPH_EXEC),.program=cpu_to_le32(2),
+             .count=cpu_to_le32(1),.cparam1=cpu_to_le64(17),.dependencies=cpu_to_le64(3),
+             .payload=cpu_to_le32(offsetof(typeof(cancelled),mr)+8*sizeof(uint32_t))}},
+        .range={.nsid=cpu_to_le32(1),.blocks=cpu_to_le32(8)}};
+    cancelled.mr[2]=cpu_to_le32(control); cancelled.mr[10]=cpu_to_le32(id);
+    femu_graph_submit(&c,buf,&cancelled,sizeof(cancelled));
+    deadline=g_get_monotonic_time()+FEMU_POLL_LIMIT_MS*1000;
+    bool populated=false;
+    while(!populated) {
+        for(unsigned i=0;i<FEMU_CACHE_RX_SLOTS;i++)
+            populated|=qtest_readq(qts,descriptors+i*sizeof(struct femu_cache_slot))!=0;
+        g_assert_cmpint(g_get_monotonic_time(),<,deadline);
+    }
+    FemuQueue original=c.io;
+    femu_burst_queue(&c,&c.io,2);
+    femu_graph_session_cmd(&c,FEMU_GRAPH_CANCEL,session,20);
+    g_assert_cmpint(FEMU_SC(femu_complete(&c,&original,NULL,NULL)),==,NVME_CMD_ABORT_REQ);
+    femu_queue_free(&c,&c.io); c.io=original;
+    cmd=(NvmeCmd){.opcode=FEMU_CSD_DEALLOC,.nsid=cpu_to_le32(1),.cdw10=cpu_to_le32(control)};
+    femu_submit(&c,&c.io,&cmd);
+    g_assert_cmpint(FEMU_SC(femu_complete(&c,&c.io,NULL,NULL)),==,NVME_SUCCESS);
     cmd=(NvmeCmd){.opcode=FEMU_CSD_DEALLOC,.nsid=cpu_to_le32(1),.cdw10=cpu_to_le32(io)};
     femu_submit(&c,&c.io,&cmd);
     g_assert_cmpint(FEMU_SC(femu_complete(&c,&c.io,NULL,NULL)),==,NVME_SUCCESS);
