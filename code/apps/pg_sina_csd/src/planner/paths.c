@@ -231,9 +231,12 @@ static Plan *device_plan(PlannerInfo *root,RelOptInfo *rel,CustomPath *path,List
 {
     Plan *native=linitial(path->custom_private);
     if(pg_sina_previewing_path) {
-        Plan *copy=copyObject(native);
-        apply_tlist_labeling(copy->targetlist,tlist);
-        return pg_sina_native_wrapper(copy);
+        /* Borrow the immutable prepared child. The whole preview receives
+         * its single private copy in prepare_candidate before any rewrites. */
+        Plan *view=pg_sina_native_wrapper(native);
+        apply_tlist_labeling(view->targetlist,tlist);
+        if(pg_sina_planning) ++pg_sina_planning->preview_borrows;
+        return view;
     }
     Plan *copy=copyObject(native);
     apply_tlist_labeling(copy->targetlist,tlist);

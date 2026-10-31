@@ -173,6 +173,8 @@ TPCH_MODES=host-only sh /home/femu/tests/tpch-test.sh
 
 `schema_reads/schema_reuses` 记录规划内表列布局读取和复用次数。只缓存关系锁保护的列定义与文件节点，每个候选仍复制自己的列槽和限制信息；行数、谓词、物理选择和缓存比例按原流程计算。候选标记只借用输出列描述，实际交付给PG的输出表达式在选中后构造，预览标记在setrefs前移除；不改变PG和设备候选的搜索范围。
 
+`preview_borrows` 记录预览时只读借用已准备子树的次数；修改前仍生成独立副本，避免影响 HOST 和其他候选。预览结束后包装只保留列标签，表达式由子树保留。`prune_reuses` 记录父节点保留子树全部输出、因而跳过内部重复裁列的次数；输出缩减时重新裁列，物理算法和排序需求仍重新检查。这两个计数表示省去的重复工作，不代表少搜索了候选。
+
 通用树的 profile 同时记录 PG 调度线程的墙钟：`CSD Host Completion Copy` 是请求完成后同步读取 AFDM 控制记录及结果头的时间，`CSD Host Submit` 是 PG 主线程准备和提交请求的时间，不包含 callback 续交。其中 `Queue`、`Control Write` 及已有的 `LOAD Preparation` 均包含在 Submit 中，不能再次相加。`Poll` 是检查完成标志的时间，`Idle Sleep` 是没有可推进任务时的休眠时间。`Pending Requests Sum` 累计各请求提交到 callback 的时间，最终返回 PG 的请求还包含完成观察等待；跨并发请求求和，不是查询延迟或纯 I/O 时间。Host Submissions/Completions 只计 PG 提交和观察的次数，Callback Submissions 另计自动续交次数。关闭 profile 时不采集这些计时。
 
 `CSD Host Assigned LOADs` 记录提前分配的顺序输入块数；开启 profile 时，`Completion Reads` 和 `Control Writes` 分别记录调度期间实际进行的控制记录读写次数，不包含初始化、结束清理和最终字符串结果复制。

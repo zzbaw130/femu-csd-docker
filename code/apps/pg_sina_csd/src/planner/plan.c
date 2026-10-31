@@ -40,6 +40,7 @@ struct binding {
 static int compile_node(PlannerInfo *,Plan *,struct qp_plan *,bool);
 static int compile_tree(PlannerInfo *,Plan *,struct qp_plan *);
 static int describe_expression(struct binding *,Node *);
+static Plan *native_plan(Plan *,List **);
 static bool function_is(Oid id,const char *name)
 {
     HeapTuple tuple=SearchSysCache1(PROCOID,ObjectIdGetDatum(id));
@@ -709,9 +710,17 @@ static bool require_expression(Node *node,struct required_columns *r)
 /* PG heap scans often expose the entire physical tuple to avoid a host
  * projection. A device scan must instead decode only required columns. Keep
  * PG's logical expressions, and update the few positional Sort/Agg fields. */
-static bool prune_columns(Plan *plan,Bitmapset *keep,bool all)
+static bool prune_columns(Plan *plan,Bitmapset *keep,bool all,List *prepared)
 {
     if(!plan) return true;
+    /* A retained child already contains exactly the dependencies of all its
+     * outputs. If the parent keeps those outputs, its internal pruning is done. */
+    if(list_member_ptr(prepared,plan)) {
+        bool complete=true; ListCell *entry;
+        foreach(entry,plan->targetlist)
+            if(!all && !bms_is_member(lfirst_node(TargetEntry,entry)->resno,keep)) { complete=false; break; }
+        if(complete) { if(pg_sina_planning) ++pg_sina_planning->prune_reuses; return true; }
+    }
     List *outputs=NIL; ListCell *c;
     foreach(c,plan->targetlist) {
         TargetEntry *t=lfirst(c);
@@ -750,7 +759,7 @@ static bool prune_columns(Plan *plan,Bitmapset *keep,bool all)
         }
     }
     if(IsA(plan,Hash)) require_expression((Node *)((Hash *)plan)->hashkeys,&r);
-    if(!prune_columns(left,r.left_columns,IsA(plan,SubqueryScan)) || !prune_columns(right,r.right_columns,false)) return false;
+    if(!prune_columns(left,r.left_columns,IsA(plan,SubqueryScan),prepared) || !prune_columns(right,r.right_columns,false,prepared)) return false;
     int i=0;
     foreach(c,position_keys) {
         TargetEntry *t=matching_entry(left->targetlist,lfirst(c)); if(!t) return false;
@@ -768,7 +777,7 @@ static int compile_tree(PlannerInfo *root,Plan *native,struct qp_plan *tree)
     }
     Plan *copy=copyObject(native);
     global_parallel_rows(copy,1);
-    if(!normalize_parallel_aggregate(&copy) || !prune_columns(copy,NULL,true)) return -1;
+    if(!normalize_parallel_aggregate(&copy) || !prune_columns(copy,NULL,true,NIL)) return -1;
     return compile_node(root,copy,tree,root->parse->sortClause!=NIL);
 }
 
@@ -898,14 +907,15 @@ static bool choose_algorithms(PlannerInfo *root,Plan **slot,bool ordered)
 Plan *pg_sina_prepare_candidate(PlannerInfo *root,Plan *native,bool ordered)
 {
     double mark=pg_sina_planner_clock();
-    Plan *copy=copyObject(native);
+    List *prepared=NIL;
+    Plan *copy=native_plan(copyObject(native),&prepared);
     if(pg_sina_planning) pg_sina_planning->prepare_copy+=pg_sina_planner_clock()-mark;
     mark=pg_sina_planner_clock();
     global_parallel_rows(copy,1);
     bool supported=normalize_parallel_aggregate(&copy);
     if(pg_sina_planning) pg_sina_planning->prepare_normalize+=pg_sina_planner_clock()-mark;
     if(!supported) return NULL;
-    mark=pg_sina_planner_clock(); supported=prune_columns(copy,NULL,true);
+    mark=pg_sina_planner_clock(); supported=prune_columns(copy,NULL,true,prepared);
     if(pg_sina_planning) pg_sina_planning->prepare_prune+=pg_sina_planner_clock()-mark;
     if(!supported) return NULL;
     mark=pg_sina_planner_clock(); supported=choose_algorithms(root,&copy,ordered);
@@ -1929,7 +1939,7 @@ Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
     Plan *copy=copyObject(native);
     global_parallel_rows(copy,1);
     int result=-1;
-    if(normalize_parallel_aggregate(&copy) && prune_columns(copy,NULL,true))
+    if(normalize_parallel_aggregate(&copy) && prune_columns(copy,NULL,true,NIL))
         result=compile_node(root,copy,tree,boundary || root->parse->sortClause!=NIL);
     if(result<0) { goto failed; }
     bool has_scan=false;
@@ -2040,27 +2050,50 @@ Plan *pg_sina_native_wrapper(Plan *native)
     scan->scan.plan=*native; NodeSetTag(scan,T_CustomScan);
     scan->scan.plan.lefttree=scan->scan.plan.righttree=NULL;
     scan->scan.plan.qual=NIL; scan->scan.plan.initPlan=NIL;
-    /* Preview strips this wrapper before setrefs; the private child already
-     * owns its targetlist. No second copy is needed for this temporary view. */
-    scan->custom_scan_tlist=native->targetlist;
+    /* PG labels this root during preview. Only TargetEntry labels are mutable;
+     * expressions and the prepared child stay borrowed until prepare copies it. */
+    scan->scan.plan.targetlist=NIL; ListCell *c;
+    foreach(c,native->targetlist)
+        scan->scan.plan.targetlist=lappend(scan->scan.plan.targetlist,flatCopyTargetEntry(lfirst(c)));
     scan->custom_plans=list_make1(native); scan->methods=&native_methods;
     return (Plan *)scan;
 }
-Plan *pg_sina_native_plan(Plan *plan)
+static Plan *native_plan(Plan *plan,List **prepared)
 {
     if(!plan) return NULL;
     if(IsA(plan,CustomScan) && ((CustomScan *)plan)->methods==&native_methods) {
         Plan *native=linitial(((CustomScan *)plan)->custom_plans);
+        apply_tlist_labeling(native->targetlist,plan->targetlist);
         native->initPlan=list_concat(plan->initPlan,native->initPlan);
         native->extParam=bms_union(native->extParam,plan->extParam);
         native->allParam=bms_union(native->allParam,plan->allParam);
-        return pg_sina_native_plan(native);
+        if(prepared) *prepared=lappend(*prepared,native);
+        return native_plan(native,prepared);
     }
-    if(pg_sina_previewing_path) {
-        plan->lefttree=pg_sina_native_plan(plan->lefttree);
-        plan->righttree=pg_sina_native_plan(plan->righttree);
-        if(IsA(plan,SubqueryScan)) ((SubqueryScan *)plan)->subplan=pg_sina_native_plan(((SubqueryScan *)plan)->subplan);
+    plan->lefttree=native_plan(plan->lefttree,prepared);
+    plan->righttree=native_plan(plan->righttree,prepared);
+    if(IsA(plan,SubqueryScan)) ((SubqueryScan *)plan)->subplan=native_plan(((SubqueryScan *)plan)->subplan,prepared);
+    return plan;
+}
+Plan *pg_sina_native_plan(Plan *plan)
+{
+    if(!pg_sina_previewing_path) return native_plan(plan,NULL);
+    if(!plan) return NULL;
+    /* create_plan has finished: a borrowed wrapper now needs only labels.
+     * Its child owns the expressions that prepare will copy. Replace, rather
+     * than edit, entries because a parent's output may share this targetlist. */
+    if(IsA(plan,CustomScan) && ((CustomScan *)plan)->methods==&native_methods) {
+        List *labels=NIL; ListCell *c;
+        foreach(c,plan->targetlist) {
+            TargetEntry *label=flatCopyTargetEntry(lfirst(c)); label->expr=NULL;
+            labels=lappend(labels,label);
+        }
+        plan->targetlist=labels;
+        return plan;
     }
+    plan->lefttree=pg_sina_native_plan(plan->lefttree);
+    plan->righttree=pg_sina_native_plan(plan->righttree);
+    if(IsA(plan,SubqueryScan)) ((SubqueryScan *)plan)->subplan=pg_sina_native_plan(((SubqueryScan *)plan)->subplan);
     return plan;
 }
 static Plan *rewrite_selected(PlannerInfo *root,RelOptInfo *rel,CustomPath *path,List *tlist,List *clauses,List *plans)

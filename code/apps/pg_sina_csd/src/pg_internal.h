@@ -33,7 +33,7 @@ struct pg_sina_planner_profile {
     double cost_reach,cost_buffers,cost_dictionary,cost_operators,cost_finish;
     double retain_copy,retain_free,retain_publish,freeze,hook_other,native_core,adaptive_core,cache_probe;
     unsigned cache_probes,cache_stats_calls,cache_mincore_calls;
-    unsigned schema_reads,schema_reuses;
+    unsigned schema_reads,schema_reuses,preview_borrows,prune_reuses;
     double cache_cpu,cache_metadata,cache_files,cache_residency,cache_count;
     uint64_t cache_pages;
     unsigned open_major_faults,open_minor_faults;
