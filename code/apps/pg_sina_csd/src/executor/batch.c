@@ -576,7 +576,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
                 if(!inflight) break;
                 void *completed=NULL;
                 CS_STATUS status=csPollEvent(event,&completed,NULL);
-                if(status==CS_NOT_DONE) { pg_sina_dcp_poll(); pg_usleep(50L); continue; }
+                if(status==CS_NOT_DONE) { if(!pg_sina_dcp_poll()) pg_usleep(50L); continue; }
                 --inflight; struct slot *slot=completed; slot->request=NULL;
                 if(status!=CS_SUCCESS) {
                     result->status=status; snprintf(result->error,sizeof(result->error),"csPollEvent(build scan): status=%d",status); goto cleanup;
@@ -687,7 +687,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
         if(!inflight) break;
         void *completed=NULL;
         CS_STATUS status=csPollEvent(event,&completed,NULL);
-        if(status==CS_NOT_DONE) { pg_sina_dcp_poll(); pg_usleep(50L); continue; }
+        if(status==CS_NOT_DONE) { if(!pg_sina_dcp_poll()) pg_usleep(50L); continue; }
         --inflight; ((struct slot *)completed)->request=NULL;
         if(status!=CS_SUCCESS) {
             result->status=status; snprintf(result->error,sizeof(result->error),"csPollEvent: status=%d",status); goto cleanup;

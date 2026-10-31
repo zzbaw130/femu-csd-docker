@@ -26,7 +26,7 @@ SET pg_sina_csd.dcp = on;
 
 同时填充两层缓存时，选择 `csd-with-hpcp` 并开启两个布尔选项。设备只做一次 DMA；DCP 模式由执行 SQL 的 PG backend 消费接收槽，按原始8KiB页复制到缺失的数据库缓冲，随后按需把同一槽交给内核填文件缓存。现有有效页不覆盖，导入页不标脏、不产生 WAL；不调用 `pg_prewarm(buffer)` 重新读文件。该实现针对已准备映射的只读镜像，不新增进程或PG worker。
 
-优先交付结果和续交就绪任务，等待设备时每次最多处理一个4MiB接收槽。接收槽满或关闭会话时允许放弃尚未传输的数据，因此填充是尽力而为，不能把累计读取量当作缓存驻留量。首次写入 shared_buffers 可能产生大量匿名内存 minor fault，DCP 不保证加速当前 CSD 查询。profile 的 `SQLerate DCP` 单独报告接收块、导入/已有页、无效页、跳过字节、填充累计时间和 minor/major fault；EXPLAIN 显示 DCP 开关。PCIe填充成本进入既有模型，PG缓冲分配/复制的CPU尚未单独校准，当前实验宜用强制路径比较。
+优先交付结果和续交就绪任务，等待设备时把4MiB接收槽分片导入：每次最多256KiB，并在完整8KiB页之间按约250µs预算让出执行权，重新检查任务完成和续交。整个槽处理完之前保持接收缓冲所有权，不增加DMA命令；做过填充后不再额外休眠50µs。接收槽满或关闭会话时允许放弃尚未传输的数据，因此填充是尽力而为，不能把累计读取量当作缓存驻留量。首次写入 shared_buffers 可能产生大量匿名内存 minor fault，DCP 不保证加速当前 CSD 查询。profile 的 `SQLerate DCP` 单独报告接收块、导入/已有页、无效页、跳过字节、填充累计时间、单次处理上限实测、查询缓冲映射/分配清零/复制耗时和 minor/major fault；EXPLAIN 显示 DCP 开关。PCIe填充成本进入既有模型，PG缓冲分配/复制的CPU尚未单独校准，当前实验宜用强制路径比较。
 
 依赖更新后的 SNIA FEMU 插件及 [femu-cache 接收模块](../femu-cache/README.md)。仅检查开关隔离、原生PG读取导入页和取消恢复，可在Guest运行 `sh /home/femu/tests/database-cache-test.sh`，使用正式Q6。缓存统计仍在规划时真实观测；本轮没有引入仅按填充量累加的驻留账本。
 

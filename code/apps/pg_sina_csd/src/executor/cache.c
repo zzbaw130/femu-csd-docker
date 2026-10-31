@@ -30,7 +30,10 @@ static struct {
     struct femu_cache_slot *slots;
     const unsigned char *data;
     unsigned next;
+    int active;
+    uint64 position;
     uint64 filled,cached,skipped,invalid,blocks,ns,minor_faults,major_faults;
+    uint64 steps,max_step_ns,lookup_ns,allocate_ns,copy_ns;
 } receiver={.fd=-1};
 static uint64 now_ns(void)
 {
@@ -58,12 +61,15 @@ void pg_sina_dcp_finish(void)
 {
     if(receiver.fd<0) return;
     /* The caller has stopped device DMA before draining these last slots. */
-    for(unsigned i=0;i<FEMU_CACHE_RX_SLOTS;i++) pg_sina_dcp_poll();
-    if(pg_sina_profile) ereport(NOTICE,(errmsg("SQLerate DCP blocks=%llu filled_pages=%llu cached_pages=%llu skipped_bytes=%llu invalid_pages=%llu wall_ms=%.3f minor_faults=%llu major_faults=%llu",
+    for(unsigned i=0;i<FEMU_CACHE_RX_SLOTS;i++)
+        do { pg_sina_dcp_poll(); } while(receiver.active>=0);
+    if(pg_sina_profile) ereport(NOTICE,(errmsg("SQLerate DCP blocks=%llu filled_pages=%llu cached_pages=%llu skipped_bytes=%llu invalid_pages=%llu wall_ms=%.3f minor_faults=%llu major_faults=%llu steps=%llu max_step_ms=%.3f lookup_ms=%.3f allocate_ms=%.3f copy_ms=%.3f",
         (unsigned long long)receiver.blocks,(unsigned long long)receiver.filled,
         (unsigned long long)receiver.cached,(unsigned long long)receiver.skipped,
         (unsigned long long)receiver.invalid,receiver.ns/1e6,
-        (unsigned long long)receiver.minor_faults,(unsigned long long)receiver.major_faults)));
+        (unsigned long long)receiver.minor_faults,(unsigned long long)receiver.major_faults,
+        (unsigned long long)receiver.steps,receiver.max_step_ns/1e6,receiver.lookup_ns/1e6,
+        receiver.allocate_ns/1e6,receiver.copy_ns/1e6)));
     if(receiver.data!=MAP_FAILED) munmap((void *)receiver.data,FEMU_CACHE_DATA_BYTES);
     if(receiver.slots!=MAP_FAILED) munmap(receiver.slots,FEMU_CACHE_PAGE_BYTES);
     close(receiver.fd); receiver.fd=-1;
@@ -72,6 +78,7 @@ void pg_sina_dcp_start(CS_DEV_HANDLE device)
 {
     if(!pg_sina_dcp || receiver.fd>=0) return;
     memset(&receiver,0,sizeof(receiver));
+    receiver.active=-1;
     receiver.fd=open("/dev/femu-cache",O_RDWR|O_CLOEXEC);
     receiver.slots=MAP_FAILED; receiver.data=MAP_FAILED;
     if(receiver.fd<0) ereport(ERROR,(errmsg("cannot open DCP receiver: %m")));
@@ -111,7 +118,9 @@ static void fill_slot(unsigned slot)
     PGAlignedBlock checked;
     bool checksums=DataChecksumsEnabled();
     Relation rel=NULL;
-    for(uint64 position=0;position<bytes;) {
+    uint64 position=receiver.position,end=Min(bytes,position+256*1024);
+    uint64 deadline=now_ns()+250000;
+    for(;position<end;) {
         struct cache_relation *match=NULL; uint64 logical=0,available=0;
         for(struct cache_relation *r=relations;r && !match;r=r->next) {
             if(r->nsid!=nsid || physical>UINT64_MAX/r->lba_bytes) continue;
@@ -128,16 +137,19 @@ static void fill_slot(unsigned slot)
             if(rel) relation_close(rel,AccessShareLock);
             rel=relation_open(match->relid,AccessShareLock);
         }
-        uint64 take=available;
+        uint64 take=Min(available,end-position);
         if(rel->rd_node.relNode!=match->filenode || logical%BLCKSZ || available<BLCKSZ) {
             take=Min(available,(uint64)(BLCKSZ-logical%BLCKSZ));
             receiver.skipped+=take; position+=take; continue;
         }
-        take=available/BLCKSZ*BLCKSZ;
+        take=Min(available,end-position)/BLCKSZ*BLCKSZ;
+        if(!take) break; /* Leave a page straddling the slice for the next turn. */
         for(uint64 offset=0;offset<take;offset+=BLCKSZ) {
             BlockNumber block=(logical+offset)/BLCKSZ;
             const void *page=data+position+offset;
+            uint64 mark=pg_sina_profile?now_ns():0;
             int present=in_buffer_pool(rel,block);
+            if(pg_sina_profile) receiver.lookup_ns+=now_ns()-mark;
             if(present) {
                 if(present==1) ++receiver.cached; else receiver.skipped+=BLCKSZ;
                 continue;
@@ -147,46 +159,69 @@ static void fill_slot(unsigned slot)
              * this scratch copy. Normal header checks do not write the page. */
             if(checksums) { memcpy(checked.data,page,BLCKSZ); page=checked.data; }
             if(!PageIsVerifiedExtended((Page)page,block,0)) { ++receiver.invalid; continue; }
+            mark=pg_sina_profile?now_ns():0;
             Buffer buffer=ReadBufferExtended(rel,MAIN_FORKNUM,block,RBM_ZERO_AND_LOCK,NULL);
+            if(pg_sina_profile) receiver.allocate_ns+=now_ns()-mark;
             /* A concurrent backend may have installed the page since lookup.
              * Never overwrite an existing page, including dirty hint bits. */
             if(PageIsNew(BufferGetPage(buffer)) &&
                !(pg_atomic_read_u32(&GetBufferDescriptor(buffer-1)->state)&BM_DIRTY)) {
+                mark=pg_sina_profile?now_ns():0;
                 memcpy(BufferGetPage(buffer),page,BLCKSZ); ++receiver.filled;
+                if(pg_sina_profile) receiver.copy_ns+=now_ns()-mark;
             } else ++receiver.cached;
             /* These are existing immutable disk bytes: no WAL or dirty mark. */
             UnlockReleaseBuffer(buffer);
+            /* Yield only between complete pages, with no buffer pin held.
+             * Retain the DMA slot until every slice has been consumed. */
+            if(now_ns()>=deadline) { take=offset+BLCKSZ; break; }
         }
         position+=take;
+        if(now_ns()>=deadline) break;
     }
     if(rel) relation_close(rel,AccessShareLock);
+    receiver.position=position;
 }
-void pg_sina_dcp_poll(void)
+bool pg_sina_dcp_poll(void)
 {
-    if(receiver.fd<0 || receiver.slots==MAP_FAILED || receiver.data==MAP_FAILED) return;
-    for(unsigned n=0;n<FEMU_CACHE_RX_SLOTS;n++) {
-        unsigned slot=(receiver.next+n)%FEMU_CACHE_RX_SLOTS;
+    if(receiver.fd<0 || receiver.slots==MAP_FAILED || receiver.data==MAP_FAILED) return false;
+    uint64 start=now_ns();
+    struct rusage before,after;
+    if(pg_sina_profile) getrusage(RUSAGE_THREAD,&before);
+    if(receiver.active<0) for(unsigned n=0;n<FEMU_CACHE_RX_SLOTS;n++) {
+        volatile unsigned slot=(receiver.next+n)%FEMU_CACHE_RX_SLOTS;
         if(le64toh(__atomic_load_n(&receiver.slots[slot].ready,__ATOMIC_ACQUIRE))!=1) continue;
+        if(ioctl(receiver.fd,FEMU_CACHE_RX_ACQUIRE,slot)<0)
+            ereport(ERROR,(errmsg("cannot acquire DCP receive slot: %m")));
+        receiver.active=slot; receiver.position=0;
         receiver.next=(slot+1)%FEMU_CACHE_RX_SLOTS;
-        uint64 start=now_ns();
-        struct rusage before,after;
-        if(pg_sina_profile) getrusage(RUSAGE_THREAD,&before);
-        if(ioctl(receiver.fd,FEMU_CACHE_RX_ACQUIRE,slot)==0) {
-            PG_TRY();
-            { if(IsTransactionState() && !QueryCancelPending && !ProcDiePending) fill_slot(slot); }
-            PG_CATCH();
-            { ioctl(receiver.fd,FEMU_CACHE_RX_RELEASE,slot); PG_RE_THROW(); }
-            PG_END_TRY();
+        break;
+    }
+    if(receiver.active>=0) {
+        unsigned slot=receiver.active;
+        PG_TRY();
+        {
+            if(IsTransactionState() && !QueryCancelPending && !ProcDiePending) fill_slot(slot);
+            else receiver.position=le64toh(receiver.slots[slot].bytes);
         }
-        unsigned flags=slot|(pg_sina_hpcp_enabled()?FEMU_CACHE_RELEASE_HPCP:0);
-        if(ioctl(receiver.fd,FEMU_CACHE_RX_RELEASE,flags)<0)
-            ereport(ERROR,(errmsg("cannot release DCP receive slot: %m")));
-        receiver.ns+=now_ns()-start; ++receiver.blocks;
+        PG_CATCH();
+        { ioctl(receiver.fd,FEMU_CACHE_RX_RELEASE,slot); receiver.active=-1; PG_RE_THROW(); }
+        PG_END_TRY();
+        if(receiver.position>=le64toh(receiver.slots[slot].bytes)) {
+            unsigned flags=slot|(pg_sina_hpcp_enabled()?FEMU_CACHE_RELEASE_HPCP:0);
+            if(ioctl(receiver.fd,FEMU_CACHE_RX_RELEASE,flags)<0)
+                ereport(ERROR,(errmsg("cannot release DCP receive slot: %m")));
+            receiver.active=-1; ++receiver.blocks;
+        }
+        uint64 elapsed=now_ns()-start;
+        receiver.ns+=elapsed; ++receiver.steps;
+        receiver.max_step_ns=Max(receiver.max_step_ns,elapsed);
         if(pg_sina_profile) {
             getrusage(RUSAGE_THREAD,&after);
             receiver.minor_faults+=after.ru_minflt-before.ru_minflt;
             receiver.major_faults+=after.ru_majflt-before.ru_majflt;
         }
-        return; /* Bound foreground work to one 4MiB slot per scheduling turn. */
+        return true;
     }
+    return false;
 }

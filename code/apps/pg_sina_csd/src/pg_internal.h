@@ -15,7 +15,8 @@ bool pg_sina_hpcp_enabled(void);
 extern bool pg_sina_dcp;
 void pg_sina_dcp_register(const struct qs_request *,const struct qs_extent *);
 void pg_sina_dcp_start(CS_DEV_HANDLE);
-void pg_sina_dcp_poll(void);
+/* Import a bounded slice; true means useful work replaced an idle wait. */
+bool pg_sina_dcp_poll(void);
 void pg_sina_dcp_finish(void);
 extern double pg_sina_host_cost_ms, pg_sina_csd_cpu_ratio;
 extern double pg_sina_internal_mbps, pg_sina_pcie_mbps, pg_sina_cache_mbps;

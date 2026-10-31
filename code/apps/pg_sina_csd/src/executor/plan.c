@@ -218,7 +218,7 @@ static void close_state(void *arg)
         /* The stopping flag prevents callbacks from claiming another block.
          * Drain current bounded blocks so their input DMA references finish. */
         while(!atomic_load_explicit(&s->slots[w].completed,memory_order_acquire)) {
-            pg_sina_dcp_poll(); pg_usleep(50L);
+            if(!pg_sina_dcp_poll()) pg_usleep(50L);
         }
         s->slots[w].pending=NULL;
     }
@@ -1002,9 +1002,9 @@ static void fetch(PlanStateCsd *s)
             if(produced<0) checked(s->execution_status,s->execution_operation);
             if(produced>0) { s->row=0; return; }
         }
-        pg_sina_dcp_poll();
+        bool populated=pg_sina_dcp_poll();
         uint64_t idle=s->profiling?clock_ns():0;
-        pg_usleep(50L);
+        if(!populated) pg_usleep(50L);
         if(s->profiling) { uint64_t slept=clock_ns()-idle; s->idle_ns+=slept; empty+=slept; }
     }
 }
