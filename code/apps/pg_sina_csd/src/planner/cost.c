@@ -407,6 +407,31 @@ static double column_distinct(Oid rel,int att,bool year)
     if(distinct>0 && st->stanullfrac>0) distinct+=1;
     ReleaseSysCache(tuple); return distinct;
 }
+/* PG can replace a self-join key by its referenced PK through an equivalence
+ * class. A validated single-column FK proves the same key domain; it does
+ * not prove that every referenced key is present or set its distinct count. */
+static bool same_key_domain(Oid a,int x,Oid b,int y)
+{
+    if(a==b && x==y) return true;
+    Oid relations[]={a,b}; int columns[]={x,y};
+    for(unsigned side=0;side<2;++side) {
+        Relation relation=relation_open(relations[side],AccessShareLock); ListCell *c; bool found=false;
+        foreach(c,RelationGetFKeyList(relation)) {
+            ForeignKeyCacheInfo *fk=lfirst(c);
+            if(fk->nkeys!=1 || fk->conkey[0]!=columns[side] ||
+               fk->confrelid!=relations[1-side] || fk->confkey[0]!=columns[1-side]) continue;
+            HeapTuple tuple=SearchSysCache1(CONSTROID,ObjectIdGetDatum(fk->conoid));
+            if(HeapTupleIsValid(tuple)) {
+                found=((Form_pg_constraint)GETSTRUCT(tuple))->convalidated;
+                ReleaseSysCache(tuple);
+            }
+            if(found) break;
+        }
+        relation_close(relation,AccessShareLock);
+        if(found) return true;
+    }
+    return false;
+}
 static double group_correlation(const struct qp_plan *tree,int node)
 {
     const struct qp_node *n=&tree->nodes[node]; Oid rel; int att; bool year=false;
@@ -426,6 +451,24 @@ void pg_sina_refine_groups(struct qp_plan *tree)
     for(unsigned i=0;i<tree->count;++i) original[i]=tree->nodes[i].estimated_rows;
     for(int i=(int)tree->count-1;i>=0;--i) {
         struct qp_node *n=&tree->nodes[i];
+        /* PG's independence estimate can clamp a residual self anti-join
+         * to one row. Use DuckDB's semi/anti fallback in that uncertain case,
+         * rather than making all downstream index probes nearly free. */
+        bool anti=false;
+        if((n->kind==QP_JOIN || n->kind==QP_INDEX_JOIN) && n->join_type==QP_ANTI &&
+           original[i]<=1 && n->join_qual>=0 && (n->nkeys==1 || n->kind==QP_INDEX_JOIN) &&
+           n->left>=0 && n->right>=0) {
+            const struct qp_node *left=&tree->nodes[n->left],*right=&tree->nodes[n->right];
+            Oid lrel,rrel=right->expr.relid; int latt,ratt=right->expr.join.build_key; bool ly=false,ry=false;
+            bool key=n->kind==QP_INDEX_JOIN || ((unsigned)n->right_keys[0]<right->expr.nout &&
+                column_origin(tree,n->right,right->expr.outputs[n->right_keys[0]].index,&rrel,&ratt,&ry));
+            if(key && (unsigned)n->left_keys[0]<left->expr.nout &&
+               column_origin(tree,n->left,left->expr.outputs[n->left_keys[0]].index,&lrel,&latt,&ly) &&
+               !ly && !ry && same_key_domain(lrel,latt,rrel,ratt)) {
+                n->estimated_rows=Max(original[i],cost_anti_fallback(left->estimated_rows)); anti=true;
+            }
+        }
+        if(anti) continue;
         if(n->kind==QP_AGGREGATE && n->nkeys) {
             double groups=1; bool derived=false,known=true;
             for(unsigned k=0;k<n->nkeys;++k) {
@@ -478,6 +521,10 @@ void pg_sina_refine_groups(struct qp_plan *tree)
             n->estimated_rows=Min(original[i],Max(0,tree->nodes[n->left].estimated_rows-n->expr.offset));
         } else if(n->left>=0 && original[n->left]>0) {
             n->estimated_rows*=tree->nodes[n->left].estimated_rows/original[n->left];
+            /* Build/probe orientation can put a refined subtree on the right.
+             * Inner-join cardinality depends on both inputs, not just left. */
+            if(n->kind==QP_JOIN && n->join_type==QP_INNER && n->right>=0 && original[n->right]>0)
+                n->estimated_rows*=tree->nodes[n->right].estimated_rows/original[n->right];
         }
     }
 }
@@ -571,6 +618,7 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
         const struct qp_node *right=n->right>=0?&tree->nodes[n->right]:NULL;
         double input=left?Max(0,left->estimated_rows):Max(0,n->estimated_rows);
         double rows=Max(0,n->estimated_rows),state=0,spill=0;
+        double index_probes=0,index_pages=0,heap_pages=0;
         double previous_cpu=p->serial+p->parallel+p->schedule+p->combine;
         double l=n->left>=0?live[n->left]:0,r=n->right>=0?live[n->right]:0;
         double lp=n->left>=0?peak[n->left]:0,rp=n->right>=0?peak[n->right]:0;
@@ -614,6 +662,47 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
                  * radix repartition: account for repeated probe reads. */
                 if(ratio>partitions) spill+=input*cost_hash_row(&left->expr)*(ceil(ratio/partitions)-1);
             }
+        } else if(n->kind==QP_INDEX_JOIN && right) {
+            const struct qs_join *access=&right->expr.join;
+            struct residency *heap=residency(right->expr.relid,observations);
+            struct residency *index=residency(access->indexid,observations);
+            double pages=Max(1,heap->bytes/BLCKSZ),leaves=Max(1,index->bytes/BLCKSZ);
+            double distinct=column_distinct(heap->oid,access->build_key,false);
+            double matches=Max(1,right->estimated_rows);
+            if(distinct>0) matches=Max(matches,heap->tuples/distinct);
+            double correlation=0;
+            HeapTuple stats=SearchSysCache3(STATRELATTINH,ObjectIdGetDatum(heap->oid),
+                Int16GetDatum(access->build_key),BoolGetDatum(false));
+            if(HeapTupleIsValid(stats)) {
+                AttStatsSlot slot;
+                if(get_attstatsslot(&slot,stats,STATISTIC_KIND_CORRELATION,InvalidOid,ATTSTATSSLOT_NUMBERS)) {
+                    if(slot.nnumbers==1) correlation=slot.numbers[0];
+                    free_attstatsslot(&slot);
+                }
+                ReleaseSysCache(stats);
+            }
+            /* An equality probe still decodes candidates rejected by a join
+             * residual. Semi/anti probes can stop after an accepted match. */
+            if((n->join_type==QP_SEMI || n->join_type==QP_ANTI) && n->join_qual<0 &&
+               n->expr.predicate<0 && right->expr.predicate<0) matches=Min(matches,1);
+            index_probes=input;
+            double fanout=Max(2,(BLCKSZ-40)/(MAXALIGN(8+access->index_key_bytes)+4.0));
+            double levels=1+ceil(log(leaves)/log(fanout));
+            double leaf_visits=input*Max(1,matches/(heap->tuples/leaves));
+            double heap_visits=cost_index_heap_visits(input,matches,heap->tuples/pages,correlation);
+            index_pages=cost_index_pages(leaf_visits,leaves,QS_INDEX_CACHE/2,QS_INDEX_KEYS)+(input>0?copies*levels:0);
+            heap_pages=cost_index_pages(heap_visits,pages,QS_INDEX_CACHE/2,
+                QS_INDEX_KEYS*Max(1,heap_visits/Max(1,input)));
+            double index_bytes=index_pages*BLCKSZ,heap_bytes=heap_pages*BLCKSZ;
+            double read=index_bytes+heap_bytes;
+            io+=transfer_ms(read,pg_sina_internal_mbps); blocks+=index_pages+heap_pages;
+            population_bytes+=read; scan_bytes+=read;
+            cache_bytes+=index_bytes*index->fraction+heap_bytes*heap->fraction;
+            work=(input*levels*(log2(fanout)+QS_INDEX_CACHE/2)*cpu_operator_cost+
+                input*matches*(cpu_tuple_cost+right->expr.nexprs*cpu_operator_cost)+
+                rows*(cpu_tuple_cost+expression))*unit;
+            parallel_cpu(p,work,tasks[i],cus);
+            p->schedule+=cost_parallel(0,ceil((index_pages+heap_pages)/QS_INDEX_READS),cus,pg_sina_parallel_task_ms);
         } else if(n->kind==QP_AGGREGATE) {
             double groups=Max(1,n->estimated_groups),group_tasks=n->left>=0?tasks[n->left]:0;
             if(!n->nkeys) {
@@ -696,6 +785,12 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
         if(p->details) appendStringInfo(p->stages,"%s%d/%s rows=%.0f groups=%.0f tasks=%.0f cpu=%.3fms state=%.0fB resident=%.0fB available=%.0fB spill=%.0fB",
             p->stages->len?"; ":"",i,device_kind(n->kind),rows,n->estimated_groups,tasks[i],
             p->serial+p->parallel+p->schedule+p->combine-previous_cpu,state,resident,available,spill);
+        if(p->details && (n->kind==QP_JOIN || n->kind==QP_INDEX_JOIN)) {
+            static const char *names[]={"inner","left","semi","anti"};
+            appendStringInfo(p->stages," join=%s",names[n->join_type]);
+        }
+        if(p->details && n->kind==QP_INDEX_JOIN)
+            appendStringInfo(p->stages," probes=%.0f index_pages=%.0f heap_pages=%.0f",index_probes,index_pages,heap_pages);
     }
     if(pg_sina_planning) pg_sina_planning->cost_operators+=pg_sina_planner_clock()-mark;
     mark=pg_sina_planner_clock();

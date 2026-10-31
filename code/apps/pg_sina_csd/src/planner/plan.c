@@ -771,14 +771,8 @@ static bool prune_columns(Plan *plan,Bitmapset *keep,bool all,List *prepared)
 }
 static int compile_tree(PlannerInfo *root,Plan *native,struct qp_plan *tree)
 {
-    if(pg_sina_exe_path==PG_SINA_ADAPTIVE) {
-        Plan *chosen=pg_sina_prepare_candidate(root,native,root->parse->sortClause!=NIL);
-        return chosen?compile_node(root,chosen,tree,root->parse->sortClause!=NIL):-1;
-    }
-    Plan *copy=copyObject(native);
-    global_parallel_rows(copy,1);
-    if(!normalize_parallel_aggregate(&copy) || !prune_columns(copy,NULL,true,NIL)) return -1;
-    return compile_node(root,copy,tree,root->parse->sortClause!=NIL);
+    Plan *chosen=pg_sina_prepare_candidate(root,native,root->parse->sortClause!=NIL);
+    return chosen?compile_node(root,chosen,tree,root->parse->sortClause!=NIL):-1;
 }
 
 /* These are physical choices, made before candidate costing. Encoding below
@@ -862,6 +856,18 @@ static bool choose_algorithms(PlannerInfo *root,Plan **slot,bool ordered)
             *slot=p=(Plan *)hash;
         }
     }
+    if(IsA(p,MergeJoin) && !ordered) {
+        List *keys=NIL,*residual=list_copy(((Join *)p)->joinqual); ListCell *c;
+        foreach(c,((MergeJoin *)p)->mergeclauses) {
+            OpExpr *key=lfirst(c); Oid left_hash,right_hash;
+            if(get_op_hash_functions(key->opno,&left_hash,&right_hash)) keys=lappend(keys,key);
+            else residual=lappend(residual,key);
+        }
+        if(keys) {
+            HashJoin *hash=makeNode(HashJoin); hash->join=*(Join *)p; NodeSetTag(hash,T_HashJoin);
+            hash->hashclauses=keys; hash->join.joinqual=residual; *slot=p=(Plan *)hash;
+        }
+    }
     if(IsA(p,HashJoin) && IsA(p->righttree,Hash)) p->righttree=p->righttree->lefttree;
     if(IsA(p,HashJoin) && ((Join *)p)->jointype==JOIN_INNER &&
        p->lefttree->plan_rows*Max(1,p->lefttree->plan_width)<p->righttree->plan_rows*Max(1,p->righttree->plan_width)) {
@@ -873,9 +879,17 @@ static bool choose_algorithms(PlannerInfo *root,Plan **slot,bool ordered)
         simple_group((Node *)p->targetlist,&group); simple_group((Node *)p->qual,&group);
         bool supported=group.supported && group.aggregates && a->numCols+2*list_length(group.aggregates)<=QS_OUT;
         bool sort=IsA(p->lefttree,Sort);
+        /* An unfiltered non-covering index orders every Heap tuple just for
+         * grouping. Both modes can instead scan batches and hash groups. */
+        IndexScan *index=IsA(p->lefttree,IndexScan)?(IndexScan *)p->lefttree:NULL;
+        bool heap=index && !index->scan.plan.qual && !index->indexqualorig && !index->indexorderbyorig;
         Sort *output=supported && sort && ordered?aggregate_output_sort(p):NULL;
-        if(supported && (a->aggstrategy==AGG_HASHED || (sort && (!ordered || output)))) {
+        if(supported && (a->aggstrategy==AGG_HASHED || (sort && (!ordered || output)) || (heap && !ordered))) {
             a->aggstrategy=AGG_HASHED;
+            if(heap && !ordered) {
+                SeqScan *scan=makeNode(SeqScan); *scan=index->scan; NodeSetTag(scan,T_SeqScan);
+                p->lefttree=(Plan *)scan;
+            }
             if(sort) {
                 Plan *input=p->lefttree;
                 if(identity_target(input,input->lefttree)) p->lefttree=input->lefttree;
@@ -1284,15 +1298,6 @@ static int compile_node_impl(PlannerInfo *root,Plan *native,struct qp_plan *tree
     else return -1;
     if(left && n->left<0) { n->left=compile_node(root,left,tree,left_order); if(n->left<0) return -1; }
     if(right) { n->right=compile_node(root,right,tree,right_order); if(n->right<0) return -1; }
-    /* DuckDB's build/probe selection prices cardinality AND row width.
-     * Commute only an INNER hash join: its relation pair stays unchanged,
-     * and expression binding below preserves the original output columns. */
-    if(pg_sina_exe_path!=PG_SINA_ADAPTIVE && n->kind==QP_JOIN && n->hash && n->join_type==QP_INNER && left && right &&
-       tree->nodes[n->left].estimated_rows*Max(1,left->plan_width)<
-       tree->nodes[n->right].estimated_rows*Max(1,right->plan_width)) {
-        int swap=n->left; n->left=n->right; n->right=swap;
-        Plan *input=left; left=right; right=input;
-    }
     b.left=left?left->targetlist:NIL; b.right=right?right->targetlist:NIL;
     if(n->kind!=QP_SCAN) {
         p->nattrs=list_length(b.left)+list_length(b.right);
@@ -1340,9 +1345,6 @@ static int compile_node_impl(PlannerInfo *root,Plan *native,struct qp_plan *tree
             }
         }
         if(!n->nkeys) return -1;
-        /* Keep PG's join order, but equality joins whose output need not be
-         * ordered can use Hash without sorting both complete inputs. */
-        if(!ordered && pg_sina_exe_path!=PG_SINA_ADAPTIVE) n->hash=1;
         if(IsA(native,MergeJoin)) {
             MergeJoin *m=(MergeJoin *)native;
             for(unsigned i=0;i<n->nkeys;++i)
@@ -1353,7 +1355,7 @@ static int compile_node_impl(PlannerInfo *root,Plan *native,struct qp_plan *tree
     }
     if(n->kind==QP_AGGREGATE) {
         Agg *a=(Agg *)native;
-        if(pg_sina_exe_path==PG_SINA_ADAPTIVE) n->hash=a->aggstrategy==AGG_HASHED;
+        n->hash=a->aggstrategy==AGG_HASHED;
         if(a->numCols>QS_KEYS) return -1;
         for(int i=0;i<a->numCols;++i) {
             TargetEntry *t=get_tle_by_resno(native->lefttree->targetlist,a->grpColIdx[i]);
@@ -1391,70 +1393,6 @@ static int compile_node_impl(PlannerInfo *root,Plan *native,struct qp_plan *tree
         if(l->limitCount) { if(!IsA(l->limitCount,Const)) return -1; Const *v=(Const *)l->limitCount; if(!v->constisnull) p->limit=DatumGetInt64(v->constvalue); }
         if(l->limitOffset) { if(!IsA(l->limitOffset,Const)) return -1; Const *v=(Const *)l->limitOffset; if(!v->constisnull) p->offset=DatumGetInt64(v->constvalue); }
     }
-    /* Keep PG HashAggregate or replace grouping-only sorting with bounded
-     * states. Required output order is reapplied above the aggregate. */
-    if(pg_sina_exe_path!=PG_SINA_ADAPTIVE && n->kind==QP_AGGREGATE && qp_hash_aggregate_supported(n) && !n->distinct && !n->distinct_aggs &&
-       p->having<0 && n->left>=0 && (tree->nodes[n->left].kind==QP_SORT ||
-        (!ordered && IsA(native,Agg) && ((Agg *)native)->aggstrategy==AGG_HASHED))) {
-        bool remove_sort=tree->nodes[n->left].kind==QP_SORT;
-        int sort_id=n->left,input=remove_sort?tree->nodes[sort_id].left:n->left;
-        /* Hash and Index joins both expose resumable column input to the sink. */
-        bool supported=input>=0 && (!remove_sort || tree->nodes[input].kind==QP_JOIN ||
-            tree->nodes[input].kind==QP_INDEX_JOIN ||
-            (tree->nodes[input].kind==QP_SCAN && !tree->nodes[input].ordered_index));
-        const struct qs_plan *sorted=&tree->nodes[n->left].expr;
-        if(remove_sort && input>=0) {
-            if(sorted->nout!=tree->nodes[input].expr.nout) supported=false;
-            for(unsigned i=0;i<sorted->nout;++i) {
-                const struct qs_expr *x=&sorted->exprs[sorted->outputs[i].index];
-                if(x->op!=Q_COLUMN || x->column!=(int)i) supported=false;
-            }
-        }
-        for(unsigned i=0;i<p->nout;++i) {
-            if(!group_output(p,p->outputs[i].index,n,false)) supported=false;
-        }
-        if(p->predicate>=0 && !group_output(p,p->predicate,n,false)) supported=false;
-        /* A sorted GroupAggregate can also supply SQL ORDER BY. Preserve
-         * that order by moving its Sort above the aggregate, using output
-         * column positions. The two existing nodes suffice. */
-        struct qs_order orders[QS_KEYS]; unsigned count=sorted->norder;
-        if(ordered) {
-            if(!remove_sort || count>QS_KEYS) supported=false;
-            for(unsigned k=0;supported && k<count;++k) {
-                int output=-1;
-                for(unsigned i=0;i<p->nout;++i) {
-                    const struct qs_expr *x=&p->exprs[p->outputs[i].index];
-                    if(x->op==Q_COLUMN && x->column==sorted->order[k].output) { output=i; break; }
-                }
-                if(output<0) supported=false;
-                else { orders[k]=sorted->order[k]; orders[k].output=output; }
-            }
-        }
-        if(supported) {
-            n->left=input; n->sorted_input=0; n->hash=1;
-            /* The removed grouping Sort imposed order on the probe stream.
-             * Hash aggregation no longer needs it: keep Index Join's vector
-             * batch instead of accidentally retaining one-key ordered probes. */
-            for(int at=input;at>=0;at=tree->nodes[at].left) {
-                struct qp_node *child=&tree->nodes[at];
-                if(child->kind==QP_INDEX_JOIN) child->sorted_input=0;
-                else if(child->kind!=QP_PROJECT && !(child->kind==QP_JOIN && child->hash)) break;
-            }
-            if(ordered) {
-                tree->nodes[sort_id]=*n;
-                const struct qp_node *aggregate=&tree->nodes[sort_id];
-                *n=(struct qp_node){.kind=QP_SORT,.left=sort_id,.right=-1,.join_qual=-1,.estimated_rows=aggregate->estimated_rows};
-                n->expr.predicate=n->expr.having=-1; n->expr.limit=-1;
-                n->expr.nout=n->expr.nexprs=n->expr.nattrs=n->expr.ncols=aggregate->expr.nout;
-                for(unsigned i=0;i<n->expr.nout;++i) {
-                    const struct qs_expr *x=&aggregate->expr.exprs[aggregate->expr.outputs[i].index];
-                    n->expr.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.column=i,.type=x->type,.scale=x->scale,.dscale=x->dscale};
-                    n->expr.outputs[i]=aggregate->expr.outputs[i]; n->expr.outputs[i].index=i;
-                }
-                n->expr.norder=count; memcpy(n->expr.order,orders,count*sizeof(*orders));
-            }
-        }
-    }
     if(pg_sina_exe_path!=PG_SINA_ADAPTIVE || (pg_sina_encoding_choice(id)&PG_SINA_DISTINCT_SORT)) bypass_distinct_sort(tree,n);
     if(pg_sina_exe_path!=PG_SINA_ADAPTIVE || (pg_sina_encoding_choice(id)&PG_SINA_DISTINCT)) choose_distinct(tree,n);
     if(n->kind==QP_SCAN && IsA(native,IndexScan)) {
@@ -1473,30 +1411,6 @@ static int compile_node_impl(PlannerInfo *root,Plan *native,struct qp_plan *tree
        (pg_sina_exe_path!=PG_SINA_ADAPTIVE || (pg_sina_encoding_choice(id)&PG_SINA_GROUP_FILTER))) push_group_key_filter(tree,n);
     if(n->kind==QP_AGGREGATE &&
        (pg_sina_exe_path!=PG_SINA_ADAPTIVE || (pg_sina_encoding_choice(id)&PG_SINA_LEFT_COUNT))) push_left_join_count(tree,n);
-    /* If no consumer requires group order, avoid sorting the full input or
-     * serializing an unfiltered Heap scan through a non-covering index.
-     * Keep PG's join tree and the input target list; use bounded Hash Group. */
-    if(pg_sina_exe_path!=PG_SINA_ADAPTIVE && n->kind==QP_AGGREGATE && !ordered && n->sorted_input && n->nkeys &&
-       qp_hash_aggregate_supported(n) && !n->distinct && !n->distinct_aggs && p->having<0 && n->left>=0) {
-        struct qp_node *input=&tree->nodes[n->left];
-        bool sorting=input->kind==QP_SORT && input->expr.limit<0 && !input->expr.offset;
-        bool index=input->kind==QP_SCAN && input->ordered_index && !(input->ordered_index&4) && input->expr.predicate<0;
-        bool supported=sorting || index;
-        unsigned keys=n->nkeys,plan_keys=p->nkeys;
-        /* PG has already validated that non-aggregate output attributes are
-         * functionally dependent on the grouping keys. Retain them as extra
-         * physical keys, so Hash Group can return that payload without
-         * changing the SQL groups. Do not infer dependencies on the device. */
-        for(unsigned i=0;supported && i<p->nout;++i)
-            supported=group_output(p,p->outputs[i].index,n,sorting);
-        if(supported && p->predicate>=0) supported=group_output(p,p->predicate,n,sorting);
-        if(supported) supported=qp_hash_aggregate_supported(n);
-        if(supported) {
-            if(sorting) { input->kind=QP_PROJECT; input->expr.norder=0; }
-            else { input->ordered_index=0; memset(&input->expr.join,0,sizeof(input->expr.join)); }
-            n->sorted_input=0; n->hash=1;
-        } else { n->nkeys=keys; p->nkeys=plan_keys; }
-    }
     return id;
 }
 
@@ -1801,7 +1715,11 @@ static int describe_tree(PlannerInfo *root,Plan *native,struct qp_plan *tree,boo
             if((unsigned)p->exprs[a].column>=width) { int swap=a; a=z; z=swap; }
             n->left_keys[n->nkeys]=p->exprs[a].column; n->right_keys[n->nkeys++]=p->exprs[z].column-width;
         }
-        if(!n->nkeys || !describe_list(&b,list_concat(list_copy(((Join *)native)->joinqual),extra))) return -1;
+        List *quals=list_concat(list_copy(((Join *)native)->joinqual),extra);
+        if(!n->nkeys || !describe_list(&b,quals)) return -1;
+        /* Parameterized index residuals live in the inner scan in PG. They
+         * are join predicates on the device, just as in the final encoder. */
+        n->join_qual=quals?0:-1;
     }
     if(n->kind==QP_AGGREGATE) {
         Agg *a=(Agg *)native; if(a->numCols>QS_KEYS) return -1;
@@ -1936,11 +1854,14 @@ Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
         tree->param_nodes[param]=id; tree->nparams=Max(tree->nparams,(unsigned)param+1);
         unsigned init=tree->ninit++; tree->init_nodes[init]=id; tree->init_params[init]=param;
     }
-    Plan *copy=copyObject(native);
-    global_parallel_rows(copy,1);
+    bool ordered=boundary || root->parse->sortClause!=NIL;
+    Plan *copy=host_scan?copyObject(native):pg_sina_prepare_candidate(root,native,ordered);
     int result=-1;
-    if(normalize_parallel_aggregate(&copy) && prune_columns(copy,NULL,true,NIL))
-        result=compile_node(root,copy,tree,boundary || root->parse->sortClause!=NIL);
+    if(host_scan) {
+        global_parallel_rows(copy,1);
+        if(!normalize_parallel_aggregate(&copy) || !prune_columns(copy,NULL,true,NIL)) copy=NULL;
+    }
+    if(copy) result=compile_node(root,copy,tree,ordered);
     if(result<0) { goto failed; }
     bool has_scan=false;
     for(unsigned i=0;i<tree->count;++i) {

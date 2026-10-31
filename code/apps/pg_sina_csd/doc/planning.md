@@ -498,3 +498,27 @@ PG两项CTest、路径回归`results/planner-paths.c9afD8/`和连接复用/取�
 Q2每次借用374次、裁列复用337次；Q9为447/340次。前后各4份计划完全相同，包括成本、连接顺序、HOST/CSD边界；候选/接受仍为323/248、288/285，最终编码21/13节点、各一份程序。原始计时、CSV/JSON和报告见`results/planner-subtrees.UomkVv/`。
 
 最终两项CTest、规划路径回归`results/planner-paths.NwjUfK/`、连接复用/取消恢复`results/connection-lifecycle.nw9nyi/`通过；正式Q2/Q9在HOST、CSD无HPCP、SQLerate、filter-only共8次冷启动结果一致，见`results/tpch.iOwnoT/`。未运行全量TPC-H或低于64MiB压力场景。
+
+## 强制CSD与SQLerate共享物理规则
+
+通用树统一调用`pg_sina_prepare_candidate`，在同一准备流程中恢复全流行数、裁列并选择物理算法；描述候选成本和编码执行图都使用准备后的算法。原先仅在强制模式编码时执行的Hash构建侧交换、无序Merge转Hash、分组Sort移除等规则前移，删除重复的编码分支。全表非覆盖索引扫描若仅为分组提供顺序、没有自身过滤或上层顺序需求，两模式均可改为顺序批量扫描＋Hash Aggregate。PG已经证明的函数依赖负载列仍纳入物理分组键，必需的结果顺序在聚合后保留。
+
+SQLerate仍可选择不同连接顺序，强制模式继续采用其PG选中树；共享规则不等于强制所有模式使用同一计划。filter-only保留扫描卸载边界，专用融合CSF及设备程序没有修改。DISTINCT等图形转换仍在候选属性描述时确定并冻结，选中后编码按已记录选择实现；索引连接是否有残余过滤也加入既有一致性检查，不新增设备ABI字段。
+
+Index Join原先跳过右侧整表扫描，却没有单独计入探测和回表。现在用左侧探测行数、右侧PG每次查找行数、键NDV、表/索引页数和PG物理相关系数估价；没有NDV时使用PG查找行数。过滤掉的候选仍可能已经发生回表及解码，只有无需残余过滤的Semi/Anti探测才按首次接受即可结束计价。PG放在内侧索引扫描中的相关过滤会移到设备连接残余条件，属性描述与编码使用同一条件集合。
+
+有界缓存估计采用页占用近似：访问V次、P页的均匀分布，预计不同页数为`P*(1-exp(-V/P))`。按现有256键批次分别计算整批和尾批，对128页游标缓存暂按索引/Heap各半分配，取全程不同页数与批次缺页合计的较大值；因此重复读取可以超过表大小，不会误当成无限缓存。Heap访问数在随机逐元组与聚簇按页读取之间按PG correlation平方插值。另计B-tree查找、页标签检查、候选解码、读请求波次，以及HPCP链路工作；使用已有带宽、CPU和调度校准参数，未新增GUC。`CSD Stage Estimates`记录连接类型及`probes/index_pages/heap_pages`，这些数值属于模型估计，不能当成实际I/O计数。
+
+残余自反连接还会触发PG的一行基数下限，使后续Index Join近似免费。仅当Anti Join有残余条件、估计不超过1行，且等值键来自同一列或经已验证单列外键关联的键域时，采用本地DuckDB `CardinalityEstimator::DEFAULT_SEMI_ANTI_SELECTIVITY=5`的兜底，即保留左侧20%。这是统计不足时的启发式，不是测得的选择率；外键只用于确认键域关联，不推断所有父键都出现或将父表行数当作实际NDV。Inner Join在左右任一子树行数被修正后，都会传播相应比例，避免Hash构建侧交换后丢失右侧修正。没有按查询编号或SQL文本设置规则。
+
+最终版本在原有RelWithDebInfo、4CU/256MiB workmem/64MiB FDM及2GB shared_buffers、16MB PG work_mem、4个PG worker上限下，仅测正式Q10/Q18/Q21。每个模式各一次独立冷启动，profile统一开启；本表为psql总时间ms，旧SQLerate来自修改前完整测试`results/tpch.i6nyie/`，不是交替多轮均值：
+
+| 查询 | 旧SQLerate | 新HOST | 新CSD无HPCP | 新CSD有HPCP | 新SQLerate |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q10 | 2635.474 | 2158.782 | 1499.494 | 1523.303 | 1564.737 |
+| Q18 | 3991.048 | 8694.642 | 817.322 | 855.366 | 848.360 |
+| Q21 | 2714.634 | 1915.699 | 915.829 | 1025.257 | 1210.827 |
+
+Q10/Q18的SQLerate与强制CSD最终设备图相同，执行主体分别约1461/795ms，对照强制HPCP约1482/811ms；Q18已不再走全量有序索引聚合。三条SQLerate均无实际spill。Q21仍选择先Hash连接orders、再进行两次lineitem索引探测，最终LIMIT留在HOST；强制CSD将orders索引探测放在后面。两者内部读取约2.262/1.552GB，执行主体1114/943ms，总时间仍相差约186ms。规则统一和严重回退修复已完成，但Q21候选排序仍非实测最优；20%兜底、均匀缓存及CPU校准仍有近似，不能宣称SQLerate总是最快，也不能把差距归因于物理内存不足。
+
+原始计时、CSV及实际计划见`results/tpch.Y91s4R/`。两项CTest通过；`results/planner-paths.8mMbBe/`增加两模式Q18聚合选择和Index Join读页估价回归，原有融合路径、HOST选择、original Q17/Q20及CTE仍通过。`results/planner-cost.nUoyRT/`验证正式Q13在64MiB查询预算下结果及估价字段；旧测试中已失效的Node Cost Estimates断言更新为当前CSD Stage Estimates。未运行完整TPC-H或低于64MiB的场景。

@@ -18,7 +18,7 @@ for query in "$@"; do
     sh "$COLD" SQLerate "$QUERIES/$query.explain.sql" \
         > "$OUT/$query.plan" 2> "$OUT/$query.plan.err"
     unset PGOPTIONS
-    grep -q 'Node Cost Estimates:.*serial=' "$OUT/$query.plan"
+    grep -q 'CSD Stage Estimates:' "$OUT/$query.plan"
     if [ "$query" = 1 ]; then
         grep -q 'fused Scan/Filter/Aggregate' "$OUT/$query.plan"
         grep -q 'Estimated Spill I/O: 0 bytes' "$OUT/$query.plan"

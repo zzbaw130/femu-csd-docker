@@ -42,6 +42,19 @@ for query in 1 6; do
     grep -q 'CSD Stage Estimates: fused Scan/Filter/Aggregate' "$OUT/fused.$query.plan"
     grep -q 'serialized_plans=0 fast_records=1' "$OUT/fused.$query.err"
 done
+# Physical preparation is shared: grouping does not require a full ordered
+# Heap walk through lineitem's non-covering index in either device mode.
+for mode in csd-with-hpcp SQLerate; do
+    plan 18 "$mode" "grouping.$mode" 'SET pg_sina_csd.csd_cpu_ratio=0.001'
+    grep -q 'CSD Plan:.*Hash Aggregate.*Hash Aggregate' "$OUT/grouping.$mode.plan"
+    if grep -q 'CSD Plan:.*index ordered' "$OUT/grouping.$mode.plan"; then exit 1; fi
+done
+# Selected index joins expose their probe and page estimates, rather than
+# silently charging only generic tuple CPU. Other physical joins remain legal.
+plan 21 SQLerate index-cost
+if grep -q 'CSD Stage Estimates:.*IndexJoin' "$OUT/index-cost.plan"; then
+    grep -Eq 'probes=[1-9][0-9]* index_pages=[1-9][0-9]* heap_pages=' "$OUT/index-cost.plan"
+fi
 # A common rewrite may also produce a better HOST candidate. It must not
 # silently replace the original native-PG baseline or require a CSD operator.
 plan 17.original host-only original

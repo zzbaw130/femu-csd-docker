@@ -88,9 +88,11 @@ List **pg_sina_search_scan_schemas(void);
 struct qp_plan *pg_sina_cost_workspace(void);
 enum { PG_SINA_GROUP_FILTER=1U<<8, PG_SINA_LEFT_COUNT=1U<<9, PG_SINA_DISTINCT=1U<<10, PG_SINA_DISTINCT_SORT=1U<<11 };
 /* Query-local choice, never a wire field: low bits select relational rewrites;
- * high bits freeze the node/access algorithms checked by the final encoder. */
+ * high bits freeze the node/access algorithms and index residual presence
+ * checked by the final encoder (residuals affect probe early-exit costs). */
 static inline unsigned pg_sina_physical_choice(const struct qp_node *n)
-{ return ((n->kind+1)<<16)|(n->hash<<24)|(n->sorted_input<<25)|(n->ordered_index<<26); }
+{ return ((n->kind+1)<<16)|(n->hash<<24)|(n->sorted_input<<25)|(n->ordered_index<<26)|
+    (n->kind==QP_INDEX_JOIN && n->join_qual>=0?1U<<30:0); }
 unsigned *pg_sina_candidate_choices(void);
 unsigned pg_sina_encoding_choice(unsigned);
 bool pg_sina_encoding_matches(unsigned,const struct qp_node *);

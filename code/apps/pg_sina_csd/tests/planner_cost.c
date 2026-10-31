@@ -5,6 +5,18 @@
 #define CHECK(test) do { if(!(test)) { fprintf(stderr,"line %d: %s\n",__LINE__,#test); return EXIT_FAILURE; } } while(0)
 int main(void)
 {
+    /* Bounded index caches must not make repeated random I/O free. A small
+     * table can fit; clustered matching tuples share a Heap page. */
+    CHECK(cost_index_pages(0,10000,64,256)==0);
+    CHECK(cost_index_pages(257,100000,0,256)<258);
+    CHECK(cost_index_pages(100000,1,64,256)<=1);
+    CHECK(cost_index_pages(1000000,10000,64,256)>10000);
+    CHECK(cost_index_pages(1000000,10000,64,256)>cost_index_pages(10000,10000,64,256));
+    CHECK(cost_index_heap_visits(100,4,50,1)==100);
+    CHECK(cost_index_heap_visits(100,4,50,0)==400);
+    CHECK(cost_index_heap_visits(0,4,50,0)==0);
+    CHECK(cost_anti_fallback(0)==0);
+    CHECK(cost_anti_fallback(1000)>1 && cost_anti_fallback(1000)<1000);
     /* A single block cannot speed up on eight CUs. Three blocks leave five
      * idle; an incomplete last wave costs more than ideal work/CU. */
     CHECK(cost_parallel(80,1,8,0.02)==80);

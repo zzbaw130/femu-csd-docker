@@ -175,6 +175,8 @@ TPCH_MODES=host-only sh /home/femu/tests/tpch-test.sh
 
 `preview_borrows` 记录预览时只读借用已准备子树的次数；修改前仍生成独立副本，避免影响 HOST 和其他候选。预览结束后包装只保留列标签，表达式由子树保留。`prune_reuses` 记录父节点保留子树全部输出、因而跳过内部重复裁列的次数；输出缩减时重新裁列，物理算法和排序需求仍重新检查。这两个计数表示省去的重复工作，不代表少搜索了候选。
 
+强制 CSD 与 SQLerate 的通用树共享物理准备规则：Hash 构建侧选择、无需顺序的 Merge→Hash、分组 Sort 移除，以及无过滤非覆盖索引分组转顺序扫描＋Hash Aggregate。SQLerate 仍按成本选择连接顺序；共享规则不要求不同模式选中同一棵树。编码阶段校验冻结的物理选择，包括索引连接是否存在残余过滤。`CSD Stage Estimates` 中连接的 `join` 标明类型；IndexJoin 的 `probes/index_pages/heap_pages` 分别是估计探测次数、索引读页数、Heap 回表读页数，包含有界缓存之外的重复读取。它们是估价，实际读取仍查看运行计数；设计及验证见 [规划设计](doc/planning.md)。
+
 通用树的 profile 同时记录 PG 调度线程的墙钟：`CSD Host Completion Copy` 是请求完成后同步读取 AFDM 控制记录及结果头的时间，`CSD Host Submit` 是 PG 主线程准备和提交请求的时间，不包含 callback 续交。其中 `Queue`、`Control Write` 及已有的 `LOAD Preparation` 均包含在 Submit 中，不能再次相加。`Poll` 是检查完成标志的时间，`Idle Sleep` 是没有可推进任务时的休眠时间。`Pending Requests Sum` 累计各请求提交到 callback 的时间，最终返回 PG 的请求还包含完成观察等待；跨并发请求求和，不是查询延迟或纯 I/O 时间。Host Submissions/Completions 只计 PG 提交和观察的次数，Callback Submissions 另计自动续交次数。关闭 profile 时不采集这些计时。
 
 `CSD Host Assigned LOADs` 记录提前分配的顺序输入块数；开启 profile 时，`Completion Reads` 和 `Control Writes` 分别记录调度期间实际进行的控制记录读写次数，不包含初始化、结束清理和最终字符串结果复制。

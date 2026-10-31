@@ -13,6 +13,29 @@ static inline double cost_slots(double count,double minimum)
     while(slots<count && slots<0x1p52) slots*=2;
     return slots;
 }
+/* Uniform page occupancy within vector batches, with the cursor's bounded
+ * cache reused between batches. A small relation fits; large random probes
+ * may reread the same page after eviction. Never cap reads at table size. */
+static inline double cost_index_pages(double visits,double pages,double cache,double batch)
+{
+    if(visits<=0 || pages<=0) return 0;
+    double unique=-pages*expm1(-visits/pages);
+    double full=floor(visits/batch),tail=visits-full*batch;
+    double misses=(-full*pages*expm1(-batch/pages)-pages*expm1(-tail/pages))*(1-cost_min(1,cache/pages));
+    return cost_max(unique,misses);
+}
+/* PG correlation describes how consecutive index matches share Heap pages.
+ * Random matches may need one page per tuple; clustered matches share pages. */
+static inline double cost_index_heap_visits(double probes,double matches,double tuples_per_page,double correlation)
+{
+    if(probes<=0 || matches<=0) return 0;
+    double clustered=cost_max(1,matches/cost_max(1,tuples_per_page));
+    double weight=correlation*correlation;
+    return probes*(weight*clustered+(1-weight)*matches);
+}
+/* DuckDB CardinalityEstimator uses DEFAULT_SEMI_ANTI_SELECTIVITY = 5.
+ * Use its 20% fallback only for degenerate residual self anti estimates. */
+static inline double cost_anti_fallback(double rows) { return rows/5; }
 /* Same packed payload as device plan.c::hash_row_bytes, including NULL and
  * numeric scale bytes. PG plan_width is not this representation. */
 static inline unsigned cost_hash_row(const struct qs_plan *p)
