@@ -218,3 +218,11 @@ Q22 filter-only比同轮HOST低35.8%。Q11完成了功能修复，但单轮仍�
 PG布局、规划成本及已有数值边界入口通过，新增HOST numeric转换覆盖超过64位的正负数、scale、int128边界及NULL。设备新增`pgSinaHostParameters64MiB`覆盖精确参数、NULL、扫描/连接引用、截断输入拒绝与清理；原类型返回、CU直接交付、索引连接三项通过。会话内功能测试还覆盖根扫描保留InitPlan、多个参数及generic prepared plan多次重新绑定，并检查确实出现CSD扫描而不是回退；未新增测试SQL文件。最终FDM_USED=0。
 
 其余22条只做现有EXPLAIN脚本的计划检查，未重跑全量基准；相关SubPlan结论见`planning.md`当前支持边界。
+
+## 冷热缓存下的计时含义
+
+`filter-only`的延迟是整条SQL延迟，不是单独Scan/Filter时间。该模式关闭HPCP/DCP，不禁止HOST保留的索引访问、连接和聚合使用PG原生缓存；当前依赖NestLoop外侧逐行参数的索引扫描仍在HOST。设备返回采用两个有界HOST批次，HOST消费慢会使返回队列满、等待并推迟续交，热缓存也会通过加快HOST消费缩短这段等待。`CSD Tree Wall`从设备流启动计到当前，包含HOST反压及期间其他HOST工作，不能当作纯设备计算或内部I/O耗时。
+
+核对`results/tpch-final.QtGkD2/`全部132份filter-only日志：22条冷热执行树、内部读取字节、返回行数及返回字节分别完全一致，所有扫描均为NVM→FDM、HPCP/DCP关闭，填充计数为0。Q4三轮SQL主体1133.0→179.1ms，但设备累计CPU仅226.0→210.7ms，内部读取均213770240B、返回57306行；队列满等待累计989.1→93.4ms。Q18主体8298.9→4657.7ms，设备累计CPU489.7→487.1ms，内部读取和返回量仍相同。不能把这些累计CPU/等待与SQL墙钟强行相加。
+
+仅追加正式Q4的冷、热各一次BUFFERS诊断（逐节点TIMING关闭）：HOST `lineitem_pkey`扫描均57306次，shared hit/read由168133/61653变为229786/0；orders的设备扫描仍读相同数据且不使用HOST缓存。两份输出与HOST参考一致、4次FDM检查为0。诊断耗时不混入原三轮中位数，未重跑全量、未修改执行代码。完整22条对照和诊断见`results/filter-cache-audit.9BBzaG/report.md`。
