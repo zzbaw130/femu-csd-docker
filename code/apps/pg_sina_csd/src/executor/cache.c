@@ -99,17 +99,6 @@ fail:
     pg_sina_dcp_finish();
     ereport(ERROR,(errmsg("cannot map DCP receive data: %m")));
 }
-static int in_buffer_pool(Relation rel,BlockNumber block)
-{
-    BufferTag tag; INIT_BUFFERTAG(tag,rel->rd_node,MAIN_FORKNUM,block);
-    uint32 hash=BufTableHashCode(&tag);
-    LWLock *lock=BufMappingPartitionLock(hash);
-    LWLockAcquire(lock,LW_SHARED);
-    int id=BufTableLookup(&tag,hash);
-    int exists=id<0?0:(pg_atomic_read_u32(&GetBufferDescriptor(id)->state)&BM_VALID)?1:2;
-    LWLockRelease(lock);
-    return exists;
-}
 static void fill_slot(unsigned slot,bool whole_slot)
 {
     const struct femu_cache_slot *s=&receiver.slots[slot];
@@ -148,23 +137,17 @@ static void fill_slot(unsigned slot,bool whole_slot)
         for(uint64 offset=0;offset<take;offset+=BLCKSZ) {
             BlockNumber block=(logical+offset)/BLCKSZ;
             const void *page=data+position+offset;
-            uint64 mark=pg_sina_profile?now_ns():0;
-            int present=in_buffer_pool(rel,block);
-            if(pg_sina_profile) receiver.lookup_ns+=now_ns()-mark;
-            if(present) {
-                if(present==1) ++receiver.cached; else receiver.skipped+=BLCKSZ;
-                continue;
-            }
             /* PG's checksum verifier temporarily clears pd_checksum. Keep
              * the DMA mapping read-only; only checksum-enabled clusters need
              * this scratch copy. Normal header checks do not write the page. */
             if(checksums) { memcpy(checked.data,page,BLCKSZ); page=checked.data; }
             if(!PageIsVerifiedExtended((Page)page,block,0)) { ++receiver.invalid; continue; }
-            mark=pg_sina_profile?now_ns():0;
+            uint64 mark=pg_sina_profile?now_ns():0;
             Buffer buffer=ReadBufferExtended(rel,MAIN_FORKNUM,block,RBM_ZERO_AND_LOCK,NULL);
             if(pg_sina_profile) receiver.allocate_ns+=now_ns()-mark;
-            /* A concurrent backend may have installed the page since lookup.
-             * Never overwrite an existing page, including dirty hint bits. */
+            /* ReadBufferExtended does the lookup, pin and locking itself.
+             * Keep its zeroing step; never overwrite an existing page,
+             * including dirty hint bits. No PG buffer internals are changed. */
             if(PageIsNew(BufferGetPage(buffer)) &&
                !(pg_atomic_read_u32(&GetBufferDescriptor(buffer-1)->state)&BM_DIRTY)) {
                 mark=pg_sina_profile?now_ns():0;
