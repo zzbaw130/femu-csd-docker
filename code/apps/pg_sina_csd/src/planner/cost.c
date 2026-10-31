@@ -30,11 +30,12 @@
 #include <float.h>
 #include <math.h>
 
-struct host_scan_cost { NodeTag type; Oid index; double rows,before,after,cpu; int workers; };
+struct host_scan_cost { NodeTag type; Oid index; double rows,before,after,startup_after,cpu; int workers; };
+struct host_lookup_cost { Oid index; JoinType type; double rows,before,inner,correction; };
 struct residency {
     Oid oid;
     double bytes,tuples,fraction,shared;
-    List *scans;
+    List *scans,*lookups;
 };
 struct placement {
     Plan *native,*device;
@@ -150,11 +151,66 @@ void pg_sina_cost_host_path(PlannerInfo *root,Path *path,Oid oid,List **observat
     }
     {
         struct host_scan_cost *scan=MemoryContextAlloc(pg_sina_search_context(),sizeof(*scan));
-        *scan=(struct host_scan_cost){.type=path->pathtype,.index=indexid,.rows=path->rows,.before=before,.after=after,
+        *scan=(struct host_scan_cost){.type=path->pathtype,.index=indexid,.rows=path->rows,.before=before,.after=after,.startup_after=startup,
             .cpu=Max(0,before-heap_io-index_io-descent-startup),.workers=path->parallel_workers};
         MemoryContext previous=MemoryContextSwitchTo(pg_sina_search_context());
         heap->scans=lappend(heap->scans,scan); MemoryContextSwitchTo(previous);
     }
+}
+/* Preserve PG's own SEMI/ANTI early-stop and rescan pricing. Discounting one
+ * full inner scan per outer row would subtract work PG never charged. */
+void pg_sina_cost_host_lookup(PlannerInfo *root,Path *path,JoinPathExtraData *extra,List **observations)
+{
+    if(!IsA(path,NestPath)) return;
+    NestPath *native=(NestPath *)path; Path *inner=native->innerjoinpath;
+    if(!IsA(inner,IndexPath) || inner->rows<=1 ||
+       (native->jointype!=JOIN_SEMI && native->jointype!=JOIN_ANTI && !native->inner_unique)) return;
+    Oid index=((IndexPath *)inner)->indexinfo->indexoid;
+    struct residency *relation=NULL; const struct host_scan_cost *price=NULL; ListCell *c,*s;
+    foreach(c,*observations) {
+        struct residency *r=lfirst(c);
+        foreach(s,r->scans) {
+            const struct host_scan_cost *scan=lfirst(s);
+            if(scan->index==index && scan->type==inner->pathtype &&
+               scan->rows==inner->rows && scan->before==inner->total_cost) { relation=r; price=scan; break; }
+        }
+        if(price) break;
+    }
+    if(!price || price->before==price->after) return;
+    NestPath repriced=*native; JoinCostWorkspace workspace;
+    double startup=inner->startup_cost,total=inner->total_cost;
+    PG_TRY();
+    {
+        inner->startup_cost=price->startup_after; inner->total_cost=price->after;
+        initial_cost_nestloop(root,&workspace,native->jointype,native->outerjoinpath,inner,extra);
+        final_cost_nestloop(root,&repriced,&workspace,extra);
+    }
+    PG_CATCH();
+    { inner->startup_cost=startup; inner->total_cost=total; PG_RE_THROW(); }
+    PG_END_TRY();
+    inner->startup_cost=startup; inner->total_cost=total;
+    struct host_lookup_cost *record=MemoryContextAlloc(pg_sina_search_context(),sizeof(*record));
+    *record=(struct host_lookup_cost){.index=index,.type=native->jointype,.rows=path->rows,
+        .before=path->total_cost,.inner=total,.correction=repriced.path.total_cost-path->total_cost};
+    MemoryContext previous=MemoryContextSwitchTo(pg_sina_search_context());
+    relation->lookups=lappend(relation->lookups,record); MemoryContextSwitchTo(previous);
+}
+static bool host_lookup_correction(Plan *plan,List **observations,double *correction)
+{
+    if(!IsA(plan,NestLoop) || !plan->righttree ||
+       (!IsA(plan->righttree,IndexScan) && !IsA(plan->righttree,IndexOnlyScan))) return false;
+    Oid index=IsA(plan->righttree,IndexScan)?((IndexScan *)plan->righttree)->indexid:
+        ((IndexOnlyScan *)plan->righttree)->indexid;
+    ListCell *c,*l;
+    foreach(c,*observations) foreach(l,((struct residency *)lfirst(c))->lookups) {
+        const struct host_lookup_cost *record=lfirst(l);
+        if(record->index==index && record->type==((NestLoop *)plan)->join.jointype &&
+           record->rows==plan->plan_rows && record->before==plan->total_cost &&
+           record->inner==plan->righttree->total_cost) {
+            *correction=record->correction*pg_sina_host_cost_ms; return true;
+        }
+    }
+    return false;
 }
 /* Preserve the unmodified native PG plan as a candidate. Look up the same
  * selected scan's Path estimate, instead of inferring I/O from output rows. */
@@ -242,7 +298,9 @@ static double statement_cache_cost(Plan *p,List *rtable,List **observations,doub
     }
     correction+=statement_cache_cost(p->lefttree,rtable,observations,repeats);
     double inner=IsA(p,NestLoop) && p->righttree && !IsA(p->righttree,Material)?Max(1,p->lefttree->plan_rows):1;
-    correction+=statement_cache_cost(p->righttree,rtable,observations,repeats*inner);
+    double lookup;
+    if(host_lookup_correction(p,observations,&lookup)) correction+=lookup*repeats;
+    else correction+=statement_cache_cost(p->righttree,rtable,observations,repeats*inner);
     if(IsA(p,SubqueryScan)) correction+=statement_cache_cost(((SubqueryScan *)p)->subplan,rtable,observations,repeats);
     if(IsA(p,CustomScan)) { ListCell *c; foreach(c,((CustomScan *)p)->custom_plans)
         correction+=statement_cache_cost(lfirst(c),rtable,observations,repeats); }

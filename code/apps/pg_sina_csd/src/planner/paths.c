@@ -390,6 +390,16 @@ void pg_sina_rel_paths(PlannerInfo *root,RelOptInfo *rel,Index rti,RangeTblEntry
 void pg_sina_join_paths(PlannerInfo *root,RelOptInfo *joinrel,RelOptInfo *outerrel,
                         RelOptInfo *innerrel,JoinType jointype,JoinPathExtraData *extra)
 {
+    if(pg_sina_path_search && pg_sina_exe_path==PG_SINA_ADAPTIVE && pg_sina_native_search && !pg_sina_compiling_plan) {
+        List *paths=list_concat(list_copy(joinrel->pathlist),list_copy(joinrel->partial_pathlist)); ListCell *c;
+        foreach(c,paths) {
+            Path *path=lfirst(c);
+            if(IsA(path,NestPath) && ((NestPath *)path)->outerjoinpath->parent==outerrel &&
+               ((NestPath *)path)->innerjoinpath->parent==innerrel)
+                pg_sina_cost_host_lookup(root,path,extra,&pg_sina_path_search->observations);
+        }
+        list_free(paths);
+    }
     if(!eligible(root)) return;
     /* Inspect PG's current alternatives too, preserving Index/Merge choices. */
     List *paths=list_concat(list_copy(joinrel->pathlist),list_copy(joinrel->partial_pathlist)); ListCell *c;

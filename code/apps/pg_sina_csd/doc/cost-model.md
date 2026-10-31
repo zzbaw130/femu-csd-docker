@@ -154,3 +154,11 @@ Spill读写各按总字节的一半近似计费：读使用internal_mbps，写�
 索引CPU的缓存校准与上述结构修正分开：PG12 B-tree每层50×cpu_operator_cost是经验价；对shared_buffers内驻留部分，替换为cpu_tuple_cost作为缓存查找/引用价，保留二分比较及实际元组/谓词开销。这是仿真环境的估价初值，不是PG或SNIA的标准要求。实际驻留为零时不减该项。Q3仍有跨表相关基数误差，详见planning.md最新验证；模型尚未达到所有热查询最优。
 
 当前决策保持纯统计模型：估价使用现有PG统计、设备物理属性和缓存驻留记录，不执行Join采样，不将验收实测行数写回规划器。现有单表统计无法完整表示跨表谓词相关性；Q3仍有基数及路径误选，作为已知精度限制明确报告。
+
+## Semi/Anti 索引连接的缓存扣费修复
+
+原生HOST候选的缓存修正曾将一次完整内侧索引扫描的价差乘外侧行数。PG对SEMI、ANTI和inner_unique连接可能只读到第一个匹配，原连接成本没有包含这些完整扫描，因而产生过量扣费，Q4最终被截成0ms。
+
+现在在原生Path阶段，保留同一索引的缓存后startup/total价格，调用PG原有initial_cost_nestloop/final_cost_nestloop重新估价，仅替换内侧输入价格；PG的match_count、匹配比例、提前结束、重扫与CPU费用均保留。临时价格在正常及ERROR路径均恢复。将差额用于选中原生计划的缓存修正，不再在这些节点重复乘完整内侧价差。只处理有真实缓存价差、内侧为索引扫描且可能提前结束的连接；没有额外设备请求或运行SQL采样。
+
+定向热测 `results/q4-q10-fix.GZzqtM/`：Q4原HOST候选从0恢复为230.928ms，共享搜索选157.028ms的CSD扫描orders→HOST Semi Index Join及聚合排序。三轮查询主体中位HOST306.3ms、filter-only181.1ms、修改前SQLerate316.0ms、修改后175.1ms；修改后规划4.5ms、执行139.4ms，SQL总时间195.9ms。设备4CU/256MiB workmem/64MiB FDM，PG配置不变，只预热一次，填充模式双开HPCP/DCP。Q4与同时采集的Q10优化前基线共36份结果一致、72份FDM检查为0、实际spill为0；两项PG组件CTest通过，未跑全量。
