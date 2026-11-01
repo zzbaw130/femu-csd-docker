@@ -982,6 +982,38 @@ static void hash_sink_batch(struct execution *s,struct qs_result *out)
     memmove(out->data,(struct qs_cell *)out->data+(size_t)count*right->nout,
         (size_t)out->rows*right->nout*sizeof(struct qs_cell));
 }
+/* Pure equality SEMI/ANTI needs existence, not duplicate build rows. Like
+ * DuckDB's duplicate-key elimination, retain one representative per key.
+ * Compact only at the existing growth barrier, with all build CUs stopped;
+ * this keeps the vector sink unchanged and needs no extra table or lock. */
+static int hash_compact_exists(struct execution *s,unsigned id)
+{
+    const struct qp_node *n=&s->plan->nodes[id];
+    if((n->join_type!=QP_SEMI && n->join_type!=QP_ANTI) || n->join_qual>=0 || n->nkeys!=1) return 0;
+    struct operator_state *o=&s->nodes[id];
+    const struct qs_plan *right=&s->plan->nodes[n->right].expr;
+    unsigned bytes=hash_row_bytes(right),column=n->right_keys[0];
+    unsigned type=right->exprs[right->outputs[column].index].type;
+    uint32_t *next=(void *)(o->hash_data+(size_t)o->hash_capacity*bytes),*buckets=next+o->hash_capacity;
+    memset(buckets,0xff,(size_t)o->hash_buckets*sizeof(*buckets));
+    unsigned rows=o->hash_rows,kept=0;
+    for(unsigned at=0;at<rows;++at) {
+        struct qs_cell row[QS_OUT],other[QS_OUT];
+        hash_load(row,o->hash_data+(size_t)at*bytes,right);
+        unsigned bucket=row_hash(n,row,1)&(o->hash_buckets-1),found=0;
+        for(unsigned match=buckets[bucket];match!=UINT_MAX;match=next[match]) {
+            hash_load(other,o->hash_data+(size_t)match*bytes,right);
+            int equal=equal_cell(s,row[column],other[column],type);
+            if(equal<0) return -5;
+            if(equal) { found=1; break; }
+        }
+        if(found) continue;
+        if(kept!=at) memmove(o->hash_data+(size_t)kept*bytes,o->hash_data+(size_t)at*bytes,bytes);
+        next[kept]=buckets[bucket]; buckets[bucket]=kept++;
+    }
+    o->hash_rows=kept;
+    return kept<rows;
+}
 static int64_t hash_build_impl(struct execution *s,unsigned id)
 {
     const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
@@ -1012,6 +1044,9 @@ static int64_t hash_build_impl(struct execution *s,unsigned id)
             size_t bytes=(size_t)o->hash_capacity*2*stride;
             void *data=bytes<=hash_limit?hash_memory(s,id,o->hash_data,bytes):NULL;
             if(!data) {
+                int compacted=hash_compact_exists(s,id);
+                if(compacted<0) return compacted;
+                if(compacted) continue;
                 /* Preserve already-built projected rows. The fallback sorts
                  * this prefix plus the remaining child stream, never rereads
                  * or decodes the original heap for another build batch. */

@@ -2384,6 +2384,22 @@ int main(int argc,char **argv)
         dictionary_plan(run,0,0,1,524288,64U*1024*1024,2);
         return 0;
     }
+    if(argc==3 && !strcmp(argv[2],"--existence-join-64m")) {
+        assert(!cs_work_init(64U*1024*1024));
+        function run=(function)dlsym(library,"pg_sina_plan"); assert(run);
+        for(unsigned join=QP_SEMI;join<=QP_ANTI;++join)
+            test(run,join,31,2000003,64,1,TEST_SERIAL);
+        for(unsigned scheduled=0;scheduled<2;++scheduled) {
+            test_scheduled=scheduled; test_workers=4;
+            for(unsigned join=QP_SEMI;join<=QP_ANTI;++join) {
+                fprintf(stderr,"existence join: scheduled=%u kind=%u\n",scheduled,join);
+                test(run,join,31,2000003,64,1,TEST_BUILD_PHASE);
+                test(run,join,31,5003,64,1,TEST_JOIN_QUAL);
+                if(join==QP_ANTI) test(run,join,31,0,64,1,TEST_SERIAL);
+            }
+        }
+        return 0;
+    }
     if(argc==3 && !strcmp(argv[2],"--aggregate-workspace-64m")) {
         assert(!cs_work_init(64U*1024*1024));
         function run=(function)dlsym(library,"pg_sina_plan"); assert(run);
