@@ -809,4 +809,6 @@ SF8镜像的表及索引约11.48GiB，超过8GiB Guest RAM与2GiB shared_buffers
 
 PG库、HPCP模块已构建部署；两个PG组件测试、脚本语法检查通过。只用正式SF8 Q6验证HOST、无填充CSD、DCP-only、双填充及连续双填充，共六份结果一致，设备执行后FDM均归零。预算耗尽后再执行时DCP初始预算和新增页均为0，allocate/copy耗时均为0，跳过6702899200B；HPCP容量跳过累计2101747712B，错误为0。前面非零预算样本均满足filled_pages+remaining_pages=admission_pages。此处为功能及容量边界检查，不用单轮耗时宣称性能胜负。
 
-测试脚本支持标准PGDATA/PGDATABASE环境变量，默认仍为SF1。SF1数据目录保存在Guest系统盘`/home/femu/pg-sf1-saved`，SF8表和索引位于模拟SSD`/data/tpch_s8`；SF8 WAL位于Guest系统盘。正式22条SQL及参数未修改，八张表均全visible/frozen并重新prepare。后续全量验收仍未完成；定向Q9暴露现有隐藏spill区只有256MiB、执行返回容量不足，需要先排除存储临时区限制再评估spill效率。准备与逐轮边界证据保存在`results/sf8-preparation/`。
+测试脚本支持标准PGDATA/PGDATABASE环境变量，默认仍为SF1。SF1数据目录保存在Guest系统盘`/home/femu/pg-sf1-saved`，SF8表和索引位于模拟SSD`/data/tpch_s8`；SF8 WAL位于Guest系统盘。正式22条SQL及参数未修改，初次装载的八张表均全visible/frozen并重新prepare。准备与逐轮边界证据保存在`results/sf8-preparation/`。
+
+预检Q9暴露初始隐藏spill区只有256MiB、执行返回容量不足；原生Q18完成，但临时文件采样已达917MiB、数据分区仅剩104MiB。为排除NVM空间不足与高占用的干扰，Compose改为20GiB可见namespace、8GiB隐藏spill区，4CU/256MiB workmem/64MiB FDM不变。QEMU已按新参数启动，Guest Identify/lsblk核验可见namespace为21474836480B。隐藏区与namespace合计仍满足固定64GiB NAND的GC保留条件；它不是额外计算内存。SF8从同一原始镜像重新装载后必须重新prepare并复核，不能混用旧extent。全量冷热性能验收仍未完成。

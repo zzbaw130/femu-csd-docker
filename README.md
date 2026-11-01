@@ -157,14 +157,15 @@ cc application.c -lsnia -o application
 | --- | --- | --- |
 | `FEMU_SMP` | 8 | guest vCPU 数 |
 | `FEMU_MEM` | 8G | guest 内存 |
-| `CSD_NVM_SIZE` | 16384 | **暴露给 guest 的SSD容量**（MB）。NAND 原始容量固定 64 GB；由于需要有25% OP，因此size最大为49152MB |
+| `CSD_NVM_SIZE` | 20480 | **暴露给 guest 的SSD容量**（MiB）。当前为SF8保留表、索引和PG临时文件空间 |
+| `CSD_SPILL_SIZE_MB` | 8192 | 设备隐藏的NVM临时区（MiB），不占FDM或计算workmem；与namespace合计必须满足NAND的GC保留要求 |
 | `CSD_FDM_SIZE` | 64 | CSF 输入输出缓冲 FDM（MiB） |
 | `CSD_NR_CU` | 4 | CSD 计算单元数（≤64） |
 | `CSD_CSF_RUNTIME_SCALE` | 1 | 程序运行时间缩放 |
-| `CSD_WORKMEM_SIZE_MB` | `64` | 所有协作式 CSF 共享的工作内存池，与 FDM 独立 |
+| `CSD_WORKMEM_SIZE_MB` | `256` | 所有协作式 CSF 共享的工作内存池，与 FDM 独立 |
 | `CSD_PROGRAM_DIR` | `/workspace/code/csd-programs/build` | 容器内算子目录（`csd_program_dir`） |
 
-最大内存需求 ≈ `CSD_NVM_SIZE`（MB）+ `FEMU_MEM`（GB） + `CSD_FDM_SIZE`（MB）+ `CSD_WORKMEM_SIZE_MB`（MiB）+ 约 1 GiB。
+RAM-backed仿真的最大内存需求 ≈ `CSD_NVM_SIZE` + `CSD_SPILL_SIZE_MB` + `CSD_FDM_SIZE` + `CSD_WORKMEM_SIZE_MB`（以上均MiB）+ `FEMU_MEM` + 约1GiB元数据。NAND原始容量固定64GiB，namespace与隐藏临时区合计最多48GiB，以保留GC空间；隐藏临时区不是计算内存。
 
 ## 6. 容易踩的坑
 
