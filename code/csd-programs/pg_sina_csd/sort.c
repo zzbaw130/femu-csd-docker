@@ -622,7 +622,7 @@ static int64_t prepare_run_text(struct row_sort *s,struct femu_csd_args *a)
         for(;s->text_column<s->plan.nout;++s->text_column) {
             unsigned col=s->text_column;
             struct qs_cell *v=&run_row(s,r,s->text_row)[col];
-            if(!text_output(&s->plan,col) || v->isnull || v->dscale==TEXT_RUN_TAG) continue;
+            if(!text_output(&s->plan,col) || v->isnull || v->dscale==TEXT_RUN_TAG || qs_cell_late_text(v)) continue;
             const char *bytes; unsigned length;
 retry_text:
             s->comparing=1;

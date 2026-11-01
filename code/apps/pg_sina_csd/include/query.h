@@ -128,6 +128,13 @@ static inline unsigned char *qs_dscales(struct qs_chunk *c) { return qs_nulls(c)
 static inline uint32_t *qs_selection(struct qs_chunk *c)
 { return (uint32_t *)(((uintptr_t)(qs_dscales(c)+(size_t)c->capacity*c->ncols)+7)&~(uintptr_t)7); }
 struct qs_cell { __int128 value; uint8_t scale, dscale, isnull; };
+/* Device-only immutable Heap byte reference. It survives FDM reuse and
+ * spill without retaining page pointers or interning output-only strings.
+ * The plan's original file mapping resolves it only at final output. */
+static inline int qs_cell_late_text(const struct qs_cell *v)
+{ return (unsigned __int128)v->value>>127; }
+static inline __int128 qs_late_text(unsigned node,uint64_t offset,unsigned bytes)
+{ return (__int128)(((unsigned __int128)1<<127)|((unsigned __int128)node<<80)|((unsigned __int128)bytes<<64)|offset); }
 /* A final string result is packed into the existing 16-byte cell: value holds
  * the bytes and scale holds the length. Values longer than QS_STRING_MAX use
  * qs_result.str_data and store an offset/length reference in the cell. */

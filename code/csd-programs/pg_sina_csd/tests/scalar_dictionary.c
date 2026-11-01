@@ -1049,6 +1049,7 @@ static void topn_bound(void)
         cs_work_context *ctx=cs_work_begin_limit(limit); assert(ctx);
         struct execution *s=cs_work_calloc(ctx,1,sizeof(*s)); assert(s);
         s->context=ctx; s->sort_limit=16U*1024*1024;
+        s->paged=qs_dictionary_create(ctx); assert(s->paged);
         s->plan=calloc(1,sizeof(*s->plan)); assert(s->plan); s->plan->count=3;
         s->nodes=cs_work_calloc(ctx,3,sizeof(*s->nodes)); assert(s->nodes);
         s->io=io; s->io_bytes=sizeof(io);
@@ -1057,29 +1058,91 @@ static void topn_bound(void)
         parent->expr.predicate=-1; parent->expr.limit=top; parent->expr.offset=top?3:0;
         *node=(struct qp_node){.kind=QP_SORT,.left=2,.right=-1}; node->expr.predicate=-1;
         if(shared) s->plan->cte_nodes[0]=1;
-        struct qs_plan input={.nout=1}; input.outputs[0].type_oid=20;
+        struct qs_plan input={.nout=2}; input.outputs[0].type_oid=20; input.outputs[1].type_oid=25;
         struct sorted_rows *sort=&s->nodes[1].left_sort;
         struct qs_order order={.output=0,.descending=1};
         assert(!sort_init(s,sort,&input,1,NULL,&order));
         assert(sort->plan.limit==(shared?-1:(int64_t)top+parent->expr.offset));
         for(unsigned row=0;row<1001;++row) {
             sort->input->rows=1; sort->input->data[0].cells[0]=(struct qs_cell){.value=row};
+            sort->input->data[0].cells[1]=(struct qs_cell){.value=qs_late_text(2,(uint64_t)row*QS_PAGE+31,7)};
             assert(!sort_call(s,sort,0));
         }
         sort->group.count=1; sort->group.states[0]=sort->task.state;
         unsigned count=0;
         do {
             assert(!sort_call(s,sort,1));
-            for(unsigned row=0;row<sort->output->rows;++row)
-                assert(sort->output->data[row].cells[0].value==1000-count++);
+            for(unsigned row=0;row<sort->output->rows;++row) {
+                unsigned expected=1000-count++;
+                assert(sort->output->data[row].cells[0].value==expected);
+                assert(sort->output->data[row].cells[1].value==qs_late_text(2,(uint64_t)expected*QS_PAGE+31,7));
+            }
         } while(!sort->output->finished);
         assert(count==(shared?1001:top+(top?3:0)));
+        qs_dictionary_abort(s->paged);
         free(s->plan); assert(!cs_work_end(ctx));
     }
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
 }
+/* Dependent payload is retained once, not hashed; preserve NULL, Numeric
+ * scales and deferred text through Hash storage, spilling and final output. */
+static void grouped_payload(void)
+{
+    const size_t limit=64U*1024*1024; assert(!cs_work_init(limit));
+    cs_work_context *ctx=cs_work_begin_limit(limit); assert(ctx);
+    struct execution s={.context=ctx,.io=io,.io_bytes=sizeof(io)};
+    size_t bytes=sizeof(struct qp_plan)+sizeof(struct qs_extent);
+    s.plan=calloc(1,bytes); assert(s.plan); s.plan->count=2;
+    s.nodes=cs_work_calloc(ctx,2,sizeof(*s.nodes)); assert(s.nodes);
+    struct qp_node *n=&s.plan->nodes[0];
+    *n=(struct qp_node){.kind=QP_AGGREGATE,.left=1,.right=-1,.nkeys=3,.group_keys=1};
+    n->expr.naggs=1; n->expr.nkeys=3; n->expr.nexprs=3; n->expr.aggs[0].kind=Q_SUM;
+    unsigned types[]={Q_INTEGER,Q_STRING,Q_DECIMAL};
+    for(unsigned k=0;k<3;++k) { n->expr.keys[k]=k; n->left_keys[k]=k; n->expr.exprs[k]=(struct qs_expr){.type=types[k],.op=Q_COLUMN,.column=k}; }
+    struct operator_state *o=&s.nodes[0]; o->group_integer=1; o->group_capacity=128;
+    o->group_count=&o->hash_rows; atomic_init(o->group_count,0);
+    o->group_stride=(sizeof(struct compact_group)+sizeof(struct group_value)+group_key_bytes(n,o)+15)&~15U;
+    o->groups=cs_work_alloc(ctx,128*o->group_stride); o->group_entries=cs_work_calloc(ctx,128,sizeof(*o->group_entries));
+    assert(o->groups && o->group_entries);
+    struct qs_cell keys[3]={{.value=1},{.value=qs_late_text(1,QS_PAGE+123,3)},{.value=-12345,.scale=2,.dscale=2}};
+    struct group_value value={.sum={.value=7},.count=1};
+    assert(group_sink_values(&s,0,o,keys,&value,0)==1);
+    struct qs_cell second[3]; memcpy(second,keys,sizeof(keys)); second[1].value=qs_late_text(1,5,1); second[2].value=99;
+    assert(group_hash(n,keys)==group_hash(n,second) && group_equal(&s,n,keys,second)==1);
+    assert(group_sink_values(&s,0,o,second,&value,0)==1 && o->hash_rows==1);
+    struct qs_cell stored[3]; group_keys(n,o,group_at(o,0),stored);
+    assert(stored[1].value==keys[1].value && stored[2].value==-12345 && stored[2].scale==2 && stored[2].dscale==2);
+    assert(group_at(o,0)->values[0].sum.value==14);
+    keys[0].isnull=1; keys[1].isnull=1; keys[2].isnull=1;
+    assert(group_sink_values(&s,0,o,keys,&value,0)==1 && o->hash_rows==2);
+    group_keys(n,o,group_at(o,1),stored); assert(stored[0].isnull && stored[1].isnull && stored[2].isnull);
+    /* A deferred string survives existing packed Hash rows. */
+    struct qs_plan packed={.nout=1}; packed.outputs[0].type_oid=25;
+    unsigned char row[32]; hash_store(row,second+1,&packed); hash_load(stored,row,&packed);
+    assert(stored[0].value==second[1].value);
+    struct qs_extent *extent=(void *)((unsigned char *)s.plan+sizeof(*s.plan));
+    *extent=(struct qs_extent){.logical=0,.lba=100,.bytes=2*QS_PAGE};
+    s.plan->nodes[1].bytes=2*QS_PAGE;
+    s.plan->files[1]=(struct qp_file_mapping){.offset=sizeof(*s.plan),.nsid=1,.lba_bytes=512,.count=1};
+    long long lengths[]={bytes}; struct femu_csd_args args={.mr_len=lengths}; s.args=&args;
+    const char *text; unsigned length;
+    assert(output_text(&s,(struct qs_cell){.value=qs_late_text(1,QS_PAGE+123,3)},&text,&length)<0 && s.late_wait==csNeedNvmRead(1));
+    struct femu_graph_read *read=(void *)io;
+    assert(le32toh(read->afdm_index)==4 && le64toh(read->lba)==116 && le64toh(read->offset)==QS_PAGE);
+    memcpy(s.late_page+123,"abc",3); s.late_valid=1; s.late_wait=0;
+    assert(!output_text(&s,(struct qs_cell){.value=qs_late_text(1,QS_PAGE+123,3)},&text,&length) && length==3 && !memcmp(text,"abc",3));
+    assert(output_text(&s,(struct qs_cell){.value=qs_late_text(1,2*QS_PAGE-1,3)},&text,&length)<0);
+    struct qs_plan output={.nout=1}; output.exprs[0].type=Q_STRING;
+    struct qs_result *out=cs_work_calloc(ctx,1,sizeof(*out)); assert(out);
+    struct qs_cell empty={.value=qs_late_text(1,QS_PAGE+123,0)};
+    assert(!export_row(&s,&output,&empty,out) && qs_cell_is_string_ref(&empty) && !qs_cell_string(&empty));
+    assert(!export_row(&s,&output,&empty,out)); /* Empty text must stay resolved on reentry. */
+    free(s.plan); assert(!cs_work_end(ctx));
+    struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
+}
 int main(int argc,char **argv)
 {
+    if(argc==2 && !strcmp(argv[1],"--group-payload-64m")) { grouped_payload(); return 0; }
     if(argc==2 && !strcmp(argv[1],"--topn-bound-64m")) { topn_bound(); return 0; }
     if(argc==2 && !strcmp(argv[1],"--existence-cache-64m")) { existence_cache(); return 0; }
     if(argc==2 && !strcmp(argv[1],"--join-payload-64m")) { join_payload_resume(); return 0; }

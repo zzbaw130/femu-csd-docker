@@ -305,6 +305,10 @@ struct execution {
     int pending_store;
     int expression_wait;
     unsigned pending_nvm;
+    int64_t late_wait;
+    unsigned late_node,late_valid;
+    uint64_t late_block;
+    unsigned char *late_page; /* One private, charged page; never borrowed FDM. */
     struct qs_metrics metrics;
     struct qs_profile profile;
     uint64_t local_profile_cpu, pipeline_start, pipeline_tick;
@@ -2531,6 +2535,31 @@ evaluate_batch:
     if(b->plan.nexprs && projection_execute(b,NULL,b->borrowed_cells?b->borrowed_selection:NULL,0,input)) return -5;
     return 2;
 }
+/* Before its LOAD block can be recycled, replace output-only byte views
+ * by immutable file offsets. The planner excludes every comparison/key use. */
+static int defer_output_vectors(struct execution *s,struct projection_batch *b)
+{
+    const struct qp_node *n=&s->plan->nodes[b->scan];
+    if(n->kind!=QP_SCAN || !n->late_text || b->joined || b->sorted || b->group_source) return 0;
+    const struct operator_state *scan=&s->nodes[b->scan];
+    const unsigned char *raw=s->arena+input_offset(s,n)+scan->scan_raw;
+    for(unsigned i=0;i<b->plan.nexprs;++i) {
+        const struct qs_expr *e=&b->plan.exprs[i]; struct qs_vector *v=&b->vectors[i];
+        if(!b->needed[i] || e->op!=Q_COLUMN || e->type!=Q_STRING || !(n->late_text&(UINT64_C(1)<<e->column)) || v->kind!=QS_TEXT) continue;
+        for(unsigned r=0;r<b->count;++r) {
+            struct qs_text_view view=v->strings[r]; __int128 value=0;
+            if(!v->nulls[r] && !v->errors[r]) {
+                if(view.id || (uintptr_t)view.data<(uintptr_t)raw || view.length>scan->scan_raw_bytes ||
+                   (uintptr_t)view.data-(uintptr_t)raw>scan->scan_raw_bytes-view.length) return -5;
+                uint64_t offset=scan->position-scan->scan_raw_bytes+((uintptr_t)view.data-(uintptr_t)raw);
+                value=qs_late_text(b->scan,offset,view.length);
+            }
+            v->values[r]=value;
+        }
+        v->kind=QS_WIDE; v->materialized=b->count;
+    }
+    return 0;
+}
 /* A Sort Source already produces evaluated cells in complete batches. Keep
  * its buffer alive until the dependent expression vectors have been consumed. */
 static int64_t projection_sort_fill(struct execution *s,struct projection_batch *b)
@@ -2567,6 +2596,7 @@ static int64_t projection_fill(struct execution *s,unsigned id,int source)
         if(b->sorted) s->nodes[b->scan].left_sort.position+=b->retry_count;
         else if(!b->group_source && !b->joined) s->nodes[b->scan].scan_position+=b->retry_count;
         b->position=0;
+        if(defer_output_vectors(s,b)) return -5;
         if(!b->lazy_text && materialize_outputs(s,b)) return -3;
     }
     while(b->position==b->count) {
@@ -2600,6 +2630,7 @@ static int64_t projection_fill(struct execution *s,unsigned id,int source)
         }
         /* A retained output must outlive this vector's byte views. Predicates
          * do not intern their temporary slices; projected text does. */
+        if(defer_output_vectors(s,b)) return -5;
         if(!b->lazy_text && materialize_outputs(s,b)) return -3;
     }
     return 2;
@@ -3049,20 +3080,41 @@ static int group_update(struct execution *s,const struct qp_node *n,unsigned agg
 }
 static struct compact_group *group_at(const struct operator_state *o,unsigned slot)
 { return (void *)((unsigned char *)o->groups+(size_t)slot*o->group_stride); }
+/* Dependent payload keeps exact Numeric values and opaque text references.
+ * Plain scalar payload needs only its 64-bit value plus NULL, not a full cell. */
+static unsigned group_payload_bytes(const struct qp_node *n,unsigned k)
+{
+    unsigned type=n->expr.exprs[n->expr.keys[k]].type;
+    return type==Q_DECIMAL || type==Q_STRING?19:9;
+}
+static unsigned group_key_bytes(const struct qp_node *n,const struct operator_state *o)
+{
+    unsigned keys=qp_group_keys(n),bytes=keys*(o->group_integer?8:sizeof(struct qs_cell));
+    for(unsigned k=keys;k<n->nkeys;++k) bytes+=group_payload_bytes(n,k);
+    return bytes;
+}
 static void group_keys(const struct qp_node *n,const struct operator_state *o,const struct compact_group *g,struct qs_cell *keys)
 {
     int wide=n->nkeys!=1 || n->expr.exprs[n->expr.keys[0]].type!=Q_INTEGER;
-    const void *stored=g->values+n->expr.naggs;
+    const unsigned char *stored=(const void *)(g->values+n->expr.naggs);
+    unsigned count=qp_group_keys(n);
     if(wide && o->group_integer) {
-        const int64_t *values=stored;
-        for(unsigned k=0;k<n->nkeys;++k) keys[k]=(struct qs_cell){.value=values[k],.isnull=!!(g->key_flags&(2U<<k))};
-    } else if(wide) memcpy(keys,stored,n->nkeys*sizeof(*keys));
+        const int64_t *values=(const void *)stored;
+        for(unsigned k=0;k<count;++k) keys[k]=(struct qs_cell){.value=values[k],.isnull=!!(g->key_flags&(2U<<k))};
+    } else if(wide) memcpy(keys,stored,count*sizeof(*keys));
     else keys[0]=(struct qs_cell){.value=g->key,.isnull=g->key_flags==2};
+    stored+=count*(o->group_integer?8:sizeof(*keys));
+    for(unsigned k=count;k<n->nkeys;++k) {
+        unsigned bytes=group_payload_bytes(n,k); keys[k]=(struct qs_cell){0};
+        if(bytes==9) { int64_t value; memcpy(&value,stored,8); keys[k].value=value; keys[k].isnull=stored[8]; }
+        else { memcpy(&keys[k].value,stored,16); keys[k].scale=stored[16]; keys[k].dscale=stored[17]; keys[k].isnull=stored[18]; }
+        stored+=bytes;
+    }
 }
 static uint64_t group_hash(const struct qp_node *n,const struct qs_cell *keys)
 {
     uint64_t hash=UINT64_C(0x9e3779b97f4a7c15);
-    for(unsigned k=0;k<n->nkeys;++k) {
+    for(unsigned k=0;k<qp_group_keys(n);++k) {
         struct qs_cell v=keys[k];
         if(v.isnull) v=(struct qs_cell){0};
         while(v.scale && !(v.value%10)) { v.value/=10; --v.scale; }
@@ -3072,7 +3124,7 @@ static uint64_t group_hash(const struct qp_node *n,const struct qs_cell *keys)
 }
 static int group_equal(struct execution *s,const struct qp_node *n,const struct qs_cell *a,const struct qs_cell *b)
 {
-    for(unsigned k=0;k<n->nkeys;++k) {
+    for(unsigned k=0;k<qp_group_keys(n);++k) {
         int equal=equal_cell(s,a[k],b[k],n->expr.exprs[n->expr.keys[k]].type);
         if(equal<0) return -5;
         if(!equal) return 0;
@@ -3255,7 +3307,7 @@ static int group_sink_hashed_values(struct execution *s,unsigned id,struct opera
     unsigned occupied=key.isnull?2:1;
     if(wide && o->group_integer) {
         occupied=1;
-        for(unsigned k=0;k<n->nkeys;++k) {
+        for(unsigned k=0;k<qp_group_keys(n);++k) {
             if(!keys[k].isnull && (keys[k].scale || keys[k].value<INT64_MIN || keys[k].value>INT64_MAX)) return -5;
             if(keys[k].isnull) occupied|=2U<<k;
         }
@@ -3276,7 +3328,7 @@ retry_bucket:
         int equal=!old;
         if(old && wide && o->group_integer) {
             const int64_t *key_values=(const void *)(g->values+n->expr.naggs); equal=old==occupied;
-            for(unsigned k=0;equal && k<n->nkeys;++k)
+            for(unsigned k=0;equal && k<qp_group_keys(n);++k)
                 if(!keys[k].isnull && key_values[k]!=(int64_t)keys[k].value) equal=0;
         } else if(old) equal=wide?group_equal(s,n,keys,(struct qs_cell *)(g->values+n->expr.naggs)):
             old==occupied && (key.isnull || g->key==(int64_t)key.value);
@@ -3305,8 +3357,14 @@ retry_bucket:
             g->key_flags=flags;
             if(wide && o->group_integer) {
                 int64_t *key_values=(void *)(g->values+n->expr.naggs);
-                for(unsigned k=0;k<n->nkeys;++k) key_values[k]=keys[k].isnull?0:(int64_t)keys[k].value;
-            } else if(wide) memcpy(g->values+n->expr.naggs,keys,n->nkeys*sizeof(*keys));
+                for(unsigned k=0;k<qp_group_keys(n);++k) key_values[k]=keys[k].isnull?0:(int64_t)keys[k].value;
+            } else if(wide) memcpy(g->values+n->expr.naggs,keys,qp_group_keys(n)*sizeof(*keys));
+            unsigned char *payload=(void *)(g->values+n->expr.naggs);
+            payload+=qp_group_keys(n)*(o->group_integer?8:sizeof(*keys));
+            for(unsigned k=qp_group_keys(n);k<n->nkeys;++k) {
+                unsigned bytes=group_payload_bytes(n,k);
+                hash_store_value(payload,&keys[k],bytes==9?8:16); payload+=bytes;
+            }
         }
         if(paged) {
             struct group_update_state *u=s->group_update;
@@ -3596,12 +3654,12 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
         available=available>reserve?available-reserve:available/2;
         o->group_integer=1;
         /* Runtime strings are canonical dictionary IDs, also 64-bit keys. */
-        for(unsigned k=0;k<n->nkeys;++k) {
+        for(unsigned k=0;k<qp_group_keys(n);++k) {
             unsigned type=n->expr.exprs[n->expr.keys[k]].type;
             if(type!=Q_INTEGER && type!=Q_STRING) o->group_integer=0;
         }
         o->group_stride=sizeof(*o->groups)+n->expr.naggs*sizeof(struct group_value)+
-            (wide?n->nkeys*(o->group_integer?sizeof(int64_t):sizeof(struct qs_cell)):0);
+            (wide?group_key_bytes(n,o):0);
         o->group_stride=(o->group_stride+15)&~15U;
         unsigned capacity=128;
         /* PG's pre-HAVING group estimate is distinct from output cardinality.
@@ -3705,7 +3763,7 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
                 partial.outputs[n->nkeys+2*a].type_oid=1700;
                 partial.outputs[n->nkeys+2*a+1].type_oid=20;
             }
-            int64_t status=sort_init(s,sort,&partial,n->nkeys,columns,NULL); if(status) return status;
+            int64_t status=sort_init(s,sort,&partial,qp_group_keys(n),columns,NULL); if(status) return status;
             if(sort->input_pending) {
                 status=sort_call(s,sort,0); if(status) return status;
                 sort->input_pending=0; sort->input->rows=0;
@@ -4986,6 +5044,31 @@ static int64_t namespace_wait(struct execution *s)
     return csNeedNvmRead(count);
 }
 
+/* Resolve immutable Heap references only at the HOST return boundary.
+ * Use the existing internal READ protocol and private I/O AFDM; no index
+ * lookup, process, host round trip or retained LOAD buffer is required. */
+static int output_text(struct execution *s,struct qs_cell value,const char **bytes,unsigned *length)
+{
+    if(!qs_cell_late_text(&value)) return text_get(s,(unsigned)value.value,bytes,length);
+    unsigned __int128 ref=(unsigned __int128)value.value;
+    unsigned node=(ref>>80)&127,n=(ref>>64)&65535;
+    uint64_t offset=(uint64_t)ref,block=offset/QS_PAGE;
+    if(node>=s->plan->count || n>QS_PAGE-offset%QS_PAGE || offset>s->plan->nodes[node].bytes ||
+       n>s->plan->nodes[node].bytes-offset) return -3;
+    if(!s->late_page) s->late_page=cs_work_alloc(s->context,QS_PAGE);
+    if(!s->late_page) return -4;
+    if(!s->late_valid || s->late_node!=node || s->late_block!=block) {
+        unsigned count=0;
+        int status=namespace_ranges(s,&s->plan->files[node],block*QS_PAGE,QS_PAGE,QS_PAGE,&count);
+        if(status!=1 || !count || s->io_bytes<2*QS_PAGE) return -3;
+        struct femu_graph_read *reads=s->io;
+        for(unsigned i=0;i<count;++i) reads[i].afdm_index=htole32(4);
+        s->late_node=node; s->late_block=block; s->late_valid=0;
+        s->late_wait=csNeedNvmRead(count); return -3;
+    }
+    *bytes=(const char *)s->late_page+offset%QS_PAGE; *length=n; return 0;
+}
+
 /* A partially exported row remains in the existing result AFDM. Only
  * completed columns contain text; the remaining ones still contain IDs. */
 static int export_row(struct execution *s,const struct qs_plan *root,struct qs_cell *row,struct qs_result *out)
@@ -4994,11 +5077,11 @@ static int export_row(struct execution *s,const struct qs_plan *root,struct qs_c
         if(!row[col].isnull && !qs_cell_string(&row[col]) && !qs_cell_is_string_ref(&row[col]) &&
            root->exprs[root->outputs[col].index].type==Q_STRING) {
             const char *bytes; unsigned length;
-            if(text_get(s,(unsigned)row[col].value,&bytes,&length)) {
+            if(output_text(s,row[col],&bytes,&length)) {
                 s->output_column=col; s->output_pending=1; return -3;
             }
             if(length>255 || out->str_bytes+length>QS_RESULT_STRING_BYTES) { text_release(s); return -3; }
-            if(length<=QS_STRING_MAX) qs_cell_set_string(&row[col],bytes,length);
+            if(length && length<=QS_STRING_MAX) qs_cell_set_string(&row[col],bytes,length);
             else {
                 memcpy(out->str_data+out->str_bytes,bytes,length);
                 qs_cell_set_string_ref(&row[col],out->str_bytes,length); out->str_bytes+=length;
@@ -5022,7 +5105,7 @@ static void export_sort_text(struct execution *s,const struct qs_plan *root,
 {
     for(unsigned col=0;col<root->nout;++col) {
         struct qs_cell *v=&row[col];
-        if(v->isnull || root->exprs[root->outputs[col].index].type!=Q_STRING || qs_cell_string(v) || qs_cell_is_string_ref(v)) continue;
+        if(v->isnull || qs_cell_late_text(v) || root->exprs[root->outputs[col].index].type!=Q_STRING || qs_cell_string(v) || qs_cell_is_string_ref(v)) continue;
         unsigned n; const char *bytes=sort_text_get(s,(uint32_t)v->value,&n);
         if(!bytes || n>255 || out->str_bytes+n>QS_RESULT_STRING_BYTES) continue;
         if(n && n<=QS_STRING_MAX) qs_cell_set_string(v,bytes,n);
@@ -5042,7 +5125,7 @@ static int export_batch(struct execution *s,const struct qs_plan *root,struct qs
         for(unsigned row=s->output_exported;row<out->rows;++row)
             for(unsigned col=0;col<root->nout;++col) {
                 const struct qs_cell *v=qp_result_row(out,row,root->nout,s->plan->packed_result)+col;
-                if(!v->isnull && !qs_cell_string(v) && !qs_cell_is_string_ref(v) && root->exprs[root->outputs[col].index].type==Q_STRING)
+                if(!v->isnull && !qs_cell_late_text(v) && !qs_cell_string(v) && !qs_cell_is_string_ref(v) && root->exprs[root->outputs[col].index].type==Q_STRING)
                     s->output_order[s->output_count++]=(struct output_string){(uint32_t)v->value,row,col};
             }
         qsort(s->output_order,s->output_count,sizeof(*s->output_order),output_string_order);
@@ -5054,14 +5137,16 @@ static int export_batch(struct execution *s,const struct qs_plan *root,struct qs
         if(text_get(s,at->id,&bytes,&length)) return -3;
         if(length>255 || out->str_bytes+length>QS_RESULT_STRING_BYTES) { text_release(s); return -3; }
         struct qs_cell *v=qp_result_row(out,at->row,root->nout,s->plan->packed_result)+at->column;
-        if(length<=QS_STRING_MAX) qs_cell_set_string(v,bytes,length);
+        if(length && length<=QS_STRING_MAX) qs_cell_set_string(v,bytes,length);
         else {
             memcpy(out->str_data+out->str_bytes,bytes,length);
             qs_cell_set_string_ref(v,out->str_bytes,length); out->str_bytes+=length;
         }
         if(text_release(s)) return -3;
     }
-    s->output_exported=out->rows; s->output_active=0; return 0;
+    for(;s->output_exported<out->rows;++s->output_exported)
+        if(export_row(s,root,qp_result_row(out,s->output_exported,root->nout,s->plan->packed_result),out)) return -3;
+    s->output_active=0; return 0;
 }
 
 /* Encode one boundary row before its input or Sort source buffer is reused.
@@ -5095,7 +5180,7 @@ static int host_append(struct execution *s,const struct qs_plan *p,struct qs_res
             if(kind==Q_CHAR) { text=&single; length=1; }
             else if(s->raw_projection) { text=(const void *)(uintptr_t)v->value; length=(unsigned)((unsigned __int128)v->value>>64); }
             else if(qs_cell_string(v)) { text=qs_cell_string_bytes(v); length=qs_cell_string(v); }
-            else if(text_get(s,(unsigned)v->value,&text,&length)) return -3;
+            else if(output_text(s,*v,&text,&length)) return -3;
             unsigned padded=oid==1042 && p->outputs[col].typmod>4?(unsigned)p->outputs[col].typmod-4:length;
             if(padded<length) padded=length;
             if(padded>255 || padded+4>sizeof(s->host_var)-offset) { text_release(s); return -3; }
@@ -5183,7 +5268,7 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
     if(s->buffered) { out->rows=s->buffered_rows; out->finished=s->buffered_finished; s->buffered=0; }
     if(s->closing) return finish_dictionary(s,a,out);
     int typed=plan->packed_result==QP_DIRECT_RESULT || (!worker && plan->packed_result==QP_TYPED_RESULT);
-    int continuing=s->text_wait || s->dictionary_wait || s->initial_wait || s->pending_sort || (typed && s->host_building);
+    int continuing=s->late_wait || s->text_wait || s->dictionary_wait || s->initial_wait || s->pending_sort || (typed && s->host_building);
     int64_t imported=initialize_dictionary(s,a);
     if(imported) return dictionary_request(s,out,imported);
     if(s->text_wait) {
@@ -5209,6 +5294,11 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
     }
     /* The last AFDM is private to this CU, also for SNIA NEED_LOAD/STORE. */
     s->io=a->mr_addr[4]; s->io_bytes=a->mr_len[4];
+    if(s->late_wait) {
+        if(!csIsReentry(a) || csReentryValue(a)!=((uint64_t)s->late_wait&CS_IO_VALUE_MASK)) return -1;
+        memcpy(s->late_page,(unsigned char *)s->io+QS_PAGE,QS_PAGE);
+        s->late_valid=1; s->late_wait=0;
+    }
     if(s->pending_nvm) {
         if(!csIsReentry(a) || csReentryValue(a)!=s->pending_nvm) return -1;
         s->pending_nvm=0; control->ready=1;
@@ -5451,11 +5541,12 @@ export_results:
     }
 combined:
     if(typed) {
-        host_publish=!s->text_wait && !s->dictionary_wait && status>=0 &&
+        host_publish=!s->late_wait && !s->text_wait && !s->dictionary_wait && status>=0 &&
             (out->finished || host_full || out->rows==capacity || (worker && s->host_scan && s->scan_drained));
         if(host_publish) { qp_host_compact(out,&plan->nodes[plan->root].expr,capacity); s->host_building=0; }
         else s->host_building=out->rows!=0;
     }
+    if(s->late_wait) status=s->late_wait;
     if(s->text_wait) status=s->text_wait;
     if(s->dictionary_wait) status=s->dictionary_wait;
     if(s->expression_wait && s->pending_spool) {
@@ -5472,7 +5563,7 @@ combined:
         ++t->calls; t->wall_ns+=now_ns(CLOCK_MONOTONIC)-start; t->cpu_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-cpu;
         atomic_fetch_sub(&owner->active_cus,1); control->peak_cus=atomic_load(&owner->peak_cus);
     }
-    control->output_rows=(s->text_wait || s->dictionary_wait || (typed && !host_publish))?0:out->rows;
+    control->output_rows=(s->late_wait || s->text_wait || s->dictionary_wait || (typed && !host_publish))?0:out->rows;
     control->output_strings=out->str_bytes;
     out->metrics=s->metrics; out->metrics.workers=s->used_workers?s->used_workers:1; out->profile=s->profile;
     struct qs_dictionary_stats dictionary;
@@ -5502,7 +5593,7 @@ combined:
             (out->finished?QP_WORKER_FINISHED:0) |
             (!control->ready && (control->bytes || control->index_nreads)?QP_CONTROL_REQUIRED:0);
     }
-    if(out->finished && !worker) { s->closing=1; return finish_dictionary(s,a,out); }
+    if(out->finished && !worker && status<=2 && !s->late_wait) { s->closing=1; return finish_dictionary(s,a,out); }
     wait_io(s,status);
     return status==QP_WAIT?0:status>2?status:0;
 }

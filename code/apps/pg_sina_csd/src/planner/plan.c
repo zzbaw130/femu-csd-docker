@@ -798,27 +798,6 @@ static bool identity_target(Plan *a,Plan *b)
         if(!expression_equal((Node *)lfirst_node(TargetEntry,x)->expr,(Node *)lfirst_node(TargetEntry,y)->expr)) return false;
     return true;
 }
-struct group_payload { Agg *aggregate; bool supported; };
-/* PG may omit functionally dependent payload from GROUP BY. The device
- * stores keys and aggregate states, so retain that payload as physical keys.
- * PG has already proved the dependency; this does not invent extra groups. */
-static bool retain_group_payload(Node *node,struct group_payload *context)
-{
-    if(!node || !context->supported || IsA(node,Aggref) || IsA(node,Const)) return false;
-    Agg *a=context->aggregate;
-    TargetEntry *entry=matching_entry(a->plan.lefttree->targetlist,(Expr *)node);
-    if(entry) {
-        for(int i=0;i<a->numCols;++i) if(a->grpColIdx[i]==entry->resno) return false;
-        if(a->numCols==QS_KEYS) { context->supported=false; return false; }
-        Oid equality; bool hashable;
-        get_sort_group_operators(exprType(node),false,true,false,NULL,&equality,NULL,&hashable);
-        if(!hashable) { context->supported=false; return false; }
-        int i=a->numCols++; a->grpColIdx[i]=entry->resno; a->grpOperators[i]=equality; a->grpCollations[i]=exprCollation(node);
-        return false;
-    }
-    if(IsA(node,Var)) { context->supported=false; return false; }
-    return expression_tree_walker(node,retain_group_payload,context);
-}
 static bool choose_algorithms(PlannerInfo *root,Plan **slot,bool ordered)
 {
     Plan *p=*slot; if(!p) return true;
@@ -899,16 +878,6 @@ static bool choose_algorithms(PlannerInfo *root,Plan **slot,bool ordered)
                 }
             }
             if(output) *slot=(Plan *)output;
-            AttrNumber *columns=palloc0(QS_KEYS*sizeof(*columns));
-            Oid *operators=palloc0(QS_KEYS*sizeof(*operators)),*collations=palloc0(QS_KEYS*sizeof(*collations));
-            memcpy(columns,a->grpColIdx,a->numCols*sizeof(*columns));
-            memcpy(operators,a->grpOperators,a->numCols*sizeof(*operators));
-            memcpy(collations,a->grpCollations,a->numCols*sizeof(*collations));
-            a->grpColIdx=columns; a->grpOperators=operators; a->grpCollations=collations;
-            struct group_payload payload={.aggregate=a,.supported=true};
-            retain_group_payload((Node *)p->targetlist,&payload); retain_group_payload((Node *)p->qual,&payload);
-            if(!payload.supported) return false;
-            if(a->numCols+2*list_length(group.aggregates)>QS_OUT) a->aggstrategy=AGG_SORTED;
         }
         else if(a->aggstrategy==AGG_HASHED && !supported) a->aggstrategy=AGG_SORTED;
     }
@@ -963,9 +932,8 @@ Plan *pg_sina_require_output_order(PlannerInfo *root,Plan *input)
     return (Plan *)sort;
 }
 
-/* Validate expressions over group keys and the aggregate result. When
- * lowering a PG-validated group, dependent output columns can be retained
- * as additional physical keys without changing the SQL groups. */
+/* PG has validated functional dependencies. Carry dependent values after
+ * the real key prefix; they do not participate in Hash/equality or ordering. */
 static bool group_output(struct qs_plan *p,int index,struct qp_node *n,bool retain)
 {
     if(index<0 || (unsigned)index>=p->nexprs) return false;
@@ -977,12 +945,16 @@ static bool group_output(struct qs_plan *p,int index,struct qp_node *n,bool reta
         p->keys[p->nkeys++]=index; n->left_keys[n->nkeys++]=x->column;
         return true;
     }
-    if(x->op==Q_AGGREF) return x->column>=0 && (unsigned)x->column<p->naggs;
+    /* Cost-only property records use a negative aggregate slot. */
+    if(x->op==Q_AGGREF) return x->column<0 || (unsigned)x->column<p->naggs;
     if(x->op==QP_PARAMETER) return true;
-    if(x->op==Q_NOT || x->op==Q_IS_NULL || x->op==Q_IS_NOT_NULL)
+    if(x->op==Q_NOT || x->op==Q_IS_NULL || x->op==Q_IS_NOT_NULL || x->op==Q_YEAR || x->op==Q_INSET)
         return group_output(p,x->left,n,retain);
+    if(x->op==Q_CASE || x->op==Q_SUBSTRING)
+        return group_output(p,x->left,n,retain) && group_output(p,x->right,n,retain) &&
+            group_output(p,x->otherwise,n,retain);
     return (x->op==Q_ADD || x->op==Q_SUB || x->op==Q_MUL || x->op==Q_DIV ||
-        (x->op>=Q_EQ && x->op<=Q_OR)) &&
+        x->op==Q_LIKE || x->op==Q_COALESCE || (x->op>=Q_EQ && x->op<=Q_OR)) &&
         group_output(p,x->left,n,retain) && group_output(p,x->right,n,retain);
 }
 /* A unique integer-key join that only returns its key is a membership test.
@@ -1389,6 +1361,12 @@ static int compile_node_impl(PlannerInfo *root,Plan *native,struct qp_plan *tree
         p->predicate=p->predicate<0?extra:add_expr(p,(struct qs_expr){.op=Q_AND,.type=Q_BOOLEAN,.left=p->predicate,.right=extra});
         if(p->predicate<0) return -1;
     }
+    if(n->kind==QP_AGGREGATE && n->hash) {
+        n->group_keys=n->nkeys;
+        for(unsigned i=0;i<p->nout;++i) if(!group_output(p,p->outputs[i].index,n,true)) return -1;
+        if(p->predicate>=0 && !group_output(p,p->predicate,n,true)) return -1;
+        if(!qp_hash_aggregate_supported(n)) return -1;
+    }
     if(n->kind==QP_SORT) {
         Sort *s=(Sort *)native; if(s->numCols>QS_OUT) return -1;
         for(int i=0;i<s->numCols;++i) {
@@ -1777,6 +1755,12 @@ static int describe_tree(PlannerInfo *root,Plan *native,struct qp_plan *tree,boo
         if(limit->limitCount) { if(!IsA(limit->limitCount,Const)) return -1; if(!((Const *)limit->limitCount)->constisnull) p->limit=DatumGetInt64(((Const *)limit->limitCount)->constvalue); }
         if(limit->limitOffset) { if(!IsA(limit->limitOffset,Const)) return -1; if(!((Const *)limit->limitOffset)->constisnull) p->offset=DatumGetInt64(((Const *)limit->limitOffset)->constvalue); }
     }
+    if(n->kind==QP_AGGREGATE && n->hash) {
+        n->group_keys=n->nkeys;
+        for(unsigned i=0;i<p->nout;++i) if(!group_output(p,p->outputs[i].index,n,true)) return -1;
+        /* describe_list records property expressions, not their boolean DAG. */
+        if(!qp_hash_aggregate_supported(n)) return -1;
+    }
     unsigned *choices=pg_sina_candidate_choices();
     if(n->kind==QP_JOIN && !ordered && ((Join *)native)->inner_unique) {
         push_group_key_filter(tree,n);
@@ -1791,6 +1775,78 @@ static int describe_tree(PlannerInfo *root,Plan *native,struct qp_plan *tree,boo
         if(tree->count!=count) choices[id]|=PG_SINA_DISTINCT;
     }
     return id;
+}
+
+/* Trace only plain column forwarding. Stateful/shared sources and computed
+ * text remain eager; this analysis never guesses a functional dependency. */
+static bool text_origin(const struct qp_plan *p,unsigned node,int expr,unsigned *scan,unsigned *column)
+{
+    if(node>=p->count || expr<0 || (unsigned)expr>=p->nodes[node].expr.nexprs) return false;
+    const struct qp_node *n=&p->nodes[node]; const struct qs_expr *e=&n->expr.exprs[expr];
+    if(e->op!=Q_COLUMN || e->column<0) return false;
+    if(n->kind==QP_SCAN) { *scan=node; *column=e->column; return true; }
+    if(n->kind!=QP_PROJECT && n->kind!=QP_JOIN && n->kind!=QP_INDEX_JOIN && n->kind!=QP_AGGREGATE && n->kind!=QP_SORT && n->kind!=QP_LIMIT) return false;
+    int child=n->left,col=e->column;
+    if(child<0) return false;
+    if((n->kind==QP_JOIN || n->kind==QP_INDEX_JOIN) && (unsigned)col>=p->nodes[child].expr.nout) { col-=p->nodes[child].expr.nout; child=n->right; }
+    if(child<0 || (unsigned)col>=p->nodes[child].expr.nout) return false;
+    return text_origin(p,child,p->nodes[child].expr.outputs[col].index,scan,column);
+}
+static bool text_uses(const struct qp_plan *p,unsigned node,int expr,unsigned scan,unsigned column)
+{
+    if(expr<0 || (unsigned)expr>=p->nodes[node].expr.nexprs) return false;
+    const struct qs_expr *e=&p->nodes[node].expr.exprs[expr]; unsigned source,col;
+    if(e->op==Q_COLUMN) return text_origin(p,node,expr,&source,&col) && source==scan && col==column;
+    if(e->op==Q_CONST || e->op==Q_PARAMETER || e->op==Q_AGGREF) return false;
+    return (e->left>=0 && e->left<expr && text_uses(p,node,e->left,scan,column)) ||
+        (e->right>=0 && e->right<expr && text_uses(p,node,e->right,scan,column)) ||
+        (e->otherwise>=0 && e->otherwise<expr && text_uses(p,node,e->otherwise,scan,column));
+}
+static void defer_output_text(struct qp_plan *p)
+{
+    const struct qp_node *top=&p->nodes[p->root];
+    /* A direct bounded ordering discards rows before output. Without it,
+     * retaining the scan's eager batch avoids random per-row heap rereads. */
+    if(top->kind!=QP_LIMIT || top->expr.limit<=0 || top->left<0 || p->nodes[top->left].kind!=QP_SORT || p->ninit || p->nparams) return;
+    for(unsigned id=0;id<p->count;++id)
+        if(p->nodes[id].kind==QP_CTE_SCAN || p->nodes[id].kind==QP_MATERIALIZED ||
+           p->nodes[id].kind==QP_SET) return;
+    for(unsigned id=0;id<p->count;++id) {
+        const struct qp_node *group=&p->nodes[id];
+        if(group->kind!=QP_AGGREGATE || !group->group_keys) continue;
+        for(unsigned k=group->group_keys;k<group->nkeys;++k) {
+            unsigned scan,column;
+            if(group->expr.exprs[group->expr.keys[k]].type!=Q_STRING ||
+               !text_origin(p,id,group->expr.keys[k],&scan,&column) || column>=QS_COLS || p->nodes[scan].ordered_index) continue;
+            bool used=false;
+            for(unsigned at=0;at<p->count && !used;++at) {
+                const struct qp_node *n=&p->nodes[at]; const struct qs_plan *q=&n->expr;
+                used=text_uses(p,at,q->predicate,scan,column);
+                for(unsigned e=0;e<q->nexprs && !used;++e)
+                    if(q->exprs[e].op!=Q_COLUMN && q->exprs[e].op!=Q_CONST && q->exprs[e].op!=Q_AGGREF)
+                        used=text_uses(p,at,e,scan,column);
+                for(unsigned a=0;a<q->naggs && !used;++a) if(q->aggs[a].kind!=Q_COUNT_STAR)
+                    used=text_uses(p,at,q->aggs[a].expr,scan,column);
+                if(n->kind==QP_AGGREGATE) for(unsigned key=0;key<qp_group_keys(n) && !used;++key)
+                    used=text_uses(p,at,q->keys[key],scan,column);
+                if(n->kind==QP_JOIN) {
+                    used|=text_uses(p,at,n->join_qual,scan,column);
+                    for(unsigned key=0;key<n->nkeys && !used;++key) {
+                        unsigned sides[2]={n->left,n->right}; int cols[2]={n->left_keys[key],n->right_keys[key]};
+                        for(unsigned side=0;side<2 && !used;++side)
+                            used=text_uses(p,sides[side],p->nodes[sides[side]].expr.outputs[cols[side]].index,scan,column);
+                    }
+                }
+                if(n->kind==QP_INDEX_JOIN) {
+                    used|=text_uses(p,at,n->join_qual,scan,column);
+                    used|=text_uses(p,n->left,p->nodes[n->left].expr.outputs[n->left_keys[0]].index,scan,column);
+                }
+                if(n->kind==QP_SORT) for(unsigned key=0;key<q->norder && !used;++key)
+                    used=text_uses(p,at,q->outputs[q->order[key].output].index,scan,column);
+            }
+            if(!used) p->nodes[scan].late_text|=UINT64_C(1)<<column;
+        }
+    }
 }
 
 Plan *pg_sina_candidate_scan(Plan *native,bool fast,bool output)
@@ -1898,6 +1954,7 @@ Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
     }
     if(!prepared) { goto failed; }
     tree->root=result;
+    defer_output_text(tree);
     pg_sina_refine_groups(tree);
     pg_sina_read_resources(device);
     if(host_scan && native->parallel_aware &&

@@ -36,6 +36,10 @@ struct qp_node {
     struct qs_plan expr;
     int kind, left, right, join_type, join_qual;
     unsigned nkeys, distinct, distinct_aggs;
+    /* Aggregate keys occupy the prefix; remaining entries carry PG-proven
+     * functionally dependent output values, never Hash/equality keys. */
+    unsigned group_keys;
+    uint64_t late_text; /* Scan attribute bitmap: output-only Heap references. */
     unsigned sorted_input, ordered_index; /* bits: forward, heap read-ahead, covered keys, unordered leaf ranges */
     unsigned hash, parallel;
     int left_keys[QS_KEYS], right_keys[QS_KEYS];
@@ -44,6 +48,8 @@ struct qp_node {
     double estimated_rows;
     double estimated_groups; /* Pre-HAVING state capacity; may use a declared FK domain bound. */
 };
+static inline unsigned qp_group_keys(const struct qp_node *n)
+{ return n->group_keys?n->group_keys:n->nkeys; }
 /* Optional per-pipeline measurements; only the coordinator writes these.
  * CPU sums include all CSF slices, wall includes LOAD and scheduling waits. */
 enum qp_wait { QP_WAIT_DICTIONARY, QP_WAIT_NVM, QP_WAIT_SPILL, QP_WAIT_INPUT, QP_WAIT_SINK, QP_WAITS };

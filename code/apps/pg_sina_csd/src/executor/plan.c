@@ -1192,8 +1192,9 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
         const struct qp_node *n=&s->plan->nodes[i];
         if(i) appendStringInfoString(&tree,"; ");
         appendStringInfo(&tree,"%u:%s",i,n->hash && n->kind==QP_AGGREGATE?"Hash Aggregate":n->kind==QP_JOIN && n->hash?"Hash Join":names[n->kind]);
-        if(n->kind==QP_AGGREGATE && n->nkeys) appendStringInfo(&tree,"[keys=%u]",n->nkeys);
+        if(n->kind==QP_AGGREGATE && n->nkeys) appendStringInfo(&tree,"[keys=%u,payload=%u]",qp_group_keys(n),n->nkeys-qp_group_keys(n));
         if(n->kind==QP_SCAN) appendStringInfo(&tree,"(%s%s)",get_rel_name(n->expr.relid),n->ordered_index?(n->ordered_index&4?", index only":n->ordered_index&2?", index ordered, heap read-ahead":", index ordered"):"");
+        if(n->kind==QP_SCAN && n->late_text) appendStringInfo(&tree,"[late_text=%llx]",(unsigned long long)n->late_text);
         if(n->kind==QP_SORT) {
             appendStringInfoString(&tree,"[");
             for(unsigned k=0;k<n->expr.norder;++k)
