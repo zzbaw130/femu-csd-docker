@@ -71,6 +71,7 @@ struct PlanStateCsd {
      * device requests must never hold up consumers of a published batch. */
     pthread_mutex_t advance_mutex;
     bool advance_mutex_ready;
+    atomic_bool delivery_pending;
     atomic_uint callbacks;
     CS_STATUS execution_status;
     const char *execution_operation;
@@ -117,7 +118,8 @@ static void shutdown_scan(CustomScanState *node);
 static void detach_delivery(dsm_segment *segment,Datum arg);
 static uint64_t clock_ns(void)
 { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000ULL+t.tv_nsec; }
-static void deliver(PlanStateCsd *s,bool callback);
+static void deliver(PlanStateCsd *s);
+static CS_STATUS submit(PlanStateCsd *s,unsigned worker);
 static CS_STATUS queue_scan(struct plan_slot *slot);
 static CS_STATUS queue_pages(struct plan_slot *slot);
 static CS_STATUS transfer(CS_MEM_HANDLE,size_t,void *,size_t,bool);
@@ -173,7 +175,7 @@ static void completed(void *context,CS_STATUS status,u64 value)
     slot->completion_status=status; slot->completion_value=value;
     pthread_mutex_unlock(&slot->mutex);
     atomic_store_explicit(&slot->completed,true,memory_order_release);
-    if(s->async_scan) deliver(s,true);
+    if(s->async_scan) deliver(s);
     atomic_fetch_sub_explicit(&s->callbacks,1,memory_order_release);
 }
 static CS_STATUS transfer(CS_MEM_HANDLE memory,size_t offset,void *data,size_t bytes,bool write)
@@ -291,6 +293,7 @@ static void begin(CustomScanState *node,EState *estate,int flags)
     s->explain_only=flags&EXEC_FLAG_EXPLAIN_ONLY; s->profiling=pg_sina_profile;
     atomic_init(&s->stopping,false); atomic_init(&s->next_scan_offset,0);
     atomic_init(&s->callbacks,0); atomic_init(&s->control_read_ns,0);
+    atomic_init(&s->delivery_pending,false);
     s->async_scan=s->plan->count==1 && s->plan->nodes[s->plan->root].kind==QP_SCAN && !s->plan->ninit;
     atomic_init(&s->load_ns,0); atomic_init(&s->load_calls,0);
     atomic_init(&s->completion_reads,0); atomic_init(&s->batch_progress,0);
@@ -539,7 +542,9 @@ static void start(PlanStateCsd *s)
         struct result_delivery *q=s->delivery;
         q->fdm_bytes=s->fdm_bytes; q->workers=s->workers;
         q->scan_bytes=s->plan->scan_bytes; q->resources=pg_sina_resources;
-        deliver(s,false); /* One initial submission; callbacks own all continuations. */
+        /* Submit before any callback owns delivery; callbacks advance every
+         * subsequent request and may wait for HOST consumption independently. */
+        checked(submit(s,0),"queue initial scan");
     }
     if(s->profiling) s->setup_ns=clock_ns()-s->start_ns;
 }
@@ -921,42 +926,51 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
     }
     return 0;
 }
-/* A full queue parks an existing SNIA completion worker on a condition
- * variable. PG consumption only signals space; it never resumes a CSF or
- * submits LOAD. A sleeping callback occupies no CU; AFDM remains query-owned. */
-static void deliver(PlanStateCsd *s,bool callback)
+/* Only one callback may wait for HOST consumption. Other completions record
+ * a wakeup and return their SNIA worker immediately, rather than accumulating
+ * one blocked thread per batch. PG consumption still only signals space. */
+static void deliver(PlanStateCsd *s)
 {
     struct result_delivery *q=s->delivery;
-    pthread_mutex_lock(&s->advance_mutex);
-    pthread_mutex_lock(&q->mutex);
-    while(!atomic_load_explicit(&s->stopping,memory_order_acquire) &&
-          s->execution_status==CS_SUCCESS && !q->eof) {
-        if(q->count==lengthof(q->batches)) {
-            if(!callback) break;
-            uint64_t waiting=s->profiling?clock_ns():0;
-            pthread_cond_wait(&q->ready,&q->mutex);
-            if(s->profiling) q->timing.full_ns+=clock_ns()-waiting;
-            continue;
-        }
-        struct qs_result *next=&q->batches[(q->head+q->count)%lengthof(q->batches)];
-        /* The producer owns the unpublished tail. Consuming the head keeps
-         * (head + count) unchanged, so this slot remains private while I/O
-         * and request configuration run outside the shared queue lock. */
-        pthread_mutex_unlock(&q->mutex);
-        uint64_t advancing=s->profiling?clock_ns():0;
-        int produced=advance(s,next);
-        uint64_t advanced=s->profiling?clock_ns():0;
+    atomic_store_explicit(&s->delivery_pending,true,memory_order_release);
+    for(;;) {
+        if(pthread_mutex_trylock(&s->advance_mutex)) return;
+        /* Acquire completed-slot writes before draining; a notification arriving
+         * after this exchange remains set for the handoff check below. */
+        atomic_exchange_explicit(&s->delivery_pending,false,memory_order_acq_rel);
         pthread_mutex_lock(&q->mutex);
-        if(s->profiling) q->timing.advance_ns+=advanced-advancing;
-        q->status=s->execution_status;
-        if(produced<=0) break;
-        ++q->count; q->eof=next->finished;
-        q->result_bytes=s->result_bytes; q->result_reads=s->result_reads; q->result_rows=s->result_rows;
-        pthread_cond_broadcast(&q->ready);
+        while(!atomic_load_explicit(&s->stopping,memory_order_acquire) &&
+              s->execution_status==CS_SUCCESS && !q->eof) {
+            if(q->count==lengthof(q->batches)) {
+                uint64_t waiting=s->profiling?clock_ns():0;
+                pthread_cond_wait(&q->ready,&q->mutex);
+                if(s->profiling) q->timing.full_ns+=clock_ns()-waiting;
+                continue;
+            }
+            struct qs_result *next=&q->batches[(q->head+q->count)%lengthof(q->batches)];
+            /* The producer owns the unpublished tail. Consuming the head keeps
+             * (head + count) unchanged, so this slot remains private while I/O
+             * and request configuration run outside the shared queue lock. */
+            pthread_mutex_unlock(&q->mutex);
+            uint64_t advancing=s->profiling?clock_ns():0;
+            int produced=advance(s,next);
+            uint64_t advanced=s->profiling?clock_ns():0;
+            pthread_mutex_lock(&q->mutex);
+            if(s->profiling) q->timing.advance_ns+=advanced-advancing;
+            q->status=s->execution_status;
+            if(produced<=0) break;
+            ++q->count; q->eof=next->finished;
+            q->result_bytes=s->result_bytes; q->result_reads=s->result_reads; q->result_rows=s->result_rows;
+            pthread_cond_broadcast(&q->ready);
+        }
+        if(q->status!=CS_SUCCESS) pthread_cond_broadcast(&q->ready);
+        pthread_mutex_unlock(&q->mutex);
+        pthread_mutex_unlock(&s->advance_mutex);
+        /* Check after unlocking: if a callback already returned because we owned
+         * delivery, drain again. If it arrives later it can acquire the mutex.
+         * This closes the empty-queue/last-completion race without polling in PG. */
+        if(!atomic_load_explicit(&s->delivery_pending,memory_order_acquire)) return;
     }
-    if(q->status!=CS_SUCCESS) pthread_cond_broadcast(&q->ready);
-    pthread_mutex_unlock(&q->mutex);
-    pthread_mutex_unlock(&s->advance_mutex);
 }
 static void fetch(PlanStateCsd *s)
 {

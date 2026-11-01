@@ -812,3 +812,13 @@ PG库、HPCP模块已构建部署；两个PG组件测试、脚本语法检查通
 测试脚本支持标准PGDATA/PGDATABASE环境变量，默认仍为SF1。SF1数据目录保存在Guest系统盘`/home/femu/pg-sf1-saved`，SF8表和索引位于模拟SSD`/data/tpch_s8`；SF8 WAL位于Guest系统盘。正式22条SQL及参数未修改，初次装载的八张表均全visible/frozen并重新prepare。准备与逐轮边界证据保存在`results/sf8-preparation/`。
 
 预检Q9暴露初始隐藏spill区只有256MiB、执行返回容量不足；原生Q18完成，但临时文件采样已达917MiB、数据分区仅剩104MiB。为排除NVM空间不足与高占用的干扰，Compose改为20GiB可见namespace、8GiB隐藏spill区，4CU/256MiB workmem/64MiB FDM不变。QEMU已按新参数启动，Guest Identify/lsblk核验可见namespace为21474836480B。隐藏区与namespace合计仍满足固定64GiB NAND的GC保留条件；它不是额外计算内存。SF8从同一原始镜像重新装载后必须重新prepare并复核，不能混用旧extent。全量冷热性能验收仍未完成。
+
+#### SF8大扫描：合并交付回调通知
+
+新容量下Q9/Q18的HOST与完整CSD结果一致，FDM均归零。单轮预检Q9为HOST18.36s/CSD19.25s，CSD上下文峰值250.24MiB、spill读写各504.06MiB；Q18为51.69s/110.60s，峰值209.14MiB、spill读写各3222.50MiB、1138 runs。Q18排序Sink/Source、聚合归并、Hash Build累计CPU分别约19.70/7.54、22.38、18.98s，不能仅凭发生spill就将退化全归因于NVM或物理内存。这些是预检，最终需三轮全量及规划选择验证。
+
+正式首轮Q1 filter-only暴露CS_OUT_OF_RESOURCES，而完整CSD正确。定向采样发现PG后端线程峰值20841：一个SNIA完成回调持有交付锁并等待HOST腾出队列空间，其余完成回调也一直阻塞在这把锁上，SNIA为后续请求不断创建线程。该问题是交付回调生命周期缺陷，不是FDM/workmem不足。
+
+参考DuckDB将阻塞任务让出执行线程的处理方式，本项目保留最简单的单一交付者：其他回调发布完成通知后尝试取得交付锁，已有交付者时立即返回库线程；持锁者释放锁后重查通知，避免最后一个完成事件丢失。PG只提交初始请求，后续仍由回调推进；仅一个回调可等待HOST消费。没有修改SNIA线程池、公开API、设备协议，也没有新增进程或PG提交worker。
+
+修复后同一正式SF8 Q1冷启动成功且结果与HOST一致，采样后端线程峰值8、FDM归零。正式Q6 filter-only三轮冷启动均结果一致、无EOF超时、FDM归零；双开HPCP/DCP的Q6也通过。两个PG组件CTest通过。首次全量尝试`results/tpch-sf8.vnCDml/`已中止，保留首错供追溯，不作为最终中位数样本；线程采样及定向结果见`results/sf8-preparation/`。修复版本必须重新开始五模式冷热三轮，不混用旧库样本。
