@@ -399,6 +399,23 @@ struct qs_cell pg_sina_parameter_cell(Datum value,Oid type,bool isnull)
     }
     return result;
 }
+/* Parallel PG consumers require their streams to be initialized together.
+ * Size input blocks for that concurrency before allocating any one stream;
+ * keep CU count and let the existing allocation retry handle actual pressure. */
+static unsigned device_streams(Plan *plan)
+{
+    if(!plan) return 0;
+    unsigned count=0; List *children=NIL; ListCell *cell;
+    if(IsA(plan,CustomScan)) {
+        CustomScan *scan=(CustomScan *)plan;
+        count=scan->methods==&pg_sina_plan_methods;
+        children=scan->custom_plans;
+    } else if(IsA(plan,Append)) children=((Append *)plan)->appendplans;
+    else if(IsA(plan,MergeAppend)) children=((MergeAppend *)plan)->mergeplans;
+    foreach(cell,children) count+=device_streams(lfirst(cell));
+    if(IsA(plan,SubqueryScan)) count+=device_streams(((SubqueryScan *)plan)->subplan);
+    return count+device_streams(plan->lefttree)+device_streams(plan->righttree);
+}
 static void start(PlanStateCsd *s)
 {
     /* This runs only on the PG owner, before callbacks/consumers. Param
@@ -463,6 +480,10 @@ static void start(PlanStateCsd *s)
     s->device_cus=pg_sina_resources.cus;
     if(parallel) s->workers=qp_task_slots(s->plan,s->device_cus);
     uint64_t capacity=pg_sina_resources.fdm_bytes;
+    PlannedStmt *stmt=s->css.ss.ps.state->es_plannedstmt;
+    unsigned streams=device_streams(stmt->planTree); ListCell *subplan;
+    foreach(subplan,stmt->subplans) streams+=device_streams(lfirst(subplan));
+    if(!streams) streams=1;
     if(s->workers<=1) s->workers=0;
     s->plan->scan_bytes=QS_CHUNK;
     size_t arena,sizes[5];
@@ -470,6 +491,12 @@ static void start(PlanStateCsd *s)
     for(;;) {
         arena=layout_buffers(s,indexed);
         size_t needed=arena+plan_bytes+(s->workers+1)*(sizeof(struct qp_control)+sizeof(*s->result)+QS_SORT_IO_BYTES)+65536;
+        /* This is an initial block size, not a per-operator memory cap.
+         * Multiple initialized scans otherwise let the first streams retain
+         * all AFDM before PG workers can consume any of their output. */
+        if(capacity && streams>1 && needed>capacity/streams && s->plan->scan_bytes>QP_SCAN_BYTES) {
+            s->plan->scan_bytes/=2; continue;
+        }
         if(capacity && needed>capacity) {
             if(s->plan->scan_bytes>QP_SCAN_BYTES) { s->plan->scan_bytes/=2; continue; }
             if(s->workers) { if(--s->workers==1) s->workers=0; continue; }

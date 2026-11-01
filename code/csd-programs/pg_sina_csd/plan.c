@@ -3236,6 +3236,9 @@ static int group_input_pending(const struct execution *s,int id)
     if(id<0) return 0;
     const struct qp_node *n=&s->plan->nodes[id]; const struct operator_state *o=&s->nodes[id];
     if(n->kind==QP_AGGREGATE && n->nkeys) return !o->finished;
+    /* A Hash Join must build its right input before this parent can consume
+     * rows. Do not preallocate a large estimated group table ahead of it. */
+    if(n->kind==QP_JOIN && n->hash && !o->hash_phase && !o->hash_fallback) return 1;
     if(n->kind==QP_SORT && !o->left_sort.drained) return 1;
     if(n->kind==QP_MATERIALIZED) return 1;
     return group_input_pending(s,n->left) || group_input_pending(s,n->right);
