@@ -112,7 +112,7 @@ static inline double cost_sort_workspace(void)
     return 3*1024*1024+32*QS_SORT_IO_BYTES+sizeof(struct qs_plan)+
         QS_EXPRS*(256*20+128.0)+2*sizeof(struct qs_result)+QS_SORT_IO_BYTES;
 }
-static inline struct cost_sort cost_sort_state(double rows,double width,double available)
+static inline struct cost_sort cost_sort_state(double rows,double width,double available,unsigned windows)
 {
     struct cost_sort s={0};
     double run_bytes=1024*1024;
@@ -121,7 +121,7 @@ static inline struct cost_sort cost_sort_state(double rows,double width,double a
     s.runs=cost_max(1,ceil(rows/run_rows));
     double payload=rows*width,metadata=s.runs*(128+sizeof(void *))+ceil(payload/QS_SORT_IO_BYTES)*8;
     s.state=payload+metadata+2*QS_SORT_IO_BYTES;
-    s.fan=(unsigned)cost_max(2,floor((available-metadata-2*QS_SORT_IO_BYTES-4096)/QS_SORT_IO_BYTES));
+    s.fan=(unsigned)cost_max(2,floor((available-metadata-2*QS_SORT_IO_BYTES-4096)/(cost_max(1,windows)*QS_SORT_IO_BYTES)));
     double resident=cost_max(0,available-metadata-run_bytes-2*QS_SORT_IO_BYTES);
     double evicted=cost_max(0,payload-resident),runs=s.runs;
     s.spill=2*evicted;

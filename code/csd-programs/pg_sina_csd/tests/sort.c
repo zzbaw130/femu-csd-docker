@@ -25,7 +25,7 @@ static int64_t sink_columns(struct femu_csd_args *a)
 }
 static void *blocks[8192];
 static unsigned next_token=1,stored,loaded,workers=4;
-static size_t capacity=8U*1024*1024,budget=8U*1024*1024;
+static size_t capacity=8U*1024*1024,budget=8U*1024*1024,text_quota_extra;
 static uint64_t complete_io(int64_t value,void *io)
 {
     uint64_t action=(uint64_t)value&~CS_IO_VALUE_MASK,token=(uint64_t)value&CS_IO_VALUE_MASK;
@@ -172,10 +172,10 @@ static int text_order(const void *left,const void *right)
     }
     return (a<b)-(a>b); /* Second key is descending row number. */
 }
-static void text_sort(void *so,function sink,function source,int64_t limit,int64_t offset,int descending,int cancel)
+static void text_sort(void *so,function sink,function source,int64_t limit,int64_t offset,int descending,int cancel,size_t memory)
 {
-    enum { ROWS=50003, CUS=4 };
-    const size_t memory=4U*1024*1024;
+    enum { CUS=4 };
+    const unsigned ROWS=memory>=64U*1024*1024?262147:50003;
     int (*set_dictionary)(uint64_t,struct qs_dictionary *)=(void *)dlsym(so,"qs_sort_paged_dictionary");
     assert(set_dictionary);
     next_token=1; stored=loaded=0;
@@ -183,7 +183,7 @@ static void text_sort(void *so,function sink,function source,int64_t limit,int64
     struct qs_dictionary *dictionary=qs_dictionary_create(parent); assert(dictionary);
     struct qs_dictionary_access *access=qs_dictionary_access_create(dictionary); assert(access);
     struct qs_plan p={.nout=3,.norder=2,.ordered_rows=2,.having=-1,.predicate=-1,
-        .limit=limit,.offset=offset,.work_mem_bytes=memory/(CUS*2),.work_mem_parent=(uintptr_t)parent};
+        .limit=limit,.offset=offset,.work_mem_bytes=memory/(CUS*2)+text_quota_extra,.work_mem_parent=(uintptr_t)parent};
     p.outputs[0].type_oid=25; p.outputs[1].type_oid=p.outputs[2].type_oid=23;
     for(unsigned col=0;col<3;++col) p.outputs[col].index=col;
     p.order[0]=(struct qs_order){.output=0,.descending=descending,.nulls_first=!descending};
@@ -202,7 +202,7 @@ static void text_sort(void *so,function sink,function source,int64_t limit,int64
         char prefix[9]; assert(snprintf(prefix,sizeof(prefix),"%08u",i*7919U%TEXT_KEYS)==8);
         char *key=(char *)text_keys+(size_t)i*TEXT_LENGTH;
         memset(key,'a'+i%26,TEXT_LENGTH); memcpy(key,prefix,8);
-        text_lengths[i]=TEXT_LENGTH;
+        text_lengths[i]=memory>=64U*1024*1024?16+i*7919U%(TEXT_LENGTH-15):TEXT_LENGTH;
         /* Empty/short strings cross the 12-byte boundary; long strings
          * sharing a prefix must resume the exact dictionary comparison. */
         if(i<16) { text_lengths[i]=i; memset(key,'x',i); }
@@ -239,7 +239,7 @@ static void text_sort(void *so,function sink,function source,int64_t limit,int64
     }
     struct qs_group group={.count=CUS}; for(unsigned i=0;i<CUS;++i) group.states[i]=tasks[i].state;
     struct qs_dictionary_stats after_sink; qs_dictionary_get_stats(dictionary,&after_sink);
-    assert(after_sink.loads>before_sink.loads);
+    if(memory<64U*1024*1024) assert(after_sink.loads>before_sink.loads);
     void *mr[]={&group,output,io}; long long len[]={sizeof(group),sizeof(*output),QS_SORT_IO_BYTES};
     struct femu_csd_args a={.numr=3,.mr_addr=mr,.mr_len=len};
     unsigned seen=0; uint64_t row_stores=0,row_loads=0;
@@ -280,9 +280,10 @@ static void text_sort(void *so,function sink,function source,int64_t limit,int64
         assert(seen==count);
     }
     struct qs_dictionary_stats stats; qs_dictionary_get_stats(dictionary,&stats);
-    assert(stats.strings==TEXT_KEYS && stats.stores && stats.loads);
+    assert(stats.strings==TEXT_KEYS);
+    if(memory<64U*1024*1024) assert(stats.stores && stats.loads);
     if(limit<0) assert(row_stores>(uint64_t)ROWS*3*sizeof(struct qs_cell)+4*QS_SORT_IO_BYTES &&
-        row_loads && stats.loads>after_sink.loads); /* Includes intermediate merged runs. */
+        row_loads && (memory>=64U*1024*1024 || stats.loads>after_sink.loads)); /* Row/text spill; the dictionary may remain resident at 64 MiB. */
     uint64_t completion=0;
     for(;;) {
         int64_t status=qs_dictionary_close(dictionary,access,io,completion);
@@ -302,7 +303,9 @@ released:;
 int main(int argc,char **argv)
 {
     assert(argc>=2 && argc<=5);
-    int dictionary=argc==3 && !strcmp(argv[2],"--dictionary");
+    int dictionary64=argc==3 && !strcmp(argv[2],"--dictionary-64m");
+    int dictionary=argc==3 && (!strcmp(argv[2],"--dictionary") || dictionary64);
+    if(dictionary64) capacity=budget=64U*1024*1024;
     if(argc>=3 && !dictionary) capacity=(size_t)strtoul(argv[2],NULL,10)*1024*1024;
     budget=argc>=4?(size_t)strtoul(argv[3],NULL,10)*1024*1024:capacity;
     if(argc==5) workers=strtoul(argv[4],NULL,10);
@@ -312,11 +315,18 @@ int main(int argc,char **argv)
     void *so=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(so);
     function sink=(function)dlsym(so,"pg_sina_sort_sink"),source=(function)dlsym(so,"pg_sina_sort_source"); assert(sink && source);
     columns_sink=(columns_function)dlsym(so,"qs_sort_sink_columns"); assert(columns_sink);
+    if(dictionary64) {
+        /* Parent/device stay at 64 MiB. Child limits from real concurrent
+         * operators are not I/O-block aligned; cover a block of remainders. */
+        for(text_quota_extra=46;text_quota_extra<65536;text_quota_extra+=4096)
+            text_sort(so,sink,source,-1,0,0,0,capacity);
+        dlclose(so); return 0;
+    }
     if(dictionary) {
-        text_sort(so,sink,source,-1,0,0,0);
-        text_sort(so,sink,source,17,5,1,0);
-        text_sort(so,sink,source,-1,0,1,1);
-        text_sort(so,sink,source,-1,0,0,2);
+        text_sort(so,sink,source,-1,0,0,0,4U*1024*1024);
+        text_sort(so,sink,source,17,5,1,0,4U*1024*1024);
+        text_sort(so,sink,source,-1,0,1,1,4U*1024*1024);
+        text_sort(so,sink,source,-1,0,0,2,4U*1024*1024);
         dlclose(so); return 0;
     }
     check(sink_columns,source,262147,-1,0,0,0,2);

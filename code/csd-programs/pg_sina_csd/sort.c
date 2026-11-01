@@ -110,6 +110,25 @@ struct row_sort {
     unsigned text_block,output_column;
     char *text_compare;
 };
+/* String heaps can grow after the row run was admitted. Keep enough room
+ * for spill tokens and an I/O block even at a non-aligned child limit. */
+static size_t row_available(const struct row_sort *s,cs_work_context *context)
+{
+    for(unsigned i=0;i<s->owners_count;++i)
+        if(s->owners[i]->context==context) { s=s->owners[i]; break; }
+    struct cs_work_context_stats memory;
+    if(cs_work_get_context_stats(context,&memory)) return 0;
+    size_t available=memory.limit_bytes-memory.used_bytes;
+    if(s->plan.work_mem_parent) {
+        struct cs_work_context_stats parent;
+        if(cs_work_get_context_stats((void *)(uintptr_t)s->plan.work_mem_parent,&parent)) return 0;
+        size_t free=parent.limit_bytes-parent.used_bytes;
+        if(free<available) available=free;
+    }
+    struct cs_work_stats pool;
+    if(cs_work_get_stats(&pool)) return 0;
+    return pool.free_bytes<available?pool.free_bytes:available;
+}
 /* Private executor reserve: one row/text run, radix scratch, a 32-way merge
  * window and control buffers. Reserve the minimum working set, not the
  * sort's maximum quota; resident runs remain reclaimable by row_evict(). */
@@ -366,7 +385,8 @@ static int64_t run_sort(struct row_sort *s,struct row_run *r,struct femu_csd_arg
             bytes+=sizeof(n)+n;
         }
         unsigned char *ordered;
-        while(!(ordered=cs_work_alloc(r->owner,bytes))) {
+        while(row_available(s,r->owner)<(size_t)bytes+QS_SORT_IO_BYTES+4096 ||
+              !(ordered=cs_work_alloc(r->owner,bytes))) {
             int64_t status=row_evict(s,r->owner,a); if(status) return status;
         }
         unsigned at=0;
@@ -570,7 +590,9 @@ static int64_t row_text_get(struct row_sort *s,const struct qs_cell *v,const cha
     if(!h || offset+sizeof(uint16_t)>h->bytes) return -3;
     if(h->blocks) {
         while(!h->data) {
-            h->data=cs_work_alloc(h->owner,(h->wide?2U:1U)*QS_SORT_IO_BYTES);
+            size_t bytes=(h->wide?2U:1U)*QS_SORT_IO_BYTES;
+            if(row_available(s,h->owner)>=bytes+QS_SORT_IO_BYTES+4096)
+                h->data=cs_work_alloc(h->owner,bytes);
             if(!h->data) { int64_t status=row_evict(s,h->owner,a); if(status) return status; }
         }
         unsigned block=offset/QS_SORT_IO_BYTES; at=offset%QS_SORT_IO_BYTES;
@@ -620,7 +642,9 @@ retry_text:
             while(need>h->capacity) {
                 unsigned capacity=h->capacity?h->capacity*2:QS_SORT_IO_BYTES;
                 if(capacity<need) capacity=need;
-                void *data=cs_work_realloc(h->owner,h->data,capacity);
+                void *data=NULL;
+                if(row_available(s,h->owner)>=(size_t)capacity-h->capacity+QS_SORT_IO_BYTES+4096)
+                    data=cs_work_realloc(h->owner,h->data,capacity);
                 if(!data) {
                     /* Release the pin before yielding. The same ID is pinned
                      * again on reentry; no borrowed pointer survives it. */
@@ -673,18 +697,7 @@ static int row_reserve(struct row_sort *s)
         s->runs=runs; s->capacity=capacity;
     }
     unsigned n=s->bounded?s->topn:s->run_rows;
-    struct cs_work_context_stats memory;
-    if(cs_work_get_context_stats(s->context,&memory)) return -4;
-    size_t available=memory.limit_bytes-memory.used_bytes;
-    if(s->plan.work_mem_parent) {
-        struct cs_work_context_stats parent;
-        if(cs_work_get_context_stats((void *)(uintptr_t)s->plan.work_mem_parent,&parent)) return -4;
-        size_t free=parent.limit_bytes-parent.used_bytes;
-        if(free<available) available=free;
-    }
-    struct cs_work_stats pool;
-    if(cs_work_get_stats(&pool)) return -4;
-    if(pool.free_bytes<available) available=pool.free_bytes;
+    size_t available=row_available(s,s->context);
     /* Keep one run of scratch for radix sorting instead of filling the quota
      * with resident runs and silently falling back to comparison sort. */
     size_t bytes=(size_t)n*s->row_bytes,scratch=s->bounded || !s->plan.norder?0:bytes;
@@ -934,7 +947,9 @@ static int64_t merge_head(struct row_sort *s,struct row_run *r,struct femu_csd_a
 {
     if(r->spilled) {
         while(!r->data) {
-            r->data=cs_work_alloc(r->owner,(size_t)r->cache_rows*s->row_bytes);
+            size_t bytes=(size_t)r->cache_rows*s->row_bytes;
+            if(row_available(s,r->owner)>=bytes+QS_SORT_IO_BYTES+4096)
+                r->data=cs_work_alloc(r->owner,bytes);
             if(!r->data) { int64_t status=row_evict(s,r->owner,a); if(status) return status; }
         }
         unsigned block=r->position/s->block_rows;
@@ -969,7 +984,11 @@ static unsigned merge_fan_in(struct row_sort *o)
     }
     size_t metadata=memory.used_bytes>data?memory.used_bytes-data:0;
     size_t reserve=metadata+tokens+2*QS_SORT_IO_BYTES+4096;
-    unsigned fan=limit>reserve?(limit-reserve)/QS_SORT_IO_BYTES:2;
+    /* Materialized strings need their own sequential window beside the
+     * row window; otherwise a nominally fitting merge thrashes text pages. */
+    unsigned windows=o->text_columns?2:1;
+    for(struct run_text *h=o->texts;h;h=h->next) if(h->wide) windows=3;
+    unsigned fan=limit>reserve?(limit-reserve)/(windows*QS_SORT_IO_BYTES):2;
     if(fan<2) fan=2;
     /* The available parent/child budget already bounds every input window.
      * A fixed fan-in adds full read/write passes even when more runs fit. */

@@ -202,12 +202,14 @@ int main(void)
      * dataset larger than all memory still requires external merge. */
     double mib=1024*1024;
     CHECK(cost_sort_workspace()>5*mib && cost_sort_workspace()<8*mib);
-    struct cost_sort small=cost_sort_state(1000,32,64*mib);
-    struct cost_sort low=cost_sort_state(8*mib,32,64*mib);
-    struct cost_sort high=cost_sort_state(8*mib,32,256*mib);
+    struct cost_sort small=cost_sort_state(1000,32,64*mib,1);
+    struct cost_sort low=cost_sort_state(8*mib,32,64*mib,1);
+    struct cost_sort high=cost_sort_state(8*mib,32,256*mib,1);
     CHECK(small.spill==0);
     CHECK(low.spill>high.spill);
     CHECK(low.fan>32 && high.fan>low.fan);
+    struct cost_sort text=cost_sort_state(8*mib,32,64*mib,2);
+    CHECK(text.fan<low.fan && text.spill>=low.spill);
     CHECK(low.comparisons>0 && low.merge>0);
     CHECK(low.state==high.state);
     CHECK(isfinite(low.spill));

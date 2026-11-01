@@ -61,7 +61,7 @@ Join 先构建右侧，再在保留 build 表时消费左侧；Sort/Aggregate �
 
 ## Spill 与串行归并
 
-- **Sort**：按照实际 1MiB run（受 sort quota 限制时缩小）、64KiB 归并缓存和可用内存估算归并路数，没有额外32路上限。先计必须驱逐的 run 写出与最终读回；run 超过 fan-in 时，再计完整中间归并的读写。CPU 分开计算 run 内排序和跨 run 的堆比较。
+- **Sort**：按照实际 1MiB run（受 sort quota 限制时缩小）、每个输入的64KiB行窗口、含字符串时的额外64KiB文本窗口和可用内存估算归并路数，没有额外32路上限。先计必须驱逐的 run 写出与最终读回；run 超过 fan-in 时，再计完整中间归并的读写。CPU 分开计算 run 内排序和跨 run 的堆比较。
 - **存在性 Hash Join**：单键纯等值、无残余条件、直接基表扫描构建侧时，利用已有列NDV判断增长屏障去重后是否能留在内存；初始分配仍按最大可容纳的二次幂容量计费，不直接用NDV代替实际初始占用。缺失统计或唯一键本身放不下，保留通用spill估计。去重的键解码、哈希和比较计串行CPU，不除以CU数量。
 - **Hash Join**：沿实际 4 分区 Hash spill 计 build/probe 数据的写出读回；分区放不下时按 build 批次增加 probe 重读，不假设实现了递归 radix repartition。实际倾斜需要用运行计时进一步校准。
 - **Hash Aggregate**：容量不足时按 key/value/count 中间记录和输入量上界估计冲刷，再计外部合并 CPU；没有伪造精确的溢出组分布。

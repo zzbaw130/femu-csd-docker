@@ -576,6 +576,15 @@ static double text_width(const struct qp_plan *tree,int id,unsigned column)
     }
     return out->typmod>4?Min(out->typmod-4,32):32;
 }
+/* Text heaps retain a window in addition to each run's row window. */
+static unsigned sort_windows(const struct qs_plan *p)
+{
+    for(unsigned c=0;c<p->nout;++c) {
+        unsigned oid=p->outputs[c].type_oid;
+        if(oid==TEXTOID || oid==BPCHAROID || oid==VARCHAROID) return 2;
+    }
+    return 1;
+}
 static double sort_width(const struct qp_plan *tree,int id)
 {
     double width=Max(1,tree->nodes[id].expr.nout)*sizeof(struct qs_cell);
@@ -777,7 +786,7 @@ static void fast_cost(struct placement *p,const struct qs_plan *plan,List **obse
     double fixed=cus*(QS_GROUPS*(QS_KEYS+QS_AGGS)*sizeof(struct qs_cell)+
         2*sizeof(struct qs_plan)+sizeof(struct qs_result)+plan->nexprs*(256*20+128.0)+8192);
     struct cost_sort sort=cost_sort_state(partial,(plan->nkeys+plan->naggs)*sizeof(struct qs_cell),
-        Max((double)QS_SORT_IO_BYTES,pg_sina_query_memory()-fixed));
+        Max((double)QS_SORT_IO_BYTES,pg_sina_query_memory()-fixed),sort_windows(plan));
     p->workers=cus; p->rows=rows; p->cache=r->fraction;
     p->parallel=cost_parallel(r->tuples*(cpu_tuple_cost+cpu_operator_cost*Max(1,plan->nexprs))*unit,tasks,cus,0);
     p->schedule=cost_parallel(0,tasks,cus,pg_sina_parallel_task_ms);
@@ -994,7 +1003,7 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
                     double row=(n->nkeys+2*n->expr.naggs)*sizeof(struct qs_cell);
                     double resident_groups=groups*available/table;
                     double partial=cost_partial_rows(input,groups,resident_groups,group_correlation(tree,i));
-                    struct cost_sort sort=cost_sort_state(partial,row,Min(quota,available/2));
+                    struct cost_sort sort=cost_sort_state(partial,row,Min(quota,available/2),sort_windows(&n->expr));
                     spill=sort.spill;
                     /* This fallback runs on the coordinator: hashing input,
                      * serializing partial states, sorting and recombining
@@ -1008,7 +1017,7 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
                 state=n->expr.naggs*(3*sizeof(struct qs_cell)+16);
                 p->serial+=work;
             } else {
-                struct cost_sort sort=cost_sort_state(input,sort_width(tree,n->left),Min(quota,available));
+                struct cost_sort sort=cost_sort_state(input,sort_width(tree,n->left),Min(quota,available),sort_windows(&left->expr));
                 state=sort.state; spill=sort.spill;
                 parallel_cpu(p,sort.comparisons*cpu_operator_cost*unit,group_tasks,cus);
                 p->combine+=(sort.merge*cpu_operator_cost+
@@ -1016,7 +1025,7 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
             }
         } else if(n->kind==QP_SORT) {
             double sort_memory=Max(quota,Max(available/2,available-2*quota));
-            struct cost_sort sort=cost_sort_state(input,sort_width(tree,i),sort_memory);
+            struct cost_sort sort=cost_sort_state(input,sort_width(tree,i),sort_memory,sort_windows(&n->expr));
             state=sort.state; spill=sort.spill;
             parallel_cpu(p,sort.comparisons*cpu_operator_cost*unit,n->left>=0?tasks[n->left]:0,cus);
             p->combine+=(sort.merge*cpu_operator_cost+
@@ -1032,7 +1041,7 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
             const int *keys[]={n->left_keys,n->right_keys};
             for(unsigned side=0;side<2;++side) if(!cost_ordered(tree,ids[side],n->nkeys,keys[side])) {
                 struct cost_sort sort=cost_sort_state(Max(0,inputs[side]->estimated_rows),
-                    sort_width(tree,ids[side]),Min(quota,available/2));
+                    sort_width(tree,ids[side]),Min(quota,available/2),sort_windows(&inputs[side]->expr));
                 state+=sort.state; spill+=sort.spill;
                 p->serial+=(sort.comparisons+sort.merge)*cpu_operator_cost*unit;
             }
