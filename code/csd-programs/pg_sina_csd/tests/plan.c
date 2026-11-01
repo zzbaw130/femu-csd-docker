@@ -2384,6 +2384,16 @@ int main(int argc,char **argv)
         dictionary_plan(run,0,0,1,524288,64U*1024*1024,2);
         return 0;
     }
+    if(argc==3 && !strcmp(argv[2],"--aggregate-workspace-64m")) {
+        assert(!cs_work_init(64U*1024*1024));
+        function run=(function)dlsym(library,"pg_sina_plan"); assert(run);
+        test_workers=4; test_scheduled=true;
+        test(run,QP_LEFT,20003,23,64,2,TEST_HASH_GROUP);
+        multiple_groups(run,64,Q_SUM,0,test_workers);
+        multiple_group_aggregates(run,64,Q_AVG,1,test_workers,GROUP_COUNTS);
+        multiple_groups(run,64,Q_COUNT,0,test_workers);
+        return 0;
+    }
     if(argc==3 && !strcmp(argv[2],"--sort-payload-64m")) {
         assert(!cs_work_init(64U*1024*1024));
         function run=(function)dlsym(library,"pg_sina_plan"); assert(run);

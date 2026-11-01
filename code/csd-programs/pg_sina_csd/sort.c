@@ -110,6 +110,14 @@ struct row_sort {
     unsigned text_block,output_column;
     char *text_compare;
 };
+/* Private executor reserve: one row/text run, radix scratch, a 32-way merge
+ * window and control buffers. Reserve the minimum working set, not the
+ * sort's maximum quota; resident runs remain reclaimable by row_evict(). */
+size_t qs_sort_min_workspace(void)
+{
+    return 3*RUN_BYTES+32*(QS_SORT_IO_BYTES+sizeof(struct row_run)+QS_OUT*sizeof(struct qs_cell))+
+        sizeof(struct row_sort)+QS_EXPRS*sizeof(struct qs_vector)+2*sizeof(struct qs_result)+4096;
+}
 enum { ROW_NONE, ROW_STORE, ROW_LOAD, ROW_FREE, ROW_COMPACT_STORE,
        ROW_TEXT_STORE, ROW_TEXT_LOAD, ROW_TEXT_FREE };
 enum { DICTIONARY_NONE, DICTIONARY_COMPARE, DICTIONARY_EVICT, DICTIONARY_COPY };

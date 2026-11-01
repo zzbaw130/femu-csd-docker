@@ -21,6 +21,7 @@ extern void qs_sort_dictionary(uint64_t,struct qs_dict *);
 extern int qs_sort_paged_dictionary(uint64_t,struct qs_dictionary *);
 extern const char *qs_sort_output_text(const struct qs_result *,uint32_t,unsigned *);
 extern int qs_sort_prepare(uint64_t);
+extern size_t qs_sort_min_workspace(void);
 extern int64_t qs_sort_finish_sink(uint64_t,struct femu_csd_args *);
 extern int64_t qs_sort_sink_columns(struct femu_csd_args *,const struct qs_plan *,const struct qs_vector *,unsigned,unsigned);
 #define QP_WAIT 1
@@ -3214,9 +3215,14 @@ static struct compact_group *group_local_next(struct execution *s,struct operato
 }
 /* Retain the compact integer-key path. Other keys add only their actual cell
  * count and grow from a small table; spill value/count states, never raw rows. */
+static size_t group_spill_reserve(const struct execution *s)
+{
+    size_t workspace=qs_sort_min_workspace();
+    return 2*(workspace<s->sort_limit?workspace:s->sort_limit);
+}
 static size_t group_reserve(const struct execution *s,const struct qp_node *n)
 {
-    size_t reserve=2*s->sort_limit;
+    size_t reserve=group_spill_reserve(s);
     /* Hash groups are allocated before their scan launches. Reserve the actual
      * worker state too, or a small query budget can lose
      * all spill space as soon as the workers start. Active workers are already
@@ -4081,7 +4087,7 @@ static void parallel_group_begin(struct execution *s,unsigned id)
         size_t data=(size_t)(o->group_capacity-o->group_capacity/8)*o->group_stride;
         size_t entries=(size_t)o->group_capacity*sizeof(*o->group_entries);
         size_t bytes=workers*(data+entries+sizeof(*o)+3*128+sizeof(o)); /* allocation/alignment headroom */
-        size_t available=m.limit_bytes-m.used_bytes,reserve=2*s->sort_limit;
+        size_t available=m.limit_bytes-m.used_bytes,reserve=group_spill_reserve(s);
         if(available<reserve || bytes>available-reserve) return;
         o->group_locals=cs_work_calloc(s->context,workers,sizeof(*o->group_locals));
         if(!o->group_locals) return;
@@ -4302,7 +4308,7 @@ restart:
             size_t spill_reserve=0;
             for(unsigned i=0;i<p->count;++i)
                 if(p->nodes[i].kind==QP_AGGREGATE && p->nodes[i].left==(int)root && s->nodes[i].group_capacity)
-                    spill_reserve=2*s->sort_limit;
+                    spill_reserve=group_spill_reserve(s);
             /* Cursor/filter state is allocated lazily by the worker. Keep
              * that space and the existing spill reserve before launching;
              * otherwise a successful launch can fail on its first page. */
