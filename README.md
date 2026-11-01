@@ -54,6 +54,19 @@ cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,f
 ./scripts/ssh-guest.sh
 ```
 
+TPC-H 三种测试模式遵循 `AGENTS.md`。在 Guest 内指定当前数据库后运行完整实验：
+
+```sh
+export PGDATA=/data/tpch_s8 PGDATABASE=tpch_s8
+TPCH_CACHE_MODES='cold warm repeat' sh /home/femu/tests/tpch-test.sh
+```
+
+默认只测 `cold`；可在脚本后传查询编号作针对性验证。`TPCH_COLD_RUNS`、`TPCH_WARM_RUNS`、`TPCH_REPEAT_RUNS` 分别默认 3、3、5。冷组每次清两层缓存；热组只用目标 SQL 的 `host-only` 预热一次，再连续测三次；重复组从冷态直接连续测五次。warm/repeat 组内使用同一连接，不插入采样 SQL、清缓存或等待。预热不计入统计，不再统一填充所有表。
+
+五个 `exe_path` 保持现有名称：`host-only`、`filter-only`、`csd-without-hpcp`、`csd-with-hpcp`、`SQLerate`。其中后两者在本实验同时开启 HPCP/DCP，前三者关闭两种填充；`csd-without-hpcp`/`csd-with-hpcp` 对应实验中的“无缓存填充/有缓存填充”完整 CSD 对照。各模式的配置和资源不另行特化。
+
+结果目录包含每次输出、同组 JSON 实际计划日志、`timings.csv`（逐次延迟和正确性）、`groups.csv`（中位数及累计延迟）。Q15 保留原脚本的 CREATE/SELECT/DROP 总耗时。默认开启扩展 profile 以保存规划、设备内存/spill 和阶段计时，auto_explain 不开启逐节点 ANALYZE/TIMING；最终分析单列前台缓存记录维护，不能将累计并行工作量直接相加作为查询耗时。
+
 想换数据规模：`./scripts/sh-guest.sh guest/start-postgre.sh -f 1`（`-f` 强制重新解压，SF 见 `data/`）。
 
 ## 3. 目录结构
