@@ -5,6 +5,7 @@ set -eu
 export PATH=/home/femu/opt/postgres/release/bin:$PATH
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 QUERIES=$ROOT/queries
+PGDATABASE=${PGDATABASE:-tpch_s1}
 COLD=/home/femu/scripts/cold-query.sh
 MODES=${TPCH_MODES:-host-only filter-only csd-without-hpcp csd-with-hpcp SQLerate}
 RESULTS=$(mktemp -d /home/femu/results/tpch.XXXXXX)
@@ -28,7 +29,7 @@ for query in "$@"; do
             ok=yes
             # 冷启动后记录实际配置，避免读取到尚未重启应用的旧值。
             if [ ! -f "$RESULTS/environment.log" ]; then
-                psql -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
+                psql -X -q -A -t -v ON_ERROR_STOP=1 -d "$PGDATABASE" \
                     -c "SELECT version()" -c "SHOW shared_buffers" -c "SHOW work_mem" \
                     -c "SHOW max_parallel_workers_per_gather" > "$RESULTS/environment.log" 2> "$RESULTS/environment.err"
             fi

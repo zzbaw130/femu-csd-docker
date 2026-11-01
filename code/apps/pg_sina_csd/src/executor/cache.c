@@ -35,6 +35,7 @@ static struct {
     uint64 position;
     uint64 filled,cached,skipped,invalid,blocks,ns,minor_faults,major_faults;
     uint64 steps,max_step_ns,lookup_ns,allocate_ns,copy_ns;
+    uint64 admission_pages,remaining_pages,capacity_skipped;
 } receiver={.fd=-1};
 static uint64 now_ns(void)
 {
@@ -64,13 +65,15 @@ void pg_sina_dcp_finish(void)
     /* The caller has stopped device DMA before draining these last slots. */
     for(unsigned i=0;i<FEMU_CACHE_RX_SLOTS;i++)
         do { pg_sina_dcp_poll(true); } while(receiver.active>=0);
-    if(pg_sina_profile) ereport(NOTICE,(errmsg("SQLerate DCP blocks=%llu filled_pages=%llu cached_pages=%llu skipped_bytes=%llu invalid_pages=%llu wall_ms=%.3f minor_faults=%llu major_faults=%llu steps=%llu max_step_ms=%.3f lookup_ms=%.3f allocate_ms=%.3f copy_ms=%.3f",
+    if(pg_sina_profile) ereport(NOTICE,(errmsg("SQLerate DCP blocks=%llu filled_pages=%llu cached_pages=%llu skipped_bytes=%llu invalid_pages=%llu wall_ms=%.3f minor_faults=%llu major_faults=%llu steps=%llu max_step_ms=%.3f lookup_ms=%.3f allocate_ms=%.3f copy_ms=%.3f admission_pages=%llu remaining_pages=%llu capacity_skipped_bytes=%llu",
         (unsigned long long)receiver.blocks,(unsigned long long)receiver.filled,
         (unsigned long long)receiver.cached,(unsigned long long)receiver.skipped,
         (unsigned long long)receiver.invalid,receiver.ns/1e6,
         (unsigned long long)receiver.minor_faults,(unsigned long long)receiver.major_faults,
         (unsigned long long)receiver.steps,receiver.max_step_ns/1e6,receiver.lookup_ns/1e6,
-        receiver.allocate_ns/1e6,receiver.copy_ns/1e6)));
+        receiver.allocate_ns/1e6,receiver.copy_ns/1e6,
+        (unsigned long long)receiver.admission_pages,(unsigned long long)receiver.remaining_pages,
+        (unsigned long long)receiver.capacity_skipped)));
     if(receiver.data!=MAP_FAILED) munmap((void *)receiver.data,FEMU_CACHE_DATA_BYTES);
     if(receiver.slots!=MAP_FAILED) munmap(receiver.slots,FEMU_CACHE_PAGE_BYTES);
     close(receiver.fd); receiver.fd=-1;
@@ -79,6 +82,13 @@ void pg_sina_dcp_start(CS_DEV_HANDLE device)
 {
     if(!pg_sina_dcp || receiver.fd>=0) return;
     memset(&receiver,0,sizeof(receiver));
+    /* Population is optional: leave 10% for HOST/catalog work. Count all
+     * occupied buffers, not only this query's relations. Within a query the
+     * allowance only decreases, preventing repeated whole-table admission. */
+    uint64 occupied=0,limit=(uint64)NBuffers-NBuffers/10;
+    for(int i=0;i<NBuffers;++i)
+        if(pg_atomic_read_u32(&GetBufferDescriptor(i)->state)&BM_TAG_VALID) ++occupied;
+    receiver.admission_pages=receiver.remaining_pages=occupied<limit?limit-occupied:0;
     receiver.active=-1;
     receiver.fd=open("/dev/femu-cache",O_RDWR|O_CLOEXEC);
     receiver.slots=MAP_FAILED; receiver.data=MAP_FAILED;
@@ -135,6 +145,10 @@ static void fill_slot(unsigned slot,bool whole_slot)
         take=Min(available,end-position)/BLCKSZ*BLCKSZ;
         if(!take) break; /* Leave a page straddling the slice for the next turn. */
         for(uint64 offset=0;offset<take;offset+=BLCKSZ) {
+            if(!receiver.remaining_pages) {
+                receiver.skipped+=BLCKSZ; receiver.capacity_skipped+=BLCKSZ;
+                continue;
+            }
             BlockNumber block=(logical+offset)/BLCKSZ;
             const void *page=data+position+offset;
             /* PG's checksum verifier temporarily clears pd_checksum. Keep
@@ -152,6 +166,7 @@ static void fill_slot(unsigned slot,bool whole_slot)
                !(pg_atomic_read_u32(&GetBufferDescriptor(buffer-1)->state)&BM_DIRTY)) {
                 mark=pg_sina_profile?now_ns():0;
                 memcpy(BufferGetPage(buffer),page,BLCKSZ); ++receiver.filled;
+                --receiver.remaining_pages;
                 if(pg_sina_profile) receiver.copy_ns+=now_ns()-mark;
             } else ++receiver.cached;
             pg_sina_cache_buffer(buffer);

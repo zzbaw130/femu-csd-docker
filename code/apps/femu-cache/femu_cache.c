@@ -15,6 +15,8 @@
 #include <linux/seq_file.h>
 #include <linux/ktime.h>
 #include <linux/nvme.h>
+#include <linux/mm.h>
+#include <linux/vmstat.h>
 #include "csd-cache.h"
 static char *device="/dev/nvme0n1";
 module_param(device,charp,0444);
@@ -46,6 +48,7 @@ static struct receiver warm_receiver;
 static DEFINE_MUTEX(receiver_pool_lock);
 static bool receiver_pool_busy;
 static atomic64_t blocks,filled,cached,skipped,errors;
+static atomic64_t capacity_skipped;
 /* Wall time within publication; local page counters avoid per-page atomics. */
 static atomic64_t publish_ns,sync_cpu_ns,lookup_ns,folio_ns,copy_ns,sync_device_ns;
 static struct dentry *profile_dir;
@@ -57,6 +60,8 @@ static int profile_show(struct seq_file *out,void *unused)
     seq_printf(out,"CACHE_HOST publish_ns=%llu sync_cpu_ns=%llu lookup_ns=%llu folio_ns=%llu copy_ns=%llu sync_device_ns=%llu\n",
         atomic64_read(&publish_ns),atomic64_read(&sync_cpu_ns),atomic64_read(&lookup_ns),
         atomic64_read(&folio_ns),atomic64_read(&copy_ns),atomic64_read(&sync_device_ns));
+    seq_printf(out,"CACHE_ADMISSION capacity_skipped_bytes=%llu reserve_bytes=%llu\n",
+        atomic64_read(&capacity_skipped),(u64)(totalram_pages()/8)*PAGE_SIZE);
     return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(profile);
@@ -174,6 +179,10 @@ static int publish_slot(struct receiver *r,unsigned index,bool hpcp,bool acquire
         dma_sync_single_for_cpu(dma_device,r->pages[index][p],PAGE_SIZE,DMA_FROM_DEVICE);
     if(timing) { u64 now=ktime_get_ns(); atomic64_add(now-mark,&sync_cpu_ns); mark=now; }
     u64 physical=lba*bdev_logical_block_size(bdev->bdev);
+    /* MemAvailable includes reclaimable file cache and would allow population
+     * to recycle its own earlier pages. Reserve one eighth of RAM as genuinely
+     * free pages; optional allocation must never initiate direct reclaim. */
+    bool admit=global_zone_page_state(NR_FREE_PAGES)>totalram_pages()/8;
     if(hpcp) for(unsigned p=0;p<count;p++) {
         if(timing) mark=ktime_get_ns();
         struct file *file=NULL;
@@ -188,9 +197,13 @@ static int publish_slot(struct receiver *r,unsigned index,bool hpcp,bool acquire
         if(timing) { u64 now=ktime_get_ns(); lookup+=now-mark; mark=now; }
         if(!file) { atomic64_add(PAGE_SIZE,&skipped); continue; }
         struct folio *folio=__filemap_get_folio(file->f_mapping,offset>>PAGE_SHIFT,
-                                               FGP_LOCK|FGP_CREAT|FGP_NOWAIT,GFP_NOIO);
+                                               FGP_LOCK|FGP_NOWAIT|(admit?FGP_CREAT:0),GFP_NOWAIT);
         if(timing) { u64 now=ktime_get_ns(); folio_time+=now-mark; mark=now; }
-        if(IS_ERR(folio)) { atomic64_add(PAGE_SIZE,&skipped); fput(file); continue; }
+        if(IS_ERR(folio)) {
+            atomic64_add(PAGE_SIZE,&skipped);
+            if(!admit) atomic64_add(PAGE_SIZE,&capacity_skipped);
+            fput(file); continue;
+        }
         if(folio_test_uptodate(folio) || folio_test_dirty(folio) || folio_order(folio)) {
             if(folio_test_uptodate(folio) && !folio_test_dirty(folio)) atomic64_add(PAGE_SIZE,&cached);
             else atomic64_add(PAGE_SIZE,&skipped);
