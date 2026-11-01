@@ -10,6 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "batch_sort.h"
+#include "csd-cache.h"
 static atomic_uint checks;
 #define CHECK(x)                                                                                   \
     do {                                                                                           \
@@ -21,7 +22,7 @@ static atomic_uint checks;
     } while (0)
 #define OK(x) CHECK((x) == CS_SUCCESS)
 static uint64_t (*mock_used_bytes)(void);
-static uint64_t (*mock_graph_commands)(void),(*mock_hidden_used)(void);
+static uint64_t (*mock_graph_commands)(void),(*mock_hidden_used)(void),(*mock_cache_graph_commands)(void);
 static CS_CSF_ID load(CS_DEV_HANDLE d, const char *file, const char *symbol, const char *name, unsigned index)
 {
     char descriptor[128];
@@ -170,15 +171,18 @@ static void test_callback_sequence(CS_MEM_HANDLE memory)
     printf("callback sequence: calls=%u thread_lifetimes=%u wall_ms=%.3f\n",sequence.calls,
         atomic_load(&sequence_threads),(end.tv_sec-begin.tv_sec)*1000.0+(end.tv_nsec-begin.tv_nsec)/1000000.0);
 }
-int main(void)
+int main(int argc,char **argv)
 {
-    CHECK(!setenv("CSD_WORKMEM_SIZE_MB", "12", 1));
+    bool pause_only=argc==2 && !strcmp(argv[1],"--population-pause-64m");
+    CHECK(argc==1 || pause_only);
+    CHECK(!setenv("CSD_WORKMEM_SIZE_MB",pause_only?"64":"12",1));
     void *mock = dlopen(CS_MOCK_PLUGIN, RTLD_NOW | RTLD_LOCAL);
     assert(mock);
     mock_used_bytes = dlsym(mock, "mock_used_bytes");
     assert(mock_used_bytes);
     mock_graph_commands=dlsym(mock,"mock_graph_commands");
     mock_hidden_used=dlsym(mock,"mock_hidden_used");
+    mock_cache_graph_commands=dlsym(mock,"mock_cache_graph_commands"); CHECK(mock_cache_graph_commands);
     CHECK(mock_graph_commands && mock_hidden_used);
     /* Keep this test-only observation handle until process exit. */
 
@@ -223,11 +227,30 @@ int main(void)
     CS_BATCH_HANDLE read_batch; CS_BATCH_INDEX read_index;
     OK(csAllocBatchRequest(CS_BATCH_SERIAL,1,&read_batch));
     OK(csConfigureBatchEntry(read_batch,CS_BATCH_ADD,read,0,0,&read_index));
+    if(pause_only) {
+        struct femu_cache_config cache={.receive_fd=-1};
+        CsConfigInfo info={.Type=CS_VENDOR_SPECIFIC,.u.VSInfo={.VSData=&cache}};
+        CsConfigData out; int length=sizeof(out);
+        OK(csConfig(d,&length,&info,&out)); CHECK(!setenv("SNIA_FEMU_HPCP","1",1));
+    }
     u64 read_value=0,graphs=mock_graph_commands();
     OK(csQueueBatchRequest(read_batch,NULL,NULL,NULL,NULL,&read_value));
     CHECK(read_value==0xbeef && mock_graph_commands()==graphs+1);
     OK(copy(read_mem,buf,sizeof(buf),CS_COPY_FROM_DEVICE,512));
     for(unsigned i=0;i<sizeof(buf);++i) CHECK(buf[i]==0xa5);
+    if(pause_only) {
+        OK(csReset(d,CS_VENDOR_SPECIFIC_TYPE,0));
+        struct femu_cache_config cache={.receive_fd=-1};
+        CsConfigInfo info={.Type=CS_VENDOR_SPECIFIC,.u.VSInfo={.VSData=&cache}};
+        CsConfigData out; int length=sizeof(out);
+        OK(csConfig(d,&length,&info,&out));
+        OK(csQueueBatchRequest(read_batch,NULL,NULL,NULL,NULL,&read_value)); CHECK(read_value==0xbeef);
+        OK(csFreeBatchRequest(read_batch)); free(read);
+        OK(csFreeMem(read_mem,&f)); OK(csFreeMem(read_io,&f)); OK(csFreeMem(a,&f)); OK(csFreeMem(b,&f));
+        CHECK(mock_cache_graph_commands()==0);
+        OK(csCloseCSx(d)); CHECK(!unsetenv("SNIA_FEMU_HPCP"));
+        puts("PASS: population paused before/after reset; internal READ/COMPUTE still executes, 64MiB workmem"); return 0;
+    }
     for(unsigned invalid=1;invalid<=6;++invalid) {
         csHelperSetComputeArg(&read->u.Compute.Args[2],CS_64BIT_VALUE_TYPE,(u64)invalid);
         OK(csConfigureBatchEntry(read_batch,CS_BATCH_RECONFIG,read,read_index,0,NULL));

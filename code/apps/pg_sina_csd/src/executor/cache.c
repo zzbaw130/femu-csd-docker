@@ -21,6 +21,7 @@ struct cache_relation {
     MemoryContextCallback cleanup;
     struct cache_relation *next;
     Oid relid,filenode;
+    RelFileNode node;
     unsigned nsid,lba_bytes,count;
     const struct qs_extent *extents;
 };
@@ -31,7 +32,8 @@ static struct {
     const unsigned char *data;
     unsigned next;
     int active;
-    bool failed;
+    bool failed,hpcp,paused;
+    CS_DEV_HANDLE device;
     uint64 position;
     uint64 filled,cached,skipped,invalid,blocks,ns,minor_faults,major_faults;
     uint64 steps,max_step_ns,lookup_ns,allocate_ns,copy_ns;
@@ -50,9 +52,11 @@ static void unregister_relation(void *arg)
 }
 void pg_sina_dcp_register(const struct qs_request *request,const struct qs_extent *extents)
 {
-    if(!pg_sina_dcp || !request->nextents) return;
+    if((!pg_sina_dcp && !pg_sina_hpcp_enabled()) || !request->nextents) return;
     struct cache_relation *r=palloc0(sizeof(*r));
     r->relid=request->plan.relid; r->filenode=request->plan.relfilenode;
+    Relation rel=relation_open(r->relid,AccessShareLock); r->node=rel->rd_node;
+    relation_close(rel,AccessShareLock);
     r->nsid=request->nsid; r->lba_bytes=request->lba_bytes;
     r->count=request->nextents; r->extents=extents;
     r->next=relations; relations=r;
@@ -78,21 +82,51 @@ void pg_sina_dcp_finish(void)
     if(receiver.slots!=MAP_FAILED) munmap(receiver.slots,FEMU_CACHE_PAGE_BYTES);
     close(receiver.fd); receiver.fd=-1;
 }
+/* Existing bitmaps describe actual pages, not a cumulative fill counter.
+ * Unknown/stale observations admit work; never pause merely from table size. */
+static void population_needed(bool *file,bool *shared)
+{
+    *file=*shared=relations==NULL;
+    pg_sina_cache_poll();
+    for(struct cache_relation *r=relations;r;r=r->next) {
+        const struct pg_sina_cache_entry *entry=pg_sina_cache_lookup(r->node);
+        *file|=!entry || !entry->file_known || entry->file_pages<entry->file_total;
+        *shared|=!entry || entry->shared_pages<entry->blocks;
+    }
+}
+static void pause_population(CS_DEV_HANDLE device)
+{
+    struct femu_cache_config cache={.receive_fd=-1};
+    CsConfigInfo info={.Type=CS_VENDOR_SPECIFIC,.u.VSInfo={.VSData=&cache}};
+    CsConfigData out; int length=sizeof(out);
+    CS_STATUS status=csConfig(device,&length,&info,&out);
+    if(status!=CS_SUCCESS) elog(ERROR,"cannot pause FEMU cache population: status=%d",status);
+    receiver.paused=true;
+    if(pg_sina_profile) ereport(NOTICE,(errmsg("SQLerate population paused device_dma=off reason=resident_or_capacity")));
+}
 void pg_sina_dcp_start(CS_DEV_HANDLE device)
 {
-    if(!pg_sina_dcp || receiver.fd>=0) return;
-    memset(&receiver,0,sizeof(receiver));
+    if((!pg_sina_dcp && !pg_sina_hpcp_enabled()) || receiver.fd>=0) return;
+    memset(&receiver,0,sizeof(receiver)); receiver.fd=-1; receiver.active=-1; receiver.device=device;
+    bool file,shared; population_needed(&file,&shared);
+    receiver.hpcp=pg_sina_hpcp_enabled() && file;
     /* Population is optional: leave 10% for HOST/catalog work. Count all
      * occupied buffers, not only this query's relations. Within a query the
      * allowance only decreases, preventing repeated whole-table admission. */
     uint64 occupied=0,limit=(uint64)NBuffers-NBuffers/10;
-    for(int i=0;i<NBuffers;++i)
+    for(int i=0;pg_sina_dcp && shared && i<NBuffers;++i)
         if(pg_atomic_read_u32(&GetBufferDescriptor(i)->state)&BM_TAG_VALID) ++occupied;
-    receiver.admission_pages=receiver.remaining_pages=occupied<limit?limit-occupied:0;
+    receiver.admission_pages=receiver.remaining_pages=pg_sina_dcp && shared && occupied<limit?limit-occupied:0;
+    if(!receiver.remaining_pages && !receiver.hpcp) { pause_population(device); return; }
+    if(!pg_sina_dcp) return; /* SNIA's existing file-cache consumer owns this case. */
     receiver.active=-1;
     receiver.fd=open("/dev/femu-cache",O_RDWR|O_CLOEXEC);
     receiver.slots=MAP_FAILED; receiver.data=MAP_FAILED;
     if(receiver.fd<0) ereport(ERROR,(errmsg("cannot open DCP receiver: %m")));
+    if(receiver.hpcp && ioctl(receiver.fd,FEMU_CACHE_RX_ADMISSION)==FEMU_CACHE_HPCP_FULL) receiver.hpcp=false;
+    if(!receiver.remaining_pages && !receiver.hpcp) {
+        close(receiver.fd); receiver.fd=-1; pause_population(device); return;
+    }
     if(ioctl(receiver.fd,FEMU_CACHE_RX_SETUP)<0) goto fail;
     receiver.slots=mmap(NULL,FEMU_CACHE_PAGE_BYTES,PROT_READ|PROT_WRITE,MAP_SHARED,receiver.fd,0);
     receiver.data=mmap(NULL,FEMU_CACHE_DATA_BYTES,PROT_READ,MAP_SHARED,receiver.fd,FEMU_CACHE_DATA_OFFSET);
@@ -185,7 +219,7 @@ static void fill_slot(unsigned slot,bool whole_slot)
 bool pg_sina_dcp_poll(bool whole_slot)
 {
     pg_sina_cache_poll();
-    if(receiver.fd<0 || receiver.slots==MAP_FAILED || receiver.data==MAP_FAILED) return false;
+    if(receiver.paused || receiver.fd<0 || receiver.slots==MAP_FAILED || receiver.data==MAP_FAILED) return false;
     uint64 start=now_ns();
     struct rusage before,after;
     if(pg_sina_profile) getrusage(RUSAGE_THREAD,&before);
@@ -202,17 +236,23 @@ bool pg_sina_dcp_poll(bool whole_slot)
         unsigned slot=receiver.active;
         PG_TRY();
         {
-            if(!receiver.failed && IsTransactionState() && !QueryCancelPending && !ProcDiePending) fill_slot(slot,whole_slot);
+            if(!receiver.paused && !receiver.failed && IsTransactionState() && !QueryCancelPending && !ProcDiePending) fill_slot(slot,whole_slot);
             else receiver.position=le64toh(receiver.slots[slot].bytes);
         }
         PG_CATCH();
         { ioctl(receiver.fd,FEMU_CACHE_RX_RELEASE,slot); receiver.active=-1; receiver.failed=true; PG_RE_THROW(); }
         PG_END_TRY();
         if(receiver.position>=le64toh(receiver.slots[slot].bytes)) {
-            unsigned flags=slot|(pg_sina_hpcp_enabled()?FEMU_CACHE_RELEASE_HPCP:0);
-            if(ioctl(receiver.fd,FEMU_CACHE_RX_RELEASE,flags)<0)
+            unsigned flags=slot|(receiver.hpcp?FEMU_CACHE_RELEASE_HPCP:0);
+            int result=ioctl(receiver.fd,FEMU_CACHE_RX_RELEASE,flags);
+            if(result<0)
                 ereport(ERROR,(errmsg("cannot release DCP receive slot: %m")));
             receiver.active=-1; ++receiver.blocks;
+            if(result==FEMU_CACHE_HPCP_FULL) receiver.hpcp=false;
+            if(!receiver.paused && !receiver.hpcp) {
+                bool file,shared; population_needed(&file,&shared);
+                if(!receiver.remaining_pages || !shared) pause_population(receiver.device);
+            }
         }
         uint64 elapsed=now_ns()-start;
         receiver.ns+=elapsed; ++receiver.steps;

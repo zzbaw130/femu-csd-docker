@@ -81,6 +81,27 @@ struct qp_plan {
     struct qp_pipeline_profile pipelines[QP_NODES];
     struct qp_file_mapping files[QP_NODES],indexes[QP_NODES];
 };
+/* A bound is valid only for one direct, unfiltered LIMIT consumer. Shared
+ * CTE/InitPlan/parameter references require the full ordering. Both executor
+ * and estimator use this rule; it is not an algorithm chosen after costing. */
+static inline int64_t qp_sort_bound(const struct qp_plan *p,unsigned id)
+{
+    const struct qp_node *n=&p->nodes[id];
+    if(n->kind!=QP_SORT || n->expr.predicate>=0) return -1;
+    const struct qp_node *bound=NULL; unsigned references=p->root==id;
+    for(unsigned i=0;i<p->count;++i) {
+        const struct qp_node *parent=&p->nodes[i];
+        if(parent->left==(int)id || parent->right==(int)id) {
+            ++references;
+            if(parent->kind==QP_LIMIT && parent->left==(int)id && parent->expr.predicate<0) bound=parent;
+        }
+    }
+    for(unsigned i=0;i<p->nparams;++i) references+=p->param_nodes[i]==(int)id;
+    for(unsigned i=0;i<p->ninit;++i) references+=p->init_nodes[i]==(int)id;
+    for(unsigned i=0;i<QP_PARAMS;++i) references+=p->cte_nodes[i]==(int)id;
+    return references==1 && bound && bound->expr.limit>=0 && bound->expr.offset>=0 &&
+        bound->expr.offset<=INT64_MAX-bound->expr.limit?bound->expr.limit+bound->expr.offset:-1;
+}
 /* PG serializes this Const for parallel workers. Keep only actual nodes;
  * runtime mappings/profiles are zero-filled when execution expands it back
  * to the unchanged, full device record. */

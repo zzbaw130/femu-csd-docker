@@ -15,7 +15,7 @@ static unsigned next_id = 1;
 static uint8_t nvm[32U << 20];
 static bool nvm_initialized;
 static unsigned next_session=1,next_spill=1;
-static uint64_t hidden_used,graph_commands;
+static uint64_t hidden_used,graph_commands,cache_graph_commands;
 static struct { void *data; uint64_t bytes,creator; unsigned session; } spills[16384];
 static CS_STATUS mock_graph(struct cs_device *,struct nvme_passthru_cmd64 *);
 static struct {
@@ -186,7 +186,9 @@ static CS_STATUS mock_graph(struct cs_device *d,struct nvme_passthru_cmd64 *c)
     unsigned count=le32toh(h->count);
     uint64_t done=0,all=UINT64_MAX>>(64-count);
     CS_STATUS status=CS_SUCCESS;
-    pthread_mutex_lock(&lock); ++graph_commands; pthread_mutex_unlock(&lock);
+    pthread_mutex_lock(&lock); ++graph_commands;
+    if(le32toh(h->flags)&FEMU_CSD_GRAPH_CACHE) ++cache_graph_commands;
+    pthread_mutex_unlock(&lock);
     while(done!=all && status==CS_SUCCESS) {
         uint64_t before=done;
         for(unsigned i=0;i<count && status==CS_SUCCESS;++i) {
@@ -286,6 +288,8 @@ static CS_STATUS mock_graph(struct cs_device *d,struct nvme_passthru_cmd64 *c)
 }
 __attribute__((visibility("default"))) uint64_t mock_graph_commands(void)
 { pthread_mutex_lock(&lock); uint64_t v=graph_commands; pthread_mutex_unlock(&lock); return v; }
+__attribute__((visibility("default"))) uint64_t mock_cache_graph_commands(void)
+{ pthread_mutex_lock(&lock); uint64_t v=cache_graph_commands; pthread_mutex_unlock(&lock); return v; }
 __attribute__((visibility("default"))) uint64_t mock_hidden_used(void)
 { pthread_mutex_lock(&lock); uint64_t v=hidden_used; pthread_mutex_unlock(&lock); return v; }
 __attribute__((visibility("default"))) uint64_t mock_used_bytes(void)

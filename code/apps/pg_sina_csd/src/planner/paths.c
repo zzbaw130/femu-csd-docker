@@ -401,6 +401,7 @@ void pg_sina_join_paths(PlannerInfo *root,RelOptInfo *joinrel,RelOptInfo *outerr
         list_free(paths);
     }
     if(!eligible(root)) return;
+    pg_sina_refine_host_anti(root,joinrel,outerrel,jointype,extra);
     /* Inspect PG's current alternatives too, preserving Index/Merge choices. */
     List *paths=list_concat(list_copy(joinrel->pathlist),list_copy(joinrel->partial_pathlist)); ListCell *c;
     foreach(c,paths) {

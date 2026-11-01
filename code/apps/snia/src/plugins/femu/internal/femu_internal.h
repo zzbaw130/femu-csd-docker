@@ -22,7 +22,7 @@ struct cs_device {
     uint32_t graph_session;
     struct cs_cache_receiver *cache;
     int cache_fd;
-    bool cache_external;
+    bool cache_external,cache_disabled;
     uint64_t next_graph;
     char path[4096];
     struct { uint32_t workers; uint64_t fdm_bytes, features; } caps;

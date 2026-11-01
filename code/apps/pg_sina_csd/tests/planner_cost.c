@@ -5,6 +5,14 @@
 #define CHECK(test) do { if(!(test)) { fprintf(stderr,"line %d: %s\n",__LINE__,#test); return EXIT_FAILURE; } } while(0)
 int main(void)
 {
+    CHECK(cost_population_fraction(true,true,1,1)==0);
+    CHECK(cost_population_fraction(true,true,1,0)==1);
+    CHECK(cost_population_fraction(false,true,0,1)==0);
+    CHECK(cost_population_fraction(true,false,0,1)==1);
+    struct cost_sort bounded=cost_topn_state(3000000,128,64*1024*1024,4,10);
+    CHECK(bounded.spill==0 && bounded.state<1024*1024);
+    CHECK(cost_topn_state(3000000,128,64*1024*1024,4,-1).spill>0);
+    CHECK(cost_topn_state(3000000,128,64*1024*1024,4,3000000).spill>0);
     /* Shared hits remove I/O, not CPU. File-only hits still copy pages;
      * overlapping cache fractions must not discount the same I/O twice. */
     CHECK(30+cost_host_cached_io(100,0,0,0.1)==130);

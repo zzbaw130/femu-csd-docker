@@ -167,7 +167,7 @@ static int publish_slot(struct receiver *r,unsigned index,bool hpcp,bool acquire
     if(le64_to_cpu(smp_load_acquire(&slot->ready))!=1) return -EAGAIN;
     dma_rmb();
     u64 bytes=le64_to_cpu(slot->bytes),lba=le64_to_cpu(slot->lba);
-    bool timing=READ_ONCE(profile);
+    bool timing=READ_ONCE(profile),full=false;
     u64 begin=timing?ktime_get_ns():0,mark=begin;
     u64 lookup=0,folio_time=0,copy_time=0;
     if(le32_to_cpu(slot->error) || !bytes || bytes>FEMU_CACHE_BLOCK_BYTES || bytes%PAGE_SIZE ||
@@ -183,6 +183,7 @@ static int publish_slot(struct receiver *r,unsigned index,bool hpcp,bool acquire
      * to recycle its own earlier pages. Reserve one eighth of RAM as genuinely
      * free pages; optional allocation must never initiate direct reclaim. */
     bool admit=global_zone_page_state(NR_FREE_PAGES)>totalram_pages()/8;
+    full=hpcp && !admit;
     if(hpcp) for(unsigned p=0;p<count;p++) {
         if(timing) mark=ktime_get_ns();
         struct file *file=NULL;
@@ -201,7 +202,9 @@ static int publish_slot(struct receiver *r,unsigned index,bool hpcp,bool acquire
         if(timing) { u64 now=ktime_get_ns(); folio_time+=now-mark; mark=now; }
         if(IS_ERR(folio)) {
             atomic64_add(PAGE_SIZE,&skipped);
-            if(!admit) atomic64_add(PAGE_SIZE,&capacity_skipped);
+            if(!admit || PTR_ERR(folio)==-ENOMEM) {
+                atomic64_add(PAGE_SIZE,&capacity_skipped); full=true;
+            }
             fput(file); continue;
         }
         if(folio_test_uptodate(folio) || folio_test_dirty(folio) || folio_order(folio)) {
@@ -229,7 +232,7 @@ done:
     atomic64_inc(&blocks);
     dma_wmb();
     smp_store_release(&slot->ready,cpu_to_le64(0));
-    return 0;
+    return full?FEMU_CACHE_HPCP_FULL:0;
 }
 static void clear_mappings(struct file *owner)
 {
@@ -244,6 +247,8 @@ static long cache_ioctl(struct file *file,unsigned cmd,unsigned long arg)
     struct femu_cache_mapping range;
     struct mapping *map;
     if(!capable(CAP_SYS_ADMIN)) return -EPERM;
+    if(cmd==FEMU_CACHE_RX_ADMISSION)
+        return global_zone_page_state(NR_FREE_PAGES)>totalram_pages()/8?0:FEMU_CACHE_HPCP_FULL;
     if(cmd==FEMU_CACHE_RX_SETUP || cmd==FEMU_CACHE_RX_PUBLISH || cmd==FEMU_CACHE_RX_ACQUIRE || cmd==FEMU_CACHE_RX_RELEASE ||
        cmd==FEMU_CACHE_RX_BIND || cmd==FEMU_CACHE_RX_UNBIND) {
         mutex_lock(&r->lock);

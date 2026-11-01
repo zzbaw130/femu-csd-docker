@@ -800,28 +800,10 @@ static int64_t sort_init(struct execution *s,struct sorted_rows *sort,const stru
     sort->output=cs_work_calloc(s->context,1,sizeof(*sort->output));
     if(!sort->input || !sort->output) return -4;
     sort->plan.nout=input->nout; sort->plan.ordered_rows=2; sort->plan.limit=-1;
-    /* Like a bounded PG Sort / DuckDB TopN, retain limit+offset rows. Only
-     * a single direct consumer may supply the bound; shared/materialized
-     * sources and filters keep their complete sort. Merge-Join sorts are
-     * separate state objects and never enter this case. */
-    for(unsigned id=0;id<s->plan->count;++id) if(s->plan->nodes[id].kind==QP_SORT &&
-        &s->nodes[id].left_sort==sort && s->plan->nodes[id].expr.predicate<0) {
-        const struct qp_node *bound=NULL; unsigned references=s->plan->root==id;
-        for(unsigned p=0;p<s->plan->count;++p) {
-            const struct qp_node *parent=&s->plan->nodes[p];
-            if(parent->left==(int)id || parent->right==(int)id) {
-                ++references;
-                if(parent->kind==QP_LIMIT && parent->left==(int)id && parent->expr.predicate<0) bound=parent;
-            }
+    for(unsigned id=0;id<s->plan->count;++id)
+        if(&s->nodes[id].left_sort==sort && s->plan->nodes[id].kind==QP_SORT) {
+            sort->plan.limit=qp_sort_bound(s->plan,id); break;
         }
-        for(unsigned p=0;p<s->plan->nparams;++p) references+=s->plan->param_nodes[p]==(int)id;
-        for(unsigned p=0;p<s->plan->ninit;++p) references+=s->plan->init_nodes[p]==(int)id;
-        for(unsigned p=0;p<QP_PARAMS;++p) references+=s->plan->cte_nodes[p]==(int)id;
-        if(references==1 && bound && bound->expr.limit>=0 && bound->expr.offset>=0 &&
-           bound->expr.offset<=INT64_MAX-bound->expr.limit)
-            sort->plan.limit=bound->expr.limit+bound->expr.offset;
-        break;
-    }
     sort->plan.work_mem_bytes=s->sort_limit;
     /* The plan depth supplies a conservative fallback reserve, not a fixed
      * partition of all memory. Borrow from actual free query memory when

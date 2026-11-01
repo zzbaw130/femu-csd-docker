@@ -44,8 +44,13 @@ struct femu_cache_mapping { int fd; fc_u32 nsid; fc_u64 lba_bytes, file_offset, 
 #define FEMU_CACHE_DATA_BYTES (FEMU_CACHE_RX_SLOTS*FEMU_CACHE_BLOCK_BYTES)
 #define FEMU_CACHE_RX_ACQUIRE _IO(0xfc,7)
 #define FEMU_CACHE_RX_RELEASE _IO(0xfc,8)
+/* Read-only Guest admission check, no receiver allocation or device I/O. */
+#define FEMU_CACHE_RX_ADMISSION _IO(0xfc,9)
 #define FEMU_CACHE_RELEASE_HPCP 0x100U
+/* Successful publication, but no more optional file-cache allocation. */
+#define FEMU_CACHE_HPCP_FULL 1
 /* FEMU csConfig(CS_VENDOR_SPECIFIC) input: borrow this prepared receiver.
  * The adapter duplicates the fd; the caller consumes its data, not a thread. */
+/* receive_fd=-1 pauses population for this execution; reset restores it. */
 struct femu_cache_config { int receive_fd; };
 #endif

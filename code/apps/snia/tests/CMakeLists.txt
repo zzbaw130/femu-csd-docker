@@ -55,3 +55,5 @@ endif()
 
 add_test(NAME csFemuCacheGuestWireAgreement COMMAND ${CMAKE_COMMAND} -E compare_files
     "${FEMU_DIR}/include/csd-cache.h" "${PROJECT_SOURCE_DIR}/../femu-cache/csd-cache.h")
+
+add_test(NAME csFemuPopulationPause64MiB COMMAND cs-csf-batch-scheduling --population-pause-64m)

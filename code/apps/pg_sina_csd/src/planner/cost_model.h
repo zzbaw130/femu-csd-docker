@@ -11,6 +11,10 @@ static inline double cost_min(double a,double b) { return a<b?a:b; }
  * caller retains CPU costs; only file-only hits pay the extra page copy. */
 static inline double cost_host_cached_io(double io,double shared,double file,double copy_ratio)
 { return io*(1-cost_max(shared,file))+io*cost_max(0,file-shared)*copy_ratio; }
+/* Either destination may still need a page. Cache population never lowers
+ * CSD internal LOAD cost: it only suppresses already unnecessary DMA. */
+static inline double cost_population_fraction(bool file_enabled,bool shared_enabled,double file,double shared)
+{ return cost_max(file_enabled?1-file:0,shared_enabled?1-shared:0); }
 /* LOAD and compute remain serial within one task, but independent CU tasks
  * overlap. Retain one participant's fill/drain share of the shorter stage. */
 static inline double cost_scan_overlap(double io,double cpu,double tasks,unsigned cus)
@@ -129,6 +133,17 @@ static inline struct cost_sort cost_sort_state(double rows,double width,double a
     s.comparisons=rows*log2(cost_max(2,cost_min(rows,run_rows)));
     s.merge=rows*log2(cost_max(1,s.runs));
     s.record_copies=rows*(s.passes+1);
+    return s;
+}
+/* TopN inspects all input rows, but retains only bound rows. If that state
+ * cannot fit, use the sorter's full external path; never erase real spill. */
+static inline struct cost_sort cost_topn_state(double rows,double width,double available,unsigned windows,int64_t bound)
+{
+    double retained=cost_min(rows,(double)bound),state=retained*width+2*QS_SORT_IO_BYTES;
+    if(bound<0 || state>available) return cost_sort_state(rows,width,available,windows);
+    struct cost_sort s={.state=state,.runs=1,.fan=2};
+    s.comparisons=rows*log2(cost_max(2,retained));
+    s.merge=retained*log2(cost_max(2,retained)); s.record_copies=rows+retained;
     return s;
 }
 /* Interpolate uniform occupancy and clustered keys using PG correlation^2.

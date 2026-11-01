@@ -127,6 +127,7 @@ void pg_sina_search_upper_paths(PlannerInfo *,UpperRelationKind,RelOptInfo *,Rel
 Plan *pg_sina_cost_device(PlannerInfo *,Plan *,bool,List **,double *,double *);
 List *pg_sina_selected_costs(PlannerInfo *,Plan *,bool,bool,Node *);
 void pg_sina_cost_host_path(PlannerInfo *,Path *,Oid,List **,bool);
+void pg_sina_refine_host_anti(PlannerInfo *,RelOptInfo *,RelOptInfo *,JoinType,JoinPathExtraData *);
 void pg_sina_cost_host_lookup(PlannerInfo *,Path *,JoinPathExtraData *,List **);
 Path *pg_sina_reprice_index_join(PlannerInfo *,NestPath *,JoinPathExtraData *,List **);
 double pg_sina_host_scan_cost(Plan *,Oid,double,List **);

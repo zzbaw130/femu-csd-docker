@@ -32,11 +32,15 @@ static void *receive_cache(void *opaque)
             if(le64toh(__atomic_load_n(&r->slots[i].ready,__ATOMIC_ACQUIRE))!=1) continue;
             found=true;
             uint64_t start=r->profile?cache_clock(CLOCK_MONOTONIC):0;
-            if(ioctl(r->fd,FEMU_CACHE_RX_PUBLISH,(unsigned long)i)<0) {
+            int result=ioctl(r->fd,FEMU_CACHE_RX_PUBLISH,(unsigned long)i);
+            if(r->profile) { r->calls++; r->ioctl_ns+=cache_clock(CLOCK_MONOTONIC)-start; }
+            if(result==FEMU_CACHE_HPCP_FULL) {
+                ioctl(r->fd,FEMU_CACHE_RX_UNBIND); goto finished;
+            }
+            if(result<0) {
                 /* The module owns page validation and always returns the slot. */
                 __atomic_store_n(&r->slots[i].ready,htole64(0),__ATOMIC_RELEASE);
             }
-            if(r->profile) { r->calls++; r->ioctl_ns+=cache_clock(CLOCK_MONOTONIC)-start; }
         }
         if(!found) {
             if(__atomic_load_n(&r->stopping,__ATOMIC_ACQUIRE)) break;
@@ -45,6 +49,7 @@ static void *receive_cache(void *opaque)
             if(r->profile) r->sleep_ns+=cache_clock(CLOCK_MONOTONIC)-start;
         }
     }
+finished:
     if(r->profile) {
         r->worker_ns=cache_clock(CLOCK_MONOTONIC)-begin;
         r->worker_cpu_ns=cache_clock(CLOCK_THREAD_CPUTIME_ID)-cpu;
@@ -54,7 +59,7 @@ static void *receive_cache(void *opaque)
 CS_STATUS femu_hpcp_start(struct cs_device *d)
 {
     const char *enabled=getenv("SNIA_FEMU_HPCP");
-    if(d->cache || (!d->cache_external && (!enabled || strcmp(enabled,"1")))) return CS_SUCCESS;
+    if(__atomic_load_n(&d->cache_disabled,__ATOMIC_ACQUIRE) || d->cache || (!d->cache_external && (!enabled || strcmp(enabled,"1")))) return CS_SUCCESS;
     struct cs_cache_receiver *r=calloc(1,sizeof(*r));
     if(!r) return CS_OUT_OF_RESOURCES;
     r->profile=d->profile;
@@ -65,6 +70,10 @@ CS_STATUS femu_hpcp_start(struct cs_device *d)
     r->slots=MAP_FAILED;
     if(r->fd<0) goto fail;
     if(!r->external) {
+        if(ioctl(r->fd,FEMU_CACHE_RX_ADMISSION)==FEMU_CACHE_HPCP_FULL) {
+            __atomic_store_n(&d->cache_disabled,true,__ATOMIC_RELEASE);
+            close(r->fd); free(r); return CS_SUCCESS;
+        }
         if(ioctl(r->fd,FEMU_CACHE_RX_SETUP)<0) goto fail;
         r->slots=mmap(NULL,FEMU_CACHE_PAGE_BYTES,PROT_READ|PROT_WRITE,MAP_SHARED,r->fd,0);
         if(r->slots==MAP_FAILED) goto fail;
@@ -83,10 +92,13 @@ fail:
 }
 CS_STATUS femu_hpcp_configure(struct cs_device *d,int fd)
 {
-    if(fd<0) return CS_INVALID_ARG;
+    if(fd< -1) return CS_INVALID_ARG;
     pthread_mutex_lock(&d->graph_lock);
     CS_STATUS status=CS_SUCCESS;
-    if(d->graph_session || d->cache || d->cache_external) status=CS_HANDLE_IN_USE;
+    if(fd==-1) {
+        __atomic_store_n(&d->cache_disabled,true,__ATOMIC_RELEASE);
+        if(d->cache && ioctl(d->cache->fd,FEMU_CACHE_RX_UNBIND)<0) status=CS_DEVICE_ERROR;
+    } else if(d->graph_session || d->cache || d->cache_external) status=CS_HANDLE_IN_USE;
     else {
         int copy=fcntl(fd,F_DUPFD_CLOEXEC,0);
         if(copy<0) status=CS_INVALID_ARG;
@@ -98,6 +110,7 @@ CS_STATUS femu_hpcp_configure(struct cs_device *d,int fd)
 void femu_hpcp_stop(struct cs_device *d)
 {
     struct cs_cache_receiver *r=d->cache;
+    __atomic_store_n(&d->cache_disabled,false,__ATOMIC_RELEASE);
     if(!r) {
         if(d->cache_external && d->cache_fd>=0) close(d->cache_fd);
         d->cache_external=false; d->cache_fd=-1;
