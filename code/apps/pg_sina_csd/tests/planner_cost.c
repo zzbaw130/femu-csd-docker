@@ -5,6 +5,14 @@
 #define CHECK(test) do { if(!(test)) { fprintf(stderr,"line %d: %s\n",__LINE__,#test); return EXIT_FAILURE; } } while(0)
 int main(void)
 {
+    struct qs_plan expressions={.nexprs=4};
+    expressions.exprs[0].op=Q_COLUMN; expressions.exprs[1].op=Q_CONST;
+    expressions.exprs[2].op=Q_PARAMETER; expressions.exprs[3].op=Q_AGGREF;
+    CHECK(cost_expression_ops(&expressions)==0);
+    expressions.exprs[3].column=-1; /* Candidate operation, not an aggregate reference. */
+    CHECK(cost_expression_ops(&expressions)==1);
+    expressions.exprs[3].op=Q_MUL;
+    CHECK(cost_expression_ops(&expressions)==1);
     CHECK(cost_population_fraction(true,true,1,1)==0);
     CHECK(cost_population_fraction(true,true,1,0)==1);
     CHECK(cost_population_fraction(false,true,0,1)==0);
@@ -23,6 +31,11 @@ int main(void)
     CHECK(cost_host_cached_io(100,0.5,1,0.1)==5);
     /* Bounded index caches must not make repeated random I/O free. A small
      * table can fit; clustered matching tuples share a Heap page. */
+    CHECK(cost_first_match_visits(4,0)==4);
+    CHECK(cost_first_match_visits(4,1)==1);
+    CHECK(cost_first_match_visits(0,0.5)==0);
+    CHECK(cost_first_match_visits(4,0.25)>2.73 && cost_first_match_visits(4,0.25)<2.74);
+    CHECK(cost_first_match_visits(128,0.1)>9.99 && cost_first_match_visits(128,0.1)<10);
     CHECK(cost_index_pages(0,10000,64,256)==0);
     CHECK(cost_index_pages(257,100000,0,256)<258);
     CHECK(cost_index_pages(100000,1,64,256)<=1);
@@ -197,9 +210,15 @@ int main(void)
     scan.nodes[1].expr.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.column=0};
     scan.nodes[1].expr.exprs[1]=(struct qs_expr){.op=Q_COLUMN,.column=1};
     scan.nodes[2].expr.nout=scan.nodes[3].expr.nout=1;
-    CHECK(cost_probe_expression(&scan,0,0,1));
+    CHECK(cost_join_expression(&scan,0,0,1,false));
     scan.nodes[0].expr.exprs[0].column=1;
-    CHECK(!cost_probe_expression(&scan,0,0,1));
+    CHECK(!cost_join_expression(&scan,0,0,1,false));
+    CHECK(cost_join_expression(&scan,0,0,1,true));
+    scan.nodes[1].kind=QP_JOIN; scan.nodes[1].join_type=QP_INNER; scan.nodes[1].nkeys=1;
+    CHECK(cost_join_expression(&scan,0,0,1,false)); /* Equal key forwarded from the other side. */
+    scan.nodes[1].join_type=QP_LEFT;
+    CHECK(!cost_join_expression(&scan,0,0,1,false)); /* NULL extension breaks that equality. */
+    scan.nodes[1].kind=QP_INDEX_JOIN;
     scan.nodes[1].parallel=1; scan.nodes[2].left=-1;
     CHECK(qp_task_slots(&scan,4)==8);
     CHECK(qp_task_slots(&scan,8)==16);

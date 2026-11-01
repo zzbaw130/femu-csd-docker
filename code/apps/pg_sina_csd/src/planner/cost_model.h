@@ -11,6 +11,20 @@ static inline double cost_min(double a,double b) { return a<b?a:b; }
  * caller retains CPU costs; only file-only hits pay the extra page copy. */
 static inline double cost_host_cached_io(double io,double shared,double file,double copy_ratio)
 { return io*(1-cost_max(shared,file))+io*cost_max(0,file-shared)*copy_ratio; }
+/* Bound vectors/columns and literals carry values; they do not execute an
+ * arithmetic instruction. Materialization/Heap cost is charged separately. */
+static inline unsigned cost_expression_ops(const struct qs_plan *p)
+{
+    unsigned count=0;
+    for(unsigned i=0;i<p->nexprs;++i) {
+        unsigned op=p->exprs[i].op;
+        /* Candidate properties use Q_AGGREF with column=-1 for an
+         * unevaluated operation; real aggregate references have an index. */
+        count+=op!=Q_COLUMN && op!=Q_CONST && op!=Q_PARAMETER &&
+            (op!=Q_AGGREF || p->exprs[i].column<0);
+    }
+    return count;
+}
 /* Either destination may still need a page. Cache population never lowers
  * CSD internal LOAD cost: it only suppresses already unnecessary DMA. */
 static inline double cost_population_fraction(bool file_enabled,bool shared_enabled,double file,double shared)
@@ -38,6 +52,15 @@ static inline double cost_index_pages(double visits,double pages,double cache,do
     double full=floor(visits/batch),tail=visits-full*batch;
     double misses=(-full*pages*expm1(-batch/pages)-pages*expm1(-tail/pages))*(1-cost_min(1,cache/pages));
     return cost_max(unique,misses);
+}
+/* Expected candidates inspected until the first success, including the
+ * no-match case. Predicate independence is the same statistical assumption
+ * used for scan selectivity; unknown residuals keep the full scan. */
+static inline double cost_first_match_visits(double candidates,double selectivity)
+{
+    if(candidates<=0 || selectivity<=0) return candidates;
+    if(selectivity>=1) return cost_min(1,candidates);
+    return -expm1(candidates*log1p(-selectivity))/selectivity;
 }
 /* PG correlation describes how consecutive index matches share Heap pages.
  * Random matches may need one page per tuple; clustered matches share pages. */
@@ -159,16 +182,27 @@ static inline double cost_partial_rows(double rows,double groups,double resident
 }
 static inline double cost_spill_io(double bytes,double read_mbps,double write_mbps)
 { return bytes/2/(read_mbps*1000)+bytes/2/(write_mbps*1000); }
-/* Group keys drawn only from a join's probe side cannot form more groups
- * than probe rows, even when the join emits many matching build rows. */
-static inline bool cost_probe_expression(const struct qp_plan *tree,int node,int expression,int join)
+/* Keys derived from one join input cannot form more groups than that
+ * input has rows. The caller handles outer-join NULLs and parameterized
+ * index inputs, whose row estimate describes one probe, not the full input. */
+static inline bool cost_join_expression(const struct qp_plan *tree,int node,int expression,int join,bool build)
 {
     const struct qp_node *n=&tree->nodes[node];
     if(expression<0 || (unsigned)expression>=n->expr.nexprs) return false;
     const struct qs_expr *e=&n->expr.exprs[expression];
     if(e->op==Q_CONST || e->op==Q_PARAMETER) return true;
     if(e->op==Q_COLUMN) {
-        if(node==join) return e->column>=0 && (unsigned)e->column<tree->nodes[n->left].expr.nout;
+        if(node==join) {
+            unsigned width=tree->nodes[n->left].expr.nout;
+            if(e->column<0 || (unsigned)e->column>=width+tree->nodes[n->right].expr.nout) return false;
+            if(((unsigned)e->column<width)!=build) return true;
+            /* An INNER equality key can be represented by either input.
+             * Outer NULL extension and parameterized indexes are excluded. */
+            if(n->kind==QP_JOIN && n->join_type==QP_INNER)
+                for(unsigned k=0;k<n->nkeys;++k)
+                    if(e->column==(build?n->left_keys[k]:(int)width+n->right_keys[k])) return true;
+            return false;
+        }
         if(n->left<0 || e->column<0) return false;
         int child=n->left,column=e->column;
         if((unsigned)column>=tree->nodes[child].expr.nout) {
@@ -176,11 +210,11 @@ static inline bool cost_probe_expression(const struct qp_plan *tree,int node,int
         }
         if(child<0 || (unsigned)column>=tree->nodes[child].expr.nout) return false;
         const struct qs_output *out=&tree->nodes[child].expr.outputs[column];
-        return !out->aggregate && cost_probe_expression(tree,child,out->index,join);
+        return !out->aggregate && cost_join_expression(tree,child,out->index,join,build);
     }
     if(e->op==Q_AGGREF || e->left<0) return false;
-    return cost_probe_expression(tree,node,e->left,join) &&
-        (e->right<0 || cost_probe_expression(tree,node,e->right,join)) &&
-        (e->otherwise<0 || cost_probe_expression(tree,node,e->otherwise,join));
+    return cost_join_expression(tree,node,e->left,join,build) &&
+        (e->right<0 || cost_join_expression(tree,node,e->right,join,build)) &&
+        (e->otherwise<0 || cost_join_expression(tree,node,e->otherwise,join,build));
 }
 #endif
