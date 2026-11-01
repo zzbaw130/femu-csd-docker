@@ -94,6 +94,8 @@ struct external_hash {
     struct spool build[HASH_PARTITIONS],probe[HASH_PARTITIONS];
     unsigned char *prefix;
     uint64_t prefix_rows,prefix_at,build_at,probe_at;
+    atomic_uint_fast64_t prefix_next;
+    int prefix_parallel,partition_attempted,probe_parallel,probe_parallel_saved;
     unsigned phase,partition,direct;
 };
 struct pending_projection {
@@ -233,7 +235,8 @@ struct operator_state {
     unsigned index_consume_position;
     unsigned char *hash_data;
     atomic_uint hash_rows;
-    unsigned hash_capacity,hash_match,hash_phase,hash_buckets;
+    unsigned hash_capacity,hash_match,hash_phase,hash_buckets,hash_cache_slots;
+    uint64_t *hash_cache;
     int hash_matched,hash_fallback,hash_shared,hash_null_right,hash_output_pending;
     unsigned hash_payload; /* Columns still borrowed from the probe vector. */
     struct hash_probe_batch *hash_probe;
@@ -306,6 +309,8 @@ struct execution {
     struct qs_profile profile;
     uint64_t local_profile_cpu, pipeline_start, pipeline_tick;
     unsigned group_source_profiling;
+    uint64_t wait_started,wait_ns[QP_WAITS],wait_calls[QP_WAITS],finished_ns;
+    unsigned wait_kind;
     uint64_t sink_ns,sink_rows;
     bool profiling, host_scan, scan_drained;
     struct femu_csd_args *args;
@@ -317,6 +322,9 @@ struct execution {
     unsigned parallel_node, root, used_workers;
     /* One-based parent receiving rows directly from parallel workers. */
     unsigned hash_sink,group_sink,aggregate_sink,group_combine;
+    unsigned partition_sink,partition_merged,partition_merge_row;
+    uint64_t partition_prefix_at,partition_prefix_end;
+    struct spool *partitions;
     bool group_shard,group_merge_full;
     atomic_uint_fast64_t next_offset;
     atomic_uint active_cus, peak_cus;
@@ -328,6 +336,29 @@ struct execution {
 };
 static uint64_t now_ns(clockid_t clock)
 { struct timespec t; clock_gettime(clock,&t); return (uint64_t)t.tv_sec*1000000000ULL+t.tv_nsec; }
+/* Observe waits at CSF boundaries, never per tuple. A completed input wait
+ * includes LOAD/queueing; dictionary BUSY includes the host retry policy. */
+static void wait_resume(struct execution *s)
+{
+    if(s->wait_started) {
+        s->wait_ns[s->wait_kind]+=now_ns(CLOCK_MONOTONIC)-s->wait_started;
+        s->wait_started=0;
+    }
+}
+static void wait_begin(struct execution *s,unsigned kind)
+{
+    if(s->profiling && s->worker) {
+        s->wait_kind=kind; ++s->wait_calls[kind]; s->wait_started=now_ns(CLOCK_MONOTONIC);
+    }
+}
+static void wait_io(struct execution *s,int64_t status)
+{
+    uint64_t operation=(uint64_t)status&~CS_IO_VALUE_MASK;
+    if(status==QS_DICTIONARY_BUSY) wait_begin(s,QP_WAIT_DICTIONARY);
+    else if(operation==CS_NEED_NVM_READ) wait_begin(s,QP_WAIT_NVM);
+    else if(operation==CS_NEED_STORE || operation==CS_NEED_LOAD || operation==CS_NEED_FREE)
+        wait_begin(s,QP_WAIT_SPILL);
+}
 static size_t input_offset(const struct execution *s,const struct qp_node *n)
 { return s->worker>1?n->parallel_input+(s->worker-2)*s->plan->parallel_stride:n->input_offset; }
 static size_t vector_offset(const struct execution *s,const struct qp_node *n)
@@ -765,6 +796,28 @@ static int64_t sort_init(struct execution *s,struct sorted_rows *sort,const stru
     sort->output=cs_work_calloc(s->context,1,sizeof(*sort->output));
     if(!sort->input || !sort->output) return -4;
     sort->plan.nout=input->nout; sort->plan.ordered_rows=2; sort->plan.limit=-1;
+    /* Like a bounded PG Sort / DuckDB TopN, retain limit+offset rows. Only
+     * a single direct consumer may supply the bound; shared/materialized
+     * sources and filters keep their complete sort. Merge-Join sorts are
+     * separate state objects and never enter this case. */
+    for(unsigned id=0;id<s->plan->count;++id) if(s->plan->nodes[id].kind==QP_SORT &&
+        &s->nodes[id].left_sort==sort && s->plan->nodes[id].expr.predicate<0) {
+        const struct qp_node *bound=NULL; unsigned references=s->plan->root==id;
+        for(unsigned p=0;p<s->plan->count;++p) {
+            const struct qp_node *parent=&s->plan->nodes[p];
+            if(parent->left==(int)id || parent->right==(int)id) {
+                ++references;
+                if(parent->kind==QP_LIMIT && parent->left==(int)id && parent->expr.predicate<0) bound=parent;
+            }
+        }
+        for(unsigned p=0;p<s->plan->nparams;++p) references+=s->plan->param_nodes[p]==(int)id;
+        for(unsigned p=0;p<s->plan->ninit;++p) references+=s->plan->init_nodes[p]==(int)id;
+        for(unsigned p=0;p<QP_PARAMS;++p) references+=s->plan->cte_nodes[p]==(int)id;
+        if(references==1 && bound && bound->expr.limit>=0 && bound->expr.offset>=0 &&
+           bound->expr.offset<=INT64_MAX-bound->expr.limit)
+            sort->plan.limit=bound->expr.limit+bound->expr.offset;
+        break;
+    }
     sort->plan.work_mem_bytes=s->sort_limit;
     /* The plan depth supplies a conservative fallback reserve, not a fixed
      * partition of all memory. Borrow from actual free query memory when
@@ -983,6 +1036,12 @@ static int hash_insert_exists(struct execution *s,const struct qp_node *n,struct
     const struct qs_plan *right,const struct qs_cell *row,uint64_t hash)
 {
     unsigned bytes=hash_row_bytes(right),column=n->right_keys[0];
+    uint64_t tag=0; unsigned cached=0;
+    if(o->hash_cache && !row[column].isnull && !row[column].scale && row[column].value>=INT64_MIN && row[column].value<=INT64_MAX) {
+        tag=(uint64_t)(int64_t)row[column].value+1;
+        cached=(hash>>32)&(o->hash_cache_slots-1);
+        if(tag && __atomic_load_n(&o->hash_cache[cached],__ATOMIC_ACQUIRE)==tag) return 1;
+    }
     unsigned type=right->exprs[right->outputs[column].index].type;
     uint32_t *next=(void *)(o->hash_data+(size_t)o->hash_capacity*bytes),*buckets=next+o->hash_capacity;
     unsigned bucket=hash&(o->hash_buckets-1);
@@ -990,13 +1049,17 @@ static int hash_insert_exists(struct execution *s,const struct qp_node *n,struct
         struct qs_cell other[QS_OUT]; hash_load(other,o->hash_data+(size_t)match*bytes,right);
         int equal=equal_cell(s,row[column],other[column],type);
         if(equal<0) return -5;
-        if(equal) return 1;
+        if(equal) {
+            if(tag) __atomic_store_n(&o->hash_cache[cached],tag,__ATOMIC_RELEASE);
+            return 1;
+        }
     }
     unsigned at; if(!hash_reserve_rows(o,1,&at)) return 0;
     hash_store(o->hash_data+(size_t)at*bytes,row,right);
     unsigned head=__atomic_load_n(&buckets[bucket],__ATOMIC_ACQUIRE);
     do { next[at]=head; }
     while(!__atomic_compare_exchange_n(&buckets[bucket],&head,at,1,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE));
+    if(tag) __atomic_store_n(&o->hash_cache[cached],tag,__ATOMIC_RELEASE);
     return 1;
 }
 static int hash_sink_batch(struct execution *s,struct qs_result *out)
@@ -1007,11 +1070,11 @@ static int hash_sink_batch(struct execution *s,struct qs_result *out)
     const struct qs_plan *right=&s->plan->nodes[n->right].expr;
     if(!o->hash_data || o->hash_fallback) return 0;
     unsigned at,count=0;
-    /* A fully reserved build already fits: batch reservation/linking avoids
-     * per-row atomic contention there. Elide duplicates in CUs when the
+    /* Without a key cache, a fully reserved build uses batch linking to avoid
+     * per-row atomic contention. Elide duplicates in CUs when the
      * estimated build exceeds its current capacity. Growth retains fallback
      * compaction if the row estimate was too small. */
-    if(hash_exists_only(n) && s->plan->nodes[n->right].estimated_rows>=o->hash_capacity) {
+    if(hash_exists_only(n) && (o->hash_cache || s->plan->nodes[n->right].estimated_rows>=o->hash_capacity)) {
         for(;count<out->rows;++count) {
             const struct qs_cell *row=(struct qs_cell *)out->data+(size_t)count*right->nout;
             int added=hash_insert_exists(s,n,o,right,row,row_hash(n,row,1));
@@ -1100,6 +1163,7 @@ static int64_t hash_build_impl(struct execution *s,unsigned id)
                 /* Preserve already-built projected rows. The fallback sorts
                  * this prefix plus the remaining child stream, never rereads
                  * or decodes the original heap for another build batch. */
+                cs_work_free(s->context,o->hash_cache); o->hash_cache=NULL;
                 size_t used=(size_t)o->hash_rows*row_bytes;
                 void *prefix=cs_work_realloc(s->context,o->hash_data,used);
                 unsigned char *retained=prefix?prefix:o->hash_data;
@@ -1123,6 +1187,7 @@ static int64_t hash_build_impl(struct execution *s,unsigned id)
             hash_link(n,o,right,o->right,at); ++s->metrics.build_rows; continue;
         }
         o->hash_phase=1;
+        cs_work_free(s->context,o->hash_cache); o->hash_cache=NULL;
     }
     return 0;
 }
@@ -1311,6 +1376,39 @@ static int64_t external_probe(struct execution *s,unsigned id,struct qs_cell *ro
     int64_t status=spool_row_bytes(s,input,e->probe_at,hash_row_bytes(p),packed); if(status) return status;
     hash_load(row,packed,p); ++e->probe_at; return 2;
 }
+/* A shared build can overflow after its CU wave has already started. At
+ * the existing idle growth barrier, switch that same wave to local partition
+ * sinks; leave already published packets for the coordinator to drain once. */
+static void partition_start(struct execution *s,unsigned id)
+{
+    if(s->worker || !s->parallel_started || s->control->parallel!=2 ||
+       s->parallel_node!=(unsigned)s->plan->nodes[id].right) return;
+    unsigned workers=s->plan->workers;
+    struct external_hash *external=s->nodes[id].external;
+    if(s->workers[0]->partition_sink || external->partition_attempted) return;
+    external->partition_attempted=1;
+    int active=0;
+    for(unsigned w=0;w<workers;++w) active|=!s->workers[w]->control->finished;
+    if(!active) return;
+    struct cs_work_context_stats memory;
+    size_t needed=(size_t)workers*HASH_PARTITIONS*(QS_SORT_IO_BYTES+sizeof(struct spool));
+    if(cs_work_get_context_stats(s->context,&memory) || needed>memory.limit_bytes-memory.used_bytes) return;
+    for(unsigned w=0;w<workers;++w) {
+        struct execution *e=s->workers[w];
+        if(e->hash_sink!=id+1 || (!e->control->finished &&
+           !(s->plan->nodes[e->root].kind==QP_AGGREGATE?e->nodes[e->root].source_projection:e->nodes[e->root].projection))) return;
+    }
+    for(unsigned w=0;w<workers;++w) {
+        struct execution *e=s->workers[w];
+        e->partitions=cs_work_calloc(e->context,HASH_PARTITIONS,sizeof(*e->partitions));
+        if(!e->partitions) {
+            for(unsigned j=0;j<w;++j) { cs_work_free(s->workers[j]->context,s->workers[j]->partitions); s->workers[j]->partitions=NULL; }
+            return;
+        }
+    }
+    atomic_init(&external->prefix_next,external->prefix_at); external->prefix_parallel=1;
+    for(unsigned w=0;w<workers;++w) { s->workers[w]->hash_sink=0; s->workers[w]->partition_sink=id+1; }
+}
 static int64_t external_build(struct execution *s,unsigned id)
 {
     const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
@@ -1322,7 +1420,22 @@ static int64_t external_build(struct execution *s,unsigned id)
     struct hash_key_layout keys; hash_key_layout(&keys,n,right,1);
     while(e->phase<2) {
         int build=e->phase==0;
-        if(build && !o->have_right && e->prefix_at<e->prefix_rows) {
+        /* A sequential probe input can use the same CU-local partition
+         * sink. Its ordinary scan buffers are already in this pipeline's
+         * layout; do not serialize the whole input through the owner. */
+        if(!build && s->plan->workers>1 && s->plan->nodes[n->left].kind==QP_SCAN &&
+           !s->plan->nodes[n->left].ordered_index) {
+            if(!e->probe_parallel) {
+                e->probe_parallel_saved=s->plan->nodes[n->left].parallel;
+                s->plan->nodes[n->left].parallel=1; e->probe_parallel=1;
+            }
+            int64_t status=parallel_next(s,n->left,NULL);
+            if(status) return status;
+            s->plan->nodes[n->left].parallel=e->probe_parallel_saved;
+            e->probe_parallel=0; ++e->phase; continue;
+        }
+        if(build) partition_start(s,id);
+        if(build && !e->prefix_parallel && !o->have_right && e->prefix_at<e->prefix_rows) {
             const unsigned char *row=e->prefix+(size_t)e->prefix_at*rb;
             int null; uint64_t hash=hash_packed(&keys,row,&null);
             if(!null) {
@@ -1333,12 +1446,17 @@ static int64_t external_build(struct execution *s,unsigned id)
         }
         if(!o->have_right) {
             int64_t status;
-            if(e->prefix) { cs_work_free(s->context,e->prefix); e->prefix=NULL; }
+            if(e->prefix && !e->prefix_parallel) { cs_work_free(s->context,e->prefix); e->prefix=NULL; }
+            if(build) partition_start(s,id);
             status=next_row(s,build?n->right:n->left,o->right);
             if(status==QP_WAIT || status<0 || status>2) return status;
             if(!status) {
                 ++e->phase;
                 if(build) {
+                    if(e->prefix_parallel) {
+                        cs_work_free(s->context,e->prefix); e->prefix=NULL;
+                        e->prefix_at=e->prefix_rows; e->prefix_parallel=0;
+                    }
                     /* The blocking child has now released its table. If all
                      * partitions fit, load them and Probe the original
                      * input in parallel without partitioning it first. Only
@@ -2536,7 +2654,7 @@ static int hash_sink_vectors(struct execution *s,unsigned id)
     const struct qs_plan *right=&s->plan->nodes[n->right].expr;
     if(!o->hash_data || o->hash_fallback) return 0;
     if(s->paged && materialize_outputs(s,b)) return -3;
-    if(hash_exists_only(n) && s->plan->nodes[n->right].estimated_rows>=o->hash_capacity) {
+    if(hash_exists_only(n) && (o->hash_cache || s->plan->nodes[n->right].estimated_rows>=o->hash_capacity)) {
         unsigned first=b->position;
         while(b->position<b->count) {
             struct qs_cell row[QS_OUT];
@@ -2584,6 +2702,91 @@ static int hash_sink_vectors(struct execution *s,unsigned id)
         next[at+r]=__atomic_exchange_n(&buckets[bucket],at+r,__ATOMIC_RELAXED);
     }
     b->position+=count; s->metrics.matched+=count; s->metrics.build_rows+=count;
+    return 0;
+}
+/* Retained packed rows are immutable until all producers finish. Claim
+ * small ranges once and preserve the cursor across STORE reentry. */
+static int64_t partition_sink_prefix(struct execution *s)
+{
+    unsigned id=s->partition_sink-1;
+    const struct qp_node *n=&s->plan->nodes[id];
+    struct external_hash *e=s->owner->nodes[id].external;
+    if(!e->prefix_parallel) return 0;
+    const struct qs_plan *right=&s->plan->nodes[n->right].expr;
+    unsigned bytes=hash_row_bytes(right); struct hash_key_layout keys;
+    hash_key_layout(&keys,n,right,1);
+    for(;;) {
+        if(s->partition_prefix_at>=s->partition_prefix_end) {
+            s->partition_prefix_at=atomic_fetch_add_explicit(&e->prefix_next,64,memory_order_relaxed);
+            if(s->partition_prefix_at>=e->prefix_rows) return 0;
+            s->partition_prefix_end=s->partition_prefix_at+64;
+            if(s->partition_prefix_end>e->prefix_rows) s->partition_prefix_end=e->prefix_rows;
+        }
+        const unsigned char *row=e->prefix+(size_t)s->partition_prefix_at*bytes;
+        int null; uint64_t hash=hash_packed(&keys,row,&null);
+        if(!null) {
+            int64_t status=spool_append_bytes(s,&s->partitions[(hash>>32)&(HASH_PARTITIONS-1)],row,bytes);
+            if(status) return status;
+        }
+        ++s->partition_prefix_at;
+    }
+}
+/* External Hash consumes unordered build rows. Each CU owns its partition
+ * tails and STORE continuation; no producer packet needs a host round trip. */
+static int64_t partition_sink_vectors(struct execution *s,struct projection_batch *b)
+{
+    const struct qp_node *n=&s->plan->nodes[s->partition_sink-1];
+    int build=!s->owner->nodes[s->partition_sink-1].external->phase;
+    const struct qs_plan *right=&s->plan->nodes[build?n->right:n->left].expr;
+    unsigned bytes=hash_row_bytes(right);
+    for(;b->position<b->count;++b->position) {
+        struct qs_cell row[QS_OUT]; int null=0;
+        for(unsigned col=0;col<right->nout;++col) {
+            int index=b->plan.outputs[col].index;
+            if(b->vectors[index].errors[b->position]) return -5;
+            row[col]=qs_vector_cell(&b->plan,b->vectors,index,b->position);
+        }
+        for(unsigned k=0;k<n->nkeys;++k) null|=row[build?n->right_keys[k]:n->left_keys[k]].isnull;
+        if(!null) {
+            uint64_t hash=row_hash(n,row,build); unsigned char packed[QS_OUT*19];
+            hash_store(packed,row,right);
+            int64_t status=spool_append_bytes(s,&s->partitions[(hash>>32)&(HASH_PARTITIONS-1)],packed,bytes);
+            if(status) return status;
+        }
+        if(build) ++s->metrics.build_rows;
+    }
+    return 0;
+}
+/* Full blocks can be adopted without reading them: order within a Hash
+ * partition is irrelevant. Only bounded partial tails need row copying. */
+static int64_t external_partition_combine(struct execution *s,struct execution *worker)
+{
+    unsigned id=worker->partition_sink-1;
+    struct external_hash *e=s->nodes[id].external;
+    unsigned bytes=hash_row_bytes(&s->plan->nodes[e->phase?s->plan->nodes[id].left:s->plan->nodes[id].right].expr);
+    unsigned block_rows=QS_SORT_IO_BYTES/bytes;
+    for(;worker->partition_merged<HASH_PARTITIONS;++worker->partition_merged) {
+        struct spool *from=&worker->partitions[worker->partition_merged],*to=e->phase?&e->probe[worker->partition_merged]:&e->build[worker->partition_merged];
+        if(from->blocks) {
+            unsigned count=to->blocks+from->blocks,capacity=to->capacity?to->capacity:8;
+            while(capacity<count) capacity*=2;
+            if(capacity>to->capacity) {
+                void *tokens=cs_work_realloc(s->context,to->tokens,(size_t)capacity*sizeof(*to->tokens));
+                if(!tokens) return -4;
+                to->tokens=tokens; to->capacity=capacity;
+            }
+            memcpy(to->tokens+to->blocks,from->tokens,(size_t)from->blocks*sizeof(*to->tokens));
+            to->blocks+=from->blocks; to->rows+=(uint64_t)from->blocks*block_rows;
+            from->blocks=0; /* Tokens now belong to the parent; never adopt twice. */
+        }
+        for(;worker->partition_merge_row<from->used;++worker->partition_merge_row) {
+            int64_t status=spool_append_bytes(s,to,from->tail+(size_t)worker->partition_merge_row*bytes,bytes);
+            if(status) return status;
+        }
+        worker->partition_merge_row=0;
+        cs_work_free(worker->context,from->tail); from->tail=NULL; from->used=0;
+        cs_work_free(worker->context,from->tokens); from->tokens=NULL;
+    }
     return 0;
 }
 /* Probe the bucket array as a batch, keeping column payloads borrowed until
@@ -4284,6 +4487,7 @@ static void parallel_group_combine(struct execution *s,unsigned id)
         e->group_combine=id+1; e->host_scan=false;
         e->nodes[id].group_local_slot=e->nodes[id].group_local_row=0; e->metrics=(struct qs_metrics){0};
         e->profile=(struct qs_profile){0}; e->local_profile_cpu=e->sink_ns=e->sink_rows=0;
+        memset(e->wait_ns,0,sizeof(e->wait_ns)); memset(e->wait_calls,0,sizeof(e->wait_calls)); e->wait_started=e->finished_ns=0;
         for(unsigned i=0;i<s->plan->count;++i) e->nodes[i].index_task.index_pages=e->nodes[i].index_task.index_tuples=0;
         *e->control=(struct qp_control){.state=(uintptr_t)e};
         memset(&s->outputs[w+1],0,sizeof(s->outputs[w+1]));
@@ -4379,7 +4583,7 @@ restart:
                 p->nodes[root].parallel=0; return row?next_row(s,root,row):3;
             }
         }
-        unsigned hash_sink=0,group_sink=0,aggregate_sink=0;
+        unsigned hash_sink=0,group_sink=0,aggregate_sink=0,partition_sink=0;
         for(unsigned i=0;i<p->count;++i) {
             const struct qp_node *parent=&p->nodes[i];
             if(parent->kind==QP_AGGREGATE && parent->left==(int)root &&
@@ -4394,6 +4598,11 @@ restart:
             if(p->nodes[i].kind==QP_JOIN && p->nodes[i].right==(int)root &&
                s->nodes[i].hash_data && !s->nodes[i].hash_phase && !s->nodes[i].hash_fallback)
                 hash_sink=i+1;
+        if(!hash_sink) for(unsigned i=0;i<p->count;++i)
+            if(p->nodes[i].kind==QP_JOIN && s->nodes[i].external &&
+               ((!s->nodes[i].external->phase && p->nodes[i].right==(int)root) ||
+                (s->nodes[i].external->phase==1 && p->nodes[i].left==(int)root)))
+                partition_sink=i+1;
         /* Build dependencies are now ready. Size the empty parent from PG's
          * output estimate, or the exact group count when preserved, instead
          * of stopping CU waves to grow the original 128-row table. DuckDB
@@ -4423,12 +4632,33 @@ restart:
                 }
             }
         }
+        if(hash_sink) {
+            const struct qp_node *join=&p->nodes[hash_sink-1];
+            struct operator_state *o=&s->nodes[hash_sink-1];
+            const struct qs_plan *right=&p->nodes[join->right].expr;
+            /* A cached complete integer key proves existence. Collisions or
+             * the reserved -1 tag still consult the exact Hash chain. This
+             * avoids random payload loads for duplicate build keys without
+             * assuming a dense key domain or a particular query. */
+            if(!o->hash_rows && !o->hash_cache && hash_exists_only(join) &&
+               right->exprs[right->outputs[join->right_keys[0]].index].type==Q_INTEGER) {
+                o->hash_cache_slots=o->hash_capacity/16;
+                if(o->hash_cache_slots<8) o->hash_cache_slots=8;
+                struct cs_work_context_stats memory;
+                size_t bytes=(size_t)o->hash_cache_slots*sizeof(*o->hash_cache);
+                size_t reserve=2*s->sort_limit+p->workers*(sizeof(*s)+p->count*sizeof(*s->nodes)+sizeof(struct qs_plan)+256);
+                if(!cs_work_get_context_stats(s->context,&memory) && memory.limit_bytes-memory.used_bytes>reserve &&
+                   bytes<=memory.limit_bytes-memory.used_bytes-reserve)
+                    o->hash_cache=cs_work_calloc(s->context,o->hash_cache_slots,sizeof(*o->hash_cache));
+            }
+        }
         for(unsigned w=0;w<p->workers;++w) {
             struct cs_work_context_stats stats;
             if(cs_work_get_context_stats(s->context,&stats)) return -4;
             const struct qp_node *leaf=&p->nodes[source];
             size_t private_bytes=sizeof(*s)+p->count*sizeof(*s->nodes)+sizeof(struct qs_plan)+256;
             if(leaf->ordered_index) private_bytes+=QS_INDEX_WORK_BYTES+sizeof(struct qs_plan);
+            if(partition_sink) private_bytes+=HASH_PARTITIONS*(QS_SORT_IO_BYTES+sizeof(struct spool));
             size_t spill_reserve=0;
             for(unsigned i=0;i<p->count;++i)
                 if(p->nodes[i].kind==QP_AGGREGATE && p->nodes[i].left==(int)root && s->nodes[i].group_capacity)
@@ -4450,6 +4680,11 @@ restart:
             }
             e->context=context; e->plan=p; e->owner=s; e->raw_projection=s->raw_projection; e->worker=w+1; e->root=root;
             e->hash_sink=hash_sink; e->group_sink=group_sink; e->aggregate_sink=aggregate_sink;
+            e->partition_sink=partition_sink;
+            if(partition_sink) {
+                e->partitions=cs_work_calloc(context,HASH_PARTITIONS,sizeof(*e->partitions));
+                if(!e->partitions) { cs_work_end(context); close_workers(s); return -4; }
+            }
             e->control=s->control+w+1; e->dictionary=s->dictionary; e->arena=s->arena;
             e->paged=s->paged; e->literal_ids=s->literal_ids; e->dictionary_ready=1;
             if(e->paged) {
@@ -4483,11 +4718,23 @@ restart:
             if(leaf->kind==QP_SCAN) *(struct qs_chunk *)(s->arena+vector_offset(e,leaf))=
                 (struct qs_chunk){.capacity=leaf->ordered_index?256:qp_scan_capacity(p,leaf),.ncols=leaf->expr.ncols};
         }
+        if(partition_sink) {
+            int supported=1,source=p->nodes[root].kind==QP_AGGREGATE;
+            for(unsigned w=0;w<p->workers;++w) {
+                struct execution *e=s->workers[w];
+                int status=projection_init(e,root,source); if(status<0) return status;
+                if(!(source?e->nodes[root].source_projection:e->nodes[root].projection)) supported=0;
+            }
+            if(!supported) {
+                partition_sink=0;
+                for(unsigned w=0;w<p->workers;++w) s->workers[w]->partition_sink=0;
+            }
+        }
         if(group_sink) parallel_group_begin(s,group_sink-1);
-        if(!hash_sink && !group_sink && !aggregate_sink) parallel_sort_begin(s,root);
+        if(!hash_sink && !group_sink && !aggregate_sink && !partition_sink) parallel_sort_begin(s,root);
         s->parallel_node=root; s->parallel_done=0;
         memset(s->parallel_position,0,sizeof(s->parallel_position)); atomic_store(&s->next_offset,0);
-        s->control->parallel=hash_sink || group_sink?2:1; ++s->control->epoch; s->control->available=s->control->drained=0;
+        s->control->parallel=hash_sink || group_sink || partition_sink?2:1; ++s->control->epoch; s->control->available=s->control->drained=0;
         s->control->scan_node=0;
         int scan=qp_probe_scan(p,root);
         bool scheduled=s->partition_join<0 && scan>=0 && !p->nodes[scan].ordered_index;
@@ -4521,13 +4768,25 @@ restart:
         s->parallel_combining=1;
         for(unsigned w=s->parallel_combine_worker;w<p->workers;++w,s->parallel_combine_worker=w) {
             const struct qs_result *v=&s->outputs[w+1];
+            if(s->workers[w]->partition_sink) {
+                int64_t status=external_partition_combine(s,s->workers[w]); if(status) return status;
+            }
             if(s->workers[w]->aggregate_sink) {
                 unsigned id=s->workers[w]->aggregate_sink-1;
                 int status=aggregate_combine(s,id,&s->workers[w]->nodes[id]); if(status) return status;
             }
             if(s->profiling) {
                 phase->worker_ns+=v->profile.operators[QS_JOIN_PROBE].cpu_ns;
+                uint64_t work=v->profile.operators[QS_JOIN_PROBE].cpu_ns;
+                phase->worker_wall_ns+=v->profile.operators[QS_JOIN_PROBE].wall_ns;
+                if(!phase->worker_cpu_min || work<phase->worker_cpu_min) phase->worker_cpu_min=work;
+                if(work>phase->worker_cpu_max) phase->worker_cpu_max=work;
+                if(s->workers[w]->finished_ns) phase->finished_idle_ns+=now_ns(CLOCK_MONOTONIC)-s->workers[w]->finished_ns;
                 phase->sink_ns+=s->workers[w]->sink_ns; phase->sink_rows+=s->workers[w]->sink_rows;
+                for(unsigned reason=0;reason<QP_WAITS;++reason) {
+                    phase->wait_ns[reason]+=s->workers[w]->wait_ns[reason];
+                    phase->wait_calls[reason]+=s->workers[w]->wait_calls[reason];
+                }
             }
             s->metrics.build_rows+=v->metrics.build_rows;
             s->metrics.scanned+=v->metrics.scanned; s->metrics.matched+=v->metrics.matched;
@@ -4606,6 +4865,7 @@ static void close_execution(struct execution *s)
  * Keep its row count private until the same batch can continue. */
 static int64_t dictionary_request(struct execution *s,struct qs_result *out,int64_t status)
 {
+    wait_io(s,status);
     if(status!=QS_DICTIONARY_BUSY) return status;
     s->buffered_rows=out->rows; s->buffered_finished=out->finished; s->buffered=1;
     out->rows=out->finished=0;
@@ -4872,6 +5132,7 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
     struct qp_control *control=(struct qp_control *)a->mr_addr[1]+worker;
     struct qs_result *out=(struct qs_result *)a->mr_addr[2]+worker;
     struct execution *s=(void *)(uintptr_t)control->state;
+    if(s) wait_resume(s);
     if(control->close) { if(s) close_execution(s); return 0; }
     if(!s) {
         if(worker) return -1;
@@ -5015,6 +5276,26 @@ produce:
     if(worker && s->sort_sink && s->pending_sort==s->sort_sink && !s->sort_sink->columns) goto produced;
     /* A spilled-partition Source retains its original row cursor. Resident
      * groups can now expose finalized columns without reopening their input. */
+    if(worker && s->partition_sink) {
+        uint64_t tick=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
+        status=partition_sink_prefix(s);
+        if(s->profiling) s->sink_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-tick;
+        if(status) goto produced;
+        unsigned id=s->root; int source=plan->nodes[id].kind==QP_AGGREGATE;
+        for(;;) {
+            status=projection_fill(s,id,source);
+            if(status!=2) {
+                if(!status) out->finished=control->finished=1;
+                goto produced;
+            }
+            struct projection_batch *b=source?s->nodes[id].source_projection:s->nodes[id].projection;
+            unsigned before=b->position;
+            uint64_t tick=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
+            status=partition_sink_vectors(s,b);
+            if(s->profiling) { s->sink_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-tick; s->sink_rows+=b->position-before; }
+            if(status) goto produced;
+        }
+    }
     if(worker && s->hash_sink && (s->source_node!=(int)s->root || plan->nodes[s->root].kind==QP_AGGREGATE)) {
         unsigned id=s->root; int source=plan->nodes[id].kind==QP_AGGREGATE;
         status=projection_init(s,id,source); if(status<0) goto produced;
@@ -5214,10 +5495,14 @@ combined:
     if(worker && status<=2) {
         uint64_t metadata=typed?QP_TYPED_OUTPUT|((uint64_t)control->output_rows<<5)|((uint64_t)control->output_strings<<22):0;
         if(typed && host_publish) qp_host_pack(out,&plan->nodes[plan->root].expr,control->output_strings);
+        if(s->profiling && out->finished && !s->finished_ns) s->finished_ns=now_ns(CLOCK_MONOTONIC);
+        if(s->host_scan && s->scan_drained && !out->finished) wait_begin(s,QP_WAIT_INPUT);
+        else if(!out->finished && control->output_rows) wait_begin(s,QP_WAIT_SINK);
         return metadata | (control->output_rows?QP_OUTPUT_READY:0) | (s->host_scan && s->scan_drained?QP_INPUT_DRAINED:0) |
             (out->finished?QP_WORKER_FINISHED:0) |
             (!control->ready && (control->bytes || control->index_nreads)?QP_CONTROL_REQUIRED:0);
     }
     if(out->finished && !worker) { s->closing=1; return finish_dictionary(s,a,out); }
+    wait_io(s,status);
     return status==QP_WAIT?0:status>2?status:0;
 }

@@ -1,6 +1,8 @@
+#define _GNU_SOURCE
 #include "dictionary.h"
 #include "cs_csf.h"
 #include <limits.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <string.h>
 
@@ -24,6 +26,9 @@ struct page_chunk { struct page_chunk *next; struct page pages[CHUNK_PAGES]; };
 struct file { struct page_chunk *chunks; unsigned count; };
 struct qs_dictionary {
     cs_work_context *context;
+    /* Serialize only the current resident call. The logical owner below
+     * survives I/O reentry; this mutex is always released before NEED_*. */
+    pthread_mutex_t resident;
     atomic_uintptr_t owner;
     struct file files[FILES];
     uint32_t capacity,count,body_page,body_used;
@@ -71,6 +76,11 @@ struct qs_dictionary *qs_dictionary_create(cs_work_context *parent)
     if(!context) return NULL;
     struct qs_dictionary *d=cs_work_calloc(context,1,sizeof(*d));
     if(!d) { cs_work_end(context); return NULL; }
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr,PTHREAD_MUTEX_ADAPTIVE_NP);
+    int error=pthread_mutex_init(&d->resident,&attr); pthread_mutexattr_destroy(&attr);
+    if(error) { cs_work_end(context); return NULL; }
     d->context=context; d->capacity=512;
     atomic_init(&d->owner,0);
     return d;
@@ -216,7 +226,7 @@ static void done(struct qs_dictionary *d,struct qs_dictionary_access *a)
     atomic_store_explicit(&d->owner,0,memory_order_release);
 }
 
-int64_t qs_dictionary_insert(struct qs_dictionary *d,struct qs_dictionary_access *a,
+static int64_t dictionary_insert(struct qs_dictionary *d,struct qs_dictionary_access *a,
     const char *key,unsigned length,uint32_t *id,void *io,uint64_t completion)
 {
     if(length>UINT16_MAX || (!key && length)) return -3;
@@ -312,7 +322,7 @@ int64_t qs_dictionary_insert(struct qs_dictionary *d,struct qs_dictionary_access
     }
 }
 
-int64_t qs_dictionary_pin(struct qs_dictionary *d,struct qs_dictionary_access *a,
+static int64_t dictionary_pin(struct qs_dictionary *d,struct qs_dictionary_access *a,
     uint32_t id,const char **bytes,unsigned *length,void *io,uint64_t completion)
 {
     int64_t rc=begin(d,a,PIN,io,completion);
@@ -343,7 +353,7 @@ void qs_dictionary_unpin(struct qs_dictionary_access *a)
     if(a->pinned) atomic_fetch_sub_explicit(&a->pinned->pins,1,memory_order_release);
     a->pinned=NULL;
 }
-int64_t qs_dictionary_evict(struct qs_dictionary *d,struct qs_dictionary_access *a,
+static int64_t dictionary_evict(struct qs_dictionary *d,struct qs_dictionary_access *a,
     void *io,uint64_t completion)
 {
     int64_t rc=begin(d,a,EVICT,io,completion);
@@ -368,7 +378,7 @@ void qs_dictionary_get_stats(struct qs_dictionary *d,struct qs_dictionary_stats 
 }
 int qs_dictionary_valid_id(const struct qs_dictionary *d,uint32_t id)
 { return id && id<=__atomic_load_n(&d->count,__ATOMIC_ACQUIRE); }
-int64_t qs_dictionary_close(struct qs_dictionary *d,struct qs_dictionary_access *a,
+static int64_t dictionary_close(struct qs_dictionary *d,struct qs_dictionary_access *a,
     void *io,uint64_t completion)
 {
     int64_t rc=begin(d,a,CLOSE,io,completion);
@@ -381,11 +391,43 @@ int64_t qs_dictionary_close(struct qs_dictionary *d,struct qs_dictionary_access 
                     done(d,a); return QS_DICTIONARY_BUSY;
                 }
     for(unsigned f=0;f<FILES;++f) { rc=discard_file(d,f); if(rc) return rc; }
-    cs_work_context *context=d->context;
-    return cs_work_end(context);
+    return 0;
+}
+/* Contention on a resident operation must not park an entire scan morsel
+ * until a host completion. A call that needs storage unlocks immediately;
+ * other callers then observe the logical owner and return BUSY as before. */
+int64_t qs_dictionary_insert(struct qs_dictionary *d,struct qs_dictionary_access *a,
+    const char *key,unsigned length,uint32_t *id,void *io,uint64_t completion)
+{
+    pthread_mutex_lock(&d->resident);
+    int64_t status=dictionary_insert(d,a,key,length,id,io,completion);
+    pthread_mutex_unlock(&d->resident); return status;
+}
+int64_t qs_dictionary_pin(struct qs_dictionary *d,struct qs_dictionary_access *a,
+    uint32_t id,const char **bytes,unsigned *length,void *io,uint64_t completion)
+{
+    pthread_mutex_lock(&d->resident);
+    int64_t status=dictionary_pin(d,a,id,bytes,length,io,completion);
+    pthread_mutex_unlock(&d->resident); return status;
+}
+int64_t qs_dictionary_evict(struct qs_dictionary *d,struct qs_dictionary_access *a,
+    void *io,uint64_t completion)
+{
+    pthread_mutex_lock(&d->resident);
+    int64_t status=dictionary_evict(d,a,io,completion);
+    pthread_mutex_unlock(&d->resident); return status;
+}
+int64_t qs_dictionary_close(struct qs_dictionary *d,struct qs_dictionary_access *a,
+    void *io,uint64_t completion)
+{
+    pthread_mutex_lock(&d->resident);
+    int64_t status=dictionary_close(d,a,io,completion);
+    pthread_mutex_unlock(&d->resident);
+    if(status) return status;
+    pthread_mutex_destroy(&d->resident); return cs_work_end(d->context);
 }
 void qs_dictionary_abort(struct qs_dictionary *d)
-{ cs_work_end(d->context); }
+{ pthread_mutex_destroy(&d->resident); cs_work_end(d->context); }
 
 struct qs_dictionary_text *qs_dictionary_text_create(struct qs_dictionary *d)
 {

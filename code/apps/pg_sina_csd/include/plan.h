@@ -46,10 +46,15 @@ struct qp_node {
 };
 /* Optional per-pipeline measurements; only the coordinator writes these.
  * CPU sums include all CSF slices, wall includes LOAD and scheduling waits. */
+enum qp_wait { QP_WAIT_DICTIONARY, QP_WAIT_NVM, QP_WAIT_SPILL, QP_WAIT_INPUT, QP_WAIT_SINK, QP_WAITS };
 struct qp_pipeline_profile {
     uint64_t wall_ns, coordinator_ns, worker_ns, rounds;
+    uint64_t worker_wall_ns,worker_cpu_min,worker_cpu_max,finished_idle_ns;
     /* Shared Hash/aggregate sink work is a subset of worker_ns. */
     uint64_t sink_ns,sink_rows;
+    /* Per-task suspension sums include scheduling until that task reenters.
+     * Tasks overlap: these are not additive query wall-clock stages. */
+    uint64_t wait_ns[QP_WAITS],wait_calls[QP_WAITS];
     /* Subintervals of coordinator Hash Build CPU, not additional time. */
     uint64_t hash_memory_ns,hash_reindex_ns,hash_reindexes,hash_reindexed_rows;
     uint64_t hash_moved_bytes;

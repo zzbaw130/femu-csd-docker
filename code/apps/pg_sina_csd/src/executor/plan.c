@@ -1192,6 +1192,7 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
         const struct qp_node *n=&s->plan->nodes[i];
         if(i) appendStringInfoString(&tree,"; ");
         appendStringInfo(&tree,"%u:%s",i,n->hash && n->kind==QP_AGGREGATE?"Hash Aggregate":n->kind==QP_JOIN && n->hash?"Hash Join":names[n->kind]);
+        if(n->kind==QP_AGGREGATE && n->nkeys) appendStringInfo(&tree,"[keys=%u]",n->nkeys);
         if(n->kind==QP_SCAN) appendStringInfo(&tree,"(%s%s)",get_rel_name(n->expr.relid),n->ordered_index?(n->ordered_index&4?", index only":n->ordered_index&2?", index ordered, heap read-ahead":", index ordered"):"");
         if(n->kind==QP_SORT) {
             appendStringInfoString(&tree,"[");
@@ -1252,6 +1253,17 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
                     (unsigned long long)p->rounds,p->wall_ns/1e6,p->coordinator_ns/1e6,p->worker_ns/1e6,
                     average,100*average/Max(1,s->device_cus),p->sink_ns/1e6,(unsigned long long)p->sink_rows);
                 ExplainPropertyText(label,value,es);
+                snprintf(label,sizeof(label),"CSD Pipeline %u task balance",i);
+                snprintf(value,sizeof(value),"csf_wall_sum=%.3f ms task_cpu_min=%.3f ms task_cpu_max=%.3f ms finished_idle_sum=%.3f ms",
+                    p->worker_wall_ns/1e6,p->worker_cpu_min/1e6,p->worker_cpu_max/1e6,p->finished_idle_ns/1e6);
+                ExplainPropertyText(label,value,es);
+                static const char *reasons[]={"dictionary_retry","internal_read","spill_io","next_input","sink_delivery"};
+                for(unsigned reason=0;reason<QP_WAITS;++reason) if(p->wait_calls[reason]) {
+                    snprintf(label,sizeof(label),"CSD Pipeline %u %s",i,reasons[reason]);
+                    snprintf(value,sizeof(value),"calls=%llu task_wait_sum=%.3f ms (includes requeue; concurrent tasks overlap)",
+                        (unsigned long long)p->wait_calls[reason],p->wait_ns[reason]/1e6);
+                    ExplainPropertyText(label,value,es);
+                }
             }
             ExplainPropertyFloat("CSD LOAD Preparation","ms",s->load_ns/1e6,3,es);
             ExplainPropertyInteger("CSD Host LOAD Requests",NULL,s->load_calls,es);

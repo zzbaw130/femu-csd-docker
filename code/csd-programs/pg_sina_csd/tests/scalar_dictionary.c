@@ -1001,8 +1001,87 @@ static void join_payload_resume(void)
     }
     puts("PASS 64 MiB vector/scalar Join payload resumes its selected pair after dictionary wait");
 }
+/* Hash-cache collisions, signed sentinels and failed insertion must never
+ * manufacture a successful existence match. Use the same bounded allocator. */
+static void existence_cache(void)
+{
+    const size_t limit=64U*1024*1024;
+    assert(!cs_work_init(limit));
+    cs_work_context *context=cs_work_begin_limit(limit); assert(context);
+    struct execution s={.context=context};
+    s.plan=calloc(1,sizeof(*s.plan)); assert(s.plan); s.plan->count=2;
+    s.nodes=cs_work_calloc(context,2,sizeof(*s.nodes)); assert(s.nodes);
+    struct qp_node *join=&s.plan->nodes[0];
+    *join=(struct qp_node){.kind=QP_JOIN,.hash=1,.right=1,.nkeys=1,.join_type=QP_ANTI,.join_qual=-1};
+    struct qs_plan *right=&s.plan->nodes[1].expr;
+    right->nout=right->nexprs=1; right->outputs[0].type_oid=20;
+    right->exprs[0].type=Q_INTEGER;
+    struct operator_state *o=&s.nodes[0]; o->hash_capacity=128; o->hash_cache_slots=8;
+    o->hash_data=cs_work_calloc(context,128,hash_row_bytes(right)+12); assert(o->hash_data);
+    o->hash_cache=cs_work_calloc(context,8,sizeof(*o->hash_cache)); assert(o->hash_cache);
+    hash_reindex(&s,0);
+    int64_t special[]={-1,INT64_MIN,INT64_MAX,0};
+    for(unsigned round=0;round<3;++round) for(unsigned k=0;k<68;++k) {
+        struct qs_cell row[1]={{.value=k<4?special[k]:(int64_t)k-36}};
+        unsigned previous=o->hash_rows;
+        assert(hash_insert_exists(&s,join,o,right,row,row_hash(join,row,1))==1);
+        if(round) assert(o->hash_rows==previous);
+    }
+    unsigned before=o->hash_rows;
+    struct qs_cell row[1]={{.value=99999999}};
+    o->hash_rows=o->hash_capacity-1;
+    assert(hash_insert_exists(&s,join,o,right,row,row_hash(join,row,1))==0);
+    o->hash_rows=before;
+    assert(hash_insert_exists(&s,join,o,right,row,row_hash(join,row,1))==1);
+    assert(o->hash_rows==before+1);
+    assert(hash_insert_exists(&s,join,o,right,row,row_hash(join,row,1))==1);
+    assert(o->hash_rows==before+1);
+    free(s.plan); assert(!cs_work_end(context));
+    struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
+}
+/* Exercise bound propagation through the real Sort CSF, including OFFSET,
+ * zero LIMIT, and a second consumer that requires the complete ordering. */
+static void topn_bound(void)
+{
+    const size_t limit=64U*1024*1024;
+    assert(!cs_work_init(limit));
+    for(unsigned shared=0;shared<2;++shared) for(unsigned top=0;top<6;top+=5) {
+        cs_work_context *ctx=cs_work_begin_limit(limit); assert(ctx);
+        struct execution *s=cs_work_calloc(ctx,1,sizeof(*s)); assert(s);
+        s->context=ctx; s->sort_limit=16U*1024*1024;
+        s->plan=calloc(1,sizeof(*s->plan)); assert(s->plan); s->plan->count=3;
+        s->nodes=cs_work_calloc(ctx,3,sizeof(*s->nodes)); assert(s->nodes);
+        s->io=io; s->io_bytes=sizeof(io);
+        struct qp_node *parent=&s->plan->nodes[0],*node=&s->plan->nodes[1];
+        *parent=(struct qp_node){.kind=QP_LIMIT,.left=1,.right=-1};
+        parent->expr.predicate=-1; parent->expr.limit=top; parent->expr.offset=top?3:0;
+        *node=(struct qp_node){.kind=QP_SORT,.left=2,.right=-1}; node->expr.predicate=-1;
+        if(shared) s->plan->cte_nodes[0]=1;
+        struct qs_plan input={.nout=1}; input.outputs[0].type_oid=20;
+        struct sorted_rows *sort=&s->nodes[1].left_sort;
+        struct qs_order order={.output=0,.descending=1};
+        assert(!sort_init(s,sort,&input,1,NULL,&order));
+        assert(sort->plan.limit==(shared?-1:(int64_t)top+parent->expr.offset));
+        for(unsigned row=0;row<1001;++row) {
+            sort->input->rows=1; sort->input->data[0].cells[0]=(struct qs_cell){.value=row};
+            assert(!sort_call(s,sort,0));
+        }
+        sort->group.count=1; sort->group.states[0]=sort->task.state;
+        unsigned count=0;
+        do {
+            assert(!sort_call(s,sort,1));
+            for(unsigned row=0;row<sort->output->rows;++row)
+                assert(sort->output->data[row].cells[0].value==1000-count++);
+        } while(!sort->output->finished);
+        assert(count==(shared?1001:top+(top?3:0)));
+        free(s->plan); assert(!cs_work_end(ctx));
+    }
+    struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
+}
 int main(int argc,char **argv)
 {
+    if(argc==2 && !strcmp(argv[1],"--topn-bound-64m")) { topn_bound(); return 0; }
+    if(argc==2 && !strcmp(argv[1],"--existence-cache-64m")) { existence_cache(); return 0; }
     if(argc==2 && !strcmp(argv[1],"--join-payload-64m")) { join_payload_resume(); return 0; }
     assert(argc==1 || (argc==2 && (!strcmp(argv[1],"--aggregate") || !strcmp(argv[1],"--hash-aggregate") || !strcmp(argv[1],"--join") || !strcmp(argv[1],"--pipeline"))));
     int aggregates=argc==2 && !strcmp(argv[1],"--aggregate"),hashed=argc==2 && !strcmp(argv[1],"--hash-aggregate");

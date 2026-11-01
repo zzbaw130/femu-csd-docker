@@ -156,9 +156,8 @@ static void *worker_insert(void *arg)
     }
     return NULL;
 }
-static void concurrent_insert(void)
+static void concurrent_insert(size_t limit)
 {
-    size_t limit=256U*1024;
     cs_work_context *parent=cs_work_begin_limit(limit); assert(parent);
     struct qs_dictionary *d=qs_dictionary_create(parent); assert(d);
     struct storage s={.mutex=PTHREAD_MUTEX_INITIALIZER};
@@ -171,7 +170,8 @@ static void concurrent_insert(void)
     for(unsigned i=0;i<4;++i) assert(!pthread_join(threads[i],NULL));
     for(unsigned i=0;i<3000;++i)
         for(unsigned w=1;w<4;++w) assert(workers[w].ids[i]==workers[0].ids[i]);
-    assert(s.stores && s.loads);
+    if(limit<64U*1024*1024) assert(s.stores && s.loads);
+    else assert(!s.stores && !s.loads);
     check_budget(parent,limit); close_dictionary(d,&workers[0].access,&s);
     assert(!cs_work_end(parent)); storage_end(&s);
 }
@@ -532,6 +532,8 @@ static void short_text_cache(void)
     const char *bytes; unsigned length;
     int64_t status=qs_dictionary_pin(d,a.state,pending,&bytes,&length,a.io,0);
     assert(((uint64_t)status&~CS_IO_VALUE_MASK)==CS_NEED_LOAD);
+    struct qs_dictionary_access *peer=qs_dictionary_access_create(d); assert(peer);
+    assert(qs_dictionary_pin(d,peer,pending,&bytes,&length,a.io,0)==QS_DICTIONARY_BUSY);
     for(unsigned i=0;i<150;++i) {
         unsigned n=snprintf(key,sizeof(key),"kind-%03u",i);
         assert(!qs_dictionary_text_get(text,ids[i],&bytes,&length,a.io));
@@ -549,6 +551,10 @@ static void short_text_cache(void)
 int main(int argc,char **argv)
 {
     assert(!cs_work_init(64U*1024*1024));
+    if(argc==2 && !strcmp(argv[1],"--resident-concurrent-64m")) {
+        concurrent_insert(64U*1024*1024);
+        return 0;
+    }
     if(argc==2 && !strcmp(argv[1],"--short-text-cache-64m")) {
         short_text_cache();
         cs_work_stats stats; assert(!cs_work_get_stats(&stats));
@@ -558,7 +564,7 @@ int main(int argc,char **argv)
     assert(argc==1);
     paging(10000,800,4U*1024*1024);
     paging(20000,17,384U*1024);
-    concurrent_insert(); cancel_pending(CS_NEED_STORE); cancel_pending(CS_NEED_LOAD); heap_scan(); vector_expressions();
+    concurrent_insert(256U*1024); cancel_pending(CS_NEED_STORE); cancel_pending(CS_NEED_LOAD); heap_scan(); vector_expressions();
     retained_location(); short_text_references(); text_cancel(CS_NEED_STORE); text_cancel(CS_NEED_LOAD);
     cs_work_stats stats; assert(!cs_work_get_stats(&stats));
     assert(!stats.used_bytes && !stats.active_contexts && !stats.active_allocations);
