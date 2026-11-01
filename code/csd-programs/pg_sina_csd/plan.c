@@ -305,6 +305,7 @@ struct execution {
     struct qs_metrics metrics;
     struct qs_profile profile;
     uint64_t local_profile_cpu, pipeline_start, pipeline_tick;
+    unsigned group_source_profiling;
     uint64_t sink_ns,sink_rows;
     bool profiling, host_scan, scan_drained;
     struct femu_csd_args *args;
@@ -880,6 +881,32 @@ static uint64_t row_hash(const struct qp_node *n,const struct qs_cell *row,int r
     for(unsigned i=0;i<n->nkeys;++i) hash=hash_key(hash,row[right?n->right_keys[i]:n->left_keys[i]]);
     return hash;
 }
+struct hash_key_layout { unsigned count,offsets[QS_KEYS],widths[QS_KEYS]; };
+static void hash_key_layout(struct hash_key_layout *layout,const struct qp_node *n,const struct qs_plan *p,int right)
+{
+    layout->count=n->nkeys;
+    for(unsigned k=0;k<n->nkeys;++k) {
+        unsigned col=right?n->right_keys[k]:n->left_keys[k],offset=0;
+        for(unsigned c=0;c<col;++c) { unsigned bytes=hash_value_bytes(p,c); offset+=bytes+(bytes<16?1:3); }
+        layout->offsets[k]=offset; layout->widths[k]=hash_value_bytes(p,col);
+    }
+}
+/* Packed payloads need no cell conversion while partitioning/reindexing.
+ * Decode only join keys, retaining the same numeric scale normalization. */
+static uint64_t hash_packed(const struct hash_key_layout *layout,const unsigned char *row,int *null)
+{
+    uint64_t hash=UINT64_C(0x9e3779b97f4a7c15); *null=0;
+    for(unsigned k=0;k<layout->count;++k) {
+        const unsigned char *from=row+layout->offsets[k]; unsigned bytes=layout->widths[k];
+        struct qs_cell value={0};
+        if(bytes==4) { int32_t v; memcpy(&v,from,4); value.value=v; }
+        else if(bytes==8) { int64_t v; memcpy(&v,from,8); value.value=v; }
+        else { memcpy(&value.value,from,16); value.scale=from[16]; }
+        value.isnull=from[bytes+(bytes==16?2:0)]; *null|=value.isnull;
+        hash=hash_key(hash,value);
+    }
+    return hash;
+}
 /* Row storage and bucket links have one writer per appended row. Bucket heads
  * are published atomically while the build CU tasks run; probing starts only
  * after all build tasks have completed. Reallocation happens at a wave barrier. */
@@ -917,30 +944,13 @@ static void hash_reindex(struct execution *s,unsigned id)
     uint32_t *next=(void *)(o->hash_data+(size_t)o->hash_capacity*rb);
     o->hash_buckets=2*o->hash_capacity;
     memset(next+o->hash_capacity,0xff,(size_t)o->hash_buckets*sizeof(uint32_t));
-    unsigned offsets[QS_KEYS],widths[QS_KEYS];
-    for(unsigned k=0;k<n->nkeys;++k) {
-        unsigned col=n->right_keys[k],offset=0;
-        for(unsigned c=0;c<col;++c) {
-            unsigned bytes=hash_value_bytes(right,c); offset+=bytes+(bytes<16?1:3);
-        }
-        offsets[k]=offset; widths[k]=hash_value_bytes(right,col);
-    }
+    struct hash_key_layout keys; hash_key_layout(&keys,n,right,1);
     uint32_t *buckets=next+o->hash_capacity;
     /* Initial setup and growth run before CUs start or after their wave
      * barrier. Only this owner writes buckets here; concurrent Sink inserts
      * retain hash_link()'s atomic publication. Decode keys, not payloads. */
     for(unsigned at=0;at<o->hash_rows;++at) {
-        const unsigned char *row=o->hash_data+(size_t)at*rb;
-        uint64_t hash=0x9e3779b97f4a7c15ULL;
-        for(unsigned k=0;k<n->nkeys;++k) {
-            const unsigned char *from=row+offsets[k]; unsigned bytes=widths[k];
-            struct qs_cell value={0};
-            if(bytes==4) { int32_t v; memcpy(&v,from,4); value.value=v; }
-            else if(bytes==8) { int64_t v; memcpy(&v,from,8); value.value=v; }
-            else { memcpy(&value.value,from,16); value.scale=from[16]; }
-            value.isnull=from[bytes+(bytes==16?2:0)];
-            hash=hash_key(hash,value);
-        }
+        int null; uint64_t hash=hash_packed(&keys,o->hash_data+(size_t)at*rb,&null);
         unsigned bucket=hash&(o->hash_buckets-1);
         next[at]=buckets[bucket]; buckets[bucket]=at;
     }
@@ -963,24 +973,64 @@ static unsigned hash_reserve_rows(struct operator_state *o,unsigned rows,unsigne
         memory_order_relaxed,memory_order_relaxed));
     return count;
 }
-static void hash_sink_batch(struct execution *s,struct qs_result *out)
+static int hash_exists_only(const struct qp_node *n)
+{ return (n->join_type==QP_SEMI || n->join_type==QP_ANTI) && n->join_qual<0 && n->nkeys==1; }
+/* Like DuckDB's duplicate-eliding equality build, reject an existing key in
+ * the producing CU instead of compacting millions of rows at a growth barrier.
+ * Concurrent first insertions may retain duplicates, which are harmless for
+ * SEMI/ANTI. Publish the initialized payload and next link together via CAS. */
+static int hash_insert_exists(struct execution *s,const struct qp_node *n,struct operator_state *o,
+    const struct qs_plan *right,const struct qs_cell *row,uint64_t hash)
+{
+    unsigned bytes=hash_row_bytes(right),column=n->right_keys[0];
+    unsigned type=right->exprs[right->outputs[column].index].type;
+    uint32_t *next=(void *)(o->hash_data+(size_t)o->hash_capacity*bytes),*buckets=next+o->hash_capacity;
+    unsigned bucket=hash&(o->hash_buckets-1);
+    for(unsigned match=__atomic_load_n(&buckets[bucket],__ATOMIC_ACQUIRE);match!=UINT_MAX;match=next[match]) {
+        struct qs_cell other[QS_OUT]; hash_load(other,o->hash_data+(size_t)match*bytes,right);
+        int equal=equal_cell(s,row[column],other[column],type);
+        if(equal<0) return -5;
+        if(equal) return 1;
+    }
+    unsigned at; if(!hash_reserve_rows(o,1,&at)) return 0;
+    hash_store(o->hash_data+(size_t)at*bytes,row,right);
+    unsigned head=__atomic_load_n(&buckets[bucket],__ATOMIC_ACQUIRE);
+    do { next[at]=head; }
+    while(!__atomic_compare_exchange_n(&buckets[bucket],&head,at,1,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE));
+    return 1;
+}
+static int hash_sink_batch(struct execution *s,struct qs_result *out)
 {
     unsigned id=s->hash_sink-1;
     const struct qp_node *n=&s->plan->nodes[id];
     struct operator_state *o=&s->owner->nodes[id];
     const struct qs_plan *right=&s->plan->nodes[n->right].expr;
-    if(!o->hash_data || o->hash_fallback) return;
-    unsigned at,count=hash_reserve_rows(o,out->rows,&at);
-    if(!count) return;
-    unsigned rb=hash_row_bytes(right);
-    for(unsigned i=0;i<count;++i) {
-        const struct qs_cell *row=(struct qs_cell *)out->data+(size_t)i*right->nout;
-        hash_store(o->hash_data+(size_t)(at+i)*rb,row,right);
-        hash_link(n,o,right,row,at+i);
+    if(!o->hash_data || o->hash_fallback) return 0;
+    unsigned at,count=0;
+    /* A fully reserved build already fits: batch reservation/linking avoids
+     * per-row atomic contention there. Elide duplicates in CUs when the
+     * estimated build exceeds its current capacity. Growth retains fallback
+     * compaction if the row estimate was too small. */
+    if(hash_exists_only(n) && s->plan->nodes[n->right].estimated_rows>=o->hash_capacity) {
+        for(;count<out->rows;++count) {
+            const struct qs_cell *row=(struct qs_cell *)out->data+(size_t)count*right->nout;
+            int added=hash_insert_exists(s,n,o,right,row,row_hash(n,row,1));
+            if(added<0) return added;
+            if(!added) break;
+        }
+    } else {
+        count=hash_reserve_rows(o,out->rows,&at);
+        unsigned rb=hash_row_bytes(right);
+        for(unsigned i=0;i<count;++i) {
+            const struct qs_cell *row=(struct qs_cell *)out->data+(size_t)i*right->nout;
+            hash_store(o->hash_data+(size_t)(at+i)*rb,row,right);
+            hash_link(n,o,right,row,at+i);
+        }
     }
     s->metrics.build_rows+=count; out->rows-=count;
     memmove(out->data,(struct qs_cell *)out->data+(size_t)count*right->nout,
         (size_t)out->rows*right->nout*sizeof(struct qs_cell));
+    return 0;
 }
 /* Pure equality SEMI/ANTI needs existence, not duplicate build rows. Like
  * DuckDB's duplicate-key elimination, retain one representative per key.
@@ -989,7 +1039,7 @@ static void hash_sink_batch(struct execution *s,struct qs_result *out)
 static int hash_compact_exists(struct execution *s,unsigned id)
 {
     const struct qp_node *n=&s->plan->nodes[id];
-    if((n->join_type!=QP_SEMI && n->join_type!=QP_ANTI) || n->join_qual>=0 || n->nkeys!=1) return 0;
+    if(!hash_exists_only(n)) return 0;
     struct operator_state *o=&s->nodes[id];
     const struct qs_plan *right=&s->plan->nodes[n->right].expr;
     unsigned bytes=hash_row_bytes(right),column=n->right_keys[0];
@@ -1269,16 +1319,22 @@ static int64_t external_build(struct execution *s,unsigned id)
     const struct qs_plan *right=&s->plan->nodes[n->right].expr,*left=&s->plan->nodes[n->left].expr;
     unsigned rb=hash_row_bytes(right),lb=hash_row_bytes(left);
     unsigned char packed[QS_OUT*19];
+    struct hash_key_layout keys; hash_key_layout(&keys,n,right,1);
     while(e->phase<2) {
         int build=e->phase==0;
+        if(build && !o->have_right && e->prefix_at<e->prefix_rows) {
+            const unsigned char *row=e->prefix+(size_t)e->prefix_at*rb;
+            int null; uint64_t hash=hash_packed(&keys,row,&null);
+            if(!null) {
+                int64_t status=spool_append_bytes(s,&e->build[(hash>>32)&(HASH_PARTITIONS-1)],row,rb);
+                if(status) return status;
+            }
+            ++e->prefix_at; continue;
+        }
         if(!o->have_right) {
             int64_t status;
-            if(build && e->prefix_at<e->prefix_rows) {
-                hash_load(o->right,e->prefix+(size_t)e->prefix_at++*rb,right); status=2;
-            } else {
-                if(e->prefix) { cs_work_free(s->context,e->prefix); e->prefix=NULL; }
-                status=next_row(s,build?n->right:n->left,o->right);
-            }
+            if(e->prefix) { cs_work_free(s->context,e->prefix); e->prefix=NULL; }
+            status=next_row(s,build?n->right:n->left,o->right);
             if(status==QP_WAIT || status<0 || status>2) return status;
             if(!status) {
                 ++e->phase;
@@ -1358,8 +1414,8 @@ static int64_t external_build(struct execution *s,unsigned id)
     uint32_t *next=(void *)(o->hash_data+(size_t)o->hash_capacity*rb),*buckets=next+o->hash_capacity;
     memset(buckets,0xff,(size_t)o->hash_buckets*sizeof(*buckets));
     for(unsigned i=0;i<o->hash_rows;++i) {
-        hash_load(o->right,o->hash_data+(size_t)i*rb,right);
-        unsigned bucket=row_hash(n,o->right,1)&(o->hash_buckets-1);
+        int null;
+        unsigned bucket=hash_packed(&keys,o->hash_data+(size_t)i*rb,&null)&(o->hash_buckets-1);
         next[i]=buckets[bucket]; buckets[bucket]=i;
     }
     e->phase=3; o->hash_phase=1;
@@ -2480,6 +2536,23 @@ static int hash_sink_vectors(struct execution *s,unsigned id)
     const struct qs_plan *right=&s->plan->nodes[n->right].expr;
     if(!o->hash_data || o->hash_fallback) return 0;
     if(s->paged && materialize_outputs(s,b)) return -3;
+    if(hash_exists_only(n) && s->plan->nodes[n->right].estimated_rows>=o->hash_capacity) {
+        unsigned first=b->position;
+        while(b->position<b->count) {
+            struct qs_cell row[QS_OUT];
+            for(unsigned col=0;col<right->nout;++col) {
+                int index=b->plan.outputs[col].index;
+                if(b->vectors[index].errors[b->position]) return -5;
+                row[col]=qs_vector_cell(&b->plan,b->vectors,index,b->position);
+            }
+            int added=hash_insert_exists(s,n,o,right,row,row_hash(n,row,1));
+            if(added<0) return added;
+            if(!added) break;
+            ++b->position;
+        }
+        s->metrics.matched+=b->position-first; s->metrics.build_rows+=b->position-first;
+        return 0;
+    }
     unsigned at,count=hash_reserve_rows(o,b->count-b->position,&at);
     if(!count) return 0;
     uint64_t hashes[QS_VECTOR_ROWS];
@@ -2817,8 +2890,6 @@ static int group_result(struct execution *s,const struct qp_node *n,const struct
     const struct qs_cell *keys,struct qs_cell *row,int raw)
 {
     struct qs_cell input[QS_COLS],values[QS_AGGS];
-    for(unsigned i=0;i<QS_COLS;++i) input[i]=(struct qs_cell){.isnull=1};
-    for(unsigned k=0;k<n->nkeys;++k) input[n->left_keys[k]]=keys[k];
     for(unsigned a=0;a<n->expr.naggs;++a) {
         int status=group_final_value(&n->expr.aggs[a],&groups[a],&values[a]); if(status) return status;
     }
@@ -2826,6 +2897,8 @@ static int group_result(struct execution *s,const struct qp_node *n,const struct
         memcpy(row,keys,n->nkeys*sizeof(*row));
         memcpy(row+n->nkeys,values,n->expr.naggs*sizeof(*row)); return 2;
     }
+    for(unsigned i=0;i<QS_COLS;++i) input[i]=(struct qs_cell){.isnull=1};
+    for(unsigned k=0;k<n->nkeys;++k) input[n->left_keys[k]]=keys[k];
     int status=project(s,n,input,values,row);
     return status<0?status:status?2:0;
 }
@@ -2844,7 +2917,7 @@ static const struct compact_group *group_source_next(struct execution *s,unsigne
 /* Separate Source columns from the aggregate's input vectors. Read-only CU
  * Sources claim records; serial/stream/spilled Sources advance their original
  * group iterator. Retain partial batches while its I/O request is serviced. */
-static int64_t projection_group_fill(struct execution *s,struct projection_batch *b)
+static int64_t projection_group_fill_impl(struct execution *s,struct projection_batch *b)
 {
     const struct qp_node *n=&s->plan->nodes[b->scan];
     if(b->error) { s->control->error=b->error; s->control->error_node=b->error_node; return b->error; }
@@ -2886,6 +2959,20 @@ static int64_t projection_group_fill(struct execution *s,struct projection_batch
         .parameters=s->params,.nparameters=QP_PARAMS,.inset=inset_vectors,.set_state=s};
     if(projection_execute(b,NULL,NULL,0,input)) return -5;
     return 2;
+}
+static int64_t projection_group_fill(struct execution *s,struct projection_batch *b)
+{
+    if(!s->profiling || s->worker || !s->plan->nodes[b->scan].hash)
+        return projection_group_fill_impl(s,b);
+    /* Count external Source/expressions per vector, not per output group.
+     * Millions of CLOCK_THREAD_CPUTIME_ID calls otherwise serialize profiling
+     * itself. Nested Sink/Sort CPU remains excluded by blocking_end(). */
+    struct blocking_timer timer=blocking_begin(s);
+    ++s->group_source_profiling;
+    int64_t status=projection_group_fill_impl(s,b);
+    --s->group_source_profiling;
+    blocking_end(s,QS_AGG_SOURCE,timer);
+    return status;
 }
 /* Published keys stay immutable throughout a CU wave. The bounded shared
  * table also accepts rows that do not fit a CU-local table. Only the owner
@@ -3493,7 +3580,9 @@ static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct q
 static int64_t hash_aggregate_next(struct execution *s,unsigned id,struct qs_cell *row,int raw)
 {
     /* Pure in-memory output is one call per group: leave it untimed. */
-    if(!s->profiling || s->nodes[id].group_phase==3) return hash_aggregate_next_impl(s,id,row,0,raw);
+    if(!s->profiling || s->nodes[id].group_phase==3 ||
+       (s->group_source_profiling && s->nodes[id].group_phase==2))
+        return hash_aggregate_next_impl(s,id,row,0,raw);
     unsigned op=s->nodes[id].group_phase==2?QS_AGG_SOURCE:QS_AGG_SINK;
     struct blocking_timer timer=blocking_begin(s);
     int64_t status=hash_aggregate_next_impl(s,id,row,0,raw); blocking_end(s,op,timer); return status;
@@ -5064,7 +5153,7 @@ produced:
     if(worker && (s->hash_sink || s->group_sink || s->aggregate_sink) && status>=0 && status<=2) {
         uint64_t cpu=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
         unsigned rows=out->rows;
-        if(s->hash_sink) hash_sink_batch(s,out);
+        if(s->hash_sink) { int added=hash_sink_batch(s,out); if(added<0) status=added; }
         if(s->group_sink) { int added=group_sink_batch(s,out); if(added<0) status=added; }
         if(s->aggregate_sink) { int added=aggregate_sink_batch(s,out); if(added<0) status=added; }
         if(s->profiling) { s->sink_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-cpu; s->sink_rows+=rows-out->rows; }

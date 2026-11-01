@@ -260,17 +260,22 @@ static inline void qp_parallel_boundaries(struct qp_plan *p,int id)
      * is driven by its left input and must not become a full parallel scan. */
     if(n->kind==QP_JOIN) qp_parallel_boundaries(p,n->right);
 }
-/* Index misses suspend a task while retaining its input. Keep a second
- * task per physical CU ready to run during that I/O. These are independent
+/* Index misses and Hash probes with dictionary/I/O waits retain their input.
+ * Keep a second task per physical CU ready during those waits. These are independent
  * execution contexts, not extra compute threads. The caller must still fit
  * their buffers in FDM and may reduce this count when capacity is limited. */
 static inline unsigned qp_task_slots(const struct qp_plan *p,unsigned cus)
 {
     unsigned slots=cus<QS_WORKERS?cus:QS_WORKERS;
     if(!slots) slots=1;
+    int grouped=0;
+    for(unsigned i=0;i<p->count;++i) grouped|=p->nodes[i].kind==QP_AGGREGATE && p->nodes[i].nkeys;
+    int scalar=p->nodes[p->root].kind==QP_AGGREGATE && !grouped;
     for(unsigned i=0;i<p->count;++i) if(p->nodes[i].parallel)
         for(int id=i;id>=0;id=p->nodes[id].left) {
-            if(p->nodes[id].kind==QP_INDEX_JOIN)
+            /* Extra tasks hide I/O in scalar probes; grouped states need
+             * that memory themselves, so retain their existing task count. */
+            if(p->nodes[id].kind==QP_INDEX_JOIN || (scalar && p->nodes[id].kind==QP_JOIN && p->nodes[id].hash))
                 return slots>QS_WORKERS/2?QS_WORKERS:2*slots;
             if(id==qp_pipeline_source(p,i)) break;
         }

@@ -502,9 +502,60 @@ static void text_cancel(uint64_t operation)
     assert(!remaining.used_bytes && !remaining.allocations);
     storage_end(&s); assert(!cs_work_end(parent));
 }
-int main(void)
+/* A CU's copied categorical values must remain readable while another
+ * access owns a real paging request. Keep the full device budget at 64MiB. */
+static void short_text_cache(void)
+{
+    const size_t limit=64U*1024*1024;
+    cs_work_context *parent=cs_work_begin_limit(limit); assert(parent);
+    struct qs_dictionary *d=qs_dictionary_create(parent); assert(d);
+    struct access a={.state=qs_dictionary_access_create(d)}; assert(a.state);
+    struct qs_dictionary_text *text=qs_dictionary_text_create(d); assert(text);
+    struct storage s={.mutex=PTHREAD_MUTEX_INITIALIZER};
+    uint32_t ids[150]; char key[32];
+    for(unsigned i=0;i<150;++i) {
+        unsigned n=snprintf(key,sizeof(key),"kind-%03u",i);
+        ids[i]=insert(d,&a,&s,key,n);
+        const char *bytes; unsigned length;
+        assert(!qs_dictionary_text_get(text,ids[i],&bytes,&length,a.io));
+        assert(length==n && !memcmp(bytes,key,n));
+        assert(!qs_dictionary_text_release(text));
+    }
+    uint32_t pending=insert(d,&a,&s,"pending",7);
+    uint64_t completion=0;
+    for(;;) {
+        int64_t status=qs_dictionary_evict(d,a.state,a.io,completion);
+        if(status==-4) break;
+        assert(status>=0 && status!=QS_DICTIONARY_BUSY);
+        completion=status?complete(&s,status,a.io):0;
+    }
+    const char *bytes; unsigned length;
+    int64_t status=qs_dictionary_pin(d,a.state,pending,&bytes,&length,a.io,0);
+    assert(((uint64_t)status&~CS_IO_VALUE_MASK)==CS_NEED_LOAD);
+    for(unsigned i=0;i<150;++i) {
+        unsigned n=snprintf(key,sizeof(key),"kind-%03u",i);
+        assert(!qs_dictionary_text_get(text,ids[i],&bytes,&length,a.io));
+        assert(length==n && !memcmp(bytes,key,n));
+        assert(!qs_dictionary_text_release(text));
+    }
+    while(status) {
+        assert(status>QS_DICTIONARY_BUSY); completion=complete(&s,status,a.io);
+        status=qs_dictionary_pin(d,a.state,pending,&bytes,&length,a.io,completion);
+    }
+    assert(length==7 && !memcmp(bytes,"pending",7)); qs_dictionary_unpin(a.state);
+    check_budget(parent,limit); close_dictionary(d,&a,&s);
+    assert(!cs_work_end(parent)); storage_end(&s);
+}
+int main(int argc,char **argv)
 {
     assert(!cs_work_init(64U*1024*1024));
+    if(argc==2 && !strcmp(argv[1],"--short-text-cache-64m")) {
+        short_text_cache();
+        cs_work_stats stats; assert(!cs_work_get_stats(&stats));
+        assert(!stats.used_bytes && !stats.active_contexts && !stats.active_allocations);
+        return 0;
+    }
+    assert(argc==1);
     paging(10000,800,4U*1024*1024);
     paging(20000,17,384U*1024);
     concurrent_insert(); cancel_pending(CS_NEED_STORE); cancel_pending(CS_NEED_LOAD); heap_scan(); vector_expressions();

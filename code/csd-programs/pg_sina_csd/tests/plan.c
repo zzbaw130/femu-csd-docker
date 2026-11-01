@@ -14,7 +14,7 @@
 #include <endian.h>
 #include <sched.h>
 typedef int64_t (*function)(struct femu_csd_args *);
-enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_INDEX_PIPELINE,TEST_INDEX_HASH,TEST_INDEX_CHAIN,TEST_INDEX_EXPR,TEST_DEVICE_IO,TEST_PACKED_KEYS,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL, TEST_VECTOR_AGG=-1,TEST_JOIN_QUAL=-2,TEST_GROUP_SOURCE=-3,TEST_GROUP_SOURCE_SPILL=-4,TEST_BUILD_GROUP_SOURCE=-5,TEST_BUILD_GROUP_HAVING=-6,TEST_BUILD_GROUP_DIRECT=-7 };
+enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_INDEX_PIPELINE,TEST_INDEX_HASH,TEST_INDEX_CHAIN,TEST_INDEX_EXPR,TEST_DEVICE_IO,TEST_PACKED_KEYS,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL,TEST_PARTITION_PACKED, TEST_VECTOR_AGG=-1,TEST_JOIN_QUAL=-2,TEST_GROUP_SOURCE=-3,TEST_GROUP_SOURCE_SPILL=-4,TEST_BUILD_GROUP_SOURCE=-5,TEST_BUILD_GROUP_HAVING=-6,TEST_BUILD_GROUP_DIRECT=-7 };
 static unsigned test_workers=4;
 static bool test_scheduled;
 static unsigned test_packed;
@@ -561,6 +561,8 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     }
     struct qp_node *j=&plan->nodes[1]; j->kind=QP_JOIN; j->left=2; j->right=3; j->join_type=join; j->join_qual=-1;
     j->hash=hash==1;
+    if(parallel==TEST_BUILD_PHASE && (join==QP_SEMI || join==QP_ANTI))
+        plan->nodes[3].estimated_rows=right_rows;
     if(parallel==TEST_WIDE_HASH && hash!=2) {
         /* Fuse a second projection over a genuine int128 scan expression.
          * It must keep the wide payload and numeric display scale. */
@@ -592,7 +594,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     for(unsigned i=0;i<4;++i) j->expr.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER,.column=i};
     for(unsigned i=0;i<3;++i) j->expr.outputs[i]=(struct qs_output){.index=i==2?3:(int)i,.type_oid=23};
     if(join==QP_SEMI || join==QP_ANTI) j->expr.outputs[2].index=1;
-    if(parallel==TEST_PACKED_KEYS) {
+    if(parallel==TEST_PACKED_KEYS || parallel==TEST_PARTITION_PACKED) {
         /* Rebuild three equivalent keys at distinct packed offsets/widths:
          * numeric scale 2, int64, int32. Payload columns are not key columns. */
         struct qs_plan *right=&plan->nodes[3].expr; right->nexprs=5; right->nout=4;
@@ -827,7 +829,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     }
     void *mr[]={plan,&control,out,arena,io}; long long len[]={plan_bytes,(plan->workers+1)*sizeof(*controls),(plan->workers+1)*sizeof(*out),bytes,(plan->workers+1)*QS_SORT_IO_BYTES};
     struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=len};
-    args.cparam1=parallel==TEST_PACKED_KEYS || parallel==TEST_PARALLEL || parallel==TEST_BUILD_PHASE || parallel==TEST_HASH_GROUP || parallel==TEST_PARTITION || parallel==TEST_PARTITION_SKEW || grouped_build || wide_build;
+    args.cparam1=parallel==TEST_PACKED_KEYS || parallel==TEST_PARALLEL || parallel==TEST_BUILD_PHASE || parallel==TEST_HASH_GROUP || parallel==TEST_GROUP_SOURCE_SPILL || parallel==TEST_PARTITION || parallel==TEST_PARTITION_SKEW || parallel==TEST_PARTITION_PACKED || grouped_build || wide_build;
     struct test_spill spill={.mutex=PTHREAD_MUTEX_INITIALIZER}; unsigned got=0; unsigned char seen[12]={0};
     uint64_t counts[12]={0},sums[12]={0},mins[12]={0},maxs[12]={0};
     uint64_t source_sums[12]={0},source_counts[12]={0};
@@ -948,7 +950,12 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     if(hash==2 && memory==4 && parallel==TEST_SERIAL) assert(spill.count); /* page-ready flag survives spill reentry */
     if(parallel==TEST_DEVICE_IO && memory==4) assert(spill.count); /* namespace and spill reentry share one CU I/O AFDM */
     if(parallel==TEST_JOIN_QUAL && right_rows==150000) assert(spill.count);
-    if(parallel==TEST_GROUP_SOURCE_SPILL) assert(spill.count && !plan->nodes[1].parallel);
+    if(parallel==TEST_GROUP_SOURCE_SPILL) {
+        assert(spill.count && !plan->nodes[1].parallel);
+        /* Source profiling must stay batched even with millions of groups. */
+        assert(out->profile.operators[QS_AGG_SOURCE].calls &&
+               out->profile.operators[QS_AGG_SOURCE].calls<rows/8);
+    }
     if(test_workers>4 && parallel) assert(out->metrics.workers==test_workers && control.epoch);
     if((parallel==TEST_GROUP_SOURCE || parallel==TEST_INDEX_EXPR) && !rows) assert(!got); else assert(got);
     if(parallel!=TEST_COUNT_ROWS && !grouped_build && parallel<TEST_PARTITION)
@@ -2393,7 +2400,10 @@ int main(int argc,char **argv)
             test_scheduled=scheduled; test_workers=4;
             for(unsigned join=QP_SEMI;join<=QP_ANTI;++join) {
                 fprintf(stderr,"existence join: scheduled=%u kind=%u\n",scheduled,join);
-                test(run,join,31,2000003,64,1,TEST_BUILD_PHASE);
+                test(run,join,31,3000003,64,1,TEST_BUILD_PHASE);
+                /* Concurrent duplicate rejection must also survive bucket
+                 * collisions and table growth across multiple CU waves. */
+                test(run,join,20003,50003,64,1,TEST_BUILD_PHASE);
                 test(run,join,31,5003,64,1,TEST_JOIN_QUAL);
                 if(join==QP_ANTI) test(run,join,31,0,64,1,TEST_SERIAL);
             }
@@ -2408,6 +2418,16 @@ int main(int argc,char **argv)
         multiple_groups(run,64,Q_SUM,0,test_workers);
         multiple_group_aggregates(run,64,Q_AVG,1,test_workers,GROUP_COUNTS);
         multiple_groups(run,64,Q_COUNT,0,test_workers);
+        test(run,QP_INNER,1200003,23,64,2,TEST_GROUP_SOURCE_SPILL);
+        return 0;
+    }
+    if(argc==3 && !strcmp(argv[2],"--external-hash-64m")) {
+        assert(!cs_work_init(64U*1024*1024));
+        function run=(function)dlsym(library,"pg_sina_plan"); assert(run);
+        test_workers=4; test_scheduled=true;
+        test(run,QP_INNER,31,3000003,64,1,TEST_PARTITION);
+        test(run,QP_INNER,31,3000003,64,1,TEST_PARTITION_PACKED);
+        test(run,QP_INNER,31,3000003,64,1,TEST_PARTITION_SERIAL);
         return 0;
     }
     if(argc==3 && !strcmp(argv[2],"--sort-payload-64m")) {

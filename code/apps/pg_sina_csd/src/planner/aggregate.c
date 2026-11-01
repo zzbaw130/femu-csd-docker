@@ -601,6 +601,9 @@ static Plan *fast_plan(PlannerInfo *root,Plan *native,struct qs_plan **propertie
        ((Scan *)leaf)->scanrelid!=rti) return NULL;
     struct qs_plan plan={0};
     if(!compile(root,list_make1_int(rti),NIL,NIL,&plan)) return NULL;
+    /* Ungrouped states already combine per CU in the general fused pipeline.
+     * Avoid three separately scheduled CSFs per input block for this shape. */
+    if(!plan.nkeys) return NULL;
     plan.external_aggregate=plan.nkeys!=0;
     Oid ns=get_namespace_oid("sina_csd",true);
     if(!OidIsValid(ns) || !OidIsValid(get_relname_relid("relations",ns))) return NULL;

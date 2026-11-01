@@ -55,6 +55,8 @@ struct qs_dictionary_text {
     struct qs_dictionary *dictionary;
     struct text_intern (*interned)[4];
     unsigned intern_next;
+    struct text_intern (*resolved)[4];
+    unsigned resolved_next;
     struct text_reference references[2];
     struct qs_dictionary_access writer;
     const char *key;
@@ -405,6 +407,15 @@ int64_t qs_dictionary_text_resume(struct qs_dictionary_text *t,void *io,uint64_t
             if(r->length<=sizeof(r->copy)) {
                 if(r->length) memcpy(r->copy,r->bytes,r->length);
                 qs_dictionary_unpin(&r->access); r->bytes=r->copy; r->copied=1;
+                /* Repeated categorical expressions need no shared dictionary
+                 * operation once this CU owns a short immutable byte copy. */
+                if(!t->resolved) t->resolved=cs_work_calloc(t->dictionary->context,64,sizeof(*t->resolved));
+                if(t->resolved) {
+                    struct text_intern *bucket=t->resolved[r->id%64],*entry=&bucket[t->resolved_next++%4];
+                    for(unsigned j=0;j<4;++j) if(!bucket[j].id || bucket[j].id==r->id) { entry=&bucket[j]; break; }
+                    entry->id=r->id; entry->length=r->length;
+                    if(r->length) memcpy(entry->bytes,r->copy,r->length);
+                }
             }
             r->ready=1;
         }
@@ -429,6 +440,15 @@ int64_t qs_dictionary_text_get(struct qs_dictionary_text *t,uint32_t id,
     }
     for(unsigned i=0;i<2;++i) if(!t->references[i].ready) {
         struct text_reference *r=&t->references[i];
+        if(t->resolved) for(unsigned j=0;j<4;++j) {
+            const struct text_intern *entry=&t->resolved[id%64][j];
+            if(entry->id!=id) continue;
+            /* Preserve the existing two-reference lifetime: the returned
+             * pointer must not change if a memo bucket is replaced later. */
+            r->id=id; r->length=entry->length; r->ready=r->copied=1;
+            if(r->length) memcpy(r->copy,entry->bytes,r->length);
+            r->bytes=r->copy; *bytes=r->bytes; *length=r->length; return 0;
+        }
         r->id=id; t->pending=i+1;
         int64_t status=qs_dictionary_text_resume(t,io,0);
         if(!status) { *bytes=r->bytes; *length=r->length; }

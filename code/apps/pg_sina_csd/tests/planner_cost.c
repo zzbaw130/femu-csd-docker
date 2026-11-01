@@ -198,6 +198,14 @@ int main(void)
     CHECK(qp_task_slots(&scan,64)==QS_WORKERS);
     scan.nodes[1].parallel=0;
     CHECK(qp_task_slots(&scan,4)==4); /* A serial index branch changes nothing. */
+    /* Hide scalar probe waits without multiplying grouped-state workspaces. */
+    scan.nodes[0].kind=QP_AGGREGATE;
+    scan.nodes[1].kind=QP_JOIN; scan.nodes[1].hash=scan.nodes[1].parallel=1;
+    CHECK(qp_task_slots(&scan,4)==8);
+    scan.nodes[0].nkeys=1;
+    CHECK(qp_task_slots(&scan,4)==4);
+    scan.nodes[0].nkeys=0; scan.nodes[3].kind=QP_AGGREGATE; scan.nodes[3].nkeys=1;
+    CHECK(qp_task_slots(&scan,4)==4); /* Inner grouping also retains its budget. */
     /* Only supported >=64MiB conditions. More workmem reduces spill, and a
      * dataset larger than all memory still requires external merge. */
     double mib=1024*1024;
