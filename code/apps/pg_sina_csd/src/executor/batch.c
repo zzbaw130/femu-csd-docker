@@ -187,7 +187,9 @@ void pg_sina_init_device(void)
     }
     free(cus); free(fdm);
     if(status!=CS_SUCCESS) { close_connection(0,0); elog(ERROR,"CSD connection initialization failed: status=%d",status); }
-    on_proc_exit(close_connection,0);
+    /* Program indices belong to MyBackendId. Unload before PG makes that ID
+     * reusable; on_proc_exit runs after CleanupInvalidationState releases it. */
+    on_shmem_exit(close_connection,0);
     if(pg_sina_profile) ereport(NOTICE,(errmsg("SQLerate connection init total_ms=%.3f programs=%u cus=%u fdm_bytes=%llu workmem_bytes=%llu",
         (clock_ns()-started)/1e6,(unsigned)lengthof(connection_programs),pg_sina_resources.cus,
         (unsigned long long)pg_sina_resources.fdm_bytes,(unsigned long long)pg_sina_resources.workmem_bytes)));
