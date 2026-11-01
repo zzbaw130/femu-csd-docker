@@ -107,6 +107,39 @@ static pg_noinline void index_cpu_cost(IndexPath *path,PlannerInfo *root)
     PG_END_TRY();
     seq_page_cost=saved_seq; random_page_cost=saved_random;
 }
+/* ExecQual stops at the first failed conjunct. Keep PG's security/cost
+ * ordering and estimate prefix survival with its existing selectivity code;
+ * do not charge every later conjunct to every Heap tuple. */
+static double host_qual_discount(PlannerInfo *root,Path *path)
+{
+    List *clauses=path->parent->baserestrictinfo;
+    unsigned count=list_length(clauses);
+    if(path->param_info || count<2) return 0;
+    struct qual_price { RestrictInfo *clause; double cost; Index security; };
+    struct qual_price *items=palloc(count*sizeof(*items));
+    unsigned at=0; ListCell *c;
+    foreach(c,clauses) {
+        RestrictInfo *r=lfirst(c); QualCost cost;
+        cost_qual_eval_node(&cost,(Node *)r,root);
+        struct qual_price item={r,cost.per_tuple,
+            r->leakproof && cost.per_tuple<10*cpu_operator_cost?0:r->security_level};
+        unsigned i=at++;
+        while(i && (item.security<items[i-1].security ||
+              (item.security==items[i-1].security && item.cost<items[i-1].cost))) {
+            items[i]=items[i-1]; --i;
+        }
+        items[i]=item;
+    }
+    List *prefix=NIL; double survival=1,saved=0;
+    for(unsigned i=0;i<count;++i) {
+        saved+=items[i].cost*(1-survival);
+        prefix=lappend(prefix,items[i].clause);
+        survival=clauselist_selectivity(root,prefix,path->parent->relid,JOIN_INNER,NULL);
+    }
+    list_free(prefix); pfree(items);
+    double divisor=path->parallel_workers+(parallel_leader_participation?Max(0,1-0.3*path->parallel_workers):0);
+    return saved*path->parent->tuples/Max(1,divisor);
+}
 void pg_sina_cost_host_path(PlannerInfo *root,Path *path,Oid oid,List **observations,bool apply)
 {
     if(path->pathtype!=T_SeqScan && !IsA(path,IndexPath)) return;
@@ -117,7 +150,11 @@ void pg_sina_cost_host_path(PlannerInfo *root,Path *path,Oid oid,List **observat
     double before=path->total_cost,heap_io=0,index_io=0,descent=0,seq,random,index_random=0;
     Oid indexid=InvalidOid;
     get_tablespace_page_costs(path->parent->reltablespace,&random,&seq);
-    if(path->pathtype==T_SeqScan) heap_io=Min(before-path->startup_cost,path->parent->pages*seq);
+    double qual_discount=0;
+    if(path->pathtype==T_SeqScan) {
+        heap_io=Min(before-path->startup_cost,path->parent->pages*seq);
+        qual_discount=host_qual_discount(root,path);
+    }
     else {
         IndexPath *original=(IndexPath *)path;
         if(original->indexinfo->relam!=BTREE_AM_OID) return;
@@ -141,7 +178,7 @@ void pg_sina_cost_host_path(PlannerInfo *root,Path *path,Oid oid,List **observat
             (original->indexinfo->tree_height+1)*index->shared);
     }
     double startup=Max(0,path->startup_cost-descent);
-    double after=Max(startup,before-heap_io-index_io-descent+
+    double after=Max(startup,before-heap_io-index_io-descent-qual_discount+
         cached_io(heap_io,path->pathtype==T_SeqScan?seq:random,heap)+
         (index?cached_io(index_io,index_random,index):0));
     if(apply) {
@@ -152,10 +189,51 @@ void pg_sina_cost_host_path(PlannerInfo *root,Path *path,Oid oid,List **observat
     {
         struct host_scan_cost *scan=MemoryContextAlloc(pg_sina_search_context(),sizeof(*scan));
         *scan=(struct host_scan_cost){.type=path->pathtype,.index=indexid,.rows=path->rows,.before=before,.after=after,.startup_after=startup,
-            .cpu=Max(0,before-heap_io-index_io-descent-startup),.workers=path->parallel_workers};
+            .cpu=Max(0,before-heap_io-index_io-descent-qual_discount-startup),.workers=path->parallel_workers};
         MemoryContext previous=MemoryContextSwitchTo(pg_sina_search_context());
         heap->scans=lappend(heap->scans,scan); MemoryContextSwitchTo(previous);
     }
+}
+/* A parameterized index is originally priced using its required base rels,
+ * before intervening joins filter the probes. Reprice for this outer Path.
+ * For a pure FK lookup, use PG's join fanout for CPU visits: the index's
+ * sampled NDV may disagree with PG's matched-FK join estimate. */
+Path *pg_sina_reprice_index_join(PlannerInfo *root,NestPath *native,JoinPathExtraData *extra,List **observations)
+{
+    if(!IsA(native->innerjoinpath,IndexPath)) return &native->path;
+    IndexPath *original=(IndexPath *)native->innerjoinpath;
+    if(!original->path.param_info || original->indexinfo->relam!=BTREE_AM_OID) return &native->path;
+    IndexPath *inner=palloc(sizeof(*inner)); *inner=*original;
+    Path *outer=native->outerjoinpath;
+    double divisor=native->path.parallel_workers+
+        (parallel_leader_participation?Max(0,1-0.3*native->path.parallel_workers):0);
+    cost_index(inner,root,Max(1,outer->rows*Max(1,divisor)),false);
+    IndexPath cpu=*inner; index_cpu_cost(&cpu,root);
+    Oid oid=rt_fetch(inner->path.parent->relid,root->parse->rtable)->relid;
+    pg_sina_cost_host_path(root,&inner->path,oid,observations,true);
+    if(native->jointype==JOIN_INNER && !native->joinrestrictinfo &&
+       list_length(inner->indexclauses)==1 && !inner->path.parent->baserestrictinfo &&
+       ((IndexClause *)linitial(inner->indexclauses))->indexcol==0 &&
+       !((IndexClause *)linitial(inner->indexclauses))->lossy) {
+        ListCell *c; foreach(c,root->fkey_list) {
+            ForeignKeyOptInfo *fk=lfirst(c);
+            if(fk->nkeys!=1 || fk->con_relid!=inner->path.parent->relid ||
+               !bms_is_member(fk->ref_relid,outer->parent->relids) ||
+               inner->indexinfo->indexkeys[0]!=fk->conkey[0] ||
+               fk->nmatched_ec+fk->nmatched_rcols!=1) continue;
+            double visits=Min(inner->path.rows,Max(1,native->path.rows/Max(1,outer->rows)));
+            double run=Max(0,cpu.path.total_cost-cpu.path.startup_cost);
+            inner->path.total_cost=Max(inner->path.startup_cost,
+                inner->path.total_cost-run*(1-visits/Max(1,inner->path.rows)));
+            inner->path.rows=visits;
+            break;
+        }
+    }
+    NestPath *out=palloc(sizeof(*out)); *out=*native; out->innerjoinpath=&inner->path;
+    JoinCostWorkspace workspace;
+    initial_cost_nestloop(root,&workspace,out->jointype,outer,&inner->path,extra);
+    final_cost_nestloop(root,out,&workspace,extra);
+    return &out->path;
 }
 /* Preserve PG's own SEMI/ANTI early-stop and rescan pricing. Discounting one
  * full inner scan per outer row would subtract work PG never charged. */
@@ -266,7 +344,7 @@ static double host_parallel_cost(Plan *plan,List *rtable,List **observations,int
         }
     }
     if(workers && left>0 && !gather) {
-        double ratio=Max(1,left/host_parallel_divisor(workers));
+        double ratio=left/host_parallel_divisor(workers);
         extra+=local*(ratio-1);
     }
     if(IsA(plan,CustomScan)) {
@@ -815,7 +893,16 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
                 unsigned op=n->expr.exprs[j].op;
                 operations+=op!=Q_COLUMN && op!=Q_CONST && op!=QP_PARAMETER;
             }
-            work=(input*(cpu_tuple_cost+cpu_operator_cost*operations)+rows*cpu_tuple_cost)*unit;
+            /* Heap walking/materialization is scalar. A direct PG scan
+             * retains native values and visits only the requested prefix;
+             * internal values also need the full cell materialization budget.
+             * PG output packs a row header plus each requested field. */
+            unsigned prefix=1;
+            for(unsigned col=0;col<n->expr.nattrs;++col)
+                if(n->expr.cols[col].slot>=0) prefix=col+1;
+            double decode=direct?(double)prefix/Max(1,n->expr.nattrs):1;
+            work=input*(cpu_tuple_cost*decode*pg_sina_host_cost_ms+cpu_operator_cost*operations*unit)+
+                rows*(direct?(cpu_tuple_cost+cpu_operator_cost*n->expr.nout)*pg_sina_host_cost_ms:cpu_tuple_cost*unit);
             double before=p->parallel+p->serial;
             parallel_cpu(p,work,tasks[i],cus);
             if(direct) overlap+=cost_scan_overlap(read_ms,p->parallel+p->serial-before,tasks[i],cus);

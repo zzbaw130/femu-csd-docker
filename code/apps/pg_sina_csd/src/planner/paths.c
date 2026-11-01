@@ -408,6 +408,15 @@ void pg_sina_join_paths(PlannerInfo *root,RelOptInfo *joinrel,RelOptInfo *outerr
         if((IsA(p,HashPath) || IsA(p,MergePath) || IsA(p,NestPath)) &&
            ((JoinPath *)p)->outerjoinpath->parent==outerrel &&
            ((JoinPath *)p)->innerjoinpath->parent==innerrel) {
+            if(IsA(p,NestPath)) {
+                Path *priced=pg_sina_reprice_index_join(root,(NestPath *)p,extra,&pg_sina_path_search->observations);
+                if(priced!=p) {
+                    joinrel->pathlist=list_delete_ptr(joinrel->pathlist,p);
+                    joinrel->partial_pathlist=list_delete_ptr(joinrel->partial_pathlist,p);
+                    relation_paths(root,joinrel)->pending=lappend(relation_paths(root,joinrel)->pending,priced);
+                    p=priced;
+                }
+            }
             add_scan_join_paths(root,joinrel,(JoinPath *)p);
             add_device_path(root,joinrel,p,false);
         }

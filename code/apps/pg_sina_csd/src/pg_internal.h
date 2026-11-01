@@ -128,6 +128,7 @@ Plan *pg_sina_cost_device(PlannerInfo *,Plan *,bool,List **,double *,double *);
 List *pg_sina_selected_costs(PlannerInfo *,Plan *,bool,bool,Node *);
 void pg_sina_cost_host_path(PlannerInfo *,Path *,Oid,List **,bool);
 void pg_sina_cost_host_lookup(PlannerInfo *,Path *,JoinPathExtraData *,List **);
+Path *pg_sina_reprice_index_join(PlannerInfo *,NestPath *,JoinPathExtraData *,List **);
 double pg_sina_host_scan_cost(Plan *,Oid,double,List **);
 double pg_sina_host_statement_cost(PlannedStmt *);
 double pg_sina_host_parallel_cost(PlannedStmt *);

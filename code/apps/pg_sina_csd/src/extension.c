@@ -80,7 +80,9 @@ static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,Param
             plan->planTree->total_cost=candidate/pg_sina_host_cost_ms;
             double original_cost=original_device?original_device->planTree->total_cost*pg_sina_host_cost_ms:DBL_MAX;
             if(original_device && original_cost<=candidate) plan=original_device;
-            if(host_cost<Min(candidate,original_cost)) plan=host;
+            /* Match PG pathnode.c's 1% cost fuzz: a nearly tied candidate
+             * does not justify replacing PG's original physical plan. */
+            if(host_cost<=Min(candidate,original_cost)*1.01) plan=host;
             if(IsA(plan->planTree,CustomScan) && ((CustomScan *)plan->planTree)->methods==&pg_sina_adaptive_methods) {
                 List *info=((CustomScan *)plan->planTree)->custom_private;
                 const char *original=original_device?psprintf("%.3fms",original_cost):"unsupported";
