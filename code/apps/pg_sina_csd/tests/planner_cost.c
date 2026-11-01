@@ -43,6 +43,13 @@ int main(void)
     CHECK(cost_hash_row(&row)==33);
     CHECK(cost_hash_state(128,33)==128*45);
     CHECK(cost_hash_state(129,33)==256*45);
+    /* A repeated-key existence build fits after compaction; unique or
+     * unknown keys still need the general external path. Limits >=64MiB. */
+    double existence_full=cost_hash_state(8000000,33);
+    CHECK(cost_hash_existence_state(8000000,131072,33,64*1024*1024)<64*1024*1024);
+    CHECK(cost_hash_existence_state(8000000,0,33,64*1024*1024)==existence_full);
+    CHECK(cost_hash_existence_state(8000000,8000000,33,64*1024*1024)==existence_full);
+    CHECK(cost_hash_existence_state(1000,10,33,64*1024*1024)==cost_hash_state(1000,33));
     struct qp_node group={.nkeys=1}; group.expr.naggs=1;
     group.expr.exprs[0].type=Q_INTEGER; group.expr.keys[0]=0;
     CHECK(cost_group_stride(&group)==64);
@@ -194,12 +201,13 @@ int main(void)
     /* Only supported >=64MiB conditions. More workmem reduces spill, and a
      * dataset larger than all memory still requires external merge. */
     double mib=1024*1024;
+    CHECK(cost_sort_workspace()>5*mib && cost_sort_workspace()<8*mib);
     struct cost_sort small=cost_sort_state(1000,32,64*mib);
     struct cost_sort low=cost_sort_state(8*mib,32,64*mib);
     struct cost_sort high=cost_sort_state(8*mib,32,256*mib);
     CHECK(small.spill==0);
     CHECK(low.spill>high.spill);
-    CHECK(low.fan>=2 && low.fan<=32);
+    CHECK(low.fan>32 && high.fan>low.fan);
     CHECK(low.comparisons>0 && low.merge>0);
     CHECK(low.state==high.state);
     CHECK(isfinite(low.spill));

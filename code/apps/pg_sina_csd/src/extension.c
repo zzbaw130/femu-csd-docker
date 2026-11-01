@@ -188,7 +188,8 @@ static const struct config_enum_entry execution_paths[] = {
 double pg_sina_host_cost_ms=0.02,pg_sina_csd_cpu_ratio=0.35;
 double pg_sina_parallel_task_ms=0.02;
 double pg_sina_internal_mbps=5000,pg_sina_pcie_mbps=3500,pg_sina_cache_mbps=10000;
-double pg_sina_internal_write_mbps=1000;
+/* Effective dependent spill writes, including request/reentry overhead. */
+double pg_sina_internal_write_mbps=100;
 double pg_sina_result_batch_ms=0.25;
 static void assign_cost(double value,void *extra) { ResetPlanCache(); }
 void _PG_init(void);
@@ -212,8 +213,8 @@ void _PG_init(void)
         &pg_sina_parallel_task_ms,0.02,0,1000,PGC_USERSET,0,NULL,assign_cost,NULL);
     DefineCustomRealVariable("pg_sina_csd.internal_mbps","Aggregate internal NVM/FDM bandwidth in decimal MB/s",NULL,
         &pg_sina_internal_mbps,5000,1,1000000,PGC_USERSET,0,NULL,assign_cost,NULL);
-    DefineCustomRealVariable("pg_sina_csd.internal_write_mbps","Internal spill write bandwidth in decimal MB/s",NULL,
-        &pg_sina_internal_write_mbps,1000,1,1000000,PGC_USERSET,0,NULL,assign_cost,NULL);
+    DefineCustomRealVariable("pg_sina_csd.internal_write_mbps","Effective dependent spill write bandwidth in decimal MB/s",NULL,
+        &pg_sina_internal_write_mbps,100,1,1000000,PGC_USERSET,0,NULL,assign_cost,NULL);
     DefineCustomRealVariable("pg_sina_csd.pcie_mbps","Shared PCIe bandwidth per direction in decimal MB/s",NULL,
         &pg_sina_pcie_mbps,3500,1,1000000,PGC_USERSET,0,NULL,assign_cost,NULL);
     DefineCustomRealVariable("pg_sina_csd.cache_mbps","Native host cached scan bandwidth in decimal MB/s",NULL,

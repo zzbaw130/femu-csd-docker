@@ -49,7 +49,7 @@ CPU 单价仍复用 PG `cpu_tuple_cost`、`cpu_operator_cost`，乘 `host_cost_m
 | --- | --- |
 | Hash build | 每列按实际压缩格式：PG int2/int4/bool/date 为 4B+1B NULL；int8 为 8B+1B；其他值为 16B+scale/dscale/NULL。每行再加一个 4B next 和两个 4B bucket。容量从 128 起按 2 次幂增长 |
 | Hash Aggregate | 单整数键保留紧凑键格式；多键按整数/字典 ID 或完整 cell 区分；聚合值是对齐后的 cell+count。记录对齐到 16B，哈希槽 8B，最多使用 7/8 的记录容量，容量从 128 起翻倍 |
-| CU 局部聚合 | 先估计一张全局表，只有全部 CU 局部表与全局表、执行器既有的两份 sort reserve 都能放下时才估计局部模式；否则估计共享模式，不因局部表放不下就判整个聚合 spill |
+| CU 局部聚合 | 先估计一张全局表，只有全部 CU 局部表与全局表、两份最低排序工作集都能放下时才估计局部模式；最低工作集按公开run/窗口/向量/结果缓冲布局近似，私有元数据留余量，不再保留两份最大排序额度 |
 | Sort | cell 记录加字符串独立载荷、长度字段；字符串平均长度沿直接列引用回溯到 PG 统计，计算生成字符串用 typmod/32B 回退；另计 run 描述、spill token、IO 缓冲。行数据与字典正文同时存在时分别计费 |
 | Set/Materialize | Set 按最多输入行数的不同值和 1/2 装载率估计 16B 槽位；Materialize 按实际 cell 行估计。Set 未恢复所有表达式形态的精确 NDV，属于偏保守的基数上界 |
 | 字典 | NDV×16B entry，2 次幂的 4B hash head、字符串正文；rehash 暂存新旧 hash head。正文/entry 按 64KiB 页取整，页描述暂按 48B/页估计 |
@@ -61,7 +61,8 @@ Join 先构建右侧，再在保留 build 表时消费左侧；Sort/Aggregate �
 
 ## Spill 与串行归并
 
-- **Sort**：按照实际 1MiB run（受 sort quota 限制时缩小）、64KiB 归并缓存、最多 32 路归并估算 run 数。先计必须驱逐的 run 写出与最终读回；run 超过 fan-in 时，再计完整中间归并的读写。CPU 分开计算 run 内比较和跨 run 的堆比较。不再统一使用 8 路外排公式。
+- **Sort**：按照实际 1MiB run（受 sort quota 限制时缩小）、64KiB 归并缓存和可用内存估算归并路数，没有额外32路上限。先计必须驱逐的 run 写出与最终读回；run 超过 fan-in 时，再计完整中间归并的读写。CPU 分开计算 run 内排序和跨 run 的堆比较。
+- **存在性 Hash Join**：单键纯等值、无残余条件、直接基表扫描构建侧时，利用已有列NDV判断增长屏障去重后是否能留在内存；初始分配仍按最大可容纳的二次幂容量计费，不直接用NDV代替实际初始占用。缺失统计或唯一键本身放不下，保留通用spill估计。去重的键解码、哈希和比较计串行CPU，不除以CU数量。
 - **Hash Join**：沿实际 4 分区 Hash spill 计 build/probe 数据的写出读回；分区放不下时按 build 批次增加 probe 重读，不假设实现了递归 radix repartition。实际倾斜需要用运行计时进一步校准。
 - **Hash Aggregate**：容量不足时按 key/value/count 中间记录和输入量上界估计冲刷，再计外部合并 CPU；没有伪造精确的溢出组分布。
 - **Set/Materialize**：按超出可用容量的部分估计一次写出读回。
@@ -121,7 +122,7 @@ Q18 的第二个根因是 `lineitem.l_orderkey` 的采样NDV仅389264，实际�
 
 真实Hash Aggregate溢出时，模型按容纳组数估计刷出次数、部分key/value/count行、run生成及归并。无序键使用均匀占用近似；单列键依据PG的相关系数平方，在随机和物理聚集两端之间插值，避免对连续键反复高估重复部分状态。CPU单列计入部分行序列化、run比较、堆归并、逐行解码及重新聚合；协调端的行处理采用现有HOST标量CPU换算，不乘向量加速比，也不除以所有CU。其余向量工作仍保留原来的并行波次模型。
 
-Spill读写各按总字节的一半近似计费：读使用internal_mbps，写使用新增的internal_write_mbps（默认1000MB/s）。5000/1000的初值参考当前NAND读40us、写200us的比例，属于待校准的有效带宽假设，不是SNIA资源查询返回的保证。每64KiB重入I/O另按已有parallel_task_ms计一次调度工作。Sort按实际1MiB run、64KiB缓存、归并fan-in与中间轮次估计记录复制，不能只计“字节÷带宽”。无需新增设备命令或算子协议。
+Spill读写各按总字节的一半近似计费：读使用internal_mbps，写使用internal_write_mbps（当前默认100MB/s）。写值表示包含依赖请求与重入等待的有效吞吐，不是原始NAND写峰值；SF8实测中原1000MB/s初值明显低估外部路径，按完整CSD及Index Join图的墙钟、CPU和spill对照作经验校准。它不是SNIA资源查询返回的保证，换设备仍需校准。每64KiB重入I/O另按已有parallel_task_ms计调度工作；Sort按实际run、归并窗口和轮次计记录复制。无需新增设备命令、配置项或算子协议。
 
 最终针对性回归见 `results/tpch.WjJAKU/`（4CU、256MiB workmem、64MiB FDM，PG配置4/2GB/16MB）。每条每种模式独立冷启动，仅使用正式SQL，输出全部逐行一致：
 

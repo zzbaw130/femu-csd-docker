@@ -910,8 +910,21 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
             double build=Max(0,right->estimated_rows),width=cost_hash_row(&right->expr);
             available=Max((double)QS_SORT_IO_BYTES,Min(available,memory-2*quota));
             state=cost_hash_state(build,width);
+            if((n->join_type==QP_SEMI || n->join_type==QP_ANTI) && n->join_qual<0 &&
+               n->nkeys==1 && right->kind==QP_SCAN) {
+                const struct qs_expr *key=&right->expr.exprs[right->expr.outputs[n->right_keys[0]].index];
+                double distinct=key->op==Q_COLUMN?column_distinct(right->expr.relid,key->column+1,false):0;
+                double compact=cost_hash_existence_state(build,distinct,width,available);
+                if(compact<state) {
+                    state=compact;
+                    double capacity=state/(width+3*sizeof(uint32_t));
+                    double rounds=ceil((build-capacity)/Max(1,capacity-Min(build,distinct)));
+                    /* Key decode/hash/compare at the growth barrier is serial. */
+                    p->serial+=rounds*capacity*3*cpu_operator_cost*pg_sina_host_cost_ms;
+                }
+            }
             parallel_cpu(p,build*(cpu_tuple_cost+cpu_operator_cost*Max(1,n->nkeys))*unit,tasks[n->right],cus);
-            /* Coordinator links buckets after worker append; do not divide. */
+            /* Coordinator reindexes at growth barriers; do not divide. */
             p->serial+=build*cpu_operator_cost*unit;
             parallel_cpu(p,(input*(cpu_operator_cost*Max(1,n->nkeys))+rows*(cpu_tuple_cost+expression))*unit,tasks[i],cus);
             if(state>available) {
@@ -969,7 +982,7 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
                 parallel_cpu(p,work,group_tasks,cus);
                 p->combine+=slots*n->expr.naggs*cpu_operator_cost*unit;
             } else if(n->hash && qp_hash_aggregate_supported(n)) {
-                available=Max((double)QS_SORT_IO_BYTES,available-2*quota);
+                available=Max((double)QS_SORT_IO_BYTES,available-2*Min(quota,cost_sort_workspace()));
                 double table=cost_group_state(n,groups);
                 bool locals=slots>1 && group_tasks>1 && (slots+1)*table<=available;
                 state=locals?(slots+1)*table:table;

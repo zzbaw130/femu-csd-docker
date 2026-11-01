@@ -61,6 +61,17 @@ static inline unsigned cost_hash_row(const struct qs_plan *p)
 }
 static inline double cost_hash_state(double rows,unsigned row_bytes)
 { return cost_slots(rows,128)*(row_bytes+3*sizeof(uint32_t)); }
+/* Existence-key compaction happens only when growth would exceed the budget.
+ * The initial table still allocates the largest fitting power-of-two, not
+ * merely the NDV-sized payload. Missing statistics retain the general model. */
+static inline double cost_hash_existence_state(double rows,double distinct,unsigned width,double available)
+{
+    double full=cost_hash_state(rows,width),stride=width+3*sizeof(uint32_t);
+    if(full<=available || distinct<=0 || cost_hash_state(cost_min(rows,distinct),width)>available) return full;
+    double capacity=1;
+    while(capacity*2*stride<=available) capacity*=2;
+    return cost_min(full,capacity*stride);
+}
 /* compact_group: 16-byte header; group_value: one aligned cell + uint64.
  * group_entry: atomic uint + row index. Dense records fill 7/8 of slots. */
 static inline unsigned cost_group_stride(const struct qp_node *n)
@@ -91,9 +102,16 @@ static inline double cost_parallel(double work,double tasks,unsigned workers,dou
     return ceil(tasks/workers)*(work/tasks+task_ms);
 }
 /* Sort uses 1MiB runs (or smaller under its quota), 64KiB input caches and
- * bounded 2..32-way consolidation. Charge initial eviction separately from
+ * memory-bounded consolidation. Charge initial eviction separately from
  * full intermediate passes; the final merge only reads spilled payload. */
 struct cost_sort { double state,runs,spill,comparisons,merge,record_copies; unsigned fan,passes; };
+/* Estimate the executor's minimum working set from public buffer layouts.
+ * The final 64KiB covers private run/control metadata; this is not a quota. */
+static inline double cost_sort_workspace(void)
+{
+    return 3*1024*1024+32*QS_SORT_IO_BYTES+sizeof(struct qs_plan)+
+        QS_EXPRS*(256*20+128.0)+2*sizeof(struct qs_result)+QS_SORT_IO_BYTES;
+}
 static inline struct cost_sort cost_sort_state(double rows,double width,double available)
 {
     struct cost_sort s={0};
@@ -103,7 +121,7 @@ static inline struct cost_sort cost_sort_state(double rows,double width,double a
     s.runs=cost_max(1,ceil(rows/run_rows));
     double payload=rows*width,metadata=s.runs*(128+sizeof(void *))+ceil(payload/QS_SORT_IO_BYTES)*8;
     s.state=payload+metadata+2*QS_SORT_IO_BYTES;
-    s.fan=(unsigned)cost_min(32,cost_max(2,floor((available-metadata-2*QS_SORT_IO_BYTES-4096)/QS_SORT_IO_BYTES)));
+    s.fan=(unsigned)cost_max(2,floor((available-metadata-2*QS_SORT_IO_BYTES-4096)/QS_SORT_IO_BYTES));
     double resident=cost_max(0,available-metadata-run_bytes-2*QS_SORT_IO_BYTES);
     double evicted=cost_max(0,payload-resident),runs=s.runs;
     s.spill=2*evicted;

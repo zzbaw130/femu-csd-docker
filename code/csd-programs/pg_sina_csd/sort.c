@@ -674,8 +674,25 @@ static int row_reserve(struct row_sort *s)
     }
     unsigned n=s->bounded?s->topn:s->run_rows;
     struct cs_work_context_stats memory;
-    if(cs_work_get_context_stats(s->context,&memory) ||
-       memory.limit_bytes-memory.used_bytes<(size_t)n*s->row_bytes+QS_SORT_IO_BYTES+4096) return -4;
+    if(cs_work_get_context_stats(s->context,&memory)) return -4;
+    size_t available=memory.limit_bytes-memory.used_bytes;
+    if(s->plan.work_mem_parent) {
+        struct cs_work_context_stats parent;
+        if(cs_work_get_context_stats((void *)(uintptr_t)s->plan.work_mem_parent,&parent)) return -4;
+        size_t free=parent.limit_bytes-parent.used_bytes;
+        if(free<available) available=free;
+    }
+    struct cs_work_stats pool;
+    if(cs_work_get_stats(&pool)) return -4;
+    if(pool.free_bytes<available) available=pool.free_bytes;
+    /* Keep one run of scratch for radix sorting instead of filling the quota
+     * with resident runs and silently falling back to comparison sort. */
+    size_t bytes=(size_t)n*s->row_bytes,scratch=s->bounded || !s->plan.norder?0:bytes;
+    for(unsigned k=0;k<s->plan.norder;++k) {
+        unsigned oid=s->plan.outputs[s->plan.order[k].output].type_oid;
+        if(oid!=20 && oid!=21 && oid!=23 && oid!=1082 && oid!=1700) scratch=0;
+    }
+    if(available<bytes+scratch+QS_SORT_IO_BYTES+4096) return -4;
     unsigned blocks=(n+s->block_rows-1)/s->block_rows;
     size_t token_bytes=(blocks*sizeof(uint64_t)+_Alignof(struct qs_cell)-1)&~(size_t)(_Alignof(struct qs_cell)-1);
     uint64_t *tokens=cs_work_calloc(s->context,1,token_bytes+s->row_bytes);
@@ -954,7 +971,8 @@ static unsigned merge_fan_in(struct row_sort *o)
     size_t reserve=metadata+tokens+2*QS_SORT_IO_BYTES+4096;
     unsigned fan=limit>reserve?(limit-reserve)/QS_SORT_IO_BYTES:2;
     if(fan<2) fan=2;
-    if(fan>32) fan=32;
+    /* The available parent/child budget already bounds every input window.
+     * A fixed fan-in adds full read/write passes even when more runs fit. */
     return fan;
 }
 static int64_t consolidate(struct row_sort *s,struct femu_csd_args *a)
