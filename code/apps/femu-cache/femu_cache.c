@@ -30,6 +30,7 @@ struct mapping {
     struct list_head list;
     struct file *file,*owner;
     struct femu_cache_mapping range;
+    unsigned char *resident;
 };
 static LIST_HEAD(mappings);
 static DEFINE_MUTEX(mapping_lock);
@@ -37,7 +38,10 @@ struct receiver {
     struct femu_cache_slot *slots;
     dma_addr_t descriptor_dma;
     void *data;
-    dma_addr_t pages[FEMU_CACHE_RX_SLOTS][FEMU_CACHE_RX_PAGES];
+    dma_addr_t pages[FEMU_CACHE_TOTAL_PAGES];
+    unsigned char *resident;
+    dma_addr_t resident_dma;
+    size_t resident_bytes;
     unsigned mapped,session;
     struct mutex lock;
     struct list_head bindings;
@@ -50,6 +54,8 @@ static DEFINE_MUTEX(receiver_pool_lock);
 static bool receiver_pool_busy;
 static atomic64_t blocks,filled,cached,skipped,errors;
 static atomic64_t capacity_skipped;
+static atomic64_t device_candidate,device_resident,device_dma,device_queue_drop;
+static atomic64_t device_credit_drop,device_overwrite_drop,device_error_drop,device_stop_drop;
 /* Wall time within publication; local page counters avoid per-page atomics. */
 static atomic64_t publish_ns,sync_cpu_ns,lookup_ns,folio_ns,copy_ns,sync_device_ns;
 static struct dentry *profile_dir;
@@ -63,41 +69,49 @@ static int profile_show(struct seq_file *out,void *unused)
         atomic64_read(&folio_ns),atomic64_read(&copy_ns),atomic64_read(&sync_device_ns));
     seq_printf(out,"CACHE_ADMISSION capacity_skipped_bytes=%llu reserve_bytes=%llu\n",
         atomic64_read(&capacity_skipped),(u64)(totalram_pages()/8)*PAGE_SIZE);
+    seq_printf(out,"CACHE_DEVICE candidate_bytes=%llu resident_bytes=%llu dma_bytes=%llu queue_dropped_bytes=%llu credit_dropped_bytes=%llu overwrite_dropped_bytes=%llu error_dropped_bytes=%llu stop_dropped_bytes=%llu\n",
+        atomic64_read(&device_candidate),atomic64_read(&device_resident),atomic64_read(&device_dma),atomic64_read(&device_queue_drop),
+        atomic64_read(&device_credit_drop),atomic64_read(&device_overwrite_drop),atomic64_read(&device_error_drop),atomic64_read(&device_stop_drop));
     return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(profile);
 static void receiver_free(struct receiver *r)
 {
     struct mapping *m,*next;
-    list_for_each_entry_safe(m,next,&r->bindings,list) { list_del(&m->list); fput(m->file); kfree(m); }
+    list_for_each_entry_safe(m,next,&r->bindings,list) { list_del(&m->list); fput(m->file); kfree(m->resident); kfree(m); }
     if(r->pooled) {
         memset(r->slots,0,PAGE_SIZE);
         mutex_lock(&receiver_pool_lock);
         receiver_pool_busy=false;
         mutex_unlock(&receiver_pool_lock);
         r->slots=NULL; r->data=NULL; r->mapped=0; r->pooled=false;
+        r->resident=NULL;
         return;
     }
     for(unsigned i=0;i<r->mapped;i++)
-        dma_unmap_page(dma_device,r->pages[i/FEMU_CACHE_RX_PAGES][i%FEMU_CACHE_RX_PAGES],
+        dma_unmap_page(dma_device,r->pages[i],
                        PAGE_SIZE,DMA_FROM_DEVICE);
     vfree(r->data);
     if(r->slots) dma_free_coherent(dma_device,PAGE_SIZE,r->slots,r->descriptor_dma);
+    if(r->resident) dma_free_coherent(dma_device,r->resident_bytes,r->resident,r->resident_dma);
     r->slots=NULL; r->data=NULL; r->mapped=0;
+    r->resident=NULL;
 }
 static int receiver_allocate(struct receiver *r)
 {
     int ret=-ENOMEM;
     if(r->slots) return -EBUSY;
     r->slots=dma_alloc_coherent(dma_device,PAGE_SIZE,&r->descriptor_dma,GFP_KERNEL);
-    r->data=vmalloc_user((size_t)FEMU_CACHE_RX_SLOTS*FEMU_CACHE_BLOCK_BYTES);
-    if(!r->slots || !r->data) goto fail;
+    r->data=vmalloc_user(FEMU_CACHE_DATA_BYTES);
+    r->resident_bytes=DIV_ROUND_UP_ULL(bdev_nr_bytes(bdev->bdev),PAGE_SIZE*8);
+    r->resident=dma_alloc_coherent(dma_device,r->resident_bytes,&r->resident_dma,GFP_KERNEL);
+    if(!r->slots || !r->data || !r->resident) goto fail;
     memset(r->slots,0,PAGE_SIZE);
-    for(unsigned i=0;i<FEMU_CACHE_RX_SLOTS*FEMU_CACHE_RX_PAGES;i++) {
+    for(unsigned i=0;i<FEMU_CACHE_TOTAL_PAGES;i++) {
         dma_addr_t address=dma_map_page(dma_device,vmalloc_to_page(r->data+(size_t)i*PAGE_SIZE),
                                         0,PAGE_SIZE,DMA_FROM_DEVICE);
         if(dma_mapping_error(dma_device,address)) goto fail;
-        r->pages[i/FEMU_CACHE_RX_PAGES][i%FEMU_CACHE_RX_PAGES]=address;
+        r->pages[i]=address;
         r->mapped++;
     }
     return 0;
@@ -113,6 +127,8 @@ static int receiver_setup(struct receiver *r)
         r->slots=warm_receiver.slots; r->descriptor_dma=warm_receiver.descriptor_dma;
         r->data=warm_receiver.data; r->mapped=warm_receiver.mapped;
         memcpy(r->pages,warm_receiver.pages,sizeof(r->pages)); r->pooled=true;
+        r->resident=warm_receiver.resident; r->resident_dma=warm_receiver.resident_dma;
+        r->resident_bytes=warm_receiver.resident_bytes;
     }
     mutex_unlock(&receiver_pool_lock);
     return r->pooled?0:receiver_allocate(r);
@@ -130,21 +146,40 @@ static int receiver_bind(struct receiver *r,unsigned session)
     command.common.cdw11=cpu_to_le32(session?session:r->session);
     if(session) {
         struct mapping *m;
+        memset(r->resident,0,r->resident_bytes);
         mutex_lock(&mapping_lock);
         list_for_each_entry(m,&mappings,list) {
             struct mapping *copy=kmalloc(sizeof(*copy),GFP_KERNEL);
             if(!copy) { mutex_unlock(&mapping_lock); return -ENOMEM; }
-            *copy=*m; copy->file=get_file(m->file); list_add_tail(&copy->list,&r->bindings);
+            *copy=*m; copy->resident=NULL; copy->file=get_file(m->file); list_add_tail(&copy->list,&r->bindings);
+            if(m->resident) for(u64 page=0;page<m->range.bytes/PAGE_SIZE;page++) {
+                u64 physical=m->range.lba_bytes/PAGE_SIZE+page;
+                if(m->resident[page/8]&(1U<<(page%8))) r->resident[physical/8]|=1U<<(physical%8);
+            }
         }
         mutex_unlock(&mapping_lock);
         info=kzalloc(sizeof(*info),GFP_KERNEL);
         if(!info) return -ENOMEM;
         info->descriptor_dma=cpu_to_le64(r->descriptor_dma);
-        for(unsigned i=0;i<FEMU_CACHE_RX_SLOTS;i++)
-            for(unsigned j=0;j<FEMU_CACHE_RX_PAGES;j++) info->pages[i][j]=cpu_to_le64(r->pages[i][j]);
+        info->resident_dma=cpu_to_le64(r->resident_dma);
+        info->resident_bytes=cpu_to_le64(r->resident_bytes);
+        for(unsigned i=0;i<FEMU_CACHE_TOTAL_PAGES;i++) info->pages[i]=cpu_to_le64(r->pages[i]);
+        dma_wmb();
     }
     if(session) r->session=session; /* retain cleanup ownership even on timeout */
     int ret=nvme_submit_sync_cmd(bdev_get_queue(bdev->bdev),&command,info,info?sizeof(*info):0);
+    if(!session && !ret) {
+        const struct femu_cache_stats *s=(void *)r->slots+FEMU_CACHE_STATS_OFFSET;
+        dma_rmb();
+        atomic64_add(le64_to_cpu(s->candidate_bytes),&device_candidate);
+        atomic64_add(le64_to_cpu(s->resident_bytes),&device_resident);
+        atomic64_add(le64_to_cpu(s->dma_bytes),&device_dma);
+        atomic64_add(le64_to_cpu(s->queue_dropped_bytes),&device_queue_drop);
+        atomic64_add(le64_to_cpu(s->credit_dropped_bytes),&device_credit_drop);
+        atomic64_add(le64_to_cpu(s->overwrite_dropped_bytes),&device_overwrite_drop);
+        atomic64_add(le64_to_cpu(s->error_dropped_bytes),&device_error_drop);
+        atomic64_add(le64_to_cpu(s->stop_dropped_bytes),&device_stop_drop);
+    }
     kfree(info);
     if(!ret) r->session=session;
     return ret>0?-EIO:ret;
@@ -156,12 +191,12 @@ static int acquire_slot(struct receiver *r,unsigned index)
     if(le64_to_cpu(smp_load_acquire(&slot->ready))!=1) return -EAGAIN;
     dma_rmb();
     u64 bytes=le64_to_cpu(slot->bytes);
-    if(le32_to_cpu(slot->error) || !bytes || bytes>FEMU_CACHE_BLOCK_BYTES || bytes%PAGE_SIZE) return -EINVAL;
+    if(le32_to_cpu(slot->error) || !bytes || bytes>FEMU_CACHE_SLOT_BYTES(index) || bytes%PAGE_SIZE) return -EINVAL;
     for(unsigned p=0;p<bytes/PAGE_SIZE;p++)
-        dma_sync_single_for_cpu(dma_device,r->pages[index][p],PAGE_SIZE,DMA_FROM_DEVICE);
+        dma_sync_single_for_cpu(dma_device,r->pages[FEMU_CACHE_SLOT_OFFSET(index)/PAGE_SIZE+p],PAGE_SIZE,DMA_FROM_DEVICE);
     return 0;
 }
-static int publish_slot(struct receiver *r,unsigned index,bool hpcp,bool acquired)
+static int publish_slot(struct receiver *r,unsigned index,bool hpcp,bool acquired,bool shared_done)
 {
     if(!r->slots || index>=FEMU_CACHE_RX_SLOTS) return -EINVAL;
     struct femu_cache_slot *slot=&r->slots[index];
@@ -171,13 +206,13 @@ static int publish_slot(struct receiver *r,unsigned index,bool hpcp,bool acquire
     bool timing=READ_ONCE(profile),full=false;
     u64 begin=timing?ktime_get_ns():0,mark=begin;
     u64 lookup=0,folio_time=0,copy_time=0;
-    if(le32_to_cpu(slot->error) || !bytes || bytes>FEMU_CACHE_BLOCK_BYTES || bytes%PAGE_SIZE ||
+    if(le32_to_cpu(slot->error) || !bytes || bytes>FEMU_CACHE_SLOT_BYTES(index) || bytes%PAGE_SIZE ||
        lba>U64_MAX/bdev_logical_block_size(bdev->bdev)) {
         atomic64_inc(&errors); goto done;
     }
     unsigned count=bytes/PAGE_SIZE;
     if(!acquired) for(unsigned p=0;p<count;p++)
-        dma_sync_single_for_cpu(dma_device,r->pages[index][p],PAGE_SIZE,DMA_FROM_DEVICE);
+        dma_sync_single_for_cpu(dma_device,r->pages[FEMU_CACHE_SLOT_OFFSET(index)/PAGE_SIZE+p],PAGE_SIZE,DMA_FROM_DEVICE);
     if(timing) { u64 now=ktime_get_ns(); atomic64_add(now-mark,&sync_cpu_ns); mark=now; }
     u64 physical=lba*bdev_logical_block_size(bdev->bdev);
     /* MemAvailable includes reclaimable file cache and would allow population
@@ -186,7 +221,7 @@ static int publish_slot(struct receiver *r,unsigned index,bool hpcp,bool acquire
     bool admit=global_zone_page_state(NR_FREE_PAGES)>totalram_pages()/8;
     full=hpcp && !admit;
     struct mapping *binding=NULL;
-    if(hpcp) for(unsigned p=0;p<count;p++) {
+    for(unsigned p=0;p<count;p++) {
         if(timing) mark=ktime_get_ns();
         struct file *file=NULL;
         u64 offset=0,at=physical+(u64)p*PAGE_SIZE;
@@ -201,6 +236,11 @@ static int publish_slot(struct receiver *r,unsigned index,bool hpcp,bool acquire
             }
         }
         if(binding) { file=binding->file; offset=binding->range.file_offset+at-binding->range.lba_bytes; }
+        bool shared=shared_done || (binding && !(binding->range.flags&FEMU_CACHE_NEEDS_DCP));
+        if(!hpcp) {
+            if(shared) r->resident[at/PAGE_SIZE/8]|=1U<<(at/PAGE_SIZE%8);
+            continue;
+        }
         if(timing) { u64 now=ktime_get_ns(); lookup+=now-mark; mark=now; }
         if(!file) { atomic64_add(PAGE_SIZE,&skipped); continue; }
         struct folio *folio=__filemap_get_folio(file->f_mapping,offset>>PAGE_SHIFT,
@@ -214,11 +254,14 @@ static int publish_slot(struct receiver *r,unsigned index,bool hpcp,bool acquire
             continue;
         }
         if(folio_test_uptodate(folio) || folio_test_dirty(folio) || folio_order(folio)) {
-            if(folio_test_uptodate(folio) && !folio_test_dirty(folio)) atomic64_add(PAGE_SIZE,&cached);
+            if(folio_test_uptodate(folio) && !folio_test_dirty(folio)) {
+                atomic64_add(PAGE_SIZE,&cached);
+                if(shared) r->resident[at/PAGE_SIZE/8]|=1U<<(at/PAGE_SIZE%8);
+            }
             else atomic64_add(PAGE_SIZE,&skipped);
         } else {
             void *target=kmap_local_folio(folio,0);
-            memcpy(target,r->data+(size_t)index*FEMU_CACHE_BLOCK_BYTES+(size_t)p*PAGE_SIZE,PAGE_SIZE);
+            memcpy(target,r->data+FEMU_CACHE_SLOT_OFFSET(index)+(size_t)p*PAGE_SIZE,PAGE_SIZE);
             kunmap_local(target); flush_dcache_folio(folio); folio_mark_uptodate(folio);
             /* Population serves a real device read, like buffered file input.
              * Give the new page its first access; duplicate DMA must not keep
@@ -226,12 +269,13 @@ static int publish_slot(struct receiver *r,unsigned index,bool hpcp,bool acquire
             folio_mark_accessed(folio);
             if(timing) copy_time+=ktime_get_ns()-mark;
             atomic64_add(PAGE_SIZE,&filled);
+            if(shared) r->resident[at/PAGE_SIZE/8]|=1U<<(at/PAGE_SIZE%8);
         }
         folio_unlock(folio); folio_put(folio);
     }
     if(timing) mark=ktime_get_ns();
     for(unsigned p=0;p<count;p++)
-        dma_sync_single_for_device(dma_device,r->pages[index][p],PAGE_SIZE,DMA_FROM_DEVICE);
+        dma_sync_single_for_device(dma_device,r->pages[FEMU_CACHE_SLOT_OFFSET(index)/PAGE_SIZE+p],PAGE_SIZE,DMA_FROM_DEVICE);
     if(timing) {
         atomic64_add(ktime_get_ns()-mark,&sync_device_ns);
         atomic64_add(lookup,&lookup_ns); atomic64_add(folio_time,&folio_ns);
@@ -248,7 +292,7 @@ static void clear_mappings(struct file *owner)
 {
     struct mapping *m,*next;
     list_for_each_entry_safe(m,next,&mappings,list) if(m->owner==owner) {
-        list_del(&m->list); fput(m->file); kfree(m);
+        list_del(&m->list); fput(m->file); kfree(m->resident); kfree(m);
     }
 }
 static long cache_ioctl(struct file *file,unsigned cmd,unsigned long arg)
@@ -263,9 +307,9 @@ static long cache_ioctl(struct file *file,unsigned cmd,unsigned long arg)
        cmd==FEMU_CACHE_RX_BIND || cmd==FEMU_CACHE_RX_UNBIND) {
         mutex_lock(&r->lock);
         int ret=cmd==FEMU_CACHE_RX_SETUP?receiver_setup(r):
-            cmd==FEMU_CACHE_RX_PUBLISH?publish_slot(r,arg,true,false):
+            cmd==FEMU_CACHE_RX_PUBLISH?publish_slot(r,arg,true,false,false):
             cmd==FEMU_CACHE_RX_ACQUIRE?acquire_slot(r,arg):
-            cmd==FEMU_CACHE_RX_RELEASE?publish_slot(r,arg&~FEMU_CACHE_RELEASE_HPCP,(arg&FEMU_CACHE_RELEASE_HPCP)!=0,true):
+            cmd==FEMU_CACHE_RX_RELEASE?publish_slot(r,arg&~(FEMU_CACHE_RELEASE_HPCP|FEMU_CACHE_RELEASE_DCP),(arg&FEMU_CACHE_RELEASE_HPCP)!=0,true,(arg&FEMU_CACHE_RELEASE_DCP)!=0):
             receiver_bind(r,cmd==FEMU_CACHE_RX_BIND?arg:0);
         mutex_unlock(&r->lock); return ret;
     }
@@ -275,7 +319,8 @@ static long cache_ioctl(struct file *file,unsigned cmd,unsigned long arg)
     if(cmd!=FEMU_CACHE_REGISTER) return -ENOTTY;
     if(copy_from_user(&range,(void __user *)arg,sizeof(range))) return -EFAULT;
     if(range.nsid!=1 || !range.bytes || range.lba_bytes>U64_MAX-range.bytes ||
-       (range.lba_bytes|range.file_offset|range.bytes)&(PAGE_SIZE-1)) return -EINVAL;
+       range.lba_bytes>bdev_nr_bytes(bdev->bdev) || range.bytes>bdev_nr_bytes(bdev->bdev)-range.lba_bytes ||
+       range.flags&~FEMU_CACHE_NEEDS_DCP || (range.lba_bytes|range.file_offset|range.bytes)&(PAGE_SIZE-1)) return -EINVAL;
     map=kzalloc(sizeof(*map),GFP_KERNEL);
     if(!map) return -ENOMEM;
     map->file=fget(range.fd);
@@ -288,6 +333,10 @@ static long cache_ioctl(struct file *file,unsigned cmd,unsigned long arg)
         kfree(map); return -EINVAL;
     }
     map->range=range; map->owner=file;
+    if(range.resident_bits) {
+        map->resident=memdup_user((void __user *)(unsigned long)range.resident_bits,DIV_ROUND_UP_ULL(range.bytes,PAGE_SIZE*8));
+        if(IS_ERR(map->resident)) { int ret=PTR_ERR(map->resident); fput(map->file); kfree(map); return ret; }
+    }
     mutex_lock(&mapping_lock); list_add_tail(&map->list,&mappings); mutex_unlock(&mapping_lock);
     return 0;
 }

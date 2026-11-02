@@ -31,6 +31,7 @@ const char *pg_sina_path_name(void);
 bool pg_sina_hpcp_enabled(void);
 extern bool pg_sina_dcp;
 void pg_sina_dcp_register(const struct qs_request *,const struct qs_extent *);
+void pg_sina_dcp_resident(Oid,uint64,uint64,unsigned char *);
 void pg_sina_dcp_start(CS_DEV_HANDLE);
 /* Whole slots are safe when callbacks advance tasks independently; otherwise
  * bound foreground work. The return value replaces an idle wait. */

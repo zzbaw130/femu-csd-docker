@@ -45,9 +45,14 @@ static void register_cache(const struct qs_request *request,const struct qs_exte
             previous=segment;
         }
         struct femu_cache_mapping mapping={.fd=input,.nsid=request->nsid,
-            .lba_bytes=e->lba*request->lba_bytes,.file_offset=e->logical%segment_bytes,.bytes=e->bytes};
+            .lba_bytes=e->lba*request->lba_bytes,.file_offset=e->logical%segment_bytes,.bytes=e->bytes,
+            .flags=pg_sina_dcp?FEMU_CACHE_NEEDS_DCP:0};
+        unsigned char *resident=palloc0((e->bytes/FEMU_CACHE_PAGE_BYTES+7)/8);
+        pg_sina_dcp_resident(request->plan.relid,e->logical,e->bytes,resident);
+        mapping.resident_bits=(uintptr_t)resident;
         if(ioctl(r->fd,FEMU_CACHE_REGISTER,&mapping))
             ereport(ERROR,(errmsg("cannot register relation HPCP: %m")));
+        pfree(resident);
     }
     if(input>=0) CloseTransientFile(input);
     pfree(base); relation_close(relation,AccessShareLock);
