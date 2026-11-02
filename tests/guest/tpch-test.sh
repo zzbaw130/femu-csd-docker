@@ -29,6 +29,7 @@ export PGOPTIONS="${PGOPTIONS:-} -c session_preload_libraries=pg_sina_csd,auto_e
 printf '%s\n' "$PGOPTIONS" > "$RESULTS/pgoptions.txt"
 printf '%s\n' "$CACHES" > "$RESULTS/cache-mode.txt"
 printf 'cold=%s warm=%s repeat=%s profile=%s\n' "$COLD_RUNS" "$WARM_RUNS" "$REPEAT_RUNS" "$PG_SINA_PROFILE" > "$RESULTS/protocol.txt"
+printf 'repeat_idle_seconds=1 repeat_idle_in_query_latency=no\n' >> "$RESULTS/protocol.txt"
 psql -X -q -A -t -v ON_ERROR_STOP=1 -d "$PGDATABASE" \
     -c "SELECT version()" -c "SHOW shared_buffers" -c "SHOW work_mem" \
     -c "SHOW max_parallel_workers_per_gather" > "$RESULTS/environment.log" 2> "$RESULTS/environment.err"
@@ -63,8 +64,8 @@ for cache in $CACHES; do
                 fi
                 clean=yes
                 if ! grep -q 'result: 0x00000000' "$prefix.fdm.before" || ! grep -q 'result: 0x00000000' "$prefix.fdm.after"; then clean=no; failed=1; fi
-                # Markers are psql output only. No SQL, cache sampling, waits or
-                # settings are inserted between executions within a warm/repeat group.
+                # Markers are psql output only. Repeat has a fixed 1s shell
+                # sleep; no sampling SQL or settings run between executions.
                 awk -v prefix="$prefix" '
                     /^TPCH_BEGIN / {run=$2; file=prefix "." run ".log"; printf "%s", "" > file; close(file); next}
                     /^TPCH_END / {file=prefix "." $2 ".done"; printf "%s", "" > file; close(file); run=""; next}

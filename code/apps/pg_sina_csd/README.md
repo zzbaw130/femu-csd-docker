@@ -164,8 +164,10 @@ bash tests/pg-sina-csd-test.sh tpch
 sh /home/femu/tests/tpch-test.sh 7 9 13
 # Guest：只运行原生 PG，用于 HOST 配置对照
 TPCH_MODES=host-only sh /home/femu/tests/tpch-test.sh
-# Guest：全部表及索引预热后测试，预热不计入查询时间
-PG_SINA_CACHE=warm sh /home/femu/tests/tpch-test.sh
+# Guest：每条SQL先以HOST预热一次，再测试目标模式三次
+TPCH_CACHE_MODES=warm sh /home/femu/tests/tpch-test.sh
+# Guest：仅Q19，从冷态连续执行五次，相邻执行固定间隔1秒
+TPCH_CACHE_MODES=repeat sh /home/femu/tests/tpch-test.sh 19
 ```
 
 `scripts/guest/start-postgre.sh` 将原生 PG 对照配置写入数据目录：`max_parallel_workers_per_gather=4`、`shared_buffers=2GB`、`work_mem=16MB`。后续冷启动也沿用这些值；`work_mem` 是每个执行节点/worker 的额度，并非整条查询的总内存。每次基准的 `environment.log` 记录运行配置。
@@ -173,11 +175,13 @@ PG_SINA_CACHE=warm sh /home/femu/tests/tpch-test.sh
 
 只保留标准规定的 Q2=100、Q3=10、Q10=20、Q18=100、Q21=100 行上限，其余查询不额外添加 LIMIT。查询参数、子查询写法和 Q15 的 CREATE VIEW/SELECT/DROP VIEW 均保持该目录原样。host 与 CSD 接收同一个文件，超时或错误直接记录为失败，不用手写参考 SQL 替代。
 
-每次测量前 `scripts/guest/cold-query.sh` 停止 PG、sync、清除 Guest page cache 并重启 PG；不重启 FEMU，以免丢失 RAM-backed NVM。profile 默认关闭。Q15 的计时是原始脚本中各 SQL 耗时之和，包含创建/删除视图，host/CSD 规则相同。
+`scripts/guest/cold-query.sh` 在每组开始时停止 PG、sync、清除 Guest page cache 并重启 PG；不重启 FEMU，以免丢失 RAM-backed NVM。cold每次执行均重新准备，warm/repeat组内不清缓存、不切模式。单独调用该脚本时profile默认关闭，正式TPC-H入口为记录计划默认开启，各模式保持一致。Q15 的计时是原始脚本中各 SQL 耗时之和，包含创建/删除视图，host/CSD 规则相同。
 
-`PG_SINA_CACHE=warm` 同样先重启并清缓存，再顺序读入 `public` 下表、索引及其 main/FSM/VM 文件，随后用 PG 官方 `pg_prewarm(...,'buffer')` 填充 shared_buffers。每条查询前都通过 `pg_buffercache` 和 `fincore` 核验两层缓存全部驻留；未填满则本次失败。预热、核验和连接初始化均在正式查询计时之外。默认不设置该变量，仍沿用原来的冷测流程。
+warm每条SQL、每种模式独立从冷态开始，先用host-only执行同一正式SQL一次预热，再在同一连接中用目标模式执行三次；不统一预热全表，不要求实际驻留100%。预热和连接初始化不计正式延迟。
 
-热测需先在 Guest 安装官方 `pg_prewarm`、`pg_buffercache` 和 `util-linux-extra`（提供 `fincore`）。已有 PG 构建可分别在 `/home/femu/opt/postgres/build/contrib/pg_prewarm`、`pg_buffercache` 下执行 `make` 与 `sudo make install`，然后在 `tpch_s1` 创建同名扩展。这里仅调用同步预热函数，不开启 autoprewarm 后台任务。SF1 表和索引约1.43GiB，当前8GiB Guest及2GiB shared_buffers均能容纳；更大数据集须以实际核验结果为准。
+repeat每条SQL、每种模式独立从冷态开始，直接用目标模式执行五次。测试脚本仅在相邻执行之间用psql的shell命令停顿1秒，给异步观测缓冲时间；不执行pg_sleep等额外SQL，不在规划器中等待。五次共有四段停顿，停顿不计单次查询及五次查询时间之和；`protocol.txt`记录该规则。cold/warm不增加此间隔。新repeat结果不能与旧的零间隔组当成同一测试条件。
+
+profile开启时，`SQLerate query IO`在主进程统一采样所选命名空间的普通NVMe完成读字节、Linux扫描/回收页面及文件页refault计数，并保留执行前后的空闲、文件和共享内存页量。普通NVMe计数包含PG并行worker，不能再次相加；CSD内部LOAD和spill仍分别读取已有设备指标，不能把普通读为零解释为设备没有读NVM。这些计数用于单查询独占实验，其他并发访问会混入全局设备/回收统计。
 
 默认对五种 exe_path 各执行完整 22 条查询。结果保存到 Guest `/home/femu/results/tpch.*`，对应主机 `results/tpch.*`：`timings.csv` 每行记录查询编号、模式、延迟、结果是否一致和执行是否成功。Guest 需安装 PG 自带的 `auto_explain`；五种模式统一记录实际执行计划为 JSON（各查询的 `.err`），不启用 ANALYZE/TIMING 节点插桩。SQLerate 的实际 HOST/CSD 边界、成本估计和设备状态可从这些计划提取，无需另跑暖缓存 EXPLAIN 猜测测量时的选择。计时包含实际计划记录开销，单次微小差异不作为稳定优劣结论。
 

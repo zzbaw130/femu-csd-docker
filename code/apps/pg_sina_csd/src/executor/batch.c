@@ -199,6 +199,7 @@ void pg_sina_read_resources(const char *path)
     /* Mapping validation only: discovery and capacity queries finished at LOAD. */
     if(!connection_device || strcmp(path,connection_path)) elog(ERROR,"CSD namespace was not initialized for this connection: %s",path);
 }
+const char *pg_sina_device_path(void) { return connection_path; }
 CS_DEV_HANDLE pg_sina_device(const char *path)
 {
     pg_sina_read_resources(path);

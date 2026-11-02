@@ -45,6 +45,8 @@ trap 'rm -f "$driver"' EXIT HUP INT TERM
         [ "$marked" = no ] || printf '\\echo TPCH_BEGIN %s\n' "$run"
         printf '\\i %s\n' "$QUERY"
         [ "$marked" = no ] || printf '\\echo TPCH_END %s\n' "$run"
+        # Test pacing only: no pg_sleep SQL or synchronous planner barrier.
+        if [ "$CACHE" = repeat ] && [ "$run" -lt "$RUNS" ]; then printf '\\! sleep 1\n'; fi
         run=$((run+1))
     done
 } > "$driver"

@@ -34,6 +34,7 @@ static struct {
 static unsigned depth;
 static bool refreshing;
 static long os_page;
+static char io_stat_path[MAXPGPATH];
 static uint64 dcp_updates,dcp_evictions;
 static ExecutorStart_hook_type previous_start;
 static ExecutorRun_hook_type previous_run;
@@ -380,10 +381,42 @@ static bool host_reads(Plan *plan)
     foreach(c,children) if(host_reads(lfirst(c))) return true;
     return host_reads(plan->lefttree) || host_reads(plan->righttree);
 }
+/* Optional query profiling only. Namespace counters include all PG workers;
+ * sample in the leader once, never sum duplicated per-worker disk totals.
+ * CSD internal LOAD/spill remain in the existing device metrics. */
+struct query_io {
+    unsigned long long reads,sectors,free,file,shmem,scan,steal,refault;
+    bool valid;
+};
+static struct query_io read_query_io(void)
+{
+    struct query_io out={0}; unsigned long long merged;
+    FILE *f=fopen(io_stat_path,"r");
+    if(f) {
+        out.valid=fscanf(f,"%llu %llu %llu",&out.reads,&merged,&out.sectors)==3;
+        fclose(f);
+    }
+    f=fopen("/proc/vmstat","r");
+    if(f) {
+        char name[80]; unsigned long long value;
+        while(fscanf(f,"%79s %llu",name,&value)==2) {
+            if(!strcmp(name,"nr_free_pages")) out.free=value;
+            else if(!strcmp(name,"nr_file_pages")) out.file=value;
+            else if(!strcmp(name,"nr_shmem")) out.shmem=value;
+            else if(!strcmp(name,"pgscan_kswapd") || !strcmp(name,"pgscan_direct")) out.scan+=value;
+            else if(!strcmp(name,"pgsteal_kswapd") || !strcmp(name,"pgsteal_direct")) out.steal+=value;
+            else if(!strcmp(name,"workingset_refault_file")) out.refault=value;
+        }
+        fclose(f);
+    }
+    return out;
+}
 static void run(QueryDesc *query,ScanDirection direction,uint64 count,bool once)
 {
-    volatile bool observe=!depth && !refreshing && !pg_sina_compiling_plan && !IsParallelWorker() &&
-        snapshot.valid && query->plannedstmt->rtable!=NIL;
+    bool outer=!depth && !refreshing && !pg_sina_compiling_plan && !IsParallelWorker() && query->plannedstmt->rtable!=NIL;
+    volatile bool measure=outer && pg_sina_profile;
+    struct query_io before={0}; if(measure) before=read_query_io();
+    volatile bool observe=outer && snapshot.valid;
     if(observe) {
         bool reads=host_reads(query->plannedstmt->planTree); ListCell *c;
         foreach(c,query->plannedstmt->subplans) reads|=host_reads(lfirst(c));
@@ -401,6 +434,13 @@ static void run(QueryDesc *query,ScanDirection direction,uint64 count,bool once)
     PG_CATCH(); { --depth; if(observe) atomic_store(&file_observing,false); PG_RE_THROW(); } PG_END_TRY();
     --depth;
     if(observe) atomic_store_explicit(&file_observing,false,memory_order_relaxed);
+    if(measure) {
+        struct query_io after=read_query_io();
+        ereport(NOTICE,(errmsg("SQLerate query IO available=%d device_reads=%llu device_read_bytes=%llu reclaim_scan_pages=%llu reclaim_steal_pages=%llu refault_file=%llu free_before_bytes=%llu free_after_bytes=%llu file_before_bytes=%llu file_after_bytes=%llu shmem_before_bytes=%llu shmem_after_bytes=%llu",
+            before.valid && after.valid,after.reads-before.reads,(after.sectors-before.sectors)*512,
+            after.scan-before.scan,after.steal-before.steal,after.refault-before.refault,
+            before.free*os_page,after.free*os_page,before.file*os_page,after.file*os_page,before.shmem*os_page,after.shmem*os_page)));
+    }
 }
 static void finish(QueryDesc *query)
 {
@@ -425,6 +465,8 @@ static void transaction_end(XactEvent event,void *arg)
 void pg_sina_cache_init(void)
 {
     os_page=sysconf(_SC_PAGESIZE);
+    const char *device=pg_sina_device_path(),*base=strrchr(device,'/');
+    snprintf(io_stat_path,sizeof(io_stat_path),"/sys/class/block/%s/stat",base?base+1:device);
     bool own_transaction=!IsTransactionState();
     if(own_transaction) StartTransactionCommand();
     bool own_snapshot=!ActiveSnapshotSet();

@@ -91,6 +91,7 @@ extern struct pg_sina_resources {
 void pg_sina_init_device(void);
 void pg_sina_read_resources(const char *device);
 CS_DEV_HANDLE pg_sina_device(const char *);
+const char *pg_sina_device_path(void);
 void pg_sina_release_device(void);
 CS_CSF_ID pg_sina_function(const char *);
 unsigned pg_sina_program_index(unsigned index);
