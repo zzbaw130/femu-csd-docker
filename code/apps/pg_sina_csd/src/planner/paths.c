@@ -541,8 +541,11 @@ void pg_sina_search_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOpt
     }
     if(pg_sina_exe_path!=PG_SINA_ADAPTIVE && !pg_sina_native_search) {
         CustomPath *complete=relation_paths(root,output)->complete;
-        if(!complete) { pg_sina_upper_paths(root,stage,input,output,NULL); return; }
-        best=&complete->path;
+        /* No complete shared-search candidate does not rule out the
+         * original PG tree's device candidate, compared after planning.
+         * Keep this Path's real price until then: the legacy rewrite has
+         * neither frozen choices nor a comparable final wrapper cost. */
+        if(complete) best=&complete->path;
     }
     CustomPath *path=makeNode(CustomPath); path->path=*best;
     NodeSetTag(path,T_CustomPath); path->path.pathtype=T_CustomScan;

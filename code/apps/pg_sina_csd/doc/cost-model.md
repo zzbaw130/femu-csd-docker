@@ -264,3 +264,9 @@ read_ms = max(缺失字节 / (internal_mbps × 1000),
 `pgSinaPlannerCost`覆盖中间层缺失、根页排除、缓存容量/轮换、局部性及IOPS/带宽两种瓶颈，并对1/2/4/8倍输入检查同一公式。公式尺度检查不等价于对应SF的SQL验收。本次仅SF2在线，主要冷态三轮路径保持，热Q5/Q21改选HOST；Q7/Q8和部分混合候选仍有误差。详细测量及SF2 Q15既有编码错误见[本轮报告](../../../../results/tpch-sf2/index-io-model/report.md)，不以旧SF1/SF8成绩代替新模型验证。
 
 本轮额外Q20对照发现，调高Index费用后会转向先对大量输入更新共享聚合表的树。旧的共享表争用项只包含键比较，漏掉分组记录的访问与发布；该树估计仅便宜约20ms，实际慢约230ms。现沿用既有共享更新的串行争用近似，补入每条输入的tuple记录访问基价；这不是断言每条记录受一个全局锁串行执行。私有局部表不加此项，radix路径移除完整同一项，不能给不共享的更新错误收费。未改变实际算子、共享锁或内存配额；最终回归和该对照分开记录。
+
+## 原生Nested Loop与扫描返回的剩余估价误差（2026-11-03，尚未修正）
+
+Q7/Q8诊断发现：原生HOST树的`pg_sina_cost_host_lookup`对普通INNER只修Index I/O和匹配FK后的Index run CPU，没有重算NestLoop自身按旧`inner.rows`收取的tuple CPU；共享搜索的`pg_sina_reprice_index_join`则已更新内侧行数，存在通路不一致。按当前PG估计及0.01的cpu_tuple_cost、0.02ms换算，分别多计约93.422/239.848ms。不是用实际验收行数拟合模型，本轮只定位、不修改定价。
+
+直接Scan返回HOST还按`rows*(cpu_tuple_cost+cpu_operator_cost*nout)*host_cost_ms`预算；Q7 orders模型约1.5秒总CPU工作量，而现有类型化批次profile全部CU累计约0.7秒，提示该项需要重新对齐。不能把含HOST反压的Tree Wall当净扫描时间，再与消费时间相加。Scan/Join重叠只覆盖直接相邻输入，流式下游消费的重叠尚未完整进入搜索。应分别校正连接tuple收费、真实列式输出工作和跨节点重叠，不能笼统降低所有索引CPU或把共有过滤成本归为差异。完整证据见[诊断报告](../../../../results/tpch-sf2/q7-q8-q15/report.md)。同轮Q15已通过候选回退的局部修复恢复完整CSD，未更改本节成本公式。
