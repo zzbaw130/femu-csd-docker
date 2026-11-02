@@ -29,6 +29,12 @@ int main(void)
     CHECK(30+cost_host_cached_io(100,0,1,0.1)==40);
     CHECK(cost_host_cached_io(100,0.5,0.5,0.1)==50);
     CHECK(cost_host_cached_io(100,0.5,1,0.1)==5);
+    CHECK(cost_host_scan_io(100,10,20,5,0,0)==35);
+    CHECK(cost_host_scan_io(100,10,20,5,0,1)==5);
+    CHECK(cost_host_scan_io(100,10,20,5,1,1)==0);
+    CHECK(cost_host_scan_io(100,10,20,5,0.5,1)==2.5);
+    CHECK(cost_host_scan_io(0,10,20,5,0,1)==0);
+    CHECK(cost_host_scan_io(10,10,20,5,0,0)==10);
     /* Bounded index caches must not make repeated random I/O free. A small
      * table can fit; clustered matching tuples share a Heap page. */
     CHECK(cost_first_match_visits(4,0)==4);

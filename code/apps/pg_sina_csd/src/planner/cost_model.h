@@ -11,6 +11,14 @@ static inline double cost_min(double a,double b) { return a<b?a:b; }
  * caller retains CPU costs; only file-only hits pay the extra page copy. */
 static inline double cost_host_cached_io(double io,double shared,double file,double copy_ratio)
 { return io*(1-cost_max(shared,file))+io*cost_max(0,file-shared)*copy_ratio; }
+/* PG's abstract sequential page price need not share its CPU-to-ms scale.
+ * Bound that price by the modeled NVM read, external transfer and PG buffer
+ * copy. File-only hits retain their actual copy cost after this correction. */
+static inline double cost_host_scan_io(double original,double storage,double link,double copy,double shared,double file)
+{
+    double cold=cost_min(original,storage+link+copy);
+    return cold*(1-cost_max(shared,file))+cost_min(original,copy)*cost_max(0,file-shared);
+}
 /* Bound vectors/columns and literals carry values; they do not execute an
  * arithmetic instruction. Materialization/Heap cost is charged separately. */
 static inline unsigned cost_expression_ops(const struct qs_plan *p)

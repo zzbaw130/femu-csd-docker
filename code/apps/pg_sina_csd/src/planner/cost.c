@@ -181,7 +181,10 @@ void pg_sina_cost_host_path(PlannerInfo *root,Path *path,Oid oid,List **observat
     double startup=path->startup_cost;
     /* PG already amortizes repeated probes. Compare observed residency
      * against single-probe I/O; do not discount the reused residual again. */
-    double cached_heap=index?Min(heap_io,cached_io(single_heap_io,random,heap)):cached_io(heap_io,seq,heap);
+    double cached_heap=index?Min(heap_io,cached_io(single_heap_io,random,heap)):
+        cost_host_scan_io(heap_io*pg_sina_host_cost_ms,
+            transfer_ms(heap->bytes,pg_sina_internal_mbps),transfer_ms(heap->bytes,pg_sina_pcie_mbps),
+            transfer_ms(heap->bytes,pg_sina_cache_mbps),heap->shared,heap->fraction)/pg_sina_host_cost_ms;
     double cached_index=index?Min(index_io,cached_io(single_index_io,index_random,index)):0;
     double after=Max(startup,before-heap_io-index_io-qual_discount+cached_heap+cached_index);
     if(apply) {
