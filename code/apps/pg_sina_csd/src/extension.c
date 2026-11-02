@@ -70,8 +70,31 @@ static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,Param
             mark=pg_sina_planner_clock();
             original_device=pg_sina_original_device_statement(host);
             if(pg_sina_planning) counters.stmt_copy=pg_sina_planner_clock()-mark;
+            /* A correlated native tree may be unsupported even though PG's
+             * plan for its decorrelated Query is executable. Keep that PG
+             * physical candidate too; otherwise shared HOST/device pruning
+             * can lose it before a complete device path is formed. */
+            if(!original_device && query!=parse) {
+                double previous=pg_sina_planner_attributed(),previous_hooks=counters.hook_other;
+                mark=pg_sina_planner_clock();
+                PlannedStmt *rewritten=plan_query(copyObject(query),cursorOptions,boundParams);
+                if(pg_sina_planning) {
+                    double elapsed=pg_sina_planner_clock()-mark;
+                    counters.native_pg+=elapsed;
+                    counters.native_core+=elapsed-(pg_sina_planner_attributed()-previous)-(counters.hook_other-previous_hooks);
+                }
+                mark=pg_sina_planner_clock();
+                original_device=pg_sina_original_device_statement(rewritten);
+                if(original_device) {
+                    List *info=((CustomScan *)original_device->planTree)->custom_private;
+                    lfirst(list_head(info))=makeString("subtree:CSD; query=rewritten PG physical tree");
+                }
+                if(pg_sina_planning) counters.stmt_copy+=pg_sina_planner_clock()-mark;
+            }
             mark=pg_sina_planner_clock();
-            host_cost=pg_sina_host_statement_cost(host)+pg_sina_host_parallel_cost(host);
+            double statement_cost=pg_sina_host_statement_cost(host),parallel_cost=pg_sina_host_parallel_cost(host);
+            host_cost=statement_cost+parallel_cost;
+            if(pg_sina_planning) ereport(NOTICE,(errmsg("SQLerate HOST costs statement_ms=%.3f parallel_ms=%.3f",statement_cost,parallel_cost)));
             if(pg_sina_planning) counters.host_cache=pg_sina_planner_clock()-mark;
             pg_sina_native_search=false;
         }

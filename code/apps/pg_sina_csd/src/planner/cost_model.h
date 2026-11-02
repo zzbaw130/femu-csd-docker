@@ -19,6 +19,14 @@ static inline double cost_host_scan_io(double original,double storage,double lin
     double cold=cost_min(original,storage+link+copy);
     return cold*(1-cost_max(shared,file))+cost_min(original,copy)*cost_max(0,file-shared);
 }
+/* heapgetpage checks the all-visible flag once per page and skips each
+ * tuple's MVCC test. Keep tuple deformation/projection costs intact. */
+static inline double cost_visible_visits(double tuples,double pages,double fraction)
+{ return cost_max(0,tuples-pages)*cost_min(1,cost_max(0,fraction)); }
+/* A partial prefilter runs first; the complete expression is then evaluated
+ * on its survivors. At selectivity 1 it adds work, rather than a discount. */
+static inline double cost_prefilter_ops(double full,double prefix,double survival,double lanes)
+{ return prefix/cost_max(1,lanes)+full*cost_min(1,cost_max(0,survival)); }
 /* Bound vectors/columns and literals carry values; they do not execute an
  * arithmetic instruction. Materialization/Heap cost is charged separately. */
 static inline unsigned cost_expression_ops(const struct qs_plan *p)

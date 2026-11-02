@@ -39,6 +39,29 @@ int main(void)
     CHECK(cost_host_scan_io(100,10,20,5,0.5,1)==2.5);
     CHECK(cost_host_scan_io(0,10,20,5,0,1)==0);
     CHECK(cost_host_scan_io(10,10,20,5,0,0)==10);
+    CHECK(cost_visible_visits(1000,10,0)==0);
+    CHECK(cost_visible_visits(1000,10,1)==990);
+    CHECK(cost_visible_visits(1000,10,0.5)==495);
+    CHECK(cost_visible_visits(1,10,1)==0);
+    CHECK(cost_prefilter_ops(12,2,0,4)==0.5);
+    CHECK(cost_prefilter_ops(12,2,0.25,4)==3.5);
+    CHECK(cost_prefilter_ops(12,2,1,4)>12);
+    CHECK(cost_prefilter_ops(12,2,0.25,1)>cost_prefilter_ops(12,2,0.25,4));
+    /* OFFSET belongs in the shared Sort/Limit bound. A second consumer
+     * must disable TopN: it still needs the complete ordered input. */
+    struct qp_plan *limit=calloc(1,sizeof(*limit));
+    CHECK(limit!=NULL);
+    for(unsigned i=0;i<QP_PARAMS;++i) limit->cte_nodes[i]=-1;
+    limit->count=2; limit->root=0;
+    limit->nodes[0]=(struct qp_node){.kind=QP_LIMIT,.left=1,.right=-1,
+        .expr={.predicate=-1,.limit=100,.offset=20}};
+    limit->nodes[1]=(struct qp_node){.kind=QP_SORT,.left=-1,.right=-1,.expr={.predicate=-1}};
+    CHECK(qp_sort_bound(limit,1)==120);
+    limit->nparams=1; limit->param_nodes[0]=1;
+    CHECK(qp_sort_bound(limit,1)==-1);
+    limit->nparams=0; limit->nodes[0].expr.limit=-1;
+    CHECK(qp_sort_bound(limit,1)==-1);
+    free(limit);
     /* Bounded index caches must not make repeated random I/O free. A small
      * table can fit; clustered matching tuples share a Heap page. */
     CHECK(cost_first_match_visits(4,0)==4);

@@ -293,6 +293,9 @@ static void add_device_path(PlannerInfo *root,RelOptInfo *rel,Path *native,bool 
     PG_END_TRY();
     pg_sina_compiling_plan=compiling;
     MemoryContextSwitchTo(owner);
+    if(top && IsA(native,LimitPath) && pg_sina_profile)
+        ereport(NOTICE,(errmsg("SQLerate Limit candidate supported=%d host_ms=%.6f device_ms=%.6f boundary_ms=%.6f rows=%.0f",
+            device!=NULL,native->total_cost*pg_sina_host_cost_ms,internal,boundary,device?device->plan_rows:0)));
     if(!device) { MemoryContextDelete(temporary); return; }
     double mark=pg_sina_planner_clock();
     if(pg_sina_planning) ++pg_sina_planning->accepted;
@@ -309,6 +312,17 @@ static void add_device_path(PlannerInfo *root,RelOptInfo *rel,Path *native,bool 
     path->custom_private=list_make5(lthird(((CustomScan *)device)->custom_private),copyObject(lsecond(((CustomScan *)device)->custom_private)),
         makeInteger(top),makeInteger(((CustomScan *)device)->methods==&pg_sina_scan_methods),copyObject(lfourth(((CustomScan *)device)->custom_private)));
     path->methods=&device_methods;
+    /* PG regards Limit as free and keeps the earlier Path on a cost tie.
+     * For the same already-device child, prefer keeping its constant Limit
+     * inside the graph within PG's normal 1% estimate tolerance. This also
+     * lets Sort see its TopN bound before path pruning. No HOST input is
+     * moved onto the device by this tie break. */
+    if(IsA(native,LimitPath)) {
+        Path *child=((LimitPath *)native)->subpath;
+        if(IsA(child,CustomPath) && ((CustomPath *)child)->methods==&device_methods &&
+           path->path.total_cost<=native->total_cost*1.01)
+            rel->pathlist=list_delete_ptr(rel->pathlist,native);
+    }
     /* Forced offload uses the same physical alternatives and prices, but
      * retains a complete device candidate even if a HOST path is cheaper. */
     if(top && path->path.total_cost<state->complete_cost) {

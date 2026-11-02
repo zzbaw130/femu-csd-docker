@@ -158,6 +158,10 @@ static void cost_host_path(PlannerInfo *root,Path *path,Oid oid,List **observati
     if(path->pathtype==T_SeqScan) {
         heap_io=Min(before-path->startup_cost,path->parent->pages*seq);
         qual_discount=host_qual_discount(root,path);
+        double divisor=Max(1,path->parallel_workers+(parallel_leader_participation?
+            Max(0,1-0.3*path->parallel_workers):0));
+        qual_discount+=cost_visible_visits(path->parent->tuples,path->parent->pages,
+            path->parent->allvisfrac)*cpu_operator_cost/divisor;
     }
     else {
         IndexPath *original=(IndexPath *)path;
@@ -926,6 +930,78 @@ static void fast_cost(struct placement *p,const struct qs_plan *plan,List **obse
     if(p->details) appendStringInfo(p->stages,"fused Scan/Filter/Aggregate tasks=%.0f groups=%.0f partial_rows=%.0f state=%.0fB spill=%.0fB",
         tasks,groups,partial,p->peak,p->spill);
 }
+/* The same plain column/constant comparisons recognized by filter.c. */
+static Oid scan_comparison_type(Node *node)
+{
+    if(!IsA(node,OpExpr) || exprType(node)!=BOOLOID || list_length(((OpExpr *)node)->args)!=2) return InvalidOid;
+    Node *a=linitial(((OpExpr *)node)->args),*b=lsecond(((OpExpr *)node)->args);
+    while(IsA(a,RelabelType)) a=(Node *)((RelabelType *)a)->arg;
+    while(IsA(b,RelabelType)) b=(Node *)((RelabelType *)b)->arg;
+    if(IsA(a,Const)) { Node *swap=a; a=b; b=swap; }
+    if(!IsA(a,Var) || !IsA(b,Const)) return InvalidOid;
+    Oid type=exprType(a);
+    return type==INT2OID || type==INT4OID || type==INT8OID || type==DATEOID || type==NUMERICOID?type:InvalidOid;
+}
+static void scan_prefilters(Node *node,List **clauses)
+{
+    if(IsA(node,List) || (IsA(node,BoolExpr) && ((BoolExpr *)node)->boolop==AND_EXPR)) {
+        ListCell *c; foreach(c,IsA(node,List)?(List *)node:((BoolExpr *)node)->args)
+            scan_prefilters(lfirst(c),clauses);
+    } else {
+        Oid type=scan_comparison_type(node);
+        /* Numeric columns are deferred; only eagerly decoded values can
+         * prune rows before the general expression fallback. */
+        if(OidIsValid(type) && type!=NUMERICOID) *clauses=lappend(*clauses,node);
+    }
+}
+/* Simple AND selection has no intermediate boolean vectors. Complex
+ * predicates can still have cheap AND conjuncts prefiltering their input. */
+static double scan_expression_ops(const struct qs_plan *p,bool properties,PlannerInfo *root)
+{
+    double total=cost_expression_ops(p),saved=0,lanes=1;
+    if(p->predicate<0) return total;
+#if defined(__x86_64__) && defined(__GNUC__)
+    if(__builtin_cpu_supports("avx2")) lanes=4;
+#endif
+    for(unsigned i=0;i<p->nexprs;++i) {
+        const struct qs_expr *e=&p->exprs[i];
+        if(e->type!=Q_BOOLEAN || e->op==Q_COLUMN || e->op==Q_CONST || e->op==Q_PARAMETER) continue;
+        bool conjunction=false,numeric=false;
+        if(properties) {
+            if(e->op!=Q_AGGREF || e->column>=0 || !e->constant) goto complex;
+            Node *node=(Node *)(intptr_t)e->constant;
+            conjunction=IsA(node,List) || (IsA(node,BoolExpr) && ((BoolExpr *)node)->boolop==AND_EXPR);
+            if(!conjunction) {
+                Oid type=scan_comparison_type(node);
+                if(!OidIsValid(type)) goto complex;
+                numeric=type==NUMERICOID;
+            }
+        } else {
+            conjunction=e->op==Q_AND;
+            if(!conjunction) {
+                if(e->op<Q_EQ || e->op>Q_GE || e->left<0 || e->right<0) goto complex;
+                const struct qs_expr *a=&p->exprs[e->left],*b=&p->exprs[e->right];
+                if(a->op==Q_CONST) { const struct qs_expr *swap=a; a=b; b=swap; }
+                if(a->op!=Q_COLUMN || b->op!=Q_CONST ||
+                   (a->type!=Q_INTEGER && a->type!=Q_DATE && a->type!=Q_DECIMAL)) goto complex;
+                numeric=a->type==Q_DECIMAL;
+            }
+        }
+        saved+=conjunction?1:numeric?0:1-1/lanes;
+    }
+    return Max(0,total-saved);
+complex:
+    if(properties && p->exprs[p->predicate].op==Q_AGGREF && p->exprs[p->predicate].constant) {
+        List *clauses=NIL;
+        scan_prefilters((Node *)(intptr_t)p->exprs[p->predicate].constant,&clauses);
+        if(clauses) {
+            double survival=clauselist_selectivity(root,clauses,0,JOIN_INNER,NULL);
+            double work=cost_prefilter_ops(total,list_length(clauses),survival,lanes);
+            list_free(clauses); return work;
+        }
+    }
+    return total;
+}
 static void device_cost(struct placement *p,List **observations,struct qp_plan *lowered,const struct qs_plan *fast)
 {
     CustomScan *scan=(CustomScan *)p->device;
@@ -1022,7 +1098,7 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
             /* References, literals and bound parameters do not execute a
              * scalar operator. Charge actual operations, not all IR nodes. */
             bool direct=tree->count==1 && tree->nodes[tree->root].kind==QP_SCAN && !tree->ninit;
-            unsigned operations=cost_expression_ops(&n->expr);
+            double operations=scan_expression_ops(&n->expr,lowered!=NULL,p->root);
             /* PG's cpu_tuple_cost is the fixed tuple visit, not an average
              * attribute-deformation price. Page/line-pointer/header checks
              * still execute when only an early column is needed. Projection
@@ -1061,7 +1137,12 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
             previous_parallel=p->parallel;
             /* Coordinator reindexes at growth barriers; do not divide. */
             p->serial+=build*cpu_operator_cost*unit;
-            parallel_cpu(p,(input*(cpu_operator_cost*Max(1,n->nkeys))+rows*(cpu_tuple_cost+expression))*unit,tasks[i],cus);
+            /* Populate each output cell/NULL slot even for plain forwarding.
+             * This memory/control work is not vector arithmetic; charging
+             * only one tuple visit loses the projection-width dependence. */
+            double materialize=rows*n->expr.nout*cpu_operator_cost*pg_sina_host_cost_ms;
+            parallel_cpu(p,(input*(cpu_operator_cost*Max(1,n->nkeys))+rows*(cpu_tuple_cost+expression))*unit+
+                materialize,tasks[i],cus);
             if(state>available) {
                 if(n->join_type==QP_INNER) {
                     double partitions=4,ratio=state/available;
@@ -1174,8 +1255,10 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
             blocks+=ceil((index_pages+heap_pages)/QS_INDEX_READS);
             scan_bytes+=read;
             cache_bytes+=index_bytes*index->fraction+heap_bytes*heap->fraction;
-            work=(input*levels*(log2(fanout)+QS_INDEX_CACHE/2)*cpu_operator_cost+
-                input*matches*(cpu_tuple_cost+cost_expression_ops(&right->expr)*cpu_operator_cost)+
+            /* B-tree descent and the cursor's linear cache-tag search are
+             * pointer/control work, not vector expression evaluation. */
+            work=input*levels*(log2(fanout)+QS_INDEX_CACHE/2)*cpu_operator_cost*pg_sina_host_cost_ms+
+                (input*matches*(cpu_tuple_cost+cost_expression_ops(&right->expr)*cpu_operator_cost)+
                 rows*(cpu_tuple_cost+expression))*unit;
             parallel_cpu(p,work,tasks[i],cus);
             p->schedule+=cost_parallel(0,ceil((index_pages+heap_pages)/QS_INDEX_READS),cus,pg_sina_parallel_task_ms);
@@ -1199,7 +1282,7 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
                  * as comparing keys. Keep the existing contention proxy,
                  * but do not price it as key arithmetic alone. Private/radix
                  * tables avoid this shared-record term. */
-                else if(group_tasks>1) p->serial+=input*(cpu_tuple_cost+cpu_operator_cost*Max(1,n->nkeys))*unit;
+                else if(group_tasks>1) p->serial+=input*(cpu_tuple_cost+cpu_operator_cost*Max(1,n->nkeys))*pg_sina_host_cost_ms;
                 p->combine+=groups*n->expr.naggs*cpu_operator_cost*unit;
                 if(table>available) {
                     /* Match plan.c::parallel_radix_begin: private tables use
@@ -1223,7 +1306,7 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
                         double blocks=floor(partial/(slots*partitions*block_rows))*slots*partitions;
                         spill=2*blocks*QS_SORT_IO_BYTES;
                         state=capacity*stride*slots+tails+reserve;
-                        p->serial-=input*(cpu_tuple_cost+cpu_operator_cost*Max(1,n->nkeys))*unit;
+                        p->serial-=input*(cpu_tuple_cost+cpu_operator_cost*Max(1,n->nkeys))*pg_sina_host_cost_ms;
                         p->combine-=groups*n->expr.naggs*cpu_operator_cost*unit;
                         parallel_cpu(p,partial*(cpu_tuple_cost+cpu_operator_cost*(n->nkeys+n->expr.naggs))*unit+
                             transfer_ms(2*partial*cost_group_stride(n),pg_sina_cache_mbps),
@@ -1288,6 +1371,11 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
                 p->combine+=(sort.merge*cpu_operator_cost+
                     sort.record_copies*(cpu_tuple_cost+n->expr.nout*cpu_operator_cost))*pg_sina_host_cost_ms+work;
             }
+        } else if(n->kind==QP_LIMIT) {
+            /* This cursor stops pulling after OFFSET + LIMIT, rather than
+             * projecting every row from its blocking child. */
+            double visits=Min(input,n->expr.offset+rows);
+            p->serial+=visits*cpu_operator_cost*unit+rows*expression*unit;
         } else if(n->kind==QP_SORT) {
             double sort_memory=cost_sort_memory(available,quota);
             struct cost_sort sort=cost_topn_state(input,sort_width(tree,i),sort_memory,sort_windows(&n->expr),qp_sort_bound(tree,i));
@@ -1337,7 +1425,8 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
             p->stages->len?"; ":"",i,device_kind(n->kind),rows,n->estimated_groups,tasks[i],
             p->serial+p->parallel+p->schedule+p->combine-previous_cpu,state,resident,available,spill);
         if(p->details && n->kind==QP_SCAN)
-            appendStringInfo(p->stages," visited=%.0f expr_ops=%u",input,cost_expression_ops(&n->expr));
+            appendStringInfo(p->stages," visited=%.0f expr_ops=%u physical_ops=%.2f",input,
+                cost_expression_ops(&n->expr),scan_expression_ops(&n->expr,lowered!=NULL,p->root));
         if(p->details && (n->kind==QP_JOIN || n->kind==QP_INDEX_JOIN)) {
             static const char *names[]={"inner","left","semi","anti"};
             appendStringInfo(p->stages," join=%s",names[n->join_type]);

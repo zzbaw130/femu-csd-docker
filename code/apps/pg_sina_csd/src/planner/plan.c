@@ -1726,6 +1726,15 @@ static int describe_tree(PlannerInfo *root,Plan *native,struct qp_plan *tree,boo
         p->outputs[p->nout++]=(struct qs_output){.index=property,.type_oid=exprType(value),.typmod=exprTypmod(value)};
     }
     if(!describe_list(&b,native->qual)) return -1;
+    if(n->kind==QP_SCAN && native->qual) {
+        /* Cost metadata only: retain the original predicate root so PG can
+         * estimate the selectivity of the device's early AND prefilters.
+         * No executable predicate/instruction is generated here. */
+        Node *qual=list_length(native->qual)==1?linitial(native->qual):(Node *)native->qual;
+        for(unsigned i=0;i<p->nexprs;++i)
+            if(p->exprs[i].op==Q_AGGREF && p->exprs[i].column<0 &&
+               p->exprs[i].constant==(intptr_t)qual) p->predicate=i;
+    }
     if(IsA(native,Result) && ((Result *)native)->resconstantqual) {
         Node *qual=((Result *)native)->resconstantqual;
         if(IsA(qual,List)?!describe_list(&b,(List *)qual):describe_expression(&b,qual)<0) return -1;
