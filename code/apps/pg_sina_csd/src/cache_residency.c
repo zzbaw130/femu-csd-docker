@@ -385,7 +385,7 @@ static bool host_reads(Plan *plan)
  * sample in the leader once, never sum duplicated per-worker disk totals.
  * CSD internal LOAD/spill remain in the existing device metrics. */
 struct query_io {
-    unsigned long long reads,sectors,free,file,shmem,scan,steal,refault;
+    unsigned long long reads,sectors,free,file,shmem,active_file,inactive_file,scan,steal,refault;
     bool valid;
 };
 static struct query_io read_query_io(void)
@@ -403,6 +403,8 @@ static struct query_io read_query_io(void)
             if(!strcmp(name,"nr_free_pages")) out.free=value;
             else if(!strcmp(name,"nr_file_pages")) out.file=value;
             else if(!strcmp(name,"nr_shmem")) out.shmem=value;
+            else if(!strcmp(name,"nr_active_file")) out.active_file=value;
+            else if(!strcmp(name,"nr_inactive_file")) out.inactive_file=value;
             else if(!strcmp(name,"pgscan_kswapd") || !strcmp(name,"pgscan_direct")) out.scan+=value;
             else if(!strcmp(name,"pgsteal_kswapd") || !strcmp(name,"pgsteal_direct")) out.steal+=value;
             else if(!strcmp(name,"workingset_refault_file")) out.refault=value;
@@ -436,10 +438,11 @@ static void run(QueryDesc *query,ScanDirection direction,uint64 count,bool once)
     if(observe) atomic_store_explicit(&file_observing,false,memory_order_relaxed);
     if(measure) {
         struct query_io after=read_query_io();
-        ereport(NOTICE,(errmsg("SQLerate query IO available=%d device_reads=%llu device_read_bytes=%llu reclaim_scan_pages=%llu reclaim_steal_pages=%llu refault_file=%llu free_before_bytes=%llu free_after_bytes=%llu file_before_bytes=%llu file_after_bytes=%llu shmem_before_bytes=%llu shmem_after_bytes=%llu",
+        ereport(NOTICE,(errmsg("SQLerate query IO available=%d device_reads=%llu device_read_bytes=%llu reclaim_scan_pages=%llu reclaim_steal_pages=%llu refault_file=%llu free_before_bytes=%llu free_after_bytes=%llu file_before_bytes=%llu file_after_bytes=%llu shmem_before_bytes=%llu shmem_after_bytes=%llu active_file_before_bytes=%llu active_file_after_bytes=%llu inactive_file_before_bytes=%llu inactive_file_after_bytes=%llu",
             before.valid && after.valid,after.reads-before.reads,(after.sectors-before.sectors)*512,
             after.scan-before.scan,after.steal-before.steal,after.refault-before.refault,
-            before.free*os_page,after.free*os_page,before.file*os_page,after.file*os_page,before.shmem*os_page,after.shmem*os_page)));
+            before.free*os_page,after.free*os_page,before.file*os_page,after.file*os_page,before.shmem*os_page,after.shmem*os_page,
+            before.active_file*os_page,after.active_file*os_page,before.inactive_file*os_page,after.inactive_file*os_page)));
     }
 }
 static void finish(QueryDesc *query)

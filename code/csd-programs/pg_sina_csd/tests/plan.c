@@ -18,6 +18,7 @@ enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FAL
 static unsigned test_workers=4;
 static bool test_scheduled;
 static bool test_partitioned;
+static bool test_resident_group;
 static unsigned test_packed;
 /* Reservations must cover physical input even when filters/NDV estimates
  * are tiny, while unused string columns must not consume AFDM. */
@@ -727,6 +728,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     }
     if(parallel==TEST_HASH_GROUP) {
         a->hash=1; a->estimated_rows=12; a->expr.naggs=1; a->expr.nout=2;
+        if(test_resident_group) a->estimated_groups=200000;
         a->expr.aggs[0]=(struct qs_agg){.expr=2,.kind=Q_COUNT};
         a->expr.outputs[1]=(struct qs_output){.index=3,.type_oid=20};
     }
@@ -959,6 +961,10 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
                out->profile.operators[QS_AGG_SOURCE].calls<rows/8);
     }
     if(test_workers>4 && parallel) assert(out->metrics.workers==test_workers && control.epoch);
+    /* A blocking Hash Join starts its parent at 128 slots. The estimated
+     * complete table fits 64MiB; private partition tables would waste >32MiB
+     * even though these input rows need only a tiny resident aggregate. */
+    if(test_resident_group) assert(out->metrics.work_peak<16U*1024*1024 && !spill.count);
     if((parallel==TEST_GROUP_SOURCE || parallel==TEST_INDEX_EXPR) && !rows) assert(!got); else assert(got);
     if(parallel!=TEST_COUNT_ROWS && !grouped_build && parallel<TEST_PARTITION)
         for(unsigned i=0;i<12;++i) assert(!seen[i]);
@@ -2184,10 +2190,6 @@ static void multiple_group_aggregates(function run,unsigned memory,unsigned kind
         io=realloc(io,(workers+1)*QS_SORT_IO_BYTES); assert(io);
         leaf->parallel=1;
         a->estimated_rows=groups;
-        /* COUNT over DISTINCT has a blocking child, so its resident table
-         * starts at 128 slots despite this estimate. It must still avoid
-         * external partitions when the complete table fits (assert below). */
-        if(kind==Q_COUNT) a->estimated_groups=groups;
         if(test_partitioned) a->estimated_groups=100000000;
         qp_mark_parallel(p,1);
         if(kind==Q_COUNT) { p->nodes[3].estimated_rows=groups; qp_mark_parallel(p,3); }
@@ -2423,6 +2425,9 @@ int main(int argc,char **argv)
         function run=(function)dlsym(library,"pg_sina_plan"); assert(run);
         test_workers=4; test_scheduled=true;
         test(run,QP_LEFT,20003,23,64,2,TEST_HASH_GROUP);
+        test_resident_group=true;
+        test(run,QP_LEFT,20003,23,64,1,TEST_HASH_GROUP);
+        test_resident_group=false;
         multiple_groups(run,64,Q_SUM,0,test_workers);
         multiple_group_aggregates(run,64,Q_AVG,1,test_workers,GROUP_COUNTS);
         multiple_groups(run,64,Q_COUNT,0,test_workers);
