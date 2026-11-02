@@ -25,6 +25,7 @@ struct cache_relation {
     unsigned nsid,lba_bytes,count;
     BufferAccessStrategy strategy;
     const struct qs_extent *extents;
+    uint64 received,filled,cached,bulk_skipped,fragment_skipped;
 };
 static struct cache_relation *relations;
 static struct {
@@ -39,6 +40,7 @@ static struct {
     uint64 filled,cached,skipped,invalid,blocks,ns,minor_faults,major_faults;
     uint64 steps,max_step_ns,lookup_ns,allocate_ns,copy_ns;
     uint64 admission_pages,remaining_pages,capacity_skipped;
+    uint64 unmapped;
 } receiver={.fd=-1};
 static uint64 now_ns(void)
 {
@@ -82,6 +84,14 @@ void pg_sina_dcp_finish(void)
         receiver.allocate_ns/1e6,receiver.copy_ns/1e6,
         (unsigned long long)receiver.admission_pages,(unsigned long long)receiver.remaining_pages,
         (unsigned long long)receiver.capacity_skipped)));
+    if(pg_sina_profile) {
+        for(struct cache_relation *r=relations;r;r=r->next)
+            if(r->received) ereport(NOTICE,(errmsg("SQLerate DCP relation relid=%u bulk=%u received_bytes=%llu filled_pages=%llu cached_pages=%llu bulk_skipped_bytes=%llu fragment_skipped_bytes=%llu",
+                r->relid,r->strategy!=NULL,(unsigned long long)r->received,
+                (unsigned long long)r->filled,(unsigned long long)r->cached,
+                (unsigned long long)r->bulk_skipped,(unsigned long long)r->fragment_skipped)));
+        ereport(NOTICE,(errmsg("SQLerate DCP unmapped_bytes=%llu",(unsigned long long)receiver.unmapped)));
+    }
     if(receiver.data!=MAP_FAILED) munmap((void *)receiver.data,FEMU_CACHE_DATA_BYTES);
     if(receiver.slots!=MAP_FAILED) munmap(receiver.slots,FEMU_CACHE_PAGE_BYTES);
     close(receiver.fd); receiver.fd=-1;
@@ -185,11 +195,12 @@ static void fill_slot(unsigned slot,bool whole_slot)
                 }
             }
         }
-        if(!match) { receiver.skipped+=FEMU_CACHE_PAGE_BYTES; position+=FEMU_CACHE_PAGE_BYTES; continue; }
+        if(!match) { receiver.unmapped+=FEMU_CACHE_PAGE_BYTES; receiver.skipped+=FEMU_CACHE_PAGE_BYTES; position+=FEMU_CACHE_PAGE_BYTES; continue; }
         const struct pg_sina_cache_entry *cached=pg_sina_cache_lookup(match->node);
         uint64 target=cached?shared_target(match,cached):UINT64_MAX;
         if(match->strategy && cached && cached->shared_pages>=target) {
             uint64 take=Min(available,bytes-position);
+            match->received+=take; match->bulk_skipped+=take;
             receiver.skipped+=take; position+=take; continue;
         }
         if(!rel || RelationGetRelid(rel)!=match->relid) {
@@ -199,6 +210,7 @@ static void fill_slot(unsigned slot,bool whole_slot)
         uint64 take=Min(available,end-position);
         if(rel->rd_node.relNode!=match->filenode || logical%BLCKSZ || available<BLCKSZ) {
             take=Min(available,(uint64)(BLCKSZ-logical%BLCKSZ));
+            match->received+=take; match->fragment_skipped+=take;
             receiver.skipped+=take; position+=take; continue;
         }
         take=Min(available,end-position)/BLCKSZ*BLCKSZ;
@@ -230,9 +242,10 @@ static void fill_slot(unsigned slot,bool whole_slot)
                !(pg_atomic_read_u32(&GetBufferDescriptor(buffer-1)->state)&BM_DIRTY)) {
                 mark=pg_sina_profile?now_ns():0;
                 memcpy(BufferGetPage(buffer),page,BLCKSZ); ++receiver.filled;
+                ++match->filled;
                 --receiver.remaining_pages;
                 if(pg_sina_profile) receiver.copy_ns+=now_ns()-mark;
-            } else ++receiver.cached;
+            } else { ++receiver.cached; ++match->cached; }
             pg_sina_cache_buffer(buffer);
             /* These are existing immutable disk bytes: no WAL or dirty mark. */
             UnlockReleaseBuffer(buffer);
@@ -240,7 +253,7 @@ static void fill_slot(unsigned slot,bool whole_slot)
              * Retain the DMA slot until every slice has been consumed. */
             if(!whole_slot && now_ns()>=deadline) { take=offset+BLCKSZ; break; }
         }
-        position+=take;
+        match->received+=take; position+=take;
         if(!whole_slot && now_ns()>=deadline) break;
     }
     if(rel) relation_close(rel,AccessShareLock);
