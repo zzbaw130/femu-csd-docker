@@ -2184,6 +2184,10 @@ static void multiple_group_aggregates(function run,unsigned memory,unsigned kind
         io=realloc(io,(workers+1)*QS_SORT_IO_BYTES); assert(io);
         leaf->parallel=1;
         a->estimated_rows=groups;
+        /* COUNT over DISTINCT has a blocking child, so its resident table
+         * starts at 128 slots despite this estimate. It must still avoid
+         * external partitions when the complete table fits (assert below). */
+        if(kind==Q_COUNT) a->estimated_groups=groups;
         if(test_partitioned) a->estimated_groups=100000000;
         qp_mark_parallel(p,1);
         if(kind==Q_COUNT) { p->nodes[3].estimated_rows=groups; qp_mark_parallel(p,3); }

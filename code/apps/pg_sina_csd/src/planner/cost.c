@@ -981,8 +981,10 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
                     state=compact;
                     double capacity=state/(width+3*sizeof(uint32_t));
                     double rounds=ceil((build-capacity)/Max(1,capacity-Min(build,distinct)));
-                    /* Key decode/hash/compare at the growth barrier is serial. */
-                    p->serial+=rounds*capacity*3*cpu_operator_cost*pg_sina_host_cost_ms;
+                    /* The compact packed-key loop runs on one device CU.
+                     * Keep it serial, but use the same device instruction
+                     * price as hash_reindex, not PG tuple interpretation. */
+                    p->serial+=rounds*capacity*3*cpu_operator_cost*unit;
                 }
             }
             parallel_cpu(p,build*(cpu_tuple_cost+cpu_operator_cost*Max(1,n->nkeys))*unit,tasks[n->right],cus);

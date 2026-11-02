@@ -4609,6 +4609,12 @@ static int parallel_radix_begin(struct execution *s,unsigned id)
     unsigned workers=s->plan->workers;
     size_t reserve=group_spill_reserve(s)+workers*qs_sort_min_workspace();
     if(available<=reserve) return 0;
+    /* A blocking child makes the initial table deliberately small. That is
+     * not evidence that the complete resident table exceeds workmem. Keep
+     * the existing growing-table path whenever it fits the remaining budget. */
+    unsigned resident=o->group_capacity;
+    while(resident<UINT_MAX/2 && resident<groups*8/7) resident*=2;
+    if((size_t)resident*per_slot<=available-reserve) return 0;
     size_t table_budget=(available-reserve)*3/5/workers;
     unsigned capacity=128;
     while(capacity<UINT_MAX/2 && (size_t)capacity*2*per_slot<=table_budget) capacity*=2;
