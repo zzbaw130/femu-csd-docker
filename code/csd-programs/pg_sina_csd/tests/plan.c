@@ -17,6 +17,7 @@ typedef int64_t (*function)(struct femu_csd_args *);
 enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_INDEX_PIPELINE,TEST_INDEX_HASH,TEST_INDEX_CHAIN,TEST_INDEX_EXPR,TEST_DEVICE_IO,TEST_PACKED_KEYS,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL,TEST_PARTITION_PACKED, TEST_VECTOR_AGG=-1,TEST_JOIN_QUAL=-2,TEST_GROUP_SOURCE=-3,TEST_GROUP_SOURCE_SPILL=-4,TEST_BUILD_GROUP_SOURCE=-5,TEST_BUILD_GROUP_HAVING=-6,TEST_BUILD_GROUP_DIRECT=-7 };
 static unsigned test_workers=4;
 static bool test_scheduled;
+static bool test_partitioned;
 static unsigned test_packed;
 /* Reservations must cover physical input even when filters/NDV estimates
  * are tiny, while unused string columns must not consume AFDM. */
@@ -951,7 +952,8 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     if(parallel==TEST_DEVICE_IO && memory==4) assert(spill.count); /* namespace and spill reentry share one CU I/O AFDM */
     if(parallel==TEST_JOIN_QUAL && right_rows==150000) assert(spill.count);
     if(parallel==TEST_GROUP_SOURCE_SPILL) {
-        assert(spill.count && !plan->nodes[1].parallel);
+        assert(spill.count && (memory<64 || plan->nodes[1].parallel));
+        if(memory==64) assert(out->metrics.runs); /* Oversized radix partitions retain the sort fallback. */
         /* Source profiling must stay batched even with millions of groups. */
         assert(out->profile.operators[QS_AGG_SOURCE].calls &&
                out->profile.operators[QS_AGG_SOURCE].calls<rows/8);
@@ -2181,7 +2183,9 @@ static void multiple_group_aggregates(function run,unsigned memory,unsigned kind
         arena=realloc(arena,bytes); assert(arena); memset(arena+old,0,bytes-old);
         io=realloc(io,(workers+1)*QS_SORT_IO_BYTES); assert(io);
         leaf->parallel=1;
-        a->estimated_rows=groups; qp_mark_parallel(p,1);
+        a->estimated_rows=groups;
+        if(test_partitioned) a->estimated_groups=100000000;
+        qp_mark_parallel(p,1);
         if(kind==Q_COUNT) { p->nodes[3].estimated_rows=groups; qp_mark_parallel(p,3); }
     }
     *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=qp_scan_capacity(p,leaf),.ncols=columns};
@@ -2275,7 +2279,7 @@ static void multiple_group_aggregates(function run,unsigned memory,unsigned kind
         assert(p->pipelines[2].sink_ns<=p->pipelines[2].worker_ns);
     }
     assert(seen==groups && out->metrics.work_peak && out->metrics.work_peak<=(uint64_t)memory*1024*1024);
-    if(memory>=64) assert(!spill.count);
+    if(memory>=64 && !test_partitioned) assert(!spill.count);
     /* A single aggregate can now fit without spilling at 4 MiB. Wider
      * partial states still exceed that budget and exercise NVM reentry. */
     if(memory==4 && counts) assert(spill.count);
@@ -2419,6 +2423,18 @@ int main(int argc,char **argv)
         multiple_group_aggregates(run,64,Q_AVG,1,test_workers,GROUP_COUNTS);
         multiple_groups(run,64,Q_COUNT,0,test_workers);
         test(run,QP_INNER,1200003,23,64,2,TEST_GROUP_SOURCE_SPILL);
+        return 0;
+    }
+    if(argc==3 && !strcmp(argv[2],"--partitioned-aggregate-64m")) {
+        assert(!cs_work_init(64U*1024*1024));
+        function run=(function)dlsym(library,"pg_sina_plan"); assert(run);
+        test_workers=4; test_scheduled=true;
+        test(run,QP_INNER,1200003,23,64,2,TEST_GROUP_SOURCE_SPILL);
+        test_partitioned=true;
+        multiple_group_aggregates(run,64,Q_SUM,0,test_workers,GROUP_COUNTS);
+        multiple_group_aggregates(run,64,Q_AVG,1,test_workers,GROUP_COUNTS);
+        multiple_group_aggregates(run,64,Q_AVG,1,test_workers,GROUP_NUMERIC_EXTREMES);
+        test_partitioned=false;
         return 0;
     }
     if(argc==3 && !strcmp(argv[2],"--external-hash-64m")) {

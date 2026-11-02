@@ -255,8 +255,8 @@ static inline int qp_probe_scan(const struct qp_plan *p,int id)
         return qp_probe_scan(p,n->left);
     return -1;
 }
-/* A finalized resident Hash Aggregate can feed a new pipeline without
- * rescanning its input. Runtime spill still uses the serial merge source. */
+/* A Hash Aggregate feeds a new pipeline without rescanning its input.
+ * The runtime distributes resident groups or complete radix partitions. */
 static inline int qp_pipeline_source(const struct qp_plan *p,int id)
 {
     if(id<0) return -1;

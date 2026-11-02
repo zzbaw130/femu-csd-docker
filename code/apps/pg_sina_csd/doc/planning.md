@@ -1207,3 +1207,28 @@ HPCP复制新页后原先只置uptodate，现补一次Linux正常文件读取使
 #### Q4/Q19无明显收益的缓存改动回退（2026-11-02）
 
 按用户要求回退设备投递去重/空闲位图和DCP按驻留记录跳过导入：Q4查询延迟改善不足1%，Q19五次累计仅改善约1.8%，未消除首次转HOST后的回收读取，不保留这些策略变化。仅保留Guest连续页复用extent/已有文件引用（查找累计约63→38ms，发布语义不变），以及EXPLAIN已有聚合归并/Sort Source调用数的显示。AGENTS的逐SQL三次中位数和不实现缓存填充收益自动判别规则保留。后续Q18改造独立验证，不将缓存填充量改变算作并行聚合收益。
+
+#### 通用分区Hash聚合与并行外排Source（2026-11-02）
+
+参考本仓库DuckDB `radix_partitioned_hashtable.cpp`的AssignTask/Finalize/Scan分工，在设备SQL程序中实现分区聚合，不向固件或SNIA加入SQL语义。分组估计超过当前表容量时，生产CU使用有界私有Hash表，表满后自行输出精确key/value/count部分状态到按键哈希划分的分区流，再清表继续消费。无需把未消费原行交回协调CU清空共享表。原驻内存聚合及不满足分区条件的路径保留，不按查询编号判断。
+
+分区数根据估计组数、局部容量和实际剩余预算选取2的幂，上限64；扣除spill与Source最低工作集后，局部表取剩余预算的60%并按worker分配。所有表、64KiB尾块、token数组和元数据都由统一workmem计费。Source以原子游标领取完整分区，合并所有生产CU在其中的部分状态；同键不会跨分区，不需跨CU更新共享聚合值。某分区仍放不下时，领取者复用原有部分状态外排/排序归并，其他CU继续自己的分区；消费完成后领取下一分区，读完的spill块及时FREE。没有改变FDM、算子参数或NVMe协议。
+
+Source复用原有最终值列批次和向量HAVING/Projection/Join，AVG最后才除sum/count，保留NULL和Numeric精度。worker私有Sort的run数也汇入查询计数。EXPLAIN的`CSD Aggregate Merge CPU`现在包含worker与协调者，替代原有Coordinator命名；协调者CPU仍由各pipeline的`coordinator`单列，不与跨CU累计CPU混淆。
+
+只验收正式Q18，SF8、4CU、256MiB workmem、64MiB FDM、8GiB Guest；PG12.22，shared_buffers=2GiB、work_mem=16MiB、并行worker上限4。两组均`csd-without-hpcp`且关闭HPCP/DCP，每次重启PG并清Guest page cache，各三次。旧版取回退提交f5f9c0f69中的聚合源码，以同编译参数链接相同Scan/Sort等对象；SQL、固件、资源与计划选择保持一致。未跑全量。
+
+| Q18三次中位数 | 原版 | 分区聚合 |
+| --- | ---: | ---: |
+| 查询ms（按既有口径扣除ExecutorEnd主线程记录维护） | 29340.349 | 12864.453 |
+| 原始psql ms | 29352.960 | 12877.637 |
+| 整体CU利用率 | 36.99% | 66.66% |
+| spill读MiB | 1023.000 | 729.438 |
+| spill写MiB | 1023.000 | 729.438 |
+| 实际workmem峰值MiB | 209.06 | 143.20 |
+
+查询延迟降低56.15%，约2.28倍。整体利用率按每轮CSF CPU/(设备墙钟×4)计算后取三次中位数；不是用线程数替代利用率，也不跨不同SQL取中位数。主输入流水线11墙钟13205.121→6746.556ms、利用率39.3%→60.7%，协调CPU3518.540→0.045ms；原sink_delivery等待消失，改为各CU自己处理分区spill I/O。新增并行Source及后续处理流水线9约2104.222ms、利用率58.6%，四个worker均有实际CPU工作。各阶段可能有重叠，累计CPU与等待不能相加当作墙钟。
+
+六份正式对照结果均匹配HOST参考，组前后FDM为0；两个64MiB聚合单测覆盖并行外排Source、过大分区Sort回退、SUM/COUNT/AVG、NULL与Numeric精度，均通过。另作Q18超时取消后恢复，结果一致、FDM0，pgSinaPlannerCost通过；验证样本不混入三次中位数。
+
+仍存在64KiB spill重入和下一输入块等待，单个倾斜分区内的归并仍顺序，没有实现K-Way Merge Path或递归再分区；全局ORDER BY仍交给后续Sort。本轮没有新增分区聚合专属成本校准或重跑SQLerate/其他查询，不将性能改善外推为全量验收。三轮逐次时间、完整pipeline、资源和I/O见[Q18定向记录](../../../../results/q18-radix/report.md)，原始对照为`baseline/`和`optimized-final/`。
