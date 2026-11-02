@@ -161,25 +161,25 @@ TPC-H 验收只读取仓库 `tests/guest/queries/1.sql` 至 `22.sql` 及对应 `
 # 仓库主机：八表映射已准备时，不必每次重新 prepare
 bash tests/pg-sina-csd-test.sh tpch
 # Guest：默认全部 22 条，也可以只测指定编号
-sh /home/femu/tests/tpch-test.sh 7 9 13
-# Guest：只运行原生 PG，用于 HOST 配置对照
-TPCH_MODES=host-only sh /home/femu/tests/tpch-test.sh
+sh /home/femu/tests/tpch-cold.sh -n 3 7 9 13
+# Guest：统一配置五种路径，HOST对照从CSV的host_only_ms列读取
+sh /home/femu/tests/tpch-cold.sh -b 2GB -w 4 -m 16MB
 # Guest：每条SQL先以HOST预热一次，再测试目标模式三次
-TPCH_CACHE_MODES=warm sh /home/femu/tests/tpch-test.sh
+sh /home/femu/tests/tpch-warm.sh -n 3
 # Guest：仅Q19，从冷态连续执行五次，相邻执行固定间隔1秒
-TPCH_CACHE_MODES=repeat sh /home/femu/tests/tpch-test.sh 19
+sh /home/femu/tests/tpch-repeat.sh -n 5 19
 ```
 
-`scripts/guest/start-postgre.sh` 将原生 PG 对照配置写入数据目录：`max_parallel_workers_per_gather=4`、`shared_buffers=2GB`、`work_mem=16MB`。后续冷启动也沿用这些值；`work_mem` 是每个执行节点/worker 的额度，并非整条查询的总内存。每次基准的 `environment.log` 记录运行配置。
+三个测试入口以启动参数统一设置`max_parallel_workers_per_gather=4`、`shared_buffers=2GB`、`work_mem=16MB`，也可用选项修改；`work_mem`是每节点/worker额度。当前参数保存在结果目录`logs/<模式>/settings.txt`。
 与原默认配置的完整冷启动对照见 [原生 PG 配置对照](doc/host-configuration.md)。
 
 只保留标准规定的 Q2=100、Q3=10、Q10=20、Q18=100、Q21=100 行上限，其余查询不额外添加 LIMIT。查询参数、子查询写法和 Q15 的 CREATE VIEW/SELECT/DROP VIEW 均保持该目录原样。host 与 CSD 接收同一个文件，超时或错误直接记录为失败，不用手写参考 SQL 替代。
 
-`scripts/guest/cold-query.sh` 在每组开始时停止 PG、sync、清除 Guest page cache 并重启 PG；不重启 FEMU，以免丢失 RAM-backed NVM。cold每次执行均重新准备，warm/repeat组内不清缓存、不切模式。单独调用该脚本时profile默认关闭，正式TPC-H入口为记录计划默认开启，各模式保持一致。Q15 的计时是原始脚本中各 SQL 耗时之和，包含创建/删除视图，host/CSD 规则相同。
+全量统一使用三个入口，不再调用逐查询驱动拼接实验；公共执行复用`tpch-test.sh`。cold每次执行重新准备缓存，warm/repeat组内同连接且不清缓存、不切模式。Q15原始计时含创建/删除视图，各路径一致。三种测试结束后统一分析六份CSV，不边测边分析。格式、参数及缓存驻留口径见[测试说明](../../../tests/guest/README.md)。`cold-query.sh`仅供已有针对性组件测试，不作为全量入口。
 
 warm每条SQL、每种模式独立从冷态开始，先用host-only执行同一正式SQL一次预热，再在同一连接中用目标模式执行三次；不统一预热全表，不要求实际驻留100%。预热和连接初始化不计正式延迟。
 
-repeat每条SQL、每种模式独立从冷态开始，直接用目标模式执行五次。测试脚本仅在相邻执行之间用psql的shell命令停顿1秒，给异步观测缓冲时间；不执行pg_sleep等额外SQL，不在规划器中等待。五次共有四段停顿，停顿不计单次查询及五次查询时间之和；`protocol.txt`记录该规则。cold/warm不增加此间隔。新repeat结果不能与旧的零间隔组当成同一测试条件。
+repeat每条SQL、每种模式独立从冷态开始，默认连续五次，相邻执行停顿1秒给异步观测缓冲，停顿不计查询时间；`-n`可调整次数。cold/warm不增加间隔。
 
 profile开启时，`SQLerate query IO`在主进程统一采样所选命名空间的普通NVMe完成读字节、Linux扫描/回收页面及文件页refault计数，并保留执行前后的空闲、文件和共享内存页量。普通NVMe计数包含PG并行worker，不能再次相加；CSD内部LOAD和spill仍分别读取已有设备指标，不能把普通读为零解释为设备没有读NVM。这些计数用于单查询独占实验，其他并发访问会混入全局设备/回收统计。
 

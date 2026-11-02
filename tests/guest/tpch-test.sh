@@ -1,101 +1,146 @@
 #!/bin/sh
-# 唯一正式TPC-H入口；cold/warm默认3次，repeat默认连续5次。
-# auto_explain保留实际计划，不开启逐节点ANALYZE/TIMING。
+# 公共执行部分；全量测试从 tpch-cold/warm/repeat.sh 进入。
 set -eu
 export PATH=/home/femu/opt/postgres/release/bin:$PATH
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-QUERIES=$ROOT/queries
-PGDATABASE=${PGDATABASE:-tpch_s1}
-COLD=/home/femu/scripts/cold-query.sh
-MODES=${TPCH_MODES:-host-only filter-only csd-without-hpcp csd-with-hpcp SQLerate}
-CACHES=${TPCH_CACHE_MODES:-${PG_SINA_CACHE:-cold}}
-COLD_RUNS=${TPCH_COLD_RUNS:-3}
-WARM_RUNS=${TPCH_WARM_RUNS:-3}
-REPEAT_RUNS=${TPCH_REPEAT_RUNS:-5}
-for count in "$COLD_RUNS" "$WARM_RUNS" "$REPEAT_RUNS"; do
-    case "$count" in ''|*[!0-9]*|0) echo 'Run counts must be positive' >&2; exit 2 ;; esac
+kind=${TPCH_CACHE_MODE:?use tpch-cold.sh, tpch-warm.sh or tpch-repeat.sh}
+n=${TPCH_RUNS:-3}; buffers=2GB; workers=4; memory=16MB
+PGDATA=${PGDATA:-/data/tpch_s1}
+out=${TPCH_RESULTS:-}
+while getopts 'n:b:w:m:D:d:o:' option; do
+    case $option in
+        n) n=$OPTARG ;; b) buffers=$OPTARG ;; w) workers=$OPTARG ;;
+        m) memory=$OPTARG ;; D) PGDATA=$OPTARG ;; d) PGDATABASE=$OPTARG ;;
+        o) out=$OPTARG ;; *) exit 2 ;;
+    esac
 done
-for cache in $CACHES; do
-    case "$cache" in cold|warm|repeat) ;; *) echo "Invalid cache mode: $cache" >&2; exit 2 ;; esac
-done
-RESULTS=${TPCH_RESULTS:-$(mktemp -d /home/femu/results/tpch.XXXXXX)}
-mkdir -p "$RESULTS"
-chmod 755 "$RESULTS"
-echo "Results: $RESULTS"
-printf 'query,mode,latency_ms,result_match,execution_ok,cache,round,fdm_clean\n' > "$RESULTS/timings.csv"
-printf 'cache,query,mode,runs,median_ms,total_ms,all_valid\n' > "$RESULTS/groups.csv"
-export PG_SINA_PROFILE=${PG_SINA_PROFILE:-on}
-export PGOPTIONS="${PGOPTIONS:-} -c session_preload_libraries=pg_sina_csd,auto_explain -c auto_explain.log_min_duration=0 -c auto_explain.log_level=notice -c auto_explain.log_analyze=off -c auto_explain.log_timing=off -c auto_explain.log_format=json"
-printf '%s\n' "$PGOPTIONS" > "$RESULTS/pgoptions.txt"
-printf '%s\n' "$CACHES" > "$RESULTS/cache-mode.txt"
-printf 'cold=%s warm=%s repeat=%s profile=%s\n' "$COLD_RUNS" "$WARM_RUNS" "$REPEAT_RUNS" "$PG_SINA_PROFILE" > "$RESULTS/protocol.txt"
-printf 'repeat_idle_seconds=1 repeat_idle_in_query_latency=no\n' >> "$RESULTS/protocol.txt"
-psql -X -q -A -t -v ON_ERROR_STOP=1 -d "$PGDATABASE" \
-    -c "SELECT version()" -c "SHOW shared_buffers" -c "SHOW work_mem" \
-    -c "SHOW max_parallel_workers_per_gather" > "$RESULTS/environment.log" 2> "$RESULTS/environment.err"
-if [ "$#" -eq 0 ]; then set -- 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22; fi
-for query in "$@"; do
-    case "$query" in ''|*[!0-9]*) echo "Invalid query: $query" >&2; exit 2 ;; esac
-    [ -f "$QUERIES/$query.sql" ] || { echo "No query: $query" >&2; exit 2; }
-    sha256sum "$QUERIES/$query.sql"
-done > "$RESULTS/queries.sha256"
-failed=0
-for cache in $CACHES; do
-    case "$cache" in cold) runs=$COLD_RUNS ;; warm) runs=$WARM_RUNS ;; repeat) runs=$REPEAT_RUNS ;; esac
-    for query in "$@"; do
-        for mode in $MODES; do
-            dir=$RESULTS/$cache/$query/$mode
-            mkdir -p "$dir"
-            mode_valid=yes
-            groups=1; per_group=$runs
-            if [ "$cache" = cold ]; then groups=$runs; per_group=1; fi
-            group=1
-            while [ "$group" -le "$groups" ]; do
-                prefix=$dir/group$group
-                sudo nvme admin-passthru /dev/nvme0 --opcode=0xc0 --cdw10=2 > "$prefix.fdm.before" 2>&1
-                sudo cat /sys/kernel/debug/femu-cache/profile > "$prefix.cache.before"
-                status=0
-                PG_SINA_CACHE=$cache PG_SINA_RUNS=$per_group sh "$COLD" "$mode" "$QUERIES/$query.sql" > "$prefix.log" 2> "$prefix.err" || status=$?
-                sudo cat /sys/kernel/debug/femu-cache/profile > "$prefix.cache.after"
-                sudo nvme admin-passthru /dev/nvme0 --opcode=0xc0 --cdw10=2 > "$prefix.fdm.after" 2>&1
-                if [ "$status" -ne 0 ]; then
-                    failed=1; mode_valid=no
-                    echo "FAIL $cache Q$query $mode group=$group status=$status; see $prefix.err" >&2
+shift $((OPTIND-1))
+[ "$n" -gt 0 ]
+case $buffers in *G|*M) buffers=${buffers}B ;; esac
+case $memory in *G|*M) memory=${memory}B ;; esac
+export PGDATA PGDATABASE=${PGDATABASE:-${PGDATA##*/}}
+processes=$workers; [ "$processes" -ge 8 ] || processes=8
+out=${out:-/home/femu/results/tpch-$PGDATABASE}
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+[ "$#" -gt 0 ] || set -- 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22
+queries="$*"
+modes='host-only filter-only csd-without-hpcp csd-with-hpcp SQLerate'
+logs=$out/logs/$kind
+mkdir -p "$logs"
+tmp=$(mktemp -d /tmp/tpch-test.XXXXXX)
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+: > "$tmp/data"
+printf 'PGDATA=%s\nPGDATABASE=%s\nshared_buffers=%s\nmax_parallel_workers_per_gather=%s\nwork_mem=%s\n%s_runs=%s\n' \
+    "$PGDATA" "$PGDATABASE" "$buffers" "$workers" "$memory" "$kind" "$n" > "$logs/settings.txt"
+export PGOPTIONS="-c session_preload_libraries=pg_sina_csd,auto_explain"
+reset_cache() {
+    pg_ctl -D "$PGDATA" -m fast -w stop > /dev/null
+    sync
+    sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+    pg_ctl -D "$PGDATA" -l "$PGDATA/log" -w start -o "-c autovacuum=off -c shared_buffers=$buffers -c work_mem=$memory -c max_parallel_workers_per_gather=$workers -c max_parallel_workers=$processes -c max_worker_processes=$processes" > /dev/null
+}
+for q in $queries; do
+    rm -f "$tmp/reference"
+    for mode in $modes; do
+        first=1
+        while [ "$first" -le "$n" ]; do
+            last=$n; [ "$kind" != cold ] || last=$first
+            reset_cache
+            population=off; explain=-1
+            case $mode in csd-with-hpcp|SQLerate) population=on ;; esac
+            [ "$mode" != SQLerate ] || explain=0
+            {
+                printf "SET statement_timeout='300s'; SET pg_sina_csd.profile=off;\n"
+                if [ "$kind" = warm ]; then
+                    printf "SET pg_sina_csd.exe_path='host-only'; SET pg_sina_csd.hpcp=off; SET pg_sina_csd.dcp=off;\n"
+                    printf '\\o /dev/null\n\\i %s/queries/%s.sql\n\\o\n\\timing off\n' "$root" "$q"
                 fi
-                clean=yes
-                if ! grep -q 'result: 0x00000000' "$prefix.fdm.before" || ! grep -q 'result: 0x00000000' "$prefix.fdm.after"; then clean=no; failed=1; fi
-                # Markers are psql output only. Repeat has a fixed 1s shell
-                # sleep; no sampling SQL or settings run between executions.
-                awk -v prefix="$prefix" '
-                    /^TPCH_BEGIN / {run=$2; file=prefix "." run ".log"; printf "%s", "" > file; close(file); next}
-                    /^TPCH_END / {file=prefix "." $2 ".done"; printf "%s", "" > file; close(file); run=""; next}
-                    run!="" {print >> (prefix "." run ".log")}
-                ' "$prefix.log"
-                run=1
-                while [ "$run" -le "$per_group" ]; do
-                    round=$run; [ "$cache" != cold ] || round=$group
-                    log=$prefix.$run.log
-                    ok=no; match=no; elapsed=
-                    if [ -f "$prefix.$run.done" ]; then
-                        elapsed=$(awk '/^Time:/ {v+=$2; n++} END {if(n) printf "%.3f",v}' "$log")
-                        [ -z "$elapsed" ] || ok=yes
-                        sed '/^Time:/d; /^Timing is /d' "$log" > "$dir/$round.rows"
-                        reference=$RESULTS/$query.reference.rows
-                        if [ "$mode" = host-only ] && [ ! -f "$reference" ]; then cp "$dir/$round.rows" "$reference"; fi
-                        if [ -f "$reference" ] && cmp -s "$reference" "$dir/$round.rows"; then match=yes; fi
-                    fi
-                    if [ "$ok" != yes ] || [ "$match" != yes ] || [ "$clean" != yes ]; then failed=1; mode_valid=no; fi
-                    printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$query" "$mode" "$elapsed" "$match" "$ok" "$cache" "$round" "$clean" >> "$RESULTS/timings.csv"
-                    echo "$cache Q$query $mode run=$round ms=$elapsed match=$match ok=$ok fdm=$clean"
-                    run=$((run+1))
+                printf "SET pg_sina_csd.exe_path='%s'; SET pg_sina_csd.hpcp=%s; SET pg_sina_csd.dcp=%s; SET pg_sina_csd.profile=on;\n" "$mode" "$population" "$population"
+                printf "SET auto_explain.log_min_duration=%s; SET auto_explain.log_level=notice; SET auto_explain.log_format=text; SET auto_explain.log_analyze=off; SET auto_explain.log_timing=off;\n" "$explain"
+                r=$first
+                while [ "$r" -le "$last" ]; do
+                    printf '\\echo TPCH_BEGIN %s\n\\i %s/queries/%s.sql\n\\timing off\n\\echo TPCH_END %s\n' "$r" "$root" "$q" "$r"
+                    if [ "$kind" = repeat ] && [ "$r" -lt "$last" ]; then printf '\\! sleep 1\n'; fi
+                    r=$((r+1))
                 done
-                group=$((group+1))
+            } > "$tmp/driver.sql"
+            prefix=$logs/Q$q.$mode.$first
+            # SQL错误写入状态，继续完成全量；Q15的DROP VIEW也能正常执行。
+            psql -X -qAt -v ON_ERROR_STOP=0 -d "$PGDATABASE" -f "$tmp/driver.sql" > "$prefix.out" 2> "$prefix.err" || true
+            awk -v q="$q" -v mode="$mode" -v first="$first" -v last="$last" -v dir="$tmp" '
+                function value(key, s) { s=$0; sub(".*" key "=", "", s); sub(/[^0-9.].*/, "", s); return s+0 }
+                BEGIN { OFMT=CONVFMT="%.3f"; er=first-1 }
+                FILENAME==ARGV[1] {
+                    if($1=="TPCH_BEGIN") { r=$2; next }
+                    if($1=="TPCH_END") { done[r]=1; r=0; next }
+                    if(r && $1=="Time:") { total[r]+=$2; timed[r]++; next }
+                    if(r && $0!~/^Timing is /) print > (dir "/" r ".rows")
+                    next
+                }
+                /SQLerate cache resident / {
+                    er++; cache[er]=sprintf("shared=%.3f;file=%.3f;known=%.3f",value("shared_pct"),value("file_pct"),value("known_pct")); next
+                }
+                /SQLerate planner total_ms=/ { t=value("total_ms"); if(t>plan[er]) plan[er]=t }
+                /duration: .* ms  plan:/ { s=$0; sub(/^.*duration: /,"",s); duration=s+0 }
+                /Execution Mode: SQLerate/ { execution[er]=duration }
+                /Placement:/ { s=$0; sub(/^.*Placement: /,"",s); path[er]=s }
+                /cache ledger refresh reason=executor_end/ { ledger[er]+=value("wall_ms") }
+                /ERROR:|FATAL:/ { if(er<first) setup_error=1; else error[er]=1 }
+                END {
+                    for(r=first;r<=last;r++) {
+                        status=done[r] && timed[r] && !error[r] && !setup_error?"ok":"error";
+                        if(mode=="SQLerate" && status=="ok" && (!plan[r] || !(r in execution) || !path[r])) status="missing_metrics";
+                        printf "D\t%s\t%d\t%s\t%s\t%.3f\t%s\t%s\t%s\t%s\t%s\n",q,r,mode,timed[r]?sprintf("%.3f",total[r]):"",ledger[r],cache[r],plan[r],execution[r],path[r],status;
+                    }
+                }' "$prefix.out" "$prefix.err" >> "$tmp/data"
+            r=$first
+            while [ "$r" -le "$last" ]; do
+                [ -f "$tmp/$r.rows" ] || : > "$tmp/$r.rows"
+                if [ "$mode" = host-only ] && [ "$r" -eq 1 ]; then cp "$tmp/$r.rows" "$tmp/reference"; fi
+                match=match; cmp -s "$tmp/reference" "$tmp/$r.rows" || match=mismatch
+                printf 'C\t%s\t%s\t%s\t%s\n' "$q" "$r" "$mode" "$match" >> "$tmp/data"
+                rm -f "$tmp/$r.rows"
+                r=$((r+1))
             done
-            awk -F, -v cache="$cache" -v q="$query" -v mode="$mode" '$1==q && $2==mode && $6==cache && $5=="yes" {print $3}' "$RESULTS/timings.csv" | sort -n > "$dir/latencies.txt"
-            awk -v cache="$cache" -v q="$query" -v mode="$mode" -v valid="$mode_valid" ' {a[++n]=$1; sum+=$1} END {if(n) printf "%s,%s,%s,%d,%.3f,%.3f,%s\n",cache,q,mode,n,n%2?a[(n+1)/2]:(a[n/2]+a[n/2+1])/2,sum,valid}' "$dir/latencies.txt" >> "$RESULTS/groups.csv"
+            first=$((last+1))
         done
     done
+    sudo nvme admin-passthru /dev/nvme0 --opcode=0xc0 --cdw10=2 > "$logs/Q$q.fdm" 2>&1
+    clean=yes; grep -q 'result: 0x00000000' "$logs/Q$q.fdm" || clean=no
+    printf 'F\t%s\t%s\n' "$q" "$clean" >> "$tmp/data"
+    printf '%s Q%s finished\n' "$kind" "$q"
 done
-echo "Results: $RESULTS"
-echo 'Correctness, selected paths and performance targets must be assessed separately.'
-exit "$failed"
+# 只整理原始记录，不在执行过程中分析性能或改变模型。
+awk -F '\t' -v qs="$queries" -v modes="$modes" -v n="$n" -v kind="$kind" -v out="$out" '
+    function csv(s) { gsub(/"/,"\"\"",s); return "\"" s "\"" }
+    $1=="D" { k=$2 SUBSEP $3 SUBSEP $4; ms[k]=$5; ledger[k]=$6; cache[k]=$7; plan[k]=$8; exec[k]=$9; path[k]=$10; status[k]=$11 }
+    $1=="C" { check[$2 SUBSEP $3 SUBSEP $4]=$5 }
+    $1=="F" { clean[$2]=$3 }
+    END {
+        count=split(modes,m," "); split("host_only filter_only csd_without_hpcp csd_with_hpcp sqlerate",name," ");
+        timing=out "/" kind ".csv"; detail=out "/" kind "-sqlerate.csv";
+        header="id";
+        for(j=1;j<=count;j++) header=header "," name[j] "_ms";
+        for(j=1;j<=count;j++) header=header "," name[j] "_executor_end_ms";
+        if(kind!="cold") for(j=1;j<=count;j++) header=header "," name[j] "_cache_residency";
+        print header ",checks,fdm_clean" > timing;
+        print "id,planning_ms,execution_ms,total_ms,executor_end_ms,cache_residency,path,status" > detail;
+        nq=split(qs,q," ");
+        for(i=1;i<=nq;i++) for(r=1;r<=n;r++) {
+            id="Q" q[i] "-" r; row=id; checks="";
+            for(j=1;j<=count;j++) { k=q[i] SUBSEP r SUBSEP m[j]; row=row "," ms[k] }
+            for(j=1;j<=count;j++) { k=q[i] SUBSEP r SUBSEP m[j]; row=row "," ledger[k] }
+            if(kind!="cold") for(j=1;j<=count;j++) { k=q[i] SUBSEP r SUBSEP m[j]; row=row "," csv(cache[k]) }
+            for(j=1;j<=count;j++) {
+                k=q[i] SUBSEP r SUBSEP m[j]; s=status[k];
+                if(s=="ok" && check[k]!="match") s="mismatch";
+                if(s!="ok") bad=1;
+                checks=checks (j>1?";":"") m[j] "=" s;
+            }
+            if(clean[q[i]]!="yes") bad=1;
+            print row "," csv(checks) "," clean[q[i]] > timing;
+            k=q[i] SUBSEP r SUBSEP "SQLerate"; s=status[k]; if(s=="ok" && check[k]!="match") s="mismatch";
+            print id "," plan[k] "," exec[k] "," ms[k] "," ledger[k] "," csv(cache[k]) "," csv(path[k]) "," s > detail;
+        }
+        exit bad;
+    }' "$tmp/data"
+printf 'Saved %s/%s.csv and %s/%s-sqlerate.csv\n' "$out" "$kind" "$out" "$kind"

@@ -22,6 +22,7 @@ struct pg_sina_cache_entry {
 void pg_sina_cache_init(void);
 /* Publish only an already completed observation; never wait for the worker. */
 void pg_sina_cache_poll(void);
+void pg_sina_cache_profile(void);
 const struct pg_sina_cache_entry *pg_sina_cache_lookup(RelFileNode);
 void pg_sina_cache_buffer(int buffer);
 extern int pg_sina_exe_path;

@@ -17,7 +17,7 @@ case ${1:-build} in
         guest 'set -e; for table in region nation supplier customer part partsupp orders lineitem; do sudo /home/femu/opt/pg_sina_csd/build/pg-sina-csd-check "dbname=tpch_s1 user=femu" "public.$table"; done'
         ;;
     tpch)
-        guest 'sh /home/femu/tests/tpch-test.sh'
+        guest 'sh /home/femu/tests/tpch-cold.sh'
         ;;
     paths)
         guest 'sh /home/femu/tests/execution-path-test.sh'

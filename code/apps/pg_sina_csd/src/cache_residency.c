@@ -195,6 +195,22 @@ void pg_sina_cache_poll(void)
     struct file_job *job=atomic_exchange_explicit(&completed_files,NULL,memory_order_acq_rel);
     if(job) publish_files(job);
 }
+/* Read the existing bitmap counters only: no descriptor scan, mincore, SQL
+ * or wait in planning. The file observation may deliberately lag behind. */
+void pg_sina_cache_profile(void)
+{
+    if(!pg_sina_profile || !snapshot.valid || depth || refreshing || IsParallelWorker()) return;
+    HASH_SEQ_STATUS scan; hash_seq_init(&scan,snapshot.entries);
+    struct pg_sina_cache_entry *entry;
+    double blocks=0,shared=0,pages=0,file=0,known=0;
+    while((entry=hash_seq_search(&scan))) {
+        blocks+=entry->blocks; shared+=entry->shared_pages;
+        pages+=entry->file_total;
+        if(entry->file_known) { file+=entry->file_pages; known+=entry->file_total; }
+    }
+    ereport(NOTICE,(errmsg("SQLerate cache resident shared_pct=%.3f file_pct=%.3f known_pct=%.3f generation=%u",
+        blocks?100*shared/blocks:0,pages?100*file/pages:0,pages?100*known/pages:0,snapshot.generation)));
+}
 static void *observe_loop(void *unused)
 {
     struct file_job *metadata=NULL;

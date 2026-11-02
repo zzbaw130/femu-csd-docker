@@ -48,7 +48,7 @@ cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,f
 ./tests/passthru-test.sh build <nvme dev> <options>
 
 # PostgreSQL host/CSD 冷启动对照，只使用 tests/guest/queries 的 22 条 SQL
-./tests/test-guest.sh tpch-test.sh
+./tests/test-guest.sh tpch-cold.sh
 
 # ssh到guest内部
 ./scripts/ssh-guest.sh
@@ -57,15 +57,17 @@ cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,f
 TPC-H 三种测试模式遵循 `AGENTS.md`。在 Guest 内指定当前数据库后运行完整实验：
 
 ```sh
-export PGDATA=/data/tpch_s8 PGDATABASE=tpch_s8
-TPCH_CACHE_MODES='cold warm repeat' sh /home/femu/tests/tpch-test.sh
+export PGDATA=/data/tpch_s4 PGDATABASE=tpch_s4
+sh /home/femu/tests/tpch-cold.sh -n 3 -o /home/femu/results/tpch-sf4
+sh /home/femu/tests/tpch-warm.sh -n 3 -o /home/femu/results/tpch-sf4
+sh /home/femu/tests/tpch-repeat.sh -n 5 -o /home/femu/results/tpch-sf4
 ```
 
-默认只测 `cold`；可在脚本后传查询编号作针对性验证。`TPCH_COLD_RUNS`、`TPCH_WARM_RUNS`、`TPCH_REPEAT_RUNS` 分别默认 3、3、5。冷组每次清两层缓存；热组只用目标 SQL 的 `host-only` 预热一次，再连续测三次；重复组从冷态直接连续测五次。warm/repeat 组内使用同一连接，不插入采样 SQL、清缓存或等待。预热不计入统计，不再统一填充所有表。
+三个入口默认次数分别为3、3、5，可用`-n`调整。`-b/-w/-m`配置shared_buffers、每Gather并行worker、work_mem，默认2GB/4/16MB。选项后可传查询编号做针对性检查。warm先HOST预热一次，repeat从冷态开始且相邻执行间隔1秒；组内同一连接，不插入采样SQL。详见[测试说明](tests/guest/README.md)。
 
 五个 `exe_path` 保持现有名称：`host-only`、`filter-only`、`csd-without-hpcp`、`csd-with-hpcp`、`SQLerate`。其中后两者在本实验同时开启 HPCP/DCP，前三者关闭两种填充；`csd-without-hpcp`/`csd-with-hpcp` 对应实验中的“无缓存填充/有缓存填充”完整 CSD 对照。各模式的配置和资源不另行特化。
 
-结果目录包含每次输出、同组 JSON 实际计划日志、`timings.csv`（逐次延迟和正确性）、`groups.csv`（中位数及累计延迟）。Q15 保留原脚本的 CREATE/SELECT/DROP 总耗时。默认开启扩展 profile 以保存规划、设备内存/spill 和阶段计时，auto_explain 不开启逐节点 ANALYZE/TIMING；最终分析单列前台缓存记录维护，不能将累计并行工作量直接相加作为查询耗时。
+三个入口共保存六份原始CSV，每份22×n行，编号Q1-1；主表并列五种模式，SQLerate详情另存规划/执行/总时间和路径，warm/repeat附缓存驻留。原始日志与配置在logs下，只有SQLerate记录auto_explain文本计划，不开启节点ANALYZE/TIMING。三种全量全部完成后才统一从CSV分析并输出report，不逐SQL分析或中途改模型。Q15总时间含CREATE/SELECT/DROP，ExecutorEnd维护时间单列，不覆盖原始时间。
 
 想换数据规模：`./scripts/sh-guest.sh guest/start-postgre.sh -f 1`（`-f` 强制重新解压，SF 见 `data/`）。
 
@@ -90,7 +92,10 @@ TPCH_CACHE_MODES='cold warm repeat' sh /home/femu/tests/tpch-test.sh
 │   ├── test-guest.sh                # 在 guest 里执行 tests/guest/<name>
 │   ├── passthru-test.sh             # CSD passthru smoke test
 │   └── guest/
-│       ├── tpch-test.sh             # 唯一 TPC-H 验收：host/CSD 冷启动对照
+│       ├── tpch-test.sh             # 三个入口共用执行与CSV整理
+│       ├── tpch-cold.sh             # 完全冷启动n次
+│       ├── tpch-warm.sh             # HOST预热一次，再测n次
+│       ├── tpch-repeat.sh           # 从冷态连续执行n次
 │       └── queries/                 # 1..22 的 <n>.sql 与 <n>.explain.sql
 ├── code/
 │   ├── FEMU/                        # FEMU 源码（改这里，容器里编译）

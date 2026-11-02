@@ -43,6 +43,7 @@ static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,Param
     PG_TRY();
     {
         pg_sina_cache_poll();
+        pg_sina_cache_profile();
         mark=pg_sina_planner_clock();
         if(pg_sina_exe_path>=PG_SINA_CSD) {
             Query *candidate=copyObject(parse);

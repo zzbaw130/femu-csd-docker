@@ -59,7 +59,7 @@ Q13/Q18 的补采使用原始 SQL，通过 auto_explain 开启 ANALYZE、BUFFERS
 Guest 运行：
 
 ```sh
-TPCH_MODES=host-only sh /home/femu/tests/tpch-test.sh
+sh /home/femu/tests/tpch-cold.sh -n 3 -b 2GB -w 4 -m 16MB
 ```
 
-脚本在首次冷启动执行后记录实际运行配置，默认不设置 TPCH_MODES 时仍测试原来的五种执行路径。本次未重新测量 CSD，不用旧 CSD 记录宣称新配置下的加速比。
+当前统一入口记录配置并测试五种路径，HOST对照读取cold.csv的host_only_ms列；本节历史实验只测原生PG，不用旧CSD记录宣称新配置下的加速比。
