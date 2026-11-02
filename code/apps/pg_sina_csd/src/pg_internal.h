@@ -37,6 +37,7 @@ bool pg_sina_dcp_poll(bool whole_slot);
 void pg_sina_dcp_finish(void);
 extern double pg_sina_host_cost_ms, pg_sina_csd_cpu_ratio;
 extern double pg_sina_internal_mbps, pg_sina_pcie_mbps, pg_sina_cache_mbps;
+extern double pg_sina_internal_read_iops;
 extern double pg_sina_internal_write_mbps;
 extern double pg_sina_result_batch_ms, pg_sina_parallel_task_ms;
 extern bool pg_sina_profile;

@@ -55,6 +55,22 @@ int main(void)
     CHECK(cost_index_clustered_pages(random_pages,1000000,10000,0)==random_pages);
     CHECK(cost_index_clustered_pages(random_pages,1000000,10000,1)<=10000);
     CHECK(cost_index_clustered_pages(random_pages,1000000,10000,0.5)>10000);
+    CHECK(cost_index_tree_pages(10000,1,128,32,256,0,0)==0);
+    CHECK(cost_index_tree_pages(1000000,100000,128,32,256,0,0)>
+        cost_index_tree_pages(1000000,100000,128,32,256,1,0));
+    CHECK(cost_index_tree_pages(1000000,100000,128,1024,256,0,0)<
+        cost_index_tree_pages(1000000,100000,128,32,256,0,0));
+    CHECK(cost_index_tree_pages(1000000,1000,128,32,256,0,100000)>
+        cost_index_tree_pages(1000000,1000,128,32,256,0,0));
+    /* The small-read service bottleneck survives unlimited transfer BW;
+     * a transfer bottleneck survives arbitrarily high IOPS. Same bound at
+     * SF1/2/8 footprints, no dataset-dependent threshold or CU multiplier. */
+    for(unsigned scale=1;scale<=8;scale*=2) {
+        double reads=scale*100000.0,bytes=reads*8192;
+        CHECK(cost_index_read_ms(bytes,reads,5000,250000)==reads/250);
+        CHECK(cost_index_read_ms(bytes,reads,100,1000000000)==bytes/100000);
+        CHECK(cost_index_read_ms(bytes,reads,5000,250000)>=cost_index_read_ms(bytes,reads,5000,500000));
+    }
     CHECK(cost_index_heap_visits(100,4,50,1)==100);
     CHECK(cost_index_heap_visits(100,4,50,0)==400);
     CHECK(cost_index_heap_visits(0,4,50,0)==0);

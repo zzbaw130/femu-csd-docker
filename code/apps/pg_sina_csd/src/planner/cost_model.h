@@ -72,6 +72,31 @@ static inline double cost_index_clustered_pages(double random,double visits,doub
     double weight=cost_min(1,correlation*correlation);
     return random*(1-weight)+cost_population_pages(visits,pages)*weight;
 }
+/* A cursor protects the root only. Intermediate B-tree levels share the
+ * bounded Index cache with leaves; count their evictions too. */
+static inline double cost_index_tree_pages(double probes,double leaves,double fanout,
+    double cache,double batch,double correlation,double churn)
+{
+    double result=0,pages=leaves;
+    while(pages>1 && fanout>1) {
+        pages=ceil(pages/fanout);
+        if(pages<=1) break;
+        /* The clock cursor evicts hot non-root pages too. A level fitting
+         * its estimated share is not permanently pinned against Heap/leaf
+         * insertions. Ordered keys need only their current ancestor page. */
+        double rotations=churn/(QS_INDEX_CACHE-1);
+        double random=cost_max(cost_index_pages(probes,pages,cache,batch),
+            cost_min(probes,rotations*cost_min(pages,cache)));
+        double ordered=cost_max(cost_population_pages(probes,pages),cost_min(probes,rotations));
+        double weight=cost_min(1,correlation*correlation);
+        result+=random*(1-weight)+ordered*weight;
+    }
+    return result;
+}
+/* Aggregate small-read service and transfer are bounds on the same I/O
+ * stage, not two copies of the payload. Never multiply IOPS by CU count. */
+static inline double cost_index_read_ms(double bytes,double requests,double mbps,double iops)
+{ return cost_max(bytes/(mbps*1000),requests*1000/iops); }
 /* Expected candidates inspected until the first success, including the
  * no-match case. Predicate independence is the same statistical assumption
  * used for scan selectivity; unknown residuals keep the full scan. */

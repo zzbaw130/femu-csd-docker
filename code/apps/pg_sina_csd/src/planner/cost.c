@@ -290,7 +290,7 @@ void pg_sina_cost_host_lookup(PlannerInfo *root,Path *path,JoinPathExtraData *ex
 {
     if(!IsA(path,NestPath)) return;
     NestPath *native=(NestPath *)path; Path *inner=native->innerjoinpath;
-    if(!IsA(inner,IndexPath) || inner->rows<=1) return;
+    if(!IsA(inner,IndexPath)) return;
     Oid index=((IndexPath *)inner)->indexinfo->indexoid;
     struct residency *volatile relation=NULL; const struct host_scan_cost *price=NULL; ListCell *c,*s;
     foreach(c,*observations) {
@@ -1008,20 +1008,18 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
             scan_bytes+=read; cache_bytes+=hit;
             population_bytes+=read*cost_population_fraction(pg_sina_hpcp_enabled(),pg_sina_dcp,relation->fraction,relation->shared);
             double read_ms=transfer_ms(read,pg_sina_internal_mbps);
-            io+=read_ms;
+            io+=n->ordered_index && !(n->ordered_index&2)?
+                cost_index_read_ms(read,read/BLCKSZ,pg_sina_internal_mbps,pg_sina_internal_read_iops):read_ms;
             blocks+=ceil(read/(n->ordered_index?QS_INDEX_READS*QS_PAGE:tree->scan_bytes));
             /* References, literals and bound parameters do not execute a
              * scalar operator. Charge actual operations, not all IR nodes. */
             bool direct=tree->count==1 && tree->nodes[tree->root].kind==QP_SCAN && !tree->ninit;
             unsigned operations=cost_expression_ops(&n->expr);
-            /* All scans share the same Heap walker: stop after the last
-             * required column. Returning PG values versus internal cells
-             * changes materialization below, not how far Heap is walked. */
-            unsigned prefix=1;
-            for(unsigned col=0;col<n->expr.nattrs;++col)
-                if(n->expr.cols[col].slot>=0) prefix=col+1;
-            double decode=(double)prefix/Max(1,n->expr.nattrs);
-            work=input*(cpu_tuple_cost*decode*pg_sina_host_cost_ms+cpu_operator_cost*operations*unit)+
+            /* PG's cpu_tuple_cost is the fixed tuple visit, not an average
+             * attribute-deformation price. Page/line-pointer/header checks
+             * still execute when only an early column is needed. Projection
+             * reduces expression/output work, never this fixed base. */
+            work=input*(cpu_tuple_cost*pg_sina_host_cost_ms+cpu_operator_cost*operations*unit)+
                 rows*(direct?(cpu_tuple_cost+cpu_operator_cost*n->expr.nout)*pg_sina_host_cost_ms:cpu_tuple_cost*unit);
             parallel_cpu(p,work,tasks[i],cus);
         } else if(n->kind==QP_JOIN && n->hash && right) {
@@ -1121,28 +1119,39 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
                probe_rel==right->expr.relid && probe_att==access->build_key)
                 heap_visits=cost_index_window_misses(heap_visits,matches,heap->tuples/pages,
                     (double)tree->scan_bytes/BLCKSZ,correlation);
-            index_pages=cost_index_pages(leaf_visits,leaves,QS_INDEX_CACHE/2,QS_INDEX_KEYS);
-            heap_pages=cost_index_pages(heap_visits,pages,QS_INDEX_CACHE/2,
+            double cursors=tasks[i]>1?Min(slots,Max(1,tasks[i])):1;
+            double heap_cache=(QS_INDEX_CACHE-1)/2.0,index_cache=heap_cache/Max(1,levels-1);
+            index_pages=cursors*cost_index_pages(leaf_visits/cursors,leaves,index_cache,QS_INDEX_KEYS);
+            heap_pages=cursors*cost_index_pages(heap_visits/cursors,pages,heap_cache,
                 QS_INDEX_KEYS*Max(1,heap_visits/Max(1,input)));
+            double ordered=0;
             /* A key correlated with the driving Heap remains clustered
              * through projections/Hash probes. Such batches revisit nearby
              * leaf/Heap pages; random keys keep the cursor-eviction model. */
             probe_year=false;
-            /* Residual/early-stop probes have a conditional access pattern;
-             * keep their conservative cache estimate instead of assuming
-             * the complete INNER equality traversal. */
-            if(n->join_type==QP_INNER && n->join_qual<0 && scan>=0 &&
+            /* Early stop changes the number of Heap visits, accounted for
+             * above, not the order of the driving keys. Cache locality is
+             * an input property for INNER/SEMI/ANTI alike. */
+            if(scan>=0 &&
                column_origin(tree,n->left,left->expr.outputs[n->left_keys[0]].index,
                     &probe_rel,&probe_att,&probe_year) && !probe_year &&
                probe_rel==tree->nodes[scan].expr.relid) {
-                double ordered=column_correlation(probe_rel,probe_att);
+                /* OIDs alone cannot distinguish two aliases of one Heap. */
+                unsigned aliases=0;
+                for(unsigned j=0;j<tree->count;++j)
+                    if(used[j] && tree->nodes[j].kind==QP_SCAN && tree->nodes[j].expr.relid==probe_rel) ++aliases;
+                if(aliases==1) ordered=column_correlation(probe_rel,probe_att);
                 index_pages=cost_index_clustered_pages(index_pages,leaf_visits,leaves,ordered);
                 heap_pages=cost_index_clustered_pages(heap_pages,heap_visits,pages,ordered*correlation);
             }
-            index_pages+=input>0?copies*levels:0;
+            double churn=index_pages+heap_pages;
+            double internal_random=cursors*cost_index_tree_pages(input/cursors,leaves,fanout,index_cache,QS_INDEX_KEYS,0,churn/cursors);
+            double internal_ordered=cost_index_tree_pages(input,leaves,fanout,index_cache,QS_INDEX_KEYS,1,churn);
+            index_pages+=internal_random*(1-ordered*ordered)+internal_ordered*ordered*ordered;
+            index_pages+=input>0?cursors:0; /* One protected root per cursor. */
             double index_bytes=index_pages*BLCKSZ,heap_bytes=heap_pages*BLCKSZ;
             double read=index_bytes+heap_bytes;
-            io+=transfer_ms(read,pg_sina_internal_mbps);
+            io+=cost_index_read_ms(read,index_pages+heap_pages,pg_sina_internal_mbps,pg_sina_internal_read_iops);
             double population_index=cost_population_pages(index_pages,leaves)*BLCKSZ*
                 cost_population_fraction(pg_sina_hpcp_enabled(),pg_sina_dcp,index->fraction,index->shared);
             double population_heap=cost_population_pages(heap_pages,pages)*BLCKSZ*
@@ -1174,7 +1183,11 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
                 if(sink_source>=0 && group_tasks>1) pipeline_cpu[sink_source]+=p->parallel-previous_parallel;
                 previous_parallel=p->parallel;
                 if(locals) parallel_cpu(p,slots*groups*n->expr.naggs*cpu_operator_cost*unit,ceil(groups/QP_VECTOR_ROWS),cus);
-                else if(group_tasks>1) p->serial+=input*cpu_operator_cost*Max(1,n->nkeys)*unit;
+                /* A shared update visits/publishes the group record as well
+                 * as comparing keys. Keep the existing contention proxy,
+                 * but do not price it as key arithmetic alone. Private/radix
+                 * tables avoid this shared-record term. */
+                else if(group_tasks>1) p->serial+=input*(cpu_tuple_cost+cpu_operator_cost*Max(1,n->nkeys))*unit;
                 p->combine+=groups*n->expr.naggs*cpu_operator_cost*unit;
                 if(table>available) {
                     /* Match plan.c::parallel_radix_begin: private tables use
@@ -1198,7 +1211,7 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
                         double blocks=floor(partial/(slots*partitions*block_rows))*slots*partitions;
                         spill=2*blocks*QS_SORT_IO_BYTES;
                         state=capacity*stride*slots+tails+reserve;
-                        p->serial-=input*cpu_operator_cost*Max(1,n->nkeys)*unit;
+                        p->serial-=input*(cpu_tuple_cost+cpu_operator_cost*Max(1,n->nkeys))*unit;
                         p->combine-=groups*n->expr.naggs*cpu_operator_cost*unit;
                         parallel_cpu(p,partial*(cpu_tuple_cost+cpu_operator_cost*(n->nkeys+n->expr.naggs))*unit+
                             transfer_ms(2*partial*cost_group_stride(n),pg_sina_cache_mbps),
