@@ -185,17 +185,22 @@ static int publish_slot(struct receiver *r,unsigned index,bool hpcp,bool acquire
      * free pages; optional allocation must never initiate direct reclaim. */
     bool admit=global_zone_page_state(NR_FREE_PAGES)>totalram_pages()/8;
     full=hpcp && !admit;
+    struct mapping *binding=NULL;
     if(hpcp) for(unsigned p=0;p<count;p++) {
         if(timing) mark=ktime_get_ns();
         struct file *file=NULL;
         u64 offset=0,at=physical+(u64)p*PAGE_SIZE;
-        struct mapping *map;
-        list_for_each_entry(map,&r->bindings,list) {
-            if(map->range.nsid==le32_to_cpu(slot->nsid) && at>=map->range.lba_bytes &&
-               at-map->range.lba_bytes<map->range.bytes) {
-                file=get_file(map->file); offset=map->range.file_offset+at-map->range.lba_bytes; break;
+        /* One LOAD normally remains inside one registered extent. Reuse
+         * that mapping instead of searching every extent for every 4KiB. */
+        if(!binding || at<binding->range.lba_bytes || at-binding->range.lba_bytes>=binding->range.bytes) {
+            struct mapping *map;
+            binding=NULL;
+            list_for_each_entry(map,&r->bindings,list) {
+                if(map->range.nsid==le32_to_cpu(slot->nsid) && at>=map->range.lba_bytes &&
+                   at-map->range.lba_bytes<map->range.bytes) { binding=map; break; }
             }
         }
+        if(binding) { file=binding->file; offset=binding->range.file_offset+at-binding->range.lba_bytes; }
         if(timing) { u64 now=ktime_get_ns(); lookup+=now-mark; mark=now; }
         if(!file) { atomic64_add(PAGE_SIZE,&skipped); continue; }
         struct folio *folio=__filemap_get_folio(file->f_mapping,offset>>PAGE_SHIFT,
@@ -206,7 +211,7 @@ static int publish_slot(struct receiver *r,unsigned index,bool hpcp,bool acquire
             if(!admit || PTR_ERR(folio)==-ENOMEM) {
                 atomic64_add(PAGE_SIZE,&capacity_skipped); full=true;
             }
-            fput(file); continue;
+            continue;
         }
         if(folio_test_uptodate(folio) || folio_test_dirty(folio) || folio_order(folio)) {
             if(folio_test_uptodate(folio) && !folio_test_dirty(folio)) atomic64_add(PAGE_SIZE,&cached);
@@ -222,7 +227,7 @@ static int publish_slot(struct receiver *r,unsigned index,bool hpcp,bool acquire
             if(timing) copy_time+=ktime_get_ns()-mark;
             atomic64_add(PAGE_SIZE,&filled);
         }
-        folio_unlock(folio); folio_put(folio); fput(file);
+        folio_unlock(folio); folio_put(folio);
     }
     if(timing) mark=ktime_get_ns();
     for(unsigned p=0;p<count;p++)

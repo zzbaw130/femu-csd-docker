@@ -33,6 +33,8 @@ typedef struct FemuCacheRing {
     QemuMutex slots_lock; /* Guest credit probes never hold the CU/FTL lock. */
     bool busy[FEMU_CACHE_RX_SLOTS], stopping;
     unsigned active, next;
+    uint8_t *sent; /* One bit per namespace page, scoped to this receiver. */
+    uint64_t npages, offered_bytes, duplicate_bytes, dma_bytes;
 } FemuCacheRing;
 struct FemuCacheItem {
     struct {
@@ -204,6 +206,7 @@ struct FemuCsdState {
     unsigned cache_work; /* retained LOAD blocks */
     unsigned cache_dirty; /* retirement scan only after a state change */
     FemuCacheItem cache[128];
+    uint64_t cache_free[2]; /* cache_lock; preserve lowest-free-index order. */
     uint64_t *cu_next_avail;    /* when each compute unit is free again */
     QemuThread *workers;        /* one per compute unit */
     QemuCond job_cond;
@@ -455,6 +458,7 @@ static void csd_init(FemuCtrl *n, NvmeNamespace *ns, Error **errp)
     csd = g_new0(FemuCsdState, 1);
     csd->params = n->csd_params;
     csd->cache_next = 1;
+    csd->cache_free[0]=csd->cache_free[1]=UINT64_MAX;
     csd->fdm_capacity = n->csd_params.fdm_size_mb * MiB;
     csd->next_afdm_id = 1;
     csd->next_group_id = 1;
@@ -2017,12 +2021,27 @@ static void csd_cache_publish(FemuCsdState *csd, FemuCsdGraphNode *v, uint64_t n
     if (!v->cache_candidate || !v->graph->session->cache_ring) return;
     v->cache_candidate=false;
     qemu_mutex_lock(&csd->cache_lock);
-    FemuCacheItem *item = NULL;
-    for (unsigned i = 0; i < ARRAY_SIZE(csd->cache); i++)
-        if (!csd->cache[i].event.token) { item = &csd->cache[i]; break; }
-    if (!item) {
+    FemuCacheRing *ring=v->graph->session->cache_ring;
+    uint64_t page=(v->cache_lba << v->graph->session->ns->lbaf.lbads)/FEMU_CACHE_PAGE_BYTES;
+    uint64_t pages=v->cache_bytes/FEMU_CACHE_PAGE_BYTES;
+    ring->offered_bytes+=v->cache_bytes;
+    bool duplicate=!((v->cache_lba << v->graph->session->ns->lbaf.lbads)%FEMU_CACHE_PAGE_BYTES) &&
+        page<ring->npages && pages<=ring->npages-page;
+    for(uint64_t p=page;duplicate && p<page+pages;++p)
+        duplicate=(ring->sent[p/8]&(1U<<(p%8)))!=0;
+    /* Successful deliveries only. Do not search the retained-block queue on
+     * every read: population must not delay the FTL for optional coalescing. */
+    if(duplicate) {
+        ring->duplicate_bytes+=v->cache_bytes;
+        qemu_mutex_unlock(&csd->cache_lock); return;
+    }
+    unsigned word=csd->cache_free[0]?0:1;
+    uint64_t free_bits=csd->cache_free[word];
+    if (!free_bits) {
         qatomic_inc(&csd->cache_dropped); qemu_mutex_unlock(&csd->cache_lock); return;
     }
+    FemuCacheItem *item=&csd->cache[word*64+__builtin_ctzll(free_bits)];
+    csd->cache_free[word]=free_bits&(free_bits-1);
     *item = (FemuCacheItem){ .graph=v->graph,
         .node=v-v->graph->nodes, .internal_read=v->job!=NULL,
         .session=v->graph->session->id,
@@ -2069,6 +2088,8 @@ static void csd_cache_finish(FemuCsdState *csd, FemuCacheItem *item)
 {
     FemuCsdGraph *g = item->graph;
     item->event.token=0;
+    unsigned slot=item-csd->cache;
+    csd->cache_free[slot/64]|=UINT64_C(1)<<(slot%64);
     qatomic_dec(&csd->cache_work);
     if (g) { g->cache_pending--; csd_cache_wake_graph(csd,g); }
 }
@@ -2088,7 +2109,10 @@ static void csd_cache_ring_stop(FemuCsdState *csd,FemuCsdSession *session)
         }
     }
     qatomic_set(&csd->cache_dirty,1);
-    session->cache_ring=NULL; qemu_mutex_destroy(&ring->slots_lock); g_free(ring);
+    if(session->profile) fprintf(stderr,"CACHE_RING session=%u offered_bytes=%" PRIu64
+        " duplicate_bytes=%" PRIu64 " dma_bytes=%" PRIu64 "\n",
+        session->id,ring->offered_bytes,ring->duplicate_bytes,ring->dma_bytes);
+    session->cache_ring=NULL; qemu_mutex_destroy(&ring->slots_lock); g_free(ring->sent); g_free(ring);
     qemu_mutex_unlock(&csd->cache_lock);
 }
 static uint16_t csd_cache_control(FemuCtrl *n,NvmeCmd *cmd)
@@ -2117,6 +2141,8 @@ static uint16_t csd_cache_control(FemuCtrl *n,NvmeCmd *cmd)
     } else if(!session || session->cache_ring) {
         qemu_mutex_unlock(&csd->lock); goto invalid;
     } else {
+        ring->npages=(le64_to_cpu(session->ns->id_ns.nsze) << session->ns->lbaf.lbads)/FEMU_CACHE_PAGE_BYTES;
+        ring->sent=g_malloc0(DIV_ROUND_UP(ring->npages,8));
         qemu_mutex_init(&ring->slots_lock);
         session->cache_ring=ring;
     }
@@ -2241,7 +2267,15 @@ static bool csd_cache_dma(FemuCsdState *csd)
         qatomic_set(&csd->cache_dirty,1);
         if(failed) qatomic_inc(&csd->cache_dropped);
         if(publish) item->dma_ns=end;
+        uint64_t physical=item->event.lba << n->namespaces[item->event.nsid-1].lbaf.lbads;
+        if(publish && !failed && !(physical%FEMU_CACHE_PAGE_BYTES)) {
+            uint64_t page=physical/FEMU_CACHE_PAGE_BYTES;
+            uint64_t pages=item->event.bytes/FEMU_CACHE_PAGE_BYTES;
+            for(uint64_t p=page;p<page+pages && p<ring->npages;++p)
+                ring->sent[p/8]|=1U<<(p%8);
+        }
     } else {
+        ring->dma_bytes+=item->event.bytes;
         item->dma_bytes=item->event.bytes;
         if(profiling) item->copy_cpu_ns=(cpu_end.tv_sec-cpu_begin.tv_sec)*1000000000LL+cpu_end.tv_nsec-cpu_begin.tv_nsec;
         item->copy_end_ns=end; item->link_end_ns=transfer.expire_time;

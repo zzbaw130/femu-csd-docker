@@ -39,6 +39,7 @@ static struct {
     uint64 filled,cached,skipped,invalid,blocks,ns,minor_faults,major_faults;
     uint64 steps,max_step_ns,lookup_ns,allocate_ns,copy_ns;
     uint64 admission_pages,remaining_pages,capacity_skipped;
+    uint64 resident_skipped;
 } receiver={.fd=-1};
 static uint64 now_ns(void)
 {
@@ -73,7 +74,7 @@ void pg_sina_dcp_finish(void)
     /* The caller has stopped device DMA before draining these last slots. */
     for(unsigned i=0;i<FEMU_CACHE_RX_SLOTS;i++)
         do { pg_sina_dcp_poll(true); } while(receiver.active>=0);
-    if(pg_sina_profile) ereport(NOTICE,(errmsg("SQLerate DCP blocks=%llu filled_pages=%llu cached_pages=%llu skipped_bytes=%llu invalid_pages=%llu wall_ms=%.3f minor_faults=%llu major_faults=%llu steps=%llu max_step_ms=%.3f lookup_ms=%.3f allocate_ms=%.3f copy_ms=%.3f admission_pages=%llu remaining_pages=%llu capacity_skipped_bytes=%llu",
+    if(pg_sina_profile) ereport(NOTICE,(errmsg("SQLerate DCP blocks=%llu filled_pages=%llu cached_pages=%llu skipped_bytes=%llu invalid_pages=%llu wall_ms=%.3f minor_faults=%llu major_faults=%llu steps=%llu max_step_ms=%.3f lookup_ms=%.3f allocate_ms=%.3f copy_ms=%.3f admission_pages=%llu remaining_pages=%llu capacity_skipped_bytes=%llu resident_skipped_pages=%llu",
         (unsigned long long)receiver.blocks,(unsigned long long)receiver.filled,
         (unsigned long long)receiver.cached,(unsigned long long)receiver.skipped,
         (unsigned long long)receiver.invalid,receiver.ns/1e6,
@@ -81,7 +82,7 @@ void pg_sina_dcp_finish(void)
         (unsigned long long)receiver.steps,receiver.max_step_ns/1e6,receiver.lookup_ns/1e6,
         receiver.allocate_ns/1e6,receiver.copy_ns/1e6,
         (unsigned long long)receiver.admission_pages,(unsigned long long)receiver.remaining_pages,
-        (unsigned long long)receiver.capacity_skipped)));
+        (unsigned long long)receiver.capacity_skipped,(unsigned long long)receiver.resident_skipped)));
     if(receiver.data!=MAP_FAILED) munmap((void *)receiver.data,FEMU_CACHE_DATA_BYTES);
     if(receiver.slots!=MAP_FAILED) munmap(receiver.slots,FEMU_CACHE_PAGE_BYTES);
     close(receiver.fd); receiver.fd=-1;
@@ -209,6 +210,12 @@ static void fill_slot(unsigned slot,bool whole_slot)
                 break;
             }
             BlockNumber block=(logical+offset)/BLCKSZ;
+            /* Optional admission need not pin a page already in the existing
+             * residency bitmap. HOST may evict it later; normal HOST reads
+             * still validate buffers, and ExecutorEnd refreshes the bitmap. */
+            if(cached && block<cached->blocks && (cached->shared_bits[block/8]&(1U<<(block%8)))) {
+                ++receiver.resident_skipped; continue;
+            }
             const void *page=data+position+offset;
             /* PG's checksum verifier temporarily clears pd_checksum. Keep
              * the DMA mapping read-only; only checksum-enabled clusters need
