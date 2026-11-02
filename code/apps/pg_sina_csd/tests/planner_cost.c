@@ -17,6 +17,10 @@ int main(void)
     CHECK(cost_population_fraction(true,true,1,0)==1);
     CHECK(cost_population_fraction(false,true,0,1)==0);
     CHECK(cost_population_fraction(true,false,0,1)==1);
+    CHECK(cost_population_pages(0,100)==0);
+    CHECK(cost_population_pages(100000,100)<=100);
+    CHECK(cost_population_pages(100000,10000)>cost_population_pages(100,10000));
+    CHECK(cost_population_pages(100000,10000)<10000);
     struct cost_sort bounded=cost_topn_state(3000000,128,64*1024*1024,4,10);
     CHECK(bounded.spill==0 && bounded.state<1024*1024);
     CHECK(cost_topn_state(3000000,128,64*1024*1024,4,-1).spill>0);
@@ -47,6 +51,10 @@ int main(void)
     CHECK(cost_index_pages(100000,1,64,256)<=1);
     CHECK(cost_index_pages(1000000,10000,64,256)>10000);
     CHECK(cost_index_pages(1000000,10000,64,256)>cost_index_pages(10000,10000,64,256));
+    double random_pages=cost_index_pages(1000000,10000,64,256);
+    CHECK(cost_index_clustered_pages(random_pages,1000000,10000,0)==random_pages);
+    CHECK(cost_index_clustered_pages(random_pages,1000000,10000,1)<=10000);
+    CHECK(cost_index_clustered_pages(random_pages,1000000,10000,0.5)>10000);
     CHECK(cost_index_heap_visits(100,4,50,1)==100);
     CHECK(cost_index_heap_visits(100,4,50,0)==400);
     CHECK(cost_index_heap_visits(0,4,50,0)==0);
@@ -237,6 +245,12 @@ int main(void)
     scan.nodes[1].join_type=QP_LEFT;
     CHECK(!cost_join_expression(&scan,0,0,1,false)); /* NULL extension breaks that equality. */
     scan.nodes[1].kind=QP_INDEX_JOIN;
+    scan.nodes[1].join_type=QP_INNER;
+    scan.nodes[3].expr.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.column=2};
+    scan.nodes[3].expr.join.build_key=3;
+    CHECK(cost_join_expression(&scan,0,0,1,false)); /* Index equality has the same bound as Hash equality. */
+    scan.nodes[3].expr.join.build_key=4;
+    CHECK(!cost_join_expression(&scan,0,0,1,false)); /* Another Heap column does not become a key. */
     scan.nodes[1].parallel=1; scan.nodes[2].left=-1;
     CHECK(qp_task_slots(&scan,4)==8);
     CHECK(qp_task_slots(&scan,8)==16);

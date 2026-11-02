@@ -1380,8 +1380,8 @@ static int compile_node_impl(PlannerInfo *root,Plan *native,struct qp_plan *tree
         if(l->limitCount) { if(!IsA(l->limitCount,Const)) return -1; Const *v=(Const *)l->limitCount; if(!v->constisnull) p->limit=DatumGetInt64(v->constvalue); }
         if(l->limitOffset) { if(!IsA(l->limitOffset,Const)) return -1; Const *v=(Const *)l->limitOffset; if(!v->constisnull) p->offset=DatumGetInt64(v->constvalue); }
     }
-    if(pg_sina_exe_path!=PG_SINA_ADAPTIVE || (pg_sina_encoding_choice(id)&PG_SINA_DISTINCT_SORT)) bypass_distinct_sort(tree,n);
-    if(pg_sina_exe_path!=PG_SINA_ADAPTIVE || (pg_sina_encoding_choice(id)&PG_SINA_DISTINCT)) choose_distinct(tree,n);
+    if(!pg_sina_path_search || (pg_sina_encoding_choice(id)&PG_SINA_DISTINCT_SORT)) bypass_distinct_sort(tree,n);
+    if(!pg_sina_path_search || (pg_sina_encoding_choice(id)&PG_SINA_DISTINCT)) choose_distinct(tree,n);
     if(n->kind==QP_SCAN && IsA(native,IndexScan)) {
         int extra=conditions(&b,((IndexScan *)native)->indexqualorig); if(extra==-2) return -1;
         if(extra>=0) p->predicate=p->predicate<0?extra:add_expr(p,(struct qs_expr){.op=Q_AND,.type=Q_BOOLEAN,.left=p->predicate,.right=extra});
@@ -1395,9 +1395,9 @@ static int compile_node_impl(PlannerInfo *root,Plan *native,struct qp_plan *tree
         return ordered_heap_scan(&b,tree,id,index->indexid,index->indexorderdir,ordered,true);
     }
     if(n->kind==QP_JOIN && !ordered && ((Join *)native)->inner_unique &&
-       (pg_sina_exe_path!=PG_SINA_ADAPTIVE || (pg_sina_encoding_choice(id)&PG_SINA_GROUP_FILTER))) push_group_key_filter(tree,n);
+       (!pg_sina_path_search || (pg_sina_encoding_choice(id)&PG_SINA_GROUP_FILTER))) push_group_key_filter(tree,n);
     if(n->kind==QP_AGGREGATE &&
-       (pg_sina_exe_path!=PG_SINA_ADAPTIVE || (pg_sina_encoding_choice(id)&PG_SINA_LEFT_COUNT))) push_left_join_count(tree,n);
+       (!pg_sina_path_search || (pg_sina_encoding_choice(id)&PG_SINA_LEFT_COUNT))) push_left_join_count(tree,n);
     return id;
 }
 
@@ -1960,7 +1960,7 @@ Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
     if(host_scan && native->parallel_aware &&
        (!IsA(native,SeqScan) || pg_sina_resources.cus<2)) { goto failed; }
     tree->nodes[result].expr.work_mem_bytes=pg_sina_query_memory();
-    if(pg_sina_exe_path==PG_SINA_ADAPTIVE) {
+    if(pg_sina_path_search) {
         if(pg_sina_encoding_choice(tree->count)) elog(ERROR,"device encoder omitted a planned operator");
         for(unsigned i=0;i<tree->count;++i) {
             if(!pg_sina_encoding_matches(i,&tree->nodes[i])) elog(ERROR,"device operator %u differs from its selected physical choice",i);

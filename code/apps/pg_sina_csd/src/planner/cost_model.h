@@ -37,6 +37,10 @@ static inline unsigned cost_expression_ops(const struct qs_plan *p)
  * CSD internal LOAD cost: it only suppresses already unnecessary DMA. */
 static inline double cost_population_fraction(bool file_enabled,bool shared_enabled,double file,double shared)
 { return cost_max(file_enabled?1-file:0,shared_enabled?1-shared:0); }
+/* Population suppresses repeated pages, although internal Index reads may
+ * revisit them after cursor eviction. Keep those two byte counts separate. */
+static inline double cost_population_pages(double visits,double pages)
+{ return visits>0 && pages>0?-pages*expm1(-visits/pages):0; }
 /* LOAD and compute remain serial within one task, but independent CU tasks
  * overlap. Retain one participant's fill/drain share of the shorter stage. */
 static inline double cost_scan_overlap(double io,double cpu,double tasks,unsigned cus)
@@ -60,6 +64,13 @@ static inline double cost_index_pages(double visits,double pages,double cache,do
     double full=floor(visits/batch),tail=visits-full*batch;
     double misses=(-full*pages*expm1(-batch/pages)-pages*expm1(-tail/pages))*(1-cost_min(1,cache/pages));
     return cost_max(unique,misses);
+}
+/* Ordered morsels share neighbouring pages. The scan's correlation is only
+ * used when the probe key comes from that scan, never from a Hash build. */
+static inline double cost_index_clustered_pages(double random,double visits,double pages,double correlation)
+{
+    double weight=cost_min(1,correlation*correlation);
+    return random*(1-weight)+cost_population_pages(visits,pages)*weight;
 }
 /* Expected candidates inspected until the first success, including the
  * no-match case. Predicate independence is the same statistical assumption
@@ -227,10 +238,19 @@ static inline bool cost_join_expression(const struct qp_plan *tree,int node,int 
             if(e->column<0 || (unsigned)e->column>=width+tree->nodes[n->right].expr.nout) return false;
             if(((unsigned)e->column<width)!=build) return true;
             /* An INNER equality key can be represented by either input.
-             * Outer NULL extension and parameterized indexes are excluded. */
+             * The Index key is stored as a Heap attribute, not right_keys. */
             if(n->kind==QP_JOIN && n->join_type==QP_INNER)
                 for(unsigned k=0;k<n->nkeys;++k)
                     if(e->column==(build?n->left_keys[k]:(int)width+n->right_keys[k])) return true;
+            if(n->kind==QP_INDEX_JOIN && n->join_type==QP_INNER && n->nkeys==1) {
+                if(build && e->column==n->left_keys[0]) return true;
+                const struct qp_node *right=&tree->nodes[n->right];
+                unsigned col=(unsigned)e->column-width;
+                if(!build && col<right->expr.nout) {
+                    const struct qs_expr *key=&right->expr.exprs[right->expr.outputs[col].index];
+                    if(key->op==Q_COLUMN && key->column+1==right->expr.join.build_key) return true;
+                }
+            }
             return false;
         }
         if(n->left<0 || e->column<0) return false;

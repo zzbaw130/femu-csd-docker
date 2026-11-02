@@ -16,8 +16,9 @@ struct path_relation {
     PlannerInfo *root;
     RelOptInfo *rel;
     CustomPath *internal; /* Best complete device subtree, without delivery. */
+    CustomPath *complete; /* Final device candidate, including HOST delivery. */
     CustomPath *scan[2]; /* Private/shared source, retained across PG pruning. */
-    double internal_cost;
+    double internal_cost,complete_cost;
     List *pending;
 };
 struct prepared_relation { Oid relid,filenode; bool prepared; char device[128]; };
@@ -167,14 +168,15 @@ static struct path_relation *relation_paths(PlannerInfo *root,RelOptInfo *rel)
         struct path_relation *p=lfirst(c);
         if(p->root==root && p->rel==rel) return p;
     }
-    struct path_relation *p=palloc0(sizeof(*p)); p->root=root; p->rel=rel; p->internal_cost=DBL_MAX;
+    struct path_relation *p=palloc0(sizeof(*p)); p->root=root; p->rel=rel;
+    p->internal_cost=p->complete_cost=DBL_MAX;
     pg_sina_path_search->relations=lappend(pg_sina_path_search->relations,p);
     return p;
 }
 static bool eligible(PlannerInfo *root)
 {
     Query *q=root->parse;
-    return pg_sina_path_search && pg_sina_exe_path==PG_SINA_ADAPTIVE && !pg_sina_native_search &&
+    return pg_sina_path_search && pg_sina_exe_path>=PG_SINA_CSD && !pg_sina_native_search &&
         !pg_sina_compiling_plan && q->commandType==CMD_SELECT && !q->hasRowSecurity &&
         !q->hasTargetSRFs && !q->rowMarks && !q->windowClause && !q->groupingSets &&
         !q->setOperations && !root->append_rel_list;
@@ -304,6 +306,12 @@ static void add_device_path(PlannerInfo *root,RelOptInfo *rel,Path *native,bool 
     path->custom_private=list_make5(lthird(((CustomScan *)device)->custom_private),copyObject(lsecond(((CustomScan *)device)->custom_private)),
         makeInteger(top),makeInteger(((CustomScan *)device)->methods==&pg_sina_scan_methods),copyObject(lfourth(((CustomScan *)device)->custom_private)));
     path->methods=&device_methods;
+    /* Forced offload uses the same physical alternatives and prices, but
+     * retains a complete device candidate even if a HOST path is cheaper. */
+    if(top && path->path.total_cost<state->complete_cost) {
+        state->complete=palloc(sizeof(*path)); *state->complete=*path;
+        state->complete_cost=path->path.total_cost;
+    }
     if(pg_sina_planning) pg_sina_planning->retain_copy+=pg_sina_planner_clock()-mark;
     double freed=pg_sina_planner_clock();
     MemoryContextDelete(temporary);
@@ -340,7 +348,7 @@ static void publish_paths(PlannerInfo *root,RelOptInfo *rel)
 /* PG's scalar cost prunes a device source before seeing the independent
  * HOST CPU work that can overlap it. Retain that source and compare it at
  * the immediate HOST join, preserving PG's algorithm and cardinalities. */
-static void add_scan_join_paths(PlannerInfo *root,RelOptInfo *rel,JoinPath *native)
+static void add_scan_join_paths(PlannerInfo *root,RelOptInfo *rel,JoinPath *native,JoinPathExtraData *extra)
 {
     bool hash=IsA(native,HashPath);
     if(!hash && !IsA(native,NestPath)) return;
@@ -356,6 +364,8 @@ static void add_scan_join_paths(PlannerInfo *root,RelOptInfo *rel,JoinPath *nati
     }
     double repeats=hash?1:Max(1,inputs[0]->rows);
     double cpu=Max(0,native->path.total_cost-inputs[0]->total_cost-inputs[1]->total_cost*repeats);
+    if(!hash && IsA(inputs[1],IndexPath))
+        cpu=pg_sina_host_join_cpu(root,(NestPath *)native,extra);
     for(unsigned mask=1;mask<4;++mask) {
         if(((mask&1) && !sources[0]) || ((mask&2) && !sources[1])) continue;
         JoinPath *join=hash?(JoinPath *)palloc(sizeof(HashPath)):(JoinPath *)palloc(sizeof(NestPath));
@@ -375,12 +385,12 @@ static void add_scan_join_paths(PlannerInfo *root,RelOptInfo *rel,JoinPath *nati
 }
 void pg_sina_rel_paths(PlannerInfo *root,RelOptInfo *rel,Index rti,RangeTblEntry *rte)
 {
-    if(!pg_sina_path_search || pg_sina_exe_path!=PG_SINA_ADAPTIVE || pg_sina_compiling_plan) return;
+    if(!pg_sina_path_search || pg_sina_exe_path<PG_SINA_CSD || pg_sina_compiling_plan) return;
     bool device=eligible(root);
     List *paths=list_concat(list_copy(rel->pathlist),list_copy(rel->partial_pathlist)); ListCell *c;
     foreach(c,paths) {
         Path *path=lfirst(c);
-        if(rte->rtekind==RTE_RELATION)
+        if(pg_sina_exe_path==PG_SINA_ADAPTIVE && rte->rtekind==RTE_RELATION)
             pg_sina_cost_host_path(root,path,rte->relid,&pg_sina_path_search->observations,!pg_sina_native_search);
         if(device) add_device_path(root,rel,path,false);
     }
@@ -409,7 +419,13 @@ void pg_sina_join_paths(PlannerInfo *root,RelOptInfo *joinrel,RelOptInfo *outerr
         if((IsA(p,HashPath) || IsA(p,MergePath) || IsA(p,NestPath)) &&
            ((JoinPath *)p)->outerjoinpath->parent==outerrel &&
            ((JoinPath *)p)->innerjoinpath->parent==innerrel) {
-            if(IsA(p,NestPath)) {
+            JoinPath *join=(JoinPath *)p;
+            /* A delivered source already received the overlap credit when
+             * this Path was built. Recosting it on a later hook invocation
+             * would silently erase that credit and prune the mixed Path. */
+            bool delivered=IsA(join->outerjoinpath,CustomPath) &&
+                ((CustomPath *)join->outerjoinpath)->methods==&device_methods;
+            if(IsA(p,NestPath) && pg_sina_exe_path==PG_SINA_ADAPTIVE && !delivered) {
                 Path *priced=pg_sina_reprice_index_join(root,(NestPath *)p,extra,&pg_sina_path_search->observations);
                 if(priced!=p) {
                     joinrel->pathlist=list_delete_ptr(joinrel->pathlist,p);
@@ -418,7 +434,7 @@ void pg_sina_join_paths(PlannerInfo *root,RelOptInfo *joinrel,RelOptInfo *outerr
                     p=priced;
                 }
             }
-            add_scan_join_paths(root,joinrel,(JoinPath *)p);
+            if(pg_sina_exe_path==PG_SINA_ADAPTIVE) add_scan_join_paths(root,joinrel,(JoinPath *)p,extra);
             add_device_path(root,joinrel,p,false);
         }
     }
@@ -518,10 +534,15 @@ void pg_sina_search_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOpt
         list_free(paths);
         publish_paths(root,output);
     }
-    if(stage!=UPPERREL_FINAL || root->parent_root || pg_sina_exe_path!=PG_SINA_ADAPTIVE || !output->pathlist) return;
+    if(stage!=UPPERREL_FINAL || root->parent_root || !output->pathlist) return;
     Path *best=NULL; ListCell *c;
     foreach(c,output->pathlist) {
         Path *p=lfirst(c); if(!best || p->total_cost<best->total_cost) best=p;
+    }
+    if(pg_sina_exe_path!=PG_SINA_ADAPTIVE && !pg_sina_native_search) {
+        CustomPath *complete=relation_paths(root,output)->complete;
+        if(!complete) { pg_sina_upper_paths(root,stage,input,output,NULL); return; }
+        best=&complete->path;
     }
     CustomPath *path=makeNode(CustomPath); path->path=*best;
     NodeSetTag(path,T_CustomPath); path->path.pathtype=T_CustomScan;

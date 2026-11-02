@@ -49,6 +49,8 @@ struct placement {
     bool offload,details;
 };
 static double transfer_ms(double bytes,double mbps) { return bytes/(mbps*1000); }
+static double column_correlation(Oid,int);
+static double host_fk_visits(PlannerInfo *,NestPath *,IndexPath *);
 /* Read the connection snapshot only. Catalog row counts/physical sizes remain
  * PG planner metadata; descriptor scans and mincore run outside planning. */
 static struct residency *residency(Oid oid,List **observations)
@@ -92,10 +94,11 @@ static Oid scan_relation(PlannerInfo *root,Plan *p)
  * component. Shared hits need no kernel->buffer copy; file-only hits do.
  * Aggregate residency does not identify overlap, so max(shared,file) is a
  * conservative union, never shared+file counted twice. */
-static double cached_io(double io,double page_cost,struct residency *r)
+static double cached_io(double io,double page_cost,struct residency *r,double footprint)
 {
     double copy=page_cost>0?transfer_ms(BLCKSZ,pg_sina_cache_mbps)/(page_cost*pg_sina_host_cost_ms):0;
-    return cost_host_cached_io(io,r->shared,r->fraction,copy);
+    double scale=footprint>0?(r->bytes/BLCKSZ)/footprint:1;
+    return cost_host_cached_io(io,Min(1,r->shared*scale),Min(1,r->fraction*scale),copy);
 }
 static pg_noinline void index_cpu_cost(IndexPath *path,PlannerInfo *root)
 {
@@ -141,7 +144,7 @@ static double host_qual_discount(PlannerInfo *root,Path *path)
     double divisor=path->parallel_workers+(parallel_leader_participation?Max(0,1-0.3*path->parallel_workers):0);
     return saved*path->parent->tuples/Max(1,divisor);
 }
-void pg_sina_cost_host_path(PlannerInfo *root,Path *path,Oid oid,List **observations,bool apply)
+static void cost_host_path(PlannerInfo *root,Path *path,Oid oid,List **observations,bool apply,NestPath *join)
 {
     if(path->pathtype!=T_SeqScan && !IsA(path,IndexPath)) return;
     /* Internal SPI/temp relations cannot become immutable device inputs. */
@@ -178,14 +181,29 @@ void pg_sina_cost_host_path(PlannerInfo *root,Path *path,Oid oid,List **observat
         /* Cache hits remove I/O, not B-tree descent, buffer pinning or
          * comparisons. Keep PG's entire index CPU price for every probe. */
     }
+    double heap_footprint=0,index_footprint=0;
+    if(index && join) {
+        IndexPath *access=(IndexPath *)path;
+        double divisor=Max(1,join->path.parallel_workers+
+            (parallel_leader_participation?Max(0,1-0.3*join->path.parallel_workers):0));
+        double probes=Max(1,join->outerjoinpath->rows*divisor);
+        double matches=Max(1,access->indexselectivity*path->parent->tuples)*
+            host_fk_visits(root,join,access)/Max(1,path->rows);
+        double correlation=access->indexinfo->indexkeys[0]>0?
+            column_correlation(oid,access->indexinfo->indexkeys[0]):0;
+        double pages=Max(1,heap->bytes/BLCKSZ);
+        heap_footprint=cost_population_pages(cost_index_heap_visits(probes,matches,
+            heap->tuples/pages,correlation),pages);
+        index_footprint=cost_population_pages(probes,Max(1,index->bytes/BLCKSZ));
+    }
     double startup=path->startup_cost;
     /* PG already amortizes repeated probes. Compare observed residency
      * against single-probe I/O; do not discount the reused residual again. */
-    double cached_heap=index?Min(heap_io,cached_io(single_heap_io,random,heap)):
+    double cached_heap=index?Min(heap_io,cached_io(single_heap_io,random,heap,heap_footprint)):
         cost_host_scan_io(heap_io*pg_sina_host_cost_ms,
             transfer_ms(heap->bytes,pg_sina_internal_mbps),transfer_ms(heap->bytes,pg_sina_pcie_mbps),
             transfer_ms(heap->bytes,pg_sina_cache_mbps),heap->shared,heap->fraction)/pg_sina_host_cost_ms;
-    double cached_index=index?Min(index_io,cached_io(single_index_io,index_random,index)):0;
+    double cached_index=index?Min(index_io,cached_io(single_index_io,index_random,index,index_footprint)):0;
     double after=Max(startup,before-heap_io-index_io-qual_discount+cached_heap+cached_index);
     if(apply) {
         if(index) ((IndexPath *)path)->indextotalcost-=index_io-cached_index;
@@ -199,6 +217,28 @@ void pg_sina_cost_host_path(PlannerInfo *root,Path *path,Oid oid,List **observat
         MemoryContext previous=MemoryContextSwitchTo(pg_sina_search_context());
         heap->scans=lappend(heap->scans,scan); MemoryContextSwitchTo(previous);
     }
+}
+void pg_sina_cost_host_path(PlannerInfo *root,Path *path,Oid oid,List **observations,bool apply)
+{ cost_host_path(root,path,oid,observations,apply,NULL); }
+/* Output visits retain local-filter selectivity. Scaling index CPU by this
+ * ratio also scales candidates inspected before that filter. */
+static double host_fk_visits(PlannerInfo *root,NestPath *native,IndexPath *inner)
+{
+    Path *outer=native->outerjoinpath;
+    if(native->jointype==JOIN_INNER && !native->joinrestrictinfo &&
+       list_length(inner->indexclauses)==1 &&
+       ((IndexClause *)linitial(inner->indexclauses))->indexcol==0 &&
+       !((IndexClause *)linitial(inner->indexclauses))->lossy) {
+        ListCell *c; foreach(c,root->fkey_list) {
+            ForeignKeyOptInfo *fk=lfirst(c);
+            if(fk->nkeys!=1 || fk->con_relid!=inner->path.parent->relid ||
+               !bms_is_member(fk->ref_relid,outer->parent->relids) ||
+               inner->indexinfo->indexkeys[0]!=fk->conkey[0] ||
+               fk->nmatched_ec+fk->nmatched_rcols!=1) continue;
+            return Min(inner->path.rows,Max(1,native->path.rows/Max(1,outer->rows)));
+        }
+    }
+    return inner->path.rows;
 }
 /* A parameterized index is originally priced using its required base rels,
  * before intervening joins filter the probes. Reprice for this outer Path.
@@ -216,30 +256,33 @@ Path *pg_sina_reprice_index_join(PlannerInfo *root,NestPath *native,JoinPathExtr
     cost_index(inner,root,Max(1,outer->rows*Max(1,divisor)),false);
     IndexPath cpu=*inner; index_cpu_cost(&cpu,root);
     Oid oid=rt_fetch(inner->path.parent->relid,root->parse->rtable)->relid;
-    pg_sina_cost_host_path(root,&inner->path,oid,observations,true);
-    if(native->jointype==JOIN_INNER && !native->joinrestrictinfo &&
-       list_length(inner->indexclauses)==1 && !inner->path.parent->baserestrictinfo &&
-       ((IndexClause *)linitial(inner->indexclauses))->indexcol==0 &&
-       !((IndexClause *)linitial(inner->indexclauses))->lossy) {
-        ListCell *c; foreach(c,root->fkey_list) {
-            ForeignKeyOptInfo *fk=lfirst(c);
-            if(fk->nkeys!=1 || fk->con_relid!=inner->path.parent->relid ||
-               !bms_is_member(fk->ref_relid,outer->parent->relids) ||
-               inner->indexinfo->indexkeys[0]!=fk->conkey[0] ||
-               fk->nmatched_ec+fk->nmatched_rcols!=1) continue;
-            double visits=Min(inner->path.rows,Max(1,native->path.rows/Max(1,outer->rows)));
-            double run=Max(0,cpu.path.total_cost-cpu.path.startup_cost);
-            inner->path.total_cost=Max(inner->path.startup_cost,
-                inner->path.total_cost-run*(1-visits/Max(1,inner->path.rows)));
-            inner->path.rows=visits;
-            break;
-        }
-    }
+    cost_host_path(root,&inner->path,oid,observations,true,native);
+    double visits=host_fk_visits(root,native,inner);
+    double run=Max(0,cpu.path.total_cost-cpu.path.startup_cost);
+    inner->path.total_cost=Max(inner->path.startup_cost,
+        inner->path.total_cost-run*(1-visits/Max(1,inner->path.rows)));
+    inner->path.rows=visits;
     NestPath *out=palloc(sizeof(*out)); *out=*native; out->innerjoinpath=&inner->path;
     JoinCostWorkspace workspace;
     initial_cost_nestloop(root,&workspace,out->jointype,outer,&inner->path,extra);
     final_cost_nestloop(root,out,&workspace,extra);
     return &out->path;
+}
+/* Ask PG for the consumer's CPU work, preserving SEMI/ANTI early stop and
+ * rescan accounting. Subtracting inner.total_cost * outer.rows instead
+ * removes work PG never charged and can incorrectly produce zero CPU. */
+double pg_sina_host_join_cpu(PlannerInfo *root,NestPath *native,JoinPathExtraData *extra)
+{
+    if(!IsA(native->innerjoinpath,IndexPath)) return 0;
+    IndexPath inner=*(IndexPath *)native->innerjoinpath;
+    index_cpu_cost(&inner,root);
+    Path outer=*native->outerjoinpath;
+    outer.startup_cost=outer.total_cost=0;
+    NestPath cpu=*native; cpu.outerjoinpath=&outer; cpu.innerjoinpath=&inner.path;
+    JoinCostWorkspace workspace;
+    initial_cost_nestloop(root,&workspace,cpu.jointype,&outer,&inner.path,extra);
+    final_cost_nestloop(root,&cpu,&workspace,extra);
+    return Max(0,cpu.path.total_cost);
 }
 /* Preserve PG's own SEMI/ANTI early-stop and rescan pricing. Discounting one
  * full inner scan per outer row would subtract work PG never charged. */
@@ -247,10 +290,9 @@ void pg_sina_cost_host_lookup(PlannerInfo *root,Path *path,JoinPathExtraData *ex
 {
     if(!IsA(path,NestPath)) return;
     NestPath *native=(NestPath *)path; Path *inner=native->innerjoinpath;
-    if(!IsA(inner,IndexPath) || inner->rows<=1 ||
-       (native->jointype!=JOIN_SEMI && native->jointype!=JOIN_ANTI && !native->inner_unique)) return;
+    if(!IsA(inner,IndexPath) || inner->rows<=1) return;
     Oid index=((IndexPath *)inner)->indexinfo->indexoid;
-    struct residency *relation=NULL; const struct host_scan_cost *price=NULL; ListCell *c,*s;
+    struct residency *volatile relation=NULL; const struct host_scan_cost *price=NULL; ListCell *c,*s;
     foreach(c,*observations) {
         struct residency *r=lfirst(c);
         foreach(s,r->scans) {
@@ -260,19 +302,31 @@ void pg_sina_cost_host_lookup(PlannerInfo *root,Path *path,JoinPathExtraData *ex
         }
         if(price) break;
     }
-    if(!price || price->before==price->after) return;
+    if(!price) return;
+    IndexPath cached=*(IndexPath *)inner;
+    cost_host_path(root,&cached.path,relation->oid,observations,true,native);
     NestPath repriced=*native; JoinCostWorkspace workspace;
     double startup=inner->startup_cost,total=inner->total_cost;
-    PG_TRY();
-    {
-        inner->startup_cost=price->startup_after; inner->total_cost=price->after;
-        initial_cost_nestloop(root,&workspace,native->jointype,native->outerjoinpath,inner,extra);
-        final_cost_nestloop(root,&repriced,&workspace,extra);
+    if(native->jointype==JOIN_INNER && !native->inner_unique) {
+        /* Keep PG's original I/O/rescan estimate. Correct only its cached
+         * I/O and the same matched-FK CPU visits used by the shared search. */
+        double visits=host_fk_visits(root,native,(IndexPath *)inner);
+        double saving=price->cpu*(1-visits/Max(1,inner->rows));
+        repriced.path.total_cost=path->total_cost+
+            Max(1,native->outerjoinpath->rows)*(cached.path.total_cost-price->before-saving);
+    } else {
+        if(price->before==cached.path.total_cost) return;
+        PG_TRY();
+        {
+            inner->startup_cost=cached.path.startup_cost; inner->total_cost=cached.path.total_cost;
+            initial_cost_nestloop(root,&workspace,native->jointype,native->outerjoinpath,inner,extra);
+            final_cost_nestloop(root,&repriced,&workspace,extra);
+        }
+        PG_CATCH();
+        { inner->startup_cost=startup; inner->total_cost=total; PG_RE_THROW(); }
+        PG_END_TRY();
+        inner->startup_cost=startup; inner->total_cost=total;
     }
-    PG_CATCH();
-    { inner->startup_cost=startup; inner->total_cost=total; PG_RE_THROW(); }
-    PG_END_TRY();
-    inner->startup_cost=startup; inner->total_cost=total;
     struct host_lookup_cost *record=MemoryContextAlloc(pg_sina_search_context(),sizeof(*record));
     *record=(struct host_lookup_cost){.index=index,.type=native->jointype,.rows=path->rows,
         .before=path->total_cost,.inner=total,.correction=repriced.path.total_cost-path->total_cost};
@@ -630,6 +684,17 @@ static double relation_tuples(Oid rel)
     double rows=Max(1,relation->rd_rel->reltuples);
     relation_close(relation,AccessShareLock); return rows;
 }
+static double column_correlation(Oid rel,int att)
+{
+    HeapTuple tuple=SearchSysCache3(STATRELATTINH,ObjectIdGetDatum(rel),Int16GetDatum(att),BoolGetDatum(false));
+    if(!HeapTupleIsValid(tuple)) return 0;
+    AttStatsSlot slot; double correlation=0;
+    if(get_attstatsslot(&slot,tuple,STATISTIC_KIND_CORRELATION,InvalidOid,ATTSTATSSLOT_NUMBERS)) {
+        if(slot.nnumbers==1) correlation=slot.numbers[0];
+        free_attstatsslot(&slot);
+    }
+    ReleaseSysCache(tuple); return correlation;
+}
 static double column_distinct(Oid rel,int att,bool year)
 {
     HeapTuple tuple=SearchSysCache3(STATRELATTINH,ObjectIdGetDatum(rel),Int16GetDatum(att),BoolGetDatum(false));
@@ -733,14 +798,7 @@ static double group_correlation(const struct qp_plan *tree,int node)
 {
     const struct qp_node *n=&tree->nodes[node]; Oid rel; int att; bool year=false;
     if(n->nkeys!=1 || !column_origin(tree,node,n->expr.keys[0],&rel,&att,&year)) return 0;
-    HeapTuple tuple=SearchSysCache3(STATRELATTINH,ObjectIdGetDatum(rel),Int16GetDatum(att),BoolGetDatum(false));
-    if(!HeapTupleIsValid(tuple)) return 0;
-    AttStatsSlot slot; double correlation=0;
-    if(get_attstatsslot(&slot,tuple,STATISTIC_KIND_CORRELATION,InvalidOid,ATTSTATSSLOT_NUMBERS)) {
-        if(slot.nnumbers) correlation=slot.numbers[0];
-        free_attstatsslot(&slot);
-    }
-    ReleaseSysCache(tuple); return correlation;
+    return column_correlation(rel,att);
 }
 void pg_sina_refine_groups(struct qp_plan *tree)
 {
@@ -951,7 +1009,7 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
             population_bytes+=read*cost_population_fraction(pg_sina_hpcp_enabled(),pg_sina_dcp,relation->fraction,relation->shared);
             double read_ms=transfer_ms(read,pg_sina_internal_mbps);
             io+=read_ms;
-            blocks+=read/(n->ordered_index?QS_PAGE:tree->scan_bytes);
+            blocks+=ceil(read/(n->ordered_index?QS_INDEX_READS*QS_PAGE:tree->scan_bytes));
             /* References, literals and bound parameters do not execute a
              * scalar operator. Charge actual operations, not all IR nodes. */
             bool direct=tree->count==1 && tree->nodes[tree->root].kind==QP_SCAN && !tree->ninit;
@@ -1025,17 +1083,20 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
             double distinct=column_distinct(heap->oid,access->build_key,false);
             double matches=Max(1,right->estimated_rows);
             if(distinct>0) matches=Max(matches,heap->tuples/distinct);
-            double correlation=0;
-            HeapTuple stats=SearchSysCache3(STATRELATTINH,ObjectIdGetDatum(heap->oid),
-                Int16GetDatum(access->build_key),BoolGetDatum(false));
-            if(HeapTupleIsValid(stats)) {
-                AttStatsSlot slot;
-                if(get_attstatsslot(&slot,stats,STATISTIC_KIND_CORRELATION,InvalidOid,ATTSTATSSLOT_NUMBERS)) {
-                    if(slot.nnumbers==1) correlation=slot.numbers[0];
-                    free_attstatsslot(&slot);
+            /* For a pure matched-FK lookup, PG's join fanout is more useful
+             * than a sampled FK NDV. Residuals still inspect rejected rows. */
+            if(n->join_type==QP_INNER && n->join_qual<0 && n->expr.predicate<0 &&
+               input>0 && n->nkeys==1) {
+                Oid rel; int att; bool year=false;
+                if(column_origin(tree,n->left,left->expr.outputs[n->left_keys[0]].index,&rel,&att,&year) &&
+                   !year && rel!=heap->oid && same_key_domain(heap->oid,access->build_key,rel,att))
+                {
+                    double selectivity=right->expr.predicate<0 || distinct<=0?1:
+                        Min(1.0,right->estimated_rows/Max(1.0,heap->tuples/distinct));
+                    matches=Min(matches,Max(1,rows/input/Max(1e-9,selectivity)));
                 }
-                ReleaseSysCache(stats);
             }
+            double correlation=column_correlation(heap->oid,access->build_key);
             /* An equality probe still decodes candidates rejected by a join
              * residual. Semi/anti probes can stop after an accepted match. */
             if((n->join_type==QP_SEMI || n->join_type==QP_ANTI) && n->join_qual<0 && n->expr.predicate<0) {
@@ -1060,14 +1121,36 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
                probe_rel==right->expr.relid && probe_att==access->build_key)
                 heap_visits=cost_index_window_misses(heap_visits,matches,heap->tuples/pages,
                     (double)tree->scan_bytes/BLCKSZ,correlation);
-            index_pages=cost_index_pages(leaf_visits,leaves,QS_INDEX_CACHE/2,QS_INDEX_KEYS)+(input>0?copies*levels:0);
+            index_pages=cost_index_pages(leaf_visits,leaves,QS_INDEX_CACHE/2,QS_INDEX_KEYS);
             heap_pages=cost_index_pages(heap_visits,pages,QS_INDEX_CACHE/2,
                 QS_INDEX_KEYS*Max(1,heap_visits/Max(1,input)));
+            /* A key correlated with the driving Heap remains clustered
+             * through projections/Hash probes. Such batches revisit nearby
+             * leaf/Heap pages; random keys keep the cursor-eviction model. */
+            probe_year=false;
+            /* Residual/early-stop probes have a conditional access pattern;
+             * keep their conservative cache estimate instead of assuming
+             * the complete INNER equality traversal. */
+            if(n->join_type==QP_INNER && n->join_qual<0 && scan>=0 &&
+               column_origin(tree,n->left,left->expr.outputs[n->left_keys[0]].index,
+                    &probe_rel,&probe_att,&probe_year) && !probe_year &&
+               probe_rel==tree->nodes[scan].expr.relid) {
+                double ordered=column_correlation(probe_rel,probe_att);
+                index_pages=cost_index_clustered_pages(index_pages,leaf_visits,leaves,ordered);
+                heap_pages=cost_index_clustered_pages(heap_pages,heap_visits,pages,ordered*correlation);
+            }
+            index_pages+=input>0?copies*levels:0;
             double index_bytes=index_pages*BLCKSZ,heap_bytes=heap_pages*BLCKSZ;
             double read=index_bytes+heap_bytes;
-            io+=transfer_ms(read,pg_sina_internal_mbps); blocks+=index_pages+heap_pages;
-            population_bytes+=index_bytes*cost_population_fraction(pg_sina_hpcp_enabled(),pg_sina_dcp,index->fraction,index->shared)+
-                heap_bytes*cost_population_fraction(pg_sina_hpcp_enabled(),pg_sina_dcp,heap->fraction,heap->shared);
+            io+=transfer_ms(read,pg_sina_internal_mbps);
+            double population_index=cost_population_pages(index_pages,leaves)*BLCKSZ*
+                cost_population_fraction(pg_sina_hpcp_enabled(),pg_sina_dcp,index->fraction,index->shared);
+            double population_heap=cost_population_pages(heap_pages,pages)*BLCKSZ*
+                cost_population_fraction(pg_sina_hpcp_enabled(),pg_sina_dcp,heap->fraction,heap->shared);
+            population_bytes+=population_index+population_heap;
+            /* Internal reads are submitted in QS_INDEX_READS-page batches;
+             * a page is not a separate host population request. */
+            blocks+=ceil((index_pages+heap_pages)/QS_INDEX_READS);
             scan_bytes+=read;
             cache_bytes+=index_bytes*index->fraction+heap_bytes*heap->fraction;
             work=(input*levels*(log2(fanout)+QS_INDEX_CACHE/2)*cpu_operator_cost+
@@ -1094,50 +1177,81 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
                 else if(group_tasks>1) p->serial+=input*cpu_operator_cost*Max(1,n->nkeys)*unit;
                 p->combine+=groups*n->expr.naggs*cpu_operator_cost*unit;
                 if(table>available) {
-                    double row=(n->nkeys+2*n->expr.naggs)*sizeof(struct qs_cell);
-                    double hash_memory=cost_group_resident(n,groups,available);
-                    double resident_groups=(hash_memory-128)/(8+(7.0/8)*cost_group_stride(n))*7/8;
-                    double partial=cost_partial_rows(input,groups,resident_groups,group_correlation(tree,i));
-                    double free_memory=available+2*Min(quota,cost_sort_workspace())-hash_memory;
-                    double sort_memory=cost_sort_memory(free_memory,quota);
-                    /* Hash buffers are freed before the final merge. Its
-                     * window budget is still bounded by the child limit. */
-                    struct cost_sort sort=cost_sort_state(partial,row,sort_memory,sort_windows(&n->expr));
-                    spill=sort.spill;
-                    /* This fallback runs on the coordinator: hashing input,
-                     * serializing partial states, sorting and recombining
-                     * them are distinct work, never divided by all CUs. */
-                    double scalar=pg_sina_host_cost_ms;
-                    double run_cpu=sort.comparisons*cpu_operator_cost*scalar;
-                    if(n->nkeys==1 && n->expr.exprs[n->expr.keys[0]].type==Q_INTEGER) {
-                        unsigned oid=left->expr.outputs[n->left_keys[0]].type_oid;
-                        if(oid==INT2OID || oid==INT4OID || oid==INT8OID || oid==DATEOID) {
-                            unsigned passes=oid==INT8OID?8:oid==INT2OID?2:4;
-                            double fraction=0;
-                            Oid rel; int att; bool year=false;
-                            if(column_origin(tree,i,n->expr.keys[0],&rel,&att,&year)) {
-                                HeapTuple stats=SearchSysCache3(STATRELATTINH,ObjectIdGetDatum(rel),Int16GetDatum(att),BoolGetDatum(false));
-                                if(HeapTupleIsValid(stats)) {
-                                    double nulls=((Form_pg_statistic)GETSTRUCT(stats))->stanullfrac;
-                                    fraction=pow(1-nulls,partial/Max(1,sort.runs));
-                                    ReleaseSysCache(stats);
-                                }
-                            }
-                            /* Integer radix runs count and scatter buckets;
-                             * they do not compare N*log(N) interpreted rows.
-                             * Include the key validation and scratch copies. */
-                            double radix=partial*(1+2*passes)*cpu_operator_cost*unit+
-                                transfer_ms(partial*row*(2*passes+1),pg_sina_cache_mbps);
-                            run_cpu=run_cpu*(1-fraction)+radix*fraction;
-                        }
+                    /* Match plan.c::parallel_radix_begin: private tables use
+                     * 3/5 of the free budget after Source workspaces. Filled
+                     * 64KiB streams spill; each CU later claims a partition.
+                     * These stages do not run a global serial sort. */
+                    double reserve=slots*Min(quota,cost_sort_workspace());
+                    double stride=8+(7.0/8)*cost_group_stride(n),capacity=128;
+                    double budget=Max(0,available-reserve)*3/5/slots;
+                    while(capacity*2*stride<=budget && capacity<UINT_MAX/2) capacity*=2;
+                    unsigned partitions=1;
+                    while(partitions<64 && partitions<groups/(capacity*7/8)) partitions*=2;
+                    double tails=slots*partitions*QS_SORT_IO_BYTES;
+                    while(partitions>slots && tails>(available-reserve)/4) {
+                        partitions/=2; tails/=2;
                     }
-                    p->combine+=run_cpu+sort.merge*cpu_operator_cost*scalar;
-                    /* The partial run already contains key/value/count
-                     * cells. Copying it performs no PG Heap/expr evaluation. */
-                    p->combine+=transfer_ms(sort.record_copies*row,pg_sina_cache_mbps);
-                    p->combine+=partial*n->expr.naggs*(cpu_tuple_cost+cpu_operator_cost)*scalar;
-                    if(p->details) appendStringInfo(p->stages,"%s%d/PartialSort rows=%.0f hash_resident=%.0fB sort_memory=%.0fB runs=%.0f fan=%u passes=%u",
-                        p->stages->len?"; ":"",i,partial,hash_memory,sort_memory,sort.runs,sort.fan,sort.passes);
+                    if(group_tasks>1 && cus>1 && partitions>=2 &&
+                       capacity*stride*slots+tails+reserve<=available) {
+                        double partial=cost_partial_rows(input,groups,capacity*7/8,group_correlation(tree,i));
+                        double block_rows=floor(QS_SORT_IO_BYTES/cost_group_stride(n));
+                        double blocks=floor(partial/(slots*partitions*block_rows))*slots*partitions;
+                        spill=2*blocks*QS_SORT_IO_BYTES;
+                        state=capacity*stride*slots+tails+reserve;
+                        p->serial-=input*cpu_operator_cost*Max(1,n->nkeys)*unit;
+                        p->combine-=groups*n->expr.naggs*cpu_operator_cost*unit;
+                        parallel_cpu(p,partial*(cpu_tuple_cost+cpu_operator_cost*(n->nkeys+n->expr.naggs))*unit+
+                            transfer_ms(2*partial*cost_group_stride(n),pg_sina_cache_mbps),
+                            Max(partitions,ceil(partial/QP_VECTOR_ROWS)),cus);
+                        if(p->details) appendStringInfo(p->stages,
+                            "%s%d/RadixAggregate partial=%.0f partitions=%u capacity=%.0f spill=%.0fB",
+                            p->stages->len?"; ":"",i,partial,partitions,capacity,spill);
+                    } else {
+                        double row=(n->nkeys+2*n->expr.naggs)*sizeof(struct qs_cell);
+                        double hash_memory=cost_group_resident(n,groups,available);
+                        double resident_groups=(hash_memory-128)/(8+(7.0/8)*cost_group_stride(n))*7/8;
+                        double partial=cost_partial_rows(input,groups,resident_groups,group_correlation(tree,i));
+                        double free_memory=available+2*Min(quota,cost_sort_workspace())-hash_memory;
+                        double sort_memory=cost_sort_memory(free_memory,quota);
+                        /* Hash buffers are freed before the final merge. Its
+                         * window budget is still bounded by the child limit. */
+                        struct cost_sort sort=cost_sort_state(partial,row,sort_memory,sort_windows(&n->expr));
+                        spill=sort.spill;
+                        /* This fallback runs on the coordinator: hashing input,
+                         * serializing partial states, sorting and recombining
+                         * them are distinct work, never divided by all CUs. */
+                        double scalar=pg_sina_host_cost_ms;
+                        double run_cpu=sort.comparisons*cpu_operator_cost*scalar;
+                        if(n->nkeys==1 && n->expr.exprs[n->expr.keys[0]].type==Q_INTEGER) {
+                            unsigned oid=left->expr.outputs[n->left_keys[0]].type_oid;
+                            if(oid==INT2OID || oid==INT4OID || oid==INT8OID || oid==DATEOID) {
+                                unsigned passes=oid==INT8OID?8:oid==INT2OID?2:4;
+                                double fraction=0;
+                                Oid rel; int att; bool year=false;
+                                if(column_origin(tree,i,n->expr.keys[0],&rel,&att,&year)) {
+                                    HeapTuple stats=SearchSysCache3(STATRELATTINH,ObjectIdGetDatum(rel),Int16GetDatum(att),BoolGetDatum(false));
+                                    if(HeapTupleIsValid(stats)) {
+                                        double nulls=((Form_pg_statistic)GETSTRUCT(stats))->stanullfrac;
+                                        fraction=pow(1-nulls,partial/Max(1,sort.runs));
+                                        ReleaseSysCache(stats);
+                                    }
+                                }
+                                /* Integer radix runs count and scatter buckets;
+                                 * they do not compare N*log(N) interpreted rows.
+                                 * Include the key validation and scratch copies. */
+                                double radix=partial*(1+2*passes)*cpu_operator_cost*unit+
+                                    transfer_ms(partial*row*(2*passes+1),pg_sina_cache_mbps);
+                                run_cpu=run_cpu*(1-fraction)+radix*fraction;
+                            }
+                        }
+                        p->combine+=run_cpu+sort.merge*cpu_operator_cost*scalar;
+                        /* The partial run already contains key/value/count
+                         * cells. Copying it performs no PG Heap/expr evaluation. */
+                        p->combine+=transfer_ms(sort.record_copies*row,pg_sina_cache_mbps);
+                        p->combine+=partial*n->expr.naggs*(cpu_tuple_cost+cpu_operator_cost)*scalar;
+                        if(p->details) appendStringInfo(p->stages,"%s%d/PartialSort rows=%.0f hash_resident=%.0fB sort_memory=%.0fB runs=%.0f fan=%u passes=%u",
+                            p->stages->len?"; ":"",i,partial,hash_memory,sort_memory,sort.runs,sort.fan,sort.passes);
+                    }
                 }
             } else if(n->sorted_input && !n->distinct && !n->distinct_aggs) {
                 state=n->expr.naggs*(3*sizeof(struct qs_cell)+16);

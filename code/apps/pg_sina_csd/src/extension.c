@@ -50,7 +50,13 @@ static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,Param
         }
         if(pg_sina_planning) counters.rewrite=pg_sina_planner_clock()-mark;
         PlannedStmt *host=NULL,*original_device=NULL; double host_cost=0;
-        if(pg_sina_exe_path==PG_SINA_ADAPTIVE) {
+        /* A forced single-table plan has no Join algorithm alternatives;
+         * retain its existing fast lowering without an extra PG search. */
+        if(pg_sina_exe_path==PG_SINA_ADAPTIVE ||
+           (pg_sina_exe_path>=PG_SINA_CSD &&
+            !(list_length(query->rtable)==1 &&
+              linitial_node(RangeTblEntry,query->rtable)->rtekind==RTE_RELATION &&
+              !query->hasSubLinks && !query->cteList))) {
             pg_sina_start_path_search();
             pg_sina_native_search=true;
             double attributed=pg_sina_planner_attributed(),hooks=counters.hook_other;
@@ -83,7 +89,7 @@ static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,Param
              * does not justify replacing PG's original physical plan,
              * including its directly translated device implementation. */
             if(original_device && original_cost<=candidate*1.01) plan=original_device;
-            if(host_cost<=Min(candidate,original_cost)*1.01) plan=host;
+            if(pg_sina_exe_path==PG_SINA_ADAPTIVE && host_cost<=Min(candidate,original_cost)*1.01) plan=host;
             if(IsA(plan->planTree,CustomScan) && ((CustomScan *)plan->planTree)->methods==&pg_sina_adaptive_methods) {
                 List *info=((CustomScan *)plan->planTree)->custom_private;
                 const char *original=original_device?psprintf("%.3fms",original_cost):"unsupported";
@@ -130,7 +136,7 @@ static void upper_hook(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *inp
     if(previous_upper_hook) previous_upper_hook(root,stage,input,output,extra);
     if(!pg_sina_compiling_plan) {
         double mark=pg_sina_planner_clock(),attributed=pg_sina_planner_attributed();
-        if(pg_sina_exe_path==PG_SINA_ADAPTIVE) pg_sina_search_upper_paths(root,stage,input,output);
+        if(pg_sina_path_search && pg_sina_exe_path>=PG_SINA_CSD) pg_sina_search_upper_paths(root,stage,input,output);
         else pg_sina_upper_paths(root,stage,input,output,extra);
         if(pg_sina_planning) pg_sina_planning->hook_other+=pg_sina_planner_clock()-mark-(pg_sina_planner_attributed()-attributed);
     }
