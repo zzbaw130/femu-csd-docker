@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Guest receive memory and clean page-cache publication; no AER or block I/O. */
 #include <linux/module.h>
+#include <linux/swap.h>
 #include <linux/blkdev.h>
 #include <linux/pci.h>
 #include <linux/dma-mapping.h>
@@ -214,6 +215,10 @@ static int publish_slot(struct receiver *r,unsigned index,bool hpcp,bool acquire
             void *target=kmap_local_folio(folio,0);
             memcpy(target,r->data+(size_t)index*FEMU_CACHE_BLOCK_BYTES+(size_t)p*PAGE_SIZE,PAGE_SIZE);
             kunmap_local(target); flush_dcache_folio(folio); folio_mark_uptodate(folio);
+            /* Population serves a real device read, like buffered file input.
+             * Give the new page its first access; duplicate DMA must not keep
+             * promoting already cached pages over the HOST working set. */
+            folio_mark_accessed(folio);
             if(timing) copy_time+=ktime_get_ns()-mark;
             atomic64_add(PAGE_SIZE,&filled);
         }
