@@ -265,8 +265,20 @@ read_ms = max(缺失字节 / (internal_mbps × 1000),
 
 本轮额外Q20对照发现，调高Index费用后会转向先对大量输入更新共享聚合表的树。旧的共享表争用项只包含键比较，漏掉分组记录的访问与发布；该树估计仅便宜约20ms，实际慢约230ms。现沿用既有共享更新的串行争用近似，补入每条输入的tuple记录访问基价；这不是断言每条记录受一个全局锁串行执行。私有局部表不加此项，radix路径移除完整同一项，不能给不共享的更新错误收费。未改变实际算子、共享锁或内存配额；最终回归和该对照分开记录。
 
-## 原生Nested Loop与扫描返回的剩余估价误差（2026-11-03，尚未修正）
+## 原生Nested Loop与扫描返回的误差定位（2026-11-03，修正见下节）
 
-Q7/Q8诊断发现：原生HOST树的`pg_sina_cost_host_lookup`对普通INNER只修Index I/O和匹配FK后的Index run CPU，没有重算NestLoop自身按旧`inner.rows`收取的tuple CPU；共享搜索的`pg_sina_reprice_index_join`则已更新内侧行数，存在通路不一致。按当前PG估计及0.01的cpu_tuple_cost、0.02ms换算，分别多计约93.422/239.848ms。不是用实际验收行数拟合模型，本轮只定位、不修改定价。
+Q7/Q8诊断发现：原生HOST树的`pg_sina_cost_host_lookup`对普通INNER只修Index I/O和匹配FK后的Index run CPU，没有重算NestLoop自身按旧`inner.rows`收取的tuple CPU；共享搜索的`pg_sina_reprice_index_join`则已更新内侧行数，存在通路不一致。按当前PG估计及0.01的cpu_tuple_cost、0.02ms换算，分别多计约93.422/239.848ms。不是用实际验收行数拟合模型，该轮只定位，修正见下节。
 
 直接Scan返回HOST还按`rows*(cpu_tuple_cost+cpu_operator_cost*nout)*host_cost_ms`预算；Q7 orders模型约1.5秒总CPU工作量，而现有类型化批次profile全部CU累计约0.7秒，提示该项需要重新对齐。不能把含HOST反压的Tree Wall当净扫描时间，再与消费时间相加。Scan/Join重叠只覆盖直接相邻输入，流式下游消费的重叠尚未完整进入搜索。应分别校正连接tuple收费、真实列式输出工作和跨节点重叠，不能笼统降低所有索引CPU或把共有过滤成本归为差异。完整证据见[诊断报告](../../../../results/tpch-sf2/q7-q8-q15/report.md)。同轮Q15已通过候选回退的局部修复恢复完整CSD，未更改本节成本公式。
+
+## FK连接CPU、类型化返回与流式混合候选修正（2026-11-03）
+
+原生HOST的普通INNER索引连接现在同步扣除`outer.rows*(旧inner.rows-修正后visits)*cpu_tuple_cost`。已有FK证明要求单键、无Join残余，visits不变时减免为0；Index I/O、根到叶比较、PG rescan及SEMI/ANTI早停继续沿原实现。共享搜索的无I/O消费CPU估计也恢复相同visits，避免调用PG cost_index后行数回到未经FK修正的值。
+
+直接返回HOST的Scan保留每条输入的固定Heap访问、实际谓词操作与每条输出的设备记录访问；去掉按HOST标量算子乘输出列数的项，改计既有`output_bytes/cache_mbps`复制工作。HOST转换、PCIe与批次费用仍在边界计价，没有把返回变成免费。完整设备树内部各Scan、Join及聚合CPU不受这个直接返回项影响，模式之间仍共用物理算子实现，无新增系数或按查询编号补偿。
+
+每个关系在原有搜索状态中保留串行/并行两类HOST流式候选，以及尚未被消费CPU掩盖的生产者工作量。扫描初始预算为`max(0, source.total-source.startup-HOST转换)`，不把同一PG消费者上的转换CPU也当成独立设备工作；普通INNER Hash Probe、Nested Loop可继续消耗这份预算，抵扣不超过消费CPU和剩余预算。已用部分不能再次抵扣。SEMI/ANTI及外连接等非INNER保留已有直接Scan估价，不传播新的跨多Join预算；条件早停与成员匹配基数的误差不能当成确定消费CPU。Hash build端只在自己的构建阶段抵扣、剩余预算不跨过build/probe边界；Sort、Aggregate、Gather、Materialize本体不作为这条流式链继续传递。重估Join从输入重新调用PG成本函数，避免hook重访时在已经减免的价格上再减一次。替换候选要求行数、并行worker、输出表达式和排序属性一致，保留副本以免PG剪枝释放其Path。
+
+单纯修价格仍不足以恢复某些混合路径：PG `try_partial_nestloop_path`会在join hook之前用原始参数化Index价做预剪枝。现在只为保留的CSD扫描/流式链，重新组合PG已经生成且参数依赖完全由外侧满足的IndexPath，用PG `create_nestloop_path`、缓存/FK修正和相同重叠模型计价，再通过普通add_path/add_partial_path比较。仅补评估无额外lateral依赖的普通INNER候选；不绕过结果语义检查，不发明索引或读取验收实际行数。仍只保留有限候选，不声称进行了包含所有并行度/排序组合的完整Pareto搜索。
+
+此修正没有增加设备算子、配置、协议或主机进程。最终针对性冷热测量、价格与实际路径见[Q7/Q8估价修复报告](../../../../results/tpch-sf2/q7-q8-cost/report.md)。

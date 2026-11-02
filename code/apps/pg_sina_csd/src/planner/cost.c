@@ -276,6 +276,10 @@ double pg_sina_host_join_cpu(PlannerInfo *root,NestPath *native,JoinPathExtraDat
     if(!IsA(native->innerjoinpath,IndexPath)) return 0;
     IndexPath inner=*(IndexPath *)native->innerjoinpath;
     index_cpu_cost(&inner,root);
+    double visits=host_fk_visits(root,native,(IndexPath *)native->innerjoinpath);
+    double run=Max(0,inner.path.total_cost-inner.path.startup_cost);
+    inner.path.total_cost=inner.path.startup_cost+run*visits/Max(1,inner.path.rows);
+    inner.path.rows=visits;
     Path outer=*native->outerjoinpath;
     outer.startup_cost=outer.total_cost=0;
     NestPath cpu=*native; cpu.outerjoinpath=&outer; cpu.innerjoinpath=&inner.path;
@@ -312,6 +316,10 @@ void pg_sina_cost_host_lookup(PlannerInfo *root,Path *path,JoinPathExtraData *ex
          * I/O and the same matched-FK CPU visits used by the shared search. */
         double visits=host_fk_visits(root,native,(IndexPath *)inner);
         double saving=price->cpu*(1-visits/Max(1,inner->rows));
+        /* final_cost_nestloop also charges tuple CPU for outer*inner rows.
+         * The matched-FK correction must reach that work, not just Index
+         * Scan CPU. host_fk_visits changes rows only without join residuals. */
+        saving+=cpu_tuple_cost*Max(0,inner->rows-visits);
         repriced.path.total_cost=path->total_cost+
             Max(1,native->outerjoinpath->rows)*(cached.path.total_cost-price->before-saving);
     } else {
@@ -1020,7 +1028,11 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
              * still execute when only an early column is needed. Projection
              * reduces expression/output work, never this fixed base. */
             work=input*(cpu_tuple_cost*pg_sina_host_cost_ms+cpu_operator_cost*operations*unit)+
-                rows*(direct?(cpu_tuple_cost+cpu_operator_cost*n->expr.nout)*pg_sina_host_cost_ms:cpu_tuple_cost*unit);
+                rows*cpu_tuple_cost*unit;
+            /* Typed column batches copy projected values; they do not run
+             * one HOST scalar operator per output cell. Keep a row visit,
+             * charge actual packet bytes, and price PG consumption below. */
+            if(direct) work+=transfer_ms(output_bytes(p->native,&n->expr,rows),pg_sina_cache_mbps);
             parallel_cpu(p,work,tasks[i],cus);
         } else if(n->kind==QP_JOIN && n->hash && right) {
             double build=Max(0,right->estimated_rows),width=cost_hash_row(&right->expr);

@@ -4,6 +4,7 @@
 #include "catalog/pg_type_d.h"
 #include "executor/spi.h"
 #include "optimizer/cost.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
@@ -18,6 +19,8 @@ struct path_relation {
     CustomPath *internal; /* Best complete device subtree, without delivery. */
     CustomPath *complete; /* Final device candidate, including HOST delivery. */
     CustomPath *scan[2]; /* Private/shared source, retained across PG pruning. */
+    Path *stream[2]; /* HOST probe chains fed by a CSD source. */
+    double stream_work[2]; /* Producer work not yet hidden, in PG cost units. */
     double internal_cost,complete_cost;
     List *pending;
 };
@@ -345,42 +348,108 @@ static void publish_paths(PlannerInfo *root,RelOptInfo *rel)
     }
     list_free(pending);
 }
-/* PG's scalar cost prunes a device source before seeing the independent
- * HOST CPU work that can overlap it. Retain that source and compare it at
- * the immediate HOST join, preserving PG's algorithm and cardinalities. */
+/* Retain a streaming probe alternative until downstream HOST work can hide
+ * its producer. Build-side work ends at this Hash boundary; Sort/Aggregate,
+ * Gather and Materialize do not enter this chain. */
 static void add_scan_join_paths(PlannerInfo *root,RelOptInfo *rel,JoinPath *native,JoinPathExtraData *extra)
 {
     bool hash=IsA(native,HashPath);
     if(!hash && !IsA(native,NestPath)) return;
     if(hash && ((HashPath *)native)->num_batches!=1) return;
     Path *inputs[]={native->outerjoinpath,native->innerjoinpath},*sources[2]={NULL,NULL};
+    double work[2]={0,0};
     for(unsigned side=0;side<2;++side) {
         Path *input=inputs[side];
-        if(input->pathtype!=T_SeqScan || input->param_info || (!hash && side)) continue;
-        CustomPath *source=relation_paths(root,input->parent)->scan[input->parallel_aware];
-        if(source && source->path.rows==input->rows &&
-           (!native->path.parallel_safe || source->path.parallel_safe) &&
-           equal(source->path.pathkeys,input->pathkeys)) sources[side]=&source->path;
+        if(input->param_info || (!hash && side)) continue;
+        struct path_relation *state=relation_paths(root,input->parent);
+        bool scan=input->pathtype==T_SeqScan ||
+            (IsA(input,CustomPath) && ((CustomPath *)input)->methods==&device_methods &&
+             pg_sina_is_scan(linitial(((CustomPath *)input)->custom_private)));
+        /* Conditional SEMI/ANTI early stop has no stable per-input consumer
+         * work. Keep its direct-Scan estimate, not a multi-Join credit carried
+         * across an uncertain membership/output cardinality. */
+        if(!scan && native->jointype!=JOIN_INNER) continue;
+        unsigned shared=input->parallel_workers>0;
+        Path *source=scan && state->scan[shared]?&state->scan[shared]->path:state->stream[shared];
+        if(source && source->rows==input->rows && source->parallel_workers==input->parallel_workers &&
+           (!native->path.parallel_safe || source->parallel_safe) && equal(source->pathkeys,input->pathkeys) &&
+           equal(source->pathtarget->exprs,input->pathtarget->exprs)) {
+            sources[side]=source;
+            /* PG conversion runs in the consumer, so cannot also be hidden
+             * by that consumer's Join CPU. Only the producer is independent. */
+            work[side]=scan?Max(0,source->total_cost-source->startup_cost-source->rows*cpu_operator_cost):
+                state->stream_work[shared];
+        }
     }
-    double repeats=hash?1:Max(1,inputs[0]->rows);
-    double cpu=Max(0,native->path.total_cost-inputs[0]->total_cost-inputs[1]->total_cost*repeats);
-    if(!hash && IsA(inputs[1],IndexPath))
-        cpu=pg_sina_host_join_cpu(root,(NestPath *)native,extra);
     for(unsigned mask=1;mask<4;++mask) {
         if(((mask&1) && !sources[0]) || ((mask&2) && !sources[1])) continue;
         JoinPath *join=hash?(JoinPath *)palloc(sizeof(HashPath)):(JoinPath *)palloc(sizeof(NestPath));
         memcpy(join,native,hash?sizeof(HashPath):sizeof(NestPath));
-        double independent=0;
         for(unsigned side=0;side<2;++side) if(mask&(1U<<side)) {
-            double count=side?repeats:1;
-            join->path.total_cost+=(sources[side]->total_cost-inputs[side]->total_cost)*count;
-            join->path.startup_cost+=hash && side?sources[side]->total_cost-inputs[side]->total_cost:
-                sources[side]->startup_cost-inputs[side]->startup_cost;
-            independent+=(sources[side]->total_cost-sources[side]->startup_cost)*count;
             if(side) join->innerjoinpath=sources[side]; else join->outerjoinpath=sources[side];
         }
-        join->path.total_cost=Max(join->path.startup_cost,join->path.total_cost-Min(cpu,independent));
+        /* Revisit hooks may see a previously discounted Join. Reprice from
+         * its inputs, rather than subtracting another credit from that Join. */
+        JoinCostWorkspace workspace;
+        double cpu,build=0;
+        if(hash) {
+            HashPath *h=(HashPath *)join;
+            initial_cost_hashjoin(root,&workspace,join->jointype,h->path_hashclauses,
+                join->outerjoinpath,join->innerjoinpath,extra,join->path.parallel_aware);
+            final_cost_hashjoin(root,h,&workspace,extra);
+            if(h->num_batches!=1) continue;
+            cpu=Max(0,join->path.total_cost-join->outerjoinpath->total_cost-join->innerjoinpath->total_cost);
+            build=Min(cpu,join->innerjoinpath->rows*(cpu_tuple_cost+
+                list_length(h->path_hashclauses)*cpu_operator_cost));
+        } else {
+            initial_cost_nestloop(root,&workspace,join->jointype,join->outerjoinpath,join->innerjoinpath,extra);
+            final_cost_nestloop(root,(NestPath *)join,&workspace,extra);
+            cpu=pg_sina_host_join_cpu(root,(NestPath *)join,extra);
+        }
+        double inner_credit=mask&2?Min(build,work[1]):0;
+        double outer_credit=mask&1?Min(Max(0,cpu-build),work[0]):0;
+        join->path.total_cost=Max(join->path.startup_cost,join->path.total_cost-inner_credit-outer_credit);
+        double remaining=(mask&1) && native->jointype==JOIN_INNER?Max(0,work[0]-outer_credit):0;
+        unsigned shared=join->path.parallel_workers>0;
+        struct path_relation *state=relation_paths(root,rel);
+        if((mask&1) && native->jointype==JOIN_INNER && !join->path.param_info &&
+           (!state->stream[shared] || join->path.total_cost<state->stream[shared]->total_cost)) {
+            /* PG may free a pruned Path; retain a separate, statement-owned
+             * copy, as for the existing scan/internal device alternatives. */
+            state->stream[shared]=palloc(hash?sizeof(HashPath):sizeof(NestPath));
+            memcpy(state->stream[shared],join,hash?sizeof(HashPath):sizeof(NestPath));
+            state->stream_work[shared]=remaining;
+        }
         relation_paths(root,rel)->pending=lappend(relation_paths(root,rel)->pending,join);
+    }
+}
+/* PG's precheck sees the original parameterized Index price before our
+ * cache/FK correction and can discard the Join before the hook sees it.
+ * Reconsider PG's legal indexes for the retained stream, then submit the
+ * corrected price through ordinary add_path/add_partial_path pruning. */
+static void add_stream_index_paths(PlannerInfo *root,RelOptInfo *rel,RelOptInfo *outer,
+    RelOptInfo *inner,JoinType type,JoinPathExtraData *extra)
+{
+    if(type!=JOIN_INNER || rel->lateral_relids || outer->top_parent_relids || inner->top_parent_relids) return;
+    struct path_relation *state=relation_paths(root,outer);
+    for(unsigned shared=0;shared<2;++shared) {
+        Path *source=state->stream[shared];
+        if(!source && state->scan[shared]) source=&state->scan[shared]->path;
+        if(!source || source->param_info) continue;
+        ListCell *c;
+        foreach(c,inner->pathlist) {
+            Path *index=lfirst(c);
+            if(!IsA(index,IndexPath) || !index->param_info ||
+               !bms_is_subset(PATH_REQ_OUTER(index),outer->relids) ||
+               (shared && (!rel->consider_parallel || !index->parallel_safe))) continue;
+            JoinCostWorkspace workspace;
+            initial_cost_nestloop(root,&workspace,type,source,index,extra);
+            NestPath *join=create_nestloop_path(root,rel,type,&workspace,extra,source,index,
+                extra->restrictlist,build_join_pathkeys(root,rel,type,source->pathkeys),NULL);
+            Path *priced=pg_sina_reprice_index_join(root,join,extra,&pg_sina_path_search->observations);
+            relation_paths(root,rel)->pending=lappend(relation_paths(root,rel)->pending,priced);
+            add_scan_join_paths(root,rel,(JoinPath *)priced,extra);
+        }
     }
 }
 void pg_sina_rel_paths(PlannerInfo *root,RelOptInfo *rel,Index rti,RangeTblEntry *rte)
@@ -439,6 +508,8 @@ void pg_sina_join_paths(PlannerInfo *root,RelOptInfo *joinrel,RelOptInfo *outerr
         }
     }
     list_free(paths);
+    if(pg_sina_exe_path==PG_SINA_ADAPTIVE)
+        add_stream_index_paths(root,joinrel,outerrel,innerrel,jointype,extra);
     publish_paths(root,joinrel);
     if(jointype!=JOIN_INNER && jointype!=JOIN_LEFT && jointype!=JOIN_RIGHT &&
        jointype!=JOIN_SEMI && jointype!=JOIN_ANTI) return;
