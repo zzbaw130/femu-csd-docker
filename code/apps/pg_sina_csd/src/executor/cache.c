@@ -23,6 +23,7 @@ struct cache_relation {
     Oid relid,filenode;
     RelFileNode node;
     unsigned nsid,lba_bytes,count;
+    BufferAccessStrategy strategy;
     const struct qs_extent *extents;
 };
 static struct cache_relation *relations;
@@ -32,7 +33,7 @@ static struct {
     const unsigned char *data;
     unsigned next;
     int active;
-    bool failed,hpcp,paused;
+    bool failed,hpcp,paused,handed_off;
     CS_DEV_HANDLE device;
     uint64 position;
     uint64 filled,cached,skipped,invalid,blocks,ns,minor_faults,major_faults;
@@ -56,6 +57,9 @@ void pg_sina_dcp_register(const struct qs_request *request,const struct qs_exten
     struct cache_relation *r=palloc0(sizeof(*r));
     r->relid=request->plan.relid; r->filenode=request->plan.relfilenode;
     Relation rel=relation_open(r->relid,AccessShareLock); r->node=rel->rd_node;
+    if(pg_sina_hpcp_enabled() && !request->plan.join.indexid &&
+       rel->rd_rel->relkind==RELKIND_RELATION && RelationGetNumberOfBlocks(rel)>(BlockNumber)(NBuffers/4))
+        r->strategy=GetAccessStrategy(BAS_BULKREAD);
     relation_close(rel,AccessShareLock);
     r->nsid=request->nsid; r->lba_bytes=request->lba_bytes;
     r->count=request->nextents; r->extents=extents;
@@ -82,6 +86,13 @@ void pg_sina_dcp_finish(void)
     if(receiver.slots!=MAP_FAILED) munmap(receiver.slots,FEMU_CACHE_PAGE_BYTES);
     close(receiver.fd); receiver.fd=-1;
 }
+/* PG keeps a 256KiB bulk-read ring for large sequential scans. Once that
+ * working set is resident, optional DCP need not rotate every streamed page
+ * through it: HPCP retains the full file working set. */
+static uint64 shared_target(const struct cache_relation *r,const struct pg_sina_cache_entry *entry)
+{
+    return r->strategy?Min(entry->blocks,(uint64)Min(NBuffers/8,256*1024/BLCKSZ)):entry->blocks;
+}
 /* Existing bitmaps describe actual pages, not a cumulative fill counter.
  * Unknown/stale observations admit work; never pause merely from table size. */
 static void population_needed(bool *file,bool *shared)
@@ -91,7 +102,7 @@ static void population_needed(bool *file,bool *shared)
     for(struct cache_relation *r=relations;r;r=r->next) {
         const struct pg_sina_cache_entry *entry=pg_sina_cache_lookup(r->node);
         *file|=!entry || !entry->file_known || entry->file_pages<entry->file_total;
-        *shared|=!entry || entry->shared_pages<entry->blocks;
+        *shared|=!entry || entry->shared_pages<shared_target(r,entry);
     }
 }
 static void pause_population(CS_DEV_HANDLE device)
@@ -118,7 +129,9 @@ void pg_sina_dcp_start(CS_DEV_HANDLE device)
         if(pg_atomic_read_u32(&GetBufferDescriptor(i)->state)&BM_TAG_VALID) ++occupied;
     receiver.admission_pages=receiver.remaining_pages=pg_sina_dcp && shared && occupied<limit?limit-occupied:0;
     if(!receiver.remaining_pages && !receiver.hpcp) { pause_population(device); return; }
-    if(!pg_sina_dcp) return; /* SNIA's existing file-cache consumer owns this case. */
+    /* No PG pages can be admitted: let SNIA's existing file-cache worker
+     * consume the ring instead of routing HPCP through the PG backend. */
+    if(!pg_sina_dcp || !receiver.remaining_pages) return;
     receiver.active=-1;
     receiver.fd=open("/dev/femu-cache",O_RDWR|O_CLOEXEC);
     receiver.slots=MAP_FAILED; receiver.data=MAP_FAILED;
@@ -155,6 +168,12 @@ static void fill_slot(unsigned slot,bool whole_slot)
     uint64 position=receiver.position,end=whole_slot?bytes:Min(bytes,position+256*1024);
     uint64 deadline=whole_slot?0:now_ns()+250000;
     for(;position<end;) {
+        if(!receiver.remaining_pages) {
+            receiver.skipped+=bytes-position;
+            receiver.capacity_skipped+=bytes-position;
+            position=bytes;
+            break;
+        }
         struct cache_relation *match=NULL; uint64 logical=0,available=0;
         for(struct cache_relation *r=relations;r && !match;r=r->next) {
             if(r->nsid!=nsid || physical>UINT64_MAX/r->lba_bytes) continue;
@@ -167,6 +186,12 @@ static void fill_slot(unsigned slot,bool whole_slot)
             }
         }
         if(!match) { receiver.skipped+=FEMU_CACHE_PAGE_BYTES; position+=FEMU_CACHE_PAGE_BYTES; continue; }
+        const struct pg_sina_cache_entry *cached=pg_sina_cache_lookup(match->node);
+        uint64 target=cached?shared_target(match,cached):UINT64_MAX;
+        if(match->strategy && cached && cached->shared_pages>=target) {
+            uint64 take=Min(available,bytes-position);
+            receiver.skipped+=take; position+=take; continue;
+        }
         if(!rel || RelationGetRelid(rel)!=match->relid) {
             if(rel) relation_close(rel,AccessShareLock);
             rel=relation_open(match->relid,AccessShareLock);
@@ -179,9 +204,9 @@ static void fill_slot(unsigned slot,bool whole_slot)
         take=Min(available,end-position)/BLCKSZ*BLCKSZ;
         if(!take) break; /* Leave a page straddling the slice for the next turn. */
         for(uint64 offset=0;offset<take;offset+=BLCKSZ) {
-            if(!receiver.remaining_pages) {
-                receiver.skipped+=BLCKSZ; receiver.capacity_skipped+=BLCKSZ;
-                continue;
+            if(!receiver.remaining_pages || (match->strategy && cached && cached->shared_pages>=target)) {
+                take=offset;
+                break;
             }
             BlockNumber block=(logical+offset)/BLCKSZ;
             const void *page=data+position+offset;
@@ -191,7 +216,12 @@ static void fill_slot(unsigned slot,bool whole_slot)
             if(checksums) { memcpy(checked.data,page,BLCKSZ); page=checked.data; }
             if(!PageIsVerifiedExtended((Page)page,block,0)) { ++receiver.invalid; continue; }
             uint64 mark=pg_sina_profile?now_ns():0;
-            Buffer buffer=ReadBufferExtended(rel,MAIN_FORKNUM,block,RBM_ZERO_AND_LOCK,NULL);
+            /* With HPCP retaining the large sequential working set, use
+             * PG's own bounded bulk-read ring for DCP. Default allocation
+             * would duplicate gigabytes and evict the file cache just filled.
+             * Small tables/indexes and DCP-only retain normal PG admission. */
+            Buffer buffer=ReadBufferExtended(rel,MAIN_FORKNUM,block,RBM_ZERO_AND_LOCK,
+                match->strategy);
             if(pg_sina_profile) receiver.allocate_ns+=now_ns()-mark;
             /* ReadBufferExtended does the lookup, pin and locking itself.
              * Keep its zeroing step; never overwrite an existing page,
@@ -219,7 +249,7 @@ static void fill_slot(unsigned slot,bool whole_slot)
 bool pg_sina_dcp_poll(bool whole_slot)
 {
     pg_sina_cache_poll();
-    if(receiver.paused || receiver.fd<0 || receiver.slots==MAP_FAILED || receiver.data==MAP_FAILED) return false;
+    if(receiver.paused || receiver.handed_off || receiver.fd<0 || receiver.slots==MAP_FAILED || receiver.data==MAP_FAILED) return false;
     uint64 start=now_ns();
     struct rusage before,after;
     if(pg_sina_profile) getrusage(RUSAGE_THREAD,&before);
@@ -249,6 +279,18 @@ bool pg_sina_dcp_poll(bool whole_slot)
                 ereport(ERROR,(errmsg("cannot release DCP receive slot: %m")));
             receiver.active=-1; ++receiver.blocks;
             if(result==FEMU_CACHE_HPCP_FULL) receiver.hpcp=false;
+            if(receiver.hpcp && !whole_slot) {
+                bool file,shared; population_needed(&file,&shared);
+                if(!shared) receiver.remaining_pages=0;
+            }
+            if(!receiver.remaining_pages && receiver.hpcp && !whole_slot) {
+                struct femu_cache_config cache={.receive_fd=FEMU_CACHE_HPCP_WORKER};
+                CsConfigInfo info={.Type=CS_VENDOR_SPECIFIC,.u.VSInfo={.VSData=&cache}};
+                CsConfigData out; int length=sizeof(out);
+                CS_STATUS status=csConfig(receiver.device,&length,&info,&out);
+                if(status!=CS_SUCCESS) elog(ERROR,"cannot return cache receiver to HPCP: status=%d",status);
+                receiver.handed_off=true;
+            }
             if(!receiver.paused && !receiver.hpcp) {
                 bool file,shared; population_needed(&file,&shared);
                 if(!receiver.remaining_pages || !shared) pause_population(receiver.device);

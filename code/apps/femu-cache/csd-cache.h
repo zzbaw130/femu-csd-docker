@@ -52,5 +52,8 @@ struct femu_cache_mapping { int fd; fc_u32 nsid; fc_u64 lba_bytes, file_offset, 
 /* FEMU csConfig(CS_VENDOR_SPECIFIC) input: borrow this prepared receiver.
  * The adapter duplicates the fd; the caller consumes its data, not a thread. */
 /* receive_fd=-1 pauses population for this execution; reset restores it. */
+/* After releasing its last DCP slot, the backend may return consumption to
+ * the existing HPCP worker, using the same fd/ring and device registration. */
+#define FEMU_CACHE_HPCP_WORKER (-2)
 struct femu_cache_config { int receive_fd; };
 #endif

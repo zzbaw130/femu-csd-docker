@@ -84,6 +84,7 @@ struct file_job {
 };
 static _Atomic(struct file_job *) queued_files,completed_files;
 static atomic_bool file_stopping=ATOMIC_VAR_INIT(false);
+static atomic_bool file_observing=ATOMIC_VAR_INIT(false);
 static sem_t file_wake;
 static pthread_t file_worker;
 static bool worker_started;
@@ -147,9 +148,21 @@ static void observe_files(struct file_job *job)
             if(map==MAP_FAILED) f->known=false;
             else {
                 if(mincore(map,bytes,vector)) f->known=false;
-                else for(size_t j=0;j<pages;++j) if(vector[j]&1) {
-                    uint64 bit=at/os_page+j;
-                    f->bits[bit/8]|=1U<<(bit%8); ++f->pages;
+                else {
+                    size_t j=0;
+                    /* mincore has one byte per page; pack eight resident
+                     * bits at a time, including fully resident segments. */
+                    for(;j+8<=pages;j+=8) {
+                        uint64 lanes=0;
+                        for(unsigned k=0;k<8;++k) lanes|=(uint64)(vector[j+k]&1)<<(8*k);
+                        unsigned char packed=((lanes&UINT64_C(0x0101010101010101))*UINT64_C(0x0102040810204080))>>56;
+                        f->bits[(at/os_page+j)/8]=packed;
+                        f->pages+=__builtin_popcount(packed);
+                    }
+                    for(;j<pages;++j) if(vector[j]&1) {
+                        uint64 bit=at/os_page+j;
+                        f->bits[bit/8]|=1U<<(bit%8); ++f->pages;
+                    }
                 }
                 munmap(map,bytes);
             }
@@ -183,15 +196,43 @@ void pg_sina_cache_poll(void)
 }
 static void *observe_loop(void *unused)
 {
+    struct file_job *metadata=NULL;
     for(;;) {
-        while(sem_wait(&file_wake)<0 && errno==EINTR) {}
+        int result;
+        if(metadata && atomic_load_explicit(&file_observing,memory_order_relaxed)) {
+            struct timespec deadline; clock_gettime(CLOCK_REALTIME,&deadline); ++deadline.tv_sec;
+            do { result=sem_timedwait(&file_wake,&deadline); } while(result<0 && errno==EINTR);
+        } else do { result=sem_wait(&file_wake); } while(result<0 && errno==EINTR);
         if(atomic_load_explicit(&file_stopping,memory_order_relaxed)) break;
         struct file_job *job=atomic_exchange_explicit(&queued_files,NULL,memory_order_acq_rel);
+        if(job) {
+            free(metadata);
+            size_t bytes=sizeof(*job)+(size_t)job->count*sizeof(job->files[0]);
+            metadata=malloc(bytes);
+            if(metadata) {
+                memcpy(metadata,job,bytes);
+                for(unsigned i=0;i<metadata->count;++i) metadata->files[i].bits=NULL;
+            }
+        } else if(result<0 && metadata && atomic_load_explicit(&file_observing,memory_order_relaxed)) {
+            size_t bytes=sizeof(*metadata)+(size_t)metadata->count*sizeof(metadata->files[0]);
+            job=malloc(bytes);
+            if(!job) continue;
+            memcpy(job,metadata,bytes);
+            bool allocated=true;
+            for(unsigned i=0;i<job->count;++i) {
+                struct file_result *f=&job->files[i]; f->pages=0;
+                f->bits=calloc(Max((f->total+7)/8,1),1);
+                allocated&=f->bits!=NULL;
+            }
+            if(!allocated) { free_files(job); continue; }
+            job->submitted_ns=monotonic_ns();
+        }
         if(!job) continue;
         observe_files(job);
         if(atomic_load_explicit(&file_stopping,memory_order_relaxed)) { free_files(job); break; }
         free_files(atomic_exchange_explicit(&completed_files,job,memory_order_acq_rel));
     }
+    free(metadata);
     return NULL;
 }
 static void stop_files(int code,Datum arg)
@@ -269,6 +310,15 @@ static void refresh(const char *reason)
 {
     instr_time begin,end; INSTR_TIME_SET_CURRENT(begin);
     pg_sina_cache_poll();
+    /* Relation/file metadata already belongs to this connection. Start the
+     * asynchronous observation before collecting PG buffer tags, so HOST
+     * prewarming is visible sooner without making the next planner wait. */
+    bool early_files=worker_started && snapshot.valid;
+    if(early_files) {
+        struct file_job *files=make_files();
+        files->generation=snapshot.generation+1;
+        submit_files(files);
+    }
     MemoryContext context=AllocSetContextCreate(TopMemoryContext,"SQLerate cache residency",ALLOCSET_DEFAULT_SIZES);
     MemoryContext previous=CurrentMemoryContext;
     BufferTag *tags=MemoryContextAllocZero(context,(Size)NBuffers*sizeof(BufferTag));
@@ -303,7 +353,7 @@ static void refresh(const char *reason)
     if(snapshot.context) MemoryContextDelete(snapshot.context);
     snapshot.context=context; snapshot.entries=(HTAB *)entries; snapshot.tags=tags;
     snapshot.valid=true; ++snapshot.generation;
-    submit_files(make_files());
+    if(!early_files) submit_files(make_files());
     INSTR_TIME_SET_CURRENT(end); INSTR_TIME_SUBTRACT(end,begin);
     if(pg_sina_profile) ereport(NOTICE,(errmsg("SQLerate cache ledger refresh reason=%s generation=%u wall_ms=%.3f relations=%ld dcp_updates=%llu dcp_evictions=%llu coalesced=%llu returned_ns=%llu",
         reason,snapshot.generation,INSTR_TIME_GET_MILLISEC(end),hash_get_num_entries(snapshot.entries),
@@ -318,12 +368,39 @@ static void start(QueryDesc *query,int flags)
     PG_CATCH(); { --depth; PG_RE_THROW(); } PG_END_TRY();
     --depth;
 }
+static bool host_reads(Plan *plan)
+{
+    if(!plan) return false;
+    if(IsA(plan,SeqScan) || IsA(plan,IndexScan) || IsA(plan,IndexOnlyScan) || IsA(plan,BitmapHeapScan)) return true;
+    List *children=NIL; ListCell *c;
+    if(IsA(plan,CustomScan)) children=((CustomScan *)plan)->custom_plans;
+    else if(IsA(plan,Append)) children=((Append *)plan)->appendplans;
+    else if(IsA(plan,MergeAppend)) children=((MergeAppend *)plan)->mergeplans;
+    else if(IsA(plan,SubqueryScan) && host_reads(((SubqueryScan *)plan)->subplan)) return true;
+    foreach(c,children) if(host_reads(lfirst(c))) return true;
+    return host_reads(plan->lefttree) || host_reads(plan->righttree);
+}
 static void run(QueryDesc *query,ScanDirection direction,uint64 count,bool once)
 {
+    volatile bool observe=!depth && !refreshing && !pg_sina_compiling_plan && !IsParallelWorker() &&
+        snapshot.valid && query->plannedstmt->rtable!=NIL;
+    if(observe) {
+        bool reads=host_reads(query->plannedstmt->planTree); ListCell *c;
+        foreach(c,query->plannedstmt->subplans) reads|=host_reads(lfirst(c));
+        observe=reads;
+    }
+    if(observe) {
+        /* Reuse this worker while HOST scans are changing residency. A
+         * one-second cadence avoids an entire-query lag after prewarming;
+         * the planner still never waits for an observation. */
+        atomic_store_explicit(&file_observing,true,memory_order_relaxed);
+        submit_files(make_files());
+    }
     ++depth;
     PG_TRY(); { if(previous_run) previous_run(query,direction,count,once); else standard_ExecutorRun(query,direction,count,once); }
-    PG_CATCH(); { --depth; PG_RE_THROW(); } PG_END_TRY();
+    PG_CATCH(); { --depth; if(observe) atomic_store(&file_observing,false); PG_RE_THROW(); } PG_END_TRY();
     --depth;
+    if(observe) atomic_store_explicit(&file_observing,false,memory_order_relaxed);
 }
 static void finish(QueryDesc *query)
 {

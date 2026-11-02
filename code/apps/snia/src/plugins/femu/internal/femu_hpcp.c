@@ -92,10 +92,21 @@ fail:
 }
 CS_STATUS femu_hpcp_configure(struct cs_device *d,int fd)
 {
-    if(fd< -1) return CS_INVALID_ARG;
+    if(fd<FEMU_CACHE_HPCP_WORKER) return CS_INVALID_ARG;
     pthread_mutex_lock(&d->graph_lock);
     CS_STATUS status=CS_SUCCESS;
-    if(fd==-1) {
+    if(fd==FEMU_CACHE_HPCP_WORKER) {
+        struct cs_cache_receiver *r=d->cache;
+        if(!r || !r->external) status=CS_INVALID_ARG;
+        else {
+            r->slots=mmap(NULL,FEMU_CACHE_PAGE_BYTES,PROT_READ|PROT_WRITE,MAP_SHARED,r->fd,0);
+            if(r->slots==MAP_FAILED) status=CS_OUT_OF_RESOURCES;
+            else if(pthread_create(&r->worker,NULL,receive_cache,r)) {
+                munmap(r->slots,FEMU_CACHE_PAGE_BYTES); r->slots=MAP_FAILED;
+                status=CS_OUT_OF_RESOURCES;
+            } else { r->external=false; d->cache_external=false; }
+        }
+    } else if(fd==-1) {
         __atomic_store_n(&d->cache_disabled,true,__ATOMIC_RELEASE);
         if(d->cache && ioctl(d->cache->fd,FEMU_CACHE_RX_UNBIND)<0) status=CS_DEVICE_ERROR;
     } else if(d->graph_session || d->cache || d->cache_external) status=CS_HANDLE_IN_USE;
