@@ -1282,3 +1282,19 @@ Q19尚未稳定解决。确认使用新一代缓存记录，实际补读与回�
 | SF1 | 历史完整五模式冷热660份结果正确；后续8条重点冷回归通过，Q9/Q10/Q22等另有SF1三轮定向对照，Q10完整CSD约659ms对filter-only约1490ms | 执行能力与主要加速已有证据，但历史完整冷热表仍有次优规划；未在当前最终版本按最新逐SQL预热和repeat协议做完整验收，不能确认SF1当前全部规划目标已经达到 |
 
 SF8证据见[最近完整验收](../../../../results/tpch-after-radix/final/report.md)与[后续定向修复](../../../../results/four-target-fix/report.md)；SF1见[历史完整冷热](../../../../results/tpch-verify.lLiR8C/report.md)、[重点回归](../../../../results/sf1-parallel-regression.ldlsix/report.md)及[Q10对照](../../../../results/q10-payload/report.md)。本次仅核对和记录，不重跑全量，不变更执行实现或缓存策略。总体可以表述为“主要功能和SF8实验趋势基本符合理论目标”，不能表述为“当前最终版本SF1/SF8三协议全部逐查询最优”。
+
+#### SF2三协议、五模式完整验收（2026-11-02）
+
+按用户要求干净关闭SF8、重启Docker，清空RAM SSD后只加载既有SF2镜像；数据库约2.872GiB，八表visible/frozen全覆盖并重新prepare。保持4CU、256MiB workmem、64MiB FDM、8GiB Guest，PG为2GiB shared_buffers、16MiB work_mem、4个并行worker上限；WAL放Guest系统盘。20GiB可见namespace和8GiB设备隐藏spill区保持不变，数据区空间充足。重启清除了/tmp接收模块，准备阶段按未修改源码重建到持久目录，srcversion仍为C3E79848A080B78EBADF160；PG、SNIA、CSF及固件沿用现有产物。设备权限在初始化/预检配置，不使用代理或查询提权进程。
+
+正式22条、五模式cold/warm各三次、repeat五次，1210份结果均与HOST参考一致，550组前后1100次空闲FDM检查归零；DCP无效页、HPCP错误、解析/资源/控制模式填充异常均为0。正式测量中没有改实现、参数或SQL，没有替换慢样本；前后产物、PG配置和协议/SQL校验值一致。冷/热均逐SQL取三次中位数，repeat逐次和累计完整保留，间隔固定1秒且不计入查询延迟。
+
+**SF2尚未达到全部理论目标，不能从SF8结果外推。** 冷态无填充完整CSD快于HOST为21/22、快于Filter为20/22。Q9明显失败：HOST/Filter/无填充CSD/双填充CSD/SQLerate分别5412/4767/6835/7474/2405ms。强制CSD的Index Join图代表样本内部读14.43GiB、Index/Heap加载1622447次，主要索引流水线平均有效CU0.79/4、利用率19.8%，峰值140.70MiB且spill0；SQLerate的Hash图内部读2.45GiB、峰值225.52MiB且spill0，不能归为workmem不足。Q12无填充CSD1123ms、Filter1109ms，约1.3%差额单列为接近，未宣称有统计显著性。
+
+冷态SQLerate中，Q4混合1888ms明显慢于强制双填充CSD850ms，错误提前保留HOST Index Semi/聚合；Q3/Q5/Q7/Q8/Q10/Q12均选Hash设备图，强制路径的Index图更快，同样双填充对照约慢19–40%，大头在执行阶段。热态Q3/Q4/Q5/Q7/Q8/Q10/Q21仍有明显次优选择，Q12也未达到最快扫描下推组合。Q3/Q21保留联合统计风险，不据此自动豁免所有多表查询；尚需分别核验缓存定价、CPU/索引价格和候选覆盖，没有按编号修正。
+
+热启动只HOST预热目标SQL一次，不等于填满每张关系。Q5原生热态三次普通NVMe读取均为0、查询中位591ms；SQLerate初见lineitem文件39.47%、shared35.24%，前两次仍全CSD约1578/1539ms，第三次关系文件覆盖100%后才改混合372ms。位图记录实际驻留，但cost.c将其压成两个关系级比例，索引cached_io使用max(shared,file)及PG已有探测减免，未显式识别该查询访问页集合。这是选择性工作集估价的边界，不是证明HOST预热失败，也尚未证明它是全部次优选择的唯一原因。
+
+repeat Q18前两次约1949/1903ms，随后全CSD图从稀疏Index回查改为再扫lineitem的Hash，后三次约3006/2993/3020ms；内部读2.17→3.88GiB，spill读写仅约174→182MiB。五次SQLerate累计12870ms、无填充CSD9072ms，不能把回退只归为内存或spill，也不能只看执行侧标签判规划正确。Q5 repeat五次仍全CSD累计7767ms，对照Filter3620ms，未实现最低累计延迟；Q9的第3次3374ms尾部样本也保留，没有剔除。
+
+Q19在本规模符合自适应预期：全CSD→全HOST四次，查询1576/1406/1100/1103/1112ms，累计6298ms，低于HOST6982ms和双填充CSD7814ms；第2次补读约228MiB，第3–5次普通读0，五次执行期回收/refault均0，没有重现SF8的GiB级回收读放大。缓存策略未改。本轮只测试和分析，没有修复上述性能问题或运行SF4；结束保留Guest的tpch_s2。完整22条五模式冷热、SQLerate规划/执行/总时间及HOST/CSD树、repeat逐次/累计和填充计时见[SF2完整报告](../../../../results/tpch-sf2/final/report.md)，完整性核验见同目录verification.json。
