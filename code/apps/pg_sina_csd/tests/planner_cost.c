@@ -44,6 +44,11 @@ int main(void)
     CHECK(cost_index_heap_visits(100,4,50,1)==100);
     CHECK(cost_index_heap_visits(100,4,50,0)==400);
     CHECK(cost_index_heap_visits(0,4,50,0)==0);
+    CHECK(cost_index_window_misses(100,4,50,512,0)==100);
+    CHECK(cost_index_window_misses(100,4,50,0,1)==100);
+    CHECK(cost_index_window_misses(100,4,50,512,1)>0);
+    CHECK(cost_index_window_misses(100,4,50,512,1)<1);
+    CHECK(cost_index_window_misses(100,100000,50,512,1)==100);
     CHECK(cost_anti_fallback(0)==0);
     CHECK(cost_anti_fallback(1000)>1 && cost_anti_fallback(1000)<1000);
     /* A single block cannot speed up on eight CUs. Three blocks leave five
@@ -76,6 +81,13 @@ int main(void)
     CHECK(cost_group_stride(&group)==64);
     CHECK(cost_group_state(&group,112)==128*(8+56)+128);
     CHECK(cost_group_state(&group,113)>cost_group_state(&group,112));
+    CHECK(cost_group_resident(&group,10000000,256*1024*1024)==0x1p21*64+128);
+    CHECK(cost_group_resident(&group,100,64*1024*1024)==cost_group_state(&group,100));
+    /* Sort-child quota under a 256MiB query, not a device workmem setting. */
+    CHECK(cost_sort_memory(128*1024*1024,16*1024*1024)==96*1024*1024);
+    struct cost_sort small_merge=cost_sort_state(12000000,96,16*1024*1024,1);
+    struct cost_sort borrowed_merge=cost_sort_state(12000000,96,96*1024*1024,1);
+    CHECK(small_merge.passes>borrowed_merge.passes && small_merge.spill>borrowed_merge.spill);
     struct qs_plan output={.nout=2}; output.outputs[1].index=1;
     CHECK(qp_result_capacity(&output,0)==256);
     uint64_t completion=QP_TYPED_OUTPUT|QP_OUTPUT_READY|QP_INPUT_DRAINED|

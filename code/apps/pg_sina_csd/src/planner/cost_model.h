@@ -71,6 +71,15 @@ static inline double cost_index_heap_visits(double probes,double matches,double 
     double weight=correlation*correlation;
     return probes*(weight*clustered+(1-weight)*matches);
 }
+/* Only a proven self-key probe may borrow its current scan morsel. PG's
+ * physical correlation estimates the clustered fraction; groups crossing a
+ * morsel boundary and uncorrelated tuples still require internal reads. */
+static inline double cost_index_window_misses(double visits,double matches,double tuples_per_page,double window_pages,double correlation)
+{
+    double footprint=cost_max(1,matches/cost_max(1,tuples_per_page));
+    double within=window_pages>0?cost_max(0,1-footprint/window_pages):0;
+    return visits*(1-correlation*correlation*within);
+}
 /* DuckDB CardinalityEstimator uses DEFAULT_SEMI_ANTI_SELECTIVITY = 5.
  * Use its 20% fallback only for degenerate residual self anti estimates. */
 static inline double cost_anti_fallback(double rows) { return rows/5; }
@@ -119,6 +128,19 @@ static inline double cost_group_state(const struct qp_node *n,double groups)
     double capacity=cost_slots(groups*8/7,128);
     return capacity*(8+(7.0/8)*cost_group_stride(n))+128;
 }
+/* The runtime allocates complete power-of-two hash tables, keeping 7/8 of
+ * their slots for dense groups. Remaining memory belongs to the spill sort,
+ * rather than to a fictitious fractional hash allocation. */
+static inline double cost_group_resident(const struct qp_node *n,double groups,double available)
+{
+    double stride=8+(7.0/8)*cost_group_stride(n),capacity=128,goal=cost_slots(groups*8/7,128);
+    while(capacity<goal && capacity*2*stride+128<=available) capacity*=2;
+    return cost_min(cost_group_state(n,groups),capacity*stride+128);
+}
+/* plan.c::sort_init borrows free parent memory, reserving two depth quotas.
+ * The depth quota is a floor, not the maximum size of a child sort. */
+static inline double cost_sort_memory(double available,double quota)
+{ return cost_max(quota,cost_max(available/2,available-2*quota)); }
 /* A wave includes the longest task, not total work / configured CU count.
  * Even balanced work pays an incomplete last wave and per-wave scheduling.
  * Serial setup/combine/reindex is charged by the caller, never divided. */

@@ -1046,6 +1046,15 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
             double levels=1+ceil(log(leaves)/log(fanout));
             double leaf_visits=input*Max(1,matches/(heap->tuples/leaves));
             double heap_visits=cost_index_heap_visits(input,matches,heap->tuples/pages,correlation);
+            int scan=qp_probe_scan(tree,n->left);
+            Oid probe_rel=InvalidOid; int probe_att=0; bool probe_year=false;
+            if(scan>=0 && tree->nodes[scan].expr.relid==right->expr.relid &&
+               tree->nodes[scan].expr.relfilenode==right->expr.relfilenode &&
+               column_origin(tree,n->left,left->expr.outputs[n->left_keys[0]].index,
+                   &probe_rel,&probe_att,&probe_year) && !probe_year &&
+               probe_rel==right->expr.relid && probe_att==access->build_key)
+                heap_visits=cost_index_window_misses(heap_visits,matches,heap->tuples/pages,
+                    (double)tree->scan_bytes/BLCKSZ,correlation);
             index_pages=cost_index_pages(leaf_visits,leaves,QS_INDEX_CACHE/2,QS_INDEX_KEYS)+(input>0?copies*levels:0);
             heap_pages=cost_index_pages(heap_visits,pages,QS_INDEX_CACHE/2,
                 QS_INDEX_KEYS*Max(1,heap_visits/Max(1,input)));
@@ -1081,17 +1090,49 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
                 p->combine+=groups*n->expr.naggs*cpu_operator_cost*unit;
                 if(table>available) {
                     double row=(n->nkeys+2*n->expr.naggs)*sizeof(struct qs_cell);
-                    double resident_groups=groups*available/table;
+                    double hash_memory=cost_group_resident(n,groups,available);
+                    double resident_groups=(hash_memory-128)/(8+(7.0/8)*cost_group_stride(n))*7/8;
                     double partial=cost_partial_rows(input,groups,resident_groups,group_correlation(tree,i));
-                    struct cost_sort sort=cost_sort_state(partial,row,Min(quota,available/2),sort_windows(&n->expr));
+                    double free_memory=available+2*Min(quota,cost_sort_workspace())-hash_memory;
+                    double sort_memory=cost_sort_memory(free_memory,quota);
+                    /* Hash buffers are freed before the final merge. Its
+                     * window budget is still bounded by the child limit. */
+                    struct cost_sort sort=cost_sort_state(partial,row,sort_memory,sort_windows(&n->expr));
                     spill=sort.spill;
                     /* This fallback runs on the coordinator: hashing input,
                      * serializing partial states, sorting and recombining
                      * them are distinct work, never divided by all CUs. */
                     double scalar=pg_sina_host_cost_ms;
-                    p->combine+=(sort.comparisons+sort.merge)*cpu_operator_cost*scalar;
-                    p->combine+=sort.record_copies*(cpu_tuple_cost+(n->nkeys+2*n->expr.naggs)*cpu_operator_cost)*scalar;
+                    double run_cpu=sort.comparisons*cpu_operator_cost*scalar;
+                    if(n->nkeys==1 && n->expr.exprs[n->expr.keys[0]].type==Q_INTEGER) {
+                        unsigned oid=left->expr.outputs[n->left_keys[0]].type_oid;
+                        if(oid==INT2OID || oid==INT4OID || oid==INT8OID || oid==DATEOID) {
+                            unsigned passes=oid==INT8OID?8:oid==INT2OID?2:4;
+                            double fraction=0;
+                            Oid rel; int att; bool year=false;
+                            if(column_origin(tree,i,n->expr.keys[0],&rel,&att,&year)) {
+                                HeapTuple stats=SearchSysCache3(STATRELATTINH,ObjectIdGetDatum(rel),Int16GetDatum(att),BoolGetDatum(false));
+                                if(HeapTupleIsValid(stats)) {
+                                    double nulls=((Form_pg_statistic)GETSTRUCT(stats))->stanullfrac;
+                                    fraction=pow(1-nulls,partial/Max(1,sort.runs));
+                                    ReleaseSysCache(stats);
+                                }
+                            }
+                            /* Integer radix runs count and scatter buckets;
+                             * they do not compare N*log(N) interpreted rows.
+                             * Include the key validation and scratch copies. */
+                            double radix=partial*(1+2*passes)*cpu_operator_cost*unit+
+                                transfer_ms(partial*row*(2*passes+1),pg_sina_cache_mbps);
+                            run_cpu=run_cpu*(1-fraction)+radix*fraction;
+                        }
+                    }
+                    p->combine+=run_cpu+sort.merge*cpu_operator_cost*scalar;
+                    /* The partial run already contains key/value/count
+                     * cells. Copying it performs no PG Heap/expr evaluation. */
+                    p->combine+=transfer_ms(sort.record_copies*row,pg_sina_cache_mbps);
                     p->combine+=partial*n->expr.naggs*(cpu_tuple_cost+cpu_operator_cost)*scalar;
+                    if(p->details) appendStringInfo(p->stages,"%s%d/PartialSort rows=%.0f hash_resident=%.0fB sort_memory=%.0fB runs=%.0f fan=%u passes=%u",
+                        p->stages->len?"; ":"",i,partial,hash_memory,sort_memory,sort.runs,sort.fan,sort.passes);
                 }
             } else if(n->sorted_input && !n->distinct && !n->distinct_aggs) {
                 state=n->expr.naggs*(3*sizeof(struct qs_cell)+16);
@@ -1104,7 +1145,7 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
                     sort.record_copies*(cpu_tuple_cost+n->expr.nout*cpu_operator_cost))*pg_sina_host_cost_ms+work;
             }
         } else if(n->kind==QP_SORT) {
-            double sort_memory=Max(quota,Max(available/2,available-2*quota));
+            double sort_memory=cost_sort_memory(available,quota);
             struct cost_sort sort=cost_topn_state(input,sort_width(tree,i),sort_memory,sort_windows(&n->expr),qp_sort_bound(tree,i));
             state=sort.state; spill=sort.spill;
             parallel_cpu(p,sort.comparisons*cpu_operator_cost*unit,n->left>=0?tasks[n->left]:0,cus);
@@ -1319,7 +1360,8 @@ static bool output_ordered(const struct qp_plan *tree,int id)
 Plan *pg_sina_cost_device(PlannerInfo *root,Plan *native,bool top,List **observations,
                          double *internal,double *boundary)
 {
-    struct placement p={.native=native,.root=root,.host=native->total_cost*pg_sina_host_cost_ms};
+    struct placement p={.native=native,.root=root,.host=native->total_cost*pg_sina_host_cost_ms,
+        .details=top && pg_sina_profile && pg_sina_native_search};
     if(!top && root->init_plans && !pg_sina_is_scan(native)) return NULL;
     double mark=pg_sina_planner_clock();
     /* Keep the prepared tree itself, rather than copying it again when the
@@ -1349,6 +1391,9 @@ Plan *pg_sina_cost_device(PlannerInfo *root,Plan *native,bool top,List **observa
     if(p.device==chosen || !p.device) { MemoryContextDelete(retained); return NULL; }
     mark=pg_sina_planner_clock();
     device_cost(&p,observations,lowered,fast);
+    if(p.details) ereport(NOTICE,(errmsg(
+        "SQLerate original device estimate total_ms=%.3f cpu_ms=%.3f io_ms=%.3f spill_bytes=%.0f peak_bytes=%.0f stages=%s",
+        p.csd+p.boundary,p.cpu,p.io,p.spill,p.peak,p.stages?p.stages->data:"")));
     if(pg_sina_planning && pg_sina_is_scan(chosen)) ereport(NOTICE,(errmsg(
         "SQLerate scan candidate relid=%u parallel=%d rows=%.0f host=%.3f device=%.3f boundary=%.3f cpu=%.3f io=%.3f",
         scan_relation(root,chosen),chosen->parallel_aware,p.rows,p.host,p.csd,p.boundary,p.cpu,p.io)));
