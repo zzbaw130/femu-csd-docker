@@ -30,9 +30,7 @@ SET pg_sina_csd.dcp = on;
 
 无连接、无外部流式阻塞的融合扫描聚合路径（包括Q6）使用SNIA完成callback领取下一输入块并续交；PG backend只等待整条扫描结束并导入DCP，不负责逐块推进。每个执行槽独占自己的FDM和批次，回调不调用PG API；此时DCP可连续导入完整4MiB槽，不使用256KiB/250µs预算。仍需PG协调的其他路径继续优先交付结果和续交，等待时每次最多导入256KiB、按约250µs预算在完整8KiB页之间让出执行权。整个槽导入完才归还接收缓冲，不增加DMA命令；有填充工作时不额外休眠50µs。接收槽满或关闭会话时允许放弃尚未传输的数据，因此填充是尽力而为，不能把累计读取量当作缓存驻留量。首次写入 shared_buffers 可能产生大量匿名内存 minor fault，DCP 不保证加速当前 CSD 查询。profile 的 `SQLerate DCP` 单独报告接收块、导入/已有页、无效页、跳过字节、填充累计时间、单次处理上限实测、扩展额外缓冲查找（当前为0）/PG分配清零/复制耗时和 minor/major fault；EXPLAIN 显示 DCP 开关。PCIe填充成本进入既有模型，PG缓冲分配/复制的CPU尚未单独校准，当前实验宜用强制路径比较。
 
-PG 集成保持非侵入式：不修改 PostgreSQL 源码，不替换运行时缓冲函数。DCP直接调用现有 `ReadBufferExtended(RBM_ZERO_AND_LOCK)`，不再先做一遍独立的缓冲哈希查找；位图未覆盖的页继续在PG原生pin和页锁保护下识别并跳过，不覆盖其内容。PG内部查找计入profile的 `allocate_ms`，`lookup_ms=0` 表示扩展的额外查找已删除。该接口的清零和首次物理页触碰仍保留，不能据此宣称消除了主要分配成本。
-
-DCP对已有驻留位图中标记的页直接跳过可选导入，避免重复校验、pin和锁定PG缓冲；`resident_skipped_pages`单独记录该数量，与实际通过PG缓冲查找验证的`cached_pages`区分。HOST正常读页仍由PG检查有效性，ExecutorEnd照常更新实际驻留记录，不把跳过次数当作新增驻留。
+PG 集成保持非侵入式：不修改 PostgreSQL 源码，不替换运行时缓冲函数。DCP直接调用现有 `ReadBufferExtended(RBM_ZERO_AND_LOCK)`，不再先做一遍独立的缓冲哈希查找；已有页在PG原生pin和页锁保护下识别并跳过，不覆盖其内容。PG内部查找计入profile的 `allocate_ms`，`lookup_ms=0` 表示扩展的额外查找已删除。该接口的清零和首次物理页触碰仍保留，不能据此宣称消除了主要分配成本。
 
 依赖更新后的 SNIA FEMU 插件及 [femu-cache 接收模块](../femu-cache/README.md)。仅检查开关隔离、原生PG读取导入页和取消恢复，可在Guest运行 `sh /home/femu/tests/database-cache-test.sh`，使用正式Q6。缓存驻留使用连接级页面位图，初始化及顶层ExecutorEnd刷新；规划阶段只读取记录。详见下文及doc/planning.md。
 
