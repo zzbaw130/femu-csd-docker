@@ -116,18 +116,13 @@ static size_t row_available(const struct row_sort *s,cs_work_context *context)
 {
     for(unsigned i=0;i<s->owners_count;++i)
         if(s->owners[i]->context==context) { s=s->owners[i]; break; }
-    struct cs_work_context_stats memory;
-    if(cs_work_get_context_stats(context,&memory)) return 0;
-    size_t available=memory.limit_bytes-memory.used_bytes;
+    size_t available=cs_work_available(context);
     if(s->plan.work_mem_parent) {
-        struct cs_work_context_stats parent;
-        if(cs_work_get_context_stats((void *)(uintptr_t)s->plan.work_mem_parent,&parent)) return 0;
-        size_t free=parent.limit_bytes-parent.used_bytes;
+        size_t free=cs_work_available((void *)(uintptr_t)s->plan.work_mem_parent);
         if(free<available) available=free;
     }
-    struct cs_work_stats pool;
-    if(cs_work_get_stats(&pool)) return 0;
-    return pool.free_bytes<available?pool.free_bytes:available;
+    size_t free_bytes=cs_work_available(NULL);
+    return free_bytes<available?free_bytes:available;
 }
 /* Private executor reserve: one row/text run, radix scratch, a 32-way merge
  * window and control buffers. Reserve the minimum working set, not the
@@ -442,9 +437,7 @@ static void compact_cache(struct row_sort *o)
         if(r->data) { cs_work_free(o->context,r->data); r->data=NULL; }
         r->loaded=UINT32_MAX;
     }
-    struct cs_work_context_stats memory;
-    if(cs_work_get_context_stats(o->context,&memory)) return;
-    size_t bytes=(memory.limit_bytes-memory.used_bytes)/(spilled+1);
+    size_t bytes=cs_work_available(o->context)/(spilled+1);
     bytes=bytes>128?bytes-128:0; /* Allocation metadata/alignment headroom. */
     unsigned rows=bytes/o->row_bytes;
     if(!rows) rows=1;
@@ -697,7 +690,6 @@ static int row_reserve(struct row_sort *s)
         s->runs=runs; s->capacity=capacity;
     }
     unsigned n=s->bounded?s->topn:s->run_rows;
-    size_t available=row_available(s,s->context);
     /* Keep one run of scratch for radix sorting instead of filling the quota
      * with resident runs and silently falling back to comparison sort. */
     size_t bytes=(size_t)n*s->row_bytes,scratch=s->bounded || !s->plan.norder?0:bytes;
@@ -705,13 +697,30 @@ static int row_reserve(struct row_sort *s)
         unsigned oid=s->plan.outputs[s->plan.order[k].output].type_oid;
         if(oid!=20 && oid!=21 && oid!=23 && oid!=1082 && oid!=1700) scratch=0;
     }
-    if(available<bytes+scratch+QS_SORT_IO_BYTES+4096) return -4;
-    unsigned blocks=(n+s->block_rows-1)/s->block_rows;
-    size_t token_bytes=(blocks*sizeof(uint64_t)+_Alignof(struct qs_cell)-1)&~(size_t)(_Alignof(struct qs_cell)-1);
-    uint64_t *tokens=cs_work_calloc(s->context,1,token_bytes+s->row_bytes);
-    if(!tokens) return -4;
-    void *data=cs_work_alloc(s->context,(size_t)n*s->row_bytes);
-    if(!data) { cs_work_free(s->context,tokens); return -4; }
+    unsigned blocks;
+    size_t token_bytes;
+    uint64_t *tokens;
+    void *data;
+    for(;;) {
+        blocks=(n+s->block_rows-1)/s->block_rows;
+        token_bytes=(blocks*sizeof(uint64_t)+_Alignof(struct qs_cell)-1)&~(size_t)(_Alignof(struct qs_cell)-1);
+        tokens=NULL; data=NULL;
+        if(row_available(s,s->context)>=bytes+scratch+QS_SORT_IO_BYTES+4096) {
+            tokens=cs_work_calloc(s->context,1,token_bytes+s->row_bytes);
+            if(tokens) data=cs_work_alloc(s->context,bytes);
+        }
+        if(data) break;
+        cs_work_free(s->context,tokens);
+        /* Concurrent operators can leave free bytes in smaller fragments.
+         * Choose a smaller initial run before consuming any rows. Existing
+         * runs retain their size and use the ordinary eviction path. */
+        if(s->bounded || s->count || n<=s->block_rows) return -4;
+        n=(n/(2*s->block_rows))*s->block_rows;
+        if(n<s->block_rows) n=s->block_rows;
+        bytes=(size_t)n*s->row_bytes;
+        if(scratch) scratch=bytes;
+    }
+    if(!s->bounded && !s->count) s->run_rows=n;
     struct row_run *r=&s->runs[s->count++];
     *r=(struct row_run){.data=data,.owner=s->context,.blocks=tokens,.nblocks=blocks,
         .head=(void *)((char *)tokens+token_bytes)};
@@ -973,7 +982,7 @@ static unsigned merge_fan_in(struct row_sort *o)
     if(o->plan.work_mem_parent) {
         struct cs_work_context_stats parent;
         if(!cs_work_get_context_stats((void *)(uintptr_t)o->plan.work_mem_parent,&parent)) {
-            size_t available=parent.limit_bytes-parent.used_bytes+memory.used_bytes;
+            size_t available=cs_work_available((void *)(uintptr_t)o->plan.work_mem_parent)+memory.used_bytes;
             if(available<limit) limit=available;
         }
     }

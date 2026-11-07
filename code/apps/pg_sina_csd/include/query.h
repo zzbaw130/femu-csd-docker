@@ -27,6 +27,9 @@
 #define QS_INDEX_READS 64
 #define QS_INDEX_KEYS 256 /* One expression vector of probe keys per batch. */
 #define QS_INDEX_CACHE 128
+#define QS_INDEX_SLOTS (QS_INDEX_CACHE+QS_INDEX_READS)
+#define QS_INDEX_POOL_OFFSET (QS_SORT_IO_BYTES+QS_INDEX_SLOTS*QS_PAGE)
+#define QS_INDEX_IO_BYTES (QS_INDEX_POOL_OFFSET+4096U)
 #define QS_INDEX_WORK_BYTES (128U*1024) /* Base cursor/tag state; pages stay in AFDM. */
 static inline size_t qs_index_work_bytes(unsigned workers)
 { return QS_INDEX_WORK_BYTES+(size_t)(workers?workers-1:0)*16384; }
@@ -293,11 +296,14 @@ struct qs_metrics {
     uint64_t spill_write_bytes, spill_read_bytes, runs, spilled_runs;
     uint64_t build_rows, join_rows, build_batches;
     uint64_t index_pages, index_tuples;
+    uint64_t index_cache_hits[2], index_cache_misses[2];
     unsigned workers;
 };
 /* Optional per-query measurements. Each CU owns its own AFDM counters. */
 enum qs_operator { QS_SCAN, QS_FILTER, QS_AGG_SINK, QS_AGG_SOURCE, QS_SORT, QS_LIMIT,
-                   QS_SORT_SINK, QS_SORT_SOURCE, QS_JOIN_BUILD, QS_JOIN_LOAD, QS_JOIN_PROBE, QS_OPERATORS };
+                   QS_SORT_SINK, QS_SORT_SOURCE, QS_JOIN_BUILD, QS_JOIN_LOAD, QS_JOIN_PROBE,
+                   QS_INDEX_CACHE_LOOKUP, QS_INDEX_CACHE_INSERT, QS_INDEX_CACHE_COPY_OUT,
+                   QS_INDEX_CACHE_COPY_IN, QS_OPERATORS };
 struct qs_timing { uint64_t calls, wall_ns, cpu_ns, max_wall_ns; };
 struct qs_profile {
     struct qs_timing operators[QS_OPERATORS];

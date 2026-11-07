@@ -1,4 +1,9 @@
 #!/bin/sh
+# 调用方式为 在 Guest 运行 SF=8 sh cold-query.sh <exe_path> <query.sql>。
+# exe_path 接受五种正式模式，host/csd 分别是 host-only/csd-without-hpcp 的别名。
+# query.sql 是 Guest 中的 SQL 路径；SF 默认 8，PGDATA/PGDATABASE 可显式覆盖。
+# PG_SINA_CACHE 选择 cold（默认）、warm、repeat；PG_SINA_RUNS 指定次数（默认 1，repeat 为 5）。
+# PG_SINA_PROFILE 为 on/off（默认 off），PGOPTIONS 可附加 PostgreSQL 启动选项。
 # 独立缓存组：cold每次清空；warm先HOST预热一次；repeat从冷态连续执行。
 set -eu
 MODE=${1:?usage: cold-query.sh execution-mode query.sql}
@@ -21,8 +26,8 @@ marked=no
 if [ -n "${PG_SINA_RUNS+x}" ] || [ "$RUNS" -gt 1 ]; then marked=yes; fi
 export PATH=/home/femu/opt/postgres/release/bin:$PATH
 export PGOPTIONS="${PGOPTIONS:-} -c pg_sina_csd.profile=$PROFILE"
-PGDATA=${PGDATA:-/data/tpch_s1}
-PGDATABASE=${PGDATABASE:-tpch_s1}
+PGDATA=${PGDATA:-/data/${PGDATABASE:-tpch_s${SF:-8}}}
+PGDATABASE=${PGDATABASE:-${PGDATA##*/}}
 pg_ctl -D "$PGDATA" -m fast -w stop >/dev/null
 sync
 sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
@@ -51,4 +56,4 @@ trap 'rm -f "$driver"' EXIT HUP INT TERM
     done
 } > "$driver"
 echo "CACHE=$CACHE exe_path=$MODE runs=$RUNS: reset both caches; population=$population" >&2
-psql -X -q -A -t -v ON_ERROR_STOP=1 -d "$PGDATABASE" -f "$driver"
+psql -X -q -A -t -v ON_ERROR_STOP=1 -d "$PGDATABASE" -f /home/femu/tests/tpch-parameters.psql -f "$driver"

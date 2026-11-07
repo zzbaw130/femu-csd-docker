@@ -22,6 +22,9 @@
 #define QP_WORKER_FINISHED 4U
 #define QP_CONTROL_REQUIRED 8U
 #define QP_RESOURCE_WAIT 16U /* Retain input; retry after another batch advances. */
+/* Resource CSF cparam1 selector. CPU fraction uses parts per million. */
+enum qp_resource { QP_RESOURCE_WORKMEM, QP_RESOURCE_CPU_RATIO };
+#define QP_CPU_RATIO_SCALE 1000000U
 /* Direct Scan completion: flags 0..4, row count 5..21, varlena bytes 22..38.
  * Bit 39 distinguishes metadata from ordinary worker status. All remain
  * below SNIA's reentry operation bits; 17 bits cover any typed batch. */
@@ -50,6 +53,12 @@ struct qp_node {
 };
 static inline unsigned qp_group_keys(const struct qp_node *n)
 { return n->group_keys?n->group_keys:n->nkeys; }
+static inline unsigned qp_hash_cache_slots(unsigned capacity)
+{ return capacity/16>8?capacity/16:8; }
+static inline size_t qp_hash_cache_words(unsigned slots)
+{ return (size_t)slots+slots/4; }
+static inline uint64_t qp_hash_bitmap_keys(unsigned slots)
+{ return (uint64_t)(slots/4)*64; }
 /* Optional per-pipeline measurements; only the coordinator writes these.
  * CPU sums include all CSF slices, wall includes LOAD and scheduling waits. */
 enum qp_wait { QP_WAIT_DICTIONARY, QP_WAIT_NVM, QP_WAIT_SPILL, QP_WAIT_INPUT, QP_WAIT_SINK, QP_WAITS };
@@ -58,6 +67,9 @@ struct qp_pipeline_profile {
     uint64_t worker_wall_ns,worker_cpu_min,worker_cpu_max,finished_idle_ns;
     /* Shared Hash/aggregate sink work is a subset of worker_ns. */
     uint64_t sink_ns,sink_rows;
+    uint64_t sink_returned_rows,slow_worker_returned_rows;
+    uint64_t input_rows,slow_worker_input_rows,slow_worker_sink_rows;
+    unsigned sink_node,slow_worker;
     /* Per-task suspension sums include scheduling until that task reenters.
      * Tasks overlap: these are not additive query wall-clock stages. */
     uint64_t wait_ns[QP_WAITS],wait_calls[QP_WAITS];
@@ -71,16 +83,26 @@ struct qp_file_mapping {
     uint64_t offset;
     uint32_t nsid,lba_bytes,count,reserved;
 };
+#define QP_INDEX_CACHE_MAX_MIB 128
 struct qp_plan {
     unsigned count, root, nparams, ninit;
     unsigned workers, scan_bytes; /* workers counts task contexts, not physical CUs. */
     unsigned packed_result; /* 0: legacy, 1: projected cells, 2: typed, 3: CU-direct typed. */
     uint64_t parallel_stride;
+    uint64_t index_cache_bytes; /* Optional clean pages charged to workmem. */
+    unsigned prefetch_node, prefetch_slots; /* One-based probe scan and independent input slots. */
+    uint64_t prefetch_input;
     int param_nodes[QP_PARAMS],cte_nodes[QP_PARAMS],init_nodes[QP_PARAMS],init_params[QP_PARAMS];
     struct qp_node nodes[QP_NODES];
     struct qp_pipeline_profile pipelines[QP_NODES];
     struct qp_file_mapping files[QP_NODES],indexes[QP_NODES];
 };
+static inline int qp_index_page_offset(size_t input,unsigned slot,size_t *offset)
+{
+    if(slot>=QS_INDEX_SLOTS) return 0;
+    *offset=input+QS_SORT_IO_BYTES+(size_t)slot*QS_PAGE;
+    return 1;
+}
 /* A bound is valid only for one direct, unfiltered LIMIT consumer. Shared
  * CTE/InitPlan/parameter references require the full ordering. Both executor
  * and estimator use this rule; it is not an algorithm chosen after costing. */
@@ -186,6 +208,13 @@ static inline unsigned qp_scan_capacity(const struct qp_plan *p,const struct qp_
 {
     unsigned rows=qp_scan_buffer_bytes(p,n)/24;
     return rows<QP_VECTOR_ROWS?rows:QP_VECTOR_ROWS;
+}
+static inline size_t qp_input_offset(const struct qp_plan *p,const struct qp_node *n,unsigned worker)
+{
+    if(worker<=1) return n->input_offset;
+    if(worker<=p->prefetch_slots && n==&p->nodes[p->prefetch_node-1])
+        return p->prefetch_input+(worker-2)*(size_t)p->scan_bytes;
+    return n->parallel_input+(worker-2)*p->parallel_stride;
 }
 /* Bound dictionary limits by physical Heap input, not estimated output
  * rows/NDV. A tuple needs at least a 24-byte header and a 4-byte line pointer;
@@ -305,9 +334,11 @@ static inline unsigned qp_task_slots(const struct qp_plan *p,unsigned cus)
     int scalar=p->nodes[p->root].kind==QP_AGGREGATE && !grouped;
     for(unsigned i=0;i<p->count;++i) if(p->nodes[i].parallel)
         for(int id=i;id>=0;id=p->nodes[id].left) {
-            /* Extra tasks hide I/O in scalar probes; grouped states need
+            /* Extra tasks hide I/O in scalar scans/probes; grouped states need
              * that memory themselves, so retain their existing task count. */
-            if(p->nodes[id].kind==QP_INDEX_JOIN || (scalar && p->nodes[id].kind==QP_JOIN && p->nodes[id].hash))
+            if(p->nodes[id].kind==QP_INDEX_JOIN ||
+               (scalar && (p->nodes[id].kind==QP_SCAN ||
+                (p->nodes[id].kind==QP_JOIN && p->nodes[id].hash))))
                 return slots>QS_WORKERS/2?QS_WORKERS:2*slots;
             if(id==qp_pipeline_source(p,i)) break;
         }

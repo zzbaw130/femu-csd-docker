@@ -294,20 +294,20 @@ The program sees one argument, `struct femu_csd_args`
   long long  buffer_len
 ```
 
-### Compute units and runtime scaling
+### Compute units and CPU quotas
 
-The program runs to completion on the host as soon as a `femu-csd-cu`
-thread is free; the compute units' busy-until times then decide when the
-guest sees the completion. This is the same
-"compute, then hold" approach the rest of FEMU uses
-([timing model](../concepts/timing-model.md#compute-then-hold)).
+An ordinary native CSF runs on a `femu-csd-cuN` thread and completes when
+that real invocation returns. Per-CU CPU cgroups limit its actual execution,
+including multi-CU workloads. No controller-wide virtual multiplier is used.
+The native ABI still permits explicit timing: those requests use the
+compute-then-hold model described below.
 
 ```text
   runtime (ns), first that applies:
     1. the runtime field of the Execute command
     2. the runtime given when the program was loaded
     3. measured host time x program runtime_scale / 10
-    4. measured host time x csf_runtime_scale
+    4. actual completion, without an extra virtual CU reservation
 
   compute units (nr_cu = 3):
     cu0  |==== A ====|
@@ -321,10 +321,13 @@ guest sees the completion. This is the same
     expire_time = cu_next_avail[cu]
 ```
 
-[`nr_cu`](../reference/properties.md#csd-computational-storage) bounds how
-many programs run at once in device time;
-[`csf_runtime_scale`](../reference/properties.md#csd-computational-storage)
-stands for how much slower the device's cores are than the host's.
+[`nr_cu`](../reference/properties.md#csd-computational-storage) bounds the
+number of real CU threads. The launcher's `CSD_CU_CPU_RATIO` limits each
+CU through an independent cgroup (default approximately 1/3, effective 0.3333, 10ms period). Zero and one
+disable the quota; other supported ratios are [0.1,1). Only CU threads move
+into these groups, not FTL, pollers, DMA or Guest vCPU threads. Explicit
+native per-command/per-program timing remains supported; ordinary native
+CSFs finish when their real invocation returns.
 
 The completion carries the program's return value, so the poller cannot post
 it before the worker has finished the run. A runtime shorter than the host's
@@ -344,7 +347,6 @@ properties apply to the namespace as in the black-box mode.
 | --- | --- |
 | `fdm_size` | device memory quota in MiB; required |
 | `nr_cu` | compute units, 1 to 64 |
-| `csf_runtime_scale` | host-to-device time factor for programs that give no runtime; not 0 |
 | `csd_program_dir` | where shared-library and eBPF programs load from |
 | `pg_rd_lat`, `pg_wr_lat` | NAND timing used by namespace/AFDM copies |
 | `nr_thread`, `time_slice`, `context_switch_time` | accepted for CEMU configurations; no effect, and a non-default value warns at realize (`nr_thread` must still not be 0) |

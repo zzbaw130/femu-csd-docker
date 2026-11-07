@@ -64,7 +64,7 @@ The FEMU device in that script is:
 
 <!-- femu-example: csd-device -->
 ```
--device femu,devsz_mb=4096,namespaces=1,femu_mode=4,secsz=512,secs_per_pg=8,pgs_per_blk=256,blks_per_pl=256,pls_per_lun=1,luns_per_ch=8,nchs=8,pg_rd_lat=40000,pg_wr_lat=200000,blk_er_lat=2000000,ch_xfer_lat=0,gc_thres_pcent=75,gc_thres_pcent_high=95,fdm_size=64,nr_cu=4,nr_thread=4,time_slice=200000,context_switch_time=200,csf_runtime_scale=3
+-device femu,devsz_mb=4096,namespaces=1,femu_mode=4,secsz=512,secs_per_pg=8,pgs_per_blk=256,blks_per_pl=256,pls_per_lun=1,luns_per_ch=8,nchs=8,pg_rd_lat=40000,pg_wr_lat=200000,blk_er_lat=2000000,ch_xfer_lat=0,gc_thres_pcent=75,gc_thres_pcent_high=95,fdm_size=64,nr_cu=4,nr_thread=4,time_slice=200000,context_switch_time=200
 ```
 
 The preset `hw/femu/scripts/configs/csd.conf` describes the same device
@@ -73,7 +73,7 @@ without the three scheduler properties that have no effect.
 
 <!-- femu-example: csd-preset -->
 ```
--device femu,id=nvme0,devsz_mb=4096,namespaces=1,secsz=512,secs_per_pg=8,pgs_per_blk=256,blks_per_pl=256,pls_per_lun=1,luns_per_ch=8,nchs=8,pg_rd_lat=40000,pg_wr_lat=200000,blk_er_lat=2000000,gc_thres_pcent=75,gc_thres_pcent_high=95,fdm_size=64,nr_cu=4,csf_runtime_scale=3,femu_mode=4
+-device femu,id=nvme0,devsz_mb=4096,namespaces=1,secsz=512,secs_per_pg=8,pgs_per_blk=256,blks_per_pl=256,pls_per_lun=1,luns_per_ch=8,nchs=8,pg_rd_lat=40000,pg_wr_lat=200000,blk_er_lat=2000000,gc_thres_pcent=75,gc_thres_pcent_high=95,fdm_size=64,nr_cu=4,femu_mode=4
 ```
 
 `run-csd.sh` does not set `csd_program_dir`, so it runs phantom programs
@@ -103,12 +103,11 @@ namespace; see the [BlackBox guide](blackbox.md#configuration).
 - `fdm_size`: device memory in MiB. Required.
 - `nr_cu`: compute units, 1 to 64. Each is a host thread, `femu-csd-cu`,
   that runs programs. A program waits for the first free unit.
-- `csf_runtime_scale`: a program that declares no run time and no scale of
-  its own holds its unit for its measured host run time times this value
-  (default 3).
-  A completion carries the program's result, so it never arrives before the
-  host has run the program: a run time, declared or scaled, shorter than the
-  host's own is not reached. QEMU warns once when that happens.
+- Native CSFs with no explicit timing finish when their actual invocation
+  returns. `run-csd.sh` can restrict each CU independently with
+  `CSD_CU_CPU_RATIO` (default approximately 1/3, effective 0.3333, fixed 10ms period; 0 and 1 disable limits,
+  other supported values are [0.1,1)). The current launcher uses the host
+  cgroup v1 CPU controller; it does not throttle FTL, pollers, DMA or vCPUs.
 - `csd_program_dir`: the host directory programs load from.
 - `nr_thread`, `time_slice` and `context_switch_time` are accepted so CEMU
   configurations still start. They have no effect, and a value other than
@@ -233,7 +232,6 @@ BlackBox ([log pages and counters](../reference/log-pages-and-counters.md#vendor
 | `CSD mode requires fdm_size to be non-zero` | Set `fdm_size`. |
 | `CSD nr_cu must be in range [1, 64]` | `nr_cu` out of range. |
 | `CSD nr_thread must be non-zero` | `nr_thread=0`. |
-| `CSD csf_runtime_scale must be non-zero` | `csf_runtime_scale=0`. |
 | `csd supports at most one namespace per controller` | Two CSD namespaces, from `namespace_modes` or from `femu_mode=4` with `namespaces` above 1. Other namespaces of the controller may use other modes. |
 | `FEMU bbssd: namespace 1 exposes ...` | The namespace does not fit the NAND geometry; see the [BlackBox limits](blackbox.md#limits-and-refusals). |
 | `FEMU csd: hot_cold_sep is not supported under FDP: ...` | A knob the FDP write path does not take, on a controller in an FDP subsystem; the same list as for BlackBox ([FDP](../features/fdp.md#limits-and-refusals)). |

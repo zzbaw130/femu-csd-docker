@@ -1,9 +1,8 @@
 #!/bin/bash
-# Usage: build.sh [-i|--rebuild-image] [-p|--build-postgre]
-#
-#   默认   重建容器镜像并启动 VM（保留已有 guest 镜像，不碰 postgres）
-#   -i     同时删掉 guest 镜像 u20s.qcow2，重新做一遍 provisioning
-#   -p     再做 postgres 那几步：初始化分区与 SNIA → 编译安装 → 载数据启库
+# 在仓库根目录运行 ./scripts/build.sh [-i|-p|-ip]。
+# 默认重建 FEMU 容器并启动 Guest，复用 Guest 系统盘。
+# -i/--rebuild-image 重建 Guest 系统盘，-p/--build-postgre 初始化并启动数据库。
+# SF 指定 -p 加载的规模（默认 0.01），例如 SF=8 ./scripts/build.sh -p。
 
 set -eu
 
@@ -33,5 +32,5 @@ docker compose up -d --wait
 if [[ ${BUILD_POSTGRE} -eq 1 ]]; then
     ${ROOT}/sh-guest.sh ${ROOT}/guest/init-csd-env.sh
     ${ROOT}/sh-guest.sh ${ROOT}/guest/install-postgre.sh
-    ${ROOT}/sh-guest.sh ${ROOT}/guest/start-postgre.sh 0.01
+    ${ROOT}/sh-guest.sh ${ROOT}/guest/start-postgre.sh "${SF:-0.01}"
 fi

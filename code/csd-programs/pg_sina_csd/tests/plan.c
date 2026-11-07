@@ -14,7 +14,7 @@
 #include <endian.h>
 #include <sched.h>
 typedef int64_t (*function)(struct femu_csd_args *);
-enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_INDEX_PIPELINE,TEST_INDEX_HASH,TEST_INDEX_CHAIN,TEST_INDEX_EXPR,TEST_DEVICE_IO,TEST_PACKED_KEYS,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL,TEST_PARTITION_PACKED, TEST_VECTOR_AGG=-1,TEST_JOIN_QUAL=-2,TEST_GROUP_SOURCE=-3,TEST_GROUP_SOURCE_SPILL=-4,TEST_BUILD_GROUP_SOURCE=-5,TEST_BUILD_GROUP_HAVING=-6,TEST_BUILD_GROUP_DIRECT=-7 };
+enum { TEST_SERIAL,TEST_PARALLEL,TEST_BUILD_PHASE,TEST_COUNT_ROWS,TEST_BUILD_FALLBACK,TEST_LARGE_SCAN,TEST_WIDE_HASH,TEST_SIGNED_HASH,TEST_BIGINT_HASH,TEST_HASH_GROUP,TEST_INDEX_PIPELINE,TEST_INDEX_HASH,TEST_INDEX_CHAIN,TEST_INDEX_EXPR,TEST_DEVICE_IO,TEST_PACKED_KEYS,TEST_PARTITION,TEST_PARTITION_SKEW,TEST_PARTITION_SERIAL,TEST_PARTITION_PACKED,TEST_PARTITION_GROUP, TEST_VECTOR_AGG=-1,TEST_JOIN_QUAL=-2,TEST_GROUP_SOURCE=-3,TEST_GROUP_SOURCE_SPILL=-4,TEST_BUILD_GROUP_SOURCE=-5,TEST_BUILD_GROUP_HAVING=-6,TEST_BUILD_GROUP_DIRECT=-7 };
 static unsigned test_workers=4;
 static bool test_scheduled;
 static bool test_partitioned;
@@ -539,6 +539,7 @@ static void *probe_worker(void *arg)
 }
 static void test(function run,unsigned join,unsigned rows,unsigned right_rows,unsigned memory,int hash,int parallel)
 {
+    int partitioned_group=parallel==TEST_PARTITION_GROUP;
     int direct=parallel==TEST_BUILD_GROUP_DIRECT;
     int wide_build=parallel==TEST_WIDE_HASH && hash==1;
     int grouped_build=parallel==TEST_BUILD_GROUP_SOURCE || parallel==TEST_BUILD_GROUP_HAVING || direct;
@@ -720,17 +721,30 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         a->nkeys=a->expr.nkeys=0;
         a->expr.exprs[0]=(struct qs_expr){.op=Q_CONST,.type=Q_INTEGER};
     }
-    if(parallel==TEST_COUNT_ROWS || grouped_build || parallel>=TEST_PARTITION) {
+    if(!partitioned_group && (parallel==TEST_COUNT_ROWS || grouped_build || parallel>=TEST_PARTITION)) {
         /* COUNT(*) needs row cardinality but no payload from the probe pipeline. */
         j->expr.nout=0; a->nkeys=a->expr.nkeys=a->expr.nattrs=0;
         a->expr.naggs=a->expr.nout=1; a->expr.aggs[0]=(struct qs_agg){.kind=Q_COUNT_STAR};
         a->expr.outputs[0]=(struct qs_output){.index=3,.type_oid=20};
     }
-    if(parallel==TEST_HASH_GROUP) {
+    if(parallel==TEST_HASH_GROUP || partitioned_group) {
         a->hash=1; a->estimated_rows=12; a->expr.naggs=1; a->expr.nout=2;
         if(test_resident_group) a->estimated_groups=200000;
         a->expr.aggs[0]=(struct qs_agg){.expr=2,.kind=Q_COUNT};
         a->expr.outputs[1]=(struct qs_output){.index=3,.type_oid=20};
+    }
+    if(partitioned_group) {
+        /* The Sort prepares a grouped Source while the child join still
+         * has spilled build batches to probe. Every batch must be counted. */
+        plan->root=4; plan->count=5; a->parallel=1;
+        struct qp_node *sort=&plan->nodes[4];
+        *sort=(struct qp_node){.kind=QP_SORT,.left=0,.right=-1};
+        sort->expr.work_mem_bytes=a->expr.work_mem_bytes; sort->expr.predicate=-1;
+        sort->expr.nattrs=sort->expr.nexprs=sort->expr.nout=2; sort->expr.norder=1;
+        for(unsigned i=0;i<2;++i) {
+            sort->expr.exprs[i]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER,.column=i};
+            sort->expr.outputs[i]=(struct qs_output){.index=i,.type_oid=i?20:23};
+        }
     }
     if(parallel==TEST_BUILD_FALLBACK) {
         /* The small inner build needs a parallel grouped input; the large
@@ -782,7 +796,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     }
     for(unsigned i=0;i<plan->count;++i) if(plan->nodes[i].kind==QP_INDEX_JOIN) {
         struct qp_node *indexed=&plan->nodes[i];
-        indexed->input_offset=bytes; bytes+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE;
+        indexed->input_offset=bytes; bytes+=QS_INDEX_IO_BYTES;
         indexed->vector_offset=bytes; bytes+=qs_index_input_bytes()+((qs_chunk_bytes(256,4)+4095)&~(size_t)4095);
     }
     size_t parallel_bytes=bytes;
@@ -792,7 +806,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         plan->nodes[2].parallel_vector=parallel_bytes; parallel_bytes+=(qs_chunk_bytes(plan->scan_bytes/24,2)+4095)&~(size_t)4095;
         for(unsigned i=0;i<plan->count;++i) if(plan->nodes[i].kind==QP_INDEX_JOIN) {
             struct qp_node *indexed=&plan->nodes[i];
-            indexed->parallel_input=parallel_bytes; parallel_bytes+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE;
+            indexed->parallel_input=parallel_bytes; parallel_bytes+=QS_INDEX_IO_BYTES;
             indexed->parallel_vector=parallel_bytes; parallel_bytes+=qs_index_input_bytes()+((qs_chunk_bytes(256,4)+4095)&~(size_t)4095);
         }
         if(parallel==TEST_BUILD_PHASE || parallel==TEST_BUILD_FALLBACK || grouped_build || wide_build) {
@@ -832,7 +846,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     }
     void *mr[]={plan,&control,out,arena,io}; long long len[]={plan_bytes,(plan->workers+1)*sizeof(*controls),(plan->workers+1)*sizeof(*out),bytes,(plan->workers+1)*QS_SORT_IO_BYTES};
     struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=len};
-    args.cparam1=parallel==TEST_PACKED_KEYS || parallel==TEST_PARALLEL || parallel==TEST_BUILD_PHASE || parallel==TEST_HASH_GROUP || parallel==TEST_GROUP_SOURCE_SPILL || parallel==TEST_PARTITION || parallel==TEST_PARTITION_SKEW || parallel==TEST_PARTITION_PACKED || grouped_build || wide_build;
+    args.cparam1=parallel==TEST_PACKED_KEYS || parallel==TEST_PARALLEL || parallel==TEST_BUILD_PHASE || parallel==TEST_HASH_GROUP || parallel==TEST_GROUP_SOURCE_SPILL || parallel==TEST_PARTITION || parallel==TEST_PARTITION_SKEW || parallel==TEST_PARTITION_PACKED || partitioned_group || grouped_build || wide_build;
     struct test_spill spill={.mutex=PTHREAD_MUTEX_INITIALIZER}; unsigned got=0; unsigned char seen[12]={0};
     uint64_t counts[12]={0},sums[12]={0},mins[12]={0},maxs[12]={0};
     uint64_t source_sums[12]={0},source_counts[12]={0};
@@ -915,13 +929,13 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             for(unsigned w=0;w<plan->workers;++w) need_input[w]=true;
         }
         for(unsigned r=0;r<out->rows;++r) {
-            if(parallel==TEST_COUNT_ROWS || grouped_build || parallel>=TEST_PARTITION) {
+            if(!partitioned_group && (parallel==TEST_COUNT_ROWS || grouped_build || parallel>=TEST_PARTITION)) {
                 uint64_t expected=0; for(unsigned i=0;i<12;++i) expected+=counts[i];
                 assert(out->data[r].cells[0].value==expected); ++got; continue;
             }
             struct qs_cell *v=out->data[r].cells; unsigned key=v[0].isnull?11:(unsigned)v[0].value;
             assert(key<12 && seen[key]); seen[key]=0; ++got;
-            if(parallel==TEST_HASH_GROUP) { assert(!v[1].isnull && v[1].value==counts[key]); continue; }
+            if(parallel==TEST_HASH_GROUP || partitioned_group) { assert(!v[1].isnull && v[1].value==counts[key]); continue; }
             if(v[1].isnull!=!counts[key] || v[2].value!=counts[key])
                 fprintf(stderr,"join=%u key=%u count=%lld expected=%llu sum=%lld expected=%llu\n",join,key,(long long)v[2].value,(unsigned long long)counts[key],(long long)v[1].value,(unsigned long long)sums[key]);
             assert(v[1].isnull==!counts[key] && v[2].value==counts[key]);
@@ -966,7 +980,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
      * even though these input rows need only a tiny resident aggregate. */
     if(test_resident_group) assert(out->metrics.work_peak<16U*1024*1024 && !spill.count);
     if((parallel==TEST_GROUP_SOURCE || parallel==TEST_INDEX_EXPR) && !rows) assert(!got); else assert(got);
-    if(parallel!=TEST_COUNT_ROWS && !grouped_build && parallel<TEST_PARTITION)
+    if(partitioned_group || (parallel!=TEST_COUNT_ROWS && !grouped_build && parallel<TEST_PARTITION))
         for(unsigned i=0;i<12;++i) assert(!seen[i]);
     if(args.cparam1&1) {
         uint64_t rounds=0;
@@ -1001,7 +1015,9 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         for(unsigned op=0;op<QS_OPERATORS;++op) if(op!=QS_JOIN_PROBE) children+=out->profile.operators[op].cpu_ns;
         assert(out->profile.operators[QS_JOIN_PROBE].cpu_ns>=children);
     } else for(unsigned i=0;i<plan->count;++i) assert(!plan->pipelines[i].rounds);
-    if(parallel>=TEST_PARTITION) {
+    if(partitioned_group) {
+        assert(spill.count && plan->pipelines[1].rounds>1);
+    } else if(parallel>=TEST_PARTITION) {
         assert(spill.count && !out->metrics.runs && out->metrics.workers==(parallel==TEST_PARTITION_SERIAL?1:4));
         if(parallel==TEST_PARTITION_SERIAL) assert(!control.epoch);
         else assert(memory==8?control.epoch==1:control.epoch>1);
@@ -1280,7 +1296,7 @@ static void probe_payload(function run,unsigned limit,int strings,int indexed,in
         bytes=(bytes+7)&~(size_t)7;
     }
     if(indexed) {
-        j->input_offset=bytes; bytes+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE;
+        j->input_offset=bytes; bytes+=QS_INDEX_IO_BYTES;
         j->vector_offset=bytes; bytes+=qs_index_input_bytes()+qs_chunk_bytes(256,4);
     }
     unsigned char *arena=calloc(1,bytes),*io=calloc(1,QS_SORT_IO_BYTES); assert(arena && io);
@@ -1513,7 +1529,7 @@ static void set_join(function run,unsigned kind,int hash,int has_null)
     }
     unsigned char *index=NULL;
     if(hash==2) {
-        n->input_offset=bytes; bytes+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE;
+        n->input_offset=bytes; bytes+=QS_INDEX_IO_BYTES;
         n->vector_offset=bytes; bytes+=qs_index_input_bytes()+qs_chunk_bytes(256,4);
         index=calloc(2,QS_PAGE); assert(index); unsigned char *leaf=index+QS_PAGE;
         w16(leaf+12,24+right_rows*4); w16(leaf+14,QS_PAGE-16-right_rows*16);
@@ -2453,6 +2469,7 @@ int main(int argc,char **argv)
         test(run,QP_INNER,31,3000003,64,1,TEST_PARTITION);
         test(run,QP_INNER,31,3000003,64,1,TEST_PARTITION_PACKED);
         test(run,QP_INNER,31,3000003,64,1,TEST_PARTITION_SERIAL);
+        test(run,QP_INNER,31,3000003,64,1,TEST_PARTITION_GROUP);
         return 0;
     }
     if(argc==3 && !strcmp(argv[2],"--sort-payload-64m")) {
@@ -2476,6 +2493,17 @@ int main(int argc,char **argv)
         uint64_t expected=strtoull(argv[2],NULL,10)*1024*1024;
         assert(capacity(&args)==(int64_t)expected);
         assert(!cs_work_get_stats(&stats) && stats.capacity_bytes==expected && !stats.used_bytes && !stats.active_contexts);
+        const char *ratios[]={"0","1","0.34","0.3333","bad","0.05"};
+        const int64_t fractions[]={1000000,1000000,340000,333300,-1,-1};
+        args.cparam1=QP_RESOURCE_CPU_RATIO;
+        for(unsigned i=0;i<sizeof(ratios)/sizeof(*ratios);++i) {
+            assert(!setenv("CSD_CU_CPU_RATIO",ratios[i],1));
+            assert(capacity(&args)==fractions[i]);
+        }
+        assert(!unsetenv("CSD_CU_CPU_RATIO") && capacity(&args)==QP_CPU_RATIO_SCALE);
+        args.cparam1=2; assert(capacity(&args)<0);
+        args.cparam1=QP_RESOURCE_WORKMEM;
+        assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
         args.numr=1; assert(capacity(&args)<0);
         printf("PASS device resource query: %llu MiB, no query allocations\n",(unsigned long long)(expected/1024/1024));
         return 0;

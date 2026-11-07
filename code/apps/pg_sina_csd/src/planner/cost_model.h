@@ -7,6 +7,33 @@
 
 static inline double cost_max(double a,double b) { return a>b?a:b; }
 static inline double cost_min(double a,double b) { return a<b?a:b; }
+/* Keep the calibrated full-CPU price separate from the device's quota.
+ * This affects CU work, never NVM/PCIe or HOST CPU service. */
+static inline double cost_device_cpu_ratio(double base,double quota)
+{ return base/(quota>0?quota:1); }
+/* The Heap decoder skips a fixed-width unprojected prefix on non-NULL
+ * tuples. It walks variable headers through the last required column
+ * even when the corresponding value is only borrowed or skipped. */
+static inline double cost_heap_decode_ops(const struct qs_plan *plan,unsigned attrs)
+{
+    unsigned last=attrs,first=0;
+    while(last && plan->cols[last-1].slot<0) --last;
+    double ops=0;
+    while(first<last) {
+        const struct qs_column *spec=&plan->cols[first];
+        if(spec->length<=0 || (spec->slot>=0 &&
+           ((spec->type!=Q_INTEGER && spec->type!=Q_DATE) || spec->deferred ||
+            (spec->length!=1 && spec->length!=2 && spec->length!=4 && spec->length!=8)))) break;
+        if(spec->slot>=0) ops+=0.25;
+        ++first;
+    }
+    for(unsigned col=first;col<last;++col) {
+        const struct qs_column *spec=&plan->cols[col];
+        ops+=spec->length>0?0.25:0.5;
+        if(spec->slot>=0) ops+=0.25;
+    }
+    return ops;
+}
 /* Overlap of the two caches is unknown: use the conservative union. The
  * caller retains CPU costs; only file-only hits pay the extra page copy. */
 static inline double cost_host_cached_io(double io,double shared,double file,double copy_ratio)
@@ -55,6 +82,38 @@ static inline double cost_scan_overlap(double io,double cpu,double tasks,unsigne
 {
     double lanes=cost_max(1,cost_min(tasks,cus));
     return cost_min(io,cpu)*(1-1/lanes);
+}
+/* A streaming consumer can issue I/O while the independent producer runs.
+ * Keep startup dependencies and the combined storage/link service bounds;
+ * overlapping two users never doubles either shared resource's bandwidth. */
+static inline double cost_stream_join(double total,double startup,double producer,
+    double consumer,double storage,double link)
+{
+    return cost_max(cost_max(startup,cost_max(storage,link)),
+        total-cost_min(cost_max(0,producer),cost_max(0,consumer)));
+}
+/* A result read arriving during a population DMA waits for its residual
+ * service. Uniform arrivals give half a burst, weighted by link duty.
+ * Each stream waits for one read before submitting the next, so a DMA
+ * burst can delay at most one read in that stream. */
+static inline double cost_population_link_wait(double population,double producer,
+    double requests,double burst)
+{
+    if(population<=0 || requests<=0 || burst<=0) return 0;
+    double intersected=requests*cost_min(population,burst)*
+        cost_min(1,population/cost_max(population,producer));
+    return cost_min(intersected,population)*0.5;
+}
+/* Each Scan stream serializes its result reads. Other CSD slots can run
+ * while that callback waits. Keep the aggregate reader and shared PCIe
+ * bounds, plus the last packet that cannot precede producer completion. */
+static inline double cost_scan_delivery(double device,double reader,double link,double batches,unsigned slots)
+{
+    /* A slot cannot run another block until its current output is read.
+     * The remaining slots can cover the service time of the reader. */
+    double overlap=cost_scan_overlap(device,reader,batches,slots);
+    double elapsed=device+reader-overlap;
+    return cost_max(elapsed,link)-device;
 }
 static inline double cost_slots(double count,double minimum)
 {
@@ -123,14 +182,18 @@ static inline double cost_index_heap_visits(double probes,double matches,double 
     double weight=correlation*correlation;
     return probes*(weight*clustered+(1-weight)*matches);
 }
-/* Only a proven self-key probe may borrow its current scan morsel. PG's
- * physical correlation estimates the clustered fraction; groups crossing a
- * morsel boundary and uncorrelated tuples still require internal reads. */
-static inline double cost_index_window_misses(double visits,double matches,double tuples_per_page,double window_pages,double correlation)
+/* A batch can span several scan morsels, but only its final morsel is
+ * available to the probe. With uniformly distributed batch ends, integrate
+ * min(batch, current_morsel_keys) over the position in the final morsel. */
+static inline double cost_index_window_misses(double visits,double matches,double tuples_per_page,
+    double window_pages,double correlation,double keys_per_morsel,double batch)
 {
     double footprint=cost_max(1,matches/cost_max(1,tuples_per_page));
     double within=window_pages>0?cost_max(0,1-footprint/window_pages):0;
-    return visits*(1-correlation*correlation*within);
+    double span=batch-1; /* The final key is always from the current morsel. */
+    double retained=keys_per_morsel>=span && keys_per_morsel>0?
+        1-span*span/(2*keys_per_morsel*batch):(1+keys_per_morsel/2)/batch;
+    return visits*(1-correlation*correlation*within*retained);
 }
 /* DuckDB CardinalityEstimator uses DEFAULT_SEMI_ANTI_SELECTIVITY = 5.
  * Use its 20% fallback only for degenerate residual self anti estimates. */
@@ -149,6 +212,14 @@ static inline unsigned cost_hash_row(const struct qs_plan *p)
 }
 static inline double cost_hash_state(double rows,unsigned row_bytes)
 { return cost_slots(rows,128)*(row_bytes+3*sizeof(uint32_t)); }
+/* After consuming the blocking build, external_build can reload all rows
+ * into one packed table. Only the bucket array needs a power of two. */
+static inline double cost_hash_reload_state(double rows,unsigned row_bytes)
+{
+    double capacity=ceil(rows/128)*128;
+    return capacity*(row_bytes+sizeof(uint32_t))+
+        cost_slots(2*capacity,256)*sizeof(uint32_t);
+}
 /* Existence-key compaction happens only when growth would exceed the budget.
  * The initial table still allocates the largest fitting power-of-two, not
  * merely the NDV-sized payload. Missing statistics retain the general model. */

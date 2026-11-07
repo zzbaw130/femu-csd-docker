@@ -1,4 +1,6 @@
 #!/bin/bash
+# 调用方式为 在 Guest 运行 bash /home/femu/scripts/install-postgre.sh，无参数。
+# 安装或复用 PostgreSQL，并为实验 Guest 配置 NVMe 直连权限。
 set -eu
 
 src_dir=/home/femu/apps/postgres
@@ -37,7 +39,7 @@ sudo chown femu /dev/nvme0 /dev/nvme0n1
 sudo chmod 0660 /dev/nvme0 /dev/nvme0n1
 # SNIA 根据 GPT 标签查找并独占 spill 分区，不假定 p1/p2 的角色。
 for partition in /sys/class/block/nvme0n1p*; do
-    if grep -qx 'PARTNAME=femu-spill' "$partition/uevent"; then
+    if [ -f "$partition/uevent" ] && grep -qx 'PARTNAME=femu-spill' "$partition/uevent"; then
         sudo chown femu "/dev/${partition##*/}"
         sudo chmod 0660 "/dev/${partition##*/}"
     fi

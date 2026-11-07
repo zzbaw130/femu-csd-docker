@@ -23,6 +23,7 @@ services:
       - /dev/kvm                  # FEMU boots its guest with KVM
     cap_add:
       - SYS_NICE                  # allow explicit NUMA memory policies
+      - IPC_LOCK                  # allow the device's explicit HugeTLB mapping
     ports:
       - "8080:8080"               # guest SSH, forwarded by run-csd.sh
     stdin_open: true              # -nographic serial console
@@ -36,18 +37,21 @@ services:
       - ./results:/workspace/results
       - ./scripts:/workspace/scripts
       - ./tests:/workspace/tests
+      # Only the CPU controller is writable; each CU joins its own child
+      # under this container's CPU cgroup. Other controller mounts stay read-only.
+      - /sys/fs/cgroup/cpu,cpuacct:/sys/fs/cgroup/cpu,cpuacct:rw
     environment:
       FEMU_SMP: 8
-      FEMU_MEM: 8G
+      FEMU_MEM: 16G
       FEMU_HOST_CPUS: 30-39       # node3: eight vCPUs and QEMU host threads
       FEMU_HOST_NODE: 3           # Guest RAM, including its caches/receive ring
-      FEMU_DEVICE_CPUS: 20-28     # node2: 1 FTL + 4 CU + 2 poller + 2 cache
-      FEMU_DEVICE_NODE: 2         # NVM, FDM, workmem, spill and device metadata
-      CSD_WORKMEM_SIZE_MB: 256    # shared CSF work arena, independent of FDM
-      CSD_FDM_SIZE: 64            # in megabytes, MAX=48GB=49152, with 25%(16GB) op
-      CSD_NVM_SIZE: 20480         # SF8 relations plus native PG temporary files
+      FEMU_DEVICE_CPUS: 20-28     # node2: 1 FTL + 8 quota-limited CU + 2 poller + 2 cache
+      FEMU_DEVICE_NODE: "1,2"     # 32GiB NVM plus hidden spill cannot fit node2 alone
+      CSD_DEVICE_MEMORY_MB: 1024 # total HugeTLB mapping, including FDM
+      CSD_FDM_SIZE: 128           # MiB reserved at the end of device memory
+      CSD_NVM_SIZE: 32768         # whole namespace for /data, including PG temporary files
       CSD_SPILL_SIZE_MB: 8192     # device-hidden NVM; independent of compute workmem
       CSD_PCIE_BANDWIDTH_MBPS: 3500 # shared per direction across all pollers
-      CSD_NR_CU: 4                # max 64
-      CSD_CSF_RUNTIME_SCALE: 1
+      CSD_NR_CU: 8                # max 64
+      CSD_CU_CPU_RATIO: ${CSD_CU_CPU_RATIO:-0.3333333333} # per CU; 0/1 unlimited, otherwise 0.1 <= ratio < 1
       CSD_PROGRAM_DIR: /workspace/code/csd-programs/build

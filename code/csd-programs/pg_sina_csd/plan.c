@@ -10,11 +10,14 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
 #include <endian.h>
 
 extern int64_t pg_sina_scan_impl(struct femu_csd_args *);
 extern int64_t pg_sina_filter_impl(struct femu_csd_args *);
+extern int64_t qs_filter_selected(struct femu_csd_args *);
 extern int64_t pg_sina_sort_sink_impl(struct femu_csd_args *);
 extern int64_t pg_sina_sort_source_impl(struct femu_csd_args *);
 extern void qs_sort_dictionary(uint64_t,struct qs_dict *);
@@ -81,9 +84,13 @@ struct sorted_rows {
     unsigned prefix_rows,prefix_position;
     struct qs_metrics metrics;
 };
+struct spool_block {
+    uint64_t token;
+    unsigned char *data;
+};
 struct spool {
     unsigned char *tail,*cache;
-    uint64_t *tokens;
+    struct spool_block *pages;
     unsigned blocks, capacity, used, loaded;
     uint64_t rows;
 };
@@ -92,10 +99,12 @@ struct spool {
 struct radix_group {
     struct spool *streams;
     unsigned partitions,workers;
+    size_t resident_reserve;
     atomic_uint next;
     struct operator_state *serial;
 };
 #define HASH_PARTITIONS 4
+#define HASH_RELOAD_BLOCK_ROWS 32768U
 /* Bounded radix partitions use the existing SNIA spill protocol. A skewed
  * partition is probed in build batches, without sorting or rereading Heap. */
 struct external_hash {
@@ -174,6 +183,7 @@ struct projection_batch {
     int retry,materializing;
     unsigned joined_row,joined_column;
     unsigned materialized_column;
+    unsigned deferred_numbers; /* Probe payload output slots, never join keys. */
     struct qs_vector_input retry_input;
     struct qs_chunk *retry_chunk;
     const uint32_t *retry_selection;
@@ -216,6 +226,9 @@ struct operator_state {
     struct qs_scan_cursor *scan_cursor;
     int defer_strings;
     struct qs_plan *scan_filter;
+    const uint32_t *scan_hash_buckets;
+    unsigned scan_hash_mask,scan_hash_slot;
+    bool scan_hash_checked;
     struct qs_dict *filter_dictionary; /* Immutable literals for raw-Heap filtering. */
     int scan_filter_checked,projection_checked;
     struct projection_batch *projection;
@@ -242,6 +255,7 @@ struct operator_state {
     int index_resume, index_flush,index_active,index_projected;
     unsigned index_consume_position;
     unsigned char *hash_data;
+    unsigned char **hash_blocks; /* Direct reload fallback for fragmented workmem. */
     atomic_uint hash_rows;
     unsigned hash_capacity,hash_match,hash_phase,hash_buckets,hash_cache_slots;
     uint64_t *hash_cache;
@@ -279,6 +293,7 @@ struct execution {
     struct qp_control *control;
     struct qs_dict *dictionary;
     struct qs_dictionary *paged;
+    struct qs_index_cache *index_cache;
     struct qs_dictionary_access *initial_access;
     unsigned *literal_ids;
     unsigned imported,literal_node,literal_string;
@@ -338,6 +353,7 @@ struct execution {
     unsigned parallel_node, root, used_workers;
     /* One-based parent receiving rows directly from parallel workers. */
     unsigned hash_sink,group_sink,aggregate_sink,group_combine;
+    uint64_t sink_returned_rows;
     unsigned partition_sink,partition_merged,partition_merge_row;
     uint64_t partition_prefix_at,partition_prefix_end;
     struct spool *partitions;
@@ -376,7 +392,7 @@ static void wait_io(struct execution *s,int64_t status)
         wait_begin(s,QP_WAIT_SPILL);
 }
 static size_t input_offset(const struct execution *s,const struct qp_node *n)
-{ return s->worker>1?n->parallel_input+(s->worker-2)*s->plan->parallel_stride:n->input_offset; }
+{ return qp_input_offset(s->plan,n,s->worker); }
 static size_t vector_offset(const struct execution *s,const struct qp_node *n)
 { return s->worker>1?n->parallel_vector+(s->worker-2)*s->plan->parallel_stride:n->vector_offset; }
 static int64_t parallel_next(struct execution *,unsigned,struct qs_cell *);
@@ -821,16 +837,14 @@ static int64_t sort_init(struct execution *s,struct sorted_rows *sort,const stru
      * partition of all memory. Borrow from actual free query memory when
      * fewer sorts are live, retaining workspace for consumers and merge. */
     struct execution *owner=s->owner?s->owner:s;
-    struct cs_work_context_stats memory;
-    if(cs_work_get_context_stats(owner->context,&memory)) return -4;
     unsigned active=0;
     for(unsigned i=0;i<owner->plan->count;++i) {
         const struct operator_state *o=&owner->nodes[i];
         active+=o->left_sort.initialized && !o->left_sort.drained;
         active+=o->right_sort.initialized && !o->right_sort.drained;
     }
-    size_t available=(memory.limit_bytes-memory.used_bytes)/(active+2);
-    size_t free_bytes=memory.limit_bytes-memory.used_bytes,reserve=2*s->sort_limit;
+    size_t free_bytes=cs_work_available(owner->context),reserve=2*s->sort_limit;
+    size_t available=free_bytes/(active+2);
     if(free_bytes>reserve && free_bytes-reserve>available) available=free_bytes-reserve;
     if(available>sort->plan.work_mem_bytes) sort->plan.work_mem_bytes=available;
     sort->plan.work_mem_parent=(uintptr_t)s->context;
@@ -1031,16 +1045,26 @@ static int hash_exists_only(const struct qp_node *n)
  * Concurrent first insertions may retain duplicates, which are harmless for
  * SEMI/ANTI. Publish the initialized payload and next link together via CAS. */
 static int hash_insert_exists(struct execution *s,const struct qp_node *n,struct operator_state *o,
-    const struct qs_plan *right,const struct qs_cell *row,uint64_t hash)
+    const struct qs_plan *right,const struct qs_cell *row)
 {
-    unsigned bytes=hash_row_bytes(right),column=n->right_keys[0];
+    unsigned column=n->right_keys[0];
+    uint64_t *seen=NULL,bit=0;
     uint64_t tag=0; unsigned cached=0;
-    if(o->hash_cache && !row[column].isnull && !row[column].scale && row[column].value>=INT64_MIN && row[column].value<=INT64_MAX) {
+    if(o->hash_cache && !row[column].isnull && !row[column].scale &&
+       row[column].value>=0 && row[column].value<qp_hash_bitmap_keys(o->hash_cache_slots)) {
+        uint64_t key=(uint64_t)row[column].value;
+        seen=o->hash_cache+o->hash_cache_slots+key/64;
+        bit=UINT64_C(1)<<(key%64);
+        if(__atomic_load_n(seen,__ATOMIC_RELAXED)&bit) return 1;
+    }
+    uint64_t hash=row_hash(n,row,1);
+    if(o->hash_cache && !seen && !row[column].isnull && !row[column].scale &&
+       row[column].value>=INT64_MIN && row[column].value<=INT64_MAX) {
         tag=(uint64_t)(int64_t)row[column].value+1;
         cached=(hash>>32)&(o->hash_cache_slots-1);
         if(tag && __atomic_load_n(&o->hash_cache[cached],__ATOMIC_ACQUIRE)==tag) return 1;
     }
-    unsigned type=right->exprs[right->outputs[column].index].type;
+    unsigned bytes=hash_row_bytes(right),type=right->exprs[right->outputs[column].index].type;
     uint32_t *next=(void *)(o->hash_data+(size_t)o->hash_capacity*bytes),*buckets=next+o->hash_capacity;
     unsigned bucket=hash&(o->hash_buckets-1);
     for(unsigned match=__atomic_load_n(&buckets[bucket],__ATOMIC_ACQUIRE);match!=UINT_MAX;match=next[match]) {
@@ -1048,6 +1072,7 @@ static int hash_insert_exists(struct execution *s,const struct qp_node *n,struct
         int equal=equal_cell(s,row[column],other[column],type);
         if(equal<0) return -5;
         if(equal) {
+            if(seen) __atomic_fetch_or(seen,bit,__ATOMIC_RELAXED);
             if(tag) __atomic_store_n(&o->hash_cache[cached],tag,__ATOMIC_RELEASE);
             return 1;
         }
@@ -1057,6 +1082,7 @@ static int hash_insert_exists(struct execution *s,const struct qp_node *n,struct
     unsigned head=__atomic_load_n(&buckets[bucket],__ATOMIC_ACQUIRE);
     do { next[at]=head; }
     while(!__atomic_compare_exchange_n(&buckets[bucket],&head,at,1,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE));
+    if(seen) __atomic_fetch_or(seen,bit,__ATOMIC_RELAXED);
     if(tag) __atomic_store_n(&o->hash_cache[cached],tag,__ATOMIC_RELEASE);
     return 1;
 }
@@ -1075,7 +1101,7 @@ static int hash_sink_batch(struct execution *s,struct qs_result *out)
     if(hash_exists_only(n) && (o->hash_cache || s->plan->nodes[n->right].estimated_rows>=o->hash_capacity)) {
         for(;count<out->rows;++count) {
             const struct qs_cell *row=(struct qs_cell *)out->data+(size_t)count*right->nout;
-            int added=hash_insert_exists(s,n,o,right,row,row_hash(n,row,1));
+            int added=hash_insert_exists(s,n,o,right,row);
             if(added<0) return added;
             if(!added) break;
         }
@@ -1146,7 +1172,20 @@ static int64_t hash_build_impl(struct execution *s,unsigned id)
         unsigned max=1; while((size_t)max*2*stride<=hash_limit && max<UINT_MAX/4) max*=2;
         unsigned capacity=128; while(capacity<estimate && capacity<max) capacity*=2;
         if(capacity>max) capacity=max;
-        o->hash_data=hash_memory(s,id,NULL,capacity*stride);
+        size_t bytes=capacity*stride;
+        /* A filtered parallel build can outgrow PG's estimate after worker
+         * allocations occupy the adjacent span. For residual SEMI/ANTI, a
+         * failed growth sorts both inputs. Reserve the next tier up front
+         * when it fits the hash budget but allocating it beside the old
+         * table would exceed that budget. */
+        if(capacity<max && s->plan->nodes[n->right].kind==QP_SCAN &&
+           s->plan->nodes[n->right].parallel && right->predicate>=0 &&
+           (n->join_type==QP_SEMI || n->join_type==QP_ANTI) && n->join_qual>=0 &&
+           bytes>hash_limit/3) {
+            o->hash_data=hash_memory(s,id,NULL,2*bytes);
+            if(o->hash_data) capacity*=2;
+        }
+        if(!o->hash_data) o->hash_data=hash_memory(s,id,NULL,bytes);
         if(!o->hash_data) { o->hash_fallback=1; return 0; }
         o->hash_capacity=capacity; hash_reindex(s,id);
     }
@@ -1226,6 +1265,26 @@ static void hash_qual_close(struct execution *s,struct operator_state *o)
     cs_work_free(s->context,o->hash_qual->expr.vectors);
     cs_work_free(s->context,o->hash_qual); o->hash_qual=NULL;
 }
+static inline unsigned char *hash_row(const struct operator_state *o,unsigned row,unsigned bytes)
+{
+    if(o->hash_blocks)
+        return o->hash_blocks[row/HASH_RELOAD_BLOCK_ROWS]+(size_t)(row%HASH_RELOAD_BLOCK_ROWS)*bytes;
+    return o->hash_data+(size_t)row*bytes;
+}
+static inline uint32_t *hash_chain(const struct operator_state *o,unsigned bytes)
+{
+    return (void *)(o->hash_data+(o->hash_blocks?0:(size_t)o->hash_capacity*bytes));
+}
+static void hash_release(cs_work_context *ctx,struct operator_state *o)
+{
+    if(o->hash_blocks) {
+        for(unsigned row=0;row<o->hash_capacity;row+=HASH_RELOAD_BLOCK_ROWS)
+            cs_work_free(ctx,o->hash_blocks[row/HASH_RELOAD_BLOCK_ROWS]);
+        cs_work_free(ctx,o->hash_blocks); o->hash_blocks=NULL;
+    }
+    if(o->hash_data) cs_work_free(ctx,o->hash_data);
+    o->hash_data=NULL;
+}
 static int64_t hash_match_next(struct execution *s,unsigned id,int boundary)
 {
     const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
@@ -1237,7 +1296,7 @@ restart:
     if(o->finished) { hash_qual_close(s,o); return 0; }
     if(o->hash_fallback==1) return 3;
     o->hash_null_right=0;
-    uint32_t *next=(void *)(o->hash_data+(size_t)o->hash_capacity*row_bytes),*buckets=next+o->hash_capacity;
+    uint32_t *next=hash_chain(o,row_bytes),*buckets=next+o->hash_capacity;
     for(;;) {
         if(!o->have_left) {
             if(boundary && hash_input_boundary(s,id)) return QP_BATCH_END;
@@ -1245,7 +1304,7 @@ restart:
             if(status!=2) {
                 if(!status && o->external) { external_advance(s,id); goto restart; }
                 if(!status) {
-                    if(!o->hash_shared) cs_work_free(s->context,o->hash_data);
+                    if(!o->hash_shared) hash_release(s->context,o);
                     o->hash_data=NULL; o->finished=1;
                     hash_qual_close(s,o);
                 }
@@ -1261,7 +1320,7 @@ restart:
                 goto matched;
             }
             unsigned at=o->hash_match-1; o->hash_match=next[at]==UINT_MAX?0:next[at]+1;
-            hash_load(o->right,o->hash_data+(size_t)at*row_bytes,right_plan);
+            hash_load(o->right,hash_row(o,at,row_bytes),right_plan);
             const struct qs_cell *right=o->right;
             int equal=keys_equal(s,n,o->left,right); if(equal<0) return -5;
             if(!equal) continue;
@@ -1319,7 +1378,7 @@ static int64_t hash_next(struct execution *s,unsigned id,struct qs_cell *row)
     }
 }
 static int64_t spool_append_context(struct execution *s,struct spool *p,const void *row,unsigned row_bytes,
-    cs_work_context *context)
+    cs_work_context *context,size_t resident_reserve)
 {
     unsigned block_rows=QS_SORT_IO_BYTES/row_bytes;
     if(!p->tail) {
@@ -1329,26 +1388,34 @@ static int64_t spool_append_context(struct execution *s,struct spool *p,const vo
     if(p->used==block_rows) {
         if(p->blocks==p->capacity) {
             unsigned capacity=p->capacity?p->capacity*2:8;
-            void *tokens=cs_work_realloc(context,p->tokens,capacity*sizeof(*p->tokens)); if(!tokens) return -4;
-            p->tokens=tokens; p->capacity=capacity;
+            void *pages=cs_work_realloc(context,p->pages,(size_t)capacity*sizeof(*p->pages)); if(!pages) return -4;
+            p->pages=pages; p->capacity=capacity;
         }
-        memcpy(s->io,p->tail,QS_SORT_IO_BYTES); s->pending_spool=p; s->pending_store=1;
-        return csNeedStore(QS_SORT_IO_BYTES);
+        unsigned char *tail=NULL;
+        if(resident_reserve && cs_work_available(context)>resident_reserve+QS_SORT_IO_BYTES)
+            tail=cs_work_alloc(context,QS_SORT_IO_BYTES);
+        if(!tail) {
+            memcpy(s->io,p->tail,QS_SORT_IO_BYTES); s->pending_spool=p; s->pending_store=1;
+            return csNeedStore(QS_SORT_IO_BYTES);
+        }
+        p->pages[p->blocks++]=(struct spool_block){.data=p->tail};
+        p->tail=tail; p->used=0;
     }
     memcpy(p->tail+(size_t)p->used*row_bytes,row,row_bytes); ++p->used; ++p->rows; return 0;
 }
 static int64_t spool_append_bytes(struct execution *s,struct spool *p,const void *row,unsigned row_bytes)
-{ return spool_append_context(s,p,row,row_bytes,s->context); }
+{ return spool_append_context(s,p,row,row_bytes,s->context,0); }
 static int64_t spool_row_bytes(struct execution *s,struct spool *p,uint64_t index,unsigned row_bytes,void *row)
 {
     unsigned block_rows=QS_SORT_IO_BYTES/row_bytes,block=index/block_rows;
     if(index>=p->rows) return -1;
     unsigned char *data=p->tail;
-    if(block<p->blocks) {
+    if(block<p->blocks && p->pages[block].data) data=p->pages[block].data;
+    else if(block<p->blocks) {
         if(!p->cache) { p->cache=cs_work_alloc(s->context,QS_SORT_IO_BYTES); if(!p->cache) return -4; }
         if(p->loaded!=block) {
             s->pending_spool=p; s->pending_store=0; s->pending_block=block;
-            return csNeedLoad(p->tokens[block]);
+            return csNeedLoad(p->pages[block].token);
         }
         data=p->cache;
     }
@@ -1361,10 +1428,40 @@ static int64_t spool_row(struct execution *s,struct spool *p,uint64_t index,unsi
 static void external_advance(struct execution *s,unsigned id)
 {
     struct operator_state *o=&s->nodes[id];
-    if(o->hash_data) cs_work_free(s->context,o->hash_data);
-    o->hash_data=NULL; o->hash_rows=o->hash_capacity=o->hash_phase=o->hash_match=0;
+    hash_release(s->context,o);
+    o->hash_rows=o->hash_capacity=o->hash_phase=o->hash_match=0;
     o->have_left=0; o->external->probe_at=0; o->external->phase=o->external->direct?4:2;
     if(o->external->direct) o->finished=1;
+}
+static int external_reload_alloc(cs_work_context *ctx,struct operator_state *o,
+    unsigned capacity,unsigned buckets,unsigned row_bytes)
+{
+    size_t index_bytes=((size_t)capacity+buckets)*sizeof(uint32_t);
+    o->hash_data=cs_work_alloc(ctx,(size_t)capacity*row_bytes+index_bytes);
+    if(o->hash_data) {
+        o->hash_capacity=capacity; o->hash_buckets=buckets;
+        return 1;
+    }
+    /* Keep a single index but let the packed rows occupy smaller free spans. */
+    unsigned count=(capacity+HASH_RELOAD_BLOCK_ROWS-1)/HASH_RELOAD_BLOCK_ROWS;
+    o->hash_data=cs_work_alloc(ctx,index_bytes);
+    if(!o->hash_data) return 0;
+    o->hash_blocks=cs_work_alloc(ctx,(size_t)count*sizeof(*o->hash_blocks));
+    if(!o->hash_blocks) { hash_release(ctx,o); return 0; }
+    o->hash_capacity=0;
+    while(o->hash_capacity<capacity) {
+        unsigned rows=capacity-o->hash_capacity;
+        if(rows>HASH_RELOAD_BLOCK_ROWS) rows=HASH_RELOAD_BLOCK_ROWS;
+        unsigned char *block=cs_work_alloc(ctx,(size_t)rows*row_bytes);
+        if(!block) {
+            hash_release(ctx,o); o->hash_capacity=0;
+            return 0;
+        }
+        o->hash_blocks[o->hash_capacity/HASH_RELOAD_BLOCK_ROWS]=block;
+        o->hash_capacity+=rows;
+    }
+    o->hash_buckets=buckets;
+    return 1;
 }
 static int64_t external_probe(struct execution *s,unsigned id,struct qs_cell *row)
 {
@@ -1391,9 +1488,8 @@ static void partition_start(struct execution *s,unsigned id)
     int active=0;
     for(unsigned w=0;w<workers;++w) active|=!s->workers[w]->control->finished;
     if(!active) return;
-    struct cs_work_context_stats memory;
     size_t needed=(size_t)workers*HASH_PARTITIONS*(QS_SORT_IO_BYTES+sizeof(struct spool));
-    if(cs_work_get_context_stats(s->context,&memory) || needed>memory.limit_bytes-memory.used_bytes) return;
+    if(needed>cs_work_available(s->context)) return;
     for(unsigned w=0;w<workers;++w) {
         struct execution *e=s->workers[w];
         if(e->hash_sink!=id+1 || (!e->control->finished &&
@@ -1469,14 +1565,19 @@ static int64_t external_build(struct execution *s,unsigned id)
                         unsigned capacity=(rows+127)&~127U,buckets=256;
                         while(buckets<capacity*2) buckets*=2;
                         size_t bytes=(size_t)capacity*(rb+4)+(size_t)buckets*4;
-                        struct cs_work_context_stats m;
-                        if(cs_work_get_context_stats(s->context,&m)) return -4;
                         size_t reserve=2*QS_SORT_IO_BYTES;
                         if(s->plan->workers>1) reserve+=s->plan->workers*(sizeof(*s)+s->plan->count*sizeof(*s->nodes)+QS_SORT_IO_BYTES+256);
-                        size_t available=m.limit_bytes-m.used_bytes;
+                        size_t available=cs_work_available(s->context);
                         if(available>reserve && bytes<=available-reserve &&
-                           (o->hash_data=cs_work_alloc(s->context,bytes))) {
-                            o->hash_capacity=capacity; o->hash_buckets=buckets; e->direct=1; e->phase=2;
+                           external_reload_alloc(s->context,o,capacity,buckets,rb)) {
+                            e->direct=1; e->phase=2;
+                        }
+                        if(s->profiling) {
+                            struct cs_work_stats pool={0};
+                            cs_work_get_stats(&pool);
+                            fprintf(stderr,"CSD_HASH_RELOAD node=%u rows=%llu width=%u bytes=%zu available=%zu reserve=%zu pool_free=%zu largest=%zu direct=%u segmented=%u\n",
+                                id,(unsigned long long)rows,rb,bytes,available,reserve,
+                                pool.free_bytes,pool.largest_free_payload,(unsigned)e->direct,o->hash_blocks!=NULL);
                         }
                     }
                 }
@@ -1509,11 +1610,9 @@ static int64_t external_build(struct execution *s,unsigned id)
             ++e->partition; e->build_at=e->probe_at=0; continue;
         }
         if(!o->hash_data) {
-            struct cs_work_context_stats m;
-            if(cs_work_get_context_stats(s->context,&m)) return -4;
             size_t reserve=2*QS_SORT_IO_BYTES;
             if(s->plan->workers>1) reserve+=s->plan->workers*(sizeof(*s)+s->plan->count*sizeof(*s->nodes)+QS_SORT_IO_BYTES+256);
-            size_t available=m.limit_bytes-m.used_bytes;
+            size_t available=cs_work_available(s->context);
             available=available>reserve?available-reserve:available/2;
             unsigned capacity=128;
             while(capacity<build->rows-e->build_at && (size_t)capacity*2*(rb+12)<=available && capacity<UINT_MAX/4) capacity*=2;
@@ -1524,17 +1623,17 @@ static int64_t external_build(struct execution *s,unsigned id)
             o->hash_capacity=capacity;
         }
         while(o->hash_rows<o->hash_capacity && e->build_at<build->rows) {
-            int64_t status=spool_row_bytes(s,build,e->build_at,rb,o->hash_data+(size_t)o->hash_rows*rb);
+            int64_t status=spool_row_bytes(s,build,e->build_at,rb,hash_row(o,o->hash_rows,rb));
             if(status) return status;
             ++e->build_at; ++o->hash_rows;
         }
         if(!e->direct) { o->hash_buckets=2*o->hash_capacity; break; }
     }
-    uint32_t *next=(void *)(o->hash_data+(size_t)o->hash_capacity*rb),*buckets=next+o->hash_capacity;
+    uint32_t *next=hash_chain(o,rb),*buckets=next+o->hash_capacity;
     memset(buckets,0xff,(size_t)o->hash_buckets*sizeof(*buckets));
     for(unsigned i=0;i<o->hash_rows;++i) {
         int null;
-        unsigned bucket=hash_packed(&keys,o->hash_data+(size_t)i*rb,&null)&(o->hash_buckets-1);
+        unsigned bucket=hash_packed(&keys,hash_row(o,i,rb),&null)&(o->hash_buckets-1);
         next[i]=buckets[bucket]; buckets[bucket]=i;
     }
     e->phase=3; o->hash_phase=1;
@@ -1868,6 +1967,56 @@ scalar:
     }
     return 0;
 }
+/* Use the immutable build's empty buckets as a runtime membership filter.
+ * Collisions survive to the normal join. Restrict this to an exclusive
+ * direct probe with a cheap integer key and a selective, small build. */
+static void scan_hash_filter_init(struct execution *s,unsigned id,struct operator_state *o)
+{
+    o->scan_hash_checked=true;
+    const struct qp_plan *plan=s->plan;
+    const struct qs_plan *filter=o->scan_filter;
+    if(plan->ninit || plan->nparams || (s->owner?s->owner:s)->partition_join>=0) return;
+    for(unsigned i=0;i<QP_PARAMS;++i) if(plan->cte_nodes[i]==(int)id) return;
+    uint8_t needed[QS_EXPRS]={0};
+    if(qs_vector_require(filter,filter->predicate,needed)) return;
+    bool text=false;
+    for(unsigned i=0;i<filter->nexprs;++i) if(needed[i]) {
+        const struct qs_expr *e=&filter->exprs[i];
+        if(e->op==Q_COLUMN) text|=e->type==Q_STRING;
+        else if(e->op!=Q_CONST && e->op!=Q_AND && e->op!=Q_OR && (e->op<Q_EQ || e->op>Q_GE))
+            return;
+    }
+    if(!text) return;
+    int parent=-1;
+    for(unsigned i=0;i<plan->count;++i) {
+        const struct qp_node *n=&plan->nodes[i];
+        if(n->right==(int)id) return;
+        if(n->left==(int)id) {
+            if(parent>=0) return;
+            parent=i;
+        }
+    }
+    if(parent<0) return;
+    const struct qp_node *join=&plan->nodes[parent];
+    const struct operator_state *build=&s->nodes[parent];
+    if(join->kind!=QP_JOIN || !join->hash || join->join_type!=QP_INNER || join->nkeys!=1 ||
+        !build->hash_phase || !build->hash_data || build->external || build->hash_fallback ||
+        (s->owner && s->owner->nodes[parent].external) ||
+        !build->hash_buckets || build->hash_buckets>32768 ||
+        8.0*build->hash_rows>=plan->nodes[id].estimated_rows)
+        return;
+    const struct qp_node *right=&plan->nodes[join->right];
+    if(right->kind!=QP_SCAN || right->expr.predicate<0) return;
+    const struct qs_expr *key=&filter->exprs[filter->outputs[join->left_keys[0]].index];
+    const struct qs_expr *build_key=&right->expr.exprs[right->expr.outputs[join->right_keys[0]].index];
+    if(key->op!=Q_COLUMN || key->type!=Q_INTEGER || build_key->type!=Q_INTEGER ||
+        key->column<0 || (unsigned)key->column>=filter->nattrs) return;
+    const struct qs_column *column=&filter->cols[key->column];
+    if(column->type!=Q_INTEGER || column->slot<0 || column->deferred) return;
+    o->scan_hash_slot=column->slot;
+    o->scan_hash_mask=build->hash_buckets-1;
+    o->scan_hash_buckets=hash_chain(build,hash_row_bytes(&right->expr))+build->hash_capacity;
+}
 static int64_t scan_chunk_next(struct execution *s,unsigned id)
 {
     const struct qp_node *n=&s->plan->nodes[id]; const struct qs_plan *p=&n->expr; struct operator_state *o=&s->nodes[id];
@@ -1959,7 +2108,22 @@ static int64_t scan_chunk_next(struct execution *s,unsigned id)
                 void *fm[]={chunk,o->scan_filter,mr[0],o->filter_dictionary?o->filter_dictionary:s->dictionary,s->params};
                 long long fl[]={len[2],sizeof(*p),task.input_bytes,0,sizeof(s->params)};
                 struct femu_csd_args filter={.numr=5,.mr_addr=fm,.mr_len=fl};
-                status=timed_call(s,pg_sina_filter_impl,&filter,QS_FILTER);
+                if(!o->scan_hash_checked) scan_hash_filter_init(s,id,o);
+                if(o->scan_hash_buckets) {
+                    struct blocking_timer timer={0}; if(s->profiling) timer=blocking_begin(s);
+                    const int64_t *keys=qs_values(chunk)+(size_t)o->scan_hash_slot*chunk->capacity;
+                    const uint8_t *nulls=qs_nulls(chunk)+(size_t)o->scan_hash_slot*((chunk->capacity+7)/8);
+                    chunk->selected=0;
+                    for(unsigned row=0;row<chunk->rows;++row) {
+                        if(nulls[row/8]&(1U<<(row%8))) continue;
+                        int64_t key=keys[row];
+                        uint64_t hash=mix_hash(UINT64_C(0x9e3779b97f4a7c15)^(uint64_t)key^-(uint64_t)(key<0));
+                        if(o->scan_hash_buckets[hash&o->scan_hash_mask]!=UINT_MAX)
+                            qs_selection(chunk)[chunk->selected++]=row;
+                    }
+                    status=qs_filter_selected(&filter);
+                    if(s->profiling) blocking_end(s,QS_FILTER,timer);
+                } else status=timed_call(s,pg_sina_filter_impl,&filter,QS_FILTER);
                 if(status==-4) {
                     /* Keep the query budget: if vector scratch does not fit,
                      * decode this retained input eagerly and use scalar SQL. */
@@ -2216,7 +2380,7 @@ static int hash_qual_next(struct execution *s,unsigned id,uint32_t first,const u
         unsigned capacity=n->join_type==QP_SEMI || n->join_type==QP_ANTI?64:QS_VECTOR_ROWS;
         while(cursor && count<capacity) {
             unsigned at=cursor-1; cursor=next[at]==UINT_MAX?0:next[at]+1;
-            hash_load(o->right,o->hash_data+(size_t)at*stride,&right->expr);
+            hash_load(o->right,hash_row(o,at,stride),&right->expr);
             int equal=keys_equal(s,n,o->left,o->right); if(equal<0) return -5;
             if(!equal) continue;
             int null=0; for(unsigned k=0;k<n->nkeys;++k) null|=o->right[n->right_keys[k]].isnull;
@@ -2234,7 +2398,7 @@ static int hash_qual_next(struct execution *s,unsigned id,uint32_t first,const u
         unsigned ln=s->plan->nodes[n->left].expr.nout;
         for(unsigned r=0;r<count;++r) {
             q->rows[r]=rows[r];
-            hash_load(o->right,o->hash_data+(size_t)rows[r]*stride,&right->expr);
+            hash_load(o->right,hash_row(o,rows[r],stride),&right->expr);
             for(unsigned col=0;col<b->plan.nattrs;++col) {
                 int slot=b->plan.cols[col].slot; if(slot<0) continue;
                 b->cells[(size_t)slot*QS_VECTOR_ROWS+r]=col<ln?o->left[col]:o->right[col-ln];
@@ -2253,12 +2417,12 @@ static int hash_qual_next(struct execution *s,unsigned id,uint32_t first,const u
         if(b->vectors[index].errors[r]) return -5;
         struct qs_cell keep=qs_vector_cell(&b->plan,b->vectors,index,r);
         if(keep.isnull || !keep.value) continue;
-        hash_load(o->right,o->hash_data+(size_t)q->rows[r]*stride,&right->expr);
+        hash_load(o->right,hash_row(o,q->rows[r],stride),&right->expr);
         return 2;
     }
     return 0;
 scalar:
-    hash_load(o->right,o->hash_data+(size_t)first*stride,&right->expr);
+    hash_load(o->right,hash_row(o,first,stride),&right->expr);
     return 3;
 }
 static int projection_init(struct execution *s,unsigned id,int source)
@@ -2622,7 +2786,8 @@ static int64_t projection_fill(struct execution *s,unsigned id,int source)
             struct qs_vector_input input={.raw=raw,.raw_bytes=scan->scan_raw_bytes,.dictionary=s->dictionary,
                 .parameters=s->params,.nparameters=QP_PARAMS,.inset=inset_vectors,.set_state=s};
             unsigned consumed=b->count;
-            if(projection_execute(b,chunk,qs_selection(chunk),scan->scan_position,input)) return -5;
+            const uint32_t *selection=chunk->selected==chunk->rows?NULL:qs_selection(chunk);
+            if(projection_execute(b,chunk,selection,scan->scan_position,input)) return -5;
             scan->scan_position+=consumed; b->position=0;
         }
         /* A retained output must outlive this vector's byte views. Predicates
@@ -2691,7 +2856,7 @@ static int hash_sink_vectors(struct execution *s,unsigned id)
                 if(b->vectors[index].errors[b->position]) return -5;
                 row[col]=qs_vector_cell(&b->plan,b->vectors,index,b->position);
             }
-            int added=hash_insert_exists(s,n,o,right,row,row_hash(n,row,1));
+            int added=hash_insert_exists(s,n,o,right,row);
             if(added<0) return added;
             if(!added) break;
             ++b->position;
@@ -2799,11 +2964,11 @@ static int64_t external_partition_combine(struct execution *s,struct execution *
             unsigned count=to->blocks+from->blocks,capacity=to->capacity?to->capacity:8;
             while(capacity<count) capacity*=2;
             if(capacity>to->capacity) {
-                void *tokens=cs_work_realloc(s->context,to->tokens,(size_t)capacity*sizeof(*to->tokens));
-                if(!tokens) return -4;
-                to->tokens=tokens; to->capacity=capacity;
+                void *pages=cs_work_realloc(s->context,to->pages,(size_t)capacity*sizeof(*to->pages));
+                if(!pages) return -4;
+                to->pages=pages; to->capacity=capacity;
             }
-            memcpy(to->tokens+to->blocks,from->tokens,(size_t)from->blocks*sizeof(*to->tokens));
+            memcpy(to->pages+to->blocks,from->pages,(size_t)from->blocks*sizeof(*to->pages));
             to->blocks+=from->blocks; to->rows+=(uint64_t)from->blocks*block_rows;
             from->blocks=0; /* Tokens now belong to the parent; never adopt twice. */
         }
@@ -2813,9 +2978,119 @@ static int64_t external_partition_combine(struct execution *s,struct execution *
         }
         worker->partition_merge_row=0;
         cs_work_free(worker->context,from->tail); from->tail=NULL; from->used=0;
-        cs_work_free(worker->context,from->tokens); from->tokens=NULL;
+        cs_work_free(worker->context,from->pages); from->pages=NULL;
     }
     return 0;
+}
+static void defer_probe_numbers(struct execution *s,const struct qp_node *join,struct projection_batch *b)
+{
+    const struct qp_node *scan=&s->plan->nodes[join->left];
+    if(scan->kind!=QP_SCAN || scan->ordered_index || b->nfilters ||
+       (scan->expr.predicate>=0 && !b->filtered_scan)) return;
+    /* The raw input can only be borrowed for direct Heap column outputs.
+     * Keep a number eager if any output of that column is a join key. */
+    uint64_t keys=0;
+    for(unsigned i=0;i<b->plan.nout;++i)
+        if(b->plan.exprs[b->plan.outputs[i].index].op!=Q_COLUMN) return;
+    for(unsigned k=0;k<join->nkeys;++k) {
+        int index=b->plan.outputs[join->left_keys[k]].index;
+        keys|=UINT64_C(1)<<b->plan.exprs[index].column;
+    }
+    unsigned numbers=0;
+    for(unsigned i=0;i<b->plan.nout;++i) {
+        const struct qs_expr *e=&b->plan.exprs[b->plan.outputs[i].index];
+        if(e->type==Q_DECIMAL && b->plan.cols[e->column].type==Q_DECIMAL &&
+           !(keys&(UINT64_C(1)<<e->column))) numbers|=1U<<i;
+    }
+    if(!numbers) return;
+    struct operator_state *o=&s->nodes[join->left];
+    if(!o->scan_filter) {
+        if(scan_filter_init(s,&scan->expr,o)) return;
+        if(!o->scan_filter) {
+            o->scan_filter=cs_work_alloc(s->context,sizeof(*o->scan_filter));
+            if(!o->scan_filter) return;
+            *o->scan_filter=scan->expr;
+        }
+    }
+    o->scan_filter_checked=1;
+    b->deferred_numbers=numbers;
+    for(;numbers;numbers&=numbers-1) {
+        unsigned i=__builtin_ctz(numbers);
+        int index=b->plan.outputs[i].index,column=b->plan.exprs[index].column;
+        /* Filter can evaluate a raw value for its predicate without replacing
+         * the reference in the chunk. The join still owns this LOAD when a
+         * matching row requests the projected value. */
+        o->scan_filter->cols[column].deferred=QS_FILTER_ONLY;
+        b->plan.cols[column].deferred=QS_DEFERRED;
+        b->needed[index]&=~2; /* Initialize a raw view, evaluate it on demand. */
+    }
+}
+
+/* Selective integer joins can discard bucket collisions in the probe
+ * batch without unpacking the build row. Leave the first exact match
+ * and the rest of its chain to the regular output/residual machinery. */
+static void reject_integer_hash_collisions(struct execution *s,const struct qp_node *n,
+    const struct projection_batch *b,const struct operator_state *o,uint32_t *matches)
+{
+    const struct qp_node *left=&s->plan->nodes[n->left],*right=&s->plan->nodes[n->right];
+    if(n->join_type!=QP_INNER || n->nkeys!=1 ||
+       n->estimated_rows>=left->estimated_rows/2) return;
+    int index=b->plan.outputs[n->left_keys[0]].index;
+    int build=right->expr.outputs[n->right_keys[0]].index;
+    if(b->plan.exprs[index].type!=Q_INTEGER || right->expr.exprs[build].type!=Q_INTEGER ||
+       b->plan.exprs[index].scale || b->vectors[index].kind==QS_DYNAMIC) return;
+    struct hash_key_layout layout;
+    hash_key_layout(&layout,n,&right->expr,1);
+    unsigned width=layout.widths[0];
+    if(width!=4 && width!=8) return;
+    unsigned stride=hash_row_bytes(&right->expr);
+    const uint32_t *next=hash_chain(o,stride);
+    const struct qs_vector *keys=&b->vectors[index];
+    bool narrow=keys->kind==QS_REFERENCE || keys->kind==QS_NARROW;
+    for(unsigned r=0;r<b->count;++r) {
+        unsigned match=matches[r];
+        if(!match) continue;
+        __int128 key=qs_vector_value(keys,r);
+        if(!narrow && qs_vector_cell(&b->plan,b->vectors,index,r).scale) continue;
+        while(match) {
+            unsigned at=match-1;
+            const unsigned char *value=hash_row(o,at,stride)+layout.offsets[0];
+            int64_t candidate;
+            if(width==4) { int32_t narrow; memcpy(&narrow,value,4); candidate=narrow; }
+            else memcpy(&candidate,value,8);
+            if(!value[width] && key==candidate) break;
+            match=next[at]==UINT_MAX?0:next[at]+1;
+        }
+        matches[r]=match;
+    }
+}
+/* The common signed integer key needs no scale normalization or payload
+ * cell. Gather projected-expression errors by column so those checks stay
+ * outside the hot hash loop and retain their original row order. */
+static bool hash_narrow_probe_slots(const struct qp_node *n,const struct projection_batch *b,
+    unsigned buckets,unsigned evaluated,struct hash_probe_batch *probe)
+{
+    if(n->nkeys!=1) return false;
+    int index=b->plan.outputs[n->left_keys[0]].index;
+    const struct qs_vector *keys=&b->vectors[index];
+    if(b->plan.exprs[index].type!=Q_INTEGER || b->plan.exprs[index].scale ||
+       (keys->kind!=QS_NARROW && keys->kind!=QS_REFERENCE)) return false;
+    memset(probe->errors,0,b->count*sizeof(probe->errors[0]));
+    for(;evaluated;evaluated&=evaluated-1) {
+        unsigned col=__builtin_ctz(evaluated);
+        const struct qs_vector *v=&b->vectors[b->plan.outputs[col].index];
+        for(unsigned r=0;r<b->count;++r) probe->errors[r]|=v->errors[r];
+    }
+    for(unsigned r=0;r<b->count;++r) {
+        if(probe->errors[r] || (!keys->all_valid && qs_vector_null(keys,r))) {
+            probe->matches[r]=UINT_MAX;
+            continue;
+        }
+        int64_t value=keys->kind==QS_REFERENCE?keys->column[qs_vector_row(keys,r)]:keys->narrow[r];
+        uint64_t hash=mix_hash(UINT64_C(0x9e3779b97f4a7c15)^(uint64_t)value^-(uint64_t)(value<0));
+        probe->matches[r]=hash&(buckets-1);
+    }
+    return true;
 }
 /* Probe the bucket array as a batch, keeping column payloads borrowed until
  * a candidate needs them. Match-chain state remains in the join operator, so
@@ -2841,6 +3116,7 @@ static int64_t hash_probe_input(struct execution *s,unsigned id,const uint32_t *
                     for(unsigned col=0;col<source->expr.nattrs;++col)
                         if(source->expr.cols[col].slot>=0 && source->expr.cols[col].type==Q_STRING)
                             s->nodes[b->scan].defer_strings=1;
+                defer_probe_numbers(s,n,b);
             }
         }
         if(b && o->hash_probe) {
@@ -2859,10 +3135,13 @@ static int64_t hash_probe_input(struct execution *s,unsigned id,const uint32_t *
                         int index=b->plan.outputs[n->left_keys[k]].index;
                         if(materialize_vector(s,&b->vectors[index],b->count)) return -3;
                     }
-                    for(unsigned r=0;r<b->count;++r) {
+                    unsigned evaluated=((1U<<b->plan.nout)-1)&~b->deferred_numbers;
+                    if(!hash_narrow_probe_slots(n,b,o->hash_buckets,evaluated,probe)) for(unsigned r=0;r<b->count;++r) {
                         uint64_t hash=UINT64_C(0x9e3779b97f4a7c15); unsigned null=0,error=0;
-                        for(unsigned col=0;col<b->plan.nout;++col)
+                        for(unsigned columns=evaluated;columns;columns&=columns-1) {
+                            unsigned col=__builtin_ctz(columns);
                             error|=b->vectors[b->plan.outputs[col].index].errors[r];
+                        }
                         for(unsigned k=0;!error && k<n->nkeys;++k) {
                             int index=b->plan.outputs[n->left_keys[k]].index;
                             struct qs_cell key=qs_vector_cell(&b->plan,b->vectors,index,r);
@@ -2877,9 +3156,19 @@ static int64_t hash_probe_input(struct execution *s,unsigned id,const uint32_t *
                         unsigned slot=probe->matches[r],at=slot==UINT_MAX?UINT_MAX:buckets[slot];
                         probe->matches[r]=at==UINT_MAX?0:at+1;
                     }
+                    reject_integer_hash_collisions(s,n,b,o,probe->matches);
                     probe->ready=1;
                 }
-                unsigned r=b->position++;
+                /* An empty bucket cannot emit a row for INNER/SEMI. Skip
+                 * consecutive misses in the vector before copying any key
+                 * cells. Let the final row cross the existing input boundary
+                 * and stop at deferred errors to keep their evaluation order. */
+                unsigned r=b->position;
+                if(n->join_type==QP_INNER || n->join_type==QP_SEMI) {
+                    while(r+1<b->count && !probe->matches[r] && !probe->errors[r]) ++r;
+                    s->metrics.matched+=r-b->position;
+                }
+                b->position=r+1;
                 /* Report expression errors only when this input row is
                  * requested: a LIMIT may never consume later error rows. */
                 if(probe->errors[r]) return -5;
@@ -2912,6 +3201,12 @@ static int hash_left_cell(struct execution *s,unsigned id,unsigned col,struct qs
             s->nodes[left].source_projection:s->nodes[left].projection;
         unsigned r=b->position-1; int index=b->plan.outputs[col].index;
         const struct qs_vector *v=&b->vectors[index];
+        if(b->deferred_numbers&(1U<<col)) {
+            struct qs_vector_input input=b->retry_input;
+            input.plan=&b->plan; input.vectors=b->vectors; input.count=b->count;
+            uint16_t row=r;
+            if(qs_vector_evaluate(&input,index,&row,1)) return -5;
+        }
         if(v->errors[r]) return -5;
         if(v->kind==QS_TEXT) {
             struct qs_cell cell={.isnull=v->nulls[r]};
@@ -3480,7 +3775,7 @@ static int64_t radix_flush(struct execution *s,unsigned id)
         uint64_t hash=wide?(uint64_t)g->key:mix_hash(g->key_flags==2?0:(uint64_t)g->key);
         unsigned partition=(hash>>32)&(radix->partitions-1);
         struct spool *stream=&radix->streams[(s->worker-1)*radix->partitions+partition];
-        int64_t status=spool_append_context(s,stream,g,local->group_stride,s->owner->context);
+        int64_t status=spool_append_context(s,stream,g,local->group_stride,s->owner->context,radix->resident_reserve);
         if(status) return status;
         ++local->group_flush;
     }
@@ -3678,21 +3973,26 @@ static int group_input_pending(const struct execution *s,int id)
 static int64_t radix_input(struct execution *s,unsigned id,struct operator_state *o)
 {
     struct radix_group *radix=o->group_radix;
+    cs_work_context *owner=s->worker?s->owner->context:s->context;
     unsigned bytes=o->group_stride,block_rows=QS_SORT_IO_BYTES/bytes;
     while(o->radix_writer<radix->workers) {
         struct spool *p=&radix->streams[o->radix_writer*radix->partitions+o->radix_partition];
         if(o->radix_row && !(o->radix_row%block_rows)) {
             unsigned block=o->radix_row/block_rows-1;
-            if(block<p->blocks && p->tokens[block]) {
-                uint64_t token=p->tokens[block]; p->tokens[block]=0;
-                return csNeedFree(token);
+            if(block<p->blocks) {
+                struct spool_block *page=&p->pages[block];
+                if(page->data) {
+                    cs_work_free(owner,page->data); page->data=NULL;
+                } else if(page->token) {
+                    uint64_t token=page->token; page->token=0;
+                    return csNeedFree(token);
+                }
             }
         }
         if(o->radix_row==p->rows) {
             cs_work_free(s->context,p->cache); p->cache=NULL;
-            cs_work_context *owner=s->worker?s->owner->context:s->context;
             cs_work_free(owner,p->tail); p->tail=NULL;
-            cs_work_free(owner,p->tokens); p->tokens=NULL;
+            cs_work_free(owner,p->pages); p->pages=NULL;
             ++o->radix_writer; o->radix_row=0; continue;
         }
         _Alignas(16) unsigned char storage[sizeof(struct compact_group)+QS_AGGS*sizeof(struct group_value)+QS_KEYS*sizeof(struct qs_cell)+32];
@@ -3728,7 +4028,7 @@ static int64_t hash_aggregate_state(struct execution *s,unsigned id,struct opera
         }
         struct cs_work_context_stats memory;
         if(cs_work_get_context_stats(s->context,&memory)) return -4;
-        size_t available=memory.limit_bytes-memory.used_bytes,reserve=group_reserve(s,n);
+        size_t available=cs_work_available(s->context),reserve=group_reserve(s,n);
         available=available>reserve?available-reserve:available/2;
         o->group_integer=1;
         /* Runtime strings are canonical dictionary IDs, also 64-bit keys. */
@@ -3807,7 +4107,8 @@ static int64_t hash_aggregate_state(struct execution *s,unsigned id,struct opera
                 unsigned capacity=o->group_capacity*2;
                 struct cs_work_context_stats m;
                 if(cs_work_get_context_stats(s->context,&m)) return -4;
-                size_t available=m.limit_bytes-m.used_bytes,reserve=group_reserve(s,n);
+                cs_work_context *context=s->worker && o->radix_source?s->owner->context:s->context;
+                size_t available=cs_work_available(context),reserve=group_reserve(s,n);
                 /* Keep spill/worker space after replacing the old buffers.
                  * Realloc may grow in place; the allocator, rather than a
                  * pessimistic quota, enforces the actual transient peak. */
@@ -3815,14 +4116,19 @@ static int64_t hash_aggregate_state(struct execution *s,unsigned id,struct opera
                 size_t released=(size_t)o->group_capacity*bytes_per_slot;
                 available+=released;
                 available=available>reserve?available-reserve:0;
-                struct group_entry *entries=!o->radix_source && capacity>o->group_capacity &&
+                struct group_entry *entries=capacity>o->group_capacity &&
                     (size_t)capacity*bytes_per_slot<=available?
-                    cs_work_calloc(s->context,capacity,sizeof(*entries)):NULL;
-                void *larger=entries?cs_work_realloc(s->context,o->groups,(size_t)(capacity-capacity/8)*o->group_stride):NULL;
+                    cs_work_calloc(context,capacity,sizeof(*entries)):NULL;
+                void *larger=entries?cs_work_realloc(context,o->groups,(size_t)(capacity-capacity/8)*o->group_stride):NULL;
                 if(larger) {
                     struct group_entry *old=o->group_entries;
                     o->groups=larger; o->group_capacity=capacity;
                     o->group_entries=entries;
+                    if(o->radix_source) {
+                        struct execution *owner=s->worker?s->owner:s;
+                        struct operator_state *table=owner->nodes[id].group_locals[s->worker?s->worker-1:0];
+                        table->groups=larger; table->group_capacity=capacity; table->group_entries=entries;
+                    }
                     unsigned rows=atomic_load_explicit(o->group_count,memory_order_relaxed);
                     for(unsigned i=0;i<rows;++i) {
                         const struct compact_group *v=group_at(o,i);
@@ -3832,9 +4138,9 @@ static int64_t hash_aggregate_state(struct execution *s,unsigned id,struct opera
                         entries[slot].row=i;
                         atomic_store_explicit(&entries[slot].state,group_entry_state(v->key_flags,hash),memory_order_relaxed);
                     }
-                    cs_work_free(s->context,old); continue;
+                    cs_work_free(context,old); continue;
                 }
-                cs_work_free(s->context,entries);
+                cs_work_free(context,entries);
                 o->group_phase=1; continue;
             }
             if(o->group_partial) { ++o->group_local_row; o->group_partial=0; }
@@ -4373,6 +4679,9 @@ static int64_t index_next(struct execution *s,unsigned id,struct qs_cell *row,st
             if(p->cols[i+2].slot>=0) p->cols[i+2].slot+=2;
         }
         int status=qs_index_init(p,&o->index_control); if(status) return status;
+        struct execution *owner=s->worker?s->owner:s;
+        if(owner->index_cache && s->plan->files[n->right].count && s->plan->indexes[n->right].count)
+            qs_index_cache_bind(&o->index_control,owner->index_cache);
         if(s->paged) { int bound=qs_index_paged_dictionary(&o->index_control,s->paged); if(bound) return bound; }
         else qs_index_dictionary(&o->index_control,s->dictionary);
         index_projection_init(s,id);
@@ -4437,7 +4746,7 @@ static int64_t index_next(struct execution *s,unsigned id,struct qs_cell *row,st
         void *mr[]={s->arena+vector_offset(s,n),p,&o->index_task,&o->index_control,
             s->arena+vector_offset(s,n)+qs_index_input_bytes(),s->arena+input_offset(s,n)};
         long long len[]={qs_chunk_bytes(QS_INDEX_KEYS,2),sizeof(*p),sizeof(o->index_task),sizeof(o->index_control),
-            qs_chunk_bytes(256,p->ncols),QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE};
+            qs_chunk_bytes(256,p->ncols),QS_INDEX_IO_BYTES};
         struct femu_csd_args a={.numr=6,.mr_addr=mr,.mr_len=len,.cparam2=s->args->cparam2};
         if(s->paged) qs_index_spill_io(&o->index_control,0,s->io);
         /* A self-join can reuse the input pages already retained by its scan.
@@ -4601,31 +4910,37 @@ static int parallel_radix_begin(struct execution *s,unsigned id)
 {
     struct operator_state *o=&s->nodes[id]; const struct qp_node *n=&s->plan->nodes[id];
     double groups=n->estimated_groups>0?n->estimated_groups:n->estimated_rows;
-    if(groups<=o->group_capacity-o->group_capacity/8 || o->group_locals) return 0;
-    struct cs_work_context_stats memory;
-    if(cs_work_get_context_stats(s->context,&memory)) return -4;
+    if(o->group_locals || atomic_load_explicit(o->group_count,memory_order_relaxed)) return 0;
     size_t per_slot=o->group_stride-o->group_stride/8+sizeof(*o->group_entries);
-    size_t available=memory.limit_bytes-memory.used_bytes+(size_t)o->group_capacity*per_slot;
+    size_t available=cs_work_available(s->context)+(size_t)o->group_capacity*per_slot;
     unsigned workers=s->plan->workers;
     size_t reserve=group_spill_reserve(s)+workers*qs_sort_min_workspace();
     if(available<=reserve) return 0;
-    /* A blocking child makes the initial table deliberately small. That is
-     * not evidence that the complete resident table exceeds workmem. Keep
-     * the existing growing-table path whenever it fits the remaining budget. */
     unsigned resident=o->group_capacity;
     while(resident<UINT_MAX/2 && resident<groups*8/7) resident*=2;
-    if((size_t)resident*per_slot<=available-reserve) return 0;
+    bool external=(size_t)resident*per_slot>available-reserve;
+    const unsigned local_limit=4096;
+    /* A large, already sized shared table can absorb all estimated groups.
+     * Small private tables would repeatedly flush the same keys in this case.
+     * Keep partition streams when the shared table would need to grow. */
+    if(!external && resident>local_limit && resident==o->group_capacity) return 0;
+    /* Keep a bounded lookup table even when the estimated groups fit.
+     * Finished chunks can stay resident instead of requiring a shared table. */
     size_t table_budget=(available-reserve)*3/5/workers;
     unsigned capacity=128;
-    while(capacity<UINT_MAX/2 && (size_t)capacity*2*per_slot<=table_budget) capacity*=2;
-    unsigned partitions=1;
-    while(partitions<64 && partitions<groups/(capacity-capacity/8)) partitions*=2;
+    unsigned target=external?UINT_MAX/2:(resident<local_limit?resident:local_limit);
+    while(capacity<target && (size_t)capacity*2*per_slot<=table_budget) capacity*=2;
+    unsigned partitions=2;
+    while(partitions<64 && (partitions<workers || partitions<groups/(capacity-capacity/8))) partitions*=2;
     size_t tails=(size_t)workers*partitions*QS_SORT_IO_BYTES;
-    while(partitions>workers && tails>(available-reserve)/4) { partitions/=2; tails/=2; }
+    while(partitions>2 && tails>(available-reserve)/4) { partitions/=2; tails/=2; }
     if(partitions<2 || (size_t)capacity*per_slot*workers+tails+reserve>available) return 0;
     struct radix_group *radix=cs_work_calloc(s->context,1,sizeof(*radix));
     if(!radix) return -4;
     radix->partitions=partitions; radix->workers=workers; atomic_init(&radix->next,0);
+    /* Retain room for not-yet-opened tails, Source read buffers and table
+     * workspaces. Concurrent Sinks can each reserve one extra block. */
+    radix->resident_reserve=reserve+tails+(size_t)workers*2*QS_SORT_IO_BYTES;
     radix->streams=cs_work_calloc(s->context,(size_t)workers*partitions,sizeof(*radix->streams));
     o->group_locals=cs_work_calloc(s->context,workers,sizeof(*o->group_locals));
     if(!radix->streams || !o->group_locals) return -4;
@@ -4656,7 +4971,7 @@ static int parallel_group_begin(struct execution *s,unsigned id)
         size_t data=(size_t)(o->group_capacity-o->group_capacity/8)*o->group_stride;
         size_t entries=(size_t)o->group_capacity*sizeof(*o->group_entries);
         size_t bytes=workers*(data+entries+sizeof(*o)+3*128+sizeof(o)); /* allocation/alignment headroom */
-        size_t available=m.limit_bytes-m.used_bytes,reserve=group_spill_reserve(s);
+        size_t available=cs_work_available(s->context),reserve=group_spill_reserve(s);
         if(available<reserve || bytes>available-reserve) return 0;
         o->group_locals=cs_work_calloc(s->context,workers,sizeof(*o->group_locals));
         if(!o->group_locals) return 0;
@@ -4729,9 +5044,13 @@ static void parallel_group_combine(struct execution *s,unsigned id)
         e->group_shard=s->group_shard; e->group_merge_full=false;
         e->group_combine=id+1; e->host_scan=false;
         e->nodes[id].group_local_slot=e->nodes[id].group_local_row=0; e->metrics=(struct qs_metrics){0};
-        e->profile=(struct qs_profile){0}; e->local_profile_cpu=e->sink_ns=e->sink_rows=0;
+        e->profile=(struct qs_profile){0}; e->local_profile_cpu=e->sink_ns=e->sink_rows=e->sink_returned_rows=0;
         memset(e->wait_ns,0,sizeof(e->wait_ns)); memset(e->wait_calls,0,sizeof(e->wait_calls)); e->wait_started=e->finished_ns=0;
-        for(unsigned i=0;i<s->plan->count;++i) e->nodes[i].index_task.index_pages=e->nodes[i].index_task.index_tuples=0;
+        for(unsigned i=0;i<s->plan->count;++i) {
+            struct qs_task *task=&e->nodes[i].index_task;
+            task->index_pages=task->index_tuples=0;
+            qs_index_cache_stats(&e->nodes[i].index_control,NULL,NULL);
+        }
         *e->control=(struct qp_control){.state=(uintptr_t)e};
         memset(&s->outputs[w+1],0,sizeof(s->outputs[w+1]));
     }
@@ -4799,8 +5118,7 @@ restart:
             if(s->nodes[id].external && s->nodes[id].finished) {
                 for(unsigned j=0;j<count;++j) {
                     struct operator_state *o=&s->nodes[builds[j]];
-                    if(o->hash_data) cs_work_free(s->context,o->hash_data);
-                    o->hash_data=NULL;
+                    hash_release(s->context,o);
                 }
                 s->control->parallel=0; s->nodes[root].finished=1; return 0;
             }
@@ -4809,10 +5127,12 @@ restart:
                 return row?next_row(s,root,row):3;
             }
         }
-        s->partition_join=-1;
+        /* Preparing an aggregate Source can resume its child wave. Keep
+         * that wave's spill cursor until this pipeline is ready to start. */
+        int partition_join=-1;
         for(unsigned i=0;i<count;++i)
-            if(s->nodes[builds[i]].external && !s->nodes[builds[i]].external->direct) { s->partition_join=builds[i]; break; }
-        if(p->nodes[source].kind==QP_AGGREGATE && s->partition_join<0) {
+            if(s->nodes[builds[i]].external && !s->nodes[builds[i]].external->direct) { partition_join=builds[i]; break; }
+        if(p->nodes[source].kind==QP_AGGREGATE && partition_join<0) {
             struct blocking_timer timer={0}; if(s->profiling) timer=blocking_begin(s);
             int64_t status=hash_aggregate_next_impl(s,source,NULL,1,0);
             if(s->profiling) blocking_end(s,QS_AGG_SINK,timer);
@@ -4826,6 +5146,7 @@ restart:
                 p->nodes[root].parallel=0; return row?next_row(s,root,row):3;
             }
         }
+        s->partition_join=partition_join;
         unsigned hash_sink=0,group_sink=0,aggregate_sink=0,partition_sink=0;
         for(unsigned i=0;i<p->count;++i) {
             const struct qp_node *parent=&p->nodes[i];
@@ -4859,7 +5180,7 @@ restart:
             struct cs_work_context_stats m;
             if(cs_work_get_context_stats(s->context,&m)) return -4;
             size_t reserve=2*s->sort_limit+p->workers*(sizeof(*s)+p->count*sizeof(*s->nodes)+sizeof(struct qs_plan)+256);
-            size_t available=m.limit_bytes-m.used_bytes;
+            size_t available=cs_work_available(s->context);
             available=available>reserve?available-reserve:0;
             size_t stride=hash_row_bytes(&p->nodes[root].expr)+3*sizeof(uint32_t);
             uint64_t rows=p->nodes[root].estimated_rows;
@@ -4885,14 +5206,16 @@ restart:
              * assuming a dense key domain or a particular query. */
             if(!o->hash_rows && !o->hash_cache && hash_exists_only(join) &&
                right->exprs[right->outputs[join->right_keys[0]].index].type==Q_INTEGER) {
-                o->hash_cache_slots=o->hash_capacity/16;
-                if(o->hash_cache_slots<8) o->hash_cache_slots=8;
-                struct cs_work_context_stats memory;
-                size_t bytes=(size_t)o->hash_cache_slots*sizeof(*o->hash_cache);
+                o->hash_cache_slots=qp_hash_cache_slots(o->hash_capacity);
+                /* The suffix is an exact bitmap for low integer keys. Set
+                 * bits only after a key is present in the main Hash table.
+                 * Other keys use the existing tags and exact chain. */
+                size_t words=qp_hash_cache_words(o->hash_cache_slots);
+                size_t bytes=words*sizeof(*o->hash_cache);
                 size_t reserve=2*s->sort_limit+p->workers*(sizeof(*s)+p->count*sizeof(*s->nodes)+sizeof(struct qs_plan)+256);
-                if(!cs_work_get_context_stats(s->context,&memory) && memory.limit_bytes-memory.used_bytes>reserve &&
-                   bytes<=memory.limit_bytes-memory.used_bytes-reserve)
-                    o->hash_cache=cs_work_calloc(s->context,o->hash_cache_slots,sizeof(*o->hash_cache));
+                size_t available=cs_work_available(s->context);
+                if(available>reserve && bytes<=available-reserve)
+                    o->hash_cache=cs_work_calloc(s->context,words,sizeof(*o->hash_cache));
             }
         }
         for(unsigned w=0;w<p->workers;++w) {
@@ -4909,7 +5232,7 @@ restart:
             /* Cursor/filter state is allocated lazily by the worker. Keep
              * that space and the existing spill reserve before launching;
              * otherwise a successful launch can fail on its first page. */
-            if(stats.limit_bytes-stats.used_bytes<(p->workers-w)*private_bytes+spill_reserve) {
+            if(cs_work_available(s->context)<(p->workers-w)*private_bytes+spill_reserve) {
                 close_workers(s); p->workers=1;
                 return row?next_row(s,root,row):3;
             }
@@ -4947,7 +5270,8 @@ restart:
             for(unsigned i=0;i<p->count;++i) {
                 const struct operator_state *built=&s->nodes[i]; struct operator_state *local=&e->nodes[i];
                 if(built->hash_phase) {
-                    local->hash_data=built->hash_data; local->hash_rows=built->hash_rows;
+                    local->hash_data=built->hash_data; local->hash_blocks=built->hash_blocks;
+                    local->hash_rows=built->hash_rows;
                     local->hash_capacity=built->hash_capacity; local->hash_phase=1; local->hash_shared=1;
                     local->hash_buckets=built->hash_buckets;
                 }
@@ -5023,7 +5347,18 @@ restart:
                 uint64_t work=v->profile.operators[QS_JOIN_PROBE].cpu_ns;
                 phase->worker_wall_ns+=v->profile.operators[QS_JOIN_PROBE].wall_ns;
                 if(!phase->worker_cpu_min || work<phase->worker_cpu_min) phase->worker_cpu_min=work;
-                if(work>phase->worker_cpu_max) phase->worker_cpu_max=work;
+                const struct execution *task=s->workers[w];
+                if(work>phase->worker_cpu_max) {
+                    phase->worker_cpu_max=work;
+                    phase->slow_worker=w+1;
+                    phase->slow_worker_input_rows=v->metrics.scanned;
+                    phase->slow_worker_sink_rows=task->sink_rows;
+                    phase->slow_worker_returned_rows=task->sink_returned_rows;
+                }
+                phase->input_rows+=v->metrics.scanned;
+                phase->sink_returned_rows+=task->sink_returned_rows;
+                if(task->hash_sink || task->group_sink)
+                    phase->sink_node=task->hash_sink?task->hash_sink:task->group_sink;
                 if(s->workers[w]->finished_ns) phase->finished_idle_ns+=now_ns(CLOCK_MONOTONIC)-s->workers[w]->finished_ns;
                 phase->sink_ns+=s->workers[w]->sink_ns; phase->sink_rows+=s->workers[w]->sink_rows;
                 for(unsigned reason=0;reason<QP_WAITS;++reason) {
@@ -5035,6 +5370,10 @@ restart:
             s->metrics.scanned+=v->metrics.scanned; s->metrics.matched+=v->metrics.matched;
             s->metrics.input_bytes+=v->metrics.input_bytes-v->metrics.index_pages*QS_PAGE;
             s->metrics.index_pages+=v->metrics.index_pages; s->metrics.index_tuples+=v->metrics.index_tuples;
+            for(unsigned kind=0;kind<2;++kind) {
+                s->metrics.index_cache_hits[kind]+=v->metrics.index_cache_hits[kind];
+                s->metrics.index_cache_misses[kind]+=v->metrics.index_cache_misses[kind];
+            }
             s->metrics.spill_read_bytes+=v->metrics.spill_read_bytes;
             s->metrics.spill_write_bytes+=v->metrics.spill_write_bytes;
             s->metrics.runs+=v->metrics.runs;
@@ -5046,6 +5385,14 @@ restart:
         }
         s->parallel_combine_worker=0; s->parallel_combining=0;
         unsigned group=s->workers[0]->group_sink;
+        if(s->profiling && group && !s->group_combine) {
+            char counts[QS_WORKERS*22+1];
+            size_t at=0;
+            for(unsigned w=0;w<p->workers;++w)
+                at+=snprintf(counts+at,sizeof(counts)-at,"%s%llu",w?",":"",
+                    (unsigned long long)s->outputs[w+1].metrics.scanned);
+            fprintf(stderr,"CSD aggregate sink node=%u pipeline=%u scan_rows_by_slot=%s\n",group-1,root,counts);
+        }
         if(!s->group_combine && group && s->nodes[group-1].group_locals && !s->nodes[group-1].group_radix) {
             parallel_group_combine(s,group-1); return QP_WAIT;
         }
@@ -5076,7 +5423,7 @@ restart:
             goto restart;
         }
         for(int id=root;id>=0 && id!=source;id=p->nodes[id].left) if(p->nodes[id].kind==QP_JOIN) {
-            cs_work_free(s->context,s->nodes[id].hash_data); s->nodes[id].hash_data=NULL;
+            hash_release(s->context,&s->nodes[id]);
         }
         s->nodes[root].finished=1; return 0;
     }
@@ -5138,12 +5485,22 @@ static int64_t finish_dictionary(struct execution *s,struct femu_csd_args *a,str
     s->paged=NULL; out->finished=s->control->finished=1; s->control->output_rows=out->rows;
     close_execution(s); return 0;
 }
-/* Resource discovery uses a normal zero-argument CSF and its 64-bit completion
- * value. SNIA CSE properties report CUs, but do not describe this allocator. */
+/* Resource discovery reuses this CSF: selector 0 reports workmem bytes,
+ * selector 1 the launcher's effective per-CU CPU fraction in ppm. No query
+ * allocations or extra CSF entry are needed. */
 int64_t pg_sina_workmem_capacity(struct femu_csd_args *a)
 {
     struct cs_work_stats stats;
-    if(!a || a->numr || cs_work_get_stats(&stats) || stats.capacity_bytes>INT64_MAX) return -1;
+    if(!a || a->numr || a->cparam2) return -1;
+    if(a->cparam1==QP_RESOURCE_CPU_RATIO) {
+        const char *value=getenv("CSD_CU_CPU_RATIO"); char *end=NULL;
+        double ratio=value?strtod(value,&end):1;
+        if(value && (!*value || *end || !(ratio>=0 && ratio<=1))) return -1;
+        if(ratio==0) ratio=1; /* 0 and 1 both mean unrestricted. */
+        if(ratio<0.1) return -1;
+        return (int64_t)(ratio*QP_CPU_RATIO_SCALE+0.5);
+    }
+    if(a->cparam1!=QP_RESOURCE_WORKMEM || cs_work_get_stats(&stats) || stats.capacity_bytes>INT64_MAX) return -1;
     return stats.capacity_bytes;
 }
 /* plan, lifecycle/page requests, result, input/dictionary arena, spill I/O.
@@ -5177,7 +5534,7 @@ static int64_t initialize_dictionary(struct execution *s,struct femu_csd_args *a
 /* Translate this SQL program's immutable file mapping into generic device
  * reads. Neither FEMU nor SNIA sees the file/extent interpretation. */
 static int namespace_ranges(struct execution *s,const struct qp_file_mapping *map,
-    uint64_t at,uint64_t bytes,uint64_t target,unsigned *count)
+    uint64_t at,uint64_t bytes,uint64_t target,uint32_t pool_offset,unsigned *count)
 {
     if(!map->count) return 0;
     if(!map->nsid || !map->lba_bytes || map->reserved || map->offset<sizeof(*s->plan) ||
@@ -5199,7 +5556,7 @@ static int namespace_ranges(struct execution *s,const struct qp_file_mapping *ma
         if(!n || (at-e->logical)%map->lba_bytes || n%map->lba_bytes || n/map->lba_bytes>UINT32_MAX) return -1;
         uint64_t lba=e->lba+(at-e->logical)/map->lba_bytes;
         struct femu_graph_read *last=*count?&reads[*count-1]:NULL;
-        if(last && le32toh(last->nsid)==map->nsid &&
+        if(last && last->pool_offset==htole32(pool_offset) && le32toh(last->nsid)==map->nsid &&
             le64toh(last->lba)+le32toh(last->blocks)==lba &&
             le64toh(last->offset)+(uint64_t)le32toh(last->blocks)*map->lba_bytes==target &&
             n/map->lba_bytes<=UINT32_MAX-le32toh(last->blocks))
@@ -5207,7 +5564,8 @@ static int namespace_ranges(struct execution *s,const struct qp_file_mapping *ma
         else {
             if(*count==FEMU_CSD_GRAPH_MAX_NODES) return 0;
             reads[(*count)++]=(struct femu_graph_read){.nsid=htole32(map->nsid),.blocks=htole32(n/map->lba_bytes),
-                .afdm_index=htole32(3),.lba=htole64(lba),.offset=htole64(target)};
+                .afdm_index=htole32(3),.pool_offset=htole32(pool_offset),
+                .lba=htole64(lba),.offset=htole64(target)};
         }
         at+=n; target+=n;
     }
@@ -5224,16 +5582,23 @@ static int64_t namespace_wait(struct execution *s)
         if(c->index_nreads>QS_INDEX_READS || (n->kind!=QP_INDEX_JOIN && !n->ordered_index)) return -1;
         unsigned leaf=n->ordered_index?c->node:(unsigned)n->right;
         if(leaf>=s->plan->count) return -1;
+        size_t input=input_offset(s,n),pool_offset=input+QS_INDEX_POOL_OFFSET;
+        if(pool_offset>UINT32_MAX || input>(uint64_t)s->args->mr_len[3] ||
+           QS_INDEX_IO_BYTES>(uint64_t)s->args->mr_len[3]-input) return -1;
+        struct femu_graph_read_pool *pool=(void *)(s->arena+pool_offset);
+        pool->slot_bytes=htole32(QS_PAGE);
+        pool->slots=htole32(QS_INDEX_SLOTS);
+        pool->pin_limit=htole32(QS_INDEX_READS);
         for(unsigned i=0;i<c->index_nreads;++i) {
             const struct qs_index_read *r=&c->index_reads[i];
-            if(r->heap>1 || r->slot>=QS_INDEX_CACHE) return -1;
+            size_t target;
+            if(r->heap>1 || !qp_index_page_offset(input,r->slot,&target)) return -1;
             const struct qp_file_mapping *map=r->heap?&s->plan->files[leaf]:&s->plan->indexes[leaf];
-            status=namespace_ranges(s,map,(uint64_t)r->block*QS_PAGE,QS_PAGE,
-                input_offset(s,n)+QS_SORT_IO_BYTES+(size_t)r->slot*QS_PAGE,&count);
+            status=namespace_ranges(s,map,(uint64_t)r->block*QS_PAGE,QS_PAGE,target,pool_offset,&count);
             if(status<=0) return status;
         }
     } else {
-        status=namespace_ranges(s,&s->plan->files[c->node],c->offset,c->bytes,input_offset(s,n),&count);
+        status=namespace_ranges(s,&s->plan->files[c->node],c->offset,c->bytes,input_offset(s,n),0,&count);
         if(status<=0) return status;
     }
     s->pending_nvm=count;
@@ -5255,7 +5620,7 @@ static int output_text(struct execution *s,struct qs_cell value,const char **byt
     if(!s->late_page) return -4;
     if(!s->late_valid || s->late_node!=node || s->late_block!=block) {
         unsigned count=0;
-        int status=namespace_ranges(s,&s->plan->files[node],block*QS_PAGE,QS_PAGE,QS_PAGE,&count);
+        int status=namespace_ranges(s,&s->plan->files[node],block*QS_PAGE,QS_PAGE,QS_PAGE,0,&count);
         if(status!=1 || !count || s->io_bytes<2*QS_PAGE) return -3;
         struct femu_graph_read *reads=s->io;
         for(unsigned i=0;i<count;++i) reads[i].afdm_index=htole32(4);
@@ -5451,6 +5816,10 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
             if(s->paged) qs_dictionary_abort(s->paged);
             cs_work_end(context); return -4;
         }
+        uint64_t cache_bytes=plan->index_cache_bytes;
+        size_t cache_limit=QP_INDEX_CACHE_MAX_MIB*1024*1024ULL;
+        if(cache_bytes>=1024*1024 && cache_bytes<=cache_limit && cache_bytes<budget)
+            s->index_cache=qs_index_cache_create(context,cache_bytes,cache_limit,a->cparam1&1);
         s->imported=1;
         s->profiling=a->cparam1&1; s->outputs=a->mr_addr[2]; control->state=(uintptr_t)s;
         out->rows=out->begin=out->finished=out->str_bytes=0; out->status=0;
@@ -5502,7 +5871,10 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
     if(s->pending_spool) {
         if(!csIsReentry(a)) return -1;
         struct spool *p=s->pending_spool;
-        if(s->pending_store) { p->tokens[p->blocks++]=csReentryValue(a); p->used=0; s->metrics.spill_write_bytes+=QS_SORT_IO_BYTES; }
+        if(s->pending_store) {
+            p->pages[p->blocks++]=(struct spool_block){.token=csReentryValue(a)};
+            p->used=0; s->metrics.spill_write_bytes+=QS_SORT_IO_BYTES;
+        }
         else { memcpy(p->cache,s->io,QS_SORT_IO_BYTES); p->loaded=s->pending_block; s->metrics.spill_read_bytes+=QS_SORT_IO_BYTES; }
         s->pending_spool=NULL;
     }
@@ -5754,7 +6126,7 @@ combined:
     if(s->dictionary_wait) status=s->dictionary_wait;
     if(s->expression_wait && s->pending_spool) {
         s->expression_wait=0;
-        status=csNeedLoad(s->pending_spool->tokens[s->pending_block]);
+        status=csNeedLoad(s->pending_spool->pages[s->pending_block].token);
     }
     if(status==QP_WAIT) {
         int64_t request=namespace_wait(s); if(request) status=request;
@@ -5777,16 +6149,31 @@ combined:
         out->metrics.spill_write_bytes+=dictionary.stores*QS_DICTIONARY_PAGE_BYTES;
     }
     for(unsigned i=0;i<plan->count;++i) if(plan->nodes[i].kind==QP_INDEX_JOIN || plan->nodes[i].ordered_index) {
-        out->metrics.index_pages+=s->nodes[i].index_task.index_pages;
-        out->metrics.index_tuples+=s->nodes[i].index_task.index_tuples;
+        const struct qs_task *task=&s->nodes[i].index_task;
+        out->metrics.index_pages+=task->index_pages;
+        out->metrics.index_tuples+=task->index_tuples;
+        if(plan->nodes[i].kind==QP_INDEX_JOIN)
+            qs_index_cache_stats(&s->nodes[i].index_control,&out->metrics,&out->profile);
     }
     out->metrics.input_bytes+=out->metrics.index_pages*QS_PAGE;
     struct cs_work_context_stats memory;
     if(!cs_work_get_context_stats(s->context,&memory)) out->metrics.work_peak=memory.peak_used_bytes;
-    if(status<0) return status;
+    if(status<0) {
+        struct cs_work_stats pool={0};
+        cs_work_get_stats(&pool);
+        const struct operator_state *failed=&s->nodes[control->error_node<plan->count?control->error_node:plan->root];
+        fprintf(stderr,"CSD plan error=%lld worker=%u node=%u root=%u phase=%u groups=%u capacity=%u radix=%u context_used=%zu context_limit=%zu pool_used=%zu pool_free=%zu largest_free=%zu\n",
+            (long long)status,worker,control->error_node,s->root,failed->group_phase,
+            failed->group_count?atomic_load(failed->group_count):0,failed->group_capacity,
+            failed->group_radix!=NULL,memory.used_bytes,memory.limit_bytes,
+            pool.used_bytes,pool.free_bytes,pool.largest_free_payload);
+        return status;
+    }
     if(s->text_wait==QS_DICTIONARY_BUSY || s->dictionary_wait==QS_DICTIONARY_BUSY ||
        (s->pending_sort && status==QS_DICTIONARY_BUSY)) return dictionary_request(s,out,QS_DICTIONARY_BUSY);
     if(worker && status<=2) {
+        if(s->profiling && (s->hash_sink || s->group_sink))
+            s->sink_returned_rows+=control->output_rows;
         uint64_t metadata=typed?QP_TYPED_OUTPUT|((uint64_t)control->output_rows<<5)|((uint64_t)control->output_strings<<22):0;
         if(typed && host_publish) qp_host_pack(out,&plan->nodes[plan->root].expr,control->output_strings);
         if(s->profiling && out->finished && !s->finished_ns) s->finished_ns=now_ns(CLOCK_MONOTONIC);

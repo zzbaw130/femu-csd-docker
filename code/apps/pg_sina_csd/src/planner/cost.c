@@ -8,10 +8,15 @@
 #include "cost_model.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_constraint.h"
+#include "catalog/pg_index.h"
 #include "catalog/namespace.h"
 #include "utils/syscache.h"
+#include "utils/acl.h"
+#include "utils/array.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "access/relation.h"
+#include "access/stratnum.h"
 #include "catalog/pg_type_d.h"
 #include "catalog/pg_am_d.h"
 #include "executor/executor.h"
@@ -20,6 +25,7 @@
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/paths.h"
+#include "optimizer/restrictinfo.h"
 #include "parser/parsetree.h"
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
@@ -28,6 +34,7 @@
 #include "utils/datetime.h"
 #include "utils/memutils.h"
 #include "utils/spccache.h"
+#include "utils/typcache.h"
 #include <float.h>
 #include <math.h>
 
@@ -36,13 +43,24 @@ struct host_lookup_cost { Oid index; JoinType type; double rows,before,inner,cor
 struct residency {
     Oid oid;
     double bytes,tuples,fraction,shared;
+    bool bulk_ready;
     List *scans,*lookups;
 };
+/* Binary Path metadata; link is pure result transfer time. The public
+ * EXPLAIN fields retain their existing order and formatting. */
+struct candidate_costs { double values[15]; int workers; double link,delivery_wait; };
+double pg_sina_scan_stream_work(Path *source)
+{
+    const Const *record=lsecond(((CustomPath *)source)->custom_private);
+    struct candidate_costs costs;
+    memcpy(&costs,VARDATA_ANY(DatumGetByteaP(record->constvalue)),sizeof(costs));
+    return Max(0,costs.values[1]/pg_sina_host_cost_ms-source->startup_cost);
+}
 struct placement {
     Plan *native,*device;
     PlannerInfo *root;
     List *children;
-    double host,native_host,csd,boundary,cache,spill,io,cpu,peak,population,rows;
+    double host,native_host,csd,boundary,cache,spill,io,cpu,peak,population,rows,link,delivery_wait;
     double serial,parallel,schedule,combine,dictionary,fdm;
     unsigned workers;
     StringInfo stages;
@@ -50,6 +68,7 @@ struct placement {
 };
 static double transfer_ms(double bytes,double mbps) { return bytes/(mbps*1000); }
 static double column_correlation(Oid,int);
+static double primary_prefix_fanout(PlannerInfo *,Oid,int);
 static double host_fk_visits(PlannerInfo *,NestPath *,IndexPath *);
 /* Read the connection snapshot only. Catalog row counts/physical sizes remain
  * PG planner metadata; descriptor scans and mincore run outside planning. */
@@ -60,12 +79,15 @@ static struct residency *residency(Oid oid,List **observations)
     double mark=pg_sina_planner_clock(),cpu=pg_sina_planner_cpu();
     struct residency *r=MemoryContextAllocZero(pg_sina_search_context(),sizeof(*r)); r->oid=oid;
     Relation rel=relation_open(oid,AccessShareLock);
-    r->bytes=(double)RelationGetNumberOfBlocks(rel)*BLCKSZ;
+    BlockNumber blocks=RelationGetNumberOfBlocks(rel);
+    r->bytes=(double)blocks*BLCKSZ;
     r->tuples=Max(1,rel->rd_rel->reltuples);
     const struct pg_sina_cache_entry *entry=pg_sina_cache_lookup(rel->rd_node);
     if(entry) {
         r->shared=entry->blocks?Min(1.0,(double)entry->shared_pages/entry->blocks):0;
         r->fraction=entry->file_known && entry->file_total?Min(1.0,(double)entry->file_pages/entry->file_total):0;
+        uint64 bulk=pg_sina_dcp_bulk_pages(blocks,rel->rd_rel->relkind,false);
+        r->bulk_ready=bulk && entry->blocks && entry->shared_pages>=Min(entry->blocks,bulk);
     }
     if(pg_sina_planning) ereport(NOTICE,(errmsg("SQLerate relation cache relid=%u shared_percent=%.2f file_percent=%.2f pages=%.0f generation=%u file_generation=%u",
         oid,r->shared*100,r->fraction*100,r->bytes/BLCKSZ,entry?entry->generation:0,entry?entry->file_generation:0)));
@@ -81,6 +103,14 @@ static struct residency *residency(Oid oid,List **observations)
         ++pg_sina_planning->cache_probes;
     }
     return r;
+}
+static double population_fraction(const struct residency *relation,bool sequential)
+{
+    /* Match the executor's bounded DCP target for large sequential scans.
+     * This discounts optional DMA only; internal LOAD still reads the table. */
+    double shared=sequential && relation->bulk_ready?1:relation->shared;
+    return cost_population_fraction(pg_sina_hpcp_enabled(),
+        pg_sina_dcp,relation->fraction,shared);
 }
 static Oid scan_relation(PlannerInfo *root,Plan *p)
 {
@@ -100,6 +130,15 @@ static double cached_io(double io,double page_cost,struct residency *r,double fo
     double scale=footprint>0?(r->bytes/BLCKSZ)/footprint:1;
     return cost_host_cached_io(io,Min(1,r->shared*scale),Min(1,r->fraction*scale),copy);
 }
+static double host_lookup_io_floor(const struct residency *r,double pages,double probes)
+{
+    double misses=pages*(1-Max(r->shared,r->fraction));
+    double bytes=misses*BLCKSZ;
+    double copy=pages*(1-r->shared)*BLCKSZ;
+    double ms=cost_index_read_ms(bytes,misses,pg_sina_internal_mbps,pg_sina_internal_read_iops)+
+        transfer_ms(bytes,pg_sina_pcie_mbps)+transfer_ms(copy,pg_sina_cache_mbps);
+    return ms/(Max(1,probes)*pg_sina_host_cost_ms);
+}
 static pg_noinline void index_cpu_cost(IndexPath *path,PlannerInfo *root)
 {
     double saved_seq=seq_page_cost,saved_random=random_page_cost;
@@ -110,6 +149,61 @@ static pg_noinline void index_cpu_cost(IndexPath *path,PlannerInfo *root)
     { seq_page_cost=saved_seq; random_page_cost=saved_random; PG_RE_THROW(); }
     PG_END_TRY();
     seq_page_cost=saved_seq; random_page_cost=saved_random;
+}
+/* Bound the equality fanout estimate by the composite PK's estimated
+ * trailing-key combinations. Range/lossy scans cannot use this bound. */
+static double host_index_fanout(PlannerInfo *root,Oid oid,IndexPath *path)
+{
+    if(list_length(path->indexclauses)!=1) return 0;
+    IndexClause *clause=linitial(path->indexclauses);
+    if(clause->indexcol || clause->lossy || !IsA(clause->rinfo->clause,OpExpr)) return 0;
+    OpExpr *op=(OpExpr *)clause->rinfo->clause;
+    if(get_op_opfamily_strategy(op->opno,path->indexinfo->opfamily[0])!=BTEqualStrategyNumber) return 0;
+    return primary_prefix_fanout(root,oid,path->indexinfo->indexkeys[0]);
+}
+/* Do not assume an unknown outer-dependent residual always succeeds. PG
+ * keeps these in ppi_clauses even when joinrestrictinfo itself is empty. */
+static bool host_index_early_stop(NestPath *join,IndexPath *path)
+{
+    if((join->jointype!=JOIN_SEMI && join->jointype!=JOIN_ANTI) ||
+       join->joinrestrictinfo || !path->path.param_info) return false;
+    ListCell *c,*i;
+    foreach(c,path->path.param_info->ppi_clauses) {
+        bool indexed=false;
+        foreach(i,path->indexclauses)
+            if(((IndexClause *)lfirst(i))->rinfo==lfirst(c)) indexed=true;
+        if(!indexed) return false;
+    }
+    return true;
+}
+/* PG's repeated-scan I/O model assumes random probes. A direct device heap
+ * scan preserves key locality within morsels; sparse probes still retain
+ * the random price. Hash/Sort/other HOST chains cannot borrow this order. */
+static double host_index_locality(PlannerInfo *root,NestPath *join,IndexPath *index)
+{
+    if(!join || join->jointype!=JOIN_INNER || !IsA(join->outerjoinpath,CustomPath) ||
+       list_length(index->indexclauses)!=1) return 0;
+    CustomPath *source=(CustomPath *)join->outerjoinpath;
+    if(!source->custom_private || !IsA(linitial(source->custom_private),SeqScan)) return 0;
+    IndexClause *clause=linitial(index->indexclauses);
+    if(clause->indexcol || clause->lossy || !IsA(clause->rinfo->clause,OpExpr)) return 0;
+    OpExpr *op=(OpExpr *)clause->rinfo->clause;
+    if(get_op_opfamily_strategy(op->opno,index->indexinfo->opfamily[0])!=BTEqualStrategyNumber) return 0;
+    ListCell *c;
+    foreach(c,op->args) {
+        Node *arg=strip_implicit_coercions(lfirst(c));
+        if(!IsA(arg,Var)) continue;
+        Var *key=(Var *)arg;
+        if(key->varlevelsup || key->varno!=source->path.parent->relid || key->varattno<=0) continue;
+        double outer=column_correlation(rt_fetch(key->varno,root->parse->rtable)->relid,key->varattno);
+        double heap=column_correlation(rt_fetch(index->path.parent->relid,root->parse->rtable)->relid,index->indexinfo->indexkeys[0]);
+        double divisor=Max(1,join->path.parallel_workers+(parallel_leader_participation?
+            Max(0,1-0.3*join->path.parallel_workers):0));
+        double probes=join->outerjoinpath->rows*divisor;
+        double pages=Max(1,index->path.parent->pages);
+        return outer*outer*heap*heap*cost_population_pages(probes,pages)/pages;
+    }
+    return 0;
 }
 /* ExecQual stops at the first failed conjunct. Keep PG's security/cost
  * ordering and estimate prefix survival with its existing selectivity code;
@@ -185,14 +279,20 @@ static void cost_host_path(PlannerInfo *root,Path *path,Oid oid,List **observati
         /* Cache hits remove I/O, not B-tree descent, buffer pinning or
          * comparisons. Keep PG's entire index CPU price for every probe. */
     }
-    double heap_footprint=0,index_footprint=0;
+    double heap_footprint=0,index_footprint=0,index_probes=0;
     if(index && join) {
         IndexPath *access=(IndexPath *)path;
         double divisor=Max(1,join->path.parallel_workers+
             (parallel_leader_participation?Max(0,1-0.3*join->path.parallel_workers):0));
         double probes=Max(1,join->outerjoinpath->rows*divisor);
-        double matches=Max(1,access->indexselectivity*path->parent->tuples)*
+        index_probes=probes;
+        double candidates=Max(1,access->indexselectivity*path->parent->tuples);
+        double matches=candidates*
             host_fk_visits(root,join,access)/Max(1,path->rows);
+        double bound=host_index_fanout(root,oid,access);
+        if(bound>0) matches=Min(matches,bound);
+        if(host_index_early_stop(join,access))
+            matches=cost_first_match_visits(matches,Min(1,path->rows/candidates));
         double correlation=access->indexinfo->indexkeys[0]>0?
             column_correlation(oid,access->indexinfo->indexkeys[0]):0;
         double pages=Max(1,heap->bytes/BLCKSZ);
@@ -201,13 +301,34 @@ static void cost_host_path(PlannerInfo *root,Path *path,Oid oid,List **observati
         index_footprint=cost_population_pages(probes,Max(1,index->bytes/BLCKSZ));
     }
     double startup=path->startup_cost;
-    /* PG already amortizes repeated probes. Compare observed residency
-     * against single-probe I/O; do not discount the reused residual again. */
-    double cached_heap=index?Min(heap_io,cached_io(single_heap_io,random,heap,heap_footprint)):
+    /* Keep the existing Heap reuse and residency model. */
+    double locality=index && join?host_index_locality(root,join,(IndexPath *)path):0;
+    double ratio=random>0?1-locality*(1-Min(1,seq/random)):1;
+    double cached_heap=index?Min(heap_io*ratio,cached_io(single_heap_io*ratio,random*ratio,heap,heap_footprint)):
         cost_host_scan_io(heap_io*pg_sina_host_cost_ms,
             transfer_ms(heap->bytes,pg_sina_internal_mbps),transfer_ms(heap->bytes,pg_sina_pcie_mbps),
             transfer_ms(heap->bytes,pg_sina_cache_mbps),heap->shared,heap->fraction)/pg_sina_host_cost_ms;
-    double cached_index=index?Min(index_io,cached_io(single_index_io,index_random,index,index_footprint)):0;
+    /* PG has already amortized repeated B-tree leaf visits in index_io.
+     * Of those expected page fetches, only the nonresident share needs
+     * storage I/O. File-only hits still pay the copy into shared buffers. */
+    double index_copy=index_random>0?Min(1,transfer_ms(BLCKSZ,pg_sina_cache_mbps)/
+        (index_random*pg_sina_host_cost_ms)):0;
+    double cached_index=index?cost_host_cached_io(index_io,index->shared,index->fraction,index_copy):0;
+    if(index && join && (join->jointype==JOIN_SEMI || join->jointype==JOIN_ANTI)) {
+        /* A disordered existence probe cannot assume that resident pages
+         * coincide with the pages visited. PG's repeat-probe discount still
+         * applies above; retain at least the service for distinct cold pages. */
+        double probes=join->outerjoinpath->rows;
+        cached_heap=Max(cached_heap,host_lookup_io_floor(heap,heap_footprint,probes));
+        cached_index=Max(cached_index,host_lookup_io_floor(index,index_footprint,probes));
+    }
+    if(index && join && apply && pg_sina_planning && index_random>0) {
+        double pg_pages=index_io/index_random*index_probes;
+        ereport(DEBUG1,(errmsg("SQLerate HOST index leaf I/O indexid=%u workers=%d device_input=%d probes=%.0f pg_pages=%.0f cold_pages=%.0f index_io_ms=%.3f",
+            indexid,join->path.parallel_workers,IsA(join->outerjoinpath,CustomPath),index_probes,pg_pages,
+            pg_pages*(1-Max(index->shared,index->fraction)),
+            cached_index*join->outerjoinpath->rows*pg_sina_host_cost_ms)));
+    }
     double after=Max(startup,before-heap_io-index_io-qual_discount+cached_heap+cached_index);
     if(apply) {
         if(index) ((IndexPath *)path)->indextotalcost-=index_io-cached_index;
@@ -224,6 +345,152 @@ static void cost_host_path(PlannerInfo *root,Path *path,Oid oid,List **observati
 }
 void pg_sina_cost_host_path(PlannerInfo *root,Path *path,Oid oid,List **observations,bool apply)
 { cost_host_path(root,path,oid,observations,apply,NULL); }
+
+struct column_comparison {
+    RestrictInfo *restriction;
+    AttrNumber left,right;
+    Oid type;
+    TypeCacheEntry *ordering;
+    bool inclusive;
+};
+
+static bool describe_column_comparison(RestrictInfo *r,Index rti,Oid oid,Oid user,bool table_access,
+                                       struct column_comparison *pair)
+{
+    OpExpr *op=(OpExpr *)r->clause;
+    if(list_length(op->args)!=2 || OidIsValid(op->inputcollid)) return false;
+    Node *args[]={linitial(op->args),lsecond(op->args)};
+    if(!IsA(args[0],Var) || !IsA(args[1],Var)) return false;
+    Var *a=(Var *)args[0],*b=(Var *)args[1];
+    if(a->varno!=rti || b->varno!=rti || a->varlevelsup || b->varlevelsup ||
+       a->varattno<=0 || b->varattno<=0 || a->varattno==b->varattno ||
+       a->vartype!=b->vartype) return false;
+    if(!table_access && (pg_attribute_aclcheck(oid,a->varattno,user,ACL_SELECT)!=ACLCHECK_OK ||
+                        pg_attribute_aclcheck(oid,b->varattno,user,ACL_SELECT)!=ACLCHECK_OK)) return false;
+    TypeCacheEntry *type=lookup_type_cache(a->vartype,TYPECACHE_CMP_PROC_FINFO|TYPECACHE_BTREE_OPFAMILY);
+    if(!OidIsValid(type->btree_opf) || !OidIsValid(type->cmp_proc_finfo.fn_oid)) return false;
+    int strategy=get_op_opfamily_strategy(op->opno,type->btree_opf);
+    if(strategy==BTGreaterStrategyNumber || strategy==BTGreaterEqualStrategyNumber) {
+        Var *swap=a; a=b; b=swap;
+        strategy=BTGreaterStrategyNumber+BTLessStrategyNumber-strategy;
+    }
+    if(strategy!=BTLessStrategyNumber && strategy!=BTLessEqualStrategyNumber) return false;
+    *pair=(struct column_comparison){r,a->varattno,b->varattno,a->vartype,type,
+        strategy==BTLessEqualStrategyNumber};
+    return true;
+}
+
+/* PG12 has no value distribution for the other operand of a Var/Var
+ * inequality. Use the two marginal distributions for an isolated pair. */
+static double column_pair_selectivity(const struct column_comparison *pair,Oid oid)
+{
+    HeapTuple stats[]={SearchSysCache3(STATRELATTINH,ObjectIdGetDatum(oid),
+                           Int16GetDatum(pair->left),BoolGetDatum(false)),
+                       SearchSysCache3(STATRELATTINH,ObjectIdGetDatum(oid),
+                           Int16GetDatum(pair->right),BoolGetDatum(false))};
+    AttStatsSlot hist[2]={{0}},mcv[2]={{0}};
+    double mass[2]={0},result=-1;
+    Oid less=get_opfamily_member(pair->ordering->btree_opf,pair->type,pair->type,BTLessStrategyNumber);
+    for(unsigned i=0;i<2;++i) {
+        if(!HeapTupleIsValid(stats[i])) goto done;
+        mass[i]=1-((Form_pg_statistic)GETSTRUCT(stats[i]))->stanullfrac;
+        if(get_attstatsslot(&mcv[i],stats[i],STATISTIC_KIND_MCV,InvalidOid,
+                           ATTSTATSSLOT_VALUES|ATTSTATSSLOT_NUMBERS))
+            for(int j=0;j<mcv[i].nnumbers;++j) mass[i]-=mcv[i].numbers[j];
+        if(!get_attstatsslot(&hist[i],stats[i],STATISTIC_KIND_HISTOGRAM,less,ATTSTATSSLOT_VALUES) ||
+           hist[i].nvalues<2) goto done;
+    }
+    result=0;
+    for(unsigned group=0;group<2;++group) {
+        AttStatsSlot *left=group?&mcv[0]:&hist[0];
+        for(int i=0;i<left->nvalues;++i) {
+            Datum value=left->values[i];
+            /* Histogram endpoints represent half a quantile interval. */
+            double weight=group?left->numbers[i]:Max(0,mass[0])/(left->nvalues-1)*
+                (i==0 || i==left->nvalues-1?0.5:1);
+            int lo=0,hi=hist[1].nvalues;
+            while(lo<hi) {
+                int mid=lo+(hi-lo)/2;
+                int32 cmp=DatumGetInt32(FunctionCall2Coll(&pair->ordering->cmp_proc_finfo,InvalidOid,value,hist[1].values[mid]));
+                if(cmp<0 || (cmp==0 && pair->inclusive)) hi=mid;
+                else lo=mid+1;
+            }
+            double fraction=(hist[1].nvalues-lo-0.5)/(hist[1].nvalues-1);
+            double survival=Max(0,mass[1])*Min(1,Max(0,fraction));
+            for(int j=0;j<mcv[1].nvalues;++j) {
+                int32 cmp=DatumGetInt32(FunctionCall2Coll(&pair->ordering->cmp_proc_finfo,InvalidOid,value,mcv[1].values[j]));
+                if(cmp<0 || (cmp==0 && pair->inclusive)) survival+=mcv[1].numbers[j];
+            }
+            result+=weight*survival;
+        }
+    }
+    result=Min(1,Max(0,result));
+done:
+    for(unsigned i=0;i<2;++i) {
+        free_attstatsslot(&hist[i]); free_attstatsslot(&mcv[i]);
+        if(HeapTupleIsValid(stats[i])) ReleaseSysCache(stats[i]);
+    }
+    return result;
+}
+
+double pg_sina_refine_base_rows(PlannerInfo *root,RelOptInfo *rel,Index rti,RangeTblEntry *rte)
+{
+    if(rte->rtekind!=RTE_RELATION || rel->reloptkind!=RELOPT_BASEREL ||
+       rte->relkind!=RELKIND_RELATION || rte->relid<FirstNormalObjectId ||
+       !rel->baserestrictinfo) return 1;
+    double uncertainty=1,before=rel->rows;
+    Oid user=OidIsValid(rte->checkAsUser)?rte->checkAsUser:GetUserId();
+    bool table_access=pg_class_aclcheck(rte->relid,user,ACL_SELECT)==ACLCHECK_OK;
+    struct column_comparison *pairs=palloc(list_length(rel->baserestrictinfo)*sizeof(*pairs));
+    Bitmapset *seen=NULL,*shared=NULL;
+    unsigned count=0,skipped=0;
+    ListCell *c;
+    foreach(c,rel->baserestrictinfo) {
+        RestrictInfo *r=lfirst(c);
+        if(!IsA(r->clause,OpExpr) || r->pseudoconstant || !restriction_is_securely_promotable(r,rel)) continue;
+        struct column_comparison *pair=&pairs[count];
+        if(!describe_column_comparison(r,rti,rte->relid,user,table_access,pair)) continue;
+        if(bms_is_member(pair->left,seen)) shared=bms_add_member(shared,pair->left);
+        if(bms_is_member(pair->right,seen)) shared=bms_add_member(shared,pair->right);
+        seen=bms_add_member(seen,pair->left);
+        seen=bms_add_member(seen,pair->right);
+        ++count;
+    }
+    for(unsigned i=0;i<count;++i) {
+        const struct column_comparison *pair=&pairs[i];
+        /* In a conjunction such as a < b AND b < c, the shared value
+         * constrains both comparisons. Marginals cannot tell us the
+         * joint selectivity, so preserve PG's estimate for those clauses. */
+        if(bms_is_member(pair->left,shared) || bms_is_member(pair->right,shared)) {
+            ++skipped;
+            continue;
+        }
+        double selectivity=column_pair_selectivity(pair,rte->relid);
+        if(selectivity<0) continue;
+        pair->restriction->norm_selec=selectivity;
+        uncertainty=Max(uncertainty,1/Max(selectivity,1/Max(1,rel->tuples)));
+    }
+    bms_free(seen); bms_free(shared); pfree(pairs);
+    if(skipped && pg_sina_planning)
+        ereport(NOTICE,(errmsg("SQLerate shared-column comparisons relid=%u rti=%u preserved=%u",
+            rte->relid,rti,skipped)));
+    if(uncertainty==1) return 1;
+    set_baserel_size_estimates(root,rel);
+    if(pg_sina_planning) ereport(NOTICE,(errmsg("SQLerate column comparison relid=%u rti=%u original_rows=%.0f estimated_rows=%.0f",
+        rte->relid,rti,before,rel->rows)));
+    List *paths=list_concat(list_copy(rel->pathlist),list_copy(rel->partial_pathlist));
+    foreach(c,paths) {
+        Path *path=lfirst(c);
+        if(path->param_info)
+            path->param_info->ppi_rows=get_parameterized_baserel_size(root,rel,path->param_info->ppi_clauses);
+        if(path->pathtype==T_SeqScan) cost_seqscan(path,root,rel,path->param_info);
+        else path->rows=path->param_info?path->param_info->ppi_rows:
+            clamp_row_est(rel->rows/Max(1,path->parallel_workers+
+                (parallel_leader_participation?Max(0,1-0.3*path->parallel_workers):0)));
+    }
+    list_free(paths);
+    return uncertainty;
+}
 /* Output visits retain local-filter selectivity. Scaling index CPU by this
  * ratio also scales candidates inspected before that filter. */
 static double host_fk_visits(PlannerInfo *root,NestPath *native,IndexPath *inner)
@@ -248,19 +515,25 @@ static double host_fk_visits(PlannerInfo *root,NestPath *native,IndexPath *inner
  * before intervening joins filter the probes. Reprice for this outer Path.
  * For a pure FK lookup, use PG's join fanout for CPU visits: the index's
  * sampled NDV may disagree with PG's matched-FK join estimate. */
-Path *pg_sina_reprice_index_join(PlannerInfo *root,NestPath *native,JoinPathExtraData *extra,List **observations)
+Path *pg_sina_reprice_index_join(PlannerInfo *root,NestPath *native,JoinPathExtraData *extra,List **observations,double host_pages)
 {
     if(!IsA(native->innerjoinpath,IndexPath)) return &native->path;
     IndexPath *original=(IndexPath *)native->innerjoinpath;
     if(!original->path.param_info || original->indexinfo->relam!=BTREE_AM_OID) return &native->path;
     IndexPath *inner=palloc(sizeof(*inner)); *inner=*original;
     Path *outer=native->outerjoinpath;
+    /* Only borrow the smaller competition set when shared_buffers alone
+     * can hold it. HPCP still competes for OS cache; no global PG price or
+     * effective_cache_size is changed or assumed to be free memory. */
+    PlannerInfo cache_root=*root;
+    if(host_pages+inner->indexinfo->pages<=NBuffers)
+        cache_root.total_table_pages=host_pages;
     double divisor=native->path.parallel_workers+
         (parallel_leader_participation?Max(0,1-0.3*native->path.parallel_workers):0);
-    cost_index(inner,root,Max(1,outer->rows*Max(1,divisor)),false);
+    cost_index(inner,&cache_root,Max(1,outer->rows*Max(1,divisor)),false);
     IndexPath cpu=*inner; index_cpu_cost(&cpu,root);
     Oid oid=rt_fetch(inner->path.parent->relid,root->parse->rtable)->relid;
-    cost_host_path(root,&inner->path,oid,observations,true,native);
+    cost_host_path(&cache_root,&inner->path,oid,observations,true,native);
     double visits=host_fk_visits(root,native,inner);
     double run=Max(0,cpu.path.total_cost-cpu.path.startup_cost);
     inner->path.total_cost=Max(inner->path.startup_cost,
@@ -272,12 +545,11 @@ Path *pg_sina_reprice_index_join(PlannerInfo *root,NestPath *native,JoinPathExtr
     final_cost_nestloop(root,out,&workspace,extra);
     return &out->path;
 }
-/* Ask PG for the consumer's CPU work, preserving SEMI/ANTI early stop and
- * rescan accounting. Subtracting inner.total_cost * outer.rows instead
- * removes work PG never charged and can incorrectly produce zero CPU. */
-double pg_sina_host_join_cpu(PlannerInfo *root,NestPath *native,JoinPathExtraData *extra)
+/* Price the streaming Index consumer with PG's CPU, early-stop and rescan
+ * accounting, then overlap independent I/O with the device producer. */
+double pg_sina_host_index_pipeline_cost(PlannerInfo *root,NestPath *native,JoinPathExtraData *extra,double producer)
 {
-    if(!IsA(native->innerjoinpath,IndexPath)) return 0;
+    if(!IsA(native->innerjoinpath,IndexPath)) return native->path.total_cost;
     IndexPath inner=*(IndexPath *)native->innerjoinpath;
     index_cpu_cost(&inner,root);
     double visits=host_fk_visits(root,native,(IndexPath *)native->innerjoinpath);
@@ -290,7 +562,41 @@ double pg_sina_host_join_cpu(PlannerInfo *root,NestPath *native,JoinPathExtraDat
     JoinCostWorkspace workspace;
     initial_cost_nestloop(root,&workspace,cpu.jointype,&outer,&inner.path,extra);
     final_cost_nestloop(root,&cpu,&workspace,extra);
-    return Max(0,cpu.path.total_cost);
+    double consumer=Max(0,cpu.path.total_cost),storage=0,link=0,delivery_wait=0;
+    /* Only a direct base Scan supplies the resource breakdown for the
+     * shared storage and link bounds. The consumer's overlap credit covers
+     * HOST CPU work. Synchronous index misses depend on delivered keys
+     * and contend with subsequent CSD reads on the same device. */
+    if(native->jointype==JOIN_INNER && IsA(native->outerjoinpath,CustomPath)) {
+        CustomPath *source=(CustomPath *)native->outerjoinpath;
+        if(IsA(linitial(source->custom_private),SeqScan) && IsA(lsecond(source->custom_private),Const)) {
+            Const *record=(Const *)lsecond(source->custom_private);
+            struct candidate_costs cost;
+            memcpy(&cost,VARDATA_ANY(DatumGetByteaP(record->constvalue)),sizeof(cost));
+            delivery_wait=cost.delivery_wait/pg_sina_host_cost_ms;
+            IndexPath *priced=(IndexPath *)native->innerjoinpath;
+            double index_io=Max(0,priced->indextotalcost-inner.indextotalcost);
+            double heap_io=Max(0,priced->path.total_cost-inner.path.total_cost-index_io);
+            double random,seq,index_random;
+            get_tablespace_page_costs(priced->path.parent->reltablespace,&random,&seq);
+            get_tablespace_page_costs(priced->indexinfo->reltablespace,&index_random,NULL);
+            double locality=host_index_locality(root,native,priced);
+            if(random>0) random*=1-locality*(1-Min(1,seq/random));
+            double divisor=Max(1,native->path.parallel_workers+(parallel_leader_participation?
+                Max(0,1-0.3*native->path.parallel_workers):0));
+            /* PG I/O prices include within-query reuse and observed cache
+             * discounts. Convert their remaining page work to transfer
+             * service, not to a second copy of PG's latency price. */
+            double pages=(random>0?heap_io/random:0)+(index_random>0?index_io/index_random:0);
+            double bytes=pages*Max(1,native->outerjoinpath->rows)*divisor*BLCKSZ;
+            storage=(cost.values[6]+transfer_ms(bytes,pg_sina_internal_mbps))/pg_sina_host_cost_ms;
+            link=(cost.link+cost.values[8]+transfer_ms(bytes,pg_sina_pcie_mbps))/pg_sina_host_cost_ms;
+        }
+    }
+    /* Result-read completion gates producer requeue. This residual DMA
+     * wait is outside CPU/I/O overlap; aggregate bandwidth alone misses it. */
+    return cost_stream_join(native->path.total_cost,native->path.startup_cost,
+        producer,consumer,storage,link)+delivery_wait;
 }
 /* Preserve PG's own SEMI/ANTI early-stop and rescan pricing. Discounting one
  * full inner scan per outer row would subtract work PG never charged. */
@@ -396,7 +702,8 @@ static double host_parallel_cost(Plan *plan,List *rtable,List **observations,int
     bool gather=IsA(plan,Gather) || IsA(plan,GatherMerge);
     if(gather) workers=IsA(plan,Gather)?((Gather *)plan)->num_workers:((GatherMerge *)plan)->num_workers;
     double left=0,right=0;
-    double extra=host_parallel_cost(plan->lefttree,rtable,observations,workers,&left);
+    double extra=pg_sina_host_hash_penalty(plan,true)/pg_sina_host_cost_ms;
+    extra+=host_parallel_cost(plan->lefttree,rtable,observations,workers,&left);
     double repeats=IsA(plan,NestLoop) && plan->righttree && !IsA(plan->righttree,Material)?Max(1,plan->lefttree->plan_rows):1;
     extra+=host_parallel_cost(plan->righttree,rtable,observations,workers,&right)*repeats;
     double local=Max(0,plan->total_cost-(plan->lefttree?plan->lefttree->total_cost:0)-
@@ -438,7 +745,7 @@ double pg_sina_host_parallel_cost(PlannedStmt *stmt)
 static double statement_cache_cost(Plan *p,List *rtable,List **observations,double repeats)
 {
     if(!p) return 0;
-    double correction=0;
+    double correction=pg_sina_host_hash_penalty(p,false)*repeats;
     if(IsA(p,SeqScan) || IsA(p,IndexScan) || IsA(p,IndexOnlyScan) || IsA(p,BitmapHeapScan)) {
         RangeTblEntry *r=rt_fetch(((Scan *)p)->scanrelid,rtable);
         if(r->rtekind==RTE_RELATION) {
@@ -488,7 +795,7 @@ static double output_bytes(Plan *p,const struct qs_plan *output,double rows)
     rows=Max(0,rows);
     return rows*width+Max(1,ceil(rows/output_capacity(p,output)))*offsetof(struct qs_result,data);
 }
-/* Match executor layout selection: try smaller input blocks before fewer tasks.
+/* Match the single-stream executor's block/slot preference.
  * File-extent descriptors are not yet available here; allow one page/node. */
 static unsigned device_workers(struct qp_plan *tree,double *fdm)
 {
@@ -496,36 +803,40 @@ static unsigned device_workers(struct qp_plan *tree,double *fdm)
     bool indexed[QP_NODES]={0};
     for(unsigned i=0;i<tree->count;++i) {
         if(tree->nodes[i].parallel) workers=qp_task_slots(tree,pg_sina_resources.cus);
-        if(tree->nodes[i].kind==QP_INDEX_JOIN) indexed[tree->nodes[i].right]=true;
+        if(tree->nodes[i].kind==QP_INDEX_JOIN) {
+            indexed[tree->nodes[i].right]=true;
+        }
     }
-    unsigned chunk=QS_CHUNK;
+    tree->scan_bytes=QS_CHUNK;
     for(;;) {
-        double arena=TYPEALIGN(4096,sizeof(struct qs_dict)),stride=0;
-        tree->scan_bytes=chunk;
+        double arena=TYPEALIGN(4096,sizeof(struct qs_dict)),private_bytes=0;
         for(unsigned i=0;i<tree->count;++i) {
             const struct qp_node *n=&tree->nodes[i];
             double input=0;
             if(n->kind==QP_SCAN && !indexed[i])
-                input=(n->ordered_index?QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE:
+                input=(n->ordered_index?QS_INDEX_IO_BYTES:
                     qp_scan_buffer_bytes(tree,n))+TYPEALIGN(4096,qs_chunk_bytes(
                     n->ordered_index?256:qp_scan_capacity(tree,n),n->expr.ncols));
             if(n->kind==QP_INDEX_JOIN)
-                input=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE+qs_index_input_bytes()+TYPEALIGN(4096,
+                input=QS_INDEX_IO_BYTES+qs_index_input_bytes()+TYPEALIGN(4096,
                     qs_chunk_bytes(256,tree->nodes[n->right].expr.ncols+2));
+            if(n->kind==QP_INDEX_JOIN || (n->kind==QP_SCAN && n->ordered_index && !indexed[i]))
+                private_bytes+=QS_INDEX_IO_BYTES;
             arena+=input;
         }
+        double stride=private_bytes;
         for(unsigned i=0;i<tree->count;++i) if(tree->nodes[i].parallel) {
-            int source=qp_pipeline_source(tree,i); double bytes=0;
+            int source=qp_pipeline_source(tree,i); double bytes=private_bytes;
             for(int id=i;id>=0;id=tree->nodes[id].left) {
                 const struct qp_node *n=&tree->nodes[id];
                 if(id==source && n->kind!=QP_SCAN) break;
                 if(n->kind==QP_SCAN) {
-                    bytes+=(n->ordered_index?QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE:
+                    bytes+=(n->ordered_index?0:
                         qp_scan_buffer_bytes(tree,n))+TYPEALIGN(4096,qs_chunk_bytes(
                         n->ordered_index?256:qp_scan_capacity(tree,n),n->expr.ncols));
                     break;
                 }
-                if(n->kind==QP_INDEX_JOIN) bytes+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE+qs_index_input_bytes()+
+                if(n->kind==QP_INDEX_JOIN) bytes+=qs_index_input_bytes()+
                     TYPEALIGN(4096,qs_chunk_bytes(256,tree->nodes[n->right].expr.ncols+2));
             }
             stride=Max(stride,bytes);
@@ -533,9 +844,8 @@ static unsigned device_workers(struct qp_plan *tree,double *fdm)
         unsigned slots=workers>1?workers+1:1;
         *fdm=arena+(workers-1)*stride+sizeof(*tree)+qp_host_parameter_bytes(tree)+tree->count*4096+
             slots*(sizeof(struct qp_control)+sizeof(struct qs_result)+QS_SORT_IO_BYTES)+65536;
-        if(*fdm<=pg_sina_resources.fdm_bytes || (chunk==QP_SCAN_BYTES && workers==1)) break;
-        if(chunk>QP_SCAN_BYTES) chunk/=2;
-        else --workers;
+        if(*fdm<=pg_sina_resources.fdm_bytes || workers==1) break;
+        --workers;
     }
     return workers;
 }
@@ -548,7 +858,11 @@ static double dictionary_state(const struct qp_plan *tree,List **observations)
         const struct qp_node *n=&tree->nodes[i];
         if(n->kind!=QP_SCAN) continue;
         double rows=residency(n->expr.relid,observations)->tuples;
+        /* The vector Heap filter works on byte views. Only survivors can
+         * materialize strings, whereas an ordered index uses its own cursor. */
+        double materialized=n->expr.predicate>=0 && !n->ordered_index?Min(rows,n->estimated_rows):rows;
         for(unsigned c=0;c<n->expr.nattrs;++c) if(n->expr.cols[c].slot>=0 && n->expr.cols[c].type==Q_STRING) {
+            if(n->late_text&(UINT64_C(1)<<c)) continue;
             int average=get_attavgwidth(n->expr.relid,c+1);
             double distinct=Min(rows,200),width=average>0?average:32;
             HeapTuple stats=SearchSysCache3(STATRELATTINH,ObjectIdGetDatum(n->expr.relid),
@@ -558,6 +872,7 @@ static double dictionary_state(const struct qp_plan *tree,List **observations)
                 distinct=st->stadistinct<0?-st->stadistinct*rows:st->stadistinct>0?st->stadistinct:distinct;
                 distinct=Min(distinct,rows*(1-st->stanullfrac)); ReleaseSysCache(stats);
             }
+            distinct=Min(distinct,Max(0,materialized));
             entries+=distinct; body+=distinct*width;
         }
         entries+=n->expr.nstrings;
@@ -673,22 +988,29 @@ static const char *device_kind(int kind)
 }
 /* Follow compiled column references, including joins and projections. Only
  * recognized expressions refine PG estimates; no query-specific row counts. */
-static bool column_origin(const struct qp_plan *tree,int node,int expression,Oid *rel,int *att,bool *year)
+static int column_source(const struct qp_plan *tree,int node,int expression,int *att,bool *year)
 {
     const struct qp_node *n=&tree->nodes[node];
-    if(expression<0 || (unsigned)expression>=n->expr.nexprs) return false;
+    if(expression<0 || (unsigned)expression>=n->expr.nexprs) return -1;
     const struct qs_expr *e=&n->expr.exprs[expression];
-    if(e->op==Q_YEAR) { *year=true; return column_origin(tree,node,e->left,rel,att,year); }
-    if(e->op!=Q_COLUMN || e->column<0) return false;
-    if(n->kind==QP_SCAN) { *rel=n->expr.relid; *att=e->column+1; return true; }
-    if(n->left<0) return false;
+    if(e->op==Q_YEAR) { *year=true; return column_source(tree,node,e->left,att,year); }
+    if(e->op!=Q_COLUMN || e->column<0) return -1;
+    if(n->kind==QP_SCAN) { *att=e->column+1; return node; }
+    if(n->left<0) return -1;
     int child=n->left,column=e->column;
     if((unsigned)column>=tree->nodes[child].expr.nout) {
         column-=tree->nodes[child].expr.nout; child=n->right;
     }
-    if(child<0 || (unsigned)column>=tree->nodes[child].expr.nout) return false;
+    if(child<0 || (unsigned)column>=tree->nodes[child].expr.nout) return -1;
     const struct qs_output *out=&tree->nodes[child].expr.outputs[column];
-    return !out->aggregate && column_origin(tree,child,out->index,rel,att,year);
+    return out->aggregate?-1:column_source(tree,child,out->index,att,year);
+}
+static bool column_origin(const struct qp_plan *tree,int node,int expression,Oid *rel,int *att,bool *year)
+{
+    int source=column_source(tree,node,expression,att,year);
+    if(source<0) return false;
+    *rel=tree->nodes[source].expr.relid;
+    return true;
 }
 static double relation_tuples(Oid rel)
 {
@@ -732,6 +1054,59 @@ static double column_distinct(Oid rel,int att,bool year)
     }
     if(distinct>0 && st->stanullfrac>0) distinct+=1;
     ReleaseSysCache(tuple); return distinct;
+}
+/* ANALYZE's range is used for pricing only. A key outside it still takes
+ * the exact Hash path at execution time. Missing statistics give no credit. */
+static double bitmap_nonnull_fraction(Oid rel,int att,uint64_t limit)
+{
+    HeapTuple tuple=SearchSysCache3(STATRELATTINH,ObjectIdGetDatum(rel),Int16GetDatum(att),BoolGetDatum(false));
+    if(!HeapTupleIsValid(tuple)) return 0;
+    bool covered=true,have_histogram=false;
+    for(int kind=STATISTIC_KIND_MCV;kind<=STATISTIC_KIND_HISTOGRAM && covered;++kind) {
+        AttStatsSlot slot;
+        if(!get_attstatsslot(&slot,tuple,kind,InvalidOid,ATTSTATSSLOT_VALUES)) continue;
+        if(kind==STATISTIC_KIND_HISTOGRAM) have_histogram=slot.nvalues>1;
+        for(int i=0;i<slot.nvalues;++i) {
+            int64_t key;
+            if(slot.valuetype==INT2OID) key=DatumGetInt16(slot.values[i]);
+            else if(slot.valuetype==INT4OID) key=DatumGetInt32(slot.values[i]);
+            else if(slot.valuetype==INT8OID) key=DatumGetInt64(slot.values[i]);
+            else { covered=false; break; }
+            if(key<0 || (uint64_t)key>=limit) { covered=false; break; }
+        }
+        free_attstatsslot(&slot);
+    }
+    double fraction=covered && have_histogram?1-((Form_pg_statistic)GETSTRUCT(tuple))->stanullfrac:0;
+    ReleaseSysCache(tuple); return fraction;
+}
+/* A composite primary key limits rows sharing its first column to the
+ * observed trailing-key combinations. This is a statistics-based floor,
+ * independent of the referencing FK's much larger capacity upper bound. */
+static double primary_prefix_fanout(PlannerInfo *root,Oid rel,int att)
+{
+    for(int i=1;i<root->simple_rel_array_size;++i) {
+        RelOptInfo *base=root->simple_rel_array[i];
+        if(!base || base->rtekind!=RTE_RELATION || rt_fetch(i,root->parse->rtable)->relid!=rel) continue;
+        ListCell *c;
+        foreach(c,base->indexlist) {
+            IndexOptInfo *index=lfirst(c);
+            if(index->nkeycolumns<2 || index->indexkeys[0]!=att) continue;
+            HeapTuple tuple=SearchSysCache1(INDEXRELID,ObjectIdGetDatum(index->indexoid));
+            if(!HeapTupleIsValid(tuple)) continue;
+            Form_pg_index info=(Form_pg_index)GETSTRUCT(tuple);
+            bool primary=info->indisprimary && info->indisvalid;
+            ReleaseSysCache(tuple);
+            if(!primary) continue;
+            double combinations=1;
+            for(int k=1;k<index->nkeycolumns;++k) {
+                double distinct=index->indexkeys[k]>0?column_distinct(rel,index->indexkeys[k],false):0;
+                if(distinct<=0) return 0;
+                combinations*=distinct;
+            }
+            return combinations;
+        }
+    }
+    return 0;
 }
 /* A validated FK gives a key-domain capacity bound, not observed NDV or
  * join coverage. Use it for state sizing only, never filter selectivity. */
@@ -812,7 +1187,7 @@ static double group_correlation(const struct qp_plan *tree,int node)
     if(n->nkeys!=1 || !column_origin(tree,node,n->expr.keys[0],&rel,&att,&year)) return 0;
     return column_correlation(rel,att);
 }
-void pg_sina_refine_groups(struct qp_plan *tree)
+void pg_sina_refine_groups(PlannerInfo *root,struct qp_plan *tree)
 {
     double original[QP_NODES];
     for(unsigned i=0;i<tree->count;++i) original[i]=tree->nodes[i].estimated_rows;
@@ -856,6 +1231,16 @@ void pg_sina_refine_groups(struct qp_plan *tree)
             if(n->nkeys==1 && n->left>=0) {
                 Oid rel; int att; bool year=false;
                 if(column_origin(tree,i,n->expr.keys[0],&rel,&att,&year) && !year) {
+                    int input=n->left;
+                    while(input>=0 && (tree->nodes[input].kind==QP_PROJECT || tree->nodes[input].kind==QP_SORT))
+                        input=tree->nodes[input].left;
+                    double fanout=input>=0 && tree->nodes[input].kind==QP_SCAN &&
+                        tree->nodes[input].expr.relid==rel?primary_prefix_fanout(root,rel,att):0;
+                    double floor=fanout>0?tree->nodes[n->left].estimated_rows/fanout:0;
+                    if(floor>n->estimated_groups && n->estimated_groups>0) {
+                        n->estimated_rows*=floor/n->estimated_groups;
+                        n->estimated_groups=floor;
+                    }
                     double domain=column_key_domain(rel,att);
                     if(domain>0) n->estimated_groups=Max(n->estimated_groups,
                         Min(tree->nodes[n->left].estimated_rows,domain));
@@ -896,6 +1281,52 @@ void pg_sina_refine_groups(struct qp_plan *tree)
         }
     }
 }
+static double vector_lanes(void)
+{
+#if defined(__x86_64__) && defined(__GNUC__)
+    if(__builtin_cpu_supports("avx2")) return 4;
+#endif
+    return 1;
+}
+static bool fused_scan_comparison(const struct qs_plan *plan)
+{
+    if(plan->predicate<0) return false;
+    const struct qs_expr *e=&plan->exprs[plan->predicate];
+    if(e->op<Q_EQ || e->op>Q_GE) return false;
+    const struct qs_expr *column=&plan->exprs[e->left],*value=&plan->exprs[e->right];
+    if(column->op==Q_CONST) { const struct qs_expr *swap=column; column=value; value=swap; }
+    return column->op==Q_COLUMN && value->op==Q_CONST && !value->isnull &&
+        (column->type==Q_INTEGER || column->type==Q_DATE) && column->scale==value->scale &&
+        !plan->cols[column->column].deferred;
+}
+static double fused_input_ops(const struct qs_plan *plan,bool *needed,double lanes)
+{
+    double count=0;
+    for(int i=(int)plan->nexprs-1;i>=0;--i) if(needed[i]) {
+        const struct qs_expr *e=&plan->exprs[i];
+        if(e->op==Q_COLUMN || e->op==Q_CONST) continue;
+        double ops=1;
+        if(lanes>1 && e->op>=Q_ADD && e->op<=Q_MUL) {
+            const struct qs_expr *left=&plan->exprs[e->left],*right=&plan->exprs[e->right];
+            /* Match the narrow arithmetic shape. Multiplication retains
+             * extra work for the packed int32 range checks. */
+            if(left->op<=Q_MUL && right->op<=Q_MUL && !left->isnull && !right->isnull &&
+               (left->type==Q_DECIMAL || left->type==Q_INTEGER) &&
+               (right->type==Q_DECIMAL || right->type==Q_INTEGER) &&
+               (e->op==Q_MUL ||
+                ((left->scale==e->scale || left->op==Q_CONST) &&
+                 (right->scale==e->scale || right->op==Q_CONST))))
+                ops=(e->op==Q_MUL?2:1)/lanes;
+        }
+        count+=ops;
+        if(e->left>=0 && e->left<i) needed[e->left]=true;
+        if(e->op!=Q_NOT && e->op!=Q_IS_NULL && e->op!=Q_IS_NOT_NULL && e->op!=Q_YEAR &&
+           e->right>=0 && e->right<i) needed[e->right]=true;
+        if((e->op==Q_CASE || e->op==Q_SUBSTRING) && e->otherwise>=0 && e->otherwise<i)
+            needed[e->otherwise]=true;
+    }
+    return count;
+}
 /* The fused single-table CSF keeps at most 256 groups per CU, flushes partial
  * states when full, and merges those states rather than sorting base rows. */
 static void fast_cost(struct placement *p,const struct qs_plan *plan,List **observations)
@@ -906,29 +1337,72 @@ static void fast_cost(struct placement *p,const struct qs_plan *plan,List **obse
     Plan *aggregate=p->native;
     while(aggregate && !IsA(aggregate,Agg)) aggregate=aggregate->lefttree;
     double groups=plan->nkeys && aggregate?Max(1,((Agg *)aggregate)->numGroups):1;
-    double rows=Max(0,p->native->plan_rows),unit=pg_sina_host_cost_ms*pg_sina_csd_cpu_ratio;
-    double partial=groups<=QS_GROUPS?Min(r->tuples,cus*groups):r->tuples;
-    double fixed=cus*(QS_GROUPS*(QS_KEYS+QS_AGGS)*sizeof(struct qs_cell)+
+    double rows=Max(0,p->native->plan_rows),unit=pg_sina_host_cost_ms*cost_device_cpu_ratio(pg_sina_csd_cpu_ratio,pg_sina_resources.cpu_ratio);
+    Index rti=linitial_node(RangeTblRef,p->root->parse->jointree->fromlist)->rtindex;
+    double selected=Min(r->tuples,Max(0,p->root->simple_rel_array[rti]->rows));
+    unsigned slots=Min(2*cus,QS_WORKERS);
+    double partial=groups<=QS_GROUPS?Min(selected,slots*groups):selected;
+    double fixed=slots*(QS_GROUPS*(QS_KEYS+QS_AGGS)*sizeof(struct qs_cell)+
         2*sizeof(struct qs_plan)+sizeof(struct qs_result)+plan->nexprs*(256*20+128.0)+8192);
     struct cost_sort sort=cost_sort_state(partial,(plan->nkeys+plan->naggs)*sizeof(struct qs_cell),
         Max((double)QS_SORT_IO_BYTES,pg_sina_query_memory()-fixed),sort_windows(plan));
-    p->workers=cus; p->rows=rows; p->cache=r->fraction;
-    p->parallel=cost_parallel(r->tuples*(cpu_tuple_cost+cpu_operator_cost*(cost_expression_ops(plan)+plan->naggs))*unit,tasks,cus,0);
+    p->workers=slots; p->rows=rows; p->cache=r->fraction;
+    bool filter[QS_EXPRS]={0},sink[QS_EXPRS]={0};
+    if(plan->predicate>=0) filter[plan->predicate]=true;
+    for(unsigned i=0;i<plan->nkeys;++i) sink[plan->keys[i]]=true;
+    for(unsigned i=0;i<plan->naggs;++i) if(plan->aggs[i].expr>=0) sink[plan->aggs[i].expr]=true;
+    double lanes=vector_lanes(),filter_ops=fused_input_ops(plan,filter,1);
+    if(fused_scan_comparison(plan)) filter_ops/=lanes;
+    bool predicate_columns[QS_COLS]={0};
+    for(unsigned i=0;i<plan->nexprs;++i)
+        if(filter[i] && plan->exprs[i].op==Q_COLUMN)
+            predicate_columns[plan->exprs[i].column]=true;
+    unsigned attrs=qs_probe_attrs(plan),eager=0,deferred=0,predicate_deferred=0;
+    for(unsigned i=0;i<attrs;++i) {
+        const struct qs_column *column=&plan->cols[i];
+        if(column->slot<0 || column->type!=Q_DECIMAL) continue;
+        if(column->deferred) {
+            ++deferred;
+            if(predicate_columns[i]) ++predicate_deferred;
+        } else ++eager;
+    }
+    /* Use the compiled flags consumed by Scan and Filter. Heap traversal
+     * locates the payload either way. A deferred value adds a selection
+     * lookup, null check and reference validation before decoding. A
+     * predicate can also decode it on rows that are later rejected. */
+    const double numeric_ops=0.75,late_numeric_ops=numeric_ops+3;
+    double decode_ops=cost_heap_decode_ops(plan,attrs);
+    double scan=(r->bytes/BLCKSZ+r->tuples*(2+decode_ops+filter_ops+numeric_ops*eager))*
+        cpu_operator_cost*unit;
+    double deferred_work=(selected*deferred+r->tuples*predicate_deferred)*late_numeric_ops*cpu_operator_cost*unit;
+    /* The sink shares SUM/AVG/COUNT(expr) updates for each compiled input.
+     * COUNT(*) uses its own input identity (-1). */
+    unsigned accumulators=0;
+    for(unsigned i=0;i<plan->naggs;++i) {
+        unsigned j=0;
+        while(j<i && plan->aggs[j].expr!=plan->aggs[i].expr) ++j;
+        if(j==i) ++accumulators;
+    }
+    double sink_ops=fused_input_ops(plan,sink,lanes);
+    double aggregate_work=selected*(cpu_tuple_cost+cpu_operator_cost*(sink_ops+accumulators))*unit;
+    p->parallel=cost_parallel(scan+deferred_work+aggregate_work,tasks,cus,0);
     p->schedule=cost_parallel(0,tasks,cus,pg_sina_parallel_task_ms);
     p->combine=(sort.comparisons+sort.merge+partial*plan->naggs)*cpu_operator_cost*unit;
     p->spill=plan->nkeys?sort.spill:0;
     p->peak=Min((double)pg_sina_query_memory(),fixed+(plan->nkeys?sort.state:0));
-    p->io=transfer_ms(r->bytes,pg_sina_internal_mbps)+
-        cost_spill_io(p->spill,pg_sina_internal_mbps,pg_sina_internal_write_mbps);
+    double load=transfer_ms(r->bytes,pg_sina_internal_mbps);
+    p->io=load+cost_spill_io(p->spill,pg_sina_internal_mbps,pg_sina_internal_write_mbps);
     p->schedule+=ceil(p->spill/QS_SORT_IO_BYTES)*pg_sina_parallel_task_ms;
     p->cpu=p->parallel+p->schedule+p->combine;
-    p->population=transfer_ms(r->bytes*cost_population_fraction(pg_sina_hpcp_enabled(),pg_sina_dcp,r->fraction,r->shared),pg_sina_pcie_mbps);
-    p->csd=Max(p->io+p->cpu,p->population)+2;
+    p->population=transfer_ms(r->bytes*population_fraction(r,!plan->join.indexid),pg_sina_pcie_mbps);
+    double overlap=cost_scan_overlap(load,p->parallel,tasks,cus);
+    p->csd=Max(p->io+p->cpu-overlap,p->population)+2;
     p->boundary=transfer_ms(Max(1,ceil(rows/QS_RESULT_ROWS))*offsetof(struct qs_result,str_data),pg_sina_pcie_mbps)+
         rows*cpu_tuple_cost*pg_sina_host_cost_ms+Max(1,ceil(rows/QS_RESULT_ROWS))*pg_sina_result_batch_ms;
     if(p->details) p->stages=makeStringInfo();
-    if(p->details) appendStringInfo(p->stages,"fused Scan/Filter/Aggregate tasks=%.0f groups=%.0f partial_rows=%.0f state=%.0fB spill=%.0fB",
-        tasks,groups,partial,p->peak,p->spill);
+    if(p->details) appendStringInfo(p->stages,"fused Scan/Filter/Aggregate visited=%.0f selected=%.0f tasks=%.0f groups=%.0f partial_rows=%.0f state=%.0fB spill=%.0fB overlap=%.3fms decode_ops=%.2f eager_numeric=%u deferred_numeric=%u predicate_deferred=%u deferred_ms=%.3f accumulators=%u filter_ops=%.2f sink_ops=%.2f",
+        r->tuples,selected,tasks,groups,partial,p->peak,p->spill,overlap,decode_ops,eager,deferred,predicate_deferred,
+        cost_parallel(deferred_work,tasks,cus,0),accumulators,filter_ops,sink_ops);
 }
 /* The same plain column/constant comparisons recognized by filter.c. */
 static Oid scan_comparison_type(Node *node)
@@ -938,31 +1412,113 @@ static Oid scan_comparison_type(Node *node)
     while(IsA(a,RelabelType)) a=(Node *)((RelabelType *)a)->arg;
     while(IsA(b,RelabelType)) b=(Node *)((RelabelType *)b)->arg;
     if(IsA(a,Const)) { Node *swap=a; a=b; b=swap; }
-    if(!IsA(a,Var) || !IsA(b,Const)) return InvalidOid;
+    if(!IsA(a,Var)) return InvalidOid;
     Oid type=exprType(a);
+    if(IsA(b,Var))
+        return exprType(b)==type && (type==INT2OID || type==INT4OID || type==INT8OID || type==DATEOID)?
+            type:InvalidOid;
+    if(!IsA(b,Const)) return InvalidOid;
     return type==INT2OID || type==INT4OID || type==INT8OID || type==DATEOID || type==NUMERICOID?type:InvalidOid;
 }
-static void scan_prefilters(Node *node,List **clauses)
+static double scan_text_checks(Node *node)
+{
+    List *args; Oid op; bool array=IsA(node,ScalarArrayOpExpr);
+    if(array) {
+        ScalarArrayOpExpr *s=(ScalarArrayOpExpr *)node;
+        if(!s->useOr) return 0;
+        args=s->args; op=s->opno;
+    } else if(IsA(node,OpExpr)) {
+        args=((OpExpr *)node)->args; op=((OpExpr *)node)->opno;
+    } else return 0;
+    Oid fn=get_opcode(op);
+    if((fn!=F_TEXTEQ && fn!=F_BPCHAREQ) || list_length(args)!=2) return 0;
+    Node *a=strip_implicit_coercions(linitial(args)),*b=strip_implicit_coercions(lsecond(args));
+    if(!array && IsA(a,Const)) { Node *swap=a; a=b; b=swap; }
+    if(!IsA(a,Var) || !IsA(b,Const) || ((Const *)b)->constisnull) return 0;
+    if(!array) return 1;
+    Datum datum=((Const *)b)->constvalue;
+    ArrayType *values=DatumGetArrayTypeP(datum);
+    double count=ARR_HASNULL(values)?0:ArrayGetNItems(ARR_NDIM(values),ARR_DIMS(values));
+    if((void *)values!=DatumGetPointer(datum)) pfree(values);
+    return count;
+}
+/* Borrowed text selection only runs ahead of non-throwing predicates. */
+static bool scan_prefilter_unsafe(Node *node,void *context)
+{
+    if(!node || IsA(node,Var) || IsA(node,Const) || IsA(node,Param)) return false;
+    if(IsA(node,List) || IsA(node,BoolExpr) || IsA(node,RelabelType) ||
+       IsA(node,NullTest) || IsA(node,ScalarArrayOpExpr) ||
+       (IsA(node,OpExpr) && exprType(node)==BOOLOID))
+        return expression_tree_walker(node,scan_prefilter_unsafe,context);
+    return true;
+}
+struct scan_selection {
+    List *eager,*text;
+    double text_checks;
+    bool residual;
+};
+static void scan_prefilters(Node *node,struct scan_selection *selection)
 {
     if(IsA(node,List) || (IsA(node,BoolExpr) && ((BoolExpr *)node)->boolop==AND_EXPR)) {
         ListCell *c; foreach(c,IsA(node,List)?(List *)node:((BoolExpr *)node)->args)
-            scan_prefilters(lfirst(c),clauses);
+            scan_prefilters(lfirst(c),selection);
     } else {
         Oid type=scan_comparison_type(node);
         /* Numeric columns are deferred; only eagerly decoded values can
          * prune rows before the general expression fallback. */
-        if(OidIsValid(type) && type!=NUMERICOID) *clauses=lappend(*clauses,node);
+        if(OidIsValid(type) && type!=NUMERICOID) selection->eager=lappend(selection->eager,node);
+        else {
+            double checks=scan_text_checks(node);
+            if(checks>0) {
+                selection->text=lappend(selection->text,node);
+                selection->text_checks+=checks;
+            } else selection->residual=true;
+        }
     }
+}
+/* filter.c runs the eager SIMD prefix first, then decodes deferred numerics
+ * only for surviving rows. Preserve that order and PG's clause statistics. */
+static bool scan_conjunction_ops(PlannerInfo *root,Node *node,double lanes,
+    List **prefix,bool *deferred,double *work)
+{
+    if(IsA(node,List) || (IsA(node,BoolExpr) && ((BoolExpr *)node)->boolop==AND_EXPR)) {
+        ListCell *c;
+        foreach(c,IsA(node,List)?(List *)node:((BoolExpr *)node)->args)
+            if(!scan_conjunction_ops(root,lfirst(c),lanes,prefix,deferred,work)) return false;
+        return true;
+    }
+    Oid type=scan_comparison_type(node);
+    if(!OidIsValid(type)) return false;
+    bool numeric=type==NUMERICOID;
+    double survival=*deferred || numeric?
+        clauselist_selectivity(root,*prefix,0,JOIN_INNER,NULL):1;
+    *work+=survival/(!*deferred && !numeric?lanes:1);
+    *deferred|=numeric;
+    *prefix=lappend(*prefix,node);
+    return true;
 }
 /* Simple AND selection has no intermediate boolean vectors. Complex
  * predicates can still have cheap AND conjuncts prefiltering their input. */
 static double scan_expression_ops(const struct qs_plan *p,bool properties,PlannerInfo *root)
 {
-    double total=cost_expression_ops(p),saved=0,lanes=1;
+    double total=cost_expression_ops(p),saved=0,lanes=vector_lanes();
     if(p->predicate<0) return total;
-#if defined(__x86_64__) && defined(__GNUC__)
-    if(__builtin_cpu_supports("avx2")) lanes=4;
-#endif
+    if(properties && p->exprs[p->predicate].op==Q_AGGREF && p->exprs[p->predicate].constant) {
+        List *prefix=NIL; bool deferred=false; double work=0,boolean_ops=0;
+        bool simple=scan_conjunction_ops(root,(Node *)(intptr_t)p->exprs[p->predicate].constant,
+            lanes,&prefix,&deferred,&work);
+        if(simple && deferred) {
+            for(unsigned i=0;i<p->nexprs;++i) {
+                const struct qs_expr *e=&p->exprs[i];
+                boolean_ops+=e->type==Q_BOOLEAN && e->op==Q_AGGREF && e->column<0 &&
+                    (e->constant==p->exprs[p->predicate].constant ||
+                     list_member_ptr(prefix,(Node *)(intptr_t)e->constant));
+            }
+            list_free(prefix);
+            return Max(0,total-boolean_ops)+work;
+        }
+        list_free(prefix);
+    }
     for(unsigned i=0;i<p->nexprs;++i) {
         const struct qs_expr *e=&p->exprs[i];
         if(e->type!=Q_BOOLEAN || e->op==Q_COLUMN || e->op==Q_CONST || e->op==Q_PARAMETER) continue;
@@ -992,12 +1548,19 @@ static double scan_expression_ops(const struct qs_plan *p,bool properties,Planne
     return Max(0,total-saved);
 complex:
     if(properties && p->exprs[p->predicate].op==Q_AGGREF && p->exprs[p->predicate].constant) {
-        List *clauses=NIL;
-        scan_prefilters((Node *)(intptr_t)p->exprs[p->predicate].constant,&clauses);
-        if(clauses) {
-            double survival=clauselist_selectivity(root,clauses,0,JOIN_INNER,NULL);
-            double work=cost_prefilter_ops(total,list_length(clauses),survival,lanes);
-            list_free(clauses); return work;
+        struct scan_selection selection={0};
+        Node *filter=(Node *)(intptr_t)p->exprs[p->predicate].constant;
+        if(!scan_prefilter_unsafe(filter,NULL)) {
+            scan_prefilters(filter,&selection);
+            if(selection.eager || selection.text) {
+                double eager=clauselist_selectivity(root,selection.eager,0,JOIN_INNER,NULL);
+                double work=list_length(selection.eager)/lanes+selection.text_checks*eager;
+                List *clauses=list_concat(selection.eager,selection.text);
+                if(selection.residual)
+                    work+=total*clauselist_selectivity(root,clauses,0,JOIN_INNER,NULL);
+                list_free(clauses);
+                return work;
+            }
         }
     }
     return total;
@@ -1045,7 +1608,7 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
     mark=pg_sina_planner_clock();
     double pipeline_io[QP_NODES]={0},pipeline_cpu[QP_NODES]={0};
     double io=0,overlap=0,population_bytes=0,cache_bytes=0,scan_bytes=0,blocks=0;
-    double memory=Max(1,pg_sina_query_memory()),unit=pg_sina_host_cost_ms*pg_sina_csd_cpu_ratio;
+    double memory=Max(1,pg_sina_query_memory()),unit=pg_sina_host_cost_ms*cost_device_cpu_ratio(pg_sina_csd_cpu_ratio,pg_sina_resources.cpu_ratio);
     p->dictionary=dictionary_state(tree,observations);
     if(pg_sina_planning) pg_sina_planning->cost_dictionary+=pg_sina_planner_clock()-mark;
     mark=pg_sina_planner_clock();
@@ -1058,8 +1621,8 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
         const struct qp_node *n=&tree->nodes[i],*left=n->left>=0?&tree->nodes[n->left]:NULL;
         const struct qp_node *right=n->right>=0?&tree->nodes[n->right]:NULL;
         double input=left?Max(0,left->estimated_rows):Max(0,n->estimated_rows);
-        double rows=Max(0,n->estimated_rows),state=0,spill=0;
-        double index_probes=0,index_pages=0,heap_pages=0,index_tuple_visits=0;
+        double rows=Max(0,n->estimated_rows),state=0,spill=0,reloaded_hash=0;
+        double index_probes=0,index_pages=0,heap_pages=0,index_tuple_visits=0,decode_ops=0,bitmap_hits=0;
         double previous_cpu=p->serial+p->parallel+p->schedule+p->combine;
         double previous_parallel=p->parallel,previous_io=io;
         double l=n->left>=0?live[n->left]:0,r=n->right>=0?live[n->right]:0;
@@ -1090,7 +1653,7 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
                 }
             }
             scan_bytes+=read; cache_bytes+=hit;
-            population_bytes+=read*cost_population_fraction(pg_sina_hpcp_enabled(),pg_sina_dcp,relation->fraction,relation->shared);
+            population_bytes+=read*population_fraction(relation,!n->ordered_index && !n->expr.join.indexid);
             double read_ms=transfer_ms(read,pg_sina_internal_mbps);
             io+=n->ordered_index && !(n->ordered_index&2)?
                 cost_index_read_ms(read,read/BLCKSZ,pg_sina_internal_mbps,pg_sina_internal_read_iops):read_ms;
@@ -1099,12 +1662,17 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
              * scalar operator. Charge actual operations, not all IR nodes. */
             bool direct=tree->count==1 && tree->nodes[tree->root].kind==QP_SCAN && !tree->ninit;
             double operations=scan_expression_ops(&n->expr,lowered!=NULL,p->root);
-            /* PG's cpu_tuple_cost is the fixed tuple visit, not an average
-             * attribute-deformation price. Page/line-pointer/header checks
-             * still execute when only an early column is needed. Projection
-             * reduces expression/output work, never this fixed base. */
-            work=input*(cpu_tuple_cost*pg_sina_host_cost_ms+cpu_operator_cost*operations*unit)+
-                rows*cpu_tuple_cost*unit;
+            if(!n->ordered_index) decode_ops=cost_heap_decode_ops(&n->expr,n->expr.nattrs);
+            /* Page/line-pointer/header checks and physical attributes
+             * visited by the decoder all consume the device CU's budget. */
+            work=input*(cpu_tuple_cost*pg_sina_host_cost_ms+operations*cpu_operator_cost*unit);
+            if(!n->ordered_index) {
+                /* The column decoder validates page metadata, line pointers
+                 * and tuple headers separately. Attributes have their own
+                 * cost below, as does producing a surviving tuple. */
+                work=(read/BLCKSZ+input*(2+decode_ops+operations))*cpu_operator_cost*unit;
+            }
+            work+=rows*cpu_tuple_cost*unit;
             /* Typed column batches copy projected values; they do not run
              * one HOST scalar operator per output cell. Keep a row visit,
              * charge actual packet bytes, and price PG consumption below. */
@@ -1114,6 +1682,7 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
             double build=Max(0,right->estimated_rows),width=cost_hash_row(&right->expr);
             available=Max((double)QS_SORT_IO_BYTES,Min(available,memory-2*quota));
             state=cost_hash_state(build,width);
+            double bitmap_init=0;
             if((n->join_type==QP_SEMI || n->join_type==QP_ANTI) && n->join_qual<0 &&
                n->nkeys==1 && right->kind==QP_SCAN) {
                 const struct qs_expr *key=&right->expr.exprs[right->expr.outputs[n->right_keys[0]].index];
@@ -1129,26 +1698,88 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
                      * Keep it serial, but use the same device instruction
                      * price as hash_reindex, not PG tuple interpretation. */
                     p->serial+=rounds*capacity*3*cpu_operator_cost*unit;
+                } else if(key->op==Q_COLUMN && key->type==Q_INTEGER && distinct>0 && distinct<build &&
+                          right->parallel && tasks[n->right]>1) {
+                    double capacity=cost_slots(build+1,128);
+                    if(capacity<=UINT_MAX/4) {
+                        unsigned cache_slots=qp_hash_cache_slots((unsigned)capacity);
+                        double cache_bytes=qp_hash_cache_words(cache_slots)*sizeof(uint64_t);
+                        double table_bytes=capacity*(width+3*sizeof(uint32_t));
+                        if(table_bytes+cache_bytes<=available) {
+                            double nonnull=bitmap_nonnull_fraction(right->expr.relid,key->column+1,
+                                qp_hash_bitmap_keys(cache_slots));
+                            bitmap_hits=Max(0,build*nonnull-distinct);
+                            if(bitmap_hits>0) {
+                                state=table_bytes+cache_bytes;
+                                bitmap_init=transfer_ms(2*capacity*sizeof(uint32_t)+cache_bytes,
+                                    pg_sina_cache_mbps)*unit/pg_sina_host_cost_ms;
+                            }
+                        }
+                    }
                 }
             }
-            parallel_cpu(p,build*(cpu_tuple_cost+cpu_operator_cost*Max(1,n->nkeys))*unit,tasks[n->right],cus);
+            /* Workers pack all build payload columns and publish each
+             * bucket link, in addition to hashing the key. */
+            double build_ops=Max(1,n->nkeys)+right->expr.nout+1;
+            double build_cpu=build*(cpu_tuple_cost+cpu_operator_cost*build_ops)-
+                bitmap_hits*cpu_operator_cost*(build_ops-1);
+            parallel_cpu(p,build_cpu*unit,tasks[n->right],cus);
             int build_source=qp_pipeline_source(tree,n->right);
             if(build_source>=0 && tasks[n->right]>1) pipeline_cpu[build_source]+=p->parallel-previous_parallel;
             previous_parallel=p->parallel;
-            /* Coordinator reindexes at growth barriers; do not divide. */
-            p->serial+=build*cpu_operator_cost*unit;
+            /* Resident parallel sinks reserve the predicted capacity before
+             * inserting rows. Worker appends already link buckets. Only the
+             * scalar/growth path needs to reindex populated entries. */
+            if(tasks[n->right]<=1 || state>available)
+                p->serial+=(build-bitmap_hits)*cpu_operator_cost*unit;
+            p->serial+=bitmap_init;
             /* Populate each output cell/NULL slot even for plain forwarding.
              * This memory/control work is not vector arithmetic; charging
              * only one tuple visit loses the projection-width dependence. */
             double materialize=rows*n->expr.nout*cpu_operator_cost*pg_sina_host_cost_ms;
-            parallel_cpu(p,(input*(cpu_operator_cost*Max(1,n->nkeys))+rows*(cpu_tuple_cost+expression))*unit+
+            /* Probe hashes each key and gathers a bucket even on a miss.
+             * INNER then follows the bucket chain and unpacks the stored
+             * payload before comparing keys, including hash collisions. */
+            double keys=Max(1,n->nkeys);
+            double probe_cpu=input*(2*keys+1)*cpu_operator_cost*unit;
+            if(n->join_type==QP_INNER) {
+                double buckets=2*cost_slots(build,128);
+                double candidates=rows+input*build/buckets;
+                double scalar_unit=pg_sina_host_cost_ms*cost_device_cpu_ratio(1,pg_sina_resources.cpu_ratio);
+                const struct qs_output *probe=&left->expr.outputs[n->left_keys[0]];
+                const struct qs_output *build_key=&right->expr.outputs[n->right_keys[0]];
+                bool narrow=keys==1 && tasks[i]>1 && state<=available && rows<input/2 &&
+                    probe->index>=0 && left->expr.exprs[probe->index].op==Q_COLUMN &&
+                    left->expr.exprs[probe->index].type==Q_INTEGER &&
+                    (build_key->type_oid==INT4OID || build_key->type_oid==INT8OID);
+                /* The vector probe compares a packed key before loading the
+                 * payload on selective integer joins. Collisions still walk
+                 * links and compare keys, but unpack no payload. */
+                double payload_rows=narrow?rows:candidates;
+                probe_cpu+=(candidates*(1+keys)+payload_rows*right->expr.nout)*cpu_operator_cost*scalar_unit;
+            } else probe_cpu+=rows*keys*cpu_operator_cost*unit;
+            parallel_cpu(p,probe_cpu+rows*(cpu_tuple_cost+expression)*unit+
                 materialize,tasks[i],cus);
             if(state>available) {
                 if(n->join_type==QP_INNER) {
                     double partitions=4,ratio=state/available;
-                    spill=2*(build*width+input*cost_hash_row(&left->expr));
-                    /* Oversized partitions replay probe batches. */
-                    if(ratio>partitions) spill+=input*cost_hash_row(&left->expr)*(ceil(ratio/partitions)-1);
+                    double build_io=2*build*width;
+                    double reload=cost_hash_reload_state(build,width);
+                    /* The build subtree has drained before reloading. Keep
+                     * its retained materializations, the left state and the
+                     * partition tails plus the worker I/O reserve. */
+                    double reload_budget=memory-dictionary_meta-scratch-l-rr-
+                        (2+slots+partitions)*QS_SORT_IO_BYTES;
+                    if(build<=UINT_MAX/4 && reload<=reload_budget) {
+                        reloaded_hash=reload;
+                        spill=build_io;
+                        p->serial+=transfer_ms(build_io,pg_sina_cache_mbps);
+                    } else {
+                        double probe=input*cost_hash_row(&left->expr);
+                        spill=build_io+2*probe;
+                        /* Oversized partitions replay probe batches. */
+                        if(ratio>partitions) spill+=probe*(ceil(ratio/partitions)-1);
+                    }
                 } else {
                     /* hash_build_impl uses external partitions only for
                      * INNER. SEMI/ANTI/LEFT retain the prefix then sort/merge
@@ -1174,6 +1805,8 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
             double distinct=column_distinct(heap->oid,access->build_key,false);
             double matches=Max(1,right->estimated_rows);
             if(distinct>0) matches=Max(matches,heap->tuples/distinct);
+            double bound=primary_prefix_fanout(p->root,heap->oid,access->build_key);
+            if(bound>0) matches=Min(matches,bound);
             /* For a pure matched-FK lookup, PG's join fanout is more useful
              * than a sampled FK NDV. Residuals still inspect rejected rows. */
             if(n->join_type==QP_INNER && n->join_qual<0 && n->expr.predicate<0 &&
@@ -1204,39 +1837,29 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
             double leaf_visits=input*Max(1,matches/(heap->tuples/leaves));
             double heap_visits=cost_index_heap_visits(input,matches,heap->tuples/pages,correlation);
             int scan=qp_probe_scan(tree,n->left);
-            Oid probe_rel=InvalidOid; int probe_att=0; bool probe_year=false;
-            if(scan>=0 && tree->nodes[scan].expr.relid==right->expr.relid &&
-               tree->nodes[scan].expr.relfilenode==right->expr.relfilenode &&
-               column_origin(tree,n->left,left->expr.outputs[n->left_keys[0]].index,
-                   &probe_rel,&probe_att,&probe_year) && !probe_year &&
-               probe_rel==right->expr.relid && probe_att==access->build_key)
-                heap_visits=cost_index_window_misses(heap_visits,matches,heap->tuples/pages,
-                    (double)tree->scan_bytes/BLCKSZ,correlation);
+            int probe_att=0; bool probe_year=false;
+            double ordered=0;
+            if(scan>=0 && column_source(tree,n->left,left->expr.outputs[n->left_keys[0]].index,
+                   &probe_att,&probe_year)==scan && !probe_year) {
+                const struct qs_plan *driving=&tree->nodes[scan].expr;
+                ordered=column_correlation(driving->relid,probe_att);
+                if(driving->relid==right->expr.relid && driving->relfilenode==right->expr.relfilenode &&
+                   probe_att==access->build_key) {
+                    double morsels=Max(1,ceil((double)heap->bytes/tree->scan_bytes));
+                    double batch=n->sorted_input?1:QS_INDEX_KEYS;
+                    heap_visits=cost_index_window_misses(heap_visits,matches,heap->tuples/pages,
+                        (double)tree->scan_bytes/BLCKSZ,correlation,input/morsels,batch);
+                }
+            }
             double cursors=tasks[i]>1?Min(slots,Max(1,tasks[i])):1;
             double heap_cache=(QS_INDEX_CACHE-1)/2.0,index_cache=heap_cache/Max(1,levels-1);
             index_pages=cursors*cost_index_pages(leaf_visits/cursors,leaves,index_cache,QS_INDEX_KEYS);
             heap_pages=cursors*cost_index_pages(heap_visits/cursors,pages,heap_cache,
                 QS_INDEX_KEYS*Max(1,heap_visits/Max(1,input)));
-            double ordered=0;
-            /* A key correlated with the driving Heap remains clustered
-             * through projections/Hash probes. Such batches revisit nearby
-             * leaf/Heap pages; random keys keep the cursor-eviction model. */
-            probe_year=false;
-            /* Early stop changes the number of Heap visits, accounted for
-             * above, not the order of the driving keys. Cache locality is
-             * an input property for INNER/SEMI/ANTI alike. */
-            if(scan>=0 &&
-               column_origin(tree,n->left,left->expr.outputs[n->left_keys[0]].index,
-                    &probe_rel,&probe_att,&probe_year) && !probe_year &&
-               probe_rel==tree->nodes[scan].expr.relid) {
-                /* OIDs alone cannot distinguish two aliases of one Heap. */
-                unsigned aliases=0;
-                for(unsigned j=0;j<tree->count;++j)
-                    if(used[j] && tree->nodes[j].kind==QP_SCAN && tree->nodes[j].expr.relid==probe_rel) ++aliases;
-                if(aliases==1) ordered=column_correlation(probe_rel,probe_att);
-                index_pages=cost_index_clustered_pages(index_pages,leaf_visits,leaves,ordered);
-                heap_pages=cost_index_clustered_pages(heap_pages,heap_visits,pages,ordered*correlation);
-            }
+            /* The exact driving scan supplies key locality even when
+             * several aliases refer to the same underlying table. */
+            index_pages=cost_index_clustered_pages(index_pages,leaf_visits,leaves,ordered);
+            heap_pages=cost_index_clustered_pages(heap_pages,heap_visits,pages,ordered*correlation);
             double churn=index_pages+heap_pages;
             double internal_random=cursors*cost_index_tree_pages(input/cursors,leaves,fanout,index_cache,QS_INDEX_KEYS,0,churn/cursors);
             double internal_ordered=cost_index_tree_pages(input,leaves,fanout,index_cache,QS_INDEX_KEYS,1,churn);
@@ -1246,9 +1869,9 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
             double read=index_bytes+heap_bytes;
             io+=cost_index_read_ms(read,index_pages+heap_pages,pg_sina_internal_mbps,pg_sina_internal_read_iops);
             double population_index=cost_population_pages(index_pages,leaves)*BLCKSZ*
-                cost_population_fraction(pg_sina_hpcp_enabled(),pg_sina_dcp,index->fraction,index->shared);
+                population_fraction(index,false);
             double population_heap=cost_population_pages(heap_pages,pages)*BLCKSZ*
-                cost_population_fraction(pg_sina_hpcp_enabled(),pg_sina_dcp,heap->fraction,heap->shared);
+                population_fraction(heap,false);
             population_bytes+=population_index+population_heap;
             /* Internal reads are submitted in QS_INDEX_READS-page batches;
              * a page is not a separate host population request. */
@@ -1262,6 +1885,12 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
                 rows*(cpu_tuple_cost+expression))*unit;
             parallel_cpu(p,work,tasks[i],cus);
             p->schedule+=cost_parallel(0,ceil((index_pages+heap_pages)/QS_INDEX_READS),cus,pg_sina_parallel_task_ms);
+            /* An Index Join issues dependent reads after receiving keys.
+             * Only the parallel probe work can hide its read service. Heap
+             * LOADs retain the streaming overlap from the driving scan. */
+            overlap+=cost_scan_overlap(io-previous_io,p->parallel-previous_parallel,tasks[i],cus);
+            previous_io=io;
+            previous_parallel=p->parallel;
         } else if(n->kind==QP_AGGREGATE) {
             double groups=Max(1,n->estimated_groups),group_tasks=n->left>=0?tasks[n->left]:0;
             if(!n->nkeys) {
@@ -1407,10 +2036,10 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
             pipeline_cpu[source]+=p->parallel-previous_parallel;
         }
         p->spill+=spill;
-        double resident=Min(state,available);
+        double resident=reloaded_hash?reloaded_hash:Min(state,available);
         if(n->kind==QP_JOIN && n->hash) {
             peak[i]=Max(rp+Min(state,128*(right?cost_hash_row(&right->expr)+12:0)),
-                resident+Max(r,lp));
+                resident+(reloaded_hash?lp+rr:Max(r,lp)));
             live[i]=resident+l+rr;
         } else if(n->kind==QP_SORT || n->kind==QP_AGGREGATE || n->kind==QP_MATERIALIZED || n->kind==QP_SET) {
             peak[i]=Max(Max(lp,rp),resident+l+r);
@@ -1425,11 +2054,13 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
             p->stages->len?"; ":"",i,device_kind(n->kind),rows,n->estimated_groups,tasks[i],
             p->serial+p->parallel+p->schedule+p->combine-previous_cpu,state,resident,available,spill);
         if(p->details && n->kind==QP_SCAN)
-            appendStringInfo(p->stages," visited=%.0f expr_ops=%u physical_ops=%.2f",input,
-                cost_expression_ops(&n->expr),scan_expression_ops(&n->expr,lowered!=NULL,p->root));
+            appendStringInfo(p->stages," visited=%.0f expr_ops=%u physical_ops=%.2f decode_ops=%.2f",input,
+                cost_expression_ops(&n->expr),scan_expression_ops(&n->expr,lowered!=NULL,p->root),decode_ops);
         if(p->details && (n->kind==QP_JOIN || n->kind==QP_INDEX_JOIN)) {
             static const char *names[]={"inner","left","semi","anti"};
             appendStringInfo(p->stages," join=%s",names[n->join_type]);
+            if(bitmap_hits) appendStringInfo(p->stages," bitmap_hits=%.0f",bitmap_hits);
+            if(reloaded_hash) appendStringInfo(p->stages," reload_build=%.0fB",reloaded_hash);
         }
         if(p->details && n->kind==QP_INDEX_JOIN)
             appendStringInfo(p->stages," probes=%.0f tuples_per_probe=%.3f index_pages=%.0f heap_pages=%.0f",index_probes,index_tuple_visits,index_pages,heap_pages);
@@ -1463,13 +2094,38 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
     /* Shared CSD I/O/transfer occurs once. Only HOST tuple conversion is
      * distributed among PG consumers, using PG's partial-row estimate. */
     double batches=Max(1,ceil(p->rows/output_capacity(p->native,&tree->nodes[tree->root].expr)));
-    if(tree->count==1 && tree->nodes[tree->root].kind==QP_SCAN && !tree->nodes[tree->root].ordered_index)
-        batches=Max(batches,tasks[tree->root]); /* CU flushes at each input block. */
-    p->boundary=transfer_ms(output_bytes(p->native,&tree->nodes[tree->root].expr,p->rows),pg_sina_pcie_mbps)+
-        p->rows/consumers*cpu_operator_cost*pg_sina_host_cost_ms+batches*pg_sina_result_batch_ms;
+    bool scan_delivery=tree->count==1 && tree->nodes[tree->root].kind==QP_SCAN &&
+        !tree->nodes[tree->root].ordered_index;
+    if(scan_delivery) {
+        double blocks=tasks[tree->root];
+        /* The last packet of each input block is flushed before requeue.
+         * When a block spans packets, budget for half a partial packet on
+         * average instead of packing its tail into the next block. */
+        if(batches>blocks) batches+=Max(0,blocks-1)*0.5;
+        batches=Max(batches,blocks);
+    }
+    p->link=transfer_ms(output_bytes(p->native,&tree->nodes[tree->root].expr,p->rows),pg_sina_pcie_mbps);
+    /* The HOST scan boundary clears/stores a slot per row and checks and
+     * decodes each projected field from the column packet. */
+    double conversion_ops=scan_delivery?1+tree->nodes[tree->root].expr.nout:1;
+    double host_conversion=p->rows/consumers*conversion_ops*cpu_operator_cost*pg_sina_host_cost_ms;
+    double reader=p->link+batches*pg_sina_result_batch_ms;
+    double first_delivery=(host_conversion+reader)/batches;
+    p->boundary=host_conversion+reader;
+    if(scan_delivery) {
+        double wait=cost_population_link_wait(p->population,p->csd,batches,
+            Min(transfer_ms(tree->scan_bytes,pg_sina_pcie_mbps),p->population/Max(1,blocks)));
+        if(slots>1 && !tree->ninit) {
+            reader+=wait;
+            p->boundary=host_conversion+cost_scan_delivery(device,reader,p->link+p->population,batches,slots);
+            first_delivery+=wait/batches;
+        } else p->delivery_wait=wait;
+        if(p->details) appendStringInfo(p->stages,"; result_reader=%.3fms result_link_wait=%.3fms boundary=%.3fms",
+            reader,wait,p->boundary);
+    }
     if(tree->count==1 && tree->nodes[tree->root].kind==QP_SCAN && !tree->ninit)
         scan->scan.plan.startup_cost=Min(p->csd+p->boundary,2+
-            Max(0,p->csd-2)*Min(1.0,cus/Max(1.0,tasks[tree->root]))+p->boundary/batches)/pg_sina_host_cost_ms;
+            Max(0,p->csd-2)*Min(1.0,cus/Max(1.0,tasks[tree->root]))+first_delivery)/pg_sina_host_cost_ms;
     if(bytes) { memcpy(VARDATA(bytes),tree,VARSIZE_ANY_EXHDR(bytes)); pfree(tree); }
     if(pg_sina_planning) pg_sina_planning->cost_finish+=pg_sina_planner_clock()-mark;
 }
@@ -1555,7 +2211,6 @@ static void node_costs(struct placement *p,StringInfo text)
 /* Candidate metadata is binary and copyObject-safe. Only selected plans turn
  * these diagnostic numbers into PG Float strings for EXPLAIN. PG Paths keep
  * their ordinary numeric Cost fields, in PG cost units, throughout search. */
-struct candidate_costs { double values[15]; int workers; };
 static List *format_costs(const struct candidate_costs *costs,const char *stages)
 {
     List *out=NIL;
@@ -1568,7 +2223,7 @@ static void annotate_device(struct placement *p,bool candidate)
 {
     CustomScan *scan=(CustomScan *)p->device;
     struct candidate_costs costs={{p->host,p->csd,p->boundary,p->cache,p->spill,p->cpu,p->io,p->peak,
-        p->population,p->serial,p->parallel,p->schedule,p->combine,p->dictionary,p->fdm},p->workers};
+        p->population,p->serial,p->parallel,p->schedule,p->combine,p->dictionary,p->fdm},p->workers,p->link,p->delivery_wait};
     Node *saved;
     if(candidate) {
         bytea *record=palloc0(VARHDRSZ+sizeof(costs)); SET_VARSIZE(record,VARHDRSZ+sizeof(costs));

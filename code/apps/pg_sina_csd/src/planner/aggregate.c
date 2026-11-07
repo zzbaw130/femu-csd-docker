@@ -311,7 +311,8 @@ static int expression(Node *node,Index rti,struct qs_plan *p)
         int like=put(p,(struct qs_expr){.op=Q_COLUMN,.column=col,.type=Q_BOOLEAN});
         return not_like?put(p,(struct qs_expr){.op=Q_NOT,.type=Q_BOOLEAN,.left=like}):like;
     }
-    e.left=expression(linitial(op->args),rti,p); e.right=expression(lsecond(op->args),rti,p);
+    List *args=pg_sina_numeric_comparison_args(function,op->args);
+    e.left=expression(linitial(args),rti,p); e.right=expression(lsecond(args),rti,p);
     if(e.left<0 || e.right<0) return -1;
     if(p->exprs[e.left].type==Q_DICTIONARY || p->exprs[e.right].type==Q_DICTIONARY) return -1;
     if(builtin(function,"numeric_add")) e.op=Q_ADD;

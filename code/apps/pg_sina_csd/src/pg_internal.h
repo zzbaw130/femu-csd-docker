@@ -30,6 +30,7 @@ enum pg_sina_path { PG_SINA_HOST, PG_SINA_FILTER, PG_SINA_CSD, PG_SINA_HPCP, PG_
 const char *pg_sina_path_name(void);
 bool pg_sina_hpcp_enabled(void);
 extern bool pg_sina_dcp;
+uint64 pg_sina_dcp_bulk_pages(uint64 blocks,char relkind,bool indexed);
 void pg_sina_dcp_register(const struct qs_request *,const struct qs_extent *);
 void pg_sina_dcp_resident(Oid,uint64,uint64,unsigned char *);
 void pg_sina_dcp_start(CS_DEV_HANDLE);
@@ -85,11 +86,13 @@ static inline double pg_sina_planner_attributed(void)
         p->host_cache+p->stmt_copy+p->freeze:0;
 }
 extern int pg_sina_max_memory;
+extern int pg_sina_index_cache_mib;
 /* Per-backend device capacities, populated before finalizing an offloaded plan.
  * Workmem is private compute memory; fdm_bytes is only the I/O buffer pool. */
 extern struct pg_sina_resources {
     unsigned cus;
     uint64_t fdm_bytes,workmem_bytes;
+    double cpu_ratio; /* Effective per-CU CPU quota fraction; 1 is unrestricted. */
 } pg_sina_resources;
 void pg_sina_init_device(void);
 void pg_sina_read_resources(const char *device);
@@ -127,14 +130,17 @@ PlannedStmt *pg_sina_original_device_statement(PlannedStmt *);
 bool pg_sina_prepared_device(Oid,Oid,char *,size_t);
 void pg_sina_rel_paths(PlannerInfo *,RelOptInfo *,Index,RangeTblEntry *);
 void pg_sina_join_paths(PlannerInfo *,RelOptInfo *,RelOptInfo *,RelOptInfo *,JoinType,JoinPathExtraData *);
-void pg_sina_search_upper_paths(PlannerInfo *,UpperRelationKind,RelOptInfo *,RelOptInfo *);
+void pg_sina_search_upper_paths(PlannerInfo *,UpperRelationKind,RelOptInfo *,RelOptInfo *,void *);
 Plan *pg_sina_cost_device(PlannerInfo *,Plan *,bool,List **,double *,double *);
 List *pg_sina_selected_costs(PlannerInfo *,Plan *,bool,bool,Node *);
 void pg_sina_cost_host_path(PlannerInfo *,Path *,Oid,List **,bool);
+double pg_sina_refine_base_rows(PlannerInfo *,RelOptInfo *,Index,RangeTblEntry *);
+double pg_sina_scan_stream_work(Path *);
+double pg_sina_host_hash_penalty(Plan *,bool growth);
 void pg_sina_refine_host_anti(PlannerInfo *,RelOptInfo *,RelOptInfo *,JoinType,JoinPathExtraData *);
 void pg_sina_cost_host_lookup(PlannerInfo *,Path *,JoinPathExtraData *,List **);
-Path *pg_sina_reprice_index_join(PlannerInfo *,NestPath *,JoinPathExtraData *,List **);
-double pg_sina_host_join_cpu(PlannerInfo *,NestPath *,JoinPathExtraData *);
+Path *pg_sina_reprice_index_join(PlannerInfo *,NestPath *,JoinPathExtraData *,List **,double);
+double pg_sina_host_index_pipeline_cost(PlannerInfo *,NestPath *,JoinPathExtraData *,double);
 double pg_sina_host_scan_cost(Plan *,Oid,double,List **);
 double pg_sina_host_statement_cost(PlannedStmt *);
 double pg_sina_host_parallel_cost(PlannedStmt *);
@@ -146,6 +152,7 @@ void pg_sina_upper_paths(PlannerInfo *, UpperRelationKind, RelOptInfo *, RelOptI
 bool pg_sina_rewrite_query(Query *q);
 Plan *pg_sina_rewrite_plan(PlannerInfo *,Plan *);
 Plan *pg_sina_compile_subtree(PlannerInfo *,Plan *,bool);
+List *pg_sina_numeric_comparison_args(Oid,List *);
 static inline bool pg_sina_is_scan(Plan *plan)
 { return IsA(plan,SeqScan) || IsA(plan,IndexScan) || IsA(plan,IndexOnlyScan); }
 /* Validate and collect only the HOST InitPlan values used by this scan. */
@@ -157,7 +164,7 @@ Plan *pg_sina_require_output_order(PlannerInfo *,Plan *);
 Plan *pg_sina_describe_candidate(PlannerInfo *,Plan *,bool,struct qp_plan **);
 Plan *pg_sina_candidate_scan(Plan *,bool,bool);
 void pg_sina_finish_device_plans(Plan *);
-void pg_sina_refine_groups(struct qp_plan *);
+void pg_sina_refine_groups(PlannerInfo *,struct qp_plan *);
 Plan *pg_sina_adaptive_plan(PlannerInfo *,Plan *);
 void pg_sina_explain_placement(CustomScan *,ExplainState *);
 extern const CustomScanMethods pg_sina_adaptive_methods;

@@ -724,9 +724,6 @@ static const FemuPropDesc femu_ctrl_descs[] = {
     { "context_switch_time",
       "No effect, kept for CEMU compatibility. A value other than the "
       "default warns at realize" },
-    { "csf_runtime_scale",
-      "CSD: non-zero multiplier applied to the host run time of a program "
-      "that sets neither a runtime nor its own scale" },
     { "csd_program_dir",
       "CSD: host directory that shared-object and uBPF programs are "
       "loaded from, named by a file name with no slash that must resolve "

@@ -1,4 +1,6 @@
 #!/bin/bash
+# 调用方式为 在 Guest 运行 bash /home/femu/scripts/start-postgre.sh [-f] <SF>。
+# SF 选择 tpch_s<SF>.tar（如 0.01、4、8），-f 强制重新解包。需先初始化 NVMe 并安装 PG。
 
 FORCE_RELOAD=0
 while getopts ":f" opt; do

@@ -153,6 +153,95 @@ static bool rewrite_child(Node *node,bool *changed)
     if(IsA(node,Query)) { if(pg_sina_rewrite_query((Query *)node)) *changed=true; return false; }
     return expression_tree_walker(node,rewrite_child,changed);
 }
+
+static bool reusable_grouped_input(RangeTblEntry *rte)
+{
+    if(rte->rtekind!=RTE_SUBQUERY || rte->lateral || rte->security_barrier ||
+       rte->securityQuals || rte->requiredPerms) return false;
+    Query *input=rte->subquery;
+    if(input->commandType!=CMD_SELECT || !input->hasAggs || !input->groupClause ||
+       input->hasSubLinks || input->hasRowSecurity || input->hasTargetSRFs ||
+       input->cteList || input->rowMarks || input->limitCount || input->limitOffset ||
+       input->setOperations || input->windowClause || input->groupingSets) return false;
+    ListCell *cell;
+    foreach(cell,input->rtable) {
+        RangeTblEntry *base=lfirst_node(RangeTblEntry,cell);
+        if(base->rtekind!=RTE_RELATION || base->securityQuals || base->tablesample) return false;
+    }
+    return !query_tree_walker(input,has_outer,NULL,0) &&
+        !contain_mutable_functions((Node *)input);
+}
+
+static void use_shared_input(RangeTblEntry *rte,CommonTableExpr *cte,Index levels)
+{
+    rte->rtekind=RTE_CTE;
+    rte->subquery=NULL;
+    rte->ctename=cte->ctename;
+    rte->ctelevelsup=levels;
+    rte->coltypes=cte->ctecoltypes;
+    rte->coltypmods=cte->ctecoltypmods;
+    rte->colcollations=cte->ctecolcollations;
+}
+
+static Query *merged_grouped_input(Query *left,Query *right)
+{
+    if(equal(left,right)) return left;
+    if(list_length(left->rtable)!=list_length(right->rtable)) return NULL;
+    Query *a=copyObject(left),*b=copyObject(right);
+    ListCell *first,*second;
+    /* The view references can require different columns. Keep the union
+     * of their privilege checks while comparing all other query fields. */
+    forboth(first,a->rtable,second,b->rtable) {
+        RangeTblEntry *x=lfirst_node(RangeTblEntry,first),*y=lfirst_node(RangeTblEntry,second);
+        x->selectedCols=bms_union(x->selectedCols,y->selectedCols);
+        y->selectedCols=x->selectedCols;
+    }
+    return equal(a,b)?a:NULL;
+}
+
+/* Share a deterministic grouped input repeated by the main query and a
+ * scalar subquery. PG plans one producer and two independent CTE readers. */
+static bool share_grouped_input(Query *q)
+{
+    if(!q->hasSubLinks || !q->jointree || q->cteList || q->hasRowSecurity || q->rowMarks)
+        return false;
+    if(!find_scalar(q->jointree->quals,NULL)) return false;
+    Query *scalar=castNode(Query,first_link->subselect);
+    if(scalar->cteList || scalar->hasRowSecurity || scalar->rowMarks) return false;
+    ListCell *main_cell,*scalar_cell;
+    foreach(main_cell,q->rtable) {
+        RangeTblEntry *main=lfirst_node(RangeTblEntry,main_cell);
+        if(!reusable_grouped_input(main)) continue;
+        foreach(scalar_cell,scalar->rtable) {
+            RangeTblEntry *other=lfirst_node(RangeTblEntry,scalar_cell);
+            if(!reusable_grouped_input(other)) continue;
+            Query *producer=merged_grouped_input(main->subquery,other->subquery);
+            if(!producer) continue;
+            CommonTableExpr *cte=makeNode(CommonTableExpr);
+            cte->ctename=pstrdup("snia_shared_group");
+            cte->ctequery=(Node *)producer;
+            cte->ctematerialized=CTEMaterializeAlways;
+            cte->cterefcount=2;
+            cte->location=-1;
+            cte->ctecolnames=copyObject(main->eref->colnames);
+            ListCell *target;
+            foreach(target,producer->targetList) {
+                TargetEntry *entry=lfirst_node(TargetEntry,target);
+                if(entry->resjunk) continue;
+                Node *expr=(Node *)entry->expr;
+                cte->ctecoltypes=lappend_oid(cte->ctecoltypes,exprType(expr));
+                cte->ctecoltypmods=lappend_int(cte->ctecoltypmods,exprTypmod(expr));
+                cte->ctecolcollations=lappend_oid(cte->ctecolcollations,exprCollation(expr));
+            }
+            use_shared_input(main,cte,0);
+            use_shared_input(other,cte,1);
+            q->cteList=list_make1(cte);
+            return true;
+        }
+    }
+    return false;
+}
+
 bool pg_sina_rewrite_query(Query *q)
 {
     if(!q || q->commandType!=CMD_SELECT) return false;
@@ -163,5 +252,5 @@ bool pg_sina_rewrite_query(Query *q)
         if(!rewrite_one(candidate)) break;
         *q=*candidate; changed=true;
     }
-    return changed;
+    return share_grouped_input(q) || changed;
 }

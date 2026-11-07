@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# 调用方式为 在宿主机运行 bash tests/snia-test.sh [unit|build|smoke|example|bench]。
+# unit（默认）运行宿主单测，build 构建设备程序和 Guest 示例。
+# smoke/example 写入并运行 256MiB 排序求平均示例；bench 用已有示例输入比较 CPU 与 CSD。
+# Guest 子命令需 FEMU 已启动。SSH_PORT 默认 8080。
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 case ${1:-unit} in

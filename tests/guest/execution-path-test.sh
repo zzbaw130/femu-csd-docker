@@ -1,11 +1,17 @@
 #!/bin/sh
-# Five-mode and placement regression; SQL bodies come only from queries/.
+# 调用方式为 在 Guest 运行 SF=8 sh execution-path-test.sh，无位置参数。
+# SF 默认 8，PGDATA/PGDATABASE 可显式覆盖。需已安装扩展并准备 CSD 映射。
+# 比较五种执行路径的输出并核对指定的计划结构。
+# Five-mode and placement regression using the canonical query templates.
 set -eu
+PGDATA=${PGDATA:-/data/${PGDATABASE:-tpch_s${SF:-8}}}
+export PGDATA PGDATABASE=${PGDATABASE:-${PGDATA##*/}}
 OUT=$(mktemp -d /home/femu/results/execution-path.XXXXXX)
 chmod 755 "$OUT"
 COLD=/home/femu/scripts/cold-query.sh
 PG=/home/femu/opt/postgres/release/bin/psql
-QUERIES=/home/femu/tests/queries
+TESTS=/home/femu/tests
+QUERIES=$TESTS/queries/template
 run() {
     query=$1; mode=$2; label=$3
     sh "$COLD" "$mode" "$QUERIES/$query.sql" > "$OUT/$query.$label.log" 2> "$OUT/$query.$label.err"
@@ -16,9 +22,10 @@ run() {
 }
 plan() {
     query=$1; mode=$2; label=$3
-    "$PG" -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
+    sed 's/^select$/explain select/' "$QUERIES/$query.sql" |
+    "$PG" -X -q -A -t -v ON_ERROR_STOP=1 -d "$PGDATABASE" \
         -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path='$mode'" \
-        -f "$QUERIES/$query.explain.sql" > "$OUT/$query.$label.plan" 2> "$OUT/$query.$label.plan.err"
+        -f "$TESTS/tpch-parameters.psql" -f - > "$OUT/$query.$label.plan" 2> "$OUT/$query.$label.plan.err"
 }
 for query in 6 13; do
     run "$query" host-only host

@@ -522,8 +522,12 @@ static inline int qs_vector_execute_input(const struct qs_plan *p,struct qs_chun
     int column_input=chunk==NULL;
     if(column_input && ((p->ncols && !input.cells) || first>QS_VECTOR_ROWS || count>QS_VECTOR_ROWS-first)) return -1;
     unsigned low=column_input?0:chunk->rows,high=0;
-    for(unsigned i=0;(!column_input || selection) && i<count;++i) {
-        unsigned row=selection?selection[first+i]:first+i;
+    if(!column_input && !selection && count) {
+        if(first>chunk->rows || count>chunk->rows-first) return -1;
+        low=first; high=first+count-1;
+    }
+    for(unsigned i=0;selection && i<count;++i) {
+        unsigned row=selection[first+i];
         if(row>=(column_input?QS_VECTOR_ROWS:chunk->rows)) return -1;
         if(row<low) low=row;
         if(row>high) high=row;

@@ -201,11 +201,12 @@ With `kv_timing=model`, Store and Retrieve take their time from a fitted
 workload-mix model instead
 ([KV mode](../modes/kvssd.md#workload-mix-timing-kv_timingmodel)).
 
-CSD runs a program on the compute unit that frees up first. A program holds
-its unit for its declared run time, or for its measured host run time
-multiplied by the program's own scale, or by `csf_runtime_scale` when it
-gives none. `nr_cu` sets how many units run at once. Namespace/AFDM copies
-use the normal BlackBox FTL read/write paths, including per-page media
+CSD runs programs on `nr_cu` real worker threads. An ordinary native CSF
+finishes when its actual call returns, without an extra virtual reservation.
+The launcher can throttle each CU through an independent CPU cgroup.
+Explicit command/program runtime and per-program scale retain their native
+timing semantics; no controller-wide runtime multiplier remains.
+Namespace/AFDM copies use the normal BlackBox FTL read/write paths, including per-page media
 timing and LUN/channel contention. AFDM-to-NVM uses FUA writes.
 
 Properties: [CSD](../reference/properties.md#csd-computational-storage).

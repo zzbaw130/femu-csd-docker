@@ -33,6 +33,9 @@ static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,Param
     /* SPI mapping lookups are PG queries too, not new placement searches. */
     if(pg_sina_compiling_plan || parse->commandType!=CMD_SELECT || parse->hasModifyingCTE)
         return plan_query(parse,cursorOptions,boundParams);
+    bool measure_forced=pg_sina_profile && pg_sina_exe_path==PG_SINA_CSD;
+    instr_time forced_start;
+    if(measure_forced) INSTR_TIME_SET_CURRENT(forced_start);
     struct pg_sina_planner_profile counters={0},*saved_profile=pg_sina_planning;
     pg_sina_planning=pg_sina_profile && pg_sina_exe_path==PG_SINA_ADAPTIVE?&counters:NULL;
     double started=pg_sina_planner_clock(),mark=started,cpu_started=pg_sina_planner_cpu();
@@ -70,11 +73,10 @@ static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,Param
             mark=pg_sina_planner_clock();
             original_device=pg_sina_original_device_statement(host);
             if(pg_sina_planning) counters.stmt_copy=pg_sina_planner_clock()-mark;
-            /* A correlated native tree may be unsupported even though PG's
-             * plan for its decorrelated Query is executable. Keep that PG
-             * physical candidate too; otherwise shared HOST/device pruning
-             * can lose it before a complete device path is formed. */
-            if(!original_device && query!=parse) {
+            /* Compare both PG physical trees when a rewrite exposes a new
+             * device candidate. Shared HOST/device pruning may remove it
+             * before a complete device path is formed. */
+            if(query!=parse) {
                 double previous=pg_sina_planner_attributed(),previous_hooks=counters.hook_other;
                 mark=pg_sina_planner_clock();
                 PlannedStmt *rewritten=plan_query(copyObject(query),cursorOptions,boundParams);
@@ -84,8 +86,10 @@ static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,Param
                     counters.native_core+=elapsed-(pg_sina_planner_attributed()-previous)-(counters.hook_other-previous_hooks);
                 }
                 mark=pg_sina_planner_clock();
-                original_device=pg_sina_original_device_statement(rewritten);
-                if(original_device) {
+                PlannedStmt *rewritten_device=pg_sina_original_device_statement(rewritten);
+                if(rewritten_device && (!original_device ||
+                   rewritten_device->planTree->total_cost<original_device->planTree->total_cost)) {
+                    original_device=rewritten_device;
                     List *info=((CustomScan *)original_device->planTree)->custom_private;
                     lfirst(list_head(info))=makeString("subtree:CSD; query=rewritten PG physical tree");
                 }
@@ -152,6 +156,12 @@ static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,Param
             counters.cache_cpu,counters.cache_metadata,counters.cache_files,counters.cache_residency,counters.cache_count,
             (unsigned long long)counters.cache_pages,counters.cache_stats_calls,counters.cache_mincore_calls)));
     }
+    if(measure_forced) {
+        instr_time elapsed;
+        INSTR_TIME_SET_CURRENT(elapsed);
+        INSTR_TIME_SUBTRACT(elapsed,forced_start);
+        ereport(NOTICE,(errmsg("CSD planner total_ms=%.3f",INSTR_TIME_GET_MILLISEC(elapsed))));
+    }
     pg_sina_planning=saved_profile;
     return plan;
 }
@@ -160,7 +170,7 @@ static void upper_hook(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *inp
     if(previous_upper_hook) previous_upper_hook(root,stage,input,output,extra);
     if(!pg_sina_compiling_plan) {
         double mark=pg_sina_planner_clock(),attributed=pg_sina_planner_attributed();
-        if(pg_sina_path_search && pg_sina_exe_path>=PG_SINA_CSD) pg_sina_search_upper_paths(root,stage,input,output);
+        if(pg_sina_path_search && pg_sina_exe_path>=PG_SINA_CSD) pg_sina_search_upper_paths(root,stage,input,output,extra);
         else pg_sina_upper_paths(root,stage,input,output,extra);
         if(pg_sina_planning) pg_sina_planning->hook_other+=pg_sina_planner_clock()-mark-(pg_sina_planner_attributed()-attributed);
     }
@@ -218,13 +228,14 @@ static const struct config_enum_entry execution_paths[] = {
 };
 double pg_sina_host_cost_ms=0.02,pg_sina_csd_cpu_ratio=0.35;
 double pg_sina_parallel_task_ms=0.02;
-double pg_sina_internal_mbps=5000,pg_sina_pcie_mbps=3500,pg_sina_cache_mbps=10000;
+double pg_sina_internal_mbps=3500,pg_sina_pcie_mbps=3500,pg_sina_cache_mbps=10000;
 /* Effective aggregate service limit for small internal reads, including the
  * single FTL owner. Independent of sequential bandwidth and CU count. */
-double pg_sina_internal_read_iops=250000;
+double pg_sina_internal_read_iops=200000;
 /* Effective dependent spill writes, including request/reentry overhead. */
 double pg_sina_internal_write_mbps=100;
 double pg_sina_result_batch_ms=0.25;
+int pg_sina_index_cache_mib;
 static void assign_cost(double value,void *extra) { ResetPlanCache(); }
 void _PG_init(void);
 void _PG_init(void)
@@ -239,16 +250,19 @@ void _PG_init(void)
         &pg_sina_dcp,false,PGC_USERSET,0,NULL,assign_dcp,NULL);
     DefineCustomIntVariable("pg_sina_csd.max_memory", "Maximum device work memory per query", NULL,
         &pg_sina_max_memory, 0, 0, MAX_KILOBYTES, PGC_USERSET, GUC_UNIT_KB, check_memory, assign_memory, NULL);
+    DefineCustomIntVariable("pg_sina_csd.index_cache_mib", "Maximum clean Index Join page cache in device workmem, in MiB", NULL,
+        &pg_sina_index_cache_mib, QP_INDEX_CACHE_MAX_MIB, 0, QP_INDEX_CACHE_MAX_MIB,
+        PGC_USERSET, 0, NULL, NULL, NULL);
     DefineCustomRealVariable("pg_sina_csd.host_cost_ms","Milliseconds per PG cost unit",NULL,
         &pg_sina_host_cost_ms,0.02,0.000001,1000,PGC_USERSET,0,NULL,assign_cost,NULL);
-    DefineCustomRealVariable("pg_sina_csd.csd_cpu_ratio","Device vector CPU cost relative to native PG before CU scaling",NULL,
+    DefineCustomRealVariable("pg_sina_csd.csd_cpu_ratio","Full-CPU device vector cost relative to native PG; discovered CU quota applies separately",NULL,
         &pg_sina_csd_cpu_ratio,0.35,0.001,1000,PGC_USERSET,0,NULL,assign_cost,NULL);
     DefineCustomRealVariable("pg_sina_csd.parallel_task_ms","Scheduling cost per parallel task wave in milliseconds",NULL,
         &pg_sina_parallel_task_ms,0.02,0,1000,PGC_USERSET,0,NULL,assign_cost,NULL);
     DefineCustomRealVariable("pg_sina_csd.internal_mbps","Aggregate internal NVM/FDM bandwidth in decimal MB/s",NULL,
-        &pg_sina_internal_mbps,5000,1,1000000,PGC_USERSET,0,NULL,assign_cost,NULL);
+        &pg_sina_internal_mbps,3500,1,1000000,PGC_USERSET,0,NULL,assign_cost,NULL);
     DefineCustomRealVariable("pg_sina_csd.internal_read_iops","Aggregate service limit for internal 8KiB point reads",NULL,
-        &pg_sina_internal_read_iops,250000,1,1000000000,PGC_USERSET,0,NULL,assign_cost,NULL);
+        &pg_sina_internal_read_iops,200000,1,1000000000,PGC_USERSET,0,NULL,assign_cost,NULL);
     DefineCustomRealVariable("pg_sina_csd.internal_write_mbps","Effective dependent spill write bandwidth in decimal MB/s",NULL,
         &pg_sina_internal_write_mbps,100,1,1000000,PGC_USERSET,0,NULL,assign_cost,NULL);
     DefineCustomRealVariable("pg_sina_csd.pcie_mbps","Shared PCIe bandwidth per direction in decimal MB/s",NULL,

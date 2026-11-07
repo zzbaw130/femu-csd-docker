@@ -24,8 +24,9 @@
 #include "utils/rel.h"
 #include "utils/pg_locale.h"
 #include "utils/date.h"
+#include "utils/fmgroids.h"
+#include "utils/numeric.h"
 #include "utils/syscache.h"
-#include <errno.h>
 #include <locale.h>
 
 struct binding {
@@ -36,6 +37,8 @@ struct binding {
     struct qp_node *node;
     struct qp_plan *tree;
     bool properties;
+    uint64_t *text_inputs; /* Property-only input dependencies for late output. */
+    bool text_operand;
 };
 static int compile_node(PlannerInfo *,Plan *,struct qp_plan *,bool);
 static int compile_tree(PlannerInfo *,Plan *,struct qp_plan *);
@@ -147,18 +150,72 @@ static int literal(struct qs_plan *p,const char *bytes,unsigned length)
     struct qs_string *s=&p->strings[p->nstrings];
     s->length=length; memcpy(s->bytes,bytes,length); return p->nstrings++;
 }
-static bool numeric_literal(Datum value,int64 *number,unsigned *scale)
+static bool numeric_literal(Datum value,__int128 *number,unsigned *scale)
 {
-    char *text=DatumGetCString(DirectFunctionCall1(numeric_out,value)),digits[64];
-    unsigned n=0; bool point=false; *scale=0;
-    for(char *at=text;*at;++at) {
+    char *text=DatumGetCString(DirectFunctionCall1(numeric_out,value));
+    bool negative=*text=='-',point=false,valid=true;
+    *number=0; *scale=0;
+    for(char *at=text+negative;*at;++at) {
         if(*at=='.' && !point) { point=true; continue; }
-        if(n+1==sizeof(digits) || ((*at<'0'||*at>'9') && !(at==text && *at=='-'))) return false;
-        digits[n++]=*at; if(point) ++*scale;
+        if(*at<'0' || *at>'9' || (point && ++*scale>38) ||
+           __builtin_mul_overflow(*number,(__int128)10,number) ||
+           __builtin_add_overflow(*number,(__int128)(negative?'0'-*at:*at-'0'),number)) {
+            valid=false; break;
+        }
     }
-    if(*scale>18) return false;
-    digits[n]=0; char *end; errno=0; *number=strtoll(digits,&end,10);
-    return !errno && !*end && end!=digits;
+    pfree(text); return valid;
+}
+/* The existing instruction carries an int64 literal, but arithmetic and
+ * intermediate cells already support int128. Build a wide coefficient from
+ * exact decimal parts, keeping the original display scale. */
+static int numeric_expression(struct qs_plan *p,__int128 number,unsigned scale)
+{
+    if(number>=INT64_MIN && number<=INT64_MAX)
+        return add_expr(p,(struct qs_expr){.op=Q_CONST,.type=Q_DECIMAL,.scale=scale,.dscale=scale,.constant=number});
+    const int64 base=INT64CONST(1000000000000000000);
+    int high=numeric_expression(p,number/base,scale>=18?scale-18:0);
+    if(high<0) return -1;
+    if(scale<18) {
+        int64 factor=base;
+        for(unsigned i=0;i<scale;++i) factor/=10;
+        int shift=numeric_expression(p,factor,0);
+        if(shift<0) return -1;
+        high=add_expr(p,(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=high,.right=shift});
+        if(high<0) return -1;
+    }
+    int low=numeric_expression(p,number%base,scale);
+    if(low<0) return -1;
+    return add_expr(p,(struct qs_expr){.op=Q_ADD,.type=Q_DECIMAL,.left=high,.right=low,.scale=scale,.dscale=scale});
+}
+/* Numeric comparisons ignore display scale. Keep the original Const for
+ * arithmetic and projections, where trailing zeros can affect SQL output. */
+List *pg_sina_numeric_comparison_args(Oid fn,List *args)
+{
+    switch(fn) {
+    case F_NUMERIC_EQ:case F_NUMERIC_NE:case F_NUMERIC_LT:
+    case F_NUMERIC_LE:case F_NUMERIC_GT:case F_NUMERIC_GE:break;
+    default:return args;
+    }
+    if(list_length(args)!=2) return args;
+    Node *operands[]={linitial(args),lsecond(args)};
+    for(unsigned i=0;i<lengthof(operands);++i) {
+        Node *node=operands[i];
+        while(IsA(node,RelabelType)) node=(Node *)((RelabelType *)node)->arg;
+        if(!IsA(node,Const)) continue;
+        Const *c=(Const *)node;
+        if(c->consttype!=NUMERICOID || c->constisnull) continue;
+        Numeric numeric=DatumGetNumeric(c->constvalue);
+        if(numeric_is_nan(numeric) ||
+           DatumGetInt32(DirectFunctionCall1(numeric_scale,c->constvalue))<=6) continue;
+        char *value=numeric_normalize(numeric);
+        Datum normalized=DirectFunctionCall3(numeric_in,CStringGetDatum(value),
+            ObjectIdGetDatum(InvalidOid),Int32GetDatum(-1));
+        operands[i]=(Node *)makeConst(NUMERICOID,c->consttypmod,c->constcollid,
+            c->constlen,normalized,false,false);
+        pfree(value);
+    }
+    return operands[0]!=linitial(args) || operands[1]!=lsecond(args)?
+        list_make2(operands[0],operands[1]):args;
 }
 static int expression(struct binding *b,Node *node)
 {
@@ -230,9 +287,9 @@ static int expression(struct binding *b,Node *node)
             break;
         }
         case NUMERICOID: {
-            unsigned scale;
-            if(!numeric_literal(c->constvalue,&e.constant,&scale)) return -1;
-            e.scale=e.dscale=scale; break;
+            __int128 value; unsigned scale;
+            if(!numeric_literal(c->constvalue,&value,&scale)) return -1;
+            return numeric_expression(p,value,scale);
         }
         default:return -1;
         }
@@ -339,6 +396,7 @@ static int expression(struct binding *b,Node *node)
             }
         }
     }
+    args=pg_sina_numeric_comparison_args(fn,args);
     e.left=expression(b,linitial(args)); e.right=expression(b,lsecond(args));
     if(e.left<0 || e.right<0) return -1;
     static const char *arith[]={"numeric_add","numeric_sub","numeric_mul","numeric_div"};
@@ -1426,7 +1484,22 @@ static Node *device_output_expression(Node *node,void *context)
  * program: expressions retain only type/column lineage and a count. Literal
  * values, executable predicates and scalar instruction operands are omitted.
  * A selected candidate goes through expression() exactly once afterwards. */
-static int describe_tree(PlannerInfo *,Plan *,struct qp_plan *,bool);
+static int describe_tree(PlannerInfo *,Plan *,struct qp_plan *,bool,uint64_t *);
+static int describe_operand(struct binding *b,Node *node)
+{
+    bool saved=b->text_operand;
+    b->text_operand=b->text_inputs!=NULL;
+    int result=describe_expression(b,node);
+    b->text_operand=saved;
+    return result;
+}
+static int describe_column(struct binding *b,struct qs_expr e,int column)
+{
+    if(b->text_operand && e.type==Q_STRING)
+        b->text_inputs[b->node-b->tree->nodes]|=UINT64_C(1)<<column;
+    e.op=Q_COLUMN; e.column=column;
+    return add_expr(&b->node->expr,e);
+}
 static int describe_expression(struct binding *b,Node *node)
 {
     if(!node) return -1;
@@ -1436,14 +1509,14 @@ static int describe_expression(struct binding *b,Node *node)
     if(type==255 || ((type==Q_STRING || type==Q_CHAR) && !byte_order(exprCollation(node)))) return -1;
     struct qs_expr e={.op=Q_AGGREF,.left=-1,.right=-1,.otherwise=-1,.column=-1,.type=type};
     int col=input_column(b,node);
-    if(col>=0) { e.op=Q_COLUMN; e.column=col; return add_expr(p,e); }
+    if(col>=0) return describe_column(b,e,col);
     if(IsA(node,Var)) {
         Var *v=(Var *)node;
         if(v->varlevelsup || v->varno!=b->scan || v->varattno<=0 || (unsigned)v->varattno>p->nattrs) return -1;
         e.op=Q_COLUMN; e.column=v->varattno-1;
         if(p->cols[e.column].type==255 || (type==Q_STRING && p->cols[e.column].type!=Q_STRING)) return -1;
         if(p->cols[e.column].slot<0) p->cols[e.column].slot=p->ncols++;
-        return add_expr(p,e);
+        return describe_column(b,e,e.column);
     }
     if(IsA(node,Param)) {
         Param *v=(Param *)node;
@@ -1455,16 +1528,18 @@ static int describe_expression(struct binding *b,Node *node)
         Const *c=(Const *)node;
         if(!c->constisnull) switch(c->consttype) {
         case INT2OID:case INT4OID:case INT8OID:case BOOLOID:case DATEOID:case TIMESTAMPOID:
-        case NUMERICOID:case BPCHAROID:case VARCHAROID:case TEXTOID:break;
+        case BPCHAROID:case VARCHAROID:case TEXTOID:break;
+        case NUMERICOID: {
+            __int128 value; unsigned scale;
+            if(!numeric_literal(c->constvalue,&value,&scale)) return -1;
+            return numeric_expression(p,value,scale);
+        }
         default:return -1;
         }
         ListCell *at; foreach(at,b->literals) if(equal(c,lfirst(at))) {
             e.op=Q_CONST; e.constant=(intptr_t)lfirst(at); return add_expr(p,e);
         }
         b->literals=lappend(b->literals,c);
-        if(!c->constisnull && c->consttype==NUMERICOID) {
-            int64 value; unsigned scale; if(!numeric_literal(c->constvalue,&value,&scale)) return -1;
-        }
         if(!c->constisnull && c->consttype==DATEOID && DATE_NOT_FINITE(DatumGetInt32(c->constvalue))) return -1;
         if(!c->constisnull && c->consttype==TIMESTAMPOID && DatumGetInt64(c->constvalue)%INT64CONST(86400000000)) return -1;
         if(!c->constisnull && (type==Q_STRING || type==Q_CHAR)) {
@@ -1505,7 +1580,7 @@ static int describe_expression(struct binding *b,Node *node)
         int arg=-1;
         if(kind!=Q_COUNT_STAR) {
             if(list_length(a->args)!=1) return -1;
-            arg=describe_expression(b,(Node *)linitial_node(TargetEntry,a->args)->expr); if(arg<0) return -1;
+            arg=describe_operand(b,(Node *)linitial_node(TargetEntry,a->args)->expr); if(arg<0) return -1;
         }
         if(a->aggdistinct) {
             if(list_length(a->aggdistinct)!=1 || kind!=Q_COUNT || p->exprs[arg].op!=Q_COLUMN) return -1;
@@ -1530,7 +1605,7 @@ static int describe_expression(struct binding *b,Node *node)
         if(describe_expression(b,input)<0 || b->tree->ninit==QP_PARAMS) return -1;
         PlannerInfo *root=list_nth(b->root->glob->subroots,s->plan_id-1);
         Plan *chosen=pg_sina_prepare_candidate(root,list_nth(b->root->glob->subplans,s->plan_id-1),false);
-        int child=chosen?describe_tree(root,chosen,b->tree,false):-1;
+        int child=chosen?describe_tree(root,chosen,b->tree,false,b->text_inputs):-1;
         if(child<0 || b->tree->count==QP_NODES) return -1;
         unsigned set=b->tree->count++;
         b->tree->nodes[set]=(struct qp_node){.kind=QP_SET,.left=child,.right=-1,.expr=b->tree->nodes[child].expr};
@@ -1595,6 +1670,7 @@ static int describe_expression(struct binding *b,Node *node)
             if(part->constisnull || part->consttype!=TEXTOID || strcmp(TextDatumGetCString(part->constvalue),"year")) return -1;
             e.op=Q_YEAR; e.left=describe_expression(b,lsecond(args)); return e.left<0?-1:add_expr(p,e);
         }
+        args=pg_sina_numeric_comparison_args(fn,args);
     } else if(IsA(node,NullTest)) {
         if(((NullTest *)node)->argisrow) return -1;
         args=list_make1(((NullTest *)node)->arg);
@@ -1606,14 +1682,14 @@ static int describe_expression(struct binding *b,Node *node)
         foreach(c,v->args) { CaseWhen *w=lfirst(c); args=lappend(args,w->expr); args=lappend(args,w->result); }
     } else return -1;
     int first=-1; ListCell *c;
-    foreach(c,args) { int child=describe_expression(b,lfirst(c)); if(child<0) return -1; if(first<0) first=child; }
+    foreach(c,args) { int child=describe_operand(b,lfirst(c)); if(child<0) return -1; if(first<0) first=child; }
     /* Transparent casts preserve column lineage for NDV/text-width proofs. */
     if(name && list_length(args)==1) return first;
     e.constant=(intptr_t)node; return add_expr(p,e);
 }
 static bool describe_list(struct binding *b,List *expressions)
 {
-    ListCell *c; foreach(c,expressions) if(describe_expression(b,lfirst(c))<0) return false;
+    ListCell *c; foreach(c,expressions) if(describe_operand(b,lfirst(c))<0) return false;
     /* conditions() combines a list with AND. Count those operations without
      * constructing their executable operands. */
     for(int i=1;i<list_length(expressions);++i) {
@@ -1622,14 +1698,14 @@ static bool describe_list(struct binding *b,List *expressions)
     }
     return true;
 }
-static int describe_tree(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool ordered)
+static int describe_tree(PlannerInfo *root,Plan *native,struct qp_plan *tree,bool ordered,uint64_t *text_inputs)
 {
     if(pg_sina_planning) ++pg_sina_planning->property_nodes;
     if(!native || native->initPlan || tree->count==QP_NODES) return -1;
     unsigned id=tree->count++; struct qp_node *n=&tree->nodes[id]; memset(n,0,sizeof(*n));
     n->left=n->right=n->join_qual=-1; n->estimated_rows=native->plan_rows;
     struct qs_plan *p=&n->expr; p->predicate=native->qual?0:-1; p->having=-1; p->limit=-1;
-    struct binding b={.root=root,.plan=native,.node=n,.tree=tree,.properties=true};
+    struct binding b={.root=root,.plan=native,.node=n,.tree=tree,.properties=true,.text_inputs=text_inputs};
     Plan *left=native->lefttree,*right=native->righttree; List *extra=NIL; Node *lookup=NULL; struct qs_join access={0};
     if(IsA(native,SeqScan) || IsA(native,IndexScan) || IsA(native,IndexOnlyScan)) {
         n->kind=QP_SCAN; b.scan=((Scan *)native)->scanrelid;
@@ -1657,7 +1733,7 @@ static int describe_tree(PlannerInfo *root,Plan *native,struct qp_plan *tree,boo
     else if(IsA(native,SubqueryScan)) {
         RelOptInfo *r=root->simple_rel_array[((SubqueryScan *)native)->scan.scanrelid];
         if(!r || !r->subroot) return -1;
-        n->kind=QP_PROJECT; n->left=describe_tree(r->subroot,((SubqueryScan *)native)->subplan,tree,ordered); if(n->left<0) return -1;
+        n->kind=QP_PROJECT; n->left=describe_tree(r->subroot,((SubqueryScan *)native)->subplan,tree,ordered,text_inputs); if(n->left<0) return -1;
         left=((SubqueryScan *)native)->subplan;
     } else if(IsA(native,CteScan)) {
         int plan=((CteScan *)native)->ctePlanId;
@@ -1668,7 +1744,7 @@ static int describe_tree(PlannerInfo *root,Plan *native,struct qp_plan *tree,boo
             unsigned materialized=tree->count++; tree->cte_nodes[plan-1]=materialized;
             PlannerInfo *subroot=list_nth(root->glob->subroots,plan-1);
             Plan *chosen=pg_sina_prepare_candidate(subroot,list_nth(root->glob->subplans,plan-1),false);
-            int child=chosen?describe_tree(subroot,chosen,tree,false):-1; if(child<0) return -1;
+            int child=chosen?describe_tree(subroot,chosen,tree,false,text_inputs):-1; if(child<0) return -1;
             tree->nodes[materialized]=(struct qp_node){.kind=QP_MATERIALIZED,.left=child,.right=-1,.expr=tree->nodes[child].expr};
         }
         n->left=tree->cte_nodes[plan-1];
@@ -1677,8 +1753,8 @@ static int describe_tree(PlannerInfo *root,Plan *native,struct qp_plan *tree,boo
     bool left_order=n->kind==QP_SORT || (n->kind==QP_JOIN && n->hash)?false:n->kind==QP_AGGREGATE?n->sorted_input:ordered;
     if(IsA(native,MergeJoin)) left_order=false;
     if(IsA(native,Limit)) left_order=ordered || root->parse->sortClause!=NIL;
-    if(left && n->left<0) { n->left=describe_tree(root,left,tree,left_order); if(n->left<0) return -1; }
-    if(right) { n->right=describe_tree(root,right,tree,false); if(n->right<0) return -1; }
+    if(left && n->left<0) { n->left=describe_tree(root,left,tree,left_order,text_inputs); if(n->left<0) return -1; }
+    if(right) { n->right=describe_tree(root,right,tree,false,text_inputs); if(n->right<0) return -1; }
     b.left=left?left->targetlist:NIL; b.right=right?right->targetlist:NIL;
     if(n->kind!=QP_SCAN) {
         p->nattrs=p->ncols=list_length(b.left)+list_length(b.right); if(p->nattrs>QS_COLS) return -1;
@@ -1737,7 +1813,7 @@ static int describe_tree(PlannerInfo *root,Plan *native,struct qp_plan *tree,boo
     }
     if(IsA(native,Result) && ((Result *)native)->resconstantqual) {
         Node *qual=((Result *)native)->resconstantqual;
-        if(IsA(qual,List)?!describe_list(&b,(List *)qual):describe_expression(&b,qual)<0) return -1;
+        if(IsA(qual,List)?!describe_list(&b,(List *)qual):describe_operand(&b,qual)<0) return -1;
         p->predicate=0;
     }
     if(IsA(native,IndexScan)) {
@@ -1788,18 +1864,23 @@ static int describe_tree(PlannerInfo *root,Plan *native,struct qp_plan *tree,boo
 
 /* Trace only plain column forwarding. Stateful/shared sources and computed
  * text remain eager; this analysis never guesses a functional dependency. */
+static bool text_origin(const struct qp_plan *,unsigned,int,unsigned *,unsigned *);
+static bool text_input_origin(const struct qp_plan *p,unsigned node,unsigned col,unsigned *scan,unsigned *column)
+{
+    const struct qp_node *n=&p->nodes[node];
+    if(n->kind==QP_SCAN) { *scan=node; *column=col; return true; }
+    if(n->kind!=QP_PROJECT && n->kind!=QP_JOIN && n->kind!=QP_INDEX_JOIN && n->kind!=QP_AGGREGATE && n->kind!=QP_SORT && n->kind!=QP_LIMIT) return false;
+    int child=n->left;
+    if(child<0) return false;
+    if((n->kind==QP_JOIN || n->kind==QP_INDEX_JOIN) && col>=p->nodes[child].expr.nout) { col-=p->nodes[child].expr.nout; child=n->right; }
+    if(child<0 || col>=p->nodes[child].expr.nout) return false;
+    return text_origin(p,child,p->nodes[child].expr.outputs[col].index,scan,column);
+}
 static bool text_origin(const struct qp_plan *p,unsigned node,int expr,unsigned *scan,unsigned *column)
 {
     if(node>=p->count || expr<0 || (unsigned)expr>=p->nodes[node].expr.nexprs) return false;
-    const struct qp_node *n=&p->nodes[node]; const struct qs_expr *e=&n->expr.exprs[expr];
-    if(e->op!=Q_COLUMN || e->column<0) return false;
-    if(n->kind==QP_SCAN) { *scan=node; *column=e->column; return true; }
-    if(n->kind!=QP_PROJECT && n->kind!=QP_JOIN && n->kind!=QP_INDEX_JOIN && n->kind!=QP_AGGREGATE && n->kind!=QP_SORT && n->kind!=QP_LIMIT) return false;
-    int child=n->left,col=e->column;
-    if(child<0) return false;
-    if((n->kind==QP_JOIN || n->kind==QP_INDEX_JOIN) && (unsigned)col>=p->nodes[child].expr.nout) { col-=p->nodes[child].expr.nout; child=n->right; }
-    if(child<0 || (unsigned)col>=p->nodes[child].expr.nout) return false;
-    return text_origin(p,child,p->nodes[child].expr.outputs[col].index,scan,column);
+    const struct qs_expr *e=&p->nodes[node].expr.exprs[expr];
+    return e->op==Q_COLUMN && e->column>=0 && text_input_origin(p,node,e->column,scan,column);
 }
 static bool text_uses(const struct qp_plan *p,unsigned node,int expr,unsigned scan,unsigned column)
 {
@@ -1811,7 +1892,7 @@ static bool text_uses(const struct qp_plan *p,unsigned node,int expr,unsigned sc
         (e->right>=0 && e->right<expr && text_uses(p,node,e->right,scan,column)) ||
         (e->otherwise>=0 && e->otherwise<expr && text_uses(p,node,e->otherwise,scan,column));
 }
-static void defer_output_text(struct qp_plan *p)
+static void defer_output_text(struct qp_plan *p,const uint64_t *text_inputs)
 {
     const struct qp_node *top=&p->nodes[p->root];
     /* A direct bounded ordering discards rows before output. Without it,
@@ -1830,16 +1911,23 @@ static void defer_output_text(struct qp_plan *p)
             bool used=false;
             for(unsigned at=0;at<p->count && !used;++at) {
                 const struct qp_node *n=&p->nodes[at]; const struct qs_plan *q=&n->expr;
-                used=text_uses(p,at,q->predicate,scan,column);
-                for(unsigned e=0;e<q->nexprs && !used;++e)
-                    if(q->exprs[e].op!=Q_COLUMN && q->exprs[e].op!=Q_CONST && q->exprs[e].op!=Q_AGGREF)
-                        used=text_uses(p,at,e,scan,column);
+                if(text_inputs) {
+                    for(uint64_t mask=text_inputs[at];mask && !used;mask&=mask-1) {
+                        unsigned origin,col;
+                        used=text_input_origin(p,at,__builtin_ctzll(mask),&origin,&col) && origin==scan && col==column;
+                    }
+                } else {
+                    used=text_uses(p,at,q->predicate,scan,column);
+                    for(unsigned e=0;e<q->nexprs && !used;++e)
+                        if(q->exprs[e].op!=Q_COLUMN && q->exprs[e].op!=Q_CONST && q->exprs[e].op!=Q_AGGREF)
+                            used=text_uses(p,at,e,scan,column);
+                }
                 for(unsigned a=0;a<q->naggs && !used;++a) if(q->aggs[a].kind!=Q_COUNT_STAR)
                     used=text_uses(p,at,q->aggs[a].expr,scan,column);
                 if(n->kind==QP_AGGREGATE) for(unsigned key=0;key<qp_group_keys(n) && !used;++key)
                     used=text_uses(p,at,q->keys[key],scan,column);
                 if(n->kind==QP_JOIN) {
-                    used|=text_uses(p,at,n->join_qual,scan,column);
+                    if(!text_inputs) used|=text_uses(p,at,n->join_qual,scan,column);
                     for(unsigned key=0;key<n->nkeys && !used;++key) {
                         unsigned sides[2]={n->left,n->right}; int cols[2]={n->left_keys[key],n->right_keys[key]};
                         for(unsigned side=0;side<2 && !used;++side)
@@ -1847,7 +1935,7 @@ static void defer_output_text(struct qp_plan *p)
                     }
                 }
                 if(n->kind==QP_INDEX_JOIN) {
-                    used|=text_uses(p,at,n->join_qual,scan,column);
+                    if(!text_inputs) used|=text_uses(p,at,n->join_qual,scan,column);
                     used|=text_uses(p,n->left,p->nodes[n->left].expr.outputs[n->left_keys[0]].index,scan,column);
                 }
                 if(n->kind==QP_SORT) for(unsigned key=0;key<q->norder && !used;++key)
@@ -1963,8 +2051,8 @@ Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
     }
     if(!prepared) { goto failed; }
     tree->root=result;
-    defer_output_text(tree);
-    pg_sina_refine_groups(tree);
+    defer_output_text(tree,NULL);
+    pg_sina_refine_groups(root,tree);
     pg_sina_read_resources(device);
     if(host_scan && native->parallel_aware &&
        (!IsA(native,SeqScan) || pg_sina_resources.cus<2)) { goto failed; }
@@ -2020,11 +2108,13 @@ Plan *pg_sina_describe_candidate(PlannerInfo *root,Plan *native,bool boundary,st
         int param=linitial_int(s->setParam); if(param<0 || param>=QP_PARAMS) return native;
         PlannerInfo *subroot=list_nth(root->glob->subroots,s->plan_id-1);
         Plan *chosen=pg_sina_prepare_candidate(subroot,list_nth(root->glob->subplans,s->plan_id-1),false);
-        int child=chosen?describe_tree(subroot,chosen,tree,false):-1; if(child<0) return native;
+        int child=chosen?describe_tree(subroot,chosen,tree,false,NULL):-1; if(child<0) return native;
         tree->param_nodes[param]=child; tree->nparams=Max(tree->nparams,(unsigned)param+1);
         unsigned init=tree->ninit++; tree->init_nodes[init]=child; tree->init_params[init]=param;
     }
-    int result=describe_tree(root,native,tree,boundary || root->parse->sortClause!=NIL);
+    uint64_t text_inputs[QP_NODES]={0};
+    bool late=IsA(native,Limit) && IsA(native->lefttree,Sort);
+    int result=describe_tree(root,native,tree,boundary || root->parse->sortClause!=NIL,late?text_inputs:NULL);
     if(pg_sina_planning) pg_sina_planning->describe+=pg_sina_planner_clock()-mark;
     if(result<0) return native;
     mark=pg_sina_planner_clock();
@@ -2039,7 +2129,8 @@ Plan *pg_sina_describe_candidate(PlannerInfo *root,Plan *native,bool boundary,st
     if(!has_scan) return native;
     if(pg_sina_planning) pg_sina_planning->mapping+=pg_sina_planner_clock()-mark;
     tree->root=result; mark=pg_sina_planner_clock();
-    pg_sina_refine_groups(tree);
+    if(late) defer_output_text(tree,text_inputs);
+    pg_sina_refine_groups(root,tree);
     if(pg_sina_planning) pg_sina_planning->refine+=pg_sina_planner_clock()-mark;
     pg_sina_read_resources(device);
     for(unsigned i=0;i<tree->count;++i) {
@@ -2093,6 +2184,16 @@ Plan *pg_sina_native_plan(Plan *plan)
      * Its child owns the expressions that prepare will copy. Replace, rather
      * than edit, entries because a parent's output may share this targetlist. */
     if(IsA(plan,CustomScan) && ((CustomScan *)plan)->methods==&native_methods) {
+        Plan *native=linitial(((CustomScan *)plan)->custom_plans);
+        if(!tlist_same_exprs(plan->targetlist,native->targetlist)) {
+            /* PG can project or reorder a CustomPath's output in place.
+             * Keep that projection above the borrowed child so positional
+             * GROUP BY and Sort references still address the right columns. */
+            Result *projection=makeNode(Result);
+            projection->plan=*plan; NodeSetTag(projection,T_Result);
+            projection->plan.lefttree=pg_sina_native_plan(pg_sina_native_wrapper(native));
+            return &projection->plan;
+        }
         List *labels=NIL; ListCell *c;
         foreach(c,plan->targetlist) {
             TargetEntry *label=flatCopyTargetEntry(lfirst(c)); label->expr=NULL;

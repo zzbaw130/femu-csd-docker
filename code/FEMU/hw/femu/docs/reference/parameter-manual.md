@@ -546,7 +546,6 @@ bbssd FTL, so sections 5 to 9 apply.
 | --- | --- | --- | --- |
 | `fdm_size` | MiB | > 0, required | functional data memory |
 | `nr_cu` | compute units | 1 to 64 | programs run on the first free unit |
-| `csf_runtime_scale` | multiplier | > 0 | host run time multiplier for programs that declare no run time |
 | `csd_program_dir` | host directory | | where shared-object and uBPF programs load from; unset allows only the built-in program type |
 
 ### KV

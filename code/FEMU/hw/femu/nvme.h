@@ -2203,7 +2203,6 @@ typedef struct CsdCtrlParams {
     uint8_t  nr_thread;
     uint64_t time_slice;
     uint64_t context_switch_time;
-    uint16_t csf_runtime_scale;
     char     *program_dir;       /* where a loadable program may come from */
 } CsdCtrlParams;
 
@@ -2479,6 +2478,13 @@ typedef struct FemuCtrl {
     uint64_t        pcie_tx_next_avail_time;
     uint64_t        pcie_rx_next_avail_time;
     pthread_spinlock_t pcie_lock;
+    /* Comparison with a TX queue fed the same foreground requests only. */
+    unsigned pcie_profile_users;
+    uint64_t pcie_tx_without_hpcp;
+    struct FemuLinkProfile {
+        uint64_t requests, affected, delay_ns, exposed_ns, max_exposed_ns;
+        uint64_t afdm_requests, afdm_affected, afdm_exposed_ns;
+    } pcie_profile;
     uint64_t        fw_cpu_ns;
     /* per-opcode firmware time; 0 takes fw_cpu_ns */
     uint64_t        fw_read_ns;
@@ -2873,6 +2879,9 @@ MemTxResult femu_dma_rw(FemuCtrl *n, dma_addr_t addr, void *buf,
                         dma_addr_t len, bool to_host);
 MemTxResult femu_dma_set(FemuCtrl *n, dma_addr_t addr, uint8_t c,
                          dma_addr_t len);
+/* Source is device-owned memory and cannot alias the guest destination. */
+MemTxResult femu_dma_write_population(FemuCtrl *n, dma_addr_t addr,
+                                     const void *buf, dma_addr_t len);
 
 static inline MemTxResult femu_dma_read(FemuCtrl *n, dma_addr_t addr,
                                         void *buf, dma_addr_t len)
@@ -2976,7 +2985,7 @@ void nvme_enqueue_ns_event(FemuCtrl *n, uint8_t event_type, uint8_t event_info,
                            uint8_t log_page, uint32_t nsid);
 void nvme_clear_ns_events(FemuCtrl *n, uint8_t event_type, uint32_t nsid);
 void nvme_post_cqes_io(void *opaque);
-void nvme_charge_link(FemuCtrl *n, NvmeRequest *req);
+void nvme_charge_link(FemuCtrl *n, NvmeRequest *req, bool hpcp);
 void *nvme_poller(void *arg);
 
 /* NVMe I/O */

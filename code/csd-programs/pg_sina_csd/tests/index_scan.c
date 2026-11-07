@@ -1,6 +1,7 @@
 /* Real PG12 page layouts: internal pivots, composite-prefix duplicates across
  * leaves, NULL/unmatched/negative keys and asynchronous page continuations. */
 #include "femu-csd-kernel.h"
+#include "csd-graph.h"
 #include "cs_workmem.h"
 #include "query.h"
 #include <assert.h>
@@ -73,7 +74,7 @@ static void check(function build,function probe,function close,function source,i
     if(filtered) p.join.predicate=2;
     p.aggs[0]=(struct qs_agg){.kind=Q_COUNT_STAR,.expr=-1}; p.aggs[1]=(struct qs_agg){.kind=Q_SUM,.expr=0};
     p.outputs[0]=(struct qs_output){.aggregate=1,.index=0}; p.outputs[1]=(struct qs_output){.aggregate=1,.index=1};
-    size_t io_bytes=QS_SORT_IO_BYTES+(size_t)QS_INDEX_CACHE*QS_PAGE;
+    size_t io_bytes=QS_INDEX_IO_BYTES;
     void *io=calloc(1,io_bytes); struct qs_join_control control={0};
     struct qs_chunk *c=calloc(1,qs_chunk_bytes(513,1)),*out=calloc(1,qs_chunk_bytes(256,3)); assert(c && out && io);
     c->capacity=513; c->ncols=1; c->rows=c->selected=513;
@@ -95,6 +96,11 @@ static void check(function build,function probe,function close,function source,i
     unsigned passes=large_index && !cancel && !retained_window?2:1;
     for(unsigned pass=0;pass<passes;++pass) {
     if(pass) reset_cache(&control,test_slot);
+    struct femu_graph_read_pool *pool=(void *)((char *)io+QS_INDEX_POOL_OFFSET);
+    if(pass) {
+        for(unsigned i=0;i<QS_INDEX_READS;++i) pool->readers[i]=1;
+        memset((char *)io+QS_SORT_IO_BYTES,0x5a,QS_INDEX_READS*QS_PAGE);
+    }
     do {
         int64_t value=probe(&a);
         if(value) { assert(cancel==2 && value==-2); failed=1; break; }
@@ -103,13 +109,18 @@ static void check(function build,function probe,function close,function source,i
             const struct qs_index_read *r=&task.index_reads[i];
             root_reads+=!r->heap && r->block==1; heap_reads+=r->heap!=0;
             if(retained_window) assert(!r->heap || (retained_window==2 && r->block==0));
-            assert(r->slot<QS_INDEX_CACHE && r->block<(r->heap?(large_index?256:2):4));
+            assert(r->slot<QS_INDEX_SLOTS && r->block<(r->heap?(large_index?256:2):4));
+            assert(!pool->readers[r->slot]);
             unsigned char *dest=(void *)((char *)io+QS_SORT_IO_BYTES+(size_t)r->slot*QS_PAGE);
             memcpy(dest,r->heap?heap[r->block]:index_pages[r->block],QS_PAGE);
             if(cancel==2 && !r->heap) w16(dest+18,0);
         }
         assert(++resumes<5000);
     } while(task.index_pending);
+    if(pass) {
+        const unsigned char *p=(const void *)((char *)io+QS_SORT_IO_BYTES);
+        for(unsigned i=0;i<QS_INDEX_READS*QS_PAGE;++i) assert(p[i]==0x5a);
+    }
     }
     expected_count*=passes; expected_sum*=passes;
     assert(cancel!=2 || failed);
@@ -143,7 +154,7 @@ static void ordered_scan(void *library,unsigned rows,int empty,int flags)
     void (*range)(struct qs_join_control *,unsigned,unsigned)=dlsym(library,"qs_index_scan_range"); assert(range);
     if(flags&16) range(&control,1,3);
     struct qs_chunk *out=calloc(1,qs_chunk_bytes(17,2)); assert(out); out->capacity=17; out->ncols=p.ncols;
-    char *io=calloc(1,QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE); assert(io);
+    char *io=calloc(1,QS_INDEX_IO_BYTES); assert(io);
     unsigned seen=0;
     for(unsigned iteration=0;;++iteration) {
         assert(iteration<10000);

@@ -1,0 +1,105 @@
+-- 现有对照实验的参数值（原 QGEN 种子 1489058137）。
+-- 在 Guest 中用 psql -d tpch_s<SF> -f tpch-parameters.psql -f queries/template/<编号>.sql 调用。
+-- -d 选择数据库。第一个 -f 载入既定参数，第二个 -f 执行指定模板。
+
+-- Q1
+\set q1_ship_delay_days 106
+
+-- Q2
+\set q2_part_size 19
+\set q2_type_suffix NICKEL
+\set q2_region 'MIDDLE EAST'
+
+-- Q3
+\set q3_market_segment MACHINERY
+\set q3_cutoff_date 1995-03-31
+
+-- Q4
+\set q4_start_date 1997-10-01
+
+-- Q5
+\set q5_region AFRICA
+\set q5_start_date 1995-01-01
+
+-- Q6
+\set q6_start_date 1995-01-01
+\set q6_discount 0.06
+\set q6_quantity_limit 25
+
+-- Q7
+\set q7_nation_1 KENYA
+\set q7_nation_2 JORDAN
+
+-- Q8
+\set q8_nation JORDAN
+\set q8_region 'MIDDLE EAST'
+\set q8_part_type 'SMALL POLISHED COPPER'
+
+-- Q9
+\set q9_part_name_word floral
+
+-- Q10
+\set q10_start_date 1993-03-01
+
+-- Q11
+\set q11_nation GERMANY
+\set q11_value_fraction 0.0001000000
+
+-- Q12
+\set q12_ship_mode_1 AIR
+\set q12_ship_mode_2 TRUCK
+\set q12_start_date 1996-01-01
+
+-- Q13
+\set q13_comment_word_1 pending
+\set q13_comment_word_2 accounts
+
+-- Q14
+\set q14_start_date 1996-05-01
+
+-- Q15
+\set q15_start_date 1993-04-01
+
+-- Q16
+\set q16_excluded_brand Brand#35
+\set q16_excluded_type_prefix 'LARGE POLISHED'
+\set q16_part_size_1 34
+\set q16_part_size_2 19
+\set q16_part_size_3 32
+\set q16_part_size_4 29
+\set q16_part_size_5 25
+\set q16_part_size_6 31
+\set q16_part_size_7 45
+\set q16_part_size_8 46
+
+-- Q17
+\set q17_brand Brand#54
+\set q17_container 'JUMBO BAG'
+
+-- Q18
+\set q18_total_quantity_limit 314
+
+-- Q19
+\set q19_small_brand Brand#42
+\set q19_medium_brand Brand#43
+\set q19_large_brand Brand#33
+\set q19_small_min_quantity 9
+\set q19_medium_min_quantity 19
+\set q19_large_min_quantity 28
+
+-- Q20
+\set q20_part_name_prefix goldenrod
+\set q20_start_date 1996-01-01
+\set q20_nation JORDAN
+
+-- Q21
+\set q21_nation MOROCCO
+
+-- Q22
+\set q22_phone_prefix_1 23
+\set q22_phone_prefix_2 21
+\set q22_phone_prefix_3 25
+\set q22_phone_prefix_4 32
+\set q22_phone_prefix_5 13
+\set q22_phone_prefix_6 29
+\set q22_phone_prefix_7 11

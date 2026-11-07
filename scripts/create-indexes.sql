@@ -1,3 +1,5 @@
+-- 在宿主机用 psql -d tpch_s<SF> -f scripts/create-indexes.sql 执行。
+-- -d 指定已导入数据的目标数据库，由 gen-pgdata.sh 在导入后调用。
 \timing on
 -- primary keys
 ALTER TABLE PART ADD PRIMARY KEY (P_PARTKEY);

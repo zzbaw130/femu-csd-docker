@@ -1001,6 +1001,27 @@ static void join_payload_resume(void)
     }
     puts("PASS 64 MiB vector/scalar Join payload resumes its selected pair after dictionary wait");
 }
+static void signed_probe_slots(void)
+{
+    int64_t input[]={INT64_MIN,-1,0,1,INT64_MAX,7,8};
+    struct projection_batch batch={.count=7};
+    struct qs_vector *keys=calloc(2,sizeof(*keys)); assert(keys);
+    batch.vectors=keys; batch.plan.exprs[0].type=Q_INTEGER;
+    batch.plan.outputs[1].index=1;
+    keys[0].kind=QS_NARROW;
+    memcpy(keys[0].narrow,input,sizeof(input));
+    keys[0].nulls[5]=1; keys[1].errors[6]=1;
+    struct qp_node join={.nkeys=1};
+    struct hash_probe_batch probe;
+    assert(hash_narrow_probe_slots(&join,&batch,256,3,&probe));
+    for(unsigned i=0;i<5;++i) {
+        struct qs_cell row={.value=input[i]};
+        assert(probe.matches[i]==(row_hash(&join,&row,0)&255));
+    }
+    assert(probe.matches[5]==UINT_MAX && !probe.errors[5]);
+    assert(probe.matches[6]==UINT_MAX && probe.errors[6]);
+    free(keys);
+}
 /* Hash-cache collisions, signed sentinels and failed insertion must never
  * manufacture a successful existence match. Use the same bounded allocator. */
 static void existence_cache(void)
@@ -1018,24 +1039,28 @@ static void existence_cache(void)
     right->exprs[0].type=Q_INTEGER;
     struct operator_state *o=&s.nodes[0]; o->hash_capacity=128; o->hash_cache_slots=8;
     o->hash_data=cs_work_calloc(context,128,hash_row_bytes(right)+12); assert(o->hash_data);
-    o->hash_cache=cs_work_calloc(context,8,sizeof(*o->hash_cache)); assert(o->hash_cache);
+    o->hash_cache=cs_work_calloc(context,10,sizeof(*o->hash_cache)); assert(o->hash_cache);
     hash_reindex(&s,0);
     int64_t special[]={-1,INT64_MIN,INT64_MAX,0};
     for(unsigned round=0;round<3;++round) for(unsigned k=0;k<68;++k) {
         struct qs_cell row[1]={{.value=k<4?special[k]:(int64_t)k-36}};
         unsigned previous=o->hash_rows;
-        assert(hash_insert_exists(&s,join,o,right,row,row_hash(join,row,1))==1);
+        assert(hash_insert_exists(&s,join,o,right,row)==1);
         if(round) assert(o->hash_rows==previous);
     }
     unsigned before=o->hash_rows;
-    struct qs_cell row[1]={{.value=99999999}};
-    o->hash_rows=o->hash_capacity-1;
-    assert(hash_insert_exists(&s,join,o,right,row,row_hash(join,row,1))==0);
-    o->hash_rows=before;
-    assert(hash_insert_exists(&s,join,o,right,row,row_hash(join,row,1))==1);
-    assert(o->hash_rows==before+1);
-    assert(hash_insert_exists(&s,join,o,right,row,row_hash(join,row,1))==1);
-    assert(o->hash_rows==before+1);
+    /* The last bitmap key and the first tagged key both need a successful
+     * insertion before subsequent rows may be skipped. */
+    for(int key=127;key<=128;++key) {
+        struct qs_cell row[1]={{.value=key}};
+        o->hash_rows=o->hash_capacity-1;
+        assert(hash_insert_exists(&s,join,o,right,row)==0);
+        o->hash_rows=before;
+        assert(hash_insert_exists(&s,join,o,right,row)==1);
+        assert(o->hash_rows==++before);
+        assert(hash_insert_exists(&s,join,o,right,row)==1);
+        assert(o->hash_rows==before);
+    }
     free(s.plan); assert(!cs_work_end(context));
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
 }
@@ -1149,6 +1174,7 @@ int main(int argc,char **argv)
     assert(argc==1 || (argc==2 && (!strcmp(argv[1],"--aggregate") || !strcmp(argv[1],"--hash-aggregate") || !strcmp(argv[1],"--join") || !strcmp(argv[1],"--pipeline"))));
     int aggregates=argc==2 && !strcmp(argv[1],"--aggregate"),hashed=argc==2 && !strcmp(argv[1],"--hash-aggregate");
     int joining=argc==2 && !strcmp(argv[1],"--join"),pipeline=argc==2 && !strcmp(argv[1],"--pipeline");
+    if(joining) signed_probe_slots();
     assert(!cs_work_init(BUDGET));
     cs_work_context *ctx=cs_work_begin_limit(BUDGET); assert(ctx);
     struct qs_dictionary *d=qs_dictionary_create(ctx); assert(d);

@@ -18200,6 +18200,11 @@ static const char femu_csd_slow_src[] =
     "    nanosleep(&t, 0);\n"
     "    return 7;\n"
     "}\n"
+    "long long cpu_work(struct args *a) {\n"
+    " struct timespec begin,now; clock_gettime(CLOCK_THREAD_CPUTIME_ID,&begin);\n"
+    " do { clock_gettime(CLOCK_THREAD_CPUTIME_ID,&now); }\n"
+    " while((now.tv_sec-begin.tv_sec)*1000000000LL+now.tv_nsec-begin.tv_nsec<a->p1*1000000LL);\n"
+    " return 7; }\n"
     "long long result64(struct args *a) { return a->p1; }\n"
     "long long graph_data(struct args *a) { return a->dl ? *(unsigned char *)a->d+a->dl : 0; }\n"
     "long long graph_add(struct args *a) { *(long long *)a->a[0] += a->p1; return 7; }\n"
@@ -18610,27 +18615,32 @@ static void femu_test_csd_exec_graph(void *obj,void *data,QGuestAllocator *alloc
     g_assert_cmpint(femu_graph_run(&c,buf,&graph,sizeof(graph),NULL),==,NVME_INVALID_FIELD);
 
     /* Ordinary namespace LOAD -> CSF -> STORE, all using the same AFDM. */
+    uint32_t large = femu_graph_alloc(&c, 256 * 1024);
     struct {
         struct femu_graph_header h;
         struct femu_graph_node n[3];
-        struct femu_graph_range load;
+        struct femu_graph_range load[2];
         uint32_t mr[8];
         struct femu_graph_range store;
     } io={.h={.count=cpu_to_le32(3),.session=cpu_to_le64(session),.cookie=cpu_to_le64(4)}};
     io.h.bytes=cpu_to_le32(sizeof(io));
-    io.load=(struct femu_graph_range){cpu_to_le32(1),cpu_to_le32(8),0};
+    io.load[0]=(struct femu_graph_range){cpu_to_le32(1),cpu_to_le32(256),0};
+    io.load[1]=(struct femu_graph_range){cpu_to_le32(1),cpu_to_le32(256),cpu_to_le64(256)};
     io.store=(struct femu_graph_range){cpu_to_le32(1),cpu_to_le32(8),cpu_to_le64(8)};
-    io.mr[2]=cpu_to_le32(id);
-    io.n[0]=(struct femu_graph_node){.operation=cpu_to_le32(FEMU_GRAPH_LOAD),.afdm=cpu_to_le32(id),
-        .count=cpu_to_le32(1),.payload=cpu_to_le32(offsetof(typeof(io),load))};
+    io.mr[2]=cpu_to_le32(large);
+    io.n[0]=(struct femu_graph_node){.operation=cpu_to_le32(FEMU_GRAPH_LOAD),.afdm=cpu_to_le32(large),
+        .count=cpu_to_le32(2),.payload=cpu_to_le32(offsetof(typeof(io),load))};
     io.n[1]=(struct femu_graph_node){.operation=cpu_to_le32(FEMU_GRAPH_EXEC),.program=cpu_to_le32(2),
         .dependencies=cpu_to_le64(1),.count=cpu_to_le32(1),.cparam1=cpu_to_le64(17),
         .payload=cpu_to_le32(offsetof(typeof(io),mr))};
-    io.n[2]=(struct femu_graph_node){.operation=cpu_to_le32(FEMU_GRAPH_STORE),.afdm=cpu_to_le32(id),
+    io.n[2]=(struct femu_graph_node){.operation=cpu_to_le32(FEMU_GRAPH_STORE),.afdm=cpu_to_le32(large),
         .dependencies=cpu_to_le64(2),.count=cpu_to_le32(1),.payload=cpu_to_le32(offsetof(typeof(io),store))};
     uint64_t *words=(void *)control; memset(control,0,sizeof(control)); words[0]=100;
     femu_graph_afdm(&c,buf,id,control,true);
     g_assert_cmpint(femu_csd_copy(&c,FEMU_CSD_AFDM_TO_NVM,id,0,0,7),==,NVME_SUCCESS);
+    words[0]=200;
+    femu_graph_afdm(&c,buf,id,control,true);
+    g_assert_cmpint(femu_csd_copy(&c,FEMU_CSD_AFDM_TO_NVM,id,0,256,7),==,NVME_SUCCESS);
     int64_t started=g_get_monotonic_time();
     g_assert_cmpint(femu_graph_run(&c,buf,&io,sizeof(io),&value),==,NVME_SUCCESS);
     g_assert_cmpint(g_get_monotonic_time()-started,>=,60000); /* 20 ms read + 50 ms write */
@@ -18638,6 +18648,12 @@ static void femu_test_csd_exec_graph(void *obj,void *data,QGuestAllocator *alloc
     memset(control,0,sizeof(control)); femu_graph_afdm(&c,buf,id,control,true);
     g_assert_cmpint(femu_csd_copy(&c,FEMU_CSD_NVM_TO_AFDM,id,0,8,7),==,NVME_SUCCESS);
     femu_graph_afdm(&c,buf,id,control,false); g_assert_cmpuint(words[0],==,117);
+    NvmeCmd read_second = { .opcode=FEMU_CSD_READ_AFDM, .nsid=cpu_to_le32(1),
+        .cdw10=cpu_to_le32(128 * 1024), .cdw12=cpu_to_le32(sizeof(control)),
+        .cdw14=cpu_to_le32(large), .dptr={.prp1=cpu_to_le64(buf)} };
+    g_assert_cmpint(femu_io(&c, &read_second), ==, NVME_SUCCESS);
+    qtest_memread(c.pdev->bus->qts, buf, control, sizeof(control));
+    g_assert_cmpuint(words[0], ==, 200);
 
     /* The last dependency bit and a descriptor crossing a PRP page. */
     struct {struct femu_graph_header h; struct femu_graph_node n[64];} maximum={
@@ -18685,13 +18701,21 @@ static void femu_test_csd_cache_dma(void *obj, void *data, QGuestAllocator *allo
         g_assert_cmpint(femu_csd_copy(&c,FEMU_CSD_AFDM_TO_NVM,id,0,i*8,7),==,NVME_SUCCESS);
     }
     struct femu_cache_rx *rx=g_new0(struct femu_cache_rx,1);
-    uint64_t descriptors=guest_alloc(alloc,4096),payload=guest_alloc(alloc,sizeof(*rx));
-    uint64_t prps=guest_alloc(alloc,4096),addresses[32]={0},dest[FEMU_CACHE_RX_SLOTS];
+    uint64_t descriptors=guest_alloc(alloc,FEMU_CACHE_DESCRIPTOR_BYTES);
+    uint64_t payload=guest_alloc(alloc,sizeof(*rx)),resident=guest_alloc(alloc,4096);
+    uint64_t prps=guest_alloc(alloc,4096),addresses[512]={0},dest[FEMU_CACHE_RX_SLOTS];
     rx->descriptor_dma=cpu_to_le64(descriptors);
+    rx->resident_dma=cpu_to_le64(resident);
+    rx->resident_bytes=cpu_to_le64(1);
+    qtest_memset(qts,resident,0,4096);
+    qtest_memset(qts,descriptors,0,FEMU_CACHE_DESCRIPTOR_BYTES);
     for(unsigned i=0;i<FEMU_CACHE_RX_SLOTS;i++) {
         dest[i]=guest_alloc(alloc,4096);
-        for(unsigned j=0;j<FEMU_CACHE_RX_PAGES;j++) rx->pages[i][j]=cpu_to_le64(dest[i]);
+        unsigned first=FEMU_CACHE_SLOT_OFFSET(i)/FEMU_CACHE_PAGE_BYTES;
+        unsigned count=FEMU_CACHE_SLOT_BYTES(i)/FEMU_CACHE_PAGE_BYTES;
+        for(unsigned j=0;j<count;j++) rx->pages[first+j]=cpu_to_le64(dest[i]);
     }
+    g_assert_cmpuint(DIV_ROUND_UP(sizeof(*rx),4096)-1,<=,G_N_ELEMENTS(addresses));
     for(unsigned i=1;i<DIV_ROUND_UP(sizeof(*rx),4096);i++) addresses[i-1]=cpu_to_le64(payload+i*4096);
     qtest_memwrite(qts,prps,addresses,sizeof(addresses));
     qtest_memwrite(qts,payload,rx,sizeof(*rx));
@@ -18709,21 +18733,25 @@ static void femu_test_csd_cache_dma(void *obj, void *data, QGuestAllocator *allo
     /* Full FDM still permits direct DMA by holding the original input only
      * until transmission ends, without allocating hidden extra FDM. */
     uint32_t padding=femu_graph_alloc(&c,16*1024*1024-4096);
-    for(unsigned i=0;i<FEMU_CACHE_RX_SLOTS;i++) {
-        graph.h.cookie=cpu_to_le64(i+1); graph.range.lba=cpu_to_le64((i%2)*8);
+    for(unsigned i=FEMU_CACHE_LARGE_SLOTS;i<FEMU_CACHE_RX_SLOTS;i++) {
+        unsigned small=i-FEMU_CACHE_LARGE_SLOTS;
+        graph.h.cookie=cpu_to_le64(small+1); graph.range.lba=cpu_to_le64((small%2)*8);
         int64_t begin=g_get_monotonic_time();
         g_assert_cmpint(femu_graph_run(&c,buf,&graph,sizeof(graph),NULL),==,NVME_SUCCESS);
-        if(data && !i) g_assert_cmpint(g_get_monotonic_time()-begin,>=,4096);
+        if(data && !small) g_assert_cmpint(g_get_monotonic_time()-begin,>=,4096);
+        /* The graph completion releases its FDM input independently of
+         * descriptor publication. Reuse it before checking the Guest slot. */
+        femu_graph_afdm(&c,buf,id,expected[1-small%2],true);
         uint64_t address=descriptors+i*sizeof(struct femu_cache_slot);
         int64_t deadline=g_get_monotonic_time()+FEMU_POLL_LIMIT_MS*1000;
         while(!qtest_readq(qts,address)) g_assert_cmpint(g_get_monotonic_time(),<,deadline);
         struct femu_cache_slot slot;
         qtest_memread(qts,address,&slot,sizeof(slot));
-        g_assert_cmpuint(le64_to_cpu(slot.cookie),==,i+1);
+        g_assert_cmpuint(le64_to_cpu(slot.cookie),==,small+1);
         g_assert_cmpuint(le64_to_cpu(slot.bytes),==,4096);
         qtest_memread(qts,dest[i],actual,sizeof(actual));
-        g_assert_cmpmem(actual,sizeof(actual),expected[i%2],sizeof(actual));
-        if(!i) {
+        g_assert_cmpmem(actual,sizeof(actual),expected[small%2],sizeof(actual));
+        if(!small) {
             cmd=(NvmeCmd){.opcode=FEMU_CSD_DEALLOC,.nsid=cpu_to_le32(1),.cdw10=cpu_to_le32(padding)};
             femu_submit(&c,&c.io,&cmd);
             g_assert_cmpint(FEMU_SC(femu_complete(&c,&c.io,NULL,NULL)),==,NVME_SUCCESS);
@@ -18732,15 +18760,16 @@ static void femu_test_csd_cache_dma(void *obj, void *data, QGuestAllocator *allo
     /* A full host ring drops optional refill, rather than stalling LOAD. */
     graph.h.cookie=cpu_to_le64(9); graph.range.lba=0;
     g_assert_cmpint(femu_graph_run(&c,buf,&graph,sizeof(graph),NULL),==,NVME_SUCCESS);
-    qtest_memread(qts,dest[1],actual,sizeof(actual));
+    qtest_memread(qts,dest[FEMU_CACHE_LARGE_SLOTS+1],actual,sizeof(actual));
     g_assert_cmpmem(actual,sizeof(actual),expected[1],sizeof(actual));
     /* Return a credit through shared memory, with no NVMe ACK or Read. */
-    qtest_writeq(qts,descriptors,0);
+    uint64_t first_small=descriptors+FEMU_CACHE_LARGE_SLOTS*sizeof(struct femu_cache_slot);
+    qtest_writeq(qts,first_small,0);
     graph.h.cookie=cpu_to_le64(10);
     g_assert_cmpint(femu_graph_run(&c,buf,&graph,sizeof(graph),NULL),==,NVME_SUCCESS);
     int64_t deadline=g_get_monotonic_time()+FEMU_POLL_LIMIT_MS*1000;
-    while(!qtest_readq(qts,descriptors)) g_assert_cmpint(g_get_monotonic_time(),<,deadline);
-    g_assert_cmpuint(qtest_readq(qts,descriptors+offsetof(struct femu_cache_slot,cookie)),==,10);
+    while(!qtest_readq(qts,first_small)) g_assert_cmpint(g_get_monotonic_time(),<,deadline);
+    g_assert_cmpuint(qtest_readq(qts,first_small+offsetof(struct femu_cache_slot,cookie)),==,10);
     for(unsigned i=0;i<FEMU_CACHE_RX_SLOTS;i++)
         qtest_writeq(qts,descriptors+i*sizeof(struct femu_cache_slot),0);
     /* A reentrant CSF reads three times into the same AFDM. Every DMA must
@@ -18794,7 +18823,7 @@ static void femu_test_csd_cache_dma(void *obj, void *data, QGuestAllocator *allo
     /* A published LOAD can name a dependent CSF that cancellation never
      * starts. That consumer must not pin the graph and its AFDM forever. */
     uint32_t control=femu_graph_alloc(&c,4096);
-    qtest_memset(qts,descriptors,0,4096);
+    qtest_memset(qts,descriptors,0,FEMU_CACHE_DESCRIPTOR_BYTES);
     struct {
         struct femu_graph_header h;
         struct femu_graph_node n[3];
@@ -18843,13 +18872,70 @@ static void femu_test_csd_cache_dma(void *obj, void *data, QGuestAllocator *allo
     g_assert_cmpint(FEMU_SC(femu_complete(&c,&c.io,NULL,NULL)),==,NVME_SUCCESS);
     /* After STOP returns, even delayed transfer completion cannot touch the
      * registered memory. The Guest is now allowed to unmap/reuse it. */
-    qtest_memset(qts,descriptors,0,4096);
+    qtest_memset(qts,descriptors,0,FEMU_CACHE_DESCRIPTOR_BYTES);
     for(unsigned i=0;i<FEMU_CACHE_RX_SLOTS;i++) qtest_memset(qts,dest[i],0x5a,4096);
     g_usleep(10000);
     for(unsigned i=0;i<FEMU_CACHE_RX_SLOTS;i++) {
         g_assert_cmpuint(qtest_readq(qts,descriptors+i*sizeof(struct femu_cache_slot)),==,0);
         qtest_memread(qts,dest[i],actual,sizeof(actual));
         for(unsigned j=0;j<sizeof(actual);j++) g_assert_cmpuint(actual[j],==,0x5a);
+    }
+    if (!data) {
+        unsigned heads[FEMU_CACHE_READY_QUEUES] = {0};
+        cmd = (NvmeCmd){
+            .opcode=FEMU_CACHE_CONTROL,.nsid=cpu_to_le32(1),
+            .cdw10=cpu_to_le32(FEMU_CACHE_RX_REGISTER),.cdw11=cpu_to_le32(session),
+            .cdw12=cpu_to_le32(FEMU_CACHE_RX_QUEUED),
+            .dptr={.prp1=cpu_to_le64(payload),.prp2=cpu_to_le64(prps)},
+        };
+        femu_submit(&c,&c.io,&cmd);
+        g_assert_cmpint(FEMU_SC(femu_complete(&c,&c.io,NULL,NULL)),==,NVME_SUCCESS);
+        /* With two DMA workers, hold the even queues' small slots to force
+         * the dispatcher to use the other worker on consecutive LOADs. */
+        for (unsigned i = FEMU_CACHE_LARGE_SLOTS; i < FEMU_CACHE_RX_SLOTS; i++) {
+            if ((i % FEMU_CACHE_READY_QUEUES) % 2 == 0)
+                qtest_writeq(qts, descriptors + i * sizeof(struct femu_cache_slot), 1);
+        }
+        for (unsigned i = 0; i < 2 * FEMU_CACHE_RX_SLOTS; i++) {
+            graph.h.cookie = cpu_to_le64(100+i);
+            graph.range.lba = cpu_to_le64((i%2)*8);
+            g_assert_cmpint(femu_graph_run(&c,buf,&graph,sizeof(graph),NULL),==,NVME_SUCCESS);
+            deadline = g_get_monotonic_time()+FEMU_POLL_LIMIT_MS*1000;
+            unsigned slot = FEMU_CACHE_RX_SLOTS;
+            do {
+                for (unsigned group = 0; group < FEMU_CACHE_READY_QUEUES; group++) {
+                    uint64_t queue = descriptors + FEMU_CACHE_READY_OFFSET +
+                                     group * sizeof(struct femu_cache_ready_queue);
+                    unsigned head = heads[group];
+                    unsigned tail = qtest_readl(qts, queue);
+                    if (head == tail) continue;
+                    slot = qtest_readl(qts, queue + offsetof(struct femu_cache_ready_queue, slots)
+                                           + head * sizeof(uint32_t));
+                    g_assert_cmpuint(slot, <, FEMU_CACHE_RX_SLOTS);
+                    g_assert_cmpuint(slot % FEMU_CACHE_READY_QUEUES, ==, group);
+                    if (i < 2) g_assert_cmpuint(group % 2, ==, 1);
+                    heads[group] = (head + 1) % FEMU_CACHE_READY_CAPACITY;
+                    g_assert_cmpuint(tail, ==, heads[group]);
+                    break;
+                }
+                g_assert_cmpint(g_get_monotonic_time(),<,deadline);
+            } while (slot == FEMU_CACHE_RX_SLOTS);
+            uint64_t address = descriptors + slot * sizeof(struct femu_cache_slot);
+            g_assert_cmpuint(qtest_readq(qts,address),==,1);
+            g_assert_cmpuint(qtest_readq(qts,address+offsetof(struct femu_cache_slot,cookie)),==,100+i);
+            qtest_memread(qts,dest[slot],actual,sizeof(actual));
+            g_assert_cmpmem(actual,sizeof(actual),expected[i%2],sizeof(actual));
+            qtest_writeq(qts,address,0);
+            if (i == 1) {
+                for (unsigned j = FEMU_CACHE_LARGE_SLOTS; j < FEMU_CACHE_RX_SLOTS; j++) {
+                    if ((j % FEMU_CACHE_READY_QUEUES) % 2 == 0)
+                        qtest_writeq(qts, descriptors + j * sizeof(struct femu_cache_slot), 0);
+                }
+            }
+        }
+        cmd.cdw10=cpu_to_le32(FEMU_CACHE_RX_STOP);
+        femu_submit(&c,&c.io,&cmd);
+        g_assert_cmpint(FEMU_SC(femu_complete(&c,&c.io,NULL,NULL)),==,NVME_SUCCESS);
     }
     if(GPOINTER_TO_INT(data)==2) {
         /* Reset while a slow shared-link completion is pending. Registered
@@ -18864,7 +18950,7 @@ static void femu_test_csd_cache_dma(void *obj, void *data, QGuestAllocator *allo
         g_usleep(1000);
         femu_disable(&c);
         femu_queue_free(&c,&c.io);
-        qtest_memset(qts,descriptors,0,4096);
+        qtest_memset(qts,descriptors,0,FEMU_CACHE_DESCRIPTOR_BYTES);
         for(unsigned i=0;i<FEMU_CACHE_RX_SLOTS;i++) qtest_memset(qts,dest[i],0x5a,4096);
         g_usleep(10000);
         femu_enable(&c,c.pdev,alloc);
@@ -19173,6 +19259,103 @@ static void femu_test_csd_exec_concurrency(void *obj, void *data,
 
     guest_free(alloc, ranges);
     guest_free(alloc, buf);
+    femu_csd_remove_slow();
+}
+
+/* Run explicitly with FEMU_CU_CGROUP pointing at two prepared CPU groups.
+ * Real cgroup accounting validates actual work, not simulated completion. */
+static uint64_t femu_cu_counter(const char *group, unsigned cu, const char *file,
+                                const char *field)
+{
+    g_autofree char *path = g_strdup_printf("%s/cu%u/%s", group, cu, file);
+    g_autofree char *text = NULL;
+    const char *value;
+    g_assert_true(g_file_get_contents(path, &text, NULL, NULL));
+    value = field ? strstr(text, field) : text;
+    g_assert_nonnull(value);
+    return g_ascii_strtoull(value + (field ? strlen(field) : 0), NULL, 10);
+}
+
+static void femu_test_csd_cu_cpu_quota(void *obj, void *data,
+                                      QGuestAllocator *alloc)
+{
+    const char *group = getenv("FEMU_CU_CGROUP");
+    QFemu *femu = obj;
+    QTestState *qts = femu->dev.bus->qts;
+    FemuCtrlState c = { 0 };
+    uint64_t before[2], throttled[2], cpu[2];
+    unsigned tids[2], others = 0;
+    uint32_t id;
+    NvmeCmd cmd = { .opcode = FEMU_CSD_ALLOC_FDM,
+        .nsid = cpu_to_le32(1), .cdw10 = cpu_to_le32(4096) };
+    uint64_t buf = guest_alloc(alloc, 4096), ranges = guest_alloc(alloc, 4096);
+
+    if (!group || !*group) {
+        g_test_skip("set FEMU_CU_CGROUP to two prepared CPU cgroups");
+        return;
+    }
+    if (!femu_csd_build_slow()) {
+        femu_csd_remove_slow();
+        g_test_skip("no host C compiler");
+        return;
+    }
+    femu_enable(&c, &femu->dev, alloc);
+    femu_create_io_queues(&c);
+    for (unsigned i = 0; i < 2; i++) {
+        tids[i] = femu_cu_counter(group, i, "tasks", NULL);
+        g_assert_cmpuint(tids[i], >, 0);
+        g_autofree char *path = g_strdup_printf("/proc/%d/task/%u/comm",
+                                                qtest_pid(qts), tids[i]);
+        /* Linux comm names are optional unless debug-threads is enabled. */
+        g_assert_true(g_file_test(path, G_FILE_TEST_EXISTS));
+        before[i] = femu_cu_counter(group, i, "cpuacct.usage", NULL);
+        throttled[i] = femu_cu_counter(group, i, "cpu.stat", "nr_throttled ");
+    }
+    g_assert_cmpuint(tids[0], !=, tids[1]);
+    /* No other QEMU thread may enter either CU's group. */
+    g_autofree char *tasks = g_strdup_printf("/proc/%d/task", qtest_pid(qts));
+    GDir *dir = g_dir_open(tasks, 0, NULL);
+    const char *entry;
+    g_assert_nonnull(dir);
+    while ((entry = g_dir_read_name(dir))) {
+        unsigned tid = g_ascii_strtoull(entry, NULL, 10);
+        if (tid == tids[0] || tid == tids[1]) {
+            continue;
+        }
+        g_autofree char *path = g_strdup_printf("%s/%s/cgroup", tasks, entry);
+        g_autofree char *text = NULL;
+        g_assert_true(g_file_get_contents(path, &text, NULL, NULL));
+        g_assert_null(strstr(text, "/cu0\n"));
+        g_assert_null(strstr(text, "/cu1\n"));
+        others++;
+    }
+    g_dir_close(dir);
+    g_assert_cmpuint(others, >=, 4); /* FTL, poller, DMA and QEMU main. */
+    g_assert_cmpint(femu_csd_load(&c, buf, "slow.so", "cpu_work"), ==, NVME_SUCCESS);
+    g_assert_cmpint(femu_csd_activate(&c, 1), ==, NVME_SUCCESS);
+    femu_submit(&c, &c.io, &cmd);
+    g_assert_cmpint(FEMU_SC(femu_complete(&c, &c.io, NULL, &id)), ==, NVME_SUCCESS);
+    int64_t start = g_get_monotonic_time();
+    femu_csd_submit_exec(&c, &c.io, ranges, id, 200);
+    femu_csd_submit_exec(&c, &c.io, ranges + 2048, id, 200);
+    femu_csd_expect_exec(&c, &c.io);
+    femu_csd_expect_exec(&c, &c.io);
+    int64_t wall = g_get_monotonic_time() - start;
+    uint64_t quota = femu_cu_counter(group, 0, "cpu.cfs_quota_us", NULL);
+    for (unsigned i = 0; i < 2; i++) {
+        cpu[i] = femu_cu_counter(group, i, "cpuacct.usage", NULL) - before[i];
+        g_assert_cmpuint(cpu[i], >=, 190000000);
+        uint64_t count = femu_cu_counter(group, i, "cpu.stat", "nr_throttled ") - throttled[i];
+        if (quota != UINT64_MAX) {
+            g_assert_cmpuint(count, >, 0);
+        }
+        g_test_message("CU%u tid=%u quota=%" PRIu64 " cpu_ms=%.3f throttles=%" PRIu64,
+                       i, tids[i], quota, cpu[i] / 1000000.0, count);
+    }
+    g_test_message("two concurrent 200ms CPU calls: wall_ms=%.3f, other QEMU threads=%u",
+                   wall / 1000.0, others);
+    femu_queue_free(&c, &c.io);
+    femu_disable(&c);
     femu_csd_remove_slow();
 }
 
@@ -37225,11 +37408,11 @@ static void femu_register_nodes(void)
                                         g_get_tmp_dir(), (int)getpid());
     qos_add_test("csd-exec-graph", "femu", femu_test_csd_exec_graph,
         &(QOSGraphTestOptions){.edge.extra_device_opts=g_strdup_printf(
-            "femu_mode=4,fdm_size=16,nr_cu=2,csf_runtime_scale=1,pg_rd_lat=20000000,pg_wr_lat=50000000,csd_program_dir=%s",
+            "femu_mode=4,fdm_size=16,nr_cu=2,pg_rd_lat=20000000,pg_wr_lat=50000000,csd_program_dir=%s",
             femu_csd_slow_dir)});
     qos_add_test("csd-exec-graph-read-batch", "femu", femu_test_csd_graph_read_batch,
         &(QOSGraphTestOptions){.edge.extra_device_opts=g_strdup_printf(
-            "femu_mode=4,fdm_size=16,nr_cu=2,csf_runtime_scale=1,pg_rd_lat=20000000,pg_wr_lat=1000,csd_program_dir=%s",
+            "femu_mode=4,fdm_size=16,nr_cu=2,pg_rd_lat=20000000,pg_wr_lat=1000,csd_program_dir=%s",
             femu_csd_slow_dir)});
     qos_add_test("csd-cache-dma", "femu", femu_test_csd_cache_dma,
         &(QOSGraphTestOptions){.edge.extra_device_opts=g_strdup_printf(
@@ -37249,15 +37432,15 @@ static void femu_register_nodes(void)
             femu_csd_slow_dir)});
     qos_add_test("csd-exec-graph-spill", "femu", femu_test_csd_graph_spill,
         &(QOSGraphTestOptions){.edge.extra_device_opts=g_strdup_printf(
-            "femu_mode=4,fdm_size=16,nr_cu=2,csd_spill_size_mb=1,csf_runtime_scale=1,csd_program_dir=%s",
+            "femu_mode=4,fdm_size=16,nr_cu=2,csd_spill_size_mb=1,csd_program_dir=%s",
             femu_csd_slow_dir)});
     qos_add_test("csd-exec-graph-spill-4k", "femu", femu_test_csd_graph_spill,
         &(QOSGraphTestOptions){.edge.extra_device_opts=g_strdup_printf(
-            "femu_mode=4,fdm_size=16,nr_cu=2,lba_index=3,csd_spill_size_mb=1,csf_runtime_scale=1,csd_program_dir=%s",
+            "femu_mode=4,fdm_size=16,nr_cu=2,lba_index=3,csd_spill_size_mb=1,csd_program_dir=%s",
             femu_csd_slow_dir)});
     qos_add_test("csd-exec-graph-cancel", "femu", femu_test_csd_graph_cancel,
         &(QOSGraphTestOptions){.edge.extra_device_opts=g_strdup_printf(
-            "femu_mode=4,fdm_size=16,nr_cu=2,csf_runtime_scale=1,csd_program_dir=%s",
+            "femu_mode=4,fdm_size=16,nr_cu=2,csd_program_dir=%s",
             femu_csd_slow_dir)});
     qos_add_test("csd-runtime-floor", "femu", femu_test_csd_runtime_floor,
                  &(QOSGraphTestOptions) {
@@ -37265,6 +37448,12 @@ static void femu_register_nodes(void)
             "femu_mode=4,fdm_size=16,nr_cu=1,csd_program_dir=%s",
             femu_csd_slow_dir),
         .before = femu_csd_warn_before,
+    });
+    qos_add_test("csd-cu-cpu-quota", "femu", femu_test_csd_cu_cpu_quota,
+                 &(QOSGraphTestOptions) {
+        .edge.extra_device_opts = g_strdup_printf(
+            "femu_mode=4,fdm_size=16,nr_cu=2,csd_program_dir=%s",
+            femu_csd_slow_dir),
     });
     qos_add_test("csd-info-result64", "femu", femu_test_csd_info_result64,
                  &(QOSGraphTestOptions) {
@@ -37276,7 +37465,7 @@ static void femu_register_nodes(void)
                  femu_test_csd_exec_concurrency,
                  &(QOSGraphTestOptions) {
         .edge.extra_device_opts = g_strdup_printf(
-            "femu_mode=4,fdm_size=16,nr_cu=2,csf_runtime_scale=1,"
+            "femu_mode=4,fdm_size=16,nr_cu=2,"
             "csd_program_dir=%s", femu_csd_slow_dir),
     });
     qos_add_test("power-loss-mmio-cut", "femu", femu_test_power_mmio_cut,

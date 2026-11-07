@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# 调用方式为 bash scripts/pin-pgdata.sh <SF> [pgdata_root]。
+# SF 指定 tpch_s<SF>，pgdata_root 默认为 /data/dengyao/pgdata。
+# 冻结并核对表页后关闭数据库，输出 data/tpch_s<SF>.tar。需安装 pg_visibility。
 
 ROOT=$(dirname $(realpath $0))
 SF=${1:?usage: $0 <sf> [pgdata_root]}

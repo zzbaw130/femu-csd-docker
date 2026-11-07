@@ -275,7 +275,6 @@ Devices:
 | `nr_thread` | `uint8` | `4` | No effect, kept for CEMU compatibility; CSD still refuses 0. A value other than the default warns at realize |
 | `time_slice` | `uint64` | `200000` | No effect, kept for CEMU compatibility. A value other than the default warns at realize |
 | `context_switch_time` | `uint64` | `200` | No effect, kept for CEMU compatibility. A value other than the default warns at realize |
-| `csf_runtime_scale` | `uint16` | `3` | CSD: non-zero multiplier applied to the host run time of a program that sets neither a runtime nor its own scale |
 | `csd_program_dir` | `str` | unset | CSD: host directory that shared-object and uBPF programs are loaded from, named by a file name with no slash that must resolve inside it; unset allows only the built-in phantom program type |
 
 ### KV timing

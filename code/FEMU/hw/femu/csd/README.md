@@ -6,13 +6,19 @@ SNIA 应用仍包含 `cs.h`、链接 `-lsnia`。Guest 中的 FEMU 插件将纯�
 
 ## 执行流程
 
-可选主机页缓存填充覆盖显式 LOAD 和 CSF 可重入 namespace read，隐藏 spill 换入不HPCP。内部读取复用同一 AFDM 区域时，设备只在该区域仍被 DMA 使用时暂停该读取，完成后通过就绪队列继续；不阻塞 FTL 处理其他节点，也不等待 Guest 页缓存发布。开启HPCP的 CSF 需保持基表输入只读，输出与控制信息使用独立区域。
+可选主机页缓存填充覆盖显式 LOAD 和使用页槽池的 CSF 可重入 namespace read。CSF 从私有 AFDM 中选择可写页槽。runtime 在恢复计算前标记 DMA 占用，复制到 Guest 接收槽后归还源页，后续链路计时和发布独立进行。页槽池达到占用上限、未提供页槽池或同一批请求覆盖同一字节范围时，内部读照常执行并跳过回填。显式 LOAD 保留原有图生命周期，隐藏 spill 换入不参与 HPCP。
+
+FTL 负责 namespace 读取的地址映射和 NAND 时序。设备图中至少 128 KiB 的读取通常由两条 `femu-nvm-copy` 线程将后端数据复制到 AFDM。小块读取或复制队列满时由 FTL 直接复制。图节点在复制完成且 NAND 时限到达后才唤醒后继节点或重入 CSF，HPCP 也从此时开始处理数据。内部复制线程和 FTL 均使用设备线程的 CPU 亲和性，CU 的 CPU 配额只作用于运行 CSF 的线程。
 
 `run-csd.sh` 配置 8 个 I/O 队列、2 个正常 I/O poller；CSD 另有 2 个 `femu-cache-dma` 线程处理可选HPCP。两组传输共享 PCIe 带宽模型，HPCP不再占用正常 poller。
 
-当前 Compose 实验配置为 4 CU。Guest 的 8 个 vCPU 及其他 QEMU 线程使用 node3 的 CPU 30–39，8GiB Guest RAM 通过 QEMU memory-backend 固定在 node3；其中包括 PG 缓冲、Guest 页缓存及HPCP接收缓冲。
+`CSD_CU_CPU_RATIO` 是启动器的每 CU CPU 配额，默认约 1/3（有效 0.3333）、固定周期 10ms。0 和 1 都关闭限制；其余支持 `[0.1,1)`，更小非零比例因 Linux 最小 1ms 配额而拒绝启动。当前宿主使用 cgroup v1：Compose 只把 CPU 控制器挂为可写，启动器在容器自己的组下创建 `cu0…cuN`，各 CU 在入口自行加入。FTL、poller、cache DMA、Guest vCPU 均不迁移，没有容器总 CPU 配额。普通 native CSF 直接按实际执行完成，不再保留全局时间缩放；原生命令/程序显式声明的 runtime/scale 仍按旧 ABI 处理。
 
-设备的 1 个 FTL、4 个 CU、2 个 poller、2 个HPCP线程在各自入口设置亲和性，使用 node2 的 CPU 20–28。进程默认内存策略固定在 node2，因此 NVM RAM 后端、FDM、workmem、隐藏 spill 空间和设备元数据均分配在 node2，不随首次访问线程迁移。设备线程共享这 9 个物理核的可用集合，由 Linux 在集合内调度；并非逐线程独占一个核。
+当前 Compose 实验配置为 8 CU。Guest 的 8 个 vCPU 及其他 QEMU 线程使用 node3 的 CPU 30–39，16GiB Guest RAM 通过 QEMU memory-backend 固定在 node3；其中包括 PG 缓冲、Guest 页缓存及HPCP接收缓冲。
+
+设备启动时把 896 MiB workmem 和 128 MiB FDM 预分配在同一段设备地址内，使用 512 张 2 MiB HugeTLB 页。请在启动前为设备 NUMA 节点预留足够的页。实验宿主使用 node2，可通过 `sudo sysctl` 检查系统 HugeTLB 配置，并通过 `/sys/devices/system/node/node2/hugepages/hugepages-2048kB/nr_hugepages` 配置该节点的页数。预留或预触页失败会终止设备初始化。workmem 和 FDM 的容量仍分别记账，AFDM 从 FDM 切片，最后一个在途引用释放后才归还对应范围。
+
+设备的1个FTL、8个CU、2个poller、2个HPCP线程在入口设置亲和性，使用node2的CPU 20–28。设备内存允许在node1、node2分配：32GiB NVM后端加8GiB隐藏spill无法容纳于单个约31.4GiB的node2。Guest RAM仍单独固定在node3。设备线程共享原9个CPU的可用集合，由Linux在集合内调度，并非逐线程独占一个核。
 
 上述位置由 Compose 的 `FEMU_HOST_CPUS`、`FEMU_HOST_NODE`、`FEMU_DEVICE_CPUS`、`FEMU_DEVICE_NODE` 指定。这里 HOST 表示 Guest 模拟的数据库主机侧。启动器使用 numactl，容器通过 SYS_NICE 允许设置内存策略，不需要启动后查找 PID/TID。更换宿主时先核对 CPU/NUMA/SMT 拓扑与容量，再调整这四项；连续 CPU 编号不保证是独立物理核。直接运行 FEMU 且未设置 FEMU_DEVICE_CPUS 时不修改工作线程亲和性。
 
@@ -91,7 +97,7 @@ EXEC(sort_sink)
 
 token 只表示隐藏区段，不包含算子的 run 列表或 workmem 状态。成功图保留 token；显式 FREE、图失败回收或关闭会话释放。算子私有工作内存仍由算子清理入口释放，设备不知道其内部结构。单独原生 E1 或 SNIA csQueueComputeRequest 保持单次执行行为，只有设备图自动处理内部重入。
 
-CSF也可在最后一个MR开头写入1～64个小端femu_graph_read记录，返回csNeedNvmRead(count)（高4位为4）。记录指定当前namespace的LBA/块数，以及本次调用的目标MR下标和字节偏移。设备先复制并验证整批描述，再通过既有FTL/AFDM复制及I/O完成事件逐范围读取；全部完成后以cparam2=count重入原CSF。描述区可以与目标区重叠，未通过验证不会发起部分读取。这里只处理物理范围，不认识文件、extent或SQL；与隐藏spill token互不混淆，CSF须自行记录正在等待哪类I/O。
+CSF也可在最后一个MR开头写入1～64个小端femu_graph_read记录，返回csNeedNvmRead(count)（高4位为4）。记录指定当前namespace的LBA/块数，以及本次调用的目标MR下标和字节偏移。可选的 `pool_offset` 指向目标 MR 中紧接页槽数组的控制记录，零值表示跳过回填。CSF 固定页槽几何信息和占用上限，并在所有写入路径选择无 DMA 读者的槽。runtime 维护读者计数，DMA 可在提交它的计算图结束后继续读取源槽，因此页槽及控制记录须与其他阶段复用的工作区分开。设备先复制并验证整批描述，再通过既有FTL/AFDM复制及I/O完成事件逐范围读取；全部完成后以cparam2=count重入原CSF。描述区可以与目标区重叠，未通过验证不会发起部分读取。这里只处理物理范围，不认识文件、extent或SQL；与隐藏spill token互不混淆，CSF须自行记录正在等待哪类I/O。
 
 ## 隐藏空间配置
 
@@ -124,7 +130,7 @@ Guest 的 SNIA_FEMU_PROFILE=1 同时令插件在设备图 flags 中设置 PROFIL
 | graphs、graph_ns | 已完成的诊断图数、从设备接受请求至交回完成队列的累计时间 |
 | events、event_late_ns | 已处理到期事件数、观察时间晚于 deadline 的累计时间；包含宿主调度和模拟 I/O 的实际处理超过模型延迟等因素，不等于纯调度器 CPU |
 | io_calls、io_model_ns | 内部 I/O 段数和 FTL 返回的累计模拟延迟，包含 NAND 排队 |
-| io_work_ns | FTL 处理及 backing/AFDM 复制的累计实际经过时间；使用墙钟，不是线程 CPU 时钟 |
+| io_work_ns | FTL 线程处理设备图 I/O 的累计墙钟时间，含在 FTL 内直接执行的复制。独立复制线程的时间见 `CSD_IO_COPY_SPAN`，两类时间可重叠 |
 | cu_calls、cu_wall_ns | 图内 CSF 调用次数、实际运行墙钟之和 |
 | cu_queue_ns | CSF 入队到 CU 取走任务的累计等待 |
 | dispatch_ns | 处理到期事件和就绪图的累计墙钟，包含内部 I/O 处理，是 io_work_ns 的上层范围 |

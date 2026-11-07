@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# 调用方式为 在宿主机运行 bash tests/csd-workmem-test.sh [unit|build|live]。
+# unit（默认）运行工作内存单测，build 构建 Guest 客户端，live 在真实 FEMU 上验证。
+# live 需先 build，Guest 需有 NVMe、4 个 CU 和可用的工作内存。SSH_PORT 默认 8080。
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 case ${1:-unit} in

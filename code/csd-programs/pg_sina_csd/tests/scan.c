@@ -165,6 +165,44 @@ static void prefix_projection(function scan)
     p.strings[0].length=255; assert(scan_rows(scan,&p,c,bytes,raw)==-3);
     free(c);
 }
+static void sparse_projection(function scan)
+{
+    unsigned char raw[2*QS_PAGE]={0}; make_pages(raw);
+    struct qs_plan p={.nattrs=4,.ncols=2};
+    p.cols[0]=(struct qs_column){.length=4,.align=4,.slot=0,.type=Q_INTEGER};
+    p.cols[1]=(struct qs_column){.length=-1,.align=4,.slot=-1};
+    p.cols[2]=p.cols[1]; /* skipped attributes include a nullable varlena */
+    p.cols[3]=(struct qs_column){.length=-1,.align=4,.slot=1,.type=Q_DECIMAL};
+    size_t bytes=qs_chunk_bytes(64,2);
+    struct qs_chunk *c=calloc(1,bytes); assert(c);
+    c->capacity=64; c->ncols=2;
+    assert(!scan_rows(scan,&p,c,bytes,raw) && c->rows==62);
+    for(unsigned row=0;row<c->rows;++row) {
+        assert(qs_values(c)[row]==row);
+        assert(qs_values(c)[c->capacity+row]==(row%3)*100);
+    }
+    p.cols[3].deferred=QS_DEFERRED;
+    for(unsigned page=0;page<2;++page)
+        for(unsigned i=0;i<31;++i) {
+            unsigned row=page*31+i;
+            unsigned char *tuple=raw+(page+1)*QS_PAGE-(i+1)*64;
+            if(row%7==0) {
+                memmove(tuple+35,tuple+32,5);
+                tuple[32]=7; tuple[33]=tuple[34]=0;
+                predicate_offsets[row]+=3;
+            }
+            write16(tuple+20,0xb00);
+        }
+    assert(!scan_rows(scan,&p,c,bytes,raw) && c->rows==62);
+    for(unsigned row=0;row<c->rows;++row) {
+        struct qs_heap_ref ref;
+        memcpy(&ref,&qs_values(c)[c->capacity+row],sizeof(ref));
+        assert(ref.offset==predicate_offsets[row] && ref.bytes==4);
+    }
+    raw[QS_PAGE-64+28]=255;
+    assert(scan_rows(scan,&p,c,bytes,raw)==-2);
+    free(c);
+}
 static void deferred_strings(function scan,function filter)
 {
     unsigned char raw[2*QS_PAGE]={0}; make_pages(raw);
@@ -194,8 +232,44 @@ static void deferred_strings(function scan,function filter)
     assert(!filter(&a) && c->selected==61);
     int id=qs_dict_find(dict,"abc",3); assert(id>0 && dict->count==2 && !qs_dict_find(dict,"xyz",3));
     for(unsigned i=0;i<c->selected;++i) assert(qs_values(c)[qs_selection(c)[i]]==(i==0?p.exprs[4].constant:id));
+    p.cols[1].deferred=QS_FILTER_ONLY;
+    p.exprs[5].left=0;
+    assert(!scan_rows(scan,&p,c,bytes,raw));
+    assert(!filter(&a) && c->selected==1 && qs_selection(c)[0]==1);
+    p.exprs[4].constant=qs_dict_insert(dict,"ab ",3);
+    assert(!scan_rows(scan,&p,c,bytes,raw));
+    assert(!filter(&a) && c->selected==0);
     free(c); free(dict);
 }
+static void column_comparison(function filter)
+{
+    struct qs_plan p={.nattrs=2,.ncols=2,.nexprs=6,.predicate=5};
+    p.cols[0]=(struct qs_column){.slot=0,.type=Q_DATE};
+    p.cols[1]=(struct qs_column){.slot=1,.type=Q_DATE};
+    p.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.type=Q_DATE,.column=0};
+    p.exprs[1]=(struct qs_expr){.op=Q_COLUMN,.type=Q_DATE,.column=1};
+    p.exprs[2]=(struct qs_expr){.op=Q_LT,.type=Q_BOOLEAN,.left=0,.right=1};
+    p.exprs[3]=(struct qs_expr){.op=Q_CONST,.type=Q_DATE,.constant=7};
+    p.exprs[4]=(struct qs_expr){.op=Q_LT,.type=Q_BOOLEAN,.left=0,.right=3};
+    p.exprs[5]=(struct qs_expr){.op=Q_AND,.type=Q_BOOLEAN,.left=2,.right=4};
+    size_t bytes=qs_chunk_bytes(8,2);
+    struct qs_chunk *c=calloc(1,bytes); assert(c);
+    c->rows=7; c->capacity=8; c->ncols=2;
+    int64_t dates[]={1,2,3,4,5,6,7,0,2,3,2,4,6,7,8};
+    memcpy(qs_values(c),dates,sizeof(dates));
+    qs_nulls(c)[0]=1U<<1;
+    qs_nulls(c)[1]=1U<<4;
+    void *mr[]={c,&p}; long long len[]={bytes,sizeof(p)};
+    struct femu_csd_args a={.numr=2,.mr_addr=mr,.mr_len=len};
+    assert(!filter(&a) && c->selected==2);
+    assert(qs_selection(c)[0]==0 && qs_selection(c)[1]==5);
+    p.exprs[3].constant=5; p.exprs[4].op=Q_GE; p.exprs[5].op=Q_OR;
+    assert(!filter(&a) && c->selected==4);
+    assert(qs_selection(c)[0]==0 && qs_selection(c)[1]==4 &&
+           qs_selection(c)[2]==5 && qs_selection(c)[3]==6);
+    free(c);
+}
+
 int main(int argc,char **argv)
 {
     numeric_formats();
@@ -203,7 +277,9 @@ int main(int argc,char **argv)
     void *scan_so=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL),*filter_so=dlopen(argv[2],RTLD_NOW|RTLD_LOCAL);
     assert(scan_so && filter_so);
     function scan=(function)dlsym(scan_so,"pg_sina_scan"),filter=(function)dlsym(filter_so,"pg_sina_filter"); assert(scan && filter);
-    prefix_projection(scan); fixed_prefix_projection(scan); deferred_strings(scan,filter);
+    column_comparison(filter);
+    prefix_projection(scan); fixed_prefix_projection(scan); sparse_projection(scan);
+    deferred_strings(scan,filter);
     unsigned char raw[2*QS_PAGE]={0}; make_pages(raw);
     struct qs_plan p={.nattrs=4,.ncols=3,.nexprs=7,.predicate=6};
     p.cols[0]=(struct qs_column){.length=4,.align=4,.slot=0,.type=Q_INTEGER};

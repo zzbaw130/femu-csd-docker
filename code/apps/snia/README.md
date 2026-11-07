@@ -23,7 +23,7 @@
 
 依赖为 C 编译器、支持 C++17 的 C++ 编译器、CMake 3.16 及以上。Ubuntu 包管理器的 CMake 足够。容器与 Guest 是两套系统，容器安装软件不会同时安装到 Guest；首次镜像创建的包列表在 docker-compose.yml 的 command 中配置。
 
-Guest 启动后执行一次 `/home/femu/scripts/init-csd-env.sh`，即可准备数据/spill 分区并编译安装 SNIA 到 `/usr/local`。从宿主执行同一脚本：
+Guest 启动后执行一次 `/home/femu/scripts/init-csd-env.sh`，默认将整盘挂载到`/data`并编译安装SNIA到`/usr/local`；`--partitioned`可选用历史80%数据/20%spill布局。从宿主执行同一脚本：
 
 ```sh
 ./scripts/sh-guest.sh scripts/guest/init-csd-env.sh
@@ -157,7 +157,7 @@ FEMU 在设备图节点内自动处理整个循环，直到得到普通结果才
 
 需要长期保留设备句柄及 CSF、但结束一轮临时计算时，可调用 `csReset(device, CS_VENDOR_SPECIFIC_TYPE, 0)`。这是本项目 FEMU 对“厂商资源0”的约定，使用现有标准函数签名，不是 SNIA 对该资源编号的规定。它关闭空闲的设备图会话，回收该会话遗留 token 和 HPCP 接收状态，保留已打开的 NVMe 描述符、资源信息及已加载 CSF；后续 batch 自动建立新图会话。存在在途设备图时返回 `CS_HANDLE_IN_USE`。调用者须先停止续交、等待所有请求及回调结束，并释放不再使用的算子状态；旧 token 随 reset 失效。
 
-新的临时路径不再发现或访问 GPT `femu-spill` 分区。已有初始化脚本仍保留80%/20%的历史分区布局，避免此次修改重建数据盘；其中20%不再用于新设备 spill。已挂载数据盘时无需为了本功能重新分区。新固件与新插件应配套启用，勿把新插件安装到仍运行旧固件的 Guest。
+新的临时路径不再发现或访问GPT `femu-spill`分区。初始化脚本默认使用整盘；历史80%/20%布局仅由`--partitioned`显式启用，其20%仍不用于新设备spill。新固件与新插件应配套启用，勿把新插件安装到仍运行旧固件的Guest。
 
 设备指令布局和执行流程见 [FEMU 设备图说明](../../FEMU/hw/femu/csd/README.md)。
 

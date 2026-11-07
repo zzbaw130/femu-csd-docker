@@ -48,7 +48,7 @@ listed one by one.
 - FDP accepts `buffer_size`. Each held page keeps the placement handle of its last write and goes to that handle's reclaim unit when it is written back. RUH Update, Flush and disabling the volatile write cache write the buffer back first, and fail with Capacity Exceeded if a page finds no room.
 - FDP still refuses `hot_cold_sep` and the `hybrid` and `fast` mappings, and the message now says why: they write host data through pointers of their own, past the unit the placement handle names.
 - Computational Storage Drive mode (`femu_mode=4`) with program load and execute commands, routed through the bbssd FTL (eb01bb73b, 50b65ca91).
-- CSD `nr_cu` and `csf_runtime_scale` now take effect (202ab7afb).
+- CSD `nr_cu` limits real compute threads (202ab7afb). The former global runtime multiplier has since been removed; the launcher supports independent per-CU CPU cgroup quotas.
 - A CSD runtime shorter than the program's own run on the host cannot be reached, since the completion carries the result; QEMU now warns once when that happens (b8e8d6b45).
 - Key-value SSD mode (`femu_mode=5`) with store, retrieve, list, delete and exist commands (e72465909).
 - Every KV namespace has its own command set and key space, the KV command set is advertised to the host, and the KV Configuration feature is served (39664d242, e62db84f2, e4949509c).

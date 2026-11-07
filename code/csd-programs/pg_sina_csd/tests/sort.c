@@ -62,6 +62,7 @@ static int host_order(const void *left,const void *right)
 }
 static void check(function sink,function source,unsigned rows,int64_t limit,int64_t offset,int cancel,int profile,int packed)
 {
+    struct cs_work_stats before; assert(!cs_work_get_stats(&before));
     next_token=1; stored=loaded=0;
     unsigned *expected=malloc((rows?rows:1)*sizeof(*expected)); assert(expected);
     for(unsigned i=0;i<rows;++i) expected[i]=i;
@@ -148,7 +149,9 @@ static void check(function sink,function source,unsigned rows,int64_t limit,int6
     for(unsigned i=1;i<next_token;++i) assert(!blocks[i]);
     for(unsigned i=0;i<workers;++i) assert(!group.states[i]);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats));
-    assert(!stats.used_bytes && !stats.active_contexts && stats.peak_used_bytes<=budget && stats.peak_used_bytes<=capacity);
+    assert(stats.used_bytes==before.used_bytes && stats.active_contexts==before.active_contexts &&
+        stats.active_allocations==before.active_allocations &&
+        stats.peak_used_bytes<=budget && stats.peak_used_bytes<=capacity);
     printf("rows=%u pool=%zu budget=%zu peak=%zu store=%u load=%u\n",rows,capacity,budget,stats.peak_used_bytes,stored,loaded);
     free(input); free(out); free(io); free(c); free(expected);
 }
@@ -304,9 +307,10 @@ int main(int argc,char **argv)
 {
     assert(argc>=2 && argc<=5);
     int dictionary64=argc==3 && !strcmp(argv[2],"--dictionary-64m");
+    int fragmented64=argc==3 && !strcmp(argv[2],"--fragmented-64m");
     int dictionary=argc==3 && (!strcmp(argv[2],"--dictionary") || dictionary64);
-    if(dictionary64) capacity=budget=64U*1024*1024;
-    if(argc>=3 && !dictionary) capacity=(size_t)strtoul(argv[2],NULL,10)*1024*1024;
+    if(dictionary64 || fragmented64) capacity=budget=64U*1024*1024;
+    if(argc>=3 && !dictionary && !fragmented64) capacity=(size_t)strtoul(argv[2],NULL,10)*1024*1024;
     budget=argc>=4?(size_t)strtoul(argv[3],NULL,10)*1024*1024:capacity;
     if(argc==5) workers=strtoul(argv[4],NULL,10);
     assert(workers && workers<=QS_WORKERS);
@@ -315,6 +319,18 @@ int main(int argc,char **argv)
     void *so=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(so);
     function sink=(function)dlsym(so,"pg_sina_sort_sink"),source=(function)dlsym(so,"pg_sina_sort_source"); assert(sink && source);
     columns_sink=(columns_function)dlsym(so,"qs_sort_sink_columns"); assert(columns_sink);
+    if(fragmented64) {
+        cs_work_context *pressure=cs_work_begin(); assert(pressure);
+        void *chunks[128]; unsigned count=0;
+        while(count<128 && (chunks[count]=cs_work_alloc(pressure,512U*1024))) ++count;
+        for(unsigned i=0;i<count;i+=2) assert(!cs_work_free(pressure,chunks[i]));
+        struct cs_work_stats stats; assert(!cs_work_get_stats(&stats));
+        assert(stats.free_bytes>16U*1024*1024 && stats.largest_free_payload<1024U*1024);
+        check(sink,source,1048583,-1,0,0,0,0);
+        assert(!cs_work_end(pressure));
+        assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
+        dlclose(so); return 0;
+    }
     if(dictionary64) {
         /* Parent/device stay at 64 MiB. Child limits from real concurrent
          * operators are not I/O-block aligned; cover a block of remainders. */

@@ -1,3 +1,5 @@
+-- 在宿主机用 psql -d tpch_s<SF> -f scripts/create-tables.sql 执行。
+-- -d 指定目标数据库。本脚本会重建 TPC-H 基表，由 gen-pgdata.sh 在导入前调用。
 DROP TABLE IF EXISTS PART;
 DROP TABLE IF EXISTS SUPPLIER;
 DROP TABLE IF EXISTS PARTSUPP;

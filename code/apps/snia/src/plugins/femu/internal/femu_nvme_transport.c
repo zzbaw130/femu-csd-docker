@@ -38,6 +38,7 @@ int cs_transport_open(struct cs_device *d, const char *name)
 {
     const char *profile = getenv("SNIA_FEMU_PROFILE");
     d->profile = profile && !strcmp(profile, "1");
+    d->cache_summary = profile && !strcmp(profile, "cache");
     unsigned controller, ns;
     int end = 0;
     if (sscanf(name, "/dev/nvme%un%u%n", &controller, &ns, &end) != 2 || name[end] || !ns ||

@@ -147,6 +147,7 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     pg_sina_explain_placement((CustomScan *)node->ss.ps.plan,es);
     ExplainPropertyText("Execution Path","csd",es);
     ExplainPropertyInteger("CSD Device CUs",NULL,pg_sina_resources.cus,es);
+    ExplainPropertyFloat("CSD CU CPU Ratio",NULL,pg_sina_resources.cpu_ratio,6,es);
     ExplainPropertyInteger("CSD Device FDM","bytes",pg_sina_resources.fdm_bytes,es);
     ExplainPropertyInteger("CSD Device Workmem","bytes",pg_sina_resources.workmem_bytes,es);
     ExplainPropertyInteger("CSD Query Memory Limit","bytes",pg_sina_query_memory(),es);

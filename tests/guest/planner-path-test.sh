@@ -1,15 +1,25 @@
 #!/bin/sh
+# 调用方式为 在 Guest 运行 SF=8 sh planner-path-test.sh，无位置参数。
+# SF 默认 8，PGDATA/PGDATABASE 可显式覆盖。需已准备所选数据库的 CSD 映射。
+# 仅规划指定模板，检查路径选择、设备计划编码和去相关。
 # Planning only: canonical SQL plus a small MATERIALIZED CTE regression.
 set -eu
+PGDATA=${PGDATA:-/data/${PGDATABASE:-tpch_s${SF:-8}}}
+export PGDATA PGDATABASE=${PGDATABASE:-${PGDATA##*/}}
 PG=/home/femu/opt/postgres/release/bin/psql
-QUERIES=/home/femu/tests/queries
+TESTS=/home/femu/tests
+QUERIES=$TESTS/queries/template
 OUT=$(mktemp -d /home/femu/results/planner-paths.XXXXXX)
 chmod 755 "$OUT"
 plan() {
     query=$1; mode=$2; label=$3; settings=${4:-}
-    "$PG" -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
+    case "$query" in
+        *.original) sed -n '/^\/\* 原始查询$/,/^\*\/$/{ /^\/\* 原始查询$/d; /^\*\/$/d; p; }' "$QUERIES/${query%.original}.sql" ;;
+        *) cat "$QUERIES/$query.sql" ;;
+    esac | sed 's/^select$/explain select/' |
+    "$PG" -X -q -A -t -v ON_ERROR_STOP=1 -d "$PGDATABASE" \
         -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path='$mode'; $settings" \
-        -f "$QUERIES/$query.explain.sql" > "$OUT/$label.plan" 2> "$OUT/$label.err"
+        -f "$TESTS/tpch-parameters.psql" -f - > "$OUT/$label.plan" 2> "$OUT/$label.err"
 }
 plan 14 SQLerate expensive 'SET pg_sina_csd.csd_cpu_ratio=1000'
 if grep -q 'Custom Scan (SniaCsd' "$OUT/expensive.plan"; then exit 1; fi
@@ -67,7 +77,7 @@ for query in 17.original 20.original; do
     grep -q 'Custom Scan (SniaCsd' "$OUT/$query.plan"
     grep -q 'original HOST=' "$OUT/$query.plan"
 done
-"$PG" -X -q -A -t -v ON_ERROR_STOP=1 -d tpch_s1 \
+"$PG" -X -q -A -t -v ON_ERROR_STOP=1 -d "$PGDATABASE" \
     -c "LOAD 'pg_sina_csd'; SET pg_sina_csd.exe_path='SQLerate'" \
     -c 'EXPLAIN WITH x AS MATERIALIZED (SELECT p_partkey FROM part WHERE p_partkey <= 4) SELECT count(*) FROM x' \
     > "$OUT/cte.plan" 2> "$OUT/cte.err"

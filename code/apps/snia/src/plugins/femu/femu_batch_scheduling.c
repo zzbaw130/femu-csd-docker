@@ -94,7 +94,8 @@ static CS_STATUS queue_graph(void *device,CS_BATCH_MODE mode,unsigned capacity,
     bool cache_enabled=!__atomic_load_n(&d->cache_disabled,__ATOMIC_ACQUIRE) &&
         (d->cache_external || (getenv("SNIA_FEMU_HPCP") && !strcmp(getenv("SNIA_FEMU_HPCP"),"1")));
     h->flags=htole32((mode==CS_BATCH_SERIAL?FEMU_CSD_GRAPH_SERIAL:0) |
-        (d->profile?FEMU_CSD_GRAPH_PROFILE:0) | (cache_enabled?FEMU_CSD_GRAPH_CACHE:0));
+        (d->profile?FEMU_CSD_GRAPH_PROFILE:0) | (cache_enabled?FEMU_CSD_GRAPH_CACHE:0) |
+        (d->cache_summary?FEMU_CSD_GRAPH_CACHE_SUMMARY:0));
     struct femu_graph_node *nodes=(void *)(h+1);
     size_t offset=sizeof(*h)+count*sizeof(*nodes);
     for(unsigned i=0;i<capacity;++i) if(entries[i].request) {

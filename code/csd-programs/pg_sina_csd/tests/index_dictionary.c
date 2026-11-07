@@ -169,7 +169,7 @@ static void run(cs_work_context *parent,int probe,uint64_t cancel)
     for(unsigned i=0;i<p.ncols;++i) p.cols[i]=(struct qs_column){.slot=i,.type=i>=base+2?Q_STRING:Q_INTEGER,.align=4,.length=i>=base+2?-1:4};
     struct qs_join_control control={0}; struct qs_task task={.slot=probe?63:0,.workers=probe?64:1};
     assert(!qs_index_init(&p,&control)); assert(!qs_index_paged_dictionary(&control,dictionary));
-    size_t io_bytes=QS_SORT_IO_BYTES+(size_t)QS_INDEX_CACHE*QS_PAGE;
+    size_t io_bytes=QS_INDEX_IO_BYTES;
     char *io=calloc(1,io_bytes),*spill=calloc(1,QS_SORT_IO_BYTES); assert(io && spill);
     qs_index_spill_io(&control,task.slot,spill);
     struct qs_chunk *out=calloc(1,qs_chunk_bytes(17,p.ncols)); assert(out);

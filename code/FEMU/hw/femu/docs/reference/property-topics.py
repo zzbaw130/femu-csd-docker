@@ -156,7 +156,7 @@ DEVICES = [
                 "kind": "static",
                 "props": [
                     "fdm_size", "nr_cu", "nr_thread", "time_slice",
-                    "context_switch_time", "csf_runtime_scale",
+                    "context_switch_time",
                     "csd_program_dir",
                 ],
             },

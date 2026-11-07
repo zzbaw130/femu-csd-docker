@@ -1,5 +1,7 @@
 # SQLerate（pg_sina_csd）
 
+系统分层、PG/SNIA/NVMe 接口、设备图与 CU 调度，以及 HPCP/DCP 的队列和槽位设计见[系统架构](doc/architecture.md)。
+
 这是只读实验用 PostgreSQL 12 扩展。Guest 中的 PG 负责解析 SQL、规划和调用 SNIA；容器中编译的设备 SO 由 FEMU CU 执行扫描、表达式、连接、聚合和排序。原始 Heap 和中间结果不传回 Guest 执行器，只有最终结果转换为 PG Datum。
 
 ## 计划从哪里来
@@ -16,7 +18,7 @@
 
 HPCP 全称 **Host Page Cache Population（主机页缓存填充）**。它把设备读入的数据填充到 Guest 文件页缓存；两种 CSD 模式目前都从内部 NVM 读入 FDM，不会因为命中主机缓存就默认上传。SQLerate 分别观测 PG shared_buffers 和文件页缓存：前者命中免除读盘及内核到 PG 缓冲区的复制，后者命中仍保留复制成本；CPU、谓词和索引查找成本继续保留。这里只改变估价，HPCP 仍填充文件页缓存。成本公式、参数及当前执行边界见 [规划说明](doc/planning.md)。
 
-DCP（Database Cache Population，数据库缓存填充）把同一份设备接收数据填入 PG 的 `shared_buffers`，默认关闭。`pg_sina_csd.hpcp` 默认开启，作为原有 HPCP 模式的允许开关；关闭后，即使选择 `csd-with-hpcp` 或 `SQLerate` 也不填文件页缓存。`pg_sina_csd.dcp` 独立控制 DCP，在产生设备读取的执行路径上生效，`host-only` 不产生设备填充。
+DCP（Database Cache Population，数据库缓存填充）把同一份设备接收数据填入 PG 的 `shared_buffers`，默认关闭。`pg_sina_csd.hpcp` 默认开启，控制 HPCP 模式是否填文件页缓存。`pg_sina_csd.dcp` 独立控制 DCP，在产生设备读取的执行路径上生效，SQLerate 也使用此显式设置。EXPLAIN 的 `DCP` 显示开关状态，实际导入受缓冲预算和设备读取时序影响。`host-only` 没有设备填充。
 
 ```sql
 SET pg_sina_csd.exe_path = 'csd-without-hpcp';
@@ -24,7 +26,7 @@ SET pg_sina_csd.hpcp = off;
 SET pg_sina_csd.dcp = on;
 ```
 
-同时填充两层缓存时，选择 `csd-with-hpcp` 并开启两个布尔选项。设备只做一次 DMA；DCP 模式由执行 SQL 的 PG backend 消费接收槽，按原始8KiB页复制到缺失的数据库缓冲，随后按需把同一槽交给内核填文件缓存。现有有效页不覆盖，导入页不标脏、不产生 WAL；不调用 `pg_prewarm(buffer)` 重新读文件。该实现针对已准备映射的只读镜像，不新增进程或PG worker。
+同时填充两层缓存时，选择 `csd-with-hpcp` 并开启两个布尔选项。设备对同一个接收槽只做一次 DMA。执行 SQL 的 PG 后端按原始 8KiB 页填充缺失的数据库缓冲，SNIA 的接收线程独立调用 Guest 内核模块填充文件页缓存。现有有效页保持原样，导入页保持干净。该实现针对已准备映射的只读镜像。
 
 两层同时开启时，超过 `shared_buffers/4` 的大表顺序扫描采用 PG 的 `BAS_BULKREAD` 缓冲策略及256KiB驻留目标（当前32页），避免大表流把数据库缓冲占满并挤掉刚填入的文件缓存。达到该实际驻留目标后停止这张表的可选 DCP 导入，其余数据继续交给 HPCP，不将每次环内替换当作新增驻留并反复消耗预算；小表、索引探测及其 Heap 读取、只开 DCP 时保留普通分配与原目标。驻留量仍来自页面位图，不是累计填页数。DCP 配额耗尽或所有关系已达到目标后跳过逐页处理，并在释放当前槽后通过 FEMU 私有 `csConfig` 约定将同一接收环交回 SNIA 已有 HPCP 线程；不重新分配接收内存、不重绑 DMA，也不增加辅助进程。查询开始时已无须 DCP，则直接使用该后台线程。这是本项目的可选缓存准入策略，未修改 PG 原生扫描或缓冲替换算法。
 
@@ -107,6 +109,8 @@ Heap 扫描从页内行指针直接取得各 tuple 的起点，不依赖前一�
 
 设备可在连接树任意位置使用参数化整数前导键 B-tree 等值查找，支持复合索引的前导键，剩余条件仍在设备判断。一次最多收集 64 个外侧键；需要保留外侧顺序时按单键推进。缺页时只将页号写入控制 AFDM，PG 根据 extent 合并连续目的缓冲和相邻 LBA，通过 SERIAL batch 提交内部 NVM→AFDM LOAD→继续计算；不同执行槽可以独立推进。SEMI/ANTI 在确认匹配后立即停止该键的查找。索引页和 Heap Tuple 仍在设备解析。
 
+同一设备查询的 Index Join 游标可以在 workmem 共享干净的 B-tree 和 Heap 页，设备总上限 128 MiB。未命中时从 NVM 读到游标的私有 AFDM。B-tree 页第一次读完即可加入共享缓存。Heap 页第一次读完只登记页键，近期再次从 NVM 读到该页才复制入缓存。workmem 不足时，可释放未固定的缓存分片给算子状态。可用 `pg_sina_csd.index_cache_mib=0` 关闭共享层，私有页槽仍工作。EXPLAIN 分别记录两类页在私有页槽未命中后访问共享层的命中及未命中次数。
+
 需要顺序的、已准备映射的 PG12 整数前导键 B-tree 支持正向叶页遍历，按索引顺序回表并直接交给有序聚合，不再补 Heap 排序。索引页做有界预读；PG 相关性统计大于 0.9 时，Heap 也做有界正向预读。游标受 workmem 约束，页留在原 AFDM 缓存中。其他独立扫描仍可能降为 Heap；反向有序扫描仍补排序。Index Only Scan 当前仅支持所需列完全由已映射索引的整数前导键覆盖的形态，直接读取索引键，不回表；其他形态回退原路径。仍没有 Bitmap Scan、通用索引范围游标、部分/表达式索引或 PG13+ posting list 支持。
 
 ```sql
@@ -115,7 +119,7 @@ SET pg_sina_csd.max_memory=0;      -- 默认值，自动使用设备 workmem 总
 SET pg_sina_csd.profile=on;       -- 开发时开启，默认 off
 ```
 
-扩展在每个连接加载 C 库时完成设备初始化：通过 SNIA 发现当前实验的唯一 CSD namespace，打开设备，读取 CU/FDM 容量，下载并激活全部14个 CSF 入口，再通过 `pg_sina_workmem_capacity` 获取共享分配器总容量。连接正常退出时统一停用、卸载 CSF 并关闭设备。当前实验要求只有一个可发现的 CSD namespace，不增加额外设备路径配置。所有已映射表仍须属于这个 namespace。
+扩展在每个连接加载 C 库时完成设备初始化：通过 SNIA 发现当前实验的唯一 CSD namespace，打开设备，读取 CU/FDM 容量，下载并激活全部14个 CSF 入口，再通过 `pg_sina_workmem_capacity` 获取共享分配器总容量和实际 CU CPU 配额。连接正常退出时统一停用、卸载 CSF 并关闭设备。当前实验要求只有一个可发现的 CSD namespace，不增加额外设备路径配置。所有已映射表仍须属于这个 namespace。
 
 `LOAD 'pg_sina_csd'` 会立即完成上述初始化；为了在建立连接时自动完成，可由管理员执行以下配置，新连接生效：
 
@@ -123,9 +127,9 @@ SET pg_sina_csd.profile=on;       -- 开发时开启，默认 off
 ALTER DATABASE tpch_s1 SET session_preload_libraries='pg_sina_csd';
 ```
 
-如还使用 `auto_explain`，保留为 `'pg_sina_csd,auto_explain'`。不要使用 `shared_preload_libraries` 创建会被 fork 继承的 SNIA 连接和线程。PG 并行 worker 只注册扩展方法，不重复创建连接级设备资源。启用数据库级预加载前须先安装设备程序并配置设备权限。
+如还使用 `auto_explain`，SQL 中写作 `ALTER DATABASE tpch_s8 SET session_preload_libraries TO 'pg_sina_csd', 'auto_explain';`，两个库分别列出。不要使用 `shared_preload_libraries` 创建会被 fork 继承的 SNIA 连接和线程。PG 并行 worker 只注册扩展方法，不重复创建连接级设备资源。启用数据库级预加载前须先安装设备程序并配置设备权限。
 
-planner 和执行器复用连接持有的设备句柄、CSF ID及资源快照，不再打开/关闭设备或下载/卸载程序。查询仅分配自己的 AFDM、batch、参数和执行状态，并在完成、取消或出错时回收；多个设备子树可调用同一 CSF，其状态仍由各自 AFDM 隔离。设备重新配置后建立新连接即可重新发现。CU/FDM 通过 `csQueryDeviceProperties` 获取；当前 SNIA 资源结构没有分配器 workmem 字段，因此零参数容量 CSF 通过64位 CompValue返回 `cs_work_get_stats().capacity_bytes`。不创建辅助进程。
+planner 和执行器复用连接持有的设备句柄、CSF ID及资源快照，不再打开/关闭设备或下载/卸载程序。查询仅分配自己的 AFDM、batch、参数和执行状态，并在完成、取消或出错时回收；多个设备子树可调用同一 CSF，其状态仍由各自 AFDM 隔离。设备重新配置后建立新连接即可重新发现。CU/FDM 通过 `csQueryDeviceProperties` 获取；当前 SNIA 资源结构没有分配器 workmem 字段，因此零参数容量 CSF 通过64位 CompValue返回 `cs_work_get_stats().capacity_bytes`。同一资源 CSF 使用 `cparam1=1` 返回实际每 CU 配额的百万分比；该比例来自启动器传入设备进程的 `CSD_CU_CPU_RATIO`，已按实际微秒配额取整，0/1 不限额时归一化为 1。规划只读取连接快照，不读取 Guest 环境变量、不逐 SQL 再查询设备。`csd_cpu_ratio` 保留为不限额 CU 的基础计算成本，实际设备 CPU 单价为 `csd_cpu_ratio / 实际配额比例`，内部 I/O、PCIe、HOST CPU 不乘该系数。EXPLAIN 显示 `CSD CU CPU Ratio`。不创建辅助进程。
 
 开启 profile 时，初始化单独输出 `SQLerate connection init total_ms=... programs=14 ...`，不计入查询规划计时。可通过连接选项 `PGOPTIONS='-c pg_sina_csd.profile=on'` 在预加载前启用；已有冷启动脚本已处理。初始化仍有实际成本，论文应单列连接初始化时间，不能将计时前移解释为消除了冷启动总成本。
 
@@ -155,7 +159,7 @@ spill 使用现有 SNIA batch 的 NEED_STORE/NEED_LOAD/NEED_FREE 重入协议，
 
 ## 唯一验收入口
 
-TPC-H 验收只读取仓库 `tests/guest/queries/1.sql` 至 `22.sql` 及对应 `.explain.sql`。Guest 挂载路径为 `/home/femu/tests/queries`。扩展目录不再保存另一套 TPC-H、参考改写 SQL、临时 timed.sql 或 SQL fixture。开发中的小 SQL 仅放在临时目录定位问题，不作为验收依据；设备 C/C++ 单元测试和 `tests/heap_layout.c` 保留。
+TPC-H 验收读取仓库 `tests/guest/queries/sf<SF>_sel<选择率>/1.sql` 至 `22.sql`。用 `-s` 指定目标选择率，默认 0.1。专项组件测试可使用模板及既定参数。Guest 挂载路径为 `/home/femu/tests`。扩展目录不再保存另一套 TPC-H、参考改写 SQL、临时 timed.sql 或 SQL fixture。开发中的小 SQL 仅放在临时目录定位问题，不作为验收依据；设备 C/C++ 单元测试和 `tests/heap_layout.c` 保留。
 
 ```sh
 # 仓库主机：八表映射已准备时，不必每次重新 prepare

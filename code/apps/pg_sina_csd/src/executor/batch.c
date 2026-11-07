@@ -180,9 +180,15 @@ void pg_sina_init_device(void)
         CsComputeRequest request={.CSFId=connection_programs[lengthof(connection_programs)-1].function,.NumArgs=0};
         status=csQueueComputeRequest(&request,NULL,NULL,NULL,NULL,&bytes);
         if(status==CS_SUCCESS) {
+            u64 cpu=0;
+            request.NumArgs=1;
+            csHelperSetComputeArg(&request.Args[0],CS_64BIT_VALUE_TYPE,(u64)QP_RESOURCE_CPU_RATIO);
+            status=csQueueComputeRequest(&request,NULL,NULL,NULL,NULL,&cpu);
             pg_sina_resources=(struct pg_sina_resources){.cus=cus->CSEDetails[0].CSE[0].NumCRs,
-                .fdm_bytes=fdm->FDMDetails[0].FDM[0].FDMSize,.workmem_bytes=bytes};
-            if(!pg_sina_resources.cus || !pg_sina_resources.fdm_bytes || !bytes || bytes>INT64_MAX) status=CS_DEVICE_ERROR;
+                .fdm_bytes=fdm->FDMDetails[0].FDM[0].FDMSize,.workmem_bytes=bytes,
+                .cpu_ratio=(double)cpu/QP_CPU_RATIO_SCALE};
+            if(!pg_sina_resources.cus || !pg_sina_resources.fdm_bytes || !bytes || bytes>INT64_MAX ||
+               cpu<QP_CPU_RATIO_SCALE/10 || cpu>QP_CPU_RATIO_SCALE) status=CS_DEVICE_ERROR;
         }
     }
     free(cus); free(fdm);
@@ -190,9 +196,10 @@ void pg_sina_init_device(void)
     /* Program indices belong to MyBackendId. Unload before PG makes that ID
      * reusable; on_proc_exit runs after CleanupInvalidationState releases it. */
     on_shmem_exit(close_connection,0);
-    if(pg_sina_profile) ereport(NOTICE,(errmsg("SQLerate connection init total_ms=%.3f programs=%u cus=%u fdm_bytes=%llu workmem_bytes=%llu",
+    if(pg_sina_profile) ereport(NOTICE,(errmsg("SQLerate connection init total_ms=%.3f programs=%u cus=%u fdm_bytes=%llu workmem_bytes=%llu cpu_ratio=%.6f",
         (clock_ns()-started)/1e6,(unsigned)lengthof(connection_programs),pg_sina_resources.cus,
-        (unsigned long long)pg_sina_resources.fdm_bytes,(unsigned long long)pg_sina_resources.workmem_bytes)));
+        (unsigned long long)pg_sina_resources.fdm_bytes,(unsigned long long)pg_sina_resources.workmem_bytes,
+        pg_sina_resources.cpu_ratio)));
 }
 void pg_sina_read_resources(const char *path)
 {
@@ -469,6 +476,11 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     }
     device=pg_sina_device(request->device);
     workers=pg_sina_resources.cus;
+    /* A fused aggregate keeps independent partial states. A second slot
+     * per CU can LOAD while another slot computes; the FDM fit below still
+     * bounds all inputs, vectors and states. */
+    if(!joining && request->plan.external_aggregate && workers<QS_WORKERS)
+        workers=Min(2*workers,QS_WORKERS);
     if(workers>QS_WORKERS) workers=QS_WORKERS;
     if(!workers) goto cleanup;
     uint64_t capacity=pg_sina_resources.fdm_bytes;
@@ -479,15 +491,10 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
           ((sizeof(struct qs_result)+4095)&~(size_t)4095)+((sizeof(struct qs_plan)+4095)&~(size_t)4095)+4096+
           ((dict_size+4095)&~(size_t)4095)+
           (joining?2*((sizeof(struct qs_plan)+4095)&~(size_t)4095)+(njoins+1)*4096:0)>capacity) {
-        /* Input blocks need not consume the maximum 4 MiB. Keep the available
-         * CUs busy with smaller blocks before sacrificing parallelism. */
-        if(chunk>1024*1024U) chunk/=2;
-        else if(workers>1) --workers;
-        else if(chunk>QS_PAGE) chunk/=2;
+        if(workers>1) --workers;
         else { result->status=1; strcpy(result->error,"insufficient FDM"); goto cleanup; }
-        vector_rows=heap_capacity(chunk,min_tuple);
     }
-    if(indexed && chunk<QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE) { strcpy(result->error,"insufficient AFDM for index pages"); goto cleanup; }
+    if(indexed && chunk<QS_INDEX_IO_BYTES) { strcpy(result->error,"insufficient AFDM for index pages"); goto cleanup; }
     uint64_t nchunks=(request->bytes+chunk-1)/chunk;
     /* Keep room for grouped state and spill buffers (1 MiB), or the larger
      * expression scratch retained alongside a residual join filter (2 MiB). */
@@ -516,7 +523,9 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     }
     group.count=workers;
     bool has_filter=request->plan.predicate>=0;
-    callback_scan=!joining && !streaming && request->bytes;
+    /* Grouped aggregate sinks keep one state per slot. The next batch can
+     * start on completion, just as for a scalar aggregate. */
+    callback_scan=!joining && !request->plan.ordered_rows && request->bytes;
     if(callback_scan) {
         chain.request=request; chain.extents=extents; chain.device=device;
         chain.chunk=chunk; chain.profiling=profiling;
@@ -829,7 +838,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
                         const struct qs_request *file=read->heap?&builds[njoins-1]:&index_request;
                         const struct qs_extent *map=read->heap?build_extents[njoins-1]:index_extents;
                         uint64_t at=(uint64_t)read->block*QS_PAGE;
-                        if(read->heap>1 || read->slot>=QS_INDEX_CACHE || at>file->bytes || QS_PAGE>file->bytes-at) { strcpy(result->error,"CSD index page is outside its prepared file"); goto cleanup; }
+                        if(read->heap>1 || read->slot>=QS_INDEX_SLOTS || at>file->bytes || QS_PAGE>file->bytes-at) { strcpy(result->error,"CSD index page is outside its prepared file"); goto cleanup; }
                         append_ranges(&load->u.StorageIo.u.BlockIo,file,map,at,QS_PAGE); ++j;
                     } while(j<task.index_nreads && task.index_reads[j].slot==task.index_reads[first].slot+j-first);
                     TRY(csConfigureBatchEntry(slot->resume,CS_BATCH_ADD,load,0,previous,&current)); previous=current;

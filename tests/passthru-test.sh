@@ -1,4 +1,7 @@
 #!/bin/bash
+# 在宿主机运行 bash tests/passthru-test.sh build 编译示例及设备程序。
+# 用 bash tests/passthru-test.sh <设备> <操作> [操作参数...] 执行。
+# 设备是 Guest 的 NVMe 控制器或 namespace 路径，操作及其参数由 csd-passthru 解析。
 
 ROOT=$(dirname $(realpath $0))
 DOCKER_PROGRAMS_DIR=/workspace/code/csd-programs

@@ -1,4 +1,7 @@
 #include "./nvme.h"
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 /*
  * Does this transfer land inside the controller memory buffer? The buffer is a
@@ -53,9 +56,25 @@ static bool femu_dma_direct(FemuCtrl *n, dma_addr_t addr, dma_addr_t len,
     return true;
 }
 
+#if defined(__x86_64__)
+/* The population source is device-owned memory. Stream whole guest RAM
+ * cache lines without first fetching their old contents into the CPU. */
+__attribute__((target("avx2")))
+static void femu_copy_cache_lines(uint8_t *dst, const uint8_t *src, size_t size)
+{
+    for (size_t i = 0; i < size; i += 64) {
+        _mm256_stream_si256((__m256i *)(dst + i),
+                            _mm256_loadu_si256((const __m256i *)(src + i)));
+        _mm256_stream_si256((__m256i *)(dst + i + 32),
+                            _mm256_loadu_si256((const __m256i *)(src + i + 32)));
+    }
+    _mm_sfence();
+}
+#endif
+
 /* The CMB belongs to this device, so it is copied without dispatch. */
-MemTxResult femu_dma_rw(FemuCtrl *n, dma_addr_t addr, void *buf,
-                        dma_addr_t len, bool to_host)
+static MemTxResult femu_dma_copy(FemuCtrl *n, dma_addr_t addr, void *buf,
+                                dma_addr_t len, bool to_host, bool population)
 {
     if (nvme_addr_is_cmb(n, addr, len)) {
         uint8_t *cmb = &n->cmbuf[addr - n->ctrl_mem.addr];
@@ -81,6 +100,12 @@ MemTxResult femu_dma_rw(FemuCtrl *n, dma_addr_t addr, void *buf,
          * unmap preserves QEMU's dirty tracking and code invalidation. */
         memory_region_ref(mr);
         uint8_t *ram = (uint8_t *)memory_region_get_ram_ptr(mr) + xlat;
+#if defined(__x86_64__)
+        if (population && size >= 4096 && !(((uintptr_t)ram | size) & 63) &&
+            __builtin_cpu_supports("avx2")) {
+            femu_copy_cache_lines(ram, data, size);
+        } else
+#endif
         memmove(to_host ? ram : data, to_host ? data : ram, size);
         address_space_unmap(as, ram, size, to_host, size);
         addr += size;
@@ -88,6 +113,18 @@ MemTxResult femu_dma_rw(FemuCtrl *n, dma_addr_t addr, void *buf,
         len -= size;
     }
     return MEMTX_OK;
+}
+
+MemTxResult femu_dma_rw(FemuCtrl *n, dma_addr_t addr, void *buf,
+                        dma_addr_t len, bool to_host)
+{
+    return femu_dma_copy(n, addr, buf, len, to_host, false);
+}
+
+MemTxResult femu_dma_write_population(FemuCtrl *n, dma_addr_t addr,
+                                     const void *buf, dma_addr_t len)
+{
+    return femu_dma_copy(n, addr, (void *)buf, len, true, true);
 }
 
 MemTxResult femu_dma_set(FemuCtrl *n, dma_addr_t addr, uint8_t c,

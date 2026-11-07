@@ -629,7 +629,7 @@ static uint64_t nvme_fw_cost(FemuCtrl *n, uint8_t opcode)
  * A reservation models transfer time; actual CPU copying is not charged again.
  * Cache push DMA reserves before publishing its completion; normal commands
  * reserve once their media deadline is known. link_timing avoids double charging. */
-void nvme_charge_link(FemuCtrl *n, NvmeRequest *req)
+void nvme_charge_link(FemuCtrl *n, NvmeRequest *req, bool hpcp)
 {
     uint64_t bytes = req->xfer_bytes;
     if (!n->pcie_enabled || !req->ns || req->link_timing.end) return;
@@ -646,6 +646,29 @@ void nvme_charge_link(FemuCtrl *n, NvmeRequest *req)
                                     &n->pcie_tx_next_avail_time;
     uint64_t start = MAX(*next, (uint64_t)req->expire_time);
     *next = start + transfer;
+    if (n->pcie_profile_users && !req->is_write && !hpcp) {
+        struct FemuLinkProfile *p = &n->pcie_profile;
+        uint64_t shadow_start = MAX(n->pcie_tx_without_hpcp,
+                                    (uint64_t)req->expire_time);
+        uint64_t delay = start - shadow_start;
+        bool afdm = req->cmd_opcode == NVME_CMD_CSD_READ_AFDM;
+        n->pcie_tx_without_hpcp = shadow_start + transfer;
+        p->requests++;
+        p->afdm_requests += afdm;
+        if (delay) {
+            uint64_t end = *next + n->pcie_prop_delay_ns;
+            uint64_t now = nvme_io_clock(n);
+            uint64_t exposed = MIN(delay, end > now ? end - now : 0);
+            p->affected++;
+            p->delay_ns += delay;
+            p->exposed_ns += exposed;
+            p->max_exposed_ns = MAX(p->max_exposed_ns, exposed);
+            p->afdm_affected += afdm;
+            if (afdm) {
+                p->afdm_exposed_ns += exposed;
+            }
+        }
+    }
     req->link_timing.begin = start;
     req->link_timing.end = *next + n->pcie_prop_delay_ns;
     req->expire_time = req->link_timing.end;
@@ -680,7 +703,7 @@ static void nvme_process_cq_cpl(void *arg, int index_poller)
             req->t_return = nvme_io_clock(n);
         }
 
-        nvme_charge_link(n, req);
+        nvme_charge_link(n, req, false);
 
         /*
          * Optional controller-CPU model: charge each command its firmware

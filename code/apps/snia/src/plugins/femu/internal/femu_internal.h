@@ -27,7 +27,7 @@ struct cs_device {
     char path[4096];
     struct { uint32_t workers; uint64_t fdm_bytes, features; } caps;
     /* Optional diagnostic counters; internal to this plugin, not SNIA API. */
-    bool profile;
+    bool profile, cache_summary;
     struct { uint64_t calls, wall_ns; } io_timing[13];
     uint64_t load_to_compute_calls, load_to_compute_ns;
 };

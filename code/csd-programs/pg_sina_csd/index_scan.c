@@ -8,20 +8,51 @@
 #include "query_eval.h"
 #include "scan.h"
 #include <limits.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <string.h>
+#include <time.h>
 extern int64_t pg_sina_filter_impl(struct femu_csd_args *);
 #define INDEX_KEYS QS_INDEX_KEYS
 #define INDEX_BUCKETS (2*QS_INDEX_CACHE)
 _Static_assert(!(INDEX_BUCKETS&(INDEX_BUCKETS-1)),"index buckets must be a power of two");
-struct page_tag { uint32_t block; uint16_t heap, state; }; /* 0 absent, 1 loaded, 2 requested */
+struct page_tag { uint32_t block; uint16_t heap, state; };
+#define SHARED_WAYS 8
+#define HEAP_HISTORY 64
+#define CACHE_SHARD_BYTES (8U*1024*1024)
+#define CACHE_SAMPLE_MASK 63U
+struct shared_page {
+    uint64_t key, stamp;
+};
+struct shared_set {
+    atomic_bool busy;
+    uint64_t clock;
+    struct shared_page ways[SHARED_WAYS];
+    uint64_t seen_heap[HEAP_HISTORY];
+};
+struct cache_shard {
+    unsigned sets;
+    unsigned char *data;
+    struct shared_set set[];
+};
+struct qs_index_cache {
+    unsigned count;
+    bool profiling;
+    cs_work_cache shards[];
+};
 struct lookup { unsigned row, block, item, heap_block, heap_item, phase; int64_t key; };
 struct index_cursor {
-    struct page_tag tags[QS_INDEX_CACHE];
-    uint16_t heads[INDEX_BUCKETS],next[QS_INDEX_CACHE]; /* slot+1; zero ends a chain */
+    struct page_tag tags[QS_INDEX_SLOTS];
+    uint16_t heads[INDEX_BUCKETS],next[QS_INDEX_SLOTS]; /* slot+1; zero ends a chain */
     struct lookup keys[INDEX_KEYS];
     unsigned position, count, hand, waiting, pending, last_slot, root;
     const unsigned char *heap_window;
     uint32_t heap_first,heap_pages;
+    struct qs_index_cache *shared;
+    uint32_t heap_file,index_file;
+    uint64_t hits[2],misses[2]; /* B-tree, then Heap. */
+    unsigned cache_sequence[2];
+    struct qs_timing cache_timing[4];
     struct lookup scan;
     uint64_t *scan_tids;
     int scan_started,scan_done;
@@ -32,6 +63,126 @@ struct index_cursor {
     unsigned dictionary_pending,dictionary_key,spill_bound;
 };
 _Static_assert(sizeof(struct index_cursor)<=16384,"index cursor must fit its per-CU budget");
+
+static bool cache_shard_create(cs_work_context *ctx,cs_work_cache *storage,size_t bytes,size_t pool_limit)
+{
+    unsigned sets=(bytes-sizeof(struct cache_shard))/(sizeof(struct shared_set)+SHARED_WAYS*QS_PAGE);
+    if(!sets || cs_work_cache_allocate(ctx,storage,bytes,pool_limit)) return false;
+    struct cache_shard *cache=cs_work_cache_pin(storage);
+    if(!cache) return false;
+    cache->sets=sets;
+    cache->data=(void *)(cache->set+sets);
+    for(unsigned i=0;i<sets;++i) {
+        cache->set[i].clock=0;
+        atomic_init(&cache->set[i].busy,false);
+        memset(cache->set[i].ways,0,sizeof(cache->set[i].ways));
+        memset(cache->set[i].seen_heap,0,sizeof(cache->set[i].seen_heap));
+    }
+    cs_work_cache_unpin(storage);
+    return true;
+}
+struct qs_index_cache *qs_index_cache_create(cs_work_context *ctx,size_t bytes,size_t pool_limit,bool profiling)
+{
+    unsigned count=(bytes+CACHE_SHARD_BYTES-1)/CACHE_SHARD_BYTES;
+    struct qs_index_cache *cache=cs_work_calloc(ctx,1,sizeof(*cache)+count*sizeof(*cache->shards));
+    if(!cache) return NULL;
+    cache->profiling=profiling;
+    for(unsigned i=0;i<count;++i) {
+        size_t shard=bytes<CACHE_SHARD_BYTES?bytes:CACHE_SHARD_BYTES;
+        /* Leave room for the allocator's own metadata within the cap. */
+        if(!cache_shard_create(ctx,&cache->shards[i],shard-128,pool_limit)) break;
+        ++cache->count;
+        bytes-=shard;
+    }
+    if(cache->count) return cache;
+    cs_work_free(ctx,cache);
+    return NULL;
+}
+
+/* Keep the page only for this copy. Private AFDM handles I/O and cursor
+ * retention, so workmem can discard unpinned shards between copies. */
+static uint64_t cache_clock(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC_RAW,&t);
+    return (uint64_t)t.tv_sec*1000000000ULL+t.tv_nsec;
+}
+static bool shared_copy(struct index_cursor *cursor,uint64_t key,void *page,bool insert,bool heap)
+{
+    struct qs_index_cache *shared=cursor->shared;
+    bool sample=shared->profiling && !(cursor->cache_sequence[insert]++ & CACHE_SAMPLE_MASK);
+    uint64_t start=sample?cache_clock():0, copy_ns=0;
+    uint64_t hash=key;
+    hash=(hash^(hash>>30))*UINT64_C(0xbf58476d1ce4e5b9);
+    hash=(hash^(hash>>27))*UINT64_C(0x94d049bb133111eb);
+    hash^=hash>>31;
+    cs_work_cache *storage=&shared->shards[(uint32_t)hash%shared->count];
+    struct cache_shard *cache=cs_work_cache_pin(storage);
+    bool hit=false;
+    if(cache) {
+        unsigned index=(hash>>32)%cache->sets;
+        struct shared_set *set=&cache->set[index];
+        if(!atomic_exchange_explicit(&set->busy,true,memory_order_acquire)) {
+            unsigned victim=0,slot=0;
+            for(;slot<SHARED_WAYS;++slot) {
+                if(set->ways[slot].key==key) {
+                    hit=true;
+                    break;
+                }
+                if(set->ways[slot].stamp<set->ways[victim].stamp) victim=slot;
+            }
+            bool admit=insert;
+            if(insert && heap && !hit) {
+                /* A first load records the key without copying a page. A
+                 * matching later load can use its AFDM page to fill the cache. */
+                uint64_t *seen=&set->seen_heap[(hash>>16)&(HEAP_HISTORY-1)];
+                admit=*seen==key;
+                *seen=key;
+            }
+            if(hit || admit) {
+                if(!hit) slot=victim;
+                unsigned char *data=cache->data+((size_t)index*SHARED_WAYS+slot)*QS_PAGE;
+                if(!insert || !hit) {
+                    uint64_t copy_start=sample?cache_clock():0;
+                    if(insert) memcpy(data,page,QS_PAGE);
+                    else memcpy(page,data,QS_PAGE);
+                    if(sample) {
+                        copy_ns=cache_clock()-copy_start;
+                        struct qs_timing *copy=&cursor->cache_timing[2+insert];
+                        copy->wall_ns+=copy_ns;
+                        ++copy->calls;
+                    }
+                }
+                if(insert) set->ways[slot].key=key;
+                set->ways[slot].stamp=++set->clock;
+            }
+            atomic_store_explicit(&set->busy,false,memory_order_release);
+        }
+        cs_work_cache_unpin(storage);
+    }
+    if(sample) {
+        struct qs_timing *op=&cursor->cache_timing[insert];
+        op->wall_ns+=cache_clock()-start-copy_ns;
+        ++op->calls;
+    }
+    return hit;
+}
+static unsigned char *private_page(void *io,unsigned slot)
+{ return (unsigned char *)io+QS_SORT_IO_BYTES+(size_t)slot*QS_PAGE; }
+static uint64_t page_key(const struct index_cursor *c,unsigned block,unsigned heap)
+{
+    unsigned file=heap?c->heap_file:c->index_file;
+    return file?((uint64_t)file<<32)|block:0;
+}
+static void loaded_pages(struct index_cursor *c,void *io)
+{
+    for(unsigned i=0;i<QS_INDEX_SLOTS;++i) if(c->tags[i].state==2) {
+        struct page_tag *tag=&c->tags[i];
+        tag->state=1;
+        uint64_t key=page_key(c,tag->block,tag->heap);
+        if(c->shared && key) shared_copy(c,key,private_page(io,i),true,tag->heap);
+    }
+}
 struct index_join {
     cs_work_context *context;
     struct qs_plan scan;
@@ -77,6 +228,33 @@ int qs_index_init(const struct qs_plan *p,struct qs_join_control *control)
     control->state=(uintptr_t)h; control->indexed=1; control->batches=1;
     return 0;
 }
+void qs_index_cache_bind(struct qs_join_control *control,struct qs_index_cache *cache)
+{
+    struct index_join *h=(void *)(uintptr_t)control->state;
+    struct index_cursor *c=h->cursors[0];
+    c->shared=cache;
+    c->heap_file=h->scan.join.relid;
+    c->index_file=h->scan.join.indexid;
+}
+void qs_index_cache_stats(const struct qs_join_control *control,struct qs_metrics *metrics,struct qs_profile *profile)
+{
+    const struct index_join *h=(void *)(uintptr_t)control->state;
+    if(!h || !h->cursors[0]) return;
+    struct index_cursor *c=h->cursors[0];
+    if(metrics) for(unsigned kind=0;kind<2;++kind) {
+        metrics->index_cache_hits[kind]+=c->hits[kind];
+        metrics->index_cache_misses[kind]+=c->misses[kind];
+    } else {
+        memset(c->hits,0,sizeof(c->hits));
+        memset(c->misses,0,sizeof(c->misses));
+        memset(c->cache_timing,0,sizeof(c->cache_timing));
+    }
+    if(profile) for(unsigned i=0;i<4;++i) {
+        struct qs_timing *out=&profile->operators[QS_INDEX_CACHE_LOOKUP+i];
+        out->calls+=c->cache_timing[i].calls;
+        out->wall_ns+=c->cache_timing[i].wall_ns;
+    }
+}
 void qs_index_reset(struct qs_join_control *control,unsigned slot)
 {
     struct index_join *h=(void *)(uintptr_t)control->state;
@@ -105,7 +283,9 @@ void qs_index_heap_window(struct qs_join_control *control,unsigned slot,const vo
 void qs_index_close(struct qs_join_control *control)
 {
     struct index_join *h=(void *)(uintptr_t)control->state;
-    if(h) { cs_work_context *ctx=h->context; control->state=0; cs_work_end(ctx); }
+    if(h) {
+        cs_work_context *ctx=h->context; control->state=0; cs_work_end(ctx);
+    }
 }
 void qs_index_dictionary(struct qs_join_control *control,struct qs_dict *dictionary)
 { ((struct index_join *)(uintptr_t)control->state)->dictionary=dictionary; }
@@ -143,35 +323,50 @@ static int64_t decode_tuple(struct index_join *h,struct index_cursor *c,const un
 }
 static unsigned page_bucket(unsigned block,unsigned heap)
 { return (block*UINT32_C(0x9e3779b1)^(heap?UINT32_C(0x85ebca6b):0))&(INDEX_BUCKETS-1); }
+static const unsigned char *page_data(const struct index_cursor *c,void *io,unsigned slot)
+{
+    const struct page_tag *tag=&c->tags[slot];
+    if(tag->state!=1) return NULL;
+    return private_page(io,slot);
+}
 static const unsigned char *page_at(struct index_cursor *c,struct qs_task *task,void *io,unsigned block,unsigned heap)
 {
     if(heap && block>=c->heap_first && block-c->heap_first<c->heap_pages)
         return c->heap_window+(size_t)(block-c->heap_first)*QS_PAGE;
     const struct page_tag *last=&c->tags[c->last_slot];
     if(last->state && last->block==block && last->heap==heap)
-        return last->state==1?(unsigned char *)io+QS_SORT_IO_BYTES+(size_t)c->last_slot*QS_PAGE:NULL;
+        return page_data(c,io,c->last_slot);
     unsigned bucket=page_bucket(block,heap);
     for(unsigned at=c->heads[bucket];at;at=c->next[at-1]) {
         unsigned i=at-1;
         if(c->tags[i].block==block && c->tags[i].heap==heap) {
             c->last_slot=i;
-            return c->tags[i].state==1?(unsigned char *)io+QS_SORT_IO_BYTES+(size_t)i*QS_PAGE:NULL;
+            return page_data(c,io,i);
         }
     }
     if(task->index_nreads==QS_INDEX_READS) return NULL;
-    for(unsigned n=0;n<QS_INDEX_CACHE;++n) {
-        unsigned slot=c->hand++%QS_INDEX_CACHE;
+    const struct femu_graph_read_pool *pool=(const void *)((unsigned char *)io+QS_INDEX_POOL_OFFSET);
+    for(unsigned n=0;n<QS_INDEX_SLOTS;++n) {
+        unsigned slot=n<QS_INDEX_CACHE?c->hand++%QS_INDEX_CACHE:n;
         const struct page_tag *tag=&c->tags[slot];
         /* Every lookup batch revisits the root. Keep its one existing slot;
          * rotate the rest so LOAD destinations remain mostly contiguous. */
-        if(tag->state==2 || (tag->state && !tag->heap && tag->block==c->root)) continue;
+        if(tag->state==2 || (tag->state && !tag->heap && tag->block==c->root) ||
+           __atomic_load_n(&pool->readers[slot],__ATOMIC_ACQUIRE)) continue;
         if(tag->state) {
             uint16_t *link=&c->heads[page_bucket(tag->block,tag->heap)];
             while(*link && *link!=slot+1) link=&c->next[*link-1];
             if(*link) *link=c->next[slot];
         }
-        c->tags[slot]=(struct page_tag){block,heap,2};
+        uint64_t key=page_key(c,block,heap);
+        bool ready=c->shared && key && shared_copy(c,key,private_page(io,slot),false,heap);
+        c->tags[slot]=(struct page_tag){.block=block,.heap=heap,.state=ready?1:2};
         c->next[slot]=c->heads[bucket]; c->heads[bucket]=slot+1;
+        if(ready) {
+            ++c->hits[heap];
+            c->last_slot=slot; return page_data(c,io,slot);
+        }
+        ++c->misses[heap];
         task->index_reads[task->index_nreads++]=(struct qs_index_read){block,slot,heap};
         return NULL;
     }
@@ -246,7 +441,7 @@ int64_t qs_index_scan(struct qs_chunk *out,struct qs_task *task,struct qs_join_c
     struct index_join *h=(void *)(uintptr_t)control->state;
     struct index_cursor *c=h->cursors[0];
     if(c->waiting) {
-        for(unsigned i=0;i<QS_INDEX_CACHE;++i) if(c->tags[i].state==2) c->tags[i].state=1;
+        loaded_pages(c,io);
         c->waiting=0; task->index_pending=task->index_nreads=0;
     }
     if(!c->scan_started) {
@@ -392,13 +587,13 @@ int64_t qs_index_probe(unsigned stage,struct qs_chunk *c,const struct qs_plan *p
     const struct qs_join *j=qs_join_at(p,stage); struct index_join *h=(void *)(uintptr_t)control[stage].state;
     struct index_cursor *cursor=index_cursor(h,task->slot); if(!cursor) return -4;
     struct qs_chunk *out=(void *)((unsigned char *)a->mr_addr[4]+stage*qs_join_chunk_stride(p));
-    if(a->numr!=6 || a->mr_len[5]<QS_SORT_IO_BYTES+(long long)QS_INDEX_CACHE*QS_PAGE) return -1;
+    if(a->numr!=6 || a->mr_len[5]<QS_INDEX_IO_BYTES) return -1;
     if(h->paged_dictionary) {
         if(!cursor->spill_bound) cursor->spill_io=a->mr_addr[5];
         cursor->dictionary_completion=cursor->dictionary_pending?csReentryValue(a):0;
     }
     if(cursor->waiting) {
-        for(unsigned i=0;i<QS_INDEX_CACHE;++i) if(cursor->tags[i].state==2) cursor->tags[i].state=1;
+        loaded_pages(cursor,a->mr_addr[5]);
         cursor->waiting=0; task->index_pending=task->index_nreads=0;
     }
     if(!resume && !cursor->dictionary_pending) {

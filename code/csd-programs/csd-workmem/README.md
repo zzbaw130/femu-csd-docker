@@ -16,8 +16,9 @@ if (!buffer) { /* 缩小 chunk、分区、spill 或返回资源不足 */ }
 cs_work_end(ctx);
 ```
 
-- 默认64MiB，由容器环境变量 `CSD_WORKMEM_SIZE_MB` 配置；首次使用前也可调用 cs_work_init(bytes)，初始化后不能改变容量。
-- 一次 mmap 建立有限 arena，块头和对齐计入配额；互斥锁保护分配链及全部 CU 的总计数。
+- Compose 默认用 `CSD_WORKMEM_SIZE_MB=1024`，设备启动时把预触页的 HugeTLB 内存交给分配器。独立运行 CSF 测试仍可以用匿名 mmap 或 `cs_work_init(bytes)` 初始化内存池。
+- 块头和对齐计入配额，互斥锁保护分配链及全部 CU 的总计数。
+- Index Join 的查询内 B-tree 与 Heap 页缓存通过 `cs_work_cache_allocate` 计入同一预算，所有并发缓存合计上限为 128 MiB。普通分配遇到内存压力时可丢弃未固定的干净缓存，重读仍走原有设备 I/O。PG 会话可用 `pg_sina_csd.index_cache_mib=0` 禁用这层缓存。
 - 一次完整任务创建 context，可跨多次 CSF 入口保留；cs_work_end 批量释放。context 是不可解引用的 opaque token，最多256个。
 - cs_work_begin_limit 可限制单 context，但不为它预留独占内存。
 - cs_work_begin_child(parent, limit) 创建查询内的子 context；每次分配同时计入自身、父级和全局池的限额，供多个排序或索引节点共享一个查询预算。先结束子 context；仍有子级时结束父级返回 EBUSY。

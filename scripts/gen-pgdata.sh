@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# 调用方式为 bash scripts/gen-pgdata.sh [-f] <SF> [pgdata_root]。
+# SF 是数据规模（如 0.01、4、8），pgdata_root 默认为 /data/dengyao/pgdata。
+# -f 删除同规模旧数据目录后重建。需宿主机的 PostgreSQL 和 DuckDB，脚本会停止当前宿主 PG。
 
 FORCE_REGEN=0
 while getopts ":f" opt; do

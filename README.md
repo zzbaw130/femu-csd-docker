@@ -7,6 +7,8 @@
 
 # FEMU CSD + PostgreSQL 实验环境
 
+完整的 PG → SNIA → FEMU/FTL → CU 调用关系，以及 HPCP/DCP 填充与队列设计见 [SQLerate 系统架构](code/apps/pg_sina_csd/doc/architecture.md)。
+
 在 Docker 里构建并运行 [FEMU](https://github.com/MoatLab/FEMU)（QEMU 10.1 基座）的 **CSD 模式**
 （`femu_mode=4`）：PostgreSQL 12（`code/apps/postgres`，REL_12_STABLE）跑在 guest 里，
 数据盘是 FEMU 模拟的 NVMe SSD —— NAND 时序、FTL、GC 全部是模拟的，用来做 CSD / 存储相关实验
@@ -27,7 +29,7 @@
 | 删 `images/u20s.qcow2`（强制重做 guest 镜像） | | ✓ | |
 | `docker compose build` 编译 FEMU | ✓ | | |
 | `docker compose up -d --wait` 启动 CSD VM（等 healthcheck：guest SSH 可用） | ✓ | | |
-| guest `init-csd-env.sh`：模拟盘 GPT 分区，80% ext4 挂到 `/data`、20% 预留 spill，编译安装 SNIA | | | ✓ |
+| guest `init-csd-env.sh`：默认整盘ext4挂到`/data`，可选历史分区布局，编译安装SNIA | | | ✓ |
 | guest `install-postgre.sh`：从 `~/apps/postgres` 编译安装 PostgreSQL 到 `~/opt/postgres/release` | | | ✓ |
 | guest `start-postgre.sh 0.01`：解压 `data/tpch_s0.01.tar` 到 `/data` 并启动 `tpch_s0.01` | | | ✓ |
 
@@ -36,7 +38,7 @@ cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,f
 耗时几分钟。
 
 前置条件：x86_64 + **可用的 `/dev/kvm`**、docker compose v2、首次构建/首次启动需要联网；
-内存按第 5 节预留（默认约 32 GiB 模拟盘 + 8 GiB guest + FDM ≈ 45 GiB）。
+内存按第 5 节预留（默认约 20 GiB namespace、8 GiB 设备 spill 和 16 GiB Guest RAM，另需 FDM、workmem 和元数据）。
 
 ## 2. 快速验证
 
@@ -47,20 +49,22 @@ cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,f
 # 开启测试
 ./tests/passthru-test.sh build <nvme dev> <options>
 
-# PostgreSQL host/CSD 冷启动对照，只使用 tests/guest/queries 的 22 条 SQL
-./tests/test-guest.sh tpch-cold.sh
+# SF8 就绪后，使用正式 Q6 做一次冷启动冒烟检查
+./tests/test-guest.sh tpch-cold.sh -n 1 6
 
 # ssh到guest内部
 ./scripts/ssh-guest.sh
 ```
 
-TPC-H 三种测试模式遵循 `AGENTS.md`。在 Guest 内指定当前数据库后运行完整实验：
+TPC-H 三种测试模式遵循 `AGENTS.md`，正式实验使用 SF8 和 16 GiB Guest 内存。三个入口用 `-s` 指定目标选择率，默认 0.1，执行前需生成对应的 SQL 目录。
+重建 FEMU 后，先初始化 Guest，再用 `./scripts/sh-guest.sh scripts/guest/start-postgre.sh 8` 启动 SF8，
+并用 `bash tests/pg-sina-csd-test.sh prepare` 重建 CSD 映射。随后在 Guest 中运行完整实验：
 
 ```sh
-export PGDATA=/data/tpch_s4 PGDATABASE=tpch_s4
-sh /home/femu/tests/tpch-cold.sh -n 3 -o /home/femu/results/tpch-sf4
-sh /home/femu/tests/tpch-warm.sh -n 3 -o /home/femu/results/tpch-sf4
-sh /home/femu/tests/tpch-repeat.sh -n 5 -o /home/femu/results/tpch-sf4
+export PGDATA=/data/tpch_s8 PGDATABASE=tpch_s8
+sh /home/femu/tests/tpch-cold.sh -n 3 -o /home/femu/results/tpch-sf8
+sh /home/femu/tests/tpch-warm.sh -n 3 -o /home/femu/results/tpch-sf8
+sh /home/femu/tests/tpch-repeat.sh -n 5 -o /home/femu/results/tpch-sf8
 ```
 
 三个入口默认次数分别为3、3、5，可用`-n`调整。`-b/-w/-m`配置shared_buffers、每Gather并行worker、work_mem，默认2GB/4/16MB。选项后可传查询编号做针对性检查。warm先HOST预热一次，repeat从冷态开始且相邻执行间隔1秒；组内同一连接，不插入采样SQL。详见[测试说明](tests/guest/README.md)。
@@ -96,7 +100,8 @@ sh /home/femu/tests/tpch-repeat.sh -n 5 -o /home/femu/results/tpch-sf4
 │       ├── tpch-cold.sh             # 完全冷启动n次
 │       ├── tpch-warm.sh             # HOST预热一次，再测n次
 │       ├── tpch-repeat.sh           # 从冷态连续执行n次
-│       └── queries/                 # 1..22 的 <n>.sql 与 <n>.explain.sql
+│       ├── queries/template/        # 1..22 的 psql 查询模板
+│       └── queries/selectivity/     # 按目标选择率反查模板参数
 ├── code/
 │   ├── FEMU/                        # FEMU 源码（改这里，容器里编译）
 │   ├── apps/
@@ -131,20 +136,21 @@ data/     ← 9p: 宿主机 data           （tpch_s<SF>.tar）
 results/  ← 9p: 宿主机 results        （实验结果直接落回宿主机）
 scripts/  ← 9p: 宿主机 scripts/guest  （guest 内脚本）
 tests/    ← 9p: 宿主机 tests/guest    （tpch-test.sh + queries/）
-/data                               # 模拟 SSD 数据分区（/dev/nvme0n1p1, ext4），PGDATA 在这里
+/data                               # 模拟 SSD 整盘（/dev/nvme0n1, ext4），PGDATA 在这里
 ```
 
-模拟盘的 `femu-data` 分区约占 80%，`femu-spill` 分区约占 20%，后者不格式化、不挂载。
-Guest 需安装 `parted`。首次运行或标签不匹配时会重新分区并格式化数据区，清除原有数据；
-标签匹配时复用已有布局。执行 `./scripts/sh-guest.sh scripts/guest/init-csd-env.sh` 即可。
-宿主物理绑定在 `run-csd.sh` 启动 QEMU 时执行。当前 Compose 使用 4 CU：
-`FEMU_HOST_CPUS=30-39`、`FEMU_HOST_NODE=3` 放置 Guest vCPU、其他 QEMU 线程及 8GiB Guest RAM；
-`FEMU_DEVICE_CPUS=20-28`、`FEMU_DEVICE_NODE=2` 放置 9 个设备线程和 NVM、FDM、workmem、spill 等设备内存。
+默认将32GiB可见NVMe整盘格式化为ext4并挂载到`/data`，不再预留可见spill分区。
+执行 `./scripts/sh-guest.sh scripts/guest/init-csd-env.sh` 即可；已有整盘ext4会复用。
+首次格式化会清除原有设备数据。可显式传入`--partitioned`恢复历史80%数据/20%spill分区布局，
+该模式需要Guest的`parted`，现有分区标签匹配时复用。两种布局的设备spill均使用独立隐藏空间。
+宿主物理绑定在 `run-csd.sh` 启动 QEMU 时执行。当前 Compose 使用 8 CU：
+`FEMU_HOST_CPUS=30-39`、`FEMU_HOST_NODE=3` 放置 Guest vCPU、其他 QEMU 线程及 16GiB Guest RAM；
+`FEMU_DEVICE_CPUS=20-28` 放置13个设备线程，8条CU分别受CPU配额限制。
+`FEMU_DEVICE_NODE=1,2`允许设备内存在这两个节点分配：32GiB NVM及8GiB隐藏spill无法容纳于单个约31.4GiB的node2。
 设备线程在入口设置亲和性，不需要启动后查找 PID/TID；容器通过 SYS_NICE 允许设置 NUMA 内存策略。
 Guest 仍只看到一个虚拟 NUMA 节点。更换宿主时应核对物理核、SMT 拓扑和节点容量，再调整上述四项。
 更改这些参数需要先保存易失 SSD 数据，再重建容器。
-后续 SNIA 按 GPT `PARTLABEL=femu-spill` 查找 spill 分区，读取其起始位置和容量；
-分区序号不承担角色含义。SNIA 插件通过内部 D0/D1 处理 spill LOAD/STORE。
+SNIA将batch转换为设备执行图，设备用隐藏区段及token处理spill LOAD/STORE，不依赖GPT标签或可见分区。
 该脚本同时编译 `/home/femu/apps/snia`，安装 `cs.h`、`libsnia.so` 和 FEMU 插件到 `/usr/local`，
 并运行 `ldconfig`。完成后应用可直接使用：
 
@@ -174,16 +180,18 @@ cc application.c -lsnia -o application
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `FEMU_SMP` | 8 | guest vCPU 数 |
-| `FEMU_MEM` | 8G | guest 内存 |
-| `CSD_NVM_SIZE` | 20480 | **暴露给 guest 的SSD容量**（MiB）。当前为SF8保留表、索引和PG临时文件空间 |
+| `FEMU_MEM` | 16G | guest 内存 |
+| `CSD_NVM_SIZE` | 32768 | **暴露给 guest 的SSD容量**（MiB）。整盘用于SF8表、索引和PG临时文件 |
 | `CSD_SPILL_SIZE_MB` | 8192 | 设备隐藏的NVM临时区（MiB），不占FDM或计算workmem；与namespace合计必须满足NAND的GC保留要求 |
-| `CSD_FDM_SIZE` | 64 | CSF 输入输出缓冲 FDM（MiB） |
-| `CSD_NR_CU` | 4 | CSD 计算单元数（≤64） |
-| `CSD_CSF_RUNTIME_SCALE` | 1 | 程序运行时间缩放 |
-| `CSD_WORKMEM_SIZE_MB` | `256` | 所有协作式 CSF 共享的工作内存池，与 FDM 独立 |
+| `CSD_FDM_SIZE` | 128 | 从设备内存尾部划出的 CSF 输入输出缓冲 FDM（MiB） |
+| `CSD_NR_CU` | 8 | CSD 计算单元数（≤64） |
+| `CSD_CU_CPU_RATIO` | `0.3333333333` | 每条 CU 线程的 CPU 时间配额；0/1 关闭限制，其余支持 [0.1,1)，周期 10ms |
+| `CSD_DEVICE_MEMORY_MB` | 1024 | 连续 HugeTLB 映射的总大小（MiB），扣除 FDM 后为 CSF workmem，默认 896 MiB |
 | `CSD_PROGRAM_DIR` | `/workspace/code/csd-programs/build` | 容器内算子目录（`csd_program_dir`） |
 
-RAM-backed仿真的最大内存需求 ≈ `CSD_NVM_SIZE` + `CSD_SPILL_SIZE_MB` + `CSD_FDM_SIZE` + `CSD_WORKMEM_SIZE_MB`（以上均MiB）+ `FEMU_MEM` + 约1GiB元数据。NAND原始容量固定64GiB，namespace与隐藏临时区合计最多48GiB，以保留GC空间；隐藏临时区不是计算内存。
+RAM-backed仿真的最大内存需求 ≈ `CSD_NVM_SIZE` + `CSD_SPILL_SIZE_MB` + `CSD_DEVICE_MEMORY_MB`（以上均MiB）+ `FEMU_MEM` + 约1GiB元数据。NAND原始容量固定64GiB，namespace与隐藏临时区合计最多48GiB，以保留GC空间；隐藏临时区不是计算内存。
+
+CU 配额只作用于设备 CU，不限制 Guest vCPU、FTL、NVMe poller 或缓存 DMA。当前宿主使用 cgroup v1，Compose 仅将 CPU 控制器挂载为可写；启动脚本在容器自己的 CPU cgroup 下建立每 CU 子组，CU 启动时自行加入，退出后清理。`CSD_CU_CPU_RATIO=0` 和 `1` 都不迁移线程、不启用配额；`0<ratio<0.1` 或超出 0–1 范围拒绝启动。默认约 1/3（有效 0.3333） 对应每 CU 的 `cpu.cfs_quota_us=3333`、`cpu.cfs_period_us=10000`，不设置容器总 CPU 配额。该限制是 CPU 时间预算，不等价于处理器降频。原全局程序时间缩放参数已删除，普通 native CSF 按实际返回时间完成。
 
 ## 6. 容易踩的坑
 

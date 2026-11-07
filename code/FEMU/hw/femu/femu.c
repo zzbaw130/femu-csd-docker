@@ -3512,8 +3512,6 @@ static const Property femu_props[] = {
     DEFINE_PROP_UINT64("time_slice", FemuCtrl, csd_params.time_slice, 200000),
     DEFINE_PROP_UINT64("context_switch_time", FemuCtrl,
                        csd_params.context_switch_time, 200),
-    DEFINE_PROP_UINT16("csf_runtime_scale", FemuCtrl,
-                       csd_params.csf_runtime_scale, 3),
     DEFINE_PROP_STRING("csd_program_dir", FemuCtrl, csd_params.program_dir),
     DEFINE_PROP_STRING("kv_timing", FemuCtrl, kv_timing),
     DEFINE_PROP_STRING("kv_model_coeffs", FemuCtrl, kv_model_coeffs),

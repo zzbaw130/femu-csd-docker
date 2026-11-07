@@ -1,5 +1,14 @@
 #!/bin/bash
 # Run FEMU as a Computational Storage Drive (CSD)
+set -e -o pipefail
+
+# Per-CU CPU time, not a whole-container quota. This host uses cgroup v1.
+# 0/1 disable limits; Linux needs at least 1ms quota in the fixed 10ms period.
+cu_cpu_ratio=${CSD_CU_CPU_RATIO:-0.3333333333}
+cu_cpu_quota=$(awk -v ratio="$cu_cpu_ratio" 'BEGIN {
+    if (ratio !~ /^(0([.][0-9]+)?|1([.]0+)?)$/ || (ratio > 0 && ratio < 0.1)) exit 1;
+    print (ratio == 0 || ratio == 1) ? -1 : int(ratio * 10000 + 0.5);
+}') || { echo 'CSD_CU_CPU_RATIO must be 0, 1, or within [0.1, 1); period is 10ms' >&2; exit 1; }
 
 # Image directory
 IMGDIR=${IMGDIR:-$HOME/images}
@@ -32,12 +41,18 @@ gc_thres_pcent_high=95
 # accepted for CEMU config compatibility but configure a scheduler this port
 # does not carry, so they have no effect; values other than these defaults
 # print a warning.
-fdm_size=${CSD_FDM_SIZE}
-nr_cu=${CSD_NR_CU}
+fdm_size=${CSD_FDM_SIZE:-128}
+device_memory=${CSD_DEVICE_MEMORY_MB:-1024}
+if [[ ! $fdm_size =~ ^[1-9][0-9]*$ || ! $device_memory =~ ^[1-9][0-9]*$ ]] ||
+   (( device_memory % 2 || fdm_size >= device_memory )); then
+    echo 'CSD device memory must be a positive multiple of 2 MiB and larger than FDM' >&2
+    exit 1
+fi
+workmem_size=$((device_memory - fdm_size))
+nr_cu=${CSD_NR_CU:-8}
 nr_thread=4
 time_slice=200000
 context_switch_time=200
-csf_runtime_scale=${CSD_CSF_RUNTIME_SCALE}
 
 # container-side only; not shared with the guest
 csd_program_dir=${CSD_PROGRAM_DIR}
@@ -73,7 +88,6 @@ FEMU_OPTIONS=${FEMU_OPTIONS}",nr_cu=${nr_cu}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",nr_thread=${nr_thread}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",time_slice=${time_slice}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",context_switch_time=${context_switch_time}"
-FEMU_OPTIONS=${FEMU_OPTIONS}",csf_runtime_scale=${csf_runtime_scale}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",csd_program_dir=${csd_program_dir}"
 
 echo ${FEMU_OPTIONS}
@@ -87,10 +101,35 @@ if [[ ! -e "$OSIMGF" ]]; then
 	exit 1
 fi
 
+# Keep groups beneath the current container's CPU cgroup, preserving its
+# parent limits. No PID/TID scanning and no change to other device threads.
+cu_cgroup=
+if [ "$cu_cpu_quota" -ne -1 ]; then
+    cpu_path=$(awk -F: '$2 ~ /(^|,)cpu(,|$)/ { print $3; exit }' /proc/self/cgroup)
+    [ -n "$cpu_path" ] || { echo 'CU CPU quota requires the cgroup v1 CPU controller' >&2; exit 1; }
+    cu_cgroup="/sys/fs/cgroup/cpu${cpu_path}/femu-cu-$$"
+    mkdir "$cu_cgroup"
+    cleanup_cu_cgroups() {
+        for ((cu=0; cu<nr_cu; cu++)); do rmdir "$cu_cgroup/cu$cu" 2>/dev/null || true; done
+        rmdir "$cu_cgroup" 2>/dev/null || true
+    }
+    trap cleanup_cu_cgroups EXIT
+    for ((cu=0; cu<nr_cu; cu++)); do
+        mkdir "$cu_cgroup/cu$cu"
+        echo 10000 > "$cu_cgroup/cu$cu/cpu.cfs_period_us"
+        echo "$cu_cpu_quota" > "$cu_cgroup/cu$cu/cpu.cfs_quota_us"
+    done
+fi
+cu_cpu_effective=$(awk -v quota="$cu_cpu_quota" 'BEGIN { printf "%.4f", quota < 0 ? 1 : quota / 10000 }')
+echo "CSD CU CPU ratio=$cu_cpu_ratio effective=$cu_cpu_effective quota=$cu_cpu_quota us period=10000 us"
+
 # Bind thread groups at creation, without finding and repinning Linux TIDs.
 # Default allocations belong to the device; Guest RAM overrides that policy.
-sudo env CSD_WORKMEM_SIZE_MB="${CSD_WORKMEM_SIZE_MB:-64}" \
+sudo env CSD_WORKMEM_SIZE_MB="$workmem_size" \
+    FEMU_CSD_HUGEPAGES=1 \
+    CSD_CU_CPU_RATIO="$cu_cpu_effective" \
     FEMU_DEVICE_CPUS="${FEMU_DEVICE_CPUS}" \
+    FEMU_CU_CGROUP="$cu_cgroup" \
     numactl --physcpubind="${FEMU_HOST_CPUS}" --membind="${FEMU_DEVICE_NODE}" \
     ./qemu-system-x86_64 \
     -name "FEMU-CSD-VM",debug-threads=on \

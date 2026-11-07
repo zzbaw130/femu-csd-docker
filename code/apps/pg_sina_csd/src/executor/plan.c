@@ -45,7 +45,7 @@ struct plan_slot {
     bool ready, done, control_copied, yielded;
     uint64_t retry_progress;
     unsigned scan_node;
-    bool need_input;
+    bool need_input, prefetched_input;
     uint64_t queued_ns;
     PlanStateCsd *owner;
     unsigned worker;
@@ -64,6 +64,11 @@ struct PlanStateCsd {
     struct plan_slot slots[QS_WORKERS+1];
     unsigned workers, epoch, device_cus;
     atomic_uint_fast64_t next_scan_offset;
+    unsigned prefetch_build, prefetch_reused;
+    CS_BATCH_HANDLE prefetch_batch;
+    atomic_bool prefetch_done;
+    CS_STATUS prefetch_status;
+    bool prefetch_waited, prefetch_claimed;
     bool async_scan, delivery_shared, delivery_owner;
     struct result_delivery *delivery;
     dsm_segment *delivery_segment;
@@ -74,7 +79,7 @@ struct PlanStateCsd {
     atomic_bool delivery_pending;
     atomic_uint callbacks;
     CS_STATUS execution_status;
-    const char *execution_operation;
+    char execution_operation[160];
     atomic_uint_fast64_t batch_progress;
     unsigned retry_worker;
     unsigned next_result_worker;
@@ -227,6 +232,10 @@ static void close_state(void *arg)
     /* completed is published before a callback advances peer slots. Wait for
      * that whole continuation too, before freeing plans, handles or mutexes. */
     while(atomic_load_explicit(&s->callbacks,memory_order_acquire)) pg_usleep(50L);
+    if(s->prefetch_batch) {
+        while(!atomic_load_explicit(&s->prefetch_done,memory_order_acquire)) pg_usleep(50L);
+        csFreeBatchRequest(s->prefetch_batch); s->prefetch_batch=NULL;
+    }
     if(s->device && s->slots[0].batch && s->memory[1] && s->active) {
         unsigned close=1;
         if(transfer(s->memory[1],offsetof(struct qp_control,close),&close,sizeof(close),true)==CS_SUCCESS)
@@ -335,29 +344,41 @@ static size_t layout_buffers(PlanStateCsd *s,const bool *indexed)
 {
     size_t arena=(sizeof(struct qs_dict)+4095)&~(size_t)4095;
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_SCAN && !indexed[i]) {
-        struct qp_node *n=&s->plan->nodes[i]; unsigned bytes=n->ordered_index?QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE:qp_scan_buffer_bytes(s->plan,n);
+        struct qp_node *n=&s->plan->nodes[i]; unsigned bytes=n->ordered_index?QS_INDEX_IO_BYTES:qp_scan_buffer_bytes(s->plan,n);
         n->input_offset=arena; arena+=bytes; n->vector_offset=arena;
         arena+=(qs_chunk_bytes(n->ordered_index?256:qp_scan_capacity(s->plan,n),n->expr.ncols)+4095)&~(size_t)4095;
     }
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_INDEX_JOIN) {
         struct qp_node *n=&s->plan->nodes[i]; n->input_offset=arena;
-        arena+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE; n->vector_offset=arena;
+        arena+=QS_INDEX_IO_BYTES; n->vector_offset=arena;
         arena+=qs_index_input_bytes()+((qs_chunk_bytes(256,s->plan->nodes[n->right].expr.ncols+2)+4095)&~(size_t)4095);
     }
-    size_t stride=0;
+    /* DMA can outlive a graph. Keep these inputs outside the arena that
+     * successive parallel phases share for scans and vectors. */
+    size_t private_end=arena;
+    if(s->workers>1) for(unsigned i=0;i<s->plan->count;++i) {
+        struct qp_node *n=&s->plan->nodes[i];
+        if(n->kind==QP_INDEX_JOIN || (n->kind==QP_SCAN && n->ordered_index && !indexed[i])) {
+            n->parallel_input=private_end;
+            private_end+=QS_INDEX_IO_BYTES;
+        }
+    }
+    size_t stride=private_end-arena;
     if(s->workers>1) for(unsigned root=0;root<s->plan->count;++root) if(s->plan->nodes[root].parallel) {
-        size_t end=arena;
+        size_t end=private_end;
         int source=qp_pipeline_source(s->plan,root);
         for(int id=root;id>=0;id=s->plan->nodes[id].left) {
             struct qp_node *n=&s->plan->nodes[id];
             if(id==source && n->kind!=QP_SCAN) break;
             if(n->kind==QP_SCAN) {
-                unsigned bytes=n->ordered_index?QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE:qp_scan_buffer_bytes(s->plan,n);
-                n->parallel_input=end; end+=bytes; n->parallel_vector=end;
+                if(!n->ordered_index) {
+                    n->parallel_input=end; end+=qp_scan_buffer_bytes(s->plan,n);
+                }
+                n->parallel_vector=end;
                 end+=(qs_chunk_bytes(n->ordered_index?256:qp_scan_capacity(s->plan,n),n->expr.ncols)+4095)&~(size_t)4095; break;
             }
             if(n->kind==QP_INDEX_JOIN) {
-                n->parallel_input=end; end+=QS_SORT_IO_BYTES+QS_INDEX_CACHE*QS_PAGE; n->parallel_vector=end;
+                n->parallel_vector=end;
                 end+=qs_index_input_bytes()+((qs_chunk_bytes(256,s->plan->nodes[n->right].expr.ncols+2)+4095)&~(size_t)4095);
             }
         }
@@ -365,6 +386,21 @@ static size_t layout_buffers(PlanStateCsd *s,const bool *indexed)
     }
     s->plan->parallel_stride=stride; s->plan->workers=s->workers?s->workers:1;
     return arena+(s->workers?s->workers-1:0)*stride;
+}
+/* A simple Hash Join has one build and one probe scan. The probe's first
+ * input already has a private base buffer; only later slots need extra FDM. */
+static unsigned prefetch_probe(const struct qp_plan *p,unsigned *build_node)
+{
+    const struct qp_node *join=&p->nodes[p->root];
+    if(join->kind==QP_AGGREGATE && !join->nkeys && join->left>=0)
+        join=&p->nodes[join->left];
+    if(p->ninit || join->kind!=QP_JOIN || !join->hash || !join->parallel ||
+       join->left<0 || join->right<0 || join->left==join->right) return 0;
+    const struct qp_node *probe=&p->nodes[join->left],*build=&p->nodes[join->right];
+    if(probe->kind!=QP_SCAN || build->kind!=QP_SCAN || probe->ordered_index ||
+       build->ordered_index || !build->parallel) return 0;
+    *build_node=join->right+1;
+    return join->left+1;
 }
 /* Preserve finite PG Numeric values as scaled int128, never through double
  * or the int64 literal representation. NULL has no payload to dereference. */
@@ -486,20 +522,33 @@ static void start(PlanStateCsd *s)
     if(!streams) streams=1;
     if(s->workers<=1) s->workers=0;
     s->plan->scan_bytes=QS_CHUNK;
+    s->prefetch_build=s->prefetch_reused=0; s->prefetch_waited=s->prefetch_claimed=false;
+    unsigned probe=streams==1?prefetch_probe(s->plan,&s->prefetch_build):0;
+    bool reserve_prefetch=probe!=0;
+    atomic_init(&s->prefetch_done,false);
     size_t arena,sizes[5];
+    bool has_index_join=false;
+    for(unsigned i=0;i<s->plan->count;++i) has_index_join|=s->plan->nodes[i].kind==QP_INDEX_JOIN;
+    s->plan->index_cache_bytes=has_index_join?(uint64_t)pg_sina_index_cache_mib*1024*1024:0;
     CsMemFlags flags={.FDMId=1};
     for(;;) {
         arena=layout_buffers(s,indexed);
         size_t needed=arena+plan_bytes+(s->workers+1)*(sizeof(struct qp_control)+sizeof(*s->result)+QS_SORT_IO_BYTES)+65536;
-        /* This is an initial block size, not a per-operator memory cap.
-         * Multiple initialized scans otherwise let the first streams retain
-         * all AFDM before PG workers can consume any of their output. */
-        if(capacity && streams>1 && needed>capacity/streams && s->plan->scan_bytes>QP_SCAN_BYTES) {
-            s->plan->scan_bytes/=2; continue;
+        /* Keep 4 MiB inputs. Independent HOST scans share the FDM budget. */
+        if(capacity && needed>capacity/streams && s->workers) {
+            if(--s->workers==1) s->workers=0;
+            continue;
         }
-        if(capacity && needed>capacity) {
-            if(s->plan->scan_bytes>QP_SCAN_BYTES) { s->plan->scan_bytes/=2; continue; }
-            if(s->workers) { if(--s->workers==1) s->workers=0; continue; }
+        s->plan->prefetch_node=s->plan->prefetch_slots=0;
+        if(reserve_prefetch && s->workers>1 && needed<=capacity) {
+            unsigned slots=Min(s->device_cus,s->workers);
+            uint64_t blocks=(s->plan->nodes[probe-1].bytes+QS_CHUNK-1)/QS_CHUNK;
+            slots=Min(slots,blocks);
+            slots=Min(slots,1+(capacity-needed)/QS_CHUNK);
+            if(slots) {
+                s->plan->prefetch_node=probe; s->plan->prefetch_slots=slots;
+                s->plan->prefetch_input=arena; arena+=(size_t)(slots-1)*QS_CHUNK;
+            }
         }
         sizes[0]=plan_bytes; sizes[1]=(s->workers+1)*sizeof(struct qp_control);
         sizes[2]=(s->workers+1)*sizeof(*s->result); sizes[3]=arena; sizes[4]=QS_SORT_IO_BYTES;
@@ -518,7 +567,7 @@ static void start(PlanStateCsd *s)
             csFreeMem(s->worker_io[w],&flags); s->worker_io[w]=NULL;
         }
         if(status!=CS_NOT_ENOUGH_MEMORY && status!=CS_OUT_OF_RESOURCES) checked(status,"allocate AFDM");
-        if(s->plan->scan_bytes>QP_SCAN_BYTES) { s->plan->scan_bytes/=2; continue; }
+        if(s->plan->prefetch_slots) { reserve_prefetch=false; continue; }
         if(s->workers) { if(--s->workers==1) s->workers=0; continue; }
         checked(status,"allocate AFDM");
     }
@@ -593,6 +642,38 @@ static CS_STATUS append_ranges(CsBlockIo *io,const struct qs_request *file,const
     }
     return at==end?CS_SUCCESS:CS_INVALID_ARG;
 }
+static void probe_load_done(void *context,CS_STATUS status,u64 value)
+{
+    PlanStateCsd *s=context;
+    s->prefetch_status=status;
+    atomic_store_explicit(&s->prefetch_done,true,memory_order_release);
+}
+/* The LOADs have no dependency on build completion. Their destinations
+ * remain reserved until the corresponding probe tasks take ownership. */
+static void queue_probe_loads(PlanStateCsd *s)
+{
+    unsigned node=s->plan->prefetch_node-1,slots=s->plan->prefetch_slots;
+    const struct qp_node *n=&s->plan->nodes[node];
+    const struct qs_request *file=&s->files[node];
+    CsBatchRequest *load=calloc(1,sizeof(*load)+(file->nextents+1)*sizeof(CSBlockRange));
+    if(!load) return;
+    CS_BATCH_HANDLE batch=NULL;
+    CS_STATUS status=csAllocBatchRequest(CS_BATCH_PARALLEL,slots,&batch);
+    load->ReqType=CS_STORAGE_IO;
+    for(unsigned w=1;w<=slots && status==CS_SUCCESS;++w) {
+        uint64_t offset=(uint64_t)(w-1)*s->plan->scan_bytes;
+        load->u.StorageIo=(CsStorageRequest){.Mode=CS_STORAGE_BLOCK_IO,.DevHandle=s->device,
+            .u.BlockIo={.Type=CS_STORAGE_LOAD_TYPE,.DevMem={s->memory[3],qp_input_offset(s->plan,n,w)}}};
+        status=append_ranges(&load->u.StorageIo.u.BlockIo,file,s->extents[node],offset,
+                             Min(offset+s->plan->scan_bytes,n->bytes));
+        CS_BATCH_INDEX index;
+        if(status==CS_SUCCESS) status=csConfigureBatchEntry(batch,CS_BATCH_ADD,load,0,0,&index);
+    }
+    free(load);
+    if(status==CS_SUCCESS) status=csQueueBatchRequest(batch,s,probe_load_done,NULL,NULL,NULL);
+    if(status==CS_QUEUED) s->prefetch_batch=batch;
+    else if(batch) csFreeBatchRequest(batch);
+}
 /* The caller holds slot->mutex. Every block has its own request snapshot;
  * mappings and device handles remain alive until all callbacks are drained. */
 static CS_STATUS queue_scan(struct plan_slot *slot)
@@ -601,26 +682,31 @@ static CS_STATUS queue_scan(struct plan_slot *slot)
     unsigned node=slot->scan_node-1,worker=slot->worker;
     const struct qp_node *n=&s->plan->nodes[node];
     const struct qs_request *file=&s->files[node];
-    uint64_t offset=atomic_fetch_add_explicit(&s->next_scan_offset,s->plan->scan_bytes,memory_order_relaxed);
+    bool first=slot->prefetched_input;
+    uint64_t offset=first?(uint64_t)(worker-1)*s->plan->scan_bytes:
+        atomic_fetch_add_explicit(&s->next_scan_offset,s->plan->scan_bytes,memory_order_relaxed);
     if(offset>n->bytes) offset=n->bytes;
     uint64_t bytes=Min((uint64_t)s->plan->scan_bytes,n->bytes-offset);
+    bool loaded=first && s->prefetch_status==CS_SUCCESS;
+    bool needs_load=bytes && !loaded;
     size_t size=sizeof(CsBatchRequest)+(file->nextents+1)*sizeof(CSBlockRange);
     CsBatchRequest *load=calloc(1,size);
     CsBatchRequest *compute=calloc(1,sizeof(*compute)+6*sizeof(CsComputeArg));
     CS_STATUS status=CS_OUT_OF_RESOURCES;
     if(!load || !compute) goto done;
-    bool reuse=bytes && slot->resume;
+    bool reuse=needs_load && slot->resume && slot->scan_load;
     if(slot->resume && !reuse) {
         status=csFreeBatchRequest(slot->resume); if(status!=CS_SUCCESS) goto done;
         slot->resume=NULL;
     }
     if(!reuse) {
-        status=csAllocBatchRequest(CS_BATCH_SERIAL,bytes?2:1,&slot->resume);
+        slot->scan_load=0;
+        status=csAllocBatchRequest(CS_BATCH_SERIAL,needs_load?2:1,&slot->resume);
         if(status!=CS_SUCCESS) goto done;
     }
     CS_BATCH_INDEX previous=0,current;
-    if(bytes) {
-        size_t input=worker>1?n->parallel_input+(worker-2)*s->plan->parallel_stride:n->input_offset;
+    if(needs_load) {
+        size_t input=qp_input_offset(s->plan,n,worker);
         load->ReqType=CS_STORAGE_IO;
         load->u.StorageIo=(CsStorageRequest){.Mode=CS_STORAGE_BLOCK_IO,.DevHandle=s->device,
             .u.BlockIo={.Type=CS_STORAGE_LOAD_TYPE,.DevMem={s->memory[3],input}}};
@@ -643,7 +729,11 @@ static CS_STATUS queue_scan(struct plan_slot *slot)
     slot->control.bytes=slot->control.index_nreads=0; slot->need_input=false;
     if(s->profiling) slot->queued_ns=clock_ns();
     status=csQueueBatchRequest(slot->resume,slot,completed,NULL,&slot->inflight,NULL);
-    if(status==CS_QUEUED && bytes) ++slot->scan_loads;
+    if(status==CS_QUEUED) {
+        slot->prefetched_input=false;
+        if(needs_load) ++slot->scan_loads;
+        if(loaded) ++s->prefetch_reused;
+    }
 done:
     free(compute); free(load); return status;
 }
@@ -663,7 +753,7 @@ static CS_STATUS load_pages(PlanStateCsd *s,unsigned worker)
     unsigned node=c->node; uint64_t started=s->profiling?clock_ns():0;
     if(node>=s->plan->count) return CS_INVALID_ARG;
     const struct qp_node *n=&s->plan->nodes[node];
-    size_t input=worker>1?n->parallel_input+(worker-2)*s->plan->parallel_stride:n->input_offset;
+    size_t input=qp_input_offset(s->plan,n,worker);
     if(c->index_nreads) {
         if(c->index_nreads>QS_INDEX_READS || (n->kind!=QP_INDEX_JOIN && !n->ordered_index)) return CS_INVALID_ARG;
         unsigned leaf=n->ordered_index?node:(unsigned)n->right,max_extents=Max(s->files[leaf].nextents,s->indexes[leaf].nextents);
@@ -675,13 +765,16 @@ static CS_STATUS load_pages(PlanStateCsd *s,unsigned worker)
             load->ReqType=CS_STORAGE_IO;
             load->u.StorageIo.Mode=CS_STORAGE_BLOCK_IO; load->u.StorageIo.DevHandle=s->device;
             CsBlockIo *io=&load->u.StorageIo.u.BlockIo; io->Type=CS_STORAGE_LOAD_TYPE;
-            io->DevMem=(CsDevAFDM){s->memory[3],input+QS_SORT_IO_BYTES+(size_t)read->slot*QS_PAGE};
+            size_t target;
+            if(!qp_index_page_offset(input,read->slot,&target)) { free(load); return CS_INVALID_ARG; }
+            io->DevMem=(CsDevAFDM){s->memory[3],target};
             CS_STATUS status=CS_SUCCESS;
             for(unsigned k=first;k<j;++k) {
                 read=&c->index_reads[k]; const struct qs_request *file=read->heap?&s->files[leaf]:&s->indexes[leaf];
                 const struct qs_extent *extents=read->heap?s->extents[leaf]:s->index_extents[leaf];
                 uint64_t at=(uint64_t)read->block*QS_PAGE,end=at+QS_PAGE;
-                if(read->heap>1 || read->slot>=QS_INDEX_CACHE || end>file->bytes) { status=CS_INVALID_ARG; break; }
+                if(read->heap>1 || !qp_index_page_offset(input,read->slot,&target) ||
+                   end>file->bytes) { status=CS_INVALID_ARG; break; }
                 status=append_ranges(io,file,extents,at,end); if(status!=CS_SUCCESS) break;
             }
             if(status==CS_SUCCESS) status=configure_load(s,worker,load);
@@ -788,7 +881,11 @@ static CS_STATUS submit(PlanStateCsd *s,unsigned worker)
 /* Called either by PG for a synchronous tree, or by the existing SNIA
  * completion workers for a scan. No PostgreSQL API is used on this path. */
 static int execution_failed(PlanStateCsd *s,CS_STATUS status,const char *operation)
-{ s->execution_status=status; s->execution_operation=operation; return -1; }
+{
+    s->execution_status=status;
+    snprintf(s->execution_operation,sizeof(s->execution_operation),"%s",operation);
+    return -1;
+}
 static CS_STATUS read_result(PlanStateCsd *s,unsigned worker,const struct qp_control *control,struct qs_result *result)
 {
     const struct qs_plan *output=&s->plan->nodes[s->plan->root].expr;
@@ -814,6 +911,7 @@ static CS_STATUS read_result(PlanStateCsd *s,unsigned worker,const struct qp_con
 static int advance(PlanStateCsd *s,struct qs_result *result)
 {
     bool direct=s->plan->packed_result==QP_DIRECT_RESULT;
+    bool start_prefetch=false;
     unsigned first=s->next_result_worker;
     for(unsigned step=0;step<=s->workers;++step) {
         unsigned w=step && direct?1+(first+step-1)%s->workers:step;
@@ -850,7 +948,15 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
         if(status==CS_SUCCESS && (!w || direct) && (slot->control.output_rows || slot->control.finished))
             status=read_result(s,w,&slot->control,result);
         if(s->profiling) s->completion_copy_ns+=clock_ns()-observed;
-        if(status!=CS_SUCCESS) return execution_failed(s,status,"execute tree");
+        if(status!=CS_SUCCESS) {
+            char operation[160];
+            snprintf(operation,sizeof(operation),
+                "execute tree (worker=%u node=%u kind=%u device_error=%d completion=%llu)",
+                w,slot->control.error_node,slot->control.error_node<s->plan->count?
+                s->plan->nodes[slot->control.error_node].kind:0,
+                slot->control.error,(unsigned long long)value);
+            return execution_failed(s,status,operation);
+        }
         if(slot->resume) {
             status=csFreeBatchRequest(slot->resume);
             if(status!=CS_SUCCESS) return execution_failed(s,status,"release LOAD batch");
@@ -883,12 +989,18 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
         s->parallel=slot->control.parallel;
         if(slot->control.epoch!=s->epoch) {
             s->epoch=slot->control.epoch;
-            atomic_store(&s->next_scan_offset,0);
+            unsigned scan=slot->control.scan_node;
+            unsigned prefetched=s->prefetch_batch && !s->prefetch_claimed &&
+                scan==s->plan->prefetch_node?s->plan->prefetch_slots:0;
+            if(prefetched) s->prefetch_claimed=true;
+            start_prefetch=s->plan->prefetch_slots && scan==s->prefetch_build && !s->prefetch_batch;
+            atomic_store(&s->next_scan_offset,(uint64_t)prefetched*s->plan->scan_bytes);
             for(unsigned i=1;i<=s->workers;++i) {
                 struct plan_slot *worker=&s->slots[i];
                 worker->ready=worker->done=worker->yielded=false;
-                worker->scan_node=slot->control.scan_node;
+                worker->scan_node=scan;
                 worker->need_input=worker->scan_node!=0;
+                worker->prefetched_input=i<=prefetched;
                 /* The device initializes each phase's worker control to
                  * zero except its private state pointer. PG never uses it. */
                 memset(&worker->control,0,sizeof(worker->control));
@@ -924,6 +1036,7 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
             if(status!=CS_SUCCESS) return execution_failed(s,status,"queue tree");
         }
     }
+    if(start_prefetch) queue_probe_loads(s);
     struct plan_slot *main=&s->slots[0];
     if(!main->pending) {
         uint64_t ready=0;
@@ -944,6 +1057,13 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
                 if(s->slots[w].ready && s->slots[w].control.output_rows) output=true;
             if(!idle && output && !s->barrier_started) { s->barrier_started=clock_ns(); ++s->barriers; }
             if(idle && s->barrier_started) { s->barrier_ns+=clock_ns()-s->barrier_started; s->barrier_started=0; }
+        }
+        /* The coordinator may fall back to a serial probe using the first
+         * input buffer. Give it ownership only after the outstanding LOADs. */
+        if(idle && s->prefetch_batch && main->control.scan_node==s->prefetch_build &&
+           !atomic_load_explicit(&s->prefetch_done,memory_order_acquire)) {
+            s->prefetch_waited=true;
+            idle=false;
         }
         if(idle && (!s->parallel || ready || !main->control.parallel)) {
             main->control.available=ready;
@@ -1137,7 +1257,7 @@ static void rescan(CustomScanState *node)
         memset(&s->delivery->timing,0,sizeof(s->delivery->timing));
         memset(s->delivery->batches,0,sizeof(s->delivery->batches));
     }
-    s->execution_status=CS_SUCCESS; s->execution_operation=NULL;
+    s->execution_status=CS_SUCCESS; s->execution_operation[0]=0;
     memset(s->slots,0,sizeof(s->slots)); s->parallel=false; s->epoch=0; memset(s->result,0,sizeof(*s->result)); s->started=false; s->row=0;
 }
 static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
@@ -1149,6 +1269,7 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     pg_sina_explain_placement((CustomScan *)node->ss.ps.plan,es);
     ExplainPropertyText("Execution Path","csd",es);
     ExplainPropertyInteger("CSD Device CUs",NULL,pg_sina_resources.cus,es);
+    ExplainPropertyFloat("CSD CU CPU Ratio",NULL,pg_sina_resources.cpu_ratio,6,es);
     ExplainPropertyInteger("CSD HOST Parameter Count",NULL,list_length(s->parameter_exprs),es);
     ExplainPropertyInteger("CSD Device Initializers",NULL,s->plan->ninit,es);
     ExplainPropertyInteger("CSD Device FDM","bytes",pg_sina_resources.fdm_bytes,es);
@@ -1218,13 +1339,33 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
         ExplainPropertyInteger("CSD Task Slots",NULL,s->workers?s->workers:1,es);
         ExplainPropertyInteger("CSD Parallel Pipelines",NULL,s->slots[0].control.epoch,es);
         ExplainPropertyInteger("CSD Scan Block","bytes",s->plan->scan_bytes,es);
+        if(s->plan->prefetch_slots) {
+            ExplainPropertyInteger("CSD Probe Prefetch Reused Blocks",NULL,s->prefetch_reused,es);
+            ExplainPropertyBool("CSD Probe Prefetch Ready Before Probe",s->prefetch_reused && !s->prefetch_waited,es);
+        }
         ExplainPropertyInteger("CSD Scan Vector Capacity","rows",QP_VECTOR_ROWS,es);
         ExplainPropertyInteger("CSD AFDM","bytes",s->fdm_bytes,es);
+        if(s->plan->index_cache_bytes) ExplainPropertyInteger("CSD Index Join Cache Limit","bytes",s->plan->index_cache_bytes,es);
+        ExplainPropertyInteger("CSD Workmem B-tree Page Hits",NULL,s->result->metrics.index_cache_hits[0],es);
+        ExplainPropertyInteger("CSD Workmem B-tree Page Misses",NULL,s->result->metrics.index_cache_misses[0],es);
+        ExplainPropertyInteger("CSD Workmem Heap Page Hits",NULL,s->result->metrics.index_cache_hits[1],es);
+        ExplainPropertyInteger("CSD Workmem Heap Page Misses",NULL,s->result->metrics.index_cache_misses[1],es);
         ExplainPropertyInteger("CSD Spill Read","bytes",s->result->metrics.spill_read_bytes,es);
         ExplainPropertyInteger("CSD Spill Write","bytes",s->result->metrics.spill_write_bytes,es);
         ExplainPropertyInteger("CSD Runs",NULL,s->result->metrics.runs,es);
         if(s->profiling) {
             const struct qs_timing *t=&s->result->profile.operators[QS_JOIN_PROBE];
+            if(s->result->profile.operators[QS_INDEX_CACHE_LOOKUP].calls) {
+                static const char *const labels[]={
+                    "CSD Index Cache Lookup Sample","CSD Index Cache Insert Sample",
+                    "CSD Index Cache Hit Copy Sample","CSD Index Cache Fill Copy Sample"
+                };
+                for(unsigned i=0;i<lengthof(labels);++i) {
+                    const struct qs_timing *sample=&s->result->profile.operators[QS_INDEX_CACHE_LOOKUP+i];
+                    ExplainPropertyInteger(labels[i],"ns",sample->wall_ns,es);
+                    ExplainPropertyInteger(psprintf("%s Count",labels[i]),NULL,sample->calls,es);
+                }
+            }
             ExplainPropertyFloat("CSD Tree Wall","ms",(clock_ns()-s->start_ns)/1e6,3,es);
             ExplainPropertyFloat("CSD Setup Wall","ms",s->setup_ns/1e6,3,es);
             ExplainPropertyFloat("CSD Cleanup Wall","ms",s->cleanup_ns/1e6,3,es);
@@ -1256,6 +1397,14 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
                     (unsigned long long)p->rounds,p->wall_ns/1e6,p->coordinator_ns/1e6,p->worker_ns/1e6,
                     average,100*average/Max(1,s->device_cus),p->sink_ns/1e6,(unsigned long long)p->sink_rows);
                 ExplainPropertyText(label,value,es);
+                if(p->sink_node) {
+                    snprintf(label,sizeof(label),"CSD Pipeline %u sink distribution",i);
+                    snprintf(value,sizeof(value),"sink_node=%u returned_rows=%llu slow_slot=%u scanned=%llu/%llu sink_rows=%llu returned_rows=%llu",
+                        p->sink_node-1,(unsigned long long)p->sink_returned_rows,p->slow_worker,
+                        (unsigned long long)p->slow_worker_input_rows,(unsigned long long)p->input_rows,
+                        (unsigned long long)p->slow_worker_sink_rows,(unsigned long long)p->slow_worker_returned_rows);
+                    ExplainPropertyText(label,value,es);
+                }
                 snprintf(label,sizeof(label),"CSD Pipeline %u task balance",i);
                 snprintf(value,sizeof(value),"csf_wall_sum=%.3f ms task_cpu_min=%.3f ms task_cpu_max=%.3f ms finished_idle_sum=%.3f ms",
                     p->worker_wall_ns/1e6,p->worker_cpu_min/1e6,p->worker_cpu_max/1e6,p->finished_idle_ns/1e6);

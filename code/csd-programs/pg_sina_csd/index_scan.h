@@ -1,8 +1,15 @@
 #ifndef PG_SINA_INDEX_SCAN_H
 #define PG_SINA_INDEX_SCAN_H
 #include "query.h"
+#include "cs_workmem.h"
+#include <stdbool.h>
 struct femu_csd_args;
 struct qs_dictionary;
+struct qs_index_cache;
+struct qs_index_cache *qs_index_cache_create(cs_work_context *,size_t,size_t,bool);
+void qs_index_cache_bind(struct qs_join_control *,struct qs_index_cache *);
+/* Add this cursor's counters, or reset them if metrics is NULL. */
+void qs_index_cache_stats(const struct qs_join_control *,struct qs_metrics *,struct qs_profile *);
 int qs_index_init(const struct qs_plan *,struct qs_join_control *);
 /* Forward leaf walk, returning heap columns in index order. */
 int64_t qs_index_scan(struct qs_chunk *,struct qs_task *,struct qs_join_control *,void *,unsigned,unsigned,int);

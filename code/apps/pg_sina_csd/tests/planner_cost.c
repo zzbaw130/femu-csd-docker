@@ -5,6 +5,27 @@
 #define CHECK(test) do { if(!(test)) { fprintf(stderr,"line %d: %s\n",__LINE__,#test); return EXIT_FAILURE; } } while(0)
 int main(void)
 {
+    CHECK(cost_device_cpu_ratio(0.35,1)==0.35);
+    CHECK(cost_device_cpu_ratio(0.35,0)==0.35);
+    CHECK(cost_device_cpu_ratio(0.35,0.5)==0.7);
+    CHECK(fabs(cost_device_cpu_ratio(0.35,0.34)-0.35/0.34)<1e-12);
+    CHECK(fabs(cost_device_cpu_ratio(0.35,0.3333)-0.35*10000/3333)<1e-12);
+    struct qs_plan heap={.nattrs=5};
+    heap.cols[0]=(struct qs_column){.slot=-1,.length=8};
+    heap.cols[1]=(struct qs_column){.slot=-1,.length=-1};
+    heap.cols[2]=(struct qs_column){.slot=-1,.length=4};
+    heap.cols[3]=(struct qs_column){.slot=0,.length=4};
+    heap.cols[4]=(struct qs_column){.slot=-1,.length=-1};
+    CHECK(cost_heap_decode_ops(&heap,heap.nattrs)==1.25);
+    heap.cols[1].length=8;
+    CHECK(cost_heap_decode_ops(&heap,heap.nattrs)==0.5);
+    heap.cols[4].slot=1;
+    CHECK(cost_heap_decode_ops(&heap,heap.nattrs)==1.25);
+    heap.cols[3].slot=heap.cols[4].slot=-1;
+    CHECK(cost_heap_decode_ops(&heap,heap.nattrs)==0);
+    heap.cols[0]=(struct qs_column){.slot=0,.length=8,.type=Q_INTEGER};
+    heap.cols[3]=(struct qs_column){.slot=1,.length=4,.type=Q_DATE};
+    CHECK(cost_heap_decode_ops(&heap,heap.nattrs)==0.5);
     struct qs_plan expressions={.nexprs=4};
     expressions.exprs[0].op=Q_COLUMN; expressions.exprs[1].op=Q_CONST;
     expressions.exprs[2].op=Q_PARAMETER; expressions.exprs[3].op=Q_AGGREF;
@@ -97,11 +118,13 @@ int main(void)
     CHECK(cost_index_heap_visits(100,4,50,1)==100);
     CHECK(cost_index_heap_visits(100,4,50,0)==400);
     CHECK(cost_index_heap_visits(0,4,50,0)==0);
-    CHECK(cost_index_window_misses(100,4,50,512,0)==100);
-    CHECK(cost_index_window_misses(100,4,50,0,1)==100);
-    CHECK(cost_index_window_misses(100,4,50,512,1)>0);
-    CHECK(cost_index_window_misses(100,4,50,512,1)<1);
-    CHECK(cost_index_window_misses(100,100000,50,512,1)==100);
+    CHECK(cost_index_window_misses(100,4,50,512,0,512,256)==100);
+    CHECK(cost_index_window_misses(100,4,50,0,1,512,256)==100);
+    CHECK(cost_index_window_misses(100,4,50,512,1,512,1)<1);
+    double dense_misses=cost_index_window_misses(100,4,50,512,1,512,256);
+    double sparse_misses=cost_index_window_misses(100,4,50,512,1,32,256);
+    CHECK(dense_misses>20 && dense_misses<30 && sparse_misses>90 && sparse_misses<100);
+    CHECK(cost_index_window_misses(100,100000,50,512,1,512,256)==100);
     CHECK(cost_anti_fallback(0)==0);
     CHECK(cost_anti_fallback(1000)>1 && cost_anti_fallback(1000)<1000);
     /* A single block cannot speed up on eight CUs. Three blocks leave five
@@ -115,6 +138,36 @@ int main(void)
     CHECK(cost_scan_overlap(40,80,1,4)==0);
     CHECK(cost_scan_overlap(40,80,8,1)==0);
     CHECK(cost_scan_overlap(40,0,8,4)==0);
+    /* Cross-device streaming overlaps consumer I/O, but two scans cannot
+     * exceed one shared NAND/PCIe link, nor erase blocking startup work. */
+    CHECK(cost_stream_join(15,2,8,5,3,4)==10);
+    CHECK(cost_stream_join(15,2,8,9,12,4)==12);
+    CHECK(cost_stream_join(15,2,8,9,3,14)==14);
+    CHECK(cost_stream_join(3,0,2,1,5,0)==5);
+    CHECK(cost_stream_join(15,13,8,9,0,0)==13);
+    CHECK(cost_stream_join(15,2,0,9,0,0)==15);
+    CHECK(cost_population_link_wait(0,100,100,1)==0);
+    CHECK(cost_population_link_wait(50,100,100,1)==25);
+    CHECK(cost_population_link_wait(50,100,1000,1)==25);
+    CHECK(cost_population_link_wait(50,100,10,1)==2.5);
+    CHECK(cost_population_link_wait(100,100,100,1)==50);
+    CHECK(cost_population_link_wait(50,100,100,0.5)==12.5);
+    CHECK(cost_population_link_wait(50,100,1,100)==12.5);
+    CHECK(cost_population_link_wait(50,100,0,1)==0);
+    CHECK(cost_scan_delivery(100,20,40,10,10)==2);
+    CHECK(cost_scan_delivery(100,120,40,10,10)==30);
+    CHECK(cost_scan_delivery(100,20,130,10,10)==30);
+    CHECK(cost_scan_delivery(100,20,40,10,2)==10);
+    CHECK(cost_scan_delivery(100,20,40,1,8)==20);
+    CHECK(cost_scan_delivery(20,100,40,10,1)==100);
+    /* Dense ordered probes can share sequential service; sparse probes
+     * retain random service. A lower disk price must not discount the
+     * memory copy required for a file-only cache hit. */
+    double sparse=cost_population_pages(1,100000)/100000;
+    double dense=cost_population_pages(1000000,100000)/100000;
+    CHECK(sparse<0.0001 && dense>0.99);
+    double ordered_ratio=1-0.75*dense;
+    CHECK(fabs(cost_host_cached_io(100*ordered_ratio,0,1,0.1/ordered_ratio)-10)<1e-9);
     /* 4-byte PG integer + NULL, 8-byte integer + NULL, 128-bit numeric with
      * scale/dscale/NULL: packed 33 bytes, not three 32-byte cells. */
     struct qs_plan row={.nout=3};
@@ -326,6 +379,8 @@ int main(void)
     CHECK(cost_partial_rows(1000,100,10,-1)==100);
     CHECK(cost_partial_rows(0,100,10,0)==0);
     CHECK(cost_spill_io(1024*1024,5000,1000)>cost_spill_io(1024*1024,5000,5000));
+    CHECK(cost_hash_reload_state(130,12)==256*(12+4)+512*4);
+    CHECK(cost_hash_reload_state(257,12)<cost_hash_state(257,12));
     puts("planner cost: parallel waves, packed hash/group layouts and external sort passed");
     return EXIT_SUCCESS;
 }
