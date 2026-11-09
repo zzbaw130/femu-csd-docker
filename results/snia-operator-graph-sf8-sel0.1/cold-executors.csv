@@ -3,8 +3,8 @@ Q1-1,original-csd,8.417,3819.053,3857.412,25.108,"SNIA fast path",ok
 Q1-1,snia-operator-graph,5.442,3857.191,3883.518,16.824,"SNIA operator graph",ok
 Q2-1,original-csd,68.823,1319.474,1428.909,13.672,"pg_sina_plan",ok
 Q2-1,snia-operator-graph,75.735,6852.340,6974.502,16.414,"SNIA operator graph",ok
-Q3-1,original-csd,27.188,4156.046,4232.138,16.555,"pg_sina_plan",ok
-Q3-1,snia-operator-graph,28.203,22017.284,22095.559,15.369,"SNIA operator graph",ok
+Q3-1,original-csd,31.621,4186.909,4290.740,16.425,"pg_sina_plan",ok
+Q3-1,snia-operator-graph,26.549,18773.164,18849.675,16.503,"SNIA operator graph",ok
 Q4-1,original-csd,17.002,3149.353,3212.978,16.014,"pg_sina_plan",ok
 Q4-1,snia-operator-graph,21.839,6394.073,6459.059,15.500,"SNIA operator graph",ok
 Q5-1,original-csd,51.122,2409.039,2511.410,17.621,"pg_sina_plan",ok
@@ -19,17 +19,27 @@ Q9-1,original-csd,57.676,8865.432,8969.194,16.412,"pg_sina_plan",ok
 Q9-1,snia-operator-graph,72.097,75549.411,75671.186,16.560,"SNIA operator graph",ok
 Q10-1,original-csd,34.629,3951.432,4033.738,16.756,"pg_sina_plan",ok
 Q10-1,snia-operator-graph,30.638,13575.908,13654.364,15.976,"SNIA operator graph",ok
+Q11-1,original-csd,34.291,938.107,1019.337,16.679,"pg_sina_plan",ok
+Q11-1,snia-operator-graph,28.367,7757.083,7834.934,16.506,"SNIA operator graph",ok
 Q12-1,original-csd,24.926,3490.860,3578.575,16.449,"pg_sina_plan",ok
 Q12-1,snia-operator-graph,22.127,5334.550,5409.857,17.316,"SNIA operator graph",ok
 Q13-1,original-csd,20.409,5042.239,5105.956,13.090,"pg_sina_plan",ok
 Q13-1,snia-operator-graph,21.993,12201.143,12268.145,15.391,"SNIA operator graph",ok
 Q14-1,original-csd,14.693,2908.189,2946.949,15.332,"pg_sina_plan",ok
 Q14-1,snia-operator-graph,10.383,2786.485,2820.633,15.740,"SNIA operator graph",ok
+Q15-1,original-csd,19.458,2926.866,3013.975,14.642,"pg_sina_plan",ok
+Q15-1,snia-operator-graph,21.090,3512.663,3622.813,14.684,"SNIA operator graph",ok
+Q16-1,original-csd,18.254,2282.142,2339.461,13.844,"pg_sina_plan",ok
+Q16-1,snia-operator-graph,20.542,5224.341,5285.311,15.218,"SNIA operator graph",ok
 Q17-1,original-csd,19.441,13184.964,13252.423,16.243,"pg_sina_plan",ok
 Q17-1,snia-operator-graph,25.144,71841.041,71913.068,14.915,"SNIA operator graph",ok
 Q18-1,original-csd,40.683,18377.426,18466.035,17.387,"pg_sina_plan",ok
 Q18-1,snia-operator-graph,37.104,95761.944,95850.739,16.472,"SNIA operator graph",ok
 Q19-1,original-csd,25.240,4598.757,4650.514,15.022,"pg_sina_plan",ok
 Q19-1,snia-operator-graph,25.484,6558.682,6603.435,14.727,"SNIA operator graph",ok
+Q20-1,original-csd,39.904,3321.169,3416.893,14.198,"pg_sina_plan",ok
+Q20-1,snia-operator-graph,30.470,4538.142,4618.716,15.859,"SNIA operator graph",ok
 Q21-1,original-csd,82.300,7313.889,7446.218,16.345,"pg_sina_plan",ok
 Q21-1,snia-operator-graph,72.296,36201.434,36318.660,15.860,"SNIA operator graph",ok
+Q22-1,original-csd,30.728,1930.416,2017.335,15.198,"pg_sina_plan",ok
+Q22-1,snia-operator-graph,24.944,4976.406,5044.996,16.574,"SNIA operator graph",ok

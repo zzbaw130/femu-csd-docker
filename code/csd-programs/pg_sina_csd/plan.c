@@ -1695,7 +1695,7 @@ static int64_t external_build(struct execution *s,unsigned id)
     e->phase=3; o->hash_phase=1;
     return 0;
 }
-static int64_t materialized_row(struct execution *s,unsigned id,uint64_t position,struct qs_cell *row)
+static int64_t materialize(struct execution *s,unsigned id)
 {
     const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
     unsigned cols=s->plan->nodes[n->left].expr.nout;
@@ -1709,8 +1709,16 @@ static int64_t materialized_row(struct execution *s,unsigned id,uint64_t positio
         int64_t status=spool_append(s,&o->group,o->left,cols); if(status) return status;
         o->have_left=0;
     }
-    if(position==o->group.rows) return 0;
-    int64_t status=spool_row(s,&o->group,position,cols,row); return status?status:2;
+    return 0;
+}
+static int64_t materialized_row(struct execution *s,unsigned id,uint64_t position,struct qs_cell *row)
+{
+    int64_t status=materialize(s,id); if(status) return status;
+    const struct qp_node *n=&s->plan->nodes[id];
+    struct spool *group=&s->nodes[id].group;
+    if(position==group->rows) return 0;
+    status=spool_row(s,group,position,s->plan->nodes[n->left].expr.nout,row);
+    return status?status:2;
 }
 static int set_order(const void *a,const void *b)
 { int64_t x=*(const int64_t *)a,y=*(const int64_t *)b; return (x>y)-(x<y); }
@@ -6064,6 +6072,28 @@ static int64_t graph_finish(struct execution *s,struct femu_csd_args *a,struct q
     return QP_WORKER_FINISHED | QP_INPUT_DRAINED | (out->rows?QP_OUTPUT_READY:0);
 }
 
+/* Borrow a worker's packed Scan output in contiguous spans. The worker's
+ * slot remains live until parallel_next acknowledges its final row. */
+static int64_t graph_parallel_scan(struct execution *s,unsigned id,struct qs_result *out,unsigned capacity)
+{
+    unsigned cols=s->plan->nodes[id].expr.nout;
+    while(out->rows<capacity) {
+        int64_t status=parallel_next(s,id,NULL);
+        if(status!=2) return status;
+        unsigned w=0;
+        while(w<s->plan->workers && (!(s->control->available&(UINT64_C(1)<<w)) ||
+              s->parallel_position[w]>=s->outputs[w+1].rows)) ++w;
+        if(w==s->plan->workers) return -1;
+        const struct qs_result *input=&s->outputs[w+1];
+        unsigned at=s->parallel_position[w],rows=input->rows-at;
+        if(rows>capacity-out->rows) rows=capacity-out->rows;
+        memcpy(qp_result_row(out,out->rows,cols,1),(const struct qs_cell *)input->data+(size_t)at*cols,
+            (size_t)rows*cols*sizeof(struct qs_cell));
+        out->rows+=rows; s->parallel_position[w]+=rows;
+    }
+    return 2;
+}
+
 /* Internal edges carry packed cells. The root uses the existing typed
  * PostgreSQL boundary encoder and closes the same workmem context. */
 static int64_t graph_emit(struct femu_csd_args *a,enum graph_emit_kind kind)
@@ -6079,14 +6109,14 @@ static int64_t graph_emit(struct femu_csd_args *a,enum graph_emit_kind kind)
     struct execution *s=(void *)(uintptr_t)control->state;
     if(control->close) { if(s) close_execution(s); return 0; }
     uint64_t parameter=(uint64_t)a->cparam1;
-    bool typed=(parameter&QP_GRAPH_HOST_OUTPUT)!=0;
-    uint64_t id=(parameter&~QP_GRAPH_HOST_OUTPUT)>>QP_GRAPH_SOURCE_NODE_SHIFT;
-    if(plan->count>QP_NODES || id>=plan->count || plan->nparams>QP_PARAMS || plan->ninit ||
+    bool typed=(parameter&QP_GRAPH_HOST_OUTPUT)!=0, init=(parameter&QP_GRAPH_INIT_OUTPUT)!=0;
+    uint64_t id=(parameter&~(QP_GRAPH_HOST_OUTPUT|QP_GRAPH_INIT_OUTPUT))>>QP_GRAPH_SOURCE_NODE_SHIFT;
+    if(plan->count>QP_NODES || id>=plan->count || plan->nparams>QP_PARAMS || plan->ninit>QP_PARAMS ||
        (uint64_t)a->mr_len[0]<sizeof(*plan)+qp_host_parameter_bytes(plan) ||
        plan->workers>QS_WORKERS || a->mr_len[1]<(long long)((plan->workers+1)*sizeof(*control)) ||
        (!s && a->mr_len[2]<(long long)((plan->workers+1)*sizeof(struct qs_result)))) return -1;
     unsigned cols=plan->nodes[id].expr.nout;
-    if(!cols || cols>QS_OUT || (typed && (id!=plan->root || plan->packed_result!=QP_TYPED_RESULT ||
+    if(!cols || cols>QS_OUT || (typed && (init || id!=plan->root || plan->packed_result!=QP_TYPED_RESULT ||
        (!fed && a->numr==6)))) return -1;
     const struct qs_plan *output=&plan->nodes[id].expr;
     struct qs_result *out=!fed && a->numr==6?a->mr_addr[4]:a->mr_addr[2];
@@ -6100,13 +6130,23 @@ static int64_t graph_emit(struct femu_csd_args *a,enum graph_emit_kind kind)
     if(s->closing) return typed?graph_finish(s,a,out):-1;
     const struct qp_node *n=&plan->nodes[id];
     struct operator_state *o=&s->nodes[id];
+    if(typed && s->initializer!=plan->ninit) return -1;
+    int init_param=-1;
+    if(init) {
+        if(s->initializer>=plan->ninit || (unsigned)plan->init_nodes[s->initializer]!=id) return -1;
+        init_param=plan->init_params[s->initializer];
+        if((init_param<0)!=(n->kind==QP_SET) || init_param>=QP_PARAMS) return -1;
+    }
+    if(!fed && n->kind==QP_CTE_SCAN && (n->left<0 || (unsigned)n->left>=plan->count ||
+       !s->nodes[n->left].group_ready)) return -1;
     const struct qs_result *in=fed?a->mr_addr[4]:NULL;
     if(fed) {
         if(n->left<0 || (unsigned)n->left>=plan->count) return -1;
         if(probe && (n->kind!=QP_JOIN || !n->hash || o->hash_fallback==1 ||
            (!o->hash_phase && !o->finished && (!o->external || o->external->phase<2)))) return -1;
         if(!probe && n->kind!=QP_AGGREGATE && n->kind!=QP_PROJECT && n->kind!=QP_SORT &&
-           n->kind!=QP_LIMIT && n->kind!=QP_INDEX_JOIN) return -1;
+           n->kind!=QP_LIMIT && n->kind!=QP_INDEX_JOIN && n->kind!=QP_MATERIALIZED &&
+           (n->kind!=QP_SET || !init)) return -1;
         if(n->kind==QP_INDEX_JOIN && (n->right<0 || (unsigned)n->right>=plan->count)) return -1;
         unsigned input_cols=plan->nodes[n->left].expr.nout;
         if(!input_cols || input_cols>QS_OUT || in->status || in->finished>1 ||
@@ -6144,15 +6184,28 @@ static int64_t graph_emit(struct femu_csd_args *a,enum graph_emit_kind kind)
         s->hash_input=in; s->hash_input_node=n->left;
         s->hash_input_position=o->graph_input_position;
     }
-    while(out->rows<capacity) {
-        struct qs_cell *row=typed?s->host_row:qp_result_row(out,out->rows,cols,1);
-        status=typed && s->host_pending?2:next_row(s,id,row);
-        if(status!=2) break;
-        if(!typed) { ++out->rows; continue; }
-        s->host_pending=1;
-        int appended=host_append(s,output,out);
-        if(appended<0) status=appended;
-        if(appended) break;
+    if(n->kind==QP_SET) status=build_set(s,id);
+    else if(n->kind==QP_MATERIALIZED) status=materialize(s,id);
+    else {
+        status=2;
+        if(!fed && !init && !typed && n->kind==QP_SCAN && n->parallel && plan->workers>1)
+            status=graph_parallel_scan(s,id,out,capacity);
+        if(status==3) status=2; /* Existing serial fallback. */
+        while(status==2 && out->rows<capacity) {
+            struct qs_cell *row=typed?s->host_row:qp_result_row(out,out->rows,cols,1);
+            status=typed && s->host_pending?2:next_row(s,id,row);
+            if(status!=2) break;
+            if(init) {
+                if(s->initializer_phase) { status=-8; break; }
+                s->params[init_param]=row[0]; s->initializer_phase=1;
+                continue;
+            }
+            if(!typed) { ++out->rows; continue; }
+            s->host_pending=1;
+            int appended=host_append(s,output,out);
+            if(appended<0) status=appended;
+            if(appended) break;
+        }
     }
     if(fed) { o->graph_input_position=s->hash_input_position; s->hash_input=NULL; }
     if(s->late_wait) status=s->late_wait;
@@ -6162,19 +6215,27 @@ static int64_t graph_emit(struct femu_csd_args *a,enum graph_emit_kind kind)
         s->expression_wait=0;
         status=csNeedLoad(s->pending_spool->pages[s->pending_block].token);
     }
+    if(s->profiling && s->parallel_started)
+        plan->pipelines[s->group_combine?s->group_combine-1:s->parallel_node].coordinator_ns+=
+            now_ns(CLOCK_THREAD_CPUTIME_ID)-s->pipeline_tick;
     if(status==QP_WAIT && !control->ready && (control->bytes || control->index_nreads)) {
         status=namespace_wait(s);
         /* Without a device file mapping PG supplies LOAD -> EXEC. Keep the
          * active edge private until that page request has completed. */
         if(!status) return QP_CONTROL_REQUIRED;
     }
+    if(status==QP_WAIT && !fed && !typed && n->kind==QP_SCAN && s->parallel_started)
+        return QP_CONTROL_REQUIRED; /* Continue filling this packet from the next ready CU. */
     bool drained=fed && (!status || (status==QP_WAIT && (!probe || !o->have_left) &&
         o->graph_input_position==in->rows));
-    if(s->profiling && s->parallel_started)
-        plan->pipelines[s->group_combine?s->group_combine-1:s->parallel_node].coordinator_ns+=
-            now_ns(CLOCK_THREAD_CPUTIME_ID)-s->pipeline_tick;
     if(status<0 || status>2) goto wait;
-    if(!status) out->finished=1;
+    if(!status) {
+        if(init) {
+            if(init_param>=0 && !s->initializer_phase) s->params[init_param]=(struct qs_cell){.isnull=1};
+            s->initializer_phase=0; ++s->initializer;
+        }
+        out->finished=1;
+    }
     s->graph_source_pending=false;
     if(drained) o->graph_input_held=false;
     if(typed) {

@@ -2585,6 +2585,67 @@ static void graph_hash_build(function source,function build,function probe,funct
     free(packet); free(io); free(arena); free(plan);
 }
 
+static void graph_initializers(function source,function feed)
+{
+    struct qp_plan *plan=calloc(1,sizeof(*plan)); assert(plan);
+    plan->count=8; plan->packed_result=QP_TYPED_RESULT;
+    plan->nparams=1; plan->ninit=2;
+    plan->param_nodes[0]=1;
+    plan->init_nodes[0]=1; plan->init_params[0]=0;
+    plan->init_nodes[1]=3; plan->init_params[1]=-1;
+    struct qs_plan value={.nexprs=1,.nout=1,.predicate=-1,
+        .exprs={{.op=Q_CONST,.type=Q_INTEGER,.constant=7}},
+        .outputs={{.index=0,.type_oid=23}}};
+    plan->nodes[1]=(struct qp_node){.kind=QP_PROJECT,.left=-1,.right=-1,.expr=value};
+    plan->nodes[1].expr.exprs[0].constant=11;
+    plan->nodes[2]=(struct qp_node){.kind=QP_PROJECT,.left=-1,.right=-1,.expr=value};
+    plan->nodes[3]=(struct qp_node){.kind=QP_SET,.left=2,.right=-1,.expr=value};
+    plan->nodes[4]=(struct qp_node){.kind=QP_PROJECT,.left=-1,.right=-1,.expr=value};
+    plan->nodes[5]=(struct qp_node){.kind=QP_MATERIALIZED,.left=4,.right=-1,.expr=value};
+    value.nattrs=1; value.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER};
+    plan->nodes[6]=(struct qp_node){.kind=QP_CTE_SCAN,.left=5,.right=-1,.expr=value};
+    plan->nodes[7]=plan->nodes[6];
+    plan->nodes[0]=(struct qp_node){.kind=QP_PROJECT,.left=6,.right=-1,.expr=value};
+    struct qs_plan *root=&plan->nodes[0].expr;
+    root->nexprs=4; root->predicate=3; root->outputs[0].index=2;
+    root->exprs[1]=(struct qs_expr){.op=QP_PARAMETER,.type=Q_INTEGER};
+    root->exprs[2]=(struct qs_expr){.op=Q_ADD,.type=Q_INTEGER,.left=0,.right=1};
+    root->exprs[3]=(struct qs_expr){.op=QP_INSET,.type=Q_BOOLEAN,.left=0,.column=3};
+
+    struct qp_control control={0};
+    struct qs_dict arena={0};
+    struct qs_result *packet=calloc(1,sizeof(*packet)),*output=calloc(1,sizeof(*output));
+    void *io=calloc(1,QS_SORT_IO_BYTES); assert(packet && output && io);
+    void *mr[]={plan,&control,output,&arena,packet,io};
+    long long len[]={sizeof(*plan),sizeof(control),sizeof(*output),sizeof(arena),sizeof(*packet),QS_SORT_IO_BYTES};
+    struct femu_csd_args a={.numr=6,.mr_addr=mr,.mr_len=len};
+    struct test_spill spill={.mutex=PTHREAD_MUTEX_INITIALIZER};
+    a.cparam1=QP_GRAPH_INIT_OUTPUT|(UINT64_C(1)<<QP_GRAPH_SOURCE_NODE_SHIFT);
+    assert(graph_compute(source,&a,&spill)==QP_WORKER_FINISHED && !packet->rows);
+    for(unsigned id=2;id<=4;id+=2) {
+        a.cparam1=(uint64_t)id<<QP_GRAPH_SOURCE_NODE_SHIFT;
+        assert(graph_compute(source,&a,&spill)==(QP_WORKER_FINISHED|QP_OUTPUT_READY));
+        a.cparam1=(uint64_t)(id+1)<<QP_GRAPH_SOURCE_NODE_SHIFT;
+        if(id==2) a.cparam1|=QP_GRAPH_INIT_OUTPUT;
+        assert(graph_compute(feed,&a,&spill)==(QP_WORKER_FINISHED|QP_INPUT_DRAINED));
+        a.mr_addr=mr;
+    }
+    for(unsigned id=7;id>=6;--id) {
+        a.cparam1=(uint64_t)id<<QP_GRAPH_SOURCE_NODE_SHIFT;
+        assert(graph_compute(source,&a,&spill)==(QP_WORKER_FINISHED|QP_OUTPUT_READY));
+        assert(packet->rows==1 && qp_result_row(packet,0,1,1)->value==7);
+    }
+    a.cparam1=QP_GRAPH_HOST_OUTPUT;
+    assert(graph_compute(feed,&a,&spill)==(QP_WORKER_FINISHED|QP_INPUT_DRAINED|QP_OUTPUT_READY));
+    int32_t result;
+    memcpy(&result,qp_host_values(output,root,output->rows,0),sizeof(result));
+    assert(output->rows==1 && control.finished && !control.state && result==18);
+    assert(!spill.count);
+    struct cs_work_stats work; assert(!cs_work_get_stats(&work) && !work.used_bytes && !work.active_contexts);
+    pthread_mutex_destroy(&spill.mutex);
+    free(io); free(output); free(packet); free(plan);
+}
+
 int main(int argc,char **argv)
 {
     dictionary_size();
@@ -2601,7 +2662,8 @@ int main(int argc,char **argv)
         graph_hash_build(source,build,probe,feed,false,true);
         graph_hash_build(source,build,probe,feed,false,false);
         graph_hash_build(source,build,probe,feed,true,true);
-        puts("PASS graph HashBuild/Probe/Sort/Offset/Aggregate: nested packets, duplicate fanout, exact int128 and partition spill");
+        graph_initializers(source,feed);
+        puts("PASS graph HashBuild/Probe/Sort/Offset/Aggregate: nested packets, duplicate fanout, exact int128, partition spill, InitPlan and shared CTE");
         return 0;
     }
     if(argc==3 && !strcmp(argv[2],"--host-params-64m")) {
