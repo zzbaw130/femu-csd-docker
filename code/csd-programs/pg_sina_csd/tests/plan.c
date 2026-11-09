@@ -475,6 +475,8 @@ static int64_t test_block_exec(struct probe_test *t)
     int64_t status=0;
     for(unsigned step=0;step<BLOCK_STEPS;++step) {
         if(step==BLOCK_PROBE && !(t->scan_node&QP_GRAPH_BLOCK_PROBE)) continue;
+        if(step==BLOCK_INDEX && !(t->scan_node&QP_GRAPH_BLOCK_INDEX)) continue;
+        if(step==BLOCK_PROJECT || step==BLOCK_SORT || step==BLOCK_PARTITION) continue;
         if(step==BLOCK_GROUP && (t->scan_node&QP_GRAPH_BLOCK_BUILD)) continue;
         if(step==BLOCK_HASH && !(t->scan_node&QP_GRAPH_BLOCK_BUILD)) continue;
         for(;;) {
@@ -2817,7 +2819,8 @@ int main(int argc,char **argv)
         test(run,QP_INNER,31,3000003,64,1,TEST_PARTITION_GROUP);
         static const char *steps[]={
             "pg_sina_graph_block_scan","pg_sina_graph_block_filter","pg_sina_graph_block_probe",
-            "pg_sina_graph_block_aggregate","pg_sina_graph_block_hash_build"};
+            "pg_sina_graph_block_index","pg_sina_graph_block_project","pg_sina_graph_block_aggregate","pg_sina_graph_block_hash_build",
+            "pg_sina_graph_block_sort","pg_sina_graph_block_partition"};
         for(unsigned i=0;i<BLOCK_STEPS;++i) {
             test_block_steps[i]=(function)dlsym(library,steps[i]);
             assert(test_block_steps[i]);

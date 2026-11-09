@@ -156,8 +156,12 @@ static struct program connection_programs[]={
     {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_block_scan"},
     {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_block_filter"},
     {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_block_probe"},
+    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_block_index"},
+    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_block_project"},
     {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_block_aggregate"},
-    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_block_hash_build"}
+    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_block_hash_build"},
+    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_block_sort"},
+    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_block_partition"}
 };
 struct pg_sina_resources pg_sina_resources;
 static void close_connection(int code,Datum arg)

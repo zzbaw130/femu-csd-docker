@@ -231,7 +231,7 @@ struct operator_state {
     bool scan_hash_checked;
     struct qs_dict *filter_dictionary; /* Immutable literals for raw-Heap filtering. */
     int scan_filter_checked,projection_checked;
-    struct projection_batch *projection;
+    struct projection_batch *projection, *block_input_projection;
     struct projection_batch *source_projection;
     int source_checked;
     unsigned projection_deferred,source_deferred;
@@ -335,7 +335,14 @@ struct execution {
     size_t io_bytes, sort_limit;
     struct sorted_rows *pending_sort;
     struct sorted_rows *sort_sink; /* CU-local state; runs are owned by the query. */
-    bool block_graph;
+    bool block_graph, block_chain, block_row_pending, block_done;
+    bool block_sink_started, block_sink_done;
+    unsigned block_write, block_input_node, block_native_deferred;
+    int block_native_checked;
+    struct projection_batch *block_native_projection;
+    struct spool block_edges[2], *block_input;
+    uint64_t block_edge_read;
+    struct qs_cell block_row[QS_OUT];
     struct spool block_rows, block_overflow;
     struct qs_cell *block_cells;
     uint64_t block_read, block_overflow_read;
@@ -442,14 +449,17 @@ static void blocking_end(struct execution *s,unsigned op,struct blocking_timer b
 static int64_t next_row_impl(struct execution *,unsigned,struct qs_cell *);
 static int retry_project(struct execution *,unsigned,struct qs_cell *);
 static int64_t hash_build_input(struct execution *,unsigned,struct qs_cell *);
+static int64_t block_edge_row(struct execution *,unsigned,struct qs_cell *);
 static inline bool graph_input_edge(const struct execution *s,unsigned id)
 {
+    if(s->block_input) return id==s->block_input_node;
     return s->hash_input && s->graph_source_pending &&
         s->graph_source_kind==GRAPH_EMIT_FEED && id==s->hash_input_node;
 }
 static inline int64_t next_row(struct execution *s,unsigned id,struct qs_cell *row)
 {
-    if(graph_input_edge(s,id)) return hash_build_input(s,id,row);
+    if(graph_input_edge(s,id))
+        return s->block_input?block_edge_row(s,id,row):hash_build_input(s,id,row);
     int64_t status=3;
     if(row && id<s->plan->count && s->nodes[id].project_retry && !s->nodes[id].project_retry->inline_only) status=retry_project(s,id,row);
     if(status==3) status=next_row_impl(s,id,row);
@@ -1298,7 +1308,7 @@ static int64_t hash_build(struct execution *s,unsigned id)
  * Flush before advancing that window, but finish any live vector/match chain. */
 static int hash_input_boundary(struct execution *s,unsigned id)
 {
-    int scan=qp_probe_scan(s->plan,id); if(scan<0 || s->source_node>=0) return 0;
+    int scan=qp_probe_scan(s->plan,id); if(scan<0 || s->source_node>=0 || s->block_input) return 0;
     struct qs_chunk *chunk=(void *)(s->arena+vector_offset(s,&s->plan->nodes[scan]));
     if(!chunk->rows || s->nodes[scan].scan_position<chunk->selected) return 0;
     for(int at=id;at>=0;at=s->plan->nodes[at].left) {
@@ -1485,6 +1495,15 @@ static int64_t spool_append(struct execution *s,struct spool *p,const struct qs_
 { return spool_append_bytes(s,p,row,cols*sizeof(*row)); }
 static int64_t spool_row(struct execution *s,struct spool *p,uint64_t index,unsigned cols,struct qs_cell *row)
 { return spool_row_bytes(s,p,index,cols*sizeof(*row),row); }
+static int64_t block_edge_row(struct execution *s,unsigned id,struct qs_cell *row)
+{
+    struct spool *in=s->block_input;
+    if(s->block_edge_read==in->rows) return QP_WAIT;
+    int64_t status=spool_row(s,in,s->block_edge_read,s->plan->nodes[id].expr.nout,row);
+    if(status) return status;
+    ++s->block_edge_read;
+    return 2;
+}
 static void external_advance(struct execution *s,unsigned id)
 {
     struct operator_state *o=&s->nodes[id];
@@ -2830,19 +2849,36 @@ static int64_t projection_sort_fill(struct execution *s,struct projection_batch 
 }
 static int64_t projection_edge_fill(struct execution *s,struct projection_batch *b)
 {
-    const struct qs_result *in=s->hash_input;
-    unsigned count=in->rows-s->hash_input_position;
-    if(!count) return in->finished?0:QP_WAIT;
-    if(count>QS_VECTOR_ROWS) count=QS_VECTOR_ROWS;
-    unsigned cols=b->plan.nattrs;
-    const struct qs_cell *rows=(const struct qs_cell *)in->data+
-        (size_t)(in->begin+s->hash_input_position)*cols;
-    for(unsigned col=0;col<cols;++col) {
-        int slot=b->plan.cols[col].slot;
-        if(slot<0) continue;
-        for(unsigned r=0;r<count;++r) b->cells[slot*QS_VECTOR_ROWS+r]=rows[(size_t)r*cols+col];
+    unsigned count=0;
+    if(s->block_input) {
+        count=b->input_count;
+        for(;count<QS_VECTOR_ROWS;++count) {
+            struct qs_cell row[QS_OUT];
+            int64_t status=block_edge_row(s,b->scan,row);
+            if(status==QP_WAIT) break;
+            if(status!=2) { b->input_count=count; return status; }
+            for(unsigned col=0;col<b->plan.nattrs;++col) {
+                int slot=b->plan.cols[col].slot;
+                if(slot>=0) b->cells[slot*QS_VECTOR_ROWS+count]=row[col];
+            }
+        }
+        b->input_count=0;
+        if(!count) return QP_WAIT;
+    } else {
+        const struct qs_result *in=s->hash_input;
+        count=in->rows-s->hash_input_position;
+        if(!count) return in->finished?0:QP_WAIT;
+        if(count>QS_VECTOR_ROWS) count=QS_VECTOR_ROWS;
+        unsigned cols=b->plan.nattrs;
+        const struct qs_cell *rows=(const struct qs_cell *)in->data+
+            (size_t)(in->begin+s->hash_input_position)*cols;
+        for(unsigned col=0;col<cols;++col) {
+            int slot=b->plan.cols[col].slot;
+            if(slot<0) continue;
+            for(unsigned r=0;r<count;++r) b->cells[slot*QS_VECTOR_ROWS+r]=rows[(size_t)r*cols+col];
+        }
+        s->hash_input_position+=count;
     }
-    s->hash_input_position+=count;
     b->count=count; b->position=0;
     struct qs_vector_input input={.cells=b->cells,.dictionary=s->dictionary,
         .parameters=s->params,.nparameters=QP_PARAMS,.inset=inset_vectors,.set_state=s};
@@ -4875,6 +4911,7 @@ static int64_t index_next(struct execution *s,unsigned id,struct qs_cell *row,st
             unsigned batch=n->sorted_input?1:QS_INDEX_KEYS;
             while(o->index_count<batch && !o->input_done) {
                 int64_t status=next_row(s,n->left,o->index_left+(size_t)o->index_count*ln);
+                if(status==QP_WAIT && s->block_graph && s->scan_drained) status=0;
                 if(status==QP_WAIT || status<0 || status>2) return status;
                 if(!status) o->input_done=1; else ++o->index_count;
             }
@@ -5258,6 +5295,51 @@ fallback:
         struct execution *e=s->workers[w]; cs_work_free(e->context,e->sort_sink); e->sort_sink=NULL;
     }
 }
+static bool block_numeric_output(const struct qp_node *n)
+{
+    for(unsigned i=0;i<n->expr.nout;++i)
+        if(n->expr.outputs[i].index<0 || n->expr.exprs[n->expr.outputs[i].index].type==Q_STRING) return false;
+    return true;
+}
+/* Join and projection can carry a canonical string ID without opening
+ * its dictionary page. Keep operators that evaluate string expressions
+ * on the ordinary resumable path. */
+static bool block_passes_text(const struct qp_node *n)
+{
+    if(n->kind!=QP_JOIN && n->kind!=QP_PROJECT) return block_numeric_output(n);
+    for(unsigned i=0;i<n->expr.nexprs;++i) {
+        const struct qs_expr *e=&n->expr.exprs[i];
+        if(e->type==Q_STRING && e->op!=Q_COLUMN) return false;
+        if(e->op==Q_LIKE || e->op==Q_SUBSTRING || (e->op>=Q_EQ && e->op<=Q_GE &&
+           (n->expr.exprs[e->left].type==Q_STRING || n->expr.exprs[e->right].type==Q_STRING))) return false;
+    }
+    return true;
+}
+static bool block_group_supported(const struct qp_node *n)
+{
+    for(unsigned i=0;i<n->expr.naggs;++i) {
+        const struct qs_agg *a=&n->expr.aggs[i];
+        if((a->kind==Q_MIN || a->kind==Q_MAX) && n->expr.exprs[a->expr].type==Q_STRING) return false;
+    }
+    return true;
+}
+static bool block_chain_supported(const struct execution *s,unsigned root,int source)
+{
+    const struct qp_plan *p=s->plan;
+    unsigned count=0;
+    for(int at=root;at!=source;at=p->nodes[at].left) {
+        if(at<0 || ++count>QP_GRAPH_BLOCK_MAX_CHAIN) return false;
+        const struct qp_node *n=&p->nodes[at];
+        if(!block_passes_text(n) || !n->expr.nout) return false;
+        if(n->kind==QP_PROJECT) continue;
+        if(n->kind==QP_JOIN && n->hash && s->nodes[at].hash_phase && !s->nodes[at].external &&
+           !s->nodes[at].hash_fallback) continue;
+        if(n->kind==QP_INDEX_JOIN && n->right>=0 && p->files[n->right].count &&
+           p->indexes[n->right].count && block_numeric_output(&p->nodes[n->right])) continue;
+        return false;
+    }
+    return count!=0;
+}
 static int64_t parallel_next(struct execution *s,unsigned root,struct qs_cell *row)
 {
     struct qp_plan *p=s->plan;
@@ -5457,26 +5539,38 @@ restart:
             }
         }
         if(group_sink) { int status=parallel_group_begin(s,group_sink-1); if(status) return status; }
+        if(!s->graph_source_pending && !hash_sink && !group_sink && !aggregate_sink && !partition_sink)
+            parallel_sort_begin(s,root);
+        bool sort_sink=s->workers[0]->sort_sink && block_numeric_output(&p->nodes[root]);
         unsigned block_flags=0;
-        bool direct_probe=p->nodes[root].kind==QP_JOIN && p->nodes[root].left==source &&
-            !s->nodes[root].external;
-        bool local_radix=group_sink && s->workers[0]->nodes[group_sink-1].group_local &&
-            s->workers[0]->nodes[group_sink-1].group_local->group_radix;
-        if(s->block_graph && p->nodes[source].kind==QP_SCAN && !p->nodes[source].ordered_index &&
-           ((hash_sink && (root==(unsigned)source || direct_probe)) || (local_radix && direct_probe))) {
-            block_flags=QP_GRAPH_BLOCK_SCAN | (hash_sink?QP_GRAPH_BLOCK_BUILD:0) |
-                (direct_probe?QP_GRAPH_BLOCK_PROBE:0);
+        const struct qp_node *producer=&p->nodes[root],*leaf=&p->nodes[source];
+        bool hash_probe=producer->kind==QP_JOIN && producer->left==source && !s->nodes[root].external;
+        bool index_probe=producer->kind==QP_INDEX_JOIN && producer->left==source && producer->right>=0 &&
+            p->files[producer->right].count && p->indexes[producer->right].count &&
+            block_numeric_output(&p->nodes[producer->right]);
+        if(s->block_graph && (hash_sink || group_sink || aggregate_sink || sort_sink || partition_sink) &&
+           leaf->kind==QP_SCAN &&
+           !leaf->ordered_index && block_numeric_output(leaf) && block_passes_text(producer) &&
+           (!group_sink || block_group_supported(&p->nodes[group_sink-1])) &&
+           (!aggregate_sink || block_group_supported(&p->nodes[aggregate_sink-1]))) {
+            bool direct=(hash_probe || index_probe) && !sort_sink && !partition_sink;
+            bool chain=root!=(unsigned)source && !direct && block_chain_supported(s,root,source);
+            if(root==(unsigned)source || direct || chain)
+                block_flags=QP_GRAPH_BLOCK_SCAN | (hash_sink?QP_GRAPH_BLOCK_BUILD:0) |
+                    (direct && hash_probe?QP_GRAPH_BLOCK_PROBE:0) | (direct && index_probe?QP_GRAPH_BLOCK_INDEX:0) |
+                    (chain?QP_GRAPH_BLOCK_CHAIN:0) | (sort_sink?QP_GRAPH_BLOCK_SORT:0) |
+                    (partition_sink?QP_GRAPH_BLOCK_PARTITION:0);
             for(unsigned w=0;w<p->workers;++w) {
                 struct execution *e=s->workers[w];
-                e->block_graph=true;
+                e->block_graph=block_flags!=0;
+                e->block_chain=chain;
+                if(!block_flags) continue;
                 struct qs_chunk *chunk=(void *)(s->arena+vector_offset(e,&p->nodes[source]));
                 chunk->capacity=qp_scan_buffer_bytes(p,&p->nodes[source])/24;
             }
         }
         /* An explicit graph consumer takes the packet in a later E9
          * submission. Workers still split and decode the scan morsels. */
-        if(!s->graph_source_pending && !hash_sink && !group_sink && !aggregate_sink && !partition_sink)
-            parallel_sort_begin(s,root);
         s->parallel_node=root; s->parallel_done=0;
         memset(s->parallel_position,0,sizeof(s->parallel_position)); atomic_store(&s->next_offset,0);
         s->control->parallel=hash_sink || group_sink || partition_sink?2:1; ++s->control->epoch; s->control->available=s->control->drained=0;
@@ -5486,7 +5580,8 @@ restart:
         /* Index probes retain their keys/payloads across namespace waits.
          * They can consume the same independently scheduled scan morsels as
          * hash probes; only the retained Heap window ends at a morsel edge. */
-        if(scheduled) s->control->scan_node=(scan+1)|block_flags;
+        if(scheduled) s->control->scan_node=(scan+1)|block_flags|
+            ((block_flags&QP_GRAPH_BLOCK_CHAIN)?(root+1)<<QP_GRAPH_BLOCK_ROOT_SHIFT:0);
         s->parallel_started=1; s->used_workers=p->workers;
         if(s->profiling) { s->pipeline_start=now_ns(CLOCK_MONOTONIC); s->pipeline_tick=now_ns(CLOCK_THREAD_CPUTIME_ID); }
     }
@@ -6327,7 +6422,7 @@ int64_t pg_sina_graph_feed(struct femu_csd_args *a)
  * spool, leaving the radix table entirely to the Aggregate EXEC. */
 static unsigned block_columns(const struct execution *s,unsigned id,const struct projection_batch *b,int *indices)
 {
-    if(s->hash_sink) {
+    if(s->hash_sink || s->aggregate_sink) {
         for(unsigned col=0;col<b->plan.nout;++col) indices[col]=b->plan.outputs[col].index;
         return b->plan.nout;
     }
@@ -6336,6 +6431,9 @@ static unsigned block_columns(const struct execution *s,unsigned id,const struct
     for(unsigned k=0;k<n->nkeys;++k) indices[count++]=b->group_keys[k];
     for(unsigned a=0;a<n->expr.naggs;++a)
         if(b->group_values[a]>=0) indices[count++]=b->group_values[a];
+    const struct operator_state *local=s->nodes[id].group_local;
+    if(!local || !local->group_radix)
+        for(unsigned col=0;col<b->plan.nout;++col) indices[count++]=b->plan.outputs[col].index;
     return count;
 }
 static int64_t block_probe(struct execution *s,unsigned id)
@@ -6343,21 +6441,27 @@ static int64_t block_probe(struct execution *s,unsigned id)
     int status=projection_init(s,id,0); if(status) return status;
     struct projection_batch *b=s->nodes[id].projection;
     if(!b || !b->joined) return -4;
-    int columns[QS_KEYS+QS_AGGS];
+    int columns[QS_KEYS+QS_AGGS+QS_OUT];
     unsigned count=block_columns(s,id,b,columns);
-    size_t reserve=s->hash_sink?2*QS_SORT_IO_BYTES:s->nodes[id].group_local->group_radix->resident_reserve;
+    const struct operator_state *local=s->nodes[id].group_local;
+    size_t reserve=local && local->group_radix?local->group_radix->resident_reserve:2*QS_SORT_IO_BYTES;
     for(;;) {
         int64_t ready=projection_fill(s,id,0);
         if(ready==QP_WAIT || !ready) {
+            if(ready==QP_WAIT && s->control->index_nreads && !s->control->ready) {
+                int64_t request=namespace_wait(s);
+                return request?request:-1;
+            }
             if(!s->scan_drained) return -1;
             b->count=b->position=0;
             return 0;
         }
         if(ready!=2) return ready==3?-4:ready;
         while(b->position<b->count) {
-            struct qs_cell cells[QS_KEYS+QS_AGGS];
+            struct qs_cell cells[QS_KEYS+QS_AGGS+QS_OUT];
             for(unsigned col=0;col<count;++col) {
-                unsigned index=columns[col];
+                int index=columns[col];
+                if(index<0) { cells[col]=(struct qs_cell){0}; continue; }
                 if(b->vectors[index].errors[b->position]) return -5;
                 cells[col]=qs_vector_cell(&b->plan,b->vectors,index,b->position);
             }
@@ -6384,16 +6488,51 @@ static int64_t block_hash_vectors(struct execution *s,unsigned id,struct project
     }
     return 0;
 }
-static int64_t block_hash_scan(struct execution *s,unsigned id)
+static int64_t block_apply(struct execution *s,unsigned id,struct projection_batch *b,struct qs_result *out)
+{
+    if(s->hash_sink) return block_hash_vectors(s,id,b);
+    if(s->partition_sink) return partition_sink_vectors(s,b);
+    if(s->sort_sink) {
+        struct sorted_rows *sort=s->sort_sink;
+        sort->columns=b;
+        int64_t status=sort_call(s,sort,0); if(status) return status;
+        b->position=b->count; sort->columns=NULL;
+        return 0;
+    }
+    if(s->aggregate_sink) return aggregate_sink_vectors(s,id);
+    unsigned capacity=QS_RESULT_ROWS*QS_OUT/b->plan.nout;
+    if(out->rows==out->begin) {
+        out->rows=out->begin=0;
+        int64_t status=group_sink_vectors(s,id,out,capacity);
+        if(status) return status;
+    }
+    while(out->begin<out->rows) {
+        const struct qs_cell *row=qp_result_row(out,out->begin,b->plan.nout,1);
+        int64_t status=spool_append(s,&s->block_overflow,row,b->plan.nout);
+        if(status) return status;
+        ++out->begin;
+    }
+    out->rows=out->begin=0;
+    return 0;
+}
+static int64_t block_sink_scan(struct execution *s,unsigned id,struct qs_result *out)
 {
     int status=projection_init(s,id,0); if(status) return status;
     if(!s->nodes[id].projection) return -4;
     for(;;) {
+        struct projection_batch *b=s->nodes[id].projection;
+        if(out->begin<out->rows) {
+            int64_t applied=block_apply(s,id,b,out);
+            if(applied) return applied;
+        }
         int64_t ready=projection_fill(s,id,0);
         if(ready==QP_WAIT || !ready) return s->scan_drained?0:-1;
         if(ready!=2) return ready==3?-4:ready;
-        int64_t applied=block_hash_vectors(s,id,s->nodes[id].projection);
-        if(applied) return applied;
+        b=s->nodes[id].projection;
+        do {
+            int64_t applied=block_apply(s,id,b,out);
+            if(applied) return applied;
+        } while(b->position<b->count);
     }
 }
 static int64_t block_sink(struct execution *s,unsigned id,struct qs_result *out)
@@ -6403,12 +6542,12 @@ static int64_t block_sink(struct execution *s,unsigned id,struct qs_result *out)
         int status=projection_init(s,id,0); if(status) return status;
         struct projection_batch *b=s->nodes[id].projection;
         if(!b) return -4;
-        int columns[QS_KEYS+QS_AGGS];
+        int columns[QS_KEYS+QS_AGGS+QS_OUT];
         unsigned count=block_columns(s,id,b,columns);
         if(!s->block_cells) s->block_cells=cs_work_alloc(s->context,QS_VECTOR_ROWS*count*sizeof(*s->block_cells));
         if(!s->block_cells) return -4;
         for(;;) {
-            if(b->position==b->count) {
+            if(b->position==b->count && out->begin==out->rows) {
                 b->position=b->count=0;
                 while(b->count<QS_VECTOR_ROWS && s->block_read<rows->rows) {
                     int64_t loaded=spool_row(s,rows,s->block_read,count,s->block_cells+(size_t)b->count*count);
@@ -6418,6 +6557,7 @@ static int64_t block_sink(struct execution *s,unsigned id,struct qs_result *out)
                 if(!b->count) break;
             }
             for(unsigned col=0;col<count;++col) {
+                if(columns[col]<0) continue;
                 struct qs_vector *v=&b->vectors[columns[col]];
                 v->kind=QS_CELLS; v->cells=s->block_cells+col; v->selection=NULL;
                 v->first=0; v->cell_stride=count; v->all_valid=0;
@@ -6425,7 +6565,7 @@ static int64_t block_sink(struct execution *s,unsigned id,struct qs_result *out)
             }
             unsigned before=b->position;
             uint64_t tick=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
-            int64_t applied=s->hash_sink?block_hash_vectors(s,id,b):group_sink_vectors(s,id,out,QS_VECTOR_ROWS);
+            int64_t applied=block_apply(s,id,b,out);
             if(s->profiling) { s->sink_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-tick; s->sink_rows+=b->position-before; }
             if(applied) return applied;
         }
@@ -6438,6 +6578,78 @@ static int64_t block_sink(struct execution *s,unsigned id,struct qs_result *out)
     }
     return 0;
 }
+/* Alternating spools are shared only by adjacent EXECs in the same slot.
+ * Borrow the virtual input projection for the lifetime of this EXEC. */
+static void block_use_input(struct execution *s,unsigned id)
+{
+    struct operator_state *o=&s->nodes[id];
+    s->block_input=&s->block_edges[s->block_write^1];
+    s->block_input_node=id; s->block_edge_read=0;
+    s->block_native_projection=o->projection;
+    s->block_native_checked=o->projection_checked;
+    s->block_native_deferred=o->projection_deferred;
+    o->projection=o->block_input_projection;
+    o->projection_checked=o->projection_deferred=0;
+}
+static int64_t block_finish_input(struct execution *s)
+{
+    struct spool *in=s->block_input;
+    if(!in) return 0;
+    while(in->blocks) {
+        struct spool_block *block=&in->pages[--in->blocks];
+        cs_work_free(s->context,block->data);
+        if(block->token) return csNeedFree(block->token);
+    }
+    in->used=0; in->rows=0; in->loaded=UINT_MAX;
+    struct operator_state *o=&s->nodes[s->block_input_node];
+    o->block_input_projection=o->projection;
+    o->projection=s->block_native_projection;
+    o->projection_checked=s->block_native_checked;
+    o->projection_deferred=s->block_native_deferred;
+    s->block_input=NULL;
+    return 0;
+}
+static int64_t block_transform(struct execution *s,unsigned id,unsigned scan)
+{
+    const struct qp_node *n=&s->plan->nodes[id];
+    if(!csIsReentry(s->args)) {
+        s->block_done=s->block_row_pending=false;
+        if(n->left!=(int)scan) block_use_input(s,n->left);
+    }
+    struct spool *out=&s->block_edges[s->block_write];
+    while(!s->block_done) {
+        if(!s->block_row_pending) {
+            int64_t status=next_row(s,id,s->block_row);
+            if(status==QP_WAIT && s->control->index_nreads && !s->control->ready) {
+                int64_t request=namespace_wait(s);
+                return request?request:-1;
+            }
+            if(status==QP_WAIT && s->scan_drained) status=0;
+            if(!status) { s->block_done=true; break; }
+            if(status!=2) return status;
+            s->block_row_pending=true;
+        }
+        int64_t stored=spool_append_context(s,out,s->block_row,n->expr.nout*sizeof(struct qs_cell),
+            s->context,4*QS_SORT_IO_BYTES);
+        if(stored) return stored;
+        s->block_row_pending=false;
+    }
+    int64_t freed=block_finish_input(s); if(freed) return freed;
+    s->block_write^=1;
+    return 0;
+}
+static int64_t block_chain_sink(struct execution *s,unsigned sink,struct qs_result *out)
+{
+    if(!s->block_sink_started) {
+        s->block_sink_started=true; s->block_done=false;
+        block_use_input(s,s->root);
+    }
+    if(!s->block_done) {
+        int64_t status=block_sink_scan(s,sink,out); if(status) return status;
+        s->block_done=true;
+    }
+    return block_finish_input(s);
+}
 static int64_t graph_block_execute(struct femu_csd_args *a,enum qp_graph_block_step step)
 {
     if(!a || a->numr!=5 || a->mr_len[0]<(long long)sizeof(struct qp_plan) || a->mr_len[4]<QS_SORT_IO_BYTES)
@@ -6448,8 +6660,9 @@ static int64_t graph_block_execute(struct femu_csd_args *a,enum qp_graph_block_s
        a->mr_len[2]<(long long)((worker+1)*sizeof(struct qs_result))) return -1;
     struct qp_control *control=(struct qp_control *)a->mr_addr[1]+worker;
     struct execution *s=(void *)(uintptr_t)control->state;
-    if(!s || !s->block_graph || s->plan!=p || (!s->group_sink && !s->hash_sink)) return -1;
-    unsigned scan=qp_probe_scan(p,s->root), sink=s->group_sink?s->group_sink-1:s->root;
+    if(!s || !s->block_graph || s->plan!=p || (!s->group_sink && !s->hash_sink && !s->aggregate_sink && !s->sort_sink && !s->partition_sink)) return -1;
+    unsigned scan=qp_probe_scan(p,s->root);
+    unsigned sink=s->group_sink?s->group_sink-1:s->aggregate_sink?s->aggregate_sink-1:s->root;
     if(scan>=p->count) return -1;
     const struct qp_node *leaf=&p->nodes[scan];
     struct operator_state *o=&s->nodes[scan];
@@ -6464,22 +6677,38 @@ static int64_t graph_block_execute(struct femu_csd_args *a,enum qp_graph_block_s
         s->expression_wait=0;
     }
     uint64_t wall=s->profiling?now_ns(CLOCK_MONOTONIC):0,cpu=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
+    if(s->profiling) {
+        struct execution *owner=s->owner;
+        unsigned active=atomic_fetch_add(&owner->active_cus,1)+1,peak=atomic_load(&owner->peak_cus);
+        while(active>peak && !atomic_compare_exchange_weak(&owner->peak_cus,&peak,active)) { }
+    }
     switch(step) {
         case BLOCK_SCAN: {
             struct qs_chunk *chunk=(void *)(s->arena+vector_offset(s,leaf));
             uint64_t page=(uint64_t)a->cparam1>>QP_SCAN_PAGE_SHIFT;
-            if(page>UINT64_MAX/QS_PAGE || page*QS_PAGE>leaf->bytes) return -1;
+            if(page>UINT64_MAX/QS_PAGE || page*QS_PAGE>leaf->bytes) { status=-1; break; }
             uint64_t offset=page*QS_PAGE;
             unsigned bytes=leaf->bytes-offset<p->scan_bytes?leaf->bytes-offset:p->scan_bytes;
             if(!csIsReentry(a)) {
-                if((s->host_scan && !s->scan_drained) || s->block_rows.rows) return -1;
+                if((s->host_scan && !s->scan_drained) || s->block_rows.rows) { status=-1; break; }
                 s->host_scan=true; s->scan_drained=false; s->block_read=0;
+                s->block_sink_started=s->block_sink_done=false;
                 o->scan_position=o->scan_input=o->scan_bytes=o->scan_raw_bytes=0;
                 o->position=offset+bytes;
                 chunk->rows=chunk->selected=0;
                 out->rows=out->begin=out->finished=out->str_bytes=0;
-                if(s->root!=scan) {
-                    status=hash_probe_projection(s,s->root,0); if(status) return status;
+                unsigned first=s->root;
+                if(s->block_chain) {
+                    s->block_write=0;
+                    for(int id=s->root;id!=(int)scan;id=p->nodes[id].left) {
+                        first=id;
+                        if(p->nodes[id].kind==QP_INDEX_JOIN)
+                            s->nodes[id].input_done=s->nodes[id].finished=0;
+                    }
+                } else if(p->nodes[s->root].kind==QP_INDEX_JOIN)
+                    s->nodes[s->root].input_done=s->nodes[s->root].finished=0;
+                if(p->nodes[first].kind==QP_JOIN) {
+                    status=hash_probe_projection(s,first,0); if(status) break;
                 }
             }
             if(bytes) status=scan_decode(s,scan,bytes,false);
@@ -6495,26 +6724,55 @@ static int64_t graph_block_execute(struct femu_csd_args *a,enum qp_graph_block_s
             }
             break;
         case BLOCK_PROBE:
-            status=block_probe(s,sink);
+        case BLOCK_INDEX:
+        case BLOCK_PROJECT:
+            if(s->block_chain) {
+                unsigned id=(uint64_t)a->cparam1>>QP_GRAPH_BLOCK_NODE_SHIFT;
+                if(!id || id>p->count) { status=-1; break; }
+                status=block_transform(s,id-1,scan);
+            } else status=block_probe(s,sink);
             break;
         case BLOCK_GROUP:
-            status=block_sink(s,sink,out);
+            if(!s->block_sink_done) {
+                status=s->block_chain?block_chain_sink(s,sink,out):
+                    s->root==scan?block_sink_scan(s,sink,out):block_sink(s,sink,out);
+                s->block_sink_done=status==0;
+            }
+            /* Reentry during the final radix flush resumes the flush, even
+             * after the scan consumed and freed the final projection. */
             if(!status && o->position==leaf->bytes) {
-                status=radix_flush(s,sink);
+                struct operator_state *local=s->nodes[sink].group_local;
+                if(local && local->group_radix) status=radix_flush(s,sink);
                 if(!status) out->finished=control->finished=1;
             }
             break;
         case BLOCK_HASH: {
             uint64_t before=s->metrics.build_rows;
-            status=s->root==scan?block_hash_scan(s,sink):block_sink(s,sink,out);
+            status=s->block_chain?block_chain_sink(s,sink,out):
+                s->root==scan?block_sink_scan(s,sink,out):block_sink(s,sink,out);
             if(s->root==scan && s->profiling) s->sink_rows+=s->metrics.build_rows-before;
             if(!status && o->position==leaf->bytes) out->finished=control->finished=1;
             break;
         }
-        default: return -1;
+        case BLOCK_PARTITION:
+            status=partition_sink_prefix(s);
+            if(!status) status=s->block_chain?block_chain_sink(s,sink,out):block_sink_scan(s,sink,out);
+            if(!status && o->position==leaf->bytes) out->finished=control->finished=1;
+            break;
+        case BLOCK_SORT:
+            if(!s->sort_sink->finishing_sink)
+                status=s->block_chain?block_chain_sink(s,sink,out):block_sink_scan(s,sink,out);
+            if(!status && o->position==leaf->bytes) {
+                s->sort_sink->finishing_sink=1;
+                status=sort_call(s,s->sort_sink,0);
+                if(!status) out->finished=control->finished=1;
+            }
+            break;
+        default: status=-1; break;
     }
     if(s->profiling) {
         struct qs_timing *t=&s->profile.operators[QS_JOIN_PROBE];
+        atomic_fetch_sub(&s->owner->active_cus,1);
         ++t->calls; t->cpu_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-cpu;
         t->wall_ns+=now_ns(CLOCK_MONOTONIC)-wall;
     }
@@ -6522,8 +6780,15 @@ static int64_t graph_block_execute(struct femu_csd_args *a,enum qp_graph_block_s
     if(s->text_wait) status=s->text_wait;
     if(s->dictionary_wait) status=s->dictionary_wait;
     wait_io(s,status);
-    if(status) return status>0 && !((uint64_t)status>>60)?-4:status;
-    if(step!=BLOCK_GROUP && step!=BLOCK_HASH) return 0;
+    if(status) {
+        if(status>0 && !((uint64_t)status>>60)) status=-4;
+        if(status<0 && !control->error) {
+            control->error=status;
+            control->error_node=step<=BLOCK_FILTER?scan:sink;
+        }
+        return status;
+    }
+    if(step!=BLOCK_GROUP && step!=BLOCK_HASH && step!=BLOCK_SORT && step!=BLOCK_PARTITION) return 0;
     plan_output_metrics(s,out,worker);
     return QP_INPUT_DRAINED | (out->finished?QP_WORKER_FINISHED:0);
 }
@@ -6534,10 +6799,18 @@ int64_t pg_sina_graph_block_filter(struct femu_csd_args *a)
 { return graph_block_execute(a,BLOCK_FILTER); }
 int64_t pg_sina_graph_block_probe(struct femu_csd_args *a)
 { return graph_block_execute(a,BLOCK_PROBE); }
+int64_t pg_sina_graph_block_index(struct femu_csd_args *a)
+{ return graph_block_execute(a,BLOCK_INDEX); }
+int64_t pg_sina_graph_block_project(struct femu_csd_args *a)
+{ return graph_block_execute(a,BLOCK_PROJECT); }
 int64_t pg_sina_graph_block_aggregate(struct femu_csd_args *a)
 { return graph_block_execute(a,BLOCK_GROUP); }
 int64_t pg_sina_graph_block_hash_build(struct femu_csd_args *a)
 { return graph_block_execute(a,BLOCK_HASH); }
+int64_t pg_sina_graph_block_sort(struct femu_csd_args *a)
+{ return graph_block_execute(a,BLOCK_SORT); }
+int64_t pg_sina_graph_block_partition(struct femu_csd_args *a)
+{ return graph_block_execute(a,BLOCK_PARTITION); }
 
 enum pipeline_phase { PIPELINE_EXECUTE, PIPELINE_BUILD, PIPELINE_GROUP };
 static int64_t plan_execute(struct femu_csd_args *a,enum pipeline_phase phase)
@@ -6571,6 +6844,7 @@ static int64_t plan_execute(struct femu_csd_args *a,enum pipeline_phase phase)
         out->rows=out->begin=out->finished=out->str_bytes=0; out->status=0;
     }
     s->args=a; s->io=a->mr_addr[4]; s->io_bytes=a->mr_len[4];
+    if(!worker && ((uint64_t)a->cparam1&QP_GRAPH_BLOCK_EXEC)) s->block_graph=true;
     /* A new submission must not acknowledge an earlier worker batch again,
      * including early returns while dictionary initialization/resume is BUSY.
      * Device-internal I/O reentry still accumulates acknowledgements until
