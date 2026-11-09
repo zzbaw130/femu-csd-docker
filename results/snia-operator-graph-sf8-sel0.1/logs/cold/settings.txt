@@ -6,5 +6,6 @@ shared_buffers=2GB
 max_parallel_workers_per_gather=4
 work_mem=16MB
 cold_runs=1
-modes=host-only pg-sina-plan snia-operator-graph
+modes=host-only original-csd snia-operator-graph
 cache_mode_dcp=on
+original_module_sha256=28dd2417ef5f21724d1f2b965447bb8675186be96073d6dd4597496d160b777c  /home/femu/opt/postgres/release/lib/pg_sina_csd.so

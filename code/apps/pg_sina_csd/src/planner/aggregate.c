@@ -586,7 +586,6 @@ static bool compile(PlannerInfo *root,List *relations,List *joins,List *quals,st
  * It changes execution batching, not access paths or join order. */
 static Plan *fast_plan(PlannerInfo *root,Plan *native,struct qs_plan **properties)
 {
-    if(pg_sina_plan_only) return NULL;
     Query *q=root->parse;
     if(!q->hasAggs || q->hasSubLinks || q->havingQual || q->cteList || q->windowClause ||
        q->groupingSets || q->distinctClause || q->hasRowSecurity || q->hasTargetSRFs ||
