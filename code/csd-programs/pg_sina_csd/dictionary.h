@@ -7,6 +7,8 @@
 /* Internal scheduling result, not an SNIA status or a completed lookup. */
 #define QS_DICTIONARY_BUSY 1
 struct qs_dictionary;
+struct femu_csd_args;
+void qs_dictionary_graph_context(const struct femu_csd_args *);
 struct qs_dictionary_access;
 struct qs_dictionary_text;
 struct qs_dictionary_stats {

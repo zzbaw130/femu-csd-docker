@@ -49,7 +49,7 @@ struct plan_slot {
     bool need_input, prefetched_input;
     unsigned block_flags, batch_block_flags, block_root, batch_block_root;
     CS_BATCH_INDEX block_entries[QP_GRAPH_BLOCK_MAX_CHAIN+3];
-    uint64_t block_submissions;
+    uint64_t block_submissions,stream_submissions;
     uint64_t queued_ns;
     PlanStateCsd *owner;
     unsigned worker;
@@ -131,7 +131,7 @@ struct PlanStateCsd {
     enum graph_phase graph_phase;
     unsigned graph_node, graph_nodes, graph_init, graph_pipeline_group;
     CS_CSF_ID graph_block[BLOCK_STEPS];
-    bool graph_tree, graph_partition, graph_waves, graph_resident_text;
+    bool graph_tree, graph_partition, graph_waves, graph_resident_text, graph_stream_waves;
     uint64_t graph_packets, graph_build_packets;
     unsigned row;
     bool started, explain_only, active, profiling, operator_graph;
@@ -371,7 +371,7 @@ static unsigned scan_capacity(const PlanStateCsd *s,unsigned id)
 {
     const struct qp_node *n=&s->plan->nodes[id];
     if(n->ordered_index) return 256;
-    return s->graph_waves?qp_scan_buffer_bytes(s->plan,n)/24:qp_scan_capacity(s->plan,n);
+    return s->graph_waves && !s->graph_stream_waves?qp_scan_buffer_bytes(s->plan,n)/24:qp_scan_capacity(s->plan,n);
 }
 /* Compute offsets without allocating, so a larger I/O block can be tried
  * before reducing CU concurrency. Small relations need only their own bytes. */
@@ -645,10 +645,24 @@ static bool resident_graph_text(const struct qp_plan *plan)
     }
     return text;
 }
+/* A direct Index Join feeding a grouped sink can share a single vector
+ * between its probe and aggregate. Other text plans retain the coarse path. */
+static bool graph_stream_index_group(const struct qp_plan *p)
+{
+    const struct qp_node *root=&p->nodes[p->root];
+    if(root->kind!=QP_SORT || root->left<0 || p->ninit) return false;
+    const struct qp_node *group=&p->nodes[root->left];
+    if(group->kind!=QP_AGGREGATE || !group->hash || group->distinct ||
+       group->distinct_aggs || !qp_hash_aggregate_supported(group) || group->left<0) return false;
+    const struct qp_node *probe=&p->nodes[group->left];
+    return probe->kind==QP_INDEX_JOIN && probe->left>=0 && probe->right>=0 &&
+        p->nodes[probe->left].kind==QP_SCAN && p->nodes[probe->right].kind==QP_SCAN;
+}
 static uint64_t graph_coordinator_flags(const PlanStateCsd *s)
 {
     return (s->graph_waves?QP_GRAPH_BLOCK_EXEC:0) |
-           (s->graph_resident_text?QP_GRAPH_RESIDENT_TEXT:0);
+           (s->graph_resident_text?QP_GRAPH_RESIDENT_TEXT:0) |
+           (s->graph_stream_waves?QP_GRAPH_STREAM_EXEC:0);
 }
 static void graph_request(PlanStateCsd *s,CsComputeRequest *compute,bool loaded)
 {
@@ -750,7 +764,8 @@ static void start(PlanStateCsd *s)
             }
         }
     }
-    s->graph_resident_text=s->graph_waves && resident_graph_text(s->plan);
+    s->graph_stream_waves=s->graph_waves && (s->graph_pipeline_group || graph_stream_index_group(s->plan));
+    s->graph_resident_text=s->graph_waves && !s->graph_stream_waves && resident_graph_text(s->plan);
     pg_sina_read_resources(device);
     size_t parameter_bytes=qp_host_parameter_bytes(s->plan);
     size_t plan_bytes=sizeof(*s->plan)+parameter_bytes;
@@ -1019,6 +1034,7 @@ static CS_STATUS queue_scan(struct plan_slot *slot)
     bool block=slot->block_flags&QP_GRAPH_BLOCK_SCAN;
     bool probe=slot->block_flags&(QP_GRAPH_BLOCK_PROBE|QP_GRAPH_BLOCK_INDEX);
     bool chain=slot->block_flags&QP_GRAPH_BLOCK_CHAIN;
+    bool stream=slot->block_flags&QP_GRAPH_BLOCK_STREAM;
     unsigned ops[QP_GRAPH_BLOCK_MAX_CHAIN],count=0;
     if(chain)
         for(int id=slot->block_root;id!=(int)node;id=s->plan->nodes[id].left) {
@@ -1082,6 +1098,11 @@ static CS_STATUS queue_scan(struct plan_slot *slot)
             status=csConfigureBatchEntry(slot->resume,reuse?CS_BATCH_RECONFIG:CS_BATCH_ADD,compute,
                 reuse?slot->block_entries[i]:0,reuse?0:previous,reuse?NULL:&slot->block_entries[i]);
             if(status!=CS_SUCCESS) goto done;
+            if(stream && i && !reuse) {
+                status=csConfigureBatchEntry(slot->resume,CS_BATCH_STREAM_LINK,NULL,
+                    slot->block_entries[i],previous,NULL);
+                if(status!=CS_SUCCESS) goto done;
+            }
             previous=slot->block_entries[i];
         }
     } else {
@@ -1097,6 +1118,7 @@ static CS_STATUS queue_scan(struct plan_slot *slot)
         slot->prefetched_input=false;
         if(needs_load) ++slot->scan_loads;
         if(block && bytes) ++slot->block_submissions;
+        if(stream && bytes) ++slot->stream_submissions;
         if(loaded) ++s->prefetch_reused;
     }
 done:
@@ -1697,8 +1719,13 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     ExplainPropertyText("Execution Path","csd",es);
     ExplainPropertyText("CSD Executor",pg_sina_operator_graph?"SNIA operator graph":"pg_sina_plan",es);
     if(s->graph_waves) {
-        uint64_t blocks=0;
-        for(unsigned w=1;w<=s->workers;++w) blocks+=s->slots[w].block_submissions;
+        uint64_t blocks=0,stream=0;
+        for(unsigned w=1;w<=s->workers;++w) {
+            blocks+=s->slots[w].block_submissions;
+            stream+=s->slots[w].stream_submissions;
+        }
+        if(s->graph_stream_waves)
+            ExplainPropertyInteger("CSD Streaming Scan Block Batches",NULL,stream,es);
         ExplainPropertyInteger("CSD Explicit Scan Block Batches",NULL,blocks,es);
         if(blocks)
             ExplainPropertyText("CSD Operator Batches",

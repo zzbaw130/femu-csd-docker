@@ -9,7 +9,7 @@ bool acyclic(const std::array<BatchEntry, MaxBatch> &entries, unsigned capacity)
     for (unsigned pass = 0; pass < capacity; ++pass) {
         u64 previous = done;
         for (unsigned i = 0; i < capacity; ++i)
-            if ((all & (u64{1} << i)) && !(entries[i].dependencies & ~done)) done |= u64{1} << i;
+            if ((all & (u64{1} << i)) && !((entries[i].dependencies | entries[i].stream_inputs) & ~done)) done |= u64{1} << i;
         if (done == all) return true;
         if (done == previous) return false;
     }
@@ -83,8 +83,11 @@ CS_STATUS runBatch(const Batch &batch, std::atomic_bool &cancelled, u64 *value)
 {
     std::array<cs_backend_batch_entry, MaxBatch> entries{};
     Device *device = nullptr;
+    bool streaming = false;
     for (unsigned i = 0; i < batch.capacity; ++i) if (batch.entries[i].request) {
-        entries[i] = {batch.entries[i].request->request.get(), batch.entries[i].dependencies};
+        entries[i] = {batch.entries[i].request->request.get(), batch.entries[i].dependencies,
+                      batch.entries[i].stream_inputs};
+        streaming |= entries[i].stream_inputs != 0;
         device = batch.entries[i].request->device;
     }
     if (device && device->ops().queueBatchRequest) {
@@ -93,7 +96,7 @@ CS_STATUS runBatch(const Batch &batch, std::atomic_bool &cancelled, u64 *value)
             batch.capacity, entries.data(), isCancelled, &cancelled, value);
         if (status != CS_UNSUPPORTED) return status;
     }
-    return BatchExecution(batch, cancelled).run(value);
+    return streaming ? CS_UNSUPPORTED : BatchExecution(batch, cancelled).run(value);
 }
 } // namespace snia
 CS_STATUS csAllocBatchRequest(CS_BATCH_MODE mode, int capacity, CS_BATCH_HANDLE *out)
@@ -152,16 +155,37 @@ CS_STATUS csConfigureBatchEntry(CS_BATCH_HANDLE handle, CS_BATCH_CONFIG_TYPE act
             if (request || current || !before || !after) return CS_INVALID_ARG;
             draft[before - 1].dependencies |= bitAfter;
             break;
+        case CS_BATCH_STREAM_LINK:
+            if (request || current || !before || !after ||
+                draft[before - 1].stream_inputs ||
+                !(draft[before - 1].dependencies & bitAfter) ||
+                draft[before - 1].request->request->ReqType != CS_QUEUE_COMPUTE ||
+                draft[after - 1].request->request->ReqType != CS_QUEUE_COMPUTE) return CS_INVALID_ARG;
+            draft[before - 1].stream_inputs = bitAfter;
+            draft[before - 1].dependencies &= ~bitAfter;
+            break;
         case CS_BATCH_SPLIT:
             if (request || current || (!before && !after)) return CS_INVALID_ARG;
-            if (before && after) draft[after - 1].dependencies &= ~bitBefore;
-            else if (before) { for (auto &entry : draft) entry.dependencies &= ~bitBefore; }
-            else draft[after - 1].dependencies = 0;
+            if (before && after) {
+                draft[after - 1].dependencies &= ~bitBefore;
+                draft[after - 1].stream_inputs &= ~bitBefore;
+            } else if (before) {
+                for (auto &entry : draft) {
+                    entry.dependencies &= ~bitBefore;
+                    entry.stream_inputs &= ~bitBefore;
+                }
+            } else {
+                draft[after - 1].dependencies = 0;
+                draft[after - 1].stream_inputs = 0;
+            }
             break;
         case CS_BATCH_DELETE:
             if (request || current || !before || after) return CS_INVALID_ARG;
             draft[before - 1] = {};
-            for (auto &entry : draft) entry.dependencies &= ~bitBefore;
+            for (auto &entry : draft) {
+                entry.dependencies &= ~bitBefore;
+                entry.stream_inputs &= ~bitBefore;
+            }
             break;
         case CS_BATCH_RECONFIG:
             if (current || !before || after) return CS_INVALID_ARG;
@@ -170,6 +194,8 @@ CS_STATUS csConfigureBatchEntry(CS_BATCH_HANDLE handle, CS_BATCH_CONFIG_TYPE act
             break;
         default: return CS_INVALID_OPTION;
         }
+        for (const auto &entry : draft)
+            if (entry.stream_inputs && entry.dependencies) return CS_INVALID_ARG;
         if (!acyclic(draft, batch->capacity)) return CS_INVALID_ARG;
         batch->entries = std::move(draft);
         if (action == CS_BATCH_ADD) *current = index + 1;

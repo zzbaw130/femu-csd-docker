@@ -336,7 +336,9 @@ struct execution {
     struct sorted_rows *pending_sort;
     struct sorted_rows *sort_sink; /* CU-local state; runs are owned by the query. */
     bool block_graph, block_chain, block_row_pending, block_done;
-    bool resident_dictionary;
+    bool resident_dictionary,stream_waves,stream_block;
+    bool stream_scanning,stream_filter_output,stream_filter_retry;
+    unsigned stream_bytes,stream_offset;
     bool block_sink_started, block_sink_done;
     unsigned block_write, block_input_node, block_native_deferred;
     int block_native_checked;
@@ -2165,6 +2167,18 @@ static int64_t scan_filter_chunk(struct execution *s,unsigned id)
     } else status=timed_call(s,pg_sina_filter_impl,&filter,QS_FILTER);
     return status;
 }
+/* Size a decode window from complete Heap pages and their line pointers. */
+static unsigned scan_vector_bytes(const unsigned char *input,unsigned remaining,unsigned capacity)
+{
+    unsigned bytes=0,rows=0;
+    while(bytes<remaining) {
+        uint16_t lower; memcpy(&lower,input+bytes+12,sizeof(lower));
+        unsigned items=lower>=24?(lower-24)/4:0;
+        if(bytes && rows+items>capacity) break;
+        bytes+=QS_PAGE; rows+=items;
+    }
+    return bytes;
+}
 static int64_t scan_chunk_next(struct execution *s,unsigned id)
 {
     const struct qp_node *n=&s->plan->nodes[id]; const struct qs_plan *p=&n->expr; struct operator_state *o=&s->nodes[id];
@@ -2216,20 +2230,19 @@ static int64_t scan_chunk_next(struct execution *s,unsigned id)
             o->scan_bytes=s->control->bytes;
             s->control->ready=s->control->bytes=0;
         }
+        if(s->stream_block && id==(unsigned)qp_probe_scan(s->plan,s->root)) {
+            s->scan_drained=true;
+            return QP_WAIT;
+        }
         if(o->scan_bytes) {
             /* Keep the I/O block and fill vectors with complete heap pages.
              * Line-pointer counts conservatively include unused entries;
              * one page always fits the minimum capacity (QS_PAGE/24). */
             if(chunk->capacity<QS_PAGE/24 || o->scan_input>=o->scan_bytes) return -1;
-            unsigned bytes=0,rows=0,remaining=o->scan_bytes-o->scan_input;
+            unsigned remaining=o->scan_bytes-o->scan_input;
             if(remaining%QS_PAGE) return -1;
             const unsigned char *input=s->arena+input_offset(s,n)+o->scan_input;
-            while(bytes<remaining) {
-                uint16_t lower; memcpy(&lower,input+bytes+12,sizeof(lower));
-                unsigned items=lower>=24?(lower-24)/4:0;
-                if(bytes && rows+items>chunk->capacity) break;
-                bytes+=QS_PAGE; rows+=items;
-            }
+            unsigned bytes=scan_vector_bytes(input,remaining,chunk->capacity);
             int64_t status=scan_decode(s,id,bytes,false); if(status) return status;
             status=scan_filter_chunk(s,id);
             if(status==-4) {
@@ -5548,11 +5561,11 @@ restart:
         bool hash_probe=producer->kind==QP_JOIN && producer->left==source && !s->nodes[root].external;
         bool index_probe=producer->kind==QP_INDEX_JOIN && producer->left==source && producer->right>=0 &&
             p->files[producer->right].count && p->indexes[producer->right].count &&
-            (s->resident_dictionary || block_numeric_output(&p->nodes[producer->right]));
+            (s->stream_waves || s->resident_dictionary || block_numeric_output(&p->nodes[producer->right]));
         if(s->block_graph && (hash_sink || group_sink || aggregate_sink || sort_sink || partition_sink) &&
            leaf->kind==QP_SCAN &&
            !leaf->ordered_index &&
-           (s->resident_dictionary || (block_numeric_output(leaf) && block_passes_text(producer) &&
+           (s->stream_waves || s->resident_dictionary || (block_numeric_output(leaf) && block_passes_text(producer) &&
             (!group_sink || block_group_supported(&p->nodes[group_sink-1])) &&
             (!aggregate_sink || block_group_supported(&p->nodes[aggregate_sink-1]))))) {
             bool direct=(hash_probe || index_probe) && !sort_sink && !partition_sink;
@@ -5562,11 +5575,17 @@ restart:
                     (direct && hash_probe?QP_GRAPH_BLOCK_PROBE:0) | (direct && index_probe?QP_GRAPH_BLOCK_INDEX:0) |
                     (chain?QP_GRAPH_BLOCK_CHAIN:0) | (sort_sink?QP_GRAPH_BLOCK_SORT:0) |
                     (partition_sink?QP_GRAPH_BLOCK_PARTITION:0);
+            if(s->stream_waves) {
+                if(block_flags && !chain && !sort_sink && !partition_sink)
+                    block_flags|=QP_GRAPH_BLOCK_STREAM;
+                else block_flags=0;
+            }
             for(unsigned w=0;w<p->workers;++w) {
                 struct execution *e=s->workers[w];
                 e->block_graph=block_flags!=0;
+                e->stream_block=(block_flags&QP_GRAPH_BLOCK_STREAM)!=0;
                 e->block_chain=chain;
-                if(!block_flags) continue;
+                if(!block_flags || e->stream_block) continue;
                 struct qs_chunk *chunk=(void *)(s->arena+vector_offset(e,&p->nodes[source]));
                 chunk->capacity=qp_scan_buffer_bytes(p,&p->nodes[source])/24;
             }
@@ -6121,6 +6140,7 @@ static int open_execution(struct femu_csd_args *a,struct qp_plan *plan,
         s->output_order=cs_work_calloc(context,(size_t)qp_result_capacity(output,plan->packed_result)*text_columns,sizeof(*s->output_order));
         if(!s->output_order) { cs_work_end(context); return -4; }
     }
+    s->stream_waves=((uint64_t)a->cparam1&QP_GRAPH_STREAM_EXEC)!=0;
     s->resident_dictionary=((uint64_t)a->cparam1&QP_GRAPH_RESIDENT_TEXT)!=0;
     s->paged=s->resident_dictionary?qs_dictionary_create_resident(context):qs_dictionary_create(context);
     if(s->paged) { s->text=qs_dictionary_text_create(s->paged); s->initial_access=qs_dictionary_access_create(s->paged); }
@@ -6653,6 +6673,132 @@ static int64_t block_chain_sink(struct execution *s,unsigned sink,struct qs_resu
     }
     return block_finish_input(s);
 }
+/* The LOAD region lives for the graph. The scan vector and probe projection
+ * are separate, reusable buffers. Filter lends the scan vector downstream
+ * and returns its inlet credit only after Probe or the sink has consumed it. */
+static int64_t stream_block_step(struct execution *s,unsigned scan,unsigned sink,
+    struct qs_result *out,enum qp_graph_block_step step)
+{
+    const struct qp_node *leaf=&s->plan->nodes[scan];
+    struct operator_state *o=&s->nodes[scan];
+    struct qs_chunk *chunk=(void *)(s->arena+vector_offset(s,leaf));
+    if(step==BLOCK_SCAN) {
+        if(!s->stream_scanning) {
+            uint64_t page=(uint64_t)s->args->cparam1>>QP_SCAN_PAGE_SHIFT;
+            if(page>UINT64_MAX/QS_PAGE || page*QS_PAGE>leaf->bytes) return -1;
+            uint64_t offset=page*QS_PAGE;
+            s->stream_bytes=leaf->bytes-offset<s->plan->scan_bytes?leaf->bytes-offset:s->plan->scan_bytes;
+            s->stream_offset=0;
+            s->stream_scanning=s->host_scan=true;
+            s->stream_filter_output=s->stream_filter_retry=s->scan_drained=false;
+            o->position=offset;
+            o->scan_bytes=o->scan_input=o->scan_raw_bytes=o->scan_position=0;
+            out->rows=out->begin=out->finished=out->str_bytes=0;
+            if(s->plan->nodes[s->root].kind==QP_JOIN) {
+                int ready=hash_probe_projection(s,s->root,0); if(ready) return ready;
+            }
+        }
+        if(s->stream_offset==s->stream_bytes) return csGraphStep(FEMU_GRAPH_STEP_DONE,0);
+        unsigned remaining=s->stream_bytes-s->stream_offset;
+        if(remaining%QS_PAGE || chunk->capacity<QS_PAGE/24) return -1;
+        o->scan_input=s->stream_offset;
+        const unsigned char *input=s->arena+input_offset(s,leaf)+o->scan_input;
+        unsigned bytes=scan_vector_bytes(input,remaining,chunk->capacity);
+        int64_t status=scan_decode(s,scan,bytes,false); if(status) return status;
+        s->stream_offset+=bytes; o->position+=bytes; o->scan_position=0;
+        return csGraphStep(FEMU_GRAPH_STEP_OUTPUT,0);
+    }
+    if(step==BLOCK_FILTER) {
+        if(s->stream_filter_output) {
+            s->stream_filter_output=false;
+            return csGraphStep(FEMU_GRAPH_STEP_CONSUMED,0);
+        }
+        if(s->args->graph_input==FEMU_GRAPH_INPUT_EOF) return csGraphStep(FEMU_GRAPH_STEP_DONE,0);
+        int64_t status=s->stream_filter_retry?-4:scan_filter_chunk(s,scan);
+        if(status==-4) {
+            if(!s->stream_filter_retry) {
+                cs_work_free(s->context,o->scan_filter); o->scan_filter=NULL;
+                s->stream_filter_retry=true;
+            }
+            status=scan_decode(s,scan,o->scan_raw_bytes,true);
+        }
+        if(status) return status;
+        s->stream_filter_retry=s->scan_drained=false;
+        if(!chunk->selected) return csGraphStep(FEMU_GRAPH_STEP_CONSUMED,0);
+        if(s->plan->nodes[s->root].kind==QP_INDEX_JOIN)
+            s->nodes[s->root].input_done=s->nodes[s->root].finished=0;
+        s->stream_filter_output=true;
+        return csGraphStep(FEMU_GRAPH_STEP_OUTPUT,0);
+    }
+    if(step==BLOCK_PROBE || step==BLOCK_INDEX) {
+        if(s->args->graph_input==FEMU_GRAPH_INPUT_EOF) return csGraphStep(FEMU_GRAPH_STEP_DONE,0);
+        int status=projection_init(s,sink,0); if(status) return status;
+        if(!s->nodes[sink].projection) return -4;
+        int64_t ready=projection_fill(s,sink,0);
+        if(ready==2) return csGraphStep(FEMU_GRAPH_STEP_OUTPUT,0);
+        if(ready==QP_WAIT && s->control->index_nreads && !s->control->ready) {
+            int64_t request=namespace_wait(s); return request?request:-1;
+        }
+        if((ready==QP_WAIT || !ready) && s->scan_drained)
+            return csGraphStep(FEMU_GRAPH_STEP_CONSUMED,0);
+        return ready==3 || !ready?-4:ready;
+    }
+    if(step!=BLOCK_GROUP && step!=BLOCK_HASH) return -1;
+    bool direct=s->root==scan;
+    if(s->args->graph_input!=FEMU_GRAPH_INPUT_EOF) {
+        struct projection_batch *b=s->nodes[sink].projection;
+        unsigned before=b?b->position:0;
+        uint64_t tick=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
+        uint64_t built=s->metrics.build_rows;
+        int64_t status;
+        if(direct) status=block_sink_scan(s,sink,out);
+        else {
+            if(!b) return -4;
+            do {
+                status=block_apply(s,sink,b,out);
+            } while(!status && b->position<b->count);
+        }
+        if(s->profiling) {
+            s->sink_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-tick;
+            s->sink_rows+=s->hash_sink?s->metrics.build_rows-built:!direct?b->position-before:0;
+        }
+        if(status) return status;
+        return csGraphStep(FEMU_GRAPH_STEP_CONSUMED,0);
+    }
+    if(o->position==leaf->bytes) {
+        struct operator_state *local=s->nodes[sink].group_local;
+        if(s->group_sink && local && local->group_radix) {
+            int64_t status=radix_flush(s,sink); if(status) return status;
+        }
+        out->finished=s->control->finished=1;
+    }
+    s->stream_scanning=false;
+    return csGraphStep(FEMU_GRAPH_STEP_DONE,QP_INPUT_DRAINED|(out->finished?QP_WORKER_FINISHED:0));
+}
+static int64_t stream_block_execute(struct execution *s,struct femu_csd_args *a,
+    unsigned scan,unsigned sink,struct qs_result *out,enum qp_graph_block_step step)
+{
+    int64_t status=0;
+    if(s->text_wait) {
+        status=qs_dictionary_text_resume(s->text,s->io,s->text_wait>QS_DICTIONARY_BUSY?csReentryValue(a):0);
+        s->text_wait=status;
+        if(!status) s->expression_wait=0;
+    }
+    if(!status) status=stream_block_step(s,scan,sink,out,step);
+    if(s->late_wait) status=s->late_wait;
+    if(s->text_wait) status=s->text_wait;
+    if(s->dictionary_wait) status=s->dictionary_wait;
+    wait_io(s,status);
+    if(s->text_wait==QS_DICTIONARY_BUSY || s->dictionary_wait==QS_DICTIONARY_BUSY)
+        return csGraphWait();
+    if(status>0 && !((uint64_t)status>>60)) status=-4;
+    if(status<0 && !s->control->error) {
+        s->control->error=status;
+        s->control->error_node=step<=BLOCK_FILTER?scan:sink;
+    }
+    return status;
+}
+
 static int64_t graph_block_execute(struct femu_csd_args *a,enum qp_graph_block_step step)
 {
     if(!a || a->numr!=5 || a->mr_len[0]<(long long)sizeof(struct qp_plan) || a->mr_len[4]<QS_SORT_IO_BYTES)
@@ -6674,6 +6820,25 @@ static int64_t graph_block_execute(struct femu_csd_args *a,enum qp_graph_block_s
     wait_resume(s);
     int64_t status=resume_page_io(s,a); if(status) return status;
     status=resume_spool(s,a); if(status) return status;
+    if(s->stream_block) {
+        uint64_t wall=s->profiling?now_ns(CLOCK_MONOTONIC):0;
+        uint64_t cpu=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
+        if(s->profiling) {
+            struct execution *owner=s->owner;
+            unsigned active=atomic_fetch_add(&owner->active_cus,1)+1,peak=atomic_load(&owner->peak_cus);
+            while(active>peak && !atomic_compare_exchange_weak(&owner->peak_cus,&peak,active)) { }
+        }
+        status=stream_block_execute(s,a,scan,sink,out,step);
+        if(s->profiling) {
+            struct qs_timing *timing=&s->profile.operators[QS_JOIN_PROBE];
+            ++timing->calls; timing->cpu_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-cpu;
+            timing->wall_ns+=now_ns(CLOCK_MONOTONIC)-wall;
+            atomic_fetch_sub(&s->owner->active_cus,1);
+        }
+        if(((uint64_t)status>>60)==FEMU_GRAPH_STEP_ACTION && (status&FEMU_GRAPH_STEP_DONE) &&
+           (step==BLOCK_GROUP || step==BLOCK_HASH)) plan_output_metrics(s,out,worker);
+        return status;
+    }
     if(s->text_wait) {
         status=qs_dictionary_text_resume(s->text,s->io,s->text_wait>QS_DICTIONARY_BUSY?csReentryValue(a):0);
         s->text_wait=status; if(status) return status==QS_DICTIONARY_BUSY?-4:status;
@@ -6796,24 +6961,31 @@ static int64_t graph_block_execute(struct femu_csd_args *a,enum qp_graph_block_s
     return QP_INPUT_DRAINED | (out->finished?QP_WORKER_FINISHED:0);
 }
 
+static int64_t graph_block_call(struct femu_csd_args *a,enum qp_graph_block_step step)
+{
+    qs_dictionary_graph_context(a);
+    int64_t status=graph_block_execute(a,step);
+    qs_dictionary_graph_context(NULL);
+    return status;
+}
 int64_t pg_sina_graph_block_scan(struct femu_csd_args *a)
-{ return graph_block_execute(a,BLOCK_SCAN); }
+{ return graph_block_call(a,BLOCK_SCAN); }
 int64_t pg_sina_graph_block_filter(struct femu_csd_args *a)
-{ return graph_block_execute(a,BLOCK_FILTER); }
+{ return graph_block_call(a,BLOCK_FILTER); }
 int64_t pg_sina_graph_block_probe(struct femu_csd_args *a)
-{ return graph_block_execute(a,BLOCK_PROBE); }
+{ return graph_block_call(a,BLOCK_PROBE); }
 int64_t pg_sina_graph_block_index(struct femu_csd_args *a)
-{ return graph_block_execute(a,BLOCK_INDEX); }
+{ return graph_block_call(a,BLOCK_INDEX); }
 int64_t pg_sina_graph_block_project(struct femu_csd_args *a)
-{ return graph_block_execute(a,BLOCK_PROJECT); }
+{ return graph_block_call(a,BLOCK_PROJECT); }
 int64_t pg_sina_graph_block_aggregate(struct femu_csd_args *a)
-{ return graph_block_execute(a,BLOCK_GROUP); }
+{ return graph_block_call(a,BLOCK_GROUP); }
 int64_t pg_sina_graph_block_hash_build(struct femu_csd_args *a)
-{ return graph_block_execute(a,BLOCK_HASH); }
+{ return graph_block_call(a,BLOCK_HASH); }
 int64_t pg_sina_graph_block_sort(struct femu_csd_args *a)
-{ return graph_block_execute(a,BLOCK_SORT); }
+{ return graph_block_call(a,BLOCK_SORT); }
 int64_t pg_sina_graph_block_partition(struct femu_csd_args *a)
-{ return graph_block_execute(a,BLOCK_PARTITION); }
+{ return graph_block_call(a,BLOCK_PARTITION); }
 
 enum pipeline_phase { PIPELINE_EXECUTE, PIPELINE_BUILD, PIPELINE_GROUP };
 static int64_t plan_execute(struct femu_csd_args *a,enum pipeline_phase phase)
@@ -6827,7 +6999,7 @@ static int64_t plan_execute(struct femu_csd_args *a,enum pipeline_phase phase)
        a->mr_len[2]<(long long)((worker+1)*sizeof(struct qs_result))) return -1;
     unsigned target=0;
     if(phase!=PIPELINE_EXECUTE) {
-        uint64_t id=((uint64_t)a->cparam1&~(QP_GRAPH_BLOCK_EXEC|QP_GRAPH_RESIDENT_TEXT))>>QP_GRAPH_PIPELINE_NODE_SHIFT;
+        uint64_t id=((uint64_t)a->cparam1&~(QP_GRAPH_BLOCK_EXEC|QP_GRAPH_RESIDENT_TEXT|QP_GRAPH_STREAM_EXEC))>>QP_GRAPH_PIPELINE_NODE_SHIFT;
         if(worker || plan->ninit || id>=plan->count || id>=QP_NODES) return -1;
         const struct qp_node *n=&plan->nodes[id];
         if(n->kind!=QP_AGGREGATE || !n->nkeys || n->left<0 ||
@@ -7195,13 +7367,21 @@ combined:
     return status==QP_WAIT?0:status>2?status:0;
 }
 
+static int64_t plan_call(struct femu_csd_args *a,enum pipeline_phase phase)
+{
+    qs_dictionary_graph_context(a);
+    int64_t status=plan_execute(a,phase);
+    qs_dictionary_graph_context(NULL);
+    return status;
+}
+
 int64_t pg_sina_plan(struct femu_csd_args *a)
-{ return plan_execute(a,PIPELINE_EXECUTE); }
+{ return plan_call(a,PIPELINE_EXECUTE); }
 
 /* Separate E9 phases share the same query context and worker algorithms. */
 int64_t pg_sina_graph_build_pipeline(struct femu_csd_args *a)
-{ return plan_execute(a,PIPELINE_BUILD); }
+{ return plan_call(a,PIPELINE_BUILD); }
 int64_t pg_sina_graph_group_pipeline(struct femu_csd_args *a)
-{ return plan_execute(a,PIPELINE_GROUP); }
+{ return plan_call(a,PIPELINE_GROUP); }
 int64_t pg_sina_graph_continue(struct femu_csd_args *a)
-{ return plan_execute(a,PIPELINE_EXECUTE); }
+{ return plan_call(a,PIPELINE_EXECUTE); }

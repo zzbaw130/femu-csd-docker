@@ -1,0 +1,3 @@
+query,mode,planning_ms,execution_ms,total_ms,executor_end_ms,result_check,graph_path,explicit_scan_blocks,assigned_scan_loads,host_submissions,callback_submissions,counted_submissions,afdm_bytes,workmem_peak_bytes,spill_read_bytes,spill_write_bytes,dictionary_entries,prefetch_reused_blocks,streaming_scan_blocks,device_csf_calls,dictionary_waits,dictionary_wait_task_ms,source_run
+Q4-1,snia-operator-graph,16.335,3316.623,3378.777,16.154,ok,all_assigned_loads_explicit,408,408,18,407,425,100429320,145467632,0,393216,5,0,408,54846,42,92.56,e9-vector-dictionary-wait
+Q12-1,snia-operator-graph,21.261,4730.665,4801.688,16.421,ok,all_assigned_loads_explicit,1758,1758,18,1757,1775,100953464,144385712,0,524288,7,0,1758,202315,88,50.497,e9-vector-dictionary-wait

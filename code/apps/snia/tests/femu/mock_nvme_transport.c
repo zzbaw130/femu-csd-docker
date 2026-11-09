@@ -221,7 +221,7 @@ static CS_STATUS mock_graph(struct cs_device *d,struct nvme_passthru_cmd64 *c)
                                 uint64_t offset=le64toh(r->offset),lba=le64toh(r->lba);
                                 if(target>=exec.cdw3) { status=CS_INVALID_ARG; break; }
                                 memcpy(&ids[k],(void *)(uintptr_t)(exec.addr+target*32+8),8);
-                                if(r->reserved || le32toh(r->nsid)!=(unsigned)d->nsid || !blocks ||
+                                if(r->pool_offset || le32toh(r->nsid)!=(unsigned)d->nsid || !blocks ||
                                     lba>sizeof(nvm)/512 || blocks>sizeof(nvm)/512-lba ||
                                     offset>sizes[ids[k]] || (uint64_t)blocks*512>sizes[ids[k]]-offset) status=CS_INVALID_LENGTH;
                             }

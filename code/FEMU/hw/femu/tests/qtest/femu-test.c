@@ -18193,7 +18193,9 @@ static char *femu_csd_slow_dir;
 static const char femu_csd_slow_src[] =
     "#include <time.h>\n"
     "struct args { int numr; void **a; long long *l; long long p1, p2;\n"
-    "              void *d; long long dl; } __attribute__((packed));\n"
+    "              void *d; long long dl; void *context;\n"
+    "              unsigned long (*event)(void *, unsigned long, int);\n"
+    "              unsigned streaming, input; } __attribute__((packed));\n"
     "long long run(struct args *a)\n"
     "{\n"
     "    struct timespec t = { a->p1 / 1000, (a->p1 % 1000) * 1000000L };\n"
@@ -18213,6 +18215,26 @@ static const char femu_csd_slow_src[] =
     " int n=__atomic_add_fetch(v,1,0), old=__atomic_load_n(v+1,0);\n"
     " while(n>old && !__atomic_compare_exchange_n(v+1,&old,n,1,0,0)) {}\n"
     " run(a); __atomic_add_fetch(v+2,1,0); __atomic_sub_fetch(v,1,0); return 7; }\n"
+    "long long graph_stream(struct args *a) {\n"
+    " unsigned *v=a->a[0]; const long long step=5ULL<<60;\n"
+    " if(a->p1==0) {\n"
+    "  if(v[0]!=v[1]) return -1;\n"
+    "  if(v[0]==3) return step|4; ++v[0]; return step|2; }\n"
+    " if(a->p1==1) {\n"
+    "  if(a->input==2) return v[1]==3?step|4:-2;\n"
+    "  if(a->input!=1 || v[0]!=v[1]+1) return -3;\n"
+    "  if(!__atomic_load_n(v+4,__ATOMIC_ACQUIRE)) {\n"
+    "   a->event(a->context,(unsigned long)(v+4),0);\n"
+    "   __atomic_store_n(v+3,1,__ATOMIC_RELEASE);\n"
+    "   if(!__atomic_load_n(v+4,__ATOMIC_ACQUIRE)) return 6ULL<<60; }\n"
+    "  ++v[1]; v[2]+=v[0]; return step|1; }\n"
+    " if(a->p1==2) {\n"
+    "  struct timespec delay={0,1000000};\n"
+    "  for(unsigned i=0;i<1000 && !__atomic_load_n(v+3,__ATOMIC_ACQUIRE);++i) nanosleep(&delay,0);\n"
+    "  if(!__atomic_load_n(v+3,__ATOMIC_ACQUIRE)) return -4;\n"
+    "  nanosleep(&delay,0); __atomic_store_n(v+4,1,__ATOMIC_RELEASE);\n"
+    "  a->event(a->context,(unsigned long)(v+4),1); return 0; }\n"
+    " if(v[1]!=3) return -5; v[5]=1; return 0; }\n"
     "long long graph_spill(struct args *a) {\n"
     " unsigned long long *v=a->a[0]; char *io=a->a[a->numr-1];\n"
     " if(!a->p1) { if(a->p2) { v[0]=a->p2; return a->p2; }\n"
@@ -18577,6 +18599,65 @@ static void femu_test_csd_graph_read_batch(void *obj,void *data,QGuestAllocator 
     }
     femu_graph_session_cmd(&c,FEMU_GRAPH_CLOSE,session,0);
     femu_queue_free(&c,&c.io); femu_disable(&c); femu_csd_remove_slow();
+}
+
+static void femu_test_csd_graph_stream(void *obj, void *data, QGuestAllocator *alloc)
+{
+    FemuCtrlState c = {0};
+    uint64_t buf;
+    uint32_t session = femu_graph_setup(&c, obj, alloc, &buf);
+    uint32_t id = femu_graph_alloc(&c, 4096);
+    g_assert_cmpint(femu_csd_load_at(&c, buf, 6, "slow.so", "graph_stream", false), ==, NVME_SUCCESS);
+    g_assert_cmpint(femu_csd_activate(&c, 6), ==, NVME_SUCCESS);
+    uint32_t control[1024] = {0};
+    femu_graph_afdm(&c, buf, id, control, true);
+    struct {
+        struct femu_graph_header h;
+        struct femu_graph_node n[3];
+        uint32_t mr[8];
+    } graph = {
+        .h = {.count = cpu_to_le32(3), .flags = cpu_to_le32(FEMU_CSD_GRAPH_STREAM | FEMU_CSD_GRAPH_SERIAL),
+              .session = cpu_to_le64(session), .cookie = cpu_to_le64(1), .bytes = cpu_to_le32(sizeof(graph))}
+    };
+    graph.mr[2] = cpu_to_le32(id);
+    for (unsigned i = 0; i < 3; ++i) {
+        graph.n[i] = (struct femu_graph_node) {
+            .operation = cpu_to_le32(FEMU_GRAPH_EXEC), .program = cpu_to_le32(6),
+            .payload = cpu_to_le32(offsetof(typeof(graph), mr)), .count = cpu_to_le32(1),
+        };
+    }
+    graph.n[1].afdm_offset = cpu_to_le64(1);
+    graph.n[1].cparam1 = cpu_to_le64(1);
+    graph.n[2].dependencies = cpu_to_le64(2);
+    graph.n[2].cparam1 = cpu_to_le64(3);
+    struct {
+        struct femu_graph_header h;
+        struct femu_graph_node n;
+        uint32_t mr[8];
+    } signal = {
+        .h = {.count = cpu_to_le32(1), .session = cpu_to_le64(session),
+              .cookie = cpu_to_le64(2), .bytes = cpu_to_le32(sizeof(signal))},
+        .n = {.operation = cpu_to_le32(FEMU_GRAPH_EXEC), .program = cpu_to_le32(6),
+              .payload = cpu_to_le32(offsetof(typeof(signal), mr)), .count = cpu_to_le32(1),
+              .cparam1 = cpu_to_le64(2)},
+    };
+    signal.mr[2] = cpu_to_le32(id);
+    femu_graph_submit(&c, buf, &graph, sizeof(graph));
+    femu_graph_submit(&c, buf + 4096, &signal, sizeof(signal));
+    for (unsigned i = 0; i < 2; ++i) {
+        g_assert_cmpint(FEMU_SC(femu_complete(&c, &c.io, NULL, NULL)), ==, NVME_SUCCESS);
+    }
+    femu_graph_afdm(&c, buf, id, control, false);
+    g_assert_cmpuint(control[0], ==, 3);
+    g_assert_cmpuint(control[1], ==, 3);
+    g_assert_cmpuint(control[2], ==, 6);
+    g_assert_cmpuint(control[3], ==, 1);
+    g_assert_cmpuint(control[4], ==, 1);
+    g_assert_cmpuint(control[5], ==, 1);
+    femu_graph_session_cmd(&c, FEMU_GRAPH_CLOSE, session, 0);
+    femu_queue_free(&c, &c.io);
+    femu_disable(&c);
+    femu_csd_remove_slow();
 }
 
 static void femu_test_csd_exec_graph(void *obj,void *data,QGuestAllocator *alloc)
@@ -37410,6 +37491,9 @@ static void femu_register_nodes(void)
         &(QOSGraphTestOptions){.edge.extra_device_opts=g_strdup_printf(
             "femu_mode=4,fdm_size=16,nr_cu=2,pg_rd_lat=20000000,pg_wr_lat=50000000,csd_program_dir=%s",
             femu_csd_slow_dir)});
+    qos_add_test("csd-exec-graph-stream", "femu", femu_test_csd_graph_stream,
+        &(QOSGraphTestOptions){.edge.extra_device_opts=g_strdup_printf(
+            "femu_mode=4,fdm_size=16,nr_cu=2,csd_program_dir=%s", femu_csd_slow_dir)});
     qos_add_test("csd-exec-graph-read-batch", "femu", femu_test_csd_graph_read_batch,
         &(QOSGraphTestOptions){.edge.extra_device_opts=g_strdup_printf(
             "femu_mode=4,fdm_size=16,nr_cu=2,pg_rd_lat=20000000,pg_wr_lat=1000,csd_program_dir=%s",

@@ -71,11 +71,13 @@ static CS_STATUS queue_graph(void *device,CS_BATCH_MODE mode,unsigned capacity,
 {
     struct cs_device *d=device;
     unsigned count=0,map[CS_MAX_BATCH]={0};
+    bool streaming=false;
     size_t bytes=sizeof(struct femu_graph_header);
     if(!capacity || capacity>CS_MAX_BATCH) return CS_INVALID_LENGTH;
     for(unsigned i=0;i<capacity;++i) if(entries[i].request) {
         const CsBatchRequest *r=entries[i].request;
         map[i]=count++;
+        streaming|=entries[i].stream_inputs!=0;
         if(r->ReqType==CS_QUEUE_COMPUTE) {
             for(int j=0;j<r->u.Compute.NumArgs;++j)
                 if(r->u.Compute.Args[j].Type==CS_AFDM_TYPE) bytes+=32;
@@ -95,7 +97,8 @@ static CS_STATUS queue_graph(void *device,CS_BATCH_MODE mode,unsigned capacity,
         (d->cache_external || (getenv("SNIA_FEMU_HPCP") && !strcmp(getenv("SNIA_FEMU_HPCP"),"1")));
     h->flags=htole32((mode==CS_BATCH_SERIAL?FEMU_CSD_GRAPH_SERIAL:0) |
         (d->profile?FEMU_CSD_GRAPH_PROFILE:0) | (cache_enabled?FEMU_CSD_GRAPH_CACHE:0) |
-        (d->cache_summary?FEMU_CSD_GRAPH_CACHE_SUMMARY:0));
+        (d->cache_summary?FEMU_CSD_GRAPH_CACHE_SUMMARY:0) |
+        (streaming?FEMU_CSD_GRAPH_STREAM:0));
     struct femu_graph_node *nodes=(void *)(h+1);
     size_t offset=sizeof(*h)+count*sizeof(*nodes);
     for(unsigned i=0;i<capacity;++i) if(entries[i].request) {
@@ -105,6 +108,10 @@ static CS_STATUS queue_graph(void *device,CS_BATCH_MODE mode,unsigned capacity,
         for(unsigned j=0;j<capacity;++j)
             if(entries[i].dependencies&(UINT64_C(1)<<j)) dependencies|=UINT64_C(1)<<map[j];
         n->dependencies=htole64(dependencies); n->payload=htole32(offset);
+        if(entries[i].stream_inputs) {
+            unsigned producer=__builtin_ctzll(entries[i].stream_inputs);
+            n->afdm_offset=htole64(UINT64_C(1)<<map[producer]);
+        }
         if(r->ReqType==CS_QUEUE_COMPUTE) {
             const CsComputeRequest *c=&r->u.Compute;
             unsigned nr=0,scalars=0; uint64_t params[2]={0};
@@ -190,6 +197,6 @@ CS_STATUS femu_executeBatchEntry(void *device,const CsBatchRequest *req,bool (*c
         struct cs_task task={.dev=device,.req=req};
         return cs_task_run(&task,value);
     }
-    struct cs_backend_batch_entry entry={req,0};
+    struct cs_backend_batch_entry entry={.request=req};
     return queue_graph(device,CS_BATCH_SERIAL,1,&entry,cancelled,context,value,scope);
 }

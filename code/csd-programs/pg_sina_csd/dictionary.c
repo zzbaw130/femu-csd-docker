@@ -33,7 +33,10 @@ struct qs_dictionary {
     struct file files[FILES];
     uint32_t capacity,count,body_page,body_used;
     uint64_t clock,retired;
-    unsigned io,resident_only;
+    unsigned io,resident_only,event_waiters;
+#ifdef QP_TEST_GRAPH_DICTIONARY_SPILL
+    unsigned test_spills;
+#endif
     struct page *pending;
     struct qs_dictionary_stats stats;
 };
@@ -211,13 +214,23 @@ static int64_t discard_file(struct qs_dictionary *d,unsigned file)
     }
     *f=(struct file){0}; return 0;
 }
+static _Thread_local const struct femu_csd_args *graph_context;
+
+void qs_dictionary_graph_context(const struct femu_csd_args *args)
+{ graph_context=args; }
+
 static int64_t begin(struct qs_dictionary *d,struct qs_dictionary_access *a,
                      unsigned operation,void *io,uint64_t completion)
 {
     uintptr_t owner=0;
     if(!atomic_compare_exchange_strong_explicit(&d->owner,&owner,(uintptr_t)a,
-        memory_order_acquire,memory_order_relaxed) && owner!=(uintptr_t)a)
+        memory_order_acquire,memory_order_relaxed) && owner!=(uintptr_t)a) {
+        if(graph_context && graph_context->graph_stream) {
+            csGraphArmEvent(graph_context,(uintptr_t)d);
+            d->event_waiters=1;
+        }
         return QS_DICTIONARY_BUSY;
+    }
     if(a->pinned) {
         atomic_store_explicit(&d->owner,0,memory_order_release);
         return QS_DICTIONARY_BUSY;
@@ -231,6 +244,10 @@ static void done(struct qs_dictionary *d,struct qs_dictionary_access *a)
 {
     a->operation=0; a->phase=0;
     atomic_store_explicit(&d->owner,0,memory_order_release);
+    if(d->event_waiters) {
+        d->event_waiters=0;
+        csGraphSignalEvent(graph_context,(uintptr_t)d);
+    }
 }
 
 static int64_t dictionary_insert(struct qs_dictionary *d,struct qs_dictionary_access *a,
@@ -239,6 +256,18 @@ static int64_t dictionary_insert(struct qs_dictionary *d,struct qs_dictionary_ac
     if(length>UINT16_MAX || (!key && length)) return -3;
     int64_t rc=begin(d,a,INSERT,io,completion);
     if(rc) return rc;
+#ifdef QP_TEST_GRAPH_DICTIONARY_SPILL
+    /* The SF8 categorical dictionaries fit in RAM. Exercise real flash
+     * reentry in the test build without lowering the query's workmem. */
+    if(!completion && graph_context && graph_context->graph_stream && d->test_spills<16) {
+        struct page *dirty=victim(d);
+        if(dirty && dirty->dirty) {
+            ++d->test_spills;
+            memcpy(io,dirty->data,PAGE); d->pending=dirty; d->io=STORE;
+            return csNeedStore(PAGE);
+        }
+    }
+#endif
     struct page *p=NULL;
     for(;;) switch(a->phase) {
     case 0:

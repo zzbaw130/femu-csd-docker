@@ -219,6 +219,7 @@ typedef struct FemuCsdSession {
     uint64_t cu_calls, cu_ns, cu_queue_ns, late_ns, dispatch_ns;
     FemuCacheProfile cache_profile;
     GHashTable *cancelled; /* cancellation racing graph acceptance */
+    uint64_t event_epoch;
 } FemuCsdSession;
 
 typedef struct FemuCsdSpill {
@@ -228,7 +229,7 @@ typedef struct FemuCsdSpill {
 } FemuCsdSpill;
 
 enum { GRAPH_READY, GRAPH_COMPUTING, GRAPH_COMPUTED, GRAPH_IO, GRAPH_CACHE_WAIT,
-       GRAPH_IO_DONE, GRAPH_DONE };
+       GRAPH_IO_DONE, GRAPH_EVENT_WAIT, GRAPH_DONE };
 typedef struct FemuCsdReadCompletion {
     FemuCsdAfdm *afdm;
     uint64_t lba, offset, bytes;
@@ -256,7 +257,9 @@ typedef struct FemuCsdGraphNode {
     bool serial_reads;
     uint16_t status;
     FemuCsdGraph *graph;
-    uint64_t dependents;
+    uint64_t dependents, stream_input, stream_outputs, stream_readers;
+    uintptr_t wait_key;
+    uint64_t wait_epoch;
     unsigned remaining;
     size_t pos;
 } FemuCsdGraphNode;
@@ -271,6 +274,7 @@ struct FemuCsdGraph {
     NvmeRequest *req;
     int poller;
     FemuCsdSession *session;
+    FemuCsdState *csd;
     uint8_t *data;
     uint32_t bytes, count, flags;
     uint64_t cookie, done, result, ready;
@@ -3596,6 +3600,58 @@ static void csd_graph_defer(FemuCtrl *n, NvmeRequest *req, int poller)
     qemu_mutex_unlock(&csd->lock);
 }
 
+/* One published vector may have multiple readers. A node retains its
+ * inlet until it explicitly returns that inlet's credit. */
+static void csd_stream_ready(FemuCsdGraph *g)
+{
+    if (!(g->flags & FEMU_CSD_GRAPH_STREAM)) { return; }
+    g->ready = 0;
+    for (unsigned i = 0; i < g->count; ++i) {
+        FemuCsdGraphNode *v = &g->nodes[i];
+        if (v->state != GRAPH_READY || v->remaining || v->stream_readers) { continue; }
+        if (v->stream_input) {
+            FemuCsdGraphNode *producer = &g->nodes[ctz64(v->stream_input)];
+            if (!(producer->stream_readers & (1ULL << i)) &&
+                producer->state != GRAPH_DONE) { continue; }
+        }
+        g->ready |= 1ULL << i;
+    }
+}
+
+/* The caller arms while it still protects the resource predicate. The
+ * session generation covers signals between arming and yielding the CU. */
+static uint64_t csd_graph_event(void *context, uintptr_t key, int signal)
+{
+    FemuCsdGraphNode *v = context;
+    FemuCsdGraph *g = v->graph;
+    FemuCsdState *csd = g->csd;
+    if (!key) { return 0; }
+    qemu_mutex_lock(&csd->lock);
+    uint64_t epoch = g->session->event_epoch;
+    if (signal) {
+        ++g->session->event_epoch;
+        FemuCsdGraph *other;
+        QTAILQ_FOREACH(other, &csd->graphs, entry) {
+            if (other->session != g->session || other->status ||
+                !(other->flags & FEMU_CSD_GRAPH_STREAM)) { continue; }
+            for (unsigned i = 0; i < other->count; ++i) {
+                FemuCsdGraphNode *waiter = &other->nodes[i];
+                if (waiter->state == GRAPH_EVENT_WAIT && waiter->wait_key == key) {
+                    waiter->state = GRAPH_READY;
+                    waiter->wait_key = 0;
+                    csd_stream_ready(other);
+                    csd_graph_ready_locked(csd, other);
+                }
+            }
+        }
+    } else {
+        v->wait_key = key;
+        v->wait_epoch = epoch;
+    }
+    qemu_mutex_unlock(&csd->lock);
+    return epoch;
+}
+
 static uint16_t csd_exec_graph(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
                                NvmeRequest *req)
 {
@@ -3608,7 +3664,7 @@ static uint16_t csd_exec_graph(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         return status;
     }
     g = g_new0(FemuCsdGraph, 1);
-    g->data = g_malloc(bytes); g->bytes = bytes;
+    g->data = g_malloc(bytes); g->bytes = bytes; g->csd = csd;
     status = dma_write_cmd(n, cmd, g->data, bytes);
     if (status) { g_free(g->data); g_free(g); return status; }
     struct femu_graph_header h;
@@ -3622,7 +3678,7 @@ static uint16_t csd_exec_graph(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         bytes < sizeof(h) + g->count * sizeof(struct femu_graph_node) ||
         le32_to_cpu(h.bytes) != bytes || h.reserved ||
         (g->flags & ~(FEMU_CSD_GRAPH_SERIAL | FEMU_CSD_GRAPH_PROFILE | FEMU_CSD_GRAPH_CACHE |
-                      FEMU_CSD_GRAPH_CACHE_SUMMARY)) || !g->cookie ||
+                      FEMU_CSD_GRAPH_CACHE_SUMMARY | FEMU_CSD_GRAPH_STREAM)) || !g->cookie ||
         le64_to_cpu(h.session) > UINT32_MAX || !g->session ||
         g->session->ns != ns || csd->graph_count >= 64) {
         goto fail;
@@ -3650,6 +3706,11 @@ static uint16_t csd_exec_graph(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         if (!v->remaining) { g->ready |= 1ULL << i; }
         if ((w->dependencies & ~all) || w->reserved) { goto fail; }
         if (w->operation == FEMU_GRAPH_EXEC) {
+            if (g->flags & FEMU_CSD_GRAPH_STREAM) {
+                v->stream_input = w->afdm_offset;
+                if ((v->stream_input & ~all) || ctpop64(v->stream_input) > 1 ||
+                    (v->stream_input && w->dependencies)) { goto fail; }
+            }
             FemuCsdProgram *p = csd_get_program_locked(csd, w->program);
             if (!p || !p->active || w->count > 64 ||
                 (w->count && !csd_graph_span(g, w->payload, (uint64_t)w->count * sizeof(NvmeCsdMemoryRange))) ||
@@ -3663,6 +3724,9 @@ static uint16_t csd_exec_graph(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
             job->args.cparam1 = le64_to_cpu(w->cparam1); job->args.cparam2 = le64_to_cpu(w->cparam2);
             job->args.data_buffer = w->data_bytes ? g->data + w->data_offset : NULL;
             job->args.buffer_len = w->data_bytes;
+            job->args.graph_context = v;
+            job->args.graph_event = csd_graph_event;
+            job->args.graph_stream = (g->flags & FEMU_CSD_GRAPH_STREAM) != 0;
         } else if (w->operation == FEMU_GRAPH_LOAD || w->operation == FEMU_GRAPH_STORE) {
             FemuCsdAfdm *m = csd_get_afdm_locked(csd, w->afdm);
             if (!m || !w->count || !csd_graph_span(g, w->payload,
@@ -3685,7 +3749,7 @@ static uint16_t csd_exec_graph(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     for (unsigned pass = 0; pass < g->count; pass++) {
         uint64_t before = done;
         for (unsigned i = 0; i < g->count; i++) {
-            if (!(g->nodes[i].wire.dependencies & ~done)) { done |= 1ULL << i; }
+            if (!((g->nodes[i].wire.dependencies | g->nodes[i].stream_input) & ~done)) { done |= 1ULL << i; }
         }
         if (done == all) { break; }
         if (done == before) { goto fail; }
@@ -3693,6 +3757,11 @@ static uint16_t csd_exec_graph(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     if (done != all) { goto fail; }
     for (unsigned i = 0; i < g->count; i++) {
         uint64_t deps = g->nodes[i].wire.dependencies;
+        if (g->nodes[i].stream_input) {
+            FemuCsdGraphNode *producer = &g->nodes[ctz64(g->nodes[i].stream_input)];
+            if (!producer->job) { goto fail; }
+            producer->stream_outputs |= 1ULL << i;
+        }
         while (deps) {
             unsigned j = ctz64(deps); deps &= deps - 1;
             g->nodes[j].dependents |= 1ULL << i;
@@ -3713,6 +3782,7 @@ static uint16_t csd_exec_graph(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         pthread_spin_unlock(&n->pcie_lock);
         qatomic_inc(&csd->cache_profile_sessions);
     }
+    csd_stream_ready(g);
     g->req = req; g->session->graphs++; qatomic_inc(&csd->graph_count);
     QTAILQ_INSERT_TAIL(&csd->graphs, g, entry);
     req->opaque = g; req->defer = csd_graph_defer;
@@ -4117,6 +4187,13 @@ complete:
 static void csd_graph_compute_ready(FemuCsdState *csd, FemuCsdGraphNode *v, uint64_t now)
 {
     FemuCsdJob *job = v->job;
+    if (v->stream_input) {
+        FemuCsdGraphNode *producer = &v->graph->nodes[ctz64(v->stream_input)];
+        uint64_t inlet = 1ULL << (v - v->graph->nodes);
+        job->args.graph_input = producer->stream_readers & inlet ?
+            FEMU_GRAPH_INPUT_BATCH : FEMU_GRAPH_INPUT_EOF;
+    }
+    v->wait_key = 0;
     job->arrival = now;
     job->reserved_end = job->runtime ? csd_hold_cu_locked(csd, now, job->runtime) : 0;
     v->state = GRAPH_COMPUTING;
@@ -4159,9 +4236,41 @@ static void csd_graph_node_done(FemuCsdState *csd, FemuCsdGraphNode *v)
             if (!--g->nodes[i].remaining) { g->ready |= 1ULL << i; }
         }
     }
+    csd_stream_ready(g);
     if (!g->active || (!g->status && !(g->flags & FEMU_CSD_GRAPH_SERIAL) && g->ready)) {
         csd_graph_ready_locked(csd, g);
     }
+}
+
+static void csd_stream_step(FemuCsdState *csd, FemuCsdGraphNode *v)
+{
+    FemuCsdGraph *g = v->graph;
+    unsigned i = v - g->nodes;
+    unsigned flags = v->result & 7;
+    FemuCsdGraphNode *producer = v->stream_input ? &g->nodes[ctz64(v->stream_input)] : NULL;
+    if (!flags || ((flags & FEMU_GRAPH_STEP_CONSUMED) &&
+                   (!producer || !(producer->stream_readers & (1ULL << i)))) ||
+        ((flags & FEMU_GRAPH_STEP_OUTPUT) && (!v->stream_outputs || v->stream_readers))) {
+        g->status = NVME_INVALID_FIELD | NVME_DNR;
+        g->result = i + 1;
+        csd_graph_node_done(csd, v);
+        return;
+    }
+    if (producer && (flags & (FEMU_GRAPH_STEP_CONSUMED | FEMU_GRAPH_STEP_DONE))) {
+        producer->stream_readers &= ~(1ULL << i);
+    }
+    if (flags & FEMU_GRAPH_STEP_OUTPUT) {
+        v->stream_readers = v->stream_outputs & ~g->done;
+    }
+    if (flags & FEMU_GRAPH_STEP_DONE) {
+        v->result = (v->result & GRAPH_IO_MASK) >> 3;
+        csd_graph_node_done(csd, v);
+        return;
+    }
+    v->job->args.cparam2 = 0;
+    v->state = GRAPH_READY; g->active--;
+    csd_stream_ready(g);
+    csd_graph_ready_locked(csd, g);
 }
 
 void femu_csd_graph_poll(FemuCtrl *n)
@@ -4203,11 +4312,22 @@ void femu_csd_graph_poll(FemuCtrl *n)
         if (begin) { g->session->events++; g->session->late_ns += now - v->deadline; }
         if (g->status) { csd_graph_node_done(csd, v); }
         else if (v->state == GRAPH_COMPUTED) {
-            csd_cache_consumed(csd,v,v->deadline);
+            if (!(g->flags & FEMU_CSD_GRAPH_STREAM)) { csd_cache_consumed(csd,v,v->deadline); }
             if (v->status || (int64_t)v->result < 0) {
                 g->status = v->status ? v->status : NVME_INTERNAL_DEV_ERROR;
                 g->result = v - g->nodes + 1;
                 csd_graph_node_done(csd, v);
+            } else if ((g->flags & FEMU_CSD_GRAPH_STREAM) &&
+                       (v->result >> 60) == FEMU_GRAPH_STEP_ACTION) {
+                csd_stream_step(csd, v);
+            } else if ((g->flags & FEMU_CSD_GRAPH_STREAM) && v->wait_key &&
+                       (v->result >> 60) == FEMU_GRAPH_WAIT_ACTION) {
+                v->job->args.cparam2 = 0;
+                v->state = v->wait_epoch == g->session->event_epoch ? GRAPH_EVENT_WAIT : GRAPH_READY;
+                if (v->state == GRAPH_READY) { v->wait_key = 0; }
+                g->active--;
+                csd_stream_ready(g);
+                csd_graph_ready_locked(csd, g);
             } else if ((v->result >> 60) >= 1 && (v->result >> 60) <= 4) {
                 g->status = (v->result >> 60) == 4 ? csd_graph_read_begin(g, v) :
                     csd_graph_spill_begin(csd, g, v);
@@ -4222,7 +4342,13 @@ void femu_csd_graph_poll(FemuCtrl *n)
                     g->result = v - g->nodes + 1;
                     csd_graph_node_done(csd, v);
                 }
-            } else { csd_graph_node_done(csd, v); }
+            } else {
+                if (v->stream_input || v->stream_outputs) {
+                    g->status = NVME_INVALID_FIELD | NVME_DNR;
+                    g->result = v - g->nodes + 1;
+                }
+                csd_graph_node_done(csd, v);
+            }
         } else {
             /* All ranges in this bounded window are complete. Keep every
              * LOAD's HPCP metadata; only then resume/continue the parent. */

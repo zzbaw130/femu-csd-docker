@@ -15,7 +15,7 @@ int64_t cs_test_nvm_read(struct femu_csd_args *a)
         case 3:r[1].lba=htole64(UINT64_MAX);break;
         case 4:r[1].blocks=0;break;
         case 5:r[1].nsid=htole32(2);break;
-        case 6:r[1].reserved=htole32(1);break;
+        case 6:r[1].pool_offset=htole32(1);break;
         }
         return csNeedNvmRead(2);
     }

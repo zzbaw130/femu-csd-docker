@@ -29,4 +29,17 @@ static inline int64_t csNeedFree(uint64_t id) { return id > CS_IO_VALUE_MASK ? -
  * cparam2. The CSF retains its own pending-operation state as for spill. */
 static inline int64_t csNeedNvmRead(unsigned count)
 { return !count || count>FEMU_CSD_GRAPH_MAX_NODES ? -1 : (int64_t)(CS_NEED_NVM_READ | count); }
+/* A step may consume the inlet, publish one batch, or finish. A producer
+ * retains its output until all consumers return their credits. */
+static inline int64_t csGraphStep(unsigned flags,uint64_t result)
+{
+    return result>(CS_IO_VALUE_MASK>>3)?-1:
+        (int64_t)(((uint64_t)FEMU_GRAPH_STEP_ACTION<<60)|(result<<3)|flags);
+}
+static inline int64_t csGraphWait(void)
+{ return (int64_t)((uint64_t)FEMU_GRAPH_WAIT_ACTION<<60); }
+static inline void csGraphArmEvent(const struct femu_csd_args *args,uintptr_t key)
+{ if(args && args->graph_stream && args->graph_event) args->graph_event(args->graph_context,key,0); }
+static inline void csGraphSignalEvent(const struct femu_csd_args *args,uintptr_t key)
+{ if(args && args->graph_event) args->graph_event(args->graph_context,key,1); }
 #endif

@@ -175,6 +175,9 @@ typedef struct FemuCsdArgs {
     long long cparam2;
     void *data_buffer;
     long long buffer_len;
+    void *graph_context;
+    uint64_t (*graph_event)(void *context, uintptr_t key, int signal);
+    unsigned graph_stream, graph_input;
 } QEMU_PACKED FemuCsdArgs;
 
 typedef struct QEMU_PACKED NvmeCsdReadAfdmCmd {
