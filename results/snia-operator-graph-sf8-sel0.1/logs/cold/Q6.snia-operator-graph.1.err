@@ -1,15 +1,15 @@
 TPCH_BEGIN 1
 psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/6.sql:13: NOTICE:  SQLerate cache resident shared_pct=0.000 file_pct=0.000 known_pct=100.000 generation=1
-psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/6.sql:13: NOTICE:  duration: 0.204 ms  plan:
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/6.sql:13: NOTICE:  duration: 0.190 ms  plan:
 Query Text: SELECT device FROM sina_csd.relations WHERE relid=$1 AND relfilenode=$2
 Index Scan using relations_pkey on relations  (cost=0.15..8.17 rows=1 width=32) (actual rows=1 loops=1)
   Index Cond: (relid = '16427'::oid)
   Filter: (relfilenode = '16427'::oid)
-psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/6.sql:13: NOTICE:  CSD planner total_ms=3.265
-psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/6.sql:13: NOTICE:  CSD planner total_ms=2.025
-psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/6.sql:13: NOTICE:  SQLerate scan callbacks continuations=1750 refill_ms=67.495
-psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/6.sql:13: NOTICE:  SQLerate query IO available=1 device_reads=7 device_read_bytes=65536 reclaim_scan_pages=0 reclaim_steal_pages=0 refault_file=0 free_before_bytes=16163463168 free_after_bytes=16162947072 file_before_bytes=234991616 file_after_bytes=235331584 shmem_before_bytes=69804032 shmem_after_bytes=69869568 active_file_before_bytes=123494400 active_file_after_bytes=123830272 inactive_file_before_bytes=32292864 inactive_file_after_bytes=32636928
-psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/6.sql:13: NOTICE:  duration: 2832.435 ms  plan:
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/6.sql:13: NOTICE:  CSD planner total_ms=5.941
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/6.sql:13: NOTICE:  CSD planner total_ms=1.816
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/6.sql:13: NOTICE:  SQLerate scan callbacks continuations=1750 refill_ms=67.384
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/6.sql:13: NOTICE:  SQLerate query IO available=1 device_reads=7 device_read_bytes=65536 reclaim_scan_pages=0 reclaim_steal_pages=0 refault_file=0 free_before_bytes=16029450240 free_after_bytes=16056287232 file_before_bytes=236777472 file_after_bytes=237064192 shmem_before_bytes=69804032 shmem_after_bytes=69869568 active_file_before_bytes=125448192 active_file_after_bytes=125501440 inactive_file_before_bytes=32473088 inactive_file_after_bytes=32669696
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/6.sql:13: NOTICE:  duration: 2817.781 ms  plan:
 Query Text: select
 	sum(l_extendedprice * l_discount) as revenue
 from
@@ -37,15 +37,15 @@ Custom Scan (SniaCsdAggregate)  (cost=0.00..0.00 rows=1 width=32) (actual rows=1
   CSD Columns: 4
   CSD Deferred Columns: 3
   CSD Profile (operator times summed across CUs):
-    Setup Wall: 22.862 ms
-    Pipeline 1 Wall: 2804.717 ms
-    Pipeline 2 Wall: 0.621 ms
-    Cleanup Wall: 0.961 ms
-    Total Wall: 2829.161 ms
-    Scan: calls=1758 wall_sum=9602.624 ms cpu_sum=5055.605 ms wall_max=15.348 ms
-    Filter: calls=1758 wall_sum=5230.394 ms cpu_sum=1923.029 ms wall_max=11.972 ms
-    Aggregate.sink: calls=1758 wall_sum=421.163 ms cpu_sum=125.862 ms wall_max=13.813 ms
-    Aggregate.source: calls=1 wall_sum=0.083 ms cpu_sum=0.081 ms wall_max=0.083 ms
+    Setup Wall: 23.227 ms
+    Pipeline 1 Wall: 2790.002 ms
+    Pipeline 2 Wall: 0.618 ms
+    Cleanup Wall: 0.994 ms
+    Total Wall: 2814.840 ms
+    Scan: calls=1758 wall_sum=9496.126 ms cpu_sum=5031.235 ms wall_max=15.599 ms
+    Filter: calls=1758 wall_sum=5195.562 ms cpu_sum=1919.345 ms wall_max=12.711 ms
+    Aggregate.sink: calls=1758 wall_sum=404.049 ms cpu_sum=127.410 ms wall_max=10.079 ms
+    Aggregate.source: calls=1 wall_sum=0.085 ms cpu_sum=0.082 ms wall_max=0.085 ms
   CSD AFDM: 64540672 bytes
   CSD Chunks: 1758
   CSD Workers: 8
@@ -53,7 +53,7 @@ Custom Scan (SniaCsdAggregate)  (cost=0.00..0.00 rows=1 width=32) (actual rows=1
   CSD Matched Rows: 1993668
   CSD Internal Read: 7369793536 bytes
   CSD Workmem Peak: 858601616 bytes
-psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/6.sql:13: NOTICE:  duration: 0.343 ms  plan:
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/6.sql:13: NOTICE:  duration: 0.307 ms  plan:
 Query Text: SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','i','m') AND c.relpersistence='p' AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' ORDER BY c.oid
 Sort  (cost=24.90..25.11 rows=84 width=4) (actual rows=24 loops=1)
   Sort Key: c.oid
@@ -92,5 +92,5 @@ psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/6.sql
 psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/6.sql:13: NOTICE:  SQLerate cache ledger relation generation=2 relid=24585 blocks=2 shared_pages=2 file_pages=0 file_total=4 file_known=1 file_generation=1 shared_delta_pages=2
 psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/6.sql:13: NOTICE:  SQLerate cache ledger relation generation=2 relid=16435 blocks=1 shared_pages=0 file_pages=0 file_total=2 file_known=1 file_generation=1 shared_delta_pages=0
 psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/6.sql:13: NOTICE:  SQLerate cache ledger relation generation=2 relid=16411 blocks=28666 shared_pages=0 file_pages=0 file_total=57332 file_known=1 file_generation=1 shared_delta_pages=0
-psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/6.sql:13: NOTICE:  SQLerate cache ledger refresh reason=executor_end generation=2 wall_ms=17.052 relations=24 dcp_updates=0 dcp_evictions=0 coalesced=0 returned_ns=214793576029471
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/6.sql:13: NOTICE:  SQLerate cache ledger refresh reason=executor_end generation=2 wall_ms=24.395 relations=24 dcp_updates=0 dcp_evictions=0 coalesced=0 returned_ns=215544537841690
 TPCH_END 1

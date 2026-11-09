@@ -1,3 +1,5 @@
 id,host_only_ms,original_csd_ms,snia_operator_graph_ms,host_only_executor_end_ms,original_csd_executor_end_ms,snia_operator_graph_executor_end_ms,checks,fdm_clean
-Q1-1,10919.389,3854.616,3885.612,25.608,17.075,24.711,"host-only=ok;original-csd=ok;snia-operator-graph=ok",yes
-Q6-1,9563.632,2773.946,2858.092,25.972,14.835,17.052,"host-only=ok;original-csd=ok;snia-operator-graph=ok",yes
+Q1-1,10536.220,3857.412,3883.518,45.119,25.108,16.824,"host-only=ok;original-csd=ok;snia-operator-graph=ok",yes
+Q6-1,9497.856,2769.258,2863.407,39.257,15.247,24.395,"host-only=ok;original-csd=ok;snia-operator-graph=ok",yes
+Q14-1,10037.141,2946.949,2820.633,22.627,15.332,15.740,"host-only=ok;original-csd=ok;snia-operator-graph=ok",yes
+Q19-1,10676.614,4650.514,6603.435,29.033,15.022,14.727,"host-only=ok;original-csd=ok;snia-operator-graph=ok",yes

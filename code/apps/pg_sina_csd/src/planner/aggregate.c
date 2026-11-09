@@ -582,26 +582,61 @@ static bool compile(PlannerInfo *root,List *relations,List *joins,List *quals,st
     }
     return limit_value(root->parse->limitCount,&p->limit) && limit_value(root->parse->limitOffset,&p->offset);
 }
-/* The single-table fused pipeline is still compiled from PG's chosen Plan.
- * It changes execution batching, not access paths or join order. */
+/* The batch pipeline is compiled from PG's chosen Plan. Binary inner hash
+ * joins preserve that plan's build/probe orientation and base restrictions. */
 static Plan *fast_plan(PlannerInfo *root,Plan *native,struct qs_plan **properties)
 {
     Query *q=root->parse;
+    unsigned relations_count=list_length(q->jointree->fromlist);
     if(!q->hasAggs || q->hasSubLinks || q->havingQual || q->cteList || q->windowClause ||
        q->groupingSets || q->distinctClause || q->hasRowSecurity || q->hasTargetSRFs ||
-       list_length(q->jointree->fromlist)!=1 || !IsA(linitial(q->jointree->fromlist),RangeTblRef)) return NULL;
-    Index rti=((RangeTblRef *)linitial(q->jointree->fromlist))->rtindex;
-    RangeTblEntry *rte=rt_fetch(rti,q->rtable);
-    if(rte->rtekind!=RTE_RELATION || rte->tablesample) return NULL;
+       (relations_count!=1 && (!pg_sina_operator_graph || relations_count!=2))) return NULL;
+    Bitmapset *relids=NULL;
+    ListCell *c;
+    foreach(c,q->jointree->fromlist) {
+        if(!IsA(lfirst(c),RangeTblRef)) return NULL;
+        Index rti=lfirst_node(RangeTblRef,c)->rtindex;
+        RangeTblEntry *rte=rt_fetch(rti,q->rtable);
+        if(rte->rtekind!=RTE_RELATION || rte->tablesample) return NULL;
+        relids=bms_add_member(relids,rti);
+    }
     Plan *leaf=native;
     while(leaf && (IsA(leaf,Agg) || IsA(leaf,Sort) || IsA(leaf,Limit) || IsA(leaf,Gather) || IsA(leaf,GatherMerge))) {
         if(leaf->qual || leaf->righttree || leaf->initPlan) return NULL;
         leaf=leaf->lefttree;
     }
-    if(!leaf || (!IsA(leaf,SeqScan) && !IsA(leaf,IndexScan) && !IsA(leaf,IndexOnlyScan)) ||
-       ((Scan *)leaf)->scanrelid!=rti) return NULL;
+    if(!leaf) return NULL;
+    List *relations=NIL,*keys=NIL,*quals=NIL;
+    if(relations_count==1) {
+        if((!IsA(leaf,SeqScan) && !IsA(leaf,IndexScan) && !IsA(leaf,IndexOnlyScan)) ||
+           !bms_is_member(((Scan *)leaf)->scanrelid,relids)) return NULL;
+        relations=list_make1_int(((Scan *)leaf)->scanrelid);
+    } else {
+        if(!IsA(leaf,HashJoin) || ((Join *)leaf)->jointype!=JOIN_INNER || leaf->initPlan) return NULL;
+        Plan *probe=leaf->lefttree,*build=leaf->righttree;
+        if(IsA(build,Hash)) build=build->lefttree;
+        if(!IsA(probe,SeqScan) || !IsA(build,SeqScan)) return NULL;
+        Index outer=((Scan *)probe)->scanrelid,inner=((Scan *)build)->scanrelid;
+        if(outer==inner || !bms_is_member(outer,relids) || !bms_is_member(inner,relids)) return NULL;
+        List *hash=((HashJoin *)leaf)->hashclauses;
+        if(!hash || !IsA(linitial(hash),OpExpr)) return NULL;
+        OpExpr *key=linitial_node(OpExpr,hash);
+        Oid op=OidIsValid(key->opfuncid)?key->opfuncid:get_opcode(key->opno);
+        if(list_length(key->args)!=2 || (!builtin(op,"int2eq") && !builtin(op,"int4eq") && !builtin(op,"int8eq")))
+            return NULL;
+        relations=list_make2_int(outer,inner);
+        keys=list_make1(key);
+        quals=list_concat(list_copy(hash),list_copy(((Join *)leaf)->joinqual));
+        quals=list_concat(quals,list_copy(leaf->qual));
+        foreach(c,quals) {
+            Bitmapset *used=pull_varnos(lfirst(c));
+            bool both=bms_equal(used,relids);
+            bms_free(used);
+            if(!both) return NULL;
+        }
+    }
     struct qs_plan plan={0};
-    if(!compile(root,list_make1_int(rti),NIL,NIL,&plan)) return NULL;
+    if(!compile(root,relations,keys,quals,&plan)) return NULL;
     /* Ungrouped states already combine per CU in the general fused pipeline.
      * Avoid three separately scheduled CSFs per input block for this shape. */
     if(!plan.nkeys && !pg_sina_operator_graph) return NULL;
@@ -610,6 +645,11 @@ static Plan *fast_plan(PlannerInfo *root,Plan *native,struct qs_plan **propertie
     if(!OidIsValid(ns) || !OidIsValid(get_relname_relid("relations",ns))) return NULL;
     char device[128]={0};
     if(!pg_sina_prepared_device(plan.relid,plan.relfilenode,device,sizeof(device))) return NULL;
+    if(plan.join.relid) {
+        char build_device[sizeof(device)]={0};
+        if(!pg_sina_prepared_device(plan.join.relid,plan.join.relfilenode,build_device,sizeof(build_device)) ||
+           strcmp(device,build_device)) return NULL;
+    }
     pg_sina_read_resources(device); plan.work_mem_bytes=pg_sina_query_memory();
     if(properties) {
         *properties=palloc(sizeof(plan)); **properties=plan;

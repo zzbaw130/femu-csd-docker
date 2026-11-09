@@ -57,7 +57,17 @@ ENTRY(pg_sina_sort_source,QS_SORT_SOURCE,1)
 #elif defined(PROFILE_JOIN)
 ENTRY(pg_sina_join_build,QS_JOIN_BUILD,1)
 ENTRY(pg_sina_join_load,QS_JOIN_LOAD,1)
-ENTRY(pg_sina_join_probe,QS_JOIN_PROBE,args && args->numr==7)
+extern int64_t pg_sina_join_probe_impl(struct femu_csd_args *);
+extern int64_t qs_join_probe_batch(struct femu_csd_args *);
+int64_t pg_sina_join_probe(struct femu_csd_args *args)
+{
+    if(args && (args->cparam1&QS_BATCH_HASH_PROBE)) {
+        struct femu_csd_args batch=*args;
+        batch.cparam1 &= ~((uint64_t)QS_BATCH_HASH_PROBE);
+        return measured(&batch,qs_join_probe_batch,QS_JOIN_PROBE,0);
+    }
+    return measured(args,pg_sina_join_probe_impl,QS_JOIN_PROBE,args && args->numr==7);
+}
 extern int64_t pg_sina_join_close_impl(struct femu_csd_args *);
 int64_t pg_sina_join_close(struct femu_csd_args *args) { return pg_sina_join_close_impl(args); }
 #elif defined(PROFILE_LIMIT)

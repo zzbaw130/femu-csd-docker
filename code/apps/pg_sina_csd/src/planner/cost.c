@@ -1569,7 +1569,11 @@ static void device_cost(struct placement *p,List **observations,struct qp_plan *
 {
     CustomScan *scan=(CustomScan *)p->device;
     bytea *bytes=NULL;
-    if(scan->methods==&pg_sina_scan_methods) {
+    /* Reuse the general tree estimate for the experimental join lowering.
+     * The single-table fast estimate accounts for only one relation. */
+    if(fast && fast->join.relid && !lowered)
+        pg_sina_describe_candidate(p->root,p->native,false,&lowered);
+    if(scan->methods==&pg_sina_scan_methods && !lowered) {
         if(fast) { fast_cost(p,fast,observations); return; }
         Const *constant=linitial_node(Const,scan->custom_private);
         bytes=DatumGetByteaP(constant->constvalue);

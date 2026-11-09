@@ -105,9 +105,12 @@ struct qs_task {
     uint32_t input_bytes, workers, slot; /* slot is a PG-assigned input index. */
     uint64_t scanned, matched, joined;
     uint64_t index_pages, index_tuples;
-    uint32_t index_pending, index_nreads;
+    union { uint32_t index_pending, probe_pending; };
+    uint32_t index_nreads;
     struct qs_index_read index_reads[QS_INDEX_READS];
 };
+/* cparam1 bit 0 remains the profiling bit. */
+#define QS_BATCH_HASH_PROBE 2U
 struct qs_join_control {
     uint64_t state, rows, spill_write_bytes, spill_read_bytes;
     uint32_t batches, current, indexed;

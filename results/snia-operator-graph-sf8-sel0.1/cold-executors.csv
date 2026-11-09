@@ -1,5 +1,9 @@
 id,mode,planning_ms,execution_ms,total_ms,executor_end_ms,executor,status
-Q1-1,original-csd,12.478,3821.260,3854.616,17.075,"SNIA fast path",ok
-Q1-1,snia-operator-graph,5.109,3851.794,3885.612,24.711,"SNIA operator graph",ok
-Q6-1,original-csd,5.467,2742.662,2773.946,14.835,"pg_sina_plan",ok
-Q6-1,snia-operator-graph,5.290,2832.435,2858.092,17.052,"SNIA operator graph",ok
+Q1-1,original-csd,8.417,3819.053,3857.412,25.108,"SNIA fast path",ok
+Q1-1,snia-operator-graph,5.442,3857.191,3883.518,16.824,"SNIA operator graph",ok
+Q6-1,original-csd,16.589,2717.260,2769.258,15.247,"pg_sina_plan",ok
+Q6-1,snia-operator-graph,7.757,2817.781,2863.407,24.395,"SNIA operator graph",ok
+Q14-1,original-csd,14.693,2908.189,2946.949,15.332,"pg_sina_plan",ok
+Q14-1,snia-operator-graph,10.383,2786.485,2820.633,15.740,"SNIA operator graph",ok
+Q19-1,original-csd,25.240,4598.757,4650.514,15.022,"pg_sina_plan",ok
+Q19-1,snia-operator-graph,25.484,6558.682,6603.435,14.727,"SNIA operator graph",ok
