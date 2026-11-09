@@ -6106,7 +6106,8 @@ static int64_t graph_emit(struct femu_csd_args *a,enum graph_emit_kind kind)
         if(probe && (n->kind!=QP_JOIN || !n->hash || o->hash_fallback==1 ||
            (!o->hash_phase && !o->finished && (!o->external || o->external->phase<2)))) return -1;
         if(!probe && n->kind!=QP_AGGREGATE && n->kind!=QP_PROJECT && n->kind!=QP_SORT &&
-           n->kind!=QP_LIMIT) return -1;
+           n->kind!=QP_LIMIT && n->kind!=QP_INDEX_JOIN) return -1;
+        if(n->kind==QP_INDEX_JOIN && (n->right<0 || (unsigned)n->right>=plan->count)) return -1;
         unsigned input_cols=plan->nodes[n->left].expr.nout;
         if(!input_cols || input_cols>QS_OUT || in->status || in->finished>1 ||
            (uint64_t)in->begin+in->rows>QS_RESULT_ROWS*QS_OUT/input_cols ||
@@ -6120,7 +6121,7 @@ static int64_t graph_emit(struct femu_csd_args *a,enum graph_emit_kind kind)
     s->raw_projection=0;
     if(!csIsReentry(a)) {
         control->drained=0;
-        if(!fed && ((uint64_t)a->cparam1&QP_GRAPH_SOURCE_PAGES)) control->ready=1;
+        if(parameter&QP_GRAPH_SOURCE_PAGES) control->ready=1;
     }
     wait_resume(s);
     unsigned capacity=typed?qp_host_capacity(output):QS_RESULT_ROWS*QS_OUT/cols;
@@ -6161,11 +6162,14 @@ static int64_t graph_emit(struct femu_csd_args *a,enum graph_emit_kind kind)
         s->expression_wait=0;
         status=csNeedLoad(s->pending_spool->pages[s->pending_block].token);
     }
+    if(status==QP_WAIT && !control->ready && (control->bytes || control->index_nreads)) {
+        status=namespace_wait(s);
+        /* Without a device file mapping PG supplies LOAD -> EXEC. Keep the
+         * active edge private until that page request has completed. */
+        if(!status) return QP_CONTROL_REQUIRED;
+    }
     bool drained=fed && (!status || (status==QP_WAIT && (!probe || !o->have_left) &&
         o->graph_input_position==in->rows));
-    if(status==QP_WAIT && !drained) {
-        int64_t request=namespace_wait(s); if(request) status=request;
-    }
     if(s->profiling && s->parallel_started)
         plan->pipelines[s->group_combine?s->group_combine-1:s->parallel_node].coordinator_ns+=
             now_ns(CLOCK_THREAD_CPUTIME_ID)-s->pipeline_tick;

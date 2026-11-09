@@ -3,8 +3,14 @@ Q1-1,original-csd,8.417,3819.053,3857.412,25.108,"SNIA fast path",ok
 Q1-1,snia-operator-graph,5.442,3857.191,3883.518,16.824,"SNIA operator graph",ok
 Q3-1,original-csd,27.188,4156.046,4232.138,16.555,"pg_sina_plan",ok
 Q3-1,snia-operator-graph,28.203,22017.284,22095.559,15.369,"SNIA operator graph",ok
+Q4-1,original-csd,17.002,3149.353,3212.978,16.014,"pg_sina_plan",ok
+Q4-1,snia-operator-graph,21.839,6394.073,6459.059,15.500,"SNIA operator graph",ok
 Q6-1,original-csd,16.589,2717.260,2769.258,15.247,"pg_sina_plan",ok
 Q6-1,snia-operator-graph,7.757,2817.781,2863.407,24.395,"SNIA operator graph",ok
+Q7-1,original-csd,44.674,4089.151,4184.715,14.968,"pg_sina_plan",ok
+Q7-1,snia-operator-graph,37.851,24596.418,24683.482,17.832,"SNIA operator graph",ok
+Q13-1,original-csd,20.409,5042.239,5105.956,13.090,"pg_sina_plan",ok
+Q13-1,snia-operator-graph,21.993,12201.143,12268.145,15.391,"SNIA operator graph",ok
 Q14-1,original-csd,14.693,2908.189,2946.949,15.332,"pg_sina_plan",ok
 Q14-1,snia-operator-graph,10.383,2786.485,2820.633,15.740,"SNIA operator graph",ok
 Q19-1,original-csd,25.240,4598.757,4650.514,15.022,"pg_sina_plan",ok

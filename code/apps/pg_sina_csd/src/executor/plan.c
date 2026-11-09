@@ -542,13 +542,19 @@ static bool graph_prepare(PlanStateCsd *s,int id)
         case QP_SCAN: phase=GRAPH_SOURCE; break;
         case QP_PROJECT: phase=n->left<0?GRAPH_SOURCE:GRAPH_FEED; break;
         case QP_AGGREGATE: case QP_SORT: case QP_LIMIT: phase=GRAPH_FEED; break;
+        case QP_INDEX_JOIN:
+            if(n->right<0 || (unsigned)n->right>=s->plan->count ||
+               s->plan->nodes[n->right].kind!=QP_SCAN) return false;
+            phase=GRAPH_FEED; break;
         case QP_JOIN: if(!n->hash) return false; phase=GRAPH_BUILD_RIGHT; break;
         default: return false;
     }
     s->graph[id].phase=phase; ++s->graph_nodes;
     if(phase==GRAPH_SOURCE) return n->left<0 && n->right<0;
     if(!graph_prepare(s,n->left)) return false;
-    if(phase!=GRAPH_BUILD_RIGHT) return n->right<0;
+    /* Index Join reads its right relation by address through its native
+     * lookup cursor. Only the left key stream has a packet edge. */
+    if(phase!=GRAPH_BUILD_RIGHT) return n->kind==QP_INDEX_JOIN || n->right<0;
     s->graph_partition=true;
     return graph_prepare(s,n->right);
 }
@@ -579,9 +585,9 @@ static void graph_request(PlanStateCsd *s,CsComputeRequest *compute,bool loaded)
     } else {
         parameter|=(uint64_t)id<<QP_GRAPH_SOURCE_NODE_SHIFT;
         if(root) parameter|=QP_GRAPH_HOST_OUTPUT;
+        if(loaded) parameter|=QP_GRAPH_SOURCE_PAGES;
         if(phase==GRAPH_SOURCE) {
             compute->CSFId=s->graph_source;
-            if(loaded) parameter|=QP_GRAPH_SOURCE_PAGES;
             if(!root) {
                 csHelperSetComputeArg(&compute->Args[4],CS_AFDM_TYPE,output,0UL);
                 csHelperSetComputeArg(&compute->Args[5],CS_AFDM_TYPE,s->memory[4],0UL);
@@ -995,7 +1001,7 @@ static CS_STATUS queue_pages(struct plan_slot *slot)
         status=csFreeBatchRequest(slot->resume); if(status!=CS_SUCCESS) return status;
         slot->resume=NULL;
     }
-    if((phase==GRAPH_NATIVE || phase==GRAPH_SOURCE) &&
+    if(!graph_building(phase) &&
        (slot->control.bytes || slot->control.index_nreads) && !slot->control.ready) {
         unsigned groups=1;
         for(unsigned j=1;j<slot->control.index_nreads;++j)
