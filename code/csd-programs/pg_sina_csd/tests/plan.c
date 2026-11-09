@@ -2382,10 +2382,34 @@ static void graph_load_page(struct qp_plan *plan,struct qp_control *control,
     memcpy(arena+n->input_offset,raw[id]+control->offset,control->bytes);
     control->ready=1;
 }
-static void graph_hash_build(function source,function build,bool spill_input)
+static void graph_hash_build(function source,function build,function probe,function feed,bool spill_input,bool grouped)
 {
     struct qp_plan *plan=calloc(1,sizeof(*plan)); assert(plan);
-    plan->count=5; plan->scan_bytes=QS_PAGE;
+    plan->count=8; plan->root=5; plan->scan_bytes=QS_PAGE;
+    struct qp_node *agg=&plan->nodes[5],*sort=&plan->nodes[6],*limit=&plan->nodes[7];
+    *agg=(struct qp_node){.kind=QP_AGGREGATE,.left=7,.right=-1,.hash=grouped,.nkeys=grouped};
+    agg->expr.predicate=-1;
+    agg->expr.nattrs=agg->expr.nout=2; agg->expr.nkeys=agg->expr.naggs=1;
+    agg->expr.nexprs=3;
+    agg->expr.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER,.column=0};
+    agg->expr.exprs[1]=(struct qs_expr){.op=Q_COLUMN,.type=Q_DECIMAL,.column=1,.scale=2,.dscale=2};
+    agg->expr.exprs[2]=(struct qs_expr){.op=Q_AGGREF,.type=Q_DECIMAL,.column=0,.scale=2,.dscale=2};
+    agg->expr.outputs[0]=(struct qs_output){.index=0,.type_oid=23};
+    agg->expr.outputs[1]=(struct qs_output){.index=2,.type_oid=1700};
+    agg->expr.aggs[0]=(struct qs_agg){.kind=Q_SUM,.expr=1};
+    *sort=(struct qp_node){.kind=QP_SORT,.left=0,.right=-1};
+    sort->expr.nattrs=sort->expr.nexprs=sort->expr.nout=2;
+    sort->expr.predicate=-1; sort->expr.limit=-1;
+    memcpy(sort->expr.exprs,agg->expr.exprs,2*sizeof(struct qs_expr));
+    sort->expr.outputs[0]=agg->expr.outputs[0];
+    sort->expr.outputs[1]=(struct qs_output){.index=1,.type_oid=1700};
+    if(!grouped) {
+        agg->expr.nkeys=0; agg->expr.nout=1;
+        agg->expr.outputs[0]=agg->expr.outputs[1];
+    }
+    *limit=(struct qp_node){.kind=QP_LIMIT,.left=6,.right=-1,.expr=sort->expr};
+    limit->expr.offset=100;
+    sort->expr.norder=1; sort->expr.order[0]=(struct qs_order){.output=1};
     struct qp_node *parent=&plan->nodes[0],*child=&plan->nodes[2];
     for(unsigned i=0;i<2;++i) {
         struct qp_node *join=i?child:parent;
@@ -2400,7 +2424,7 @@ static void graph_hash_build(function source,function build,bool spill_input)
     }
     parent->expr.work_mem_bytes=64U*1024*1024;
     unsigned char *raw[5]={0};
-    unsigned rows[5]={0,2,0,701,173};
+    unsigned rows[5]={0,2,0,1101,347};
     size_t bytes=4096;
     for(unsigned id=1;id<5;++id) if(rows[id]) {
         struct qp_node *n=&plan->nodes[id]; scan(n);
@@ -2474,23 +2498,84 @@ static void graph_hash_build(function source,function build,bool spill_input)
         expected=1; expected_sum=9*factor;
     }
 
-    unsigned got=0;
+    unsigned got=0, held=0, groups=0, sorted_rows=0, limited_rows=0;
+    __int128 aggregate_sum=0, skipped=0, last=0;
     __int128 sum=0;
-    a.cparam1=0;
-    for(unsigned call=0;;++call) {
-        assert(call<1000);
-        int64_t flags=graph_compute(source,&a,&spill);
-        for(unsigned i=0;i<packet->rows;++i) {
-            const struct qs_cell *v=qp_result_row(packet,i,2,1);
-            assert(!v[0].isnull && v[0].value==1 && !v[1].isnull && v[1].scale==2 && v[1].dscale==2);
-            ++got; sum+=v[1].value;
+    struct qs_result *output=calloc(1,sizeof(*output)); assert(output);
+    void *probe_mr[]={plan,&control,output,arena,io,packet};
+    long long probe_len[]={sizeof(*plan),sizeof(control),sizeof(*output),bytes,QS_SORT_IO_BYTES,sizeof(*packet)};
+    struct femu_csd_args probe_args={.numr=6,.mr_addr=probe_mr,.mr_len=probe_len};
+    struct qs_result *sorted=calloc(1,sizeof(*sorted)),*limited=calloc(1,sizeof(*limited));
+    struct qs_result *final=calloc(1,sizeof(*final)); assert(sorted && limited && final);
+    void *sort_mr[]={plan,&control,sorted,arena,io,output};
+    void *limit_mr[]={plan,&control,limited,arena,io,sorted};
+    void *agg_mr[]={plan,&control,final,arena,io,limited};
+    struct femu_csd_args sort_args=probe_args, limit_args=probe_args, agg_args=probe_args;
+    sort_args.mr_addr=sort_mr; sort_args.cparam1=UINT64_C(6)<<QP_GRAPH_SOURCE_NODE_SHIFT;
+    limit_args.mr_addr=limit_mr; limit_args.cparam1=UINT64_C(7)<<QP_GRAPH_SOURCE_NODE_SHIFT;
+    agg_args.mr_addr=agg_mr; agg_args.cparam1=(uint64_t)plan->root<<QP_GRAPH_SOURCE_NODE_SHIFT;
+    for(unsigned batch=0;batch<(spill_input?1U:2U);++batch) {
+        packet->begin=spill_input?0:1;
+        packet->rows=spill_input?0:2;
+        packet->finished=spill_input || batch==1;
+        if(!spill_input) {
+            struct qs_cell *v=qp_result_row(packet,packet->begin,2,1);
+            v[0]=(struct qs_cell){.isnull=1}; v[1]=(struct qs_cell){0};
+            v[2]=(struct qs_cell){.value=1}; v[3]=(struct qs_cell){.value=2};
         }
-        if(flags&QP_WORKER_FINISHED) break;
-        assert(flags&(QP_OUTPUT_READY|QP_CONTROL_REQUIRED));
-        if(flags&QP_CONTROL_REQUIRED) graph_load_page(plan,&control,arena,raw);
+        for(unsigned call=0;;++call) {
+            assert(call<1000);
+            int64_t flags=graph_compute(probe,&probe_args,&spill);
+            for(unsigned i=0;i<output->rows;++i) {
+                const struct qs_cell *v=qp_result_row(output,i,2,1);
+                assert(!v[0].isnull && v[0].value==1 && !v[1].isnull && v[1].scale==2 && v[1].dscale==2);
+                ++got; sum+=v[1].value;
+            }
+            if(output->rows || output->finished) for(unsigned sort_call=0;;++sort_call) {
+                assert(sort_call<1000);
+                int64_t sorted_flags=graph_compute(feed,&sort_args,&spill);
+                for(unsigned i=0;i<sorted->rows;++i) {
+                    const struct qs_cell *v=qp_result_row(sorted,i,2,1);
+                    assert(v[0].value==1 && (!sorted_rows || last<=v[1].value));
+                    if(sorted_rows++<100) skipped+=v[1].value;
+                    last=v[1].value;
+                }
+                if(sorted->rows || sorted->finished) for(unsigned limit_call=0;;++limit_call) {
+                    assert(limit_call<1000);
+                    int64_t limited_flags=graph_compute(feed,&limit_args,&spill);
+                    limited_rows+=limited->rows;
+                    if(limited->rows || limited->finished) {
+                        int64_t consumed=graph_compute(feed,&agg_args,&spill);
+                        assert(consumed&QP_INPUT_DRAINED);
+                        assert(!!(consumed&QP_WORKER_FINISHED)==!!limited->finished);
+                        if(final->rows) {
+                            assert(limited->finished && final->rows==1);
+                            const struct qs_cell *v=qp_result_row(final,0,2,1);
+                            if(grouped) { assert(!v[0].isnull && v[0].value==1); ++v; }
+                            assert(!v->isnull && v->scale==2);
+                            ++groups; aggregate_sum+=v->value;
+                        }
+                    }
+                    if(limited_flags&QP_INPUT_DRAINED) break;
+                    assert(limited_flags&QP_OUTPUT_READY);
+                }
+                if(sorted_flags&QP_INPUT_DRAINED) break;
+                assert(sorted_flags&QP_OUTPUT_READY);
+            }
+            if(flags&QP_INPUT_DRAINED) {
+                assert(!!(flags&QP_WORKER_FINISHED)==!!packet->finished);
+                break;
+            }
+            assert((flags&QP_OUTPUT_READY) && !(flags&(QP_CONTROL_REQUIRED|QP_WORKER_FINISHED)));
+            ++held;
+        }
     }
-    assert(got==expected && sum==expected_sum);
+    assert(got==expected*(spill_input?1U:2U) && sum==expected_sum*(spill_input?1:2));
     if(spill_input) assert(spill.reads);
+    else assert(held>=2);
+    assert(sorted_rows==got && limited_rows==(got>100?got-100:0));
+    assert(groups==(limited_rows?1U:0U) && aggregate_sum==sum-skipped);
+    free(final); free(limited); free(sorted); free(output);
     control.close=1; assert(!source(&a) && !control.state);
     struct cs_work_stats work; assert(!cs_work_get_stats(&work) && !work.used_bytes && !work.active_contexts);
     for(unsigned i=0;i<spill.count;++i) free(spill.tokens[i]);
@@ -2511,9 +2596,12 @@ int main(int argc,char **argv)
         assert(!cs_work_init(64U*1024*1024));
         function source=(function)dlsym(library,"pg_sina_graph_source"); assert(source);
         function build=(function)dlsym(library,"pg_sina_graph_hash_build"); assert(build);
-        graph_hash_build(source,build,false);
-        graph_hash_build(source,build,true);
-        puts("PASS graph HashBuild: nested producer packets, exact int128, partition spill and cleanup");
+        function probe=(function)dlsym(library,"pg_sina_graph_hash_probe"); assert(probe);
+        function feed=(function)dlsym(library,"pg_sina_graph_feed"); assert(feed);
+        graph_hash_build(source,build,probe,feed,false,true);
+        graph_hash_build(source,build,probe,feed,false,false);
+        graph_hash_build(source,build,probe,feed,true,true);
+        puts("PASS graph HashBuild/Probe/Sort/Offset/Aggregate: nested packets, duplicate fanout, exact int128 and partition spill");
         return 0;
     }
     if(argc==3 && !strcmp(argv[2],"--host-params-64m")) {
