@@ -1,0 +1,3 @@
+id,host_only_ms,pg_sina_plan_ms,snia_operator_graph_ms,host_only_executor_end_ms,pg_sina_plan_executor_end_ms,snia_operator_graph_executor_end_ms,checks,fdm_clean
+Q1-1,11312.921,27708.483,3879.036,24.626,15.116,25.873,"host-only=ok;pg-sina-plan=ok;snia-operator-graph=ok",yes
+Q6-1,9716.934,2773.759,2880.338,23.973,15.258,24.979,"host-only=ok;pg-sina-plan=ok;snia-operator-graph=ok",yes

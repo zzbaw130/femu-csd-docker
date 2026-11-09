@@ -43,7 +43,7 @@ extern double pg_sina_internal_mbps, pg_sina_pcie_mbps, pg_sina_cache_mbps;
 extern double pg_sina_internal_read_iops;
 extern double pg_sina_internal_write_mbps;
 extern double pg_sina_result_batch_ms, pg_sina_parallel_task_ms;
-extern bool pg_sina_profile, pg_sina_operator_graph;
+extern bool pg_sina_profile, pg_sina_operator_graph, pg_sina_plan_only;
 /* Existing profile switch also measures planner work; all fields are ms.
  * The pointer is query-local and restored for nested planner invocations. */
 struct pg_sina_planner_profile {

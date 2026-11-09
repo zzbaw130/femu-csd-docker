@@ -586,6 +586,7 @@ static bool compile(PlannerInfo *root,List *relations,List *joins,List *quals,st
  * It changes execution batching, not access paths or join order. */
 static Plan *fast_plan(PlannerInfo *root,Plan *native,struct qs_plan **properties)
 {
+    if(pg_sina_plan_only) return NULL;
     Query *q=root->parse;
     if(!q->hasAggs || q->hasSubLinks || q->havingQual || q->cteList || q->windowClause ||
        q->groupingSets || q->distinctClause || q->hasRowSecurity || q->hasTargetSRFs ||
@@ -604,7 +605,7 @@ static Plan *fast_plan(PlannerInfo *root,Plan *native,struct qs_plan **propertie
     if(!compile(root,list_make1_int(rti),NIL,NIL,&plan)) return NULL;
     /* Ungrouped states already combine per CU in the general fused pipeline.
      * Avoid three separately scheduled CSFs per input block for this shape. */
-    if(!plan.nkeys) return NULL;
+    if(!plan.nkeys && !pg_sina_operator_graph) return NULL;
     plan.external_aggregate=plan.nkeys!=0;
     Oid ns=get_namespace_oid("sina_csd",true);
     if(!OidIsValid(ns) || !OidIsValid(get_relname_relid("relations",ns))) return NULL;

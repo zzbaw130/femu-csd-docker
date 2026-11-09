@@ -5,6 +5,8 @@
 # -D PGDATA，-d 数据库，-o 输出目录（也可用 TPCH_RESULTS）。显式 PGDATA/PGDATABASE 优先于 SF。
 # 包装入口用 TPCH_CACHE_MODE 指定缓存模式，TPCH_RUNS 指定默认次数。
 # TPCH_MODES 可指定以空格分隔的执行模式；默认测试全部五种。
+# TPCH_MODES 可追加 pg-sina-plan 和 snia-operator-graph 进行执行器对照。
+# TPCH_PG_MODULE 可指定实验扩展的绝对路径，便于与 Guest 安装版本隔离。
 # TPCH_REFERENCE_LOGS 可指定同一批正式 SQL 的已有 HOST 日志，用于只测卸载模式时校验结果。
 # TPCH_DCP=off 关闭启用 HPCP 的模式中的 DCP，默认两层同时启用。
 # TPCH_COMPARE_PROFILE=1 为所有待测模式保留 EXPLAIN 和设备缓存汇总，串口输出每个样本的边界。
@@ -84,7 +86,7 @@ printf 'cache_mode_dcp=%s\n' "$cache_mode_dcp" >> "$logs/settings.txt"
 [ -z "$reference_logs" ] || printf 'reference_logs=%s\n' "$reference_logs" >> "$logs/settings.txt"
 [ "$compare_profile" != 1 ] || printf 'compare_profile=1\n' >> "$logs/settings.txt"
 [ -z "$warm_layer" ] || printf 'warm_layer=%s\n' "$warm_layer" >> "$logs/settings.txt"
-export PGOPTIONS="-c session_preload_libraries=pg_sina_csd,auto_explain"
+export PGOPTIONS="-c session_preload_libraries=${TPCH_PG_MODULE:-pg_sina_csd},auto_explain"
 [ "$compare_profile" != 1 ] || export SNIA_FEMU_PROFILE=${SNIA_FEMU_PROFILE:-cache}
 start_pg() {
     pg_ctl -D "$PGDATA" -l "$PGDATA/log" -w start -o "-c autovacuum=off -c shared_buffers=$buffers -c work_mem=$memory -c max_parallel_workers_per_gather=$workers -c max_parallel_workers=$processes -c max_worker_processes=$processes" > /dev/null
@@ -113,6 +115,12 @@ for q in $queries; do
             [ -z "$warm_layer" ] || last=$first
             reset_cache
             population=off; dcp=off; explain=-1
+            placement=$mode; executor=
+            case $mode in
+                pg-sina-plan) placement=csd-without-hpcp; executor=pg_sina_plan ;;
+                snia-operator-graph) placement=csd-without-hpcp; executor='SNIA operator graph' ;;
+            esac
+            [ -z "$executor" ] || explain=0
             prewarm=ok
             prefix=$logs/Q$q.$mode.$first
             case $mode in csd-with-hpcp|SQLerate) population=on; dcp=$cache_mode_dcp ;; esac
@@ -137,8 +145,15 @@ for q in $queries; do
                     printf "SET pg_sina_csd.exe_path='host-only'; SET pg_sina_csd.hpcp=off; SET pg_sina_csd.dcp=off;\n"
                     printf '\\o /dev/null\n\\i %s\n\\o\n\\timing off\n' "$query_sql"
                 fi
-                printf "SET pg_sina_csd.exe_path='%s'; SET pg_sina_csd.hpcp=%s; SET pg_sina_csd.dcp=%s; SET pg_sina_csd.profile=on;\n" "$mode" "$population" "$dcp"
+                printf "SET pg_sina_csd.exe_path='%s'; SET pg_sina_csd.hpcp=%s; SET pg_sina_csd.dcp=%s; SET pg_sina_csd.profile=on;\n" "$placement" "$population" "$dcp"
+                case $mode in
+                    pg-sina-plan) printf 'SET pg_sina_csd.experimental_plan_only=on;\n' ;;
+                    snia-operator-graph) printf 'SET pg_sina_csd.experimental_operator_graph=on;\n' ;;
+                esac
                 printf "SET auto_explain.log_min_duration=%s; SET auto_explain.log_level=notice; SET auto_explain.log_format=text; SET auto_explain.log_analyze=off; SET auto_explain.log_timing=off;\n" "$explain"
+                if [ -n "$executor" ]; then
+                    printf 'SET auto_explain.log_analyze=on;\n'
+                fi
                 if [ -n "$warm_layer" ]; then
                     printf 'SET auto_explain.log_min_duration=0; SET auto_explain.log_analyze=on; SET auto_explain.log_buffers=on;\n'
                 fi
@@ -165,7 +180,7 @@ for q in $queries; do
             fi
             [ -z "$warm_layer" ] || cat /sys/block/nvme0n1/stat > "$prefix.nvme-after"
             sudo cat /sys/kernel/debug/femu-cache/profile > "$prefix.cache-after"
-            awk -v q="$q" -v mode="$mode" -v first="$first" -v last="$last" -v dir="$tmp" -v prewarm="$prewarm" '
+            awk -v q="$q" -v mode="$mode" -v first="$first" -v last="$last" -v dir="$tmp" -v prewarm="$prewarm" -v executor="$executor" '
                 function value(key, s) { s=$0; sub(".*" key "=", "", s); sub(/[^0-9.].*/, "", s); return s+0 }
                 BEGIN { OFMT=CONVFMT="%.3f"; er=first-1; setup_error=prewarm!="ok" }
                 FILENAME==ARGV[1] {
@@ -181,7 +196,21 @@ for q in $queries; do
                     if(er>=first && er<=last) cache[er]=sprintf("shared=%.3f;file=%.3f;known=%.3f",value("shared_pct"),value("file_pct"),value("known_pct")); next
                 }
                 /SQLerate planner total_ms=/ { t=value("total_ms"); if(t>plan[er]) plan[er]=t }
-                /duration: .* ms  plan:/ { s=$0; sub(/^.*duration: /,"",s); duration=s+0 }
+                /CSD planner total_ms=/ { if(executor!="" && er>=first) plan[er]+=value("total_ms") }
+                /duration: .* ms  plan:/ {
+                    s=$0; sub(/^.*duration: /,"",s); duration=s+0; engine_seen=0
+                }
+                /CSD Executor:/ {
+                    if(executor!="" && er>=first && er<=last) {
+                        s=$0; sub(/^.*CSD Executor: /,"",s)
+                        if(s!=executor) wrong_engine[er]=1
+                        else {
+                            engine[er]=s
+                            if(!engine_seen++) execution[er]+=duration
+                        }
+                    }
+                }
+                /ERROR:.*experimental CSD operator graph/ { unsupported[er]=1 }
                 /Execution Mode: SQLerate/ { execution[er]=duration }
                 /Placement:/ { s=$0; sub(/^.*Placement: /,"",s); path[er]=s }
                 /cache ledger refresh reason=executor_end/ { ledger[er]+=value("wall_ms") }
@@ -189,6 +218,11 @@ for q in $queries; do
                 END {
                     for(r=first;r<=last;r++) {
                         status=done[r] && timed[r] && !error[r] && !setup_error?"ok":"error";
+                        if(executor!="") {
+                            path[r]=engine[r];
+                            if(unsupported[r]) status="unsupported_executor";
+                            else if(status=="ok" && (!engine[r] || wrong_engine[r])) status="unexpected_executor";
+                        }
                         if(mode=="SQLerate" && status=="ok" && (!plan[r] || !(r in execution) || !path[r])) status="missing_metrics";
                         printf "D\t%s\t%d\t%s\t%s\t%.3f\t%s\t%s\t%s\t%s\t%s\n",q,r,mode,timed[r]?sprintf("%.3f",total[r]):"",ledger[r],cache[r],plan[r],execution[r],path[r],status;
                     }
@@ -229,8 +263,15 @@ awk -F '\t' -v qs="$queries" -v modes="$modes" -v n="$n" -v kind="$kind" -v out=
     $1=="F" { clean[$2]=$3 }
     END {
         count=split(modes,m," ");
-        for(j=1;j<=count;j++) { name[j]=tolower(m[j]); gsub(/-/,"_",name[j]) }
+        for(j=1;j<=count;j++) {
+            name[j]=tolower(m[j]); gsub(/-/,"_",name[j])
+            if(m[j]=="pg-sina-plan" || m[j]=="snia-operator-graph") compare=1
+        }
         timing=out "/" kind ".csv"; detail=out "/" kind "-sqlerate.csv";
+        if(compare) {
+            executors=out "/" kind "-executors.csv";
+            print "id,mode,planning_ms,execution_ms,total_ms,executor_end_ms,executor,status" > executors;
+        }
         header="id";
         for(j=1;j<=count;j++) header=header "," name[j] "_ms";
         for(j=1;j<=count;j++) header=header "," name[j] "_executor_end_ms";
@@ -248,6 +289,8 @@ awk -F '\t' -v qs="$queries" -v modes="$modes" -v n="$n" -v kind="$kind" -v out=
                 if(s=="ok" && check[k]!="match") s="mismatch";
                 if(s!="ok") bad=1;
                 checks=checks (j>1?";":"") m[j] "=" s;
+                if(m[j]=="pg-sina-plan" || m[j]=="snia-operator-graph")
+                    print id "," m[j] "," plan[k] "," exec[k] "," ms[k] "," ledger[k] "," csv(path[k]) "," s > executors;
             }
             if(clean[q[i]]!="yes") bad=1;
             print row "," csv(checks) "," clean[q[i]] > timing;

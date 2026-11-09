@@ -16,6 +16,7 @@ bool pg_sina_profile = false;
 bool pg_sina_dcp = false;
 static bool hpcp = true;
 bool pg_sina_operator_graph = false;
+bool pg_sina_plan_only = false;
 int pg_sina_max_memory = 0; /* KiB; 0 uses the device workmem capacity. */
 bool pg_sina_compiling_plan = false;
 struct pg_sina_planner_profile *pg_sina_planning;
@@ -252,6 +253,9 @@ void _PG_init(void)
     DefineCustomBoolVariable("pg_sina_csd.experimental_operator_graph",
         "Execute the supported sorted scalar SUM using separate CSD functions", NULL,
         &pg_sina_operator_graph,false,PGC_USERSET,0,NULL,NULL,NULL);
+    DefineCustomBoolVariable("pg_sina_csd.experimental_plan_only",
+        "Use the general device executor instead of the single-table batch path", NULL,
+        &pg_sina_plan_only,false,PGC_USERSET,0,NULL,NULL,NULL);
     DefineCustomIntVariable("pg_sina_csd.max_memory", "Maximum device work memory per query", NULL,
         &pg_sina_max_memory, 0, 0, MAX_KILOBYTES, PGC_USERSET, GUC_UNIT_KB, check_memory, assign_memory, NULL);
     DefineCustomIntVariable("pg_sina_csd.index_cache_mib", "Maximum clean Index Join page cache in device workmem, in MiB", NULL,

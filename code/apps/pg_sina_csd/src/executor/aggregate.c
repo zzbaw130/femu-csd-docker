@@ -152,6 +152,7 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     ExplainPropertyInteger("CSD Device Workmem","bytes",pg_sina_resources.workmem_bytes,es);
     ExplainPropertyInteger("CSD Query Memory Limit","bytes",pg_sina_query_memory(),es);
     ExplainPropertyText("CSD Scan Relation",get_rel_name(p->relid),es);
+    ExplainPropertyText("CSD Executor","SNIA operator graph",es);
     ExplainPropertyText("CSD Scheduling","independent serial batches",es);
     if(p->external_aggregate) ExplainPropertyText("CSD Aggregation","adaptive partial-state merge",es);
     StringInfoData graph; initStringInfo(&graph);
