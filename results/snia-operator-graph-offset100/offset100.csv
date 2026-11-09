@@ -1,0 +1,4 @@
+mode,status,sum,planning_ms,execution_ms,client_ms,workers,scan_wall_ms,merge_wall_ms,spill_read_bytes,spill_write_bytes
+pg-sina-plan,ok,232282862103.80,3.951,21472.530,21501.536,16,,,77594624,77594624
+snia-operator-graph,ok,232282862103.80,4.038,15094.248,15131.100,16,3103.1,11947.2,99614720,99614720
+host-reference,ok,232282862103.80,,17007.416,17052.862,,,,,

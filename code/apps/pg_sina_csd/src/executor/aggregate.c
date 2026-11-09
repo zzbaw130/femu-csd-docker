@@ -50,7 +50,7 @@ static TupleTableSlot *execute(CustomScanState *node)
     if(!s->executed) {
         struct qs_extent *extents=pg_sina_mapping(&s->request);
         s->profiling=pg_sina_profile;
-        pg_sina_execute(&s->request,extents,s->result,s->profiling,&s->stream); s->executed=true;
+        pg_sina_execute(&s->request,extents,s->result,s->profiling,&s->stream,NULL); s->executed=true;
         if(s->result->begin+s->result->rows>QS_RESULT_ROWS) elog(ERROR,"invalid CSD result range");
     }
     while(s->index==s->result->rows && !s->result->finished && s->stream) {

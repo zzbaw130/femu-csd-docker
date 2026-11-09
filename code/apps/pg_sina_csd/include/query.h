@@ -289,6 +289,11 @@ static inline int qs_dict_get(const struct qs_dict *dict,unsigned id,const char 
         (size_t)d->capacity*sizeof(uint32_t);
     *bytes=base+e->offset; *length=e->length; return 0;
 }
+/* State shared by the experimental streaming Offset and Sum CSFs. */
+struct qs_graph_tail {
+    uint64_t remaining;
+    struct qs_cell sum;
+};
 struct qs_row { struct qs_cell cells[QS_OUT]; };
 struct qs_metrics {
     uint64_t scanned, matched, input_bytes, chunks, work_peak, fdm_bytes;

@@ -143,7 +143,9 @@ static struct program connection_programs[]={
     {.file="pg-sina-join.so",.symbol="pg_sina_join_probe",.index=510},
     {.file="pg-sina-sort.so",.symbol="pg_sina_sort_sink",.index=511},
     {.file="pg-sina-sort.so",.symbol="pg_sina_sort_source",.index=512},
-    {.file="pg-sina-plan.so",.symbol="pg_sina_workmem_capacity",.index=513}
+    {.file="pg-sina-plan.so",.symbol="pg_sina_workmem_capacity",.index=513},
+    {.file="pg-sina-graph-tail.so",.symbol="pg_sina_graph_offset",.index=514},
+    {.file="pg-sina-graph-tail.so",.symbol="pg_sina_graph_sum",.index=515}
 };
 struct pg_sina_resources pg_sina_resources;
 static void close_connection(int code,Datum arg)
@@ -177,7 +179,7 @@ void pg_sina_init_device(void)
         status=load_program(connection_device,&connection_programs[i]);
     }
     if(status==CS_SUCCESS) {
-        CsComputeRequest request={.CSFId=connection_programs[lengthof(connection_programs)-1].function,.NumArgs=0};
+        CsComputeRequest request={.CSFId=pg_sina_function("pg_sina_workmem_capacity"),.NumArgs=0};
         status=csQueueComputeRequest(&request,NULL,NULL,NULL,NULL,&bytes);
         if(status==CS_SUCCESS) {
             u64 cpu=0;
@@ -398,7 +400,7 @@ static void join_metrics(struct qs_metrics *out,const struct qs_metrics *join)
 }
 #define TRY(call) do { CS_STATUS status=(call); if(status!=CS_SUCCESS) { \
     result->status=status; snprintf(result->error,sizeof(result->error),"%s: status=%d",#call,status); goto cleanup; } } while(0)
-void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct qs_result *result,bool profiling,struct pg_sina_stream **stream)
+void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct qs_result *result,bool profiling,struct pg_sina_stream **stream,const struct qs_graph_tail *tail)
 {
     pg_sina_read_resources(request->device);
     uint64_t start=profiling?clock_ns():0,phase=start,cleanup_start=0;
@@ -427,8 +429,8 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
         if(strcmp(index_request.device,request->device) || index_request.nsid!=request->nsid || index_request.lba_bytes!=request->lba_bytes) elog(ERROR,"CSD index and heap must share a namespace");
     }
     bool streaming=request->plan.ordered_rows || request->plan.external_aggregate;
-    struct pg_sina_stream *saved=streaming?calloc(1,sizeof(*saved)):NULL;
-    if(streaming && !saved) elog(ERROR,"cannot allocate CSD result stream");
+    struct pg_sina_stream *saved=streaming && !tail?calloc(1,sizeof(*saved)):NULL;
+    if(streaming && !tail && !saved) elog(ERROR,"cannot allocate CSD result stream");
     *stream=NULL;
     /* Do not longjmp through SNIA C++ frames or its batch threads. Poll PG's
      * pending cancel between event polls, then release resources before PG
@@ -442,6 +444,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     bool callback_scan=false;
     ErrorData *cache_error=NULL;
     CS_MEM_HANDLE plan_mem=NULL,out_mem=NULL,group_mem=NULL,scan_mem=NULL,join_mem=NULL,build_mem=NULL,dict_mem=NULL;
+    CS_MEM_HANDLE tail_mem=NULL;
     CS_MEM_HANDLE joined[QS_WORKERS]={0},controls_mem[QS_JOINS]={0};
     struct qs_join_control join_control[QS_JOINS]={{0}};
     struct qs_metrics join_totals={0};
@@ -479,7 +482,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     /* A fused aggregate keeps independent partial states. A second slot
      * per CU can LOAD while another slot computes; the FDM fit below still
      * bounds all inputs, vectors and states. */
-    if(!joining && request->plan.external_aggregate && workers<QS_WORKERS)
+    if(!joining && (request->plan.external_aggregate || tail) && workers<QS_WORKERS)
         workers=Min(2*workers,QS_WORKERS);
     if(workers>QS_WORKERS) workers=QS_WORKERS;
     if(!workers) goto cleanup;
@@ -525,7 +528,7 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
     bool has_filter=request->plan.predicate>=0;
     /* Grouped aggregate sinks keep one state per slot. The next batch can
      * start on completion, just as for a scalar aggregate. */
-    callback_scan=!joining && !request->plan.ordered_rows && request->bytes;
+    callback_scan=!joining && (!request->plan.ordered_rows || tail) && request->bytes;
     if(callback_scan) {
         chain.request=request; chain.extents=extents; chain.device=device;
         chain.chunk=chunk; chain.profiling=profiling;
@@ -891,8 +894,23 @@ void pg_sina_execute(struct qs_request *request,struct qs_extent *extents,struct
         CS_MEM_HANDLE limit[]={out_mem,plan_mem}; compute_request(compute,programs[LIMIT].function,limit,2,counters[0]);
         TRY(csConfigureBatchEntry(batch,CS_BATCH_ADD,compute,0,previous,&current));
     }
-    TRY(csQueueBatchRequest(batch,NULL,NULL,NULL,NULL,NULL));
+    if(tail) {
+        CS_MEM_HANDLE memories[]={out_mem,NULL};
+        TRY(csAllocMem(device,sizeof(*tail),&flags,&tail_mem,NULL));
+        TRY(copy(tail_mem,0,(void *)tail,sizeof(*tail),1));
+        memories[1]=tail_mem;
+        compute_request(compute,pg_sina_function("pg_sina_graph_offset"),memories,2,NULL);
+        TRY(csConfigureBatchEntry(batch,CS_BATCH_ADD,compute,0,previous,&current)); previous=current;
+        compute_request(compute,pg_sina_function("pg_sina_graph_sum"),memories,2,NULL);
+        TRY(csConfigureBatchEntry(batch,CS_BATCH_ADD,compute,0,previous,&current));
+        u64 finished=0;
+        do {
+            if(QueryCancelPending || ProcDiePending) goto cleanup;
+            TRY(csQueueBatchRequest(batch,NULL,NULL,NULL,NULL,&finished));
+        } while(!finished);
+    } else TRY(csQueueBatchRequest(batch,NULL,NULL,NULL,NULL,NULL));
     TRY(copy(out_mem,0,result,sizeof(*result),0));
+    if(tail) result->metrics.workers=workers;
     result->metrics.fdm_bytes=((sizeof(request->plan)+4095)&~(size_t)4095)+
         ((sizeof(*result)+4095)&~(size_t)4095)+4096+
         workers*(chunk+((qs_chunk_bytes(vector_rows,scan_cols)+4095)&~(size_t)4095)+4096+(profiling?4096:0)+((joined_bytes+4095)&~(size_t)4095))+
@@ -994,6 +1012,7 @@ cleanup:
     if(join_mem)csFreeMem(join_mem,&release);
     for(unsigned i=0;i<njoins;++i) if(controls_mem[i]) csFreeMem(controls_mem[i],&release);
     if(plan_mem)csFreeMem(plan_mem,&release);
+    if(tail_mem)csFreeMem(tail_mem,&release);
     if(out_mem)csFreeMem(out_mem,&release);
     if(group_mem)csFreeMem(group_mem,&release);
     if(dict_mem)csFreeMem(dict_mem,&release);

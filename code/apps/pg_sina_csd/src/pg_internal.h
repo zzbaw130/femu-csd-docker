@@ -43,7 +43,7 @@ extern double pg_sina_internal_mbps, pg_sina_pcie_mbps, pg_sina_cache_mbps;
 extern double pg_sina_internal_read_iops;
 extern double pg_sina_internal_write_mbps;
 extern double pg_sina_result_batch_ms, pg_sina_parallel_task_ms;
-extern bool pg_sina_profile;
+extern bool pg_sina_profile, pg_sina_operator_graph;
 /* Existing profile switch also measures planner work; all fields are ms.
  * The pointer is query-local and restored for nested planner invocations. */
 struct pg_sina_planner_profile {
@@ -174,7 +174,8 @@ Plan *pg_sina_native_plan(Plan *);
 Plan *pg_sina_native_wrapper(Plan *);
 extern const CustomScanMethods pg_sina_plan_methods;
 struct qs_extent *pg_sina_mapping(struct qs_request *request);
-void pg_sina_execute(struct qs_request *,struct qs_extent *,struct qs_result *,bool,struct pg_sina_stream **);
+Datum pg_sina_decimal(struct qs_cell);
+void pg_sina_execute(struct qs_request *,struct qs_extent *,struct qs_result *,bool,struct pg_sina_stream **,const struct qs_graph_tail *);
 void pg_sina_fetch(struct pg_sina_stream **,struct qs_result *);
 void pg_sina_close(struct pg_sina_stream *);
 Plan *pg_sina_project_scan(Plan *scope,Plan *scan);

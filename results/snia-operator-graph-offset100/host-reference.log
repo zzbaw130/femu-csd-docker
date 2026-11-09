@@ -1,0 +1,67 @@
+NOTICE:  SQLerate cache resident shared_pct=0.000 file_pct=0.000 known_pct=100.000 generation=1
+NOTICE:  SQLerate query IO available=1 device_reads=421655 device_read_bytes=7370932224 reclaim_scan_pages=0 reclaim_steal_pages=0 refault_file=0 free_before_bytes=16200560640 free_after_bytes=8622469120 file_before_bytes=232218624 file_after_bytes=7633715200 shmem_before_bytes=69369856 shmem_after_bytes=71213056 active_file_before_bytes=122642432 active_file_after_bytes=126783488 inactive_file_before_bytes=30371840 inactive_file_after_bytes=7426650112
+NOTICE:  duration: 17007.416 ms  plan:
+Query Text: SELECT SUM(l_extendedprice)
+FROM (
+    SELECT l_extendedprice
+    FROM lineitem
+    WHERE l_shipdate < DATE '1993-01-01'
+    ORDER BY l_extendedprice DESC
+    OFFSET 100
+) AS sorted;
+Aggregate  (cost=2030712.20..2030712.21 rows=1 width=32) (actual rows=1 loops=1)
+  ->  Limit  (cost=1227334.92..1954769.80 rows=6075392 width=8) (actual rows=6073265 loops=1)
+        ->  Gather Merge  (cost=1227322.95..1954769.80 rows=6075492 width=8) (actual rows=6073365 loops=1)
+              Workers Planned: 4
+              Workers Launched: 4
+              ->  Sort  (cost=1226322.89..1230120.08 rows=1518873 width=8) (actual rows=1214673 loops=5)
+                    Sort Key: lineitem.l_extendedprice DESC
+                    Sort Method: external merge  Disk: 22816kB
+                    Worker 0:  Sort Method: external merge  Disk: 22152kB
+                    Worker 1:  Sort Method: external merge  Disk: 21768kB
+                    Worker 2:  Sort Method: external merge  Disk: 22176kB
+                    Worker 3:  Sort Method: external merge  Disk: 21968kB
+                    ->  Parallel Seq Scan on lineitem  (cost=0.00..1049606.88 rows=1518873 width=8) (actual rows=1214673 loops=5)
+                          Filter: (l_shipdate < '1993-01-01'::date)
+                          Rows Removed by Filter: 8383128
+NOTICE:  SQLerate cache file publish generation=1 shared_generation=1 relations=24 observe_ms=221.137 submitted_ns=213511100460940 finished_ns=213511321597934 published_ns=213511614492350
+NOTICE:  duration: 3.393 ms  plan:
+Query Text: SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','i','m') AND c.relpersistence='p' AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' ORDER BY c.oid
+Sort  (cost=24.90..25.11 rows=84 width=4) (actual rows=24 loops=1)
+  Sort Key: c.oid
+  Sort Method: quicksort  Memory: 26kB
+  ->  Hash Join  (cost=1.11..22.21 rows=84 width=4) (actual rows=24 loops=1)
+        Hash Cond: (c.relnamespace = n.oid)
+        ->  Seq Scan on pg_class c  (cost=0.00..19.97 rows=251 width=8) (actual rows=261 loops=1)
+              Filter: ((relpersistence = 'p'::"char") AND (relkind = ANY ('{r,i,m}'::"char"[])))
+              Rows Removed by Filter: 180
+        ->  Hash  (cost=1.09..1.09 rows=2 width=4) (actual rows=2 loops=1)
+              Buckets: 1024  Batches: 1  Memory Usage: 9kB
+              ->  Seq Scan on pg_namespace n  (cost=0.00..1.09 rows=2 width=4) (actual rows=2 loops=1)
+                    Filter: ((nspname !~ '^pg_'::text) AND (nspname <> 'information_schema'::name))
+                    Rows Removed by Filter: 5
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16403 blocks=139519 shared_pages=0 file_pages=0 file_total=279038 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16459 blocks=32905 shared_pages=0 file_pages=0 file_total=65810 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16387 blocks=32769 shared_pages=0 file_pages=0 file_total=65538 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=24603 blocks=2 shared_pages=0 file_pages=0 file_total=4 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=24610 blocks=1 shared_pages=0 file_pages=0 file_total=2 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16461 blocks=131584 shared_pages=1 file_pages=4 file_total=263168 file_known=1 file_generation=1 shared_delta_pages=1
+NOTICE:  SQLerate cache ledger relation generation=2 relid=24578 blocks=1 shared_pages=0 file_pages=0 file_total=2 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=24593 blocks=2 shared_pages=0 file_pages=0 file_total=4 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=24600 blocks=1 shared_pages=0 file_pages=0 file_total=2 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16427 blocks=899633 shared_pages=160 file_pages=1799266 file_total=1799266 file_known=1 file_generation=1 shared_delta_pages=160
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16455 blocks=17551 shared_pages=0 file_pages=0 file_total=35102 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16453 blocks=221 shared_pages=0 file_pages=0 file_total=442 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16420 blocks=208731 shared_pages=0 file_pages=0 file_total=417462 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=24587 blocks=1 shared_pages=0 file_pages=0 file_total=2 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16457 blocks=3293 shared_pages=0 file_pages=0 file_total=6586 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=24613 blocks=2 shared_pages=0 file_pages=0 file_total=4 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16396 blocks=1773 shared_pages=0 file_pages=0 file_total=3546 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16441 blocks=1 shared_pages=0 file_pages=0 file_total=2 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16465 blocks=2 shared_pages=0 file_pages=0 file_total=4 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16451 blocks=4390 shared_pages=0 file_pages=0 file_total=8780 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16463 blocks=2 shared_pages=0 file_pages=0 file_total=4 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=24585 blocks=2 shared_pages=0 file_pages=0 file_total=4 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16435 blocks=1 shared_pages=0 file_pages=0 file_total=2 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16411 blocks=28666 shared_pages=0 file_pages=0 file_total=57332 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger refresh reason=executor_end generation=2 wall_ms=25.391 relations=24 dcp_updates=0 dcp_evictions=0 coalesced=0 returned_ns=213511639662846

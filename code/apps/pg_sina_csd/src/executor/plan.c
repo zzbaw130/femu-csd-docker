@@ -113,7 +113,7 @@ struct PlanStateCsd {
     CS_MEM_HANDLE worker_io[QS_WORKERS];
     CS_CSF_ID function;
     unsigned row;
-    bool started, explain_only, active, profiling;
+    bool started, explain_only, active, profiling, operator_graph;
     uint64_t start_ns;
     ResourceOwner resource_owner;
     MemoryContextCallback cleanup;
@@ -452,6 +452,55 @@ static unsigned device_streams(Plan *plan)
     if(IsA(plan,SubqueryScan)) count+=device_streams(((SubqueryScan *)plan)->subplan);
     return count+device_streams(plan->lefttree)+device_streams(plan->righttree);
 }
+/* This experiment shares the ordinary planner and only changes execution of
+ * a scalar numeric SUM above an ordered, single-column heap scan. */
+static void start_operator_graph(PlanStateCsd *s)
+{
+    static const enum qp_kind kinds[]={QP_AGGREGATE,QP_PROJECT,QP_LIMIT,QP_SORT,QP_SCAN};
+    const struct qs_plan *stages[lengthof(kinds)];
+    int id=s->plan->root;
+    if(s->plan->ninit || s->plan->nparams || s->plan->count!=lengthof(kinds))
+        elog(ERROR,"unsupported plan for the experimental CSD operator graph");
+    for(unsigned i=0;i<lengthof(kinds);++i) {
+        if(id<0 || (unsigned)id>=s->plan->count)
+            elog(ERROR,"invalid input for the experimental CSD operator graph");
+        const struct qp_node *n=&s->plan->nodes[id];
+        const struct qs_plan *p=&n->expr;
+        if(n->kind!=(int)kinds[i] || n->right>=0 || n->ordered_index || p->nout!=1 ||
+           p->outputs[0].type_oid!=NUMERICOID || (i+1<lengthof(kinds) && p->predicate>=0))
+            elog(ERROR,"unsupported operator for the experimental CSD operator graph");
+        stages[i]=p;
+        if(i+1<lengthof(kinds)) id=n->left;
+    }
+    const struct qs_plan *agg=stages[0],*limit=stages[2],*sort=stages[3],*scan=stages[4];
+    if(agg->naggs!=1 || agg->nkeys || agg->aggs[0].kind!=Q_SUM ||
+       limit->limit>=0 || limit->offset<0 || sort->norder!=1 || sort->order[0].output!=0 ||
+       scan->runtime_dict || scan->join.indexid)
+        elog(ERROR,"unsupported SUM, OFFSET or sort key for the experimental CSD operator graph");
+    const struct qs_expr *output=&agg->exprs[agg->outputs[0].index];
+    const struct qs_expr *arg=&agg->exprs[agg->aggs[0].expr];
+    if(output->op!=Q_AGGREF || output->column!=0 || arg->op!=Q_COLUMN || arg->column!=0)
+        elog(ERROR,"unsupported SUM expression for the experimental CSD operator graph");
+    for(unsigned i=1;i<=3;++i) {
+        const struct qs_expr *expr=&stages[i]->exprs[stages[i]->outputs[0].index];
+        if(expr->op!=Q_COLUMN || expr->column!=0)
+            elog(ERROR,"unsupported projection for the experimental CSD operator graph");
+    }
+
+    struct qs_request request=s->files[id];
+    request.plan.ordered_rows=1;
+    request.plan.norder=1;
+    request.plan.order[0]=sort->order[0];
+    request.plan.limit=-1;
+    request.plan.offset=0;
+    const struct qs_graph_tail tail={.remaining=limit->offset,.sum={.isnull=1}};
+    struct pg_sina_stream *stream=NULL;
+    pg_sina_execute(&request,s->extents[id],s->result,s->profiling,&stream,&tail);
+    Assert(!stream);
+    s->operator_graph=s->started=true;
+    s->result_rows=s->result->rows;
+    s->plan->nodes[s->plan->root].expr.work_mem_bytes=pg_sina_query_memory();
+}
 static void start(PlanStateCsd *s)
 {
     /* This runs only on the PG owner, before callbacks/consumers. Param
@@ -479,6 +528,7 @@ static void start(PlanStateCsd *s)
         }
     }
     if(!device) elog(ERROR,"CSD PG Plan has no prepared relation");
+    if(pg_sina_operator_graph) { start_operator_graph(s); return; }
     pg_sina_read_resources(device);
     size_t parameter_bytes=qp_host_parameter_bytes(s->plan);
     size_t plan_bytes=sizeof(*s->plan)+parameter_bytes;
@@ -1175,6 +1225,15 @@ static TupleTableSlot *execute(CustomScanState *node)
     if(s->explain_only) return ExecClearTuple(slot);
     const struct qs_plan *root=&s->plan->nodes[s->plan->root].expr;
     if(!s->started && !s->delivery_shared) start(s);
+    if(s->operator_graph) {
+        if(s->row==s->result->rows) return ExecClearTuple(slot);
+        struct qs_cell value=s->result->data[s->row++].cells[0];
+        ResetExprContext(node->ss.ps.ps_ExprContext); ExecClearTuple(slot);
+        slot->tts_isnull[0]=value.isnull;
+        if(!value.isnull) slot->tts_values[0]=pg_sina_decimal(value);
+        ExecStoreVirtualTuple(slot); node->ss.ps.ps_ExprContext->ecxt_scantuple=slot;
+        return node->ss.ps.ps_ProjInfo?ExecProject(node->ss.ps.ps_ProjInfo):slot;
+    }
     if(s->row==s->result->rows && !s->result->finished) fetch(s);
     if(s->row==s->result->rows) { close_state(s); return ExecClearTuple(slot); }
     if(!s->row) for(unsigned i=0;i<root->nout;++i) {
@@ -1258,7 +1317,7 @@ static void rescan(CustomScanState *node)
         memset(s->delivery->batches,0,sizeof(s->delivery->batches));
     }
     s->execution_status=CS_SUCCESS; s->execution_operation[0]=0;
-    memset(s->slots,0,sizeof(s->slots)); s->parallel=false; s->epoch=0; memset(s->result,0,sizeof(*s->result)); s->started=false; s->row=0;
+    memset(s->slots,0,sizeof(s->slots)); s->parallel=false; s->epoch=0; memset(s->result,0,sizeof(*s->result)); s->operator_graph=s->started=false; s->row=0;
 }
 static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
 {
@@ -1268,6 +1327,22 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     if(s->async_scan && !s->delivery_shared && s->started) close_state(s);
     pg_sina_explain_placement((CustomScan *)node->ss.ps.plan,es);
     ExplainPropertyText("Execution Path","csd",es);
+    ExplainPropertyText("CSD Executor",pg_sina_operator_graph?"SNIA operator graph":"pg_sina_plan",es);
+    if(s->operator_graph) {
+        const struct qs_metrics *m=&s->result->metrics;
+        ExplainPropertyText("CSD Operator Batches","LOAD -> Scan -> Filter -> SortSink | SortSource -> Offset -> Sum",es);
+        ExplainPropertyInteger("CSD Device CUs",NULL,pg_sina_resources.cus,es);
+        ExplainPropertyInteger("CSD Workers",NULL,m->workers,es);
+        ExplainPropertyInteger("CSD Scan Block","bytes",QS_CHUNK,es);
+        ExplainPropertyInteger("CSD Query Memory Limit","bytes",s->plan->nodes[s->plan->root].expr.work_mem_bytes,es);
+        ExplainPropertyInteger("CSD Spill Read","bytes",m->spill_read_bytes,es);
+        ExplainPropertyInteger("CSD Spill Write","bytes",m->spill_write_bytes,es);
+        ExplainPropertyInteger("CSD Runs",NULL,m->runs,es);
+        ExplainPropertyInteger("CSD Returned Rows",NULL,s->result_rows,es);
+        ExplainPropertyFloat("CSD Scan Phase Wall","ms",s->result->profile.pipeline_ns[0]/1e6,3,es);
+        ExplainPropertyFloat("CSD Merge Phase Wall","ms",s->result->profile.pipeline_ns[1]/1e6,3,es);
+        return;
+    }
     ExplainPropertyInteger("CSD Device CUs",NULL,pg_sina_resources.cus,es);
     ExplainPropertyFloat("CSD CU CPU Ratio",NULL,pg_sina_resources.cpu_ratio,6,es);
     ExplainPropertyInteger("CSD HOST Parameter Count",NULL,list_length(s->parameter_exprs),es);
