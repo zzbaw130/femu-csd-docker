@@ -37,7 +37,8 @@
 /* The coarse graph coordinator uses bits 0 and 9 as in pg_sina_plan. */
 #define QP_GRAPH_PIPELINE_NODE_SHIFT 10
 #define QP_GRAPH_PHASE_DONE 128U
-/* scan_node carries the topology of a block's explicit EXEC chain. */
+/* scan_node keeps the one-based scan ID in its low byte. For a chain,
+ * the next bits carry the one-based producer root and the high bits are flags. */
 #define QP_GRAPH_BLOCK_SCAN (1U<<31)
 #define QP_GRAPH_BLOCK_BUILD (1U<<30)
 #define QP_GRAPH_BLOCK_PROBE (1U<<29)
@@ -47,8 +48,8 @@
 #define QP_GRAPH_BLOCK_PARTITION (1U<<25)
 #define QP_GRAPH_BLOCK_FLAGS (QP_GRAPH_BLOCK_SCAN|QP_GRAPH_BLOCK_BUILD|QP_GRAPH_BLOCK_PROBE|QP_GRAPH_BLOCK_INDEX|QP_GRAPH_BLOCK_CHAIN|QP_GRAPH_BLOCK_SORT|QP_GRAPH_BLOCK_PARTITION)
 #define QP_GRAPH_BLOCK_ROOT_SHIFT 8
-#define QP_GRAPH_BLOCK_NODE_SHIFT 57
-#define QP_GRAPH_BLOCK_MAX_CHAIN 60
+#define QP_GRAPH_BLOCK_NODE_SHIFT 57 /* Chain EXEC cparam1 carries its operator ID. */
+#define QP_GRAPH_BLOCK_MAX_CHAIN 60 /* E9 leaves four entries for LOAD, Scan, Filter and sink. */
 enum qp_graph_block_step { BLOCK_SCAN, BLOCK_FILTER, BLOCK_PROBE, BLOCK_INDEX, BLOCK_PROJECT, BLOCK_GROUP, BLOCK_HASH, BLOCK_SORT, BLOCK_PARTITION, BLOCK_STEPS };
 #define QP_GRAPH_BLOCK_EXEC (UINT64_C(1)<<63)
 /* Resource CSF cparam1 selector. CPU fraction uses parts per million. */
