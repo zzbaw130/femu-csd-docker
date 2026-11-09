@@ -34,6 +34,9 @@
 #define QP_GRAPH_HASH_NODE_SHIFT 2
 #define QP_GRAPH_HASH_NEEDS_LEFT 32U
 #define QP_GRAPH_HASH_MERGE_REQUIRED 64U
+/* The coarse graph coordinator uses bits 0 and 9 as in pg_sina_plan. */
+#define QP_GRAPH_PIPELINE_NODE_SHIFT 10
+#define QP_GRAPH_PHASE_DONE 128U
 /* Resource CSF cparam1 selector. CPU fraction uses parts per million. */
 enum qp_resource { QP_RESOURCE_WORKMEM, QP_RESOURCE_CPU_RATIO };
 #define QP_CPU_RATIO_SCALE 1000000U

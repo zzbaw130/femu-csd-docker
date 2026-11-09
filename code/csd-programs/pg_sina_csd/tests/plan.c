@@ -537,6 +537,7 @@ static void *probe_worker(void *arg)
         /* A direct sink can consume a batch without emitting rows or I/O. */
     }
 }
+static function test_pipeline_build, test_pipeline_group;
 static void test(function run,unsigned join,unsigned rows,unsigned right_rows,unsigned memory,int hash,int parallel)
 {
     int partitioned_group=parallel==TEST_PARTITION_GROUP;
@@ -893,6 +894,8 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     uint64_t available=0,done=0; unsigned epoch=0;
     atomic_uint_fast64_t host_offset=0;
     bool need_input[QS_WORKERS]={0};
+    unsigned pipeline_phase=0, pipeline_stores=0, pipeline_reads=0;
+    function coordinator=test_pipeline_build?test_pipeline_build:run;
     for(unsigned iteration=0;!out->finished;++iteration) {
         if(control.parallel && !csIsReentry(&args)) {
             pthread_t threads[QS_WORKERS]; struct probe_test tasks[QS_WORKERS]; uint64_t started=0;
@@ -913,12 +916,19 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         }
         if(iteration==1000000) { fprintf(stderr,"STUCK join=%u hash=%d parallel=%d epoch=%u avail=%llu done=%llu active=%u rows=%u node=%u reads=%u bytes=%u\n",join,hash,parallel,control.epoch,(unsigned long long)available,(unsigned long long)done,control.parallel,out->rows,control.node,control.index_nreads,control.bytes); abort(); }
         uint64_t consumed=csIsReentry(&args)?control.drained:0; unsigned previous_epoch=control.epoch;
-        int64_t status=run(&args);
+        int64_t status=coordinator(&args);
+        if(status==QP_GRAPH_PHASE_DONE) {
+            assert(test_pipeline_build && pipeline_phase<2 && !out->rows);
+            coordinator=++pipeline_phase==1?test_pipeline_group:run;
+        }
         if(control.epoch==previous_epoch) assert((control.drained&consumed)==consumed);
         if(status<0) { fprintf(stderr,"native plan status=%lld join=%u row=%u state=%llu\n",(long long)status,join,rows,(unsigned long long)control.state); abort(); }
         uint64_t op=(uint64_t)status>>60,id=(uint64_t)status&CS_IO_VALUE_MASK;
         if(op) {
             if(op==4) { namespace_read(&args,id,raw[0],raw[1],index); continue; }
+            if(test_pipeline_build && pipeline_phase<2) {
+                pipeline_stores+=op==1; pipeline_reads+=op==2;
+            }
             args.cparam2=spill_request(&spill,op,id,io);
             continue;
         }
@@ -1022,6 +1032,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         if(parallel==TEST_PARTITION_SERIAL) assert(!control.epoch);
         else assert(memory==8?control.epoch==1:control.epoch>1);
     }
+    if(test_pipeline_build) assert(pipeline_phase==2 && pipeline_stores && pipeline_reads);
     for(size_t i=0;i<spill.count;++i) free(spill.tokens[i]);
     assert(!pthread_mutex_destroy(&spill.mutex));
     free(controls); free(spill.tokens); free(raw[0]); free(raw[1]); free(index); free(plan); free(arena); free(io); free(out);
@@ -2768,6 +2779,10 @@ int main(int argc,char **argv)
         test(run,QP_INNER,31,3000003,64,1,TEST_PARTITION);
         test(run,QP_INNER,31,3000003,64,1,TEST_PARTITION_PACKED);
         test(run,QP_INNER,31,3000003,64,1,TEST_PARTITION_SERIAL);
+        test(run,QP_INNER,31,3000003,64,1,TEST_PARTITION_GROUP);
+        test_pipeline_build=(function)dlsym(library,"pg_sina_graph_build_pipeline");
+        test_pipeline_group=(function)dlsym(library,"pg_sina_graph_group_pipeline");
+        assert(test_pipeline_build && test_pipeline_group);
         test(run,QP_INNER,31,3000003,64,1,TEST_PARTITION_GROUP);
         return 0;
     }

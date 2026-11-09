@@ -150,7 +150,9 @@ static struct program connection_programs[]={
     {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_hash_build"},
     {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_continue"},
     {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_hash_probe"},
-    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_feed"}
+    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_feed"},
+    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_build_pipeline"},
+    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_group_pipeline"}
 };
 struct pg_sina_resources pg_sina_resources;
 static void close_connection(int code,Datum arg)

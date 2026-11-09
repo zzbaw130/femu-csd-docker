@@ -4141,8 +4141,9 @@ static int64_t radix_input(struct execution *s,unsigned id,struct operator_state
     }
     return 0;
 }
+enum group_read_mode { GROUP_READ, GROUP_PREPARE, GROUP_ALLOCATE };
 static int64_t hash_aggregate_state(struct execution *s,unsigned id,struct operator_state *o,
-    struct qs_cell *row,int prepare,int raw)
+    struct qs_cell *row,enum group_read_mode prepare,int raw)
 {
     struct qp_node *n=&s->plan->nodes[id];
     struct sorted_rows *sort=&o->left_sort;
@@ -4200,6 +4201,7 @@ static int64_t hash_aggregate_state(struct execution *s,unsigned id,struct opera
         if(!o->groups) { n->hash=0; return prepare?3:aggregate_next_impl(s,id,row,raw); }
         o->group_capacity=capacity;
     }
+    if(prepare==GROUP_ALLOCATE) return 3;
     for(;;) {
         if(o->group_phase==0) {
             if(!o->have_left) {
@@ -4374,7 +4376,8 @@ static int64_t hash_aggregate_state(struct execution *s,unsigned id,struct opera
         int64_t result=group_result(s,n,groups,o->keys,row,raw); if(result) return result;
     }
 }
-static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct qs_cell *row,int prepare,int raw)
+static int64_t hash_aggregate_next_impl(struct execution *s,unsigned id,struct qs_cell *row,
+    enum group_read_mode prepare,int raw)
 { return hash_aggregate_state(s,id,&s->nodes[id],row,prepare,raw); }
 static int64_t radix_source_next(struct execution *s,unsigned id,struct qs_cell *row,int raw)
 {
@@ -4403,7 +4406,7 @@ static int64_t radix_source_next(struct execution *s,unsigned id,struct qs_cell 
             memset(o->group_entries,0,(size_t)o->group_capacity*sizeof(*o->group_entries));
             o->left_sort=(struct sorted_rows){0};
         }
-        int64_t status=hash_aggregate_state(s,id,o,row,0,raw); if(status) return status;
+        int64_t status=hash_aggregate_state(s,id,o,row,GROUP_READ,raw); if(status) return status;
         o->radix_partition=UINT_MAX;
     }
 }
@@ -4412,10 +4415,10 @@ static int64_t hash_aggregate_next(struct execution *s,unsigned id,struct qs_cel
     /* Pure in-memory output is one call per group: leave it untimed. */
     if(!s->profiling || s->nodes[id].group_phase==3 ||
        (s->group_source_profiling && s->nodes[id].group_phase==2))
-        return hash_aggregate_next_impl(s,id,row,0,raw);
+        return hash_aggregate_next_impl(s,id,row,GROUP_READ,raw);
     unsigned op=s->nodes[id].group_phase==2?QS_AGG_SOURCE:QS_AGG_SINK;
     struct blocking_timer timer=blocking_begin(s);
-    int64_t status=hash_aggregate_next_impl(s,id,row,0,raw); blocking_end(s,op,timer); return status;
+    int64_t status=hash_aggregate_next_impl(s,id,row,GROUP_READ,raw); blocking_end(s,op,timer); return status;
 }
 /* Consume a contiguous key range from expression columns. The next group's
  * first row stays in the batch; the current accumulators survive I/O and
@@ -5266,7 +5269,7 @@ restart:
             if(s->nodes[builds[i]].external && !s->nodes[builds[i]].external->direct) { partition_join=builds[i]; break; }
         if(p->nodes[source].kind==QP_AGGREGATE && partition_join<0) {
             struct blocking_timer timer={0}; if(s->profiling) timer=blocking_begin(s);
-            int64_t status=hash_aggregate_next_impl(s,source,NULL,1,0);
+            int64_t status=hash_aggregate_next_impl(s,source,NULL,GROUP_PREPARE,0);
             if(s->profiling) blocking_end(s,QS_AGG_SINK,timer);
             if(status!=3) return status;
             if(!s->nodes[source].group_radix && (s->nodes[source].group_phase!=3 || !s->nodes[source].groups)) {
@@ -6261,7 +6264,8 @@ int64_t pg_sina_graph_hash_probe(struct femu_csd_args *a)
 int64_t pg_sina_graph_feed(struct femu_csd_args *a)
 { return graph_emit(a,GRAPH_EMIT_FEED); }
 
-int64_t pg_sina_plan(struct femu_csd_args *a)
+enum pipeline_phase { PIPELINE_EXECUTE, PIPELINE_BUILD, PIPELINE_GROUP };
+static int64_t plan_execute(struct femu_csd_args *a,enum pipeline_phase phase)
 {
     if(!a || a->numr!=5 || a->mr_len[0]<(long long)sizeof(struct qp_plan) ||
         a->mr_len[1]<(long long)sizeof(struct qp_control) || a->mr_len[2]<(long long)sizeof(struct qs_result) ||
@@ -6270,6 +6274,17 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
     if(plan->nparams>QP_PARAMS || (uint64_t)a->mr_len[0]<sizeof(*plan)+qp_host_parameter_bytes(plan)) return -1;
     if(plan->workers>QS_WORKERS || worker>plan->workers || a->mr_len[1]<(long long)((worker+1)*sizeof(struct qp_control)) ||
        a->mr_len[2]<(long long)((worker+1)*sizeof(struct qs_result))) return -1;
+    unsigned target=0;
+    if(phase!=PIPELINE_EXECUTE) {
+        uint64_t id=(uint64_t)a->cparam1>>QP_GRAPH_PIPELINE_NODE_SHIFT;
+        if(worker || plan->ninit || id>=plan->count || id>=QP_NODES) return -1;
+        const struct qp_node *n=&plan->nodes[id];
+        if(n->kind!=QP_AGGREGATE || !n->nkeys || n->left<0 ||
+           (unsigned)n->left>=plan->count || (unsigned)n->left>=QP_NODES) return -1;
+        if(phase==PIPELINE_BUILD &&
+           (plan->nodes[n->left].kind!=QP_JOIN || !plan->nodes[n->left].hash)) return -1;
+        target=id;
+    }
     struct qp_control *control=(struct qp_control *)a->mr_addr[1]+worker;
     struct qs_result *out=(struct qs_result *)a->mr_addr[2]+worker;
     struct execution *s=(void *)(uintptr_t)control->state;
@@ -6333,6 +6348,7 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
     unsigned capacity=worker && !typed?QS_RESULT_ROWS*QS_OUT/(columns?columns:1):
         qp_result_capacity(&plan->nodes[plan->root].expr,plan->packed_result);
     int64_t status=0; int host_full=0,host_publish=0;
+    bool phase_done=false;
     if(typed && !s->host_building)
         host_begin(s,&plan->nodes[plan->root].expr,out,capacity);
     if(s->output_active) { status=s->output_status; goto export_results; }
@@ -6352,6 +6368,26 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
             if(status==2) { status=-8; break; }
             s->initializer_phase=0; ++s->initializer;
         }
+    }
+    if(phase!=PIPELINE_EXECUTE) {
+        if(phase==PIPELINE_BUILD) {
+            /* Preserve the native allocation order. Before the child hash
+             * tables exist, the aggregate reserves only its small initial table. */
+            status=plan->nodes[target].hash?
+                hash_aggregate_next_impl(s,target,NULL,GROUP_ALLOCATE,0):3;
+            if(status==3) status=hash_build(s,plan->nodes[target].left);
+            phase_done=status==0;
+        } else {
+            struct blocking_timer timer={0};
+            if(s->profiling) timer=blocking_begin(s);
+            status=plan->nodes[target].hash?
+                hash_aggregate_next_impl(s,target,NULL,GROUP_PREPARE,0):3;
+            if(s->profiling) blocking_end(s,QS_AGG_SINK,timer);
+            /* Prepare stops before reading the first finalized group. */
+            phase_done=status==3;
+            if(phase_done) status=0;
+        }
+        goto combined;
     }
 produce:
     if(worker && s->group_combine) {
@@ -6602,9 +6638,17 @@ combined:
     }
     if(out->finished && !worker && status<=2 && !s->late_wait) { s->closing=1; return finish_dictionary(s,a,out); }
     wait_io(s,status);
+    if(phase_done && !status) return QP_GRAPH_PHASE_DONE;
     return status==QP_WAIT?0:status>2?status:0;
 }
 
-/* Graph stages and their native workers must use the same module and state layout. */
+int64_t pg_sina_plan(struct femu_csd_args *a)
+{ return plan_execute(a,PIPELINE_EXECUTE); }
+
+/* Separate E9 phases share the same query context and worker algorithms. */
+int64_t pg_sina_graph_build_pipeline(struct femu_csd_args *a)
+{ return plan_execute(a,PIPELINE_BUILD); }
+int64_t pg_sina_graph_group_pipeline(struct femu_csd_args *a)
+{ return plan_execute(a,PIPELINE_GROUP); }
 int64_t pg_sina_graph_continue(struct femu_csd_args *a)
-{ return pg_sina_plan(a); }
+{ return plan_execute(a,PIPELINE_EXECUTE); }

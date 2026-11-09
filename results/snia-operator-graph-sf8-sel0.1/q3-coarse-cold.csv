@@ -1,0 +1,4 @@
+query,mode,sample,planning_ms,execution_ms,total_ms,executor_end_ms,host_submissions,callback_submissions,counted_submissions,assigned_scan_loads,host_result_requests,workmem_peak_bytes,spill_read_bytes,spill_write_bytes,result_check
+Q3-1,original-pg-sina-plan,paired-cold,24.887,4155.953,4252.580,14.937,40,2219,2259,2222,2,99375440,0,0,ok
+Q3-1,coarse-snia-graph,paired-cold,16.894,4254.386,4319.958,15.820,42,2219,2261,2222,2,98930320,0,0,ok
+Q3-1,packet-snia-graph,prior-cold,26.549,18773.164,18849.675,16.503,97878,1,97879,2222,2,369997088,0,0,ok

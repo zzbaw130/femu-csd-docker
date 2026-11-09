@@ -57,7 +57,8 @@ struct plan_slot {
     uint64_t host_gap_ns,host_gap_max_ns,host_requeues;
 };
 enum graph_phase { GRAPH_NATIVE, GRAPH_SOURCE, GRAPH_CTE_SOURCE, GRAPH_BUILD_RIGHT, GRAPH_BUILD_LEFT,
-                   GRAPH_PROBE, GRAPH_PROBE_SPILL, GRAPH_FEED, GRAPH_PHASES };
+                   GRAPH_PROBE, GRAPH_PROBE_SPILL, GRAPH_FEED, GRAPH_PIPELINE_BUILD,
+                   GRAPH_PIPELINE_GROUP, GRAPH_PHASES };
 struct graph_stage {
     CS_MEM_HANDLE packet;
     CS_BATCH_HANDLE batches[GRAPH_PHASES];
@@ -124,7 +125,7 @@ struct PlanStateCsd {
     CS_MEM_HANDLE graph_eof;
     struct graph_stage graph[QP_NODES];
     enum graph_phase graph_phase;
-    unsigned graph_node, graph_nodes, graph_init;
+    unsigned graph_node, graph_nodes, graph_init, graph_pipeline_group;
     bool graph_tree, graph_partition;
     uint64_t graph_packets, graph_build_packets;
     unsigned row;
@@ -525,6 +526,28 @@ static bool start_operator_graph(PlanStateCsd *s)
     s->plan->nodes[s->plan->root].expr.work_mem_bytes=pg_sina_query_memory();
     return true;
 }
+/* The coarse graph experiment covers a bounded Sort over a grouped
+ * inner hash tree with a nested build. Leaves retain their native CU waves. */
+static unsigned graph_pipeline_group(const struct qp_plan *p)
+{
+    if(p->ninit) return 0;
+    const struct qp_node *limit=&p->nodes[p->root];
+    if(limit->kind!=QP_LIMIT || limit->left<0) return 0;
+    const struct qp_node *sort=&p->nodes[limit->left];
+    if(sort->kind!=QP_SORT || sort->left<0 || qp_sort_bound(p,limit->left)<0) return 0;
+    const struct qp_node *group=&p->nodes[sort->left];
+    if(group->kind!=QP_AGGREGATE || !group->hash || group->distinct || group->distinct_aggs ||
+       !qp_hash_aggregate_supported(group) ||
+       group->left<0) return 0;
+    const struct qp_node *join=&p->nodes[group->left];
+    if(join->kind!=QP_JOIN || !join->hash || join->join_type!=QP_INNER ||
+       join->left<0 || join->right<0 || p->nodes[join->left].kind!=QP_SCAN) return 0;
+    const struct qp_node *build=&p->nodes[join->right];
+    if(build->kind!=QP_JOIN || !build->hash || build->join_type!=QP_INNER ||
+       build->left<0 || build->right<0 || p->nodes[build->left].kind!=QP_SCAN ||
+       p->nodes[build->right].kind!=QP_SCAN) return 0;
+    return sort->left+1;
+}
 static bool graph_building(enum graph_phase phase)
 { return phase==GRAPH_BUILD_RIGHT || phase==GRAPH_BUILD_LEFT; }
 static bool graph_sourcing(enum graph_phase phase)
@@ -586,6 +609,13 @@ static void graph_request(PlanStateCsd *s,CsComputeRequest *compute,bool loaded)
     unsigned id=s->graph_node;
     enum graph_phase phase=s->graph_phase;
     bool root=id==s->plan->root;
+    if(phase==GRAPH_PIPELINE_BUILD || phase==GRAPH_PIPELINE_GROUP) {
+        compute->CSFId=phase==GRAPH_PIPELINE_BUILD?s->graph_build:s->graph_feed;
+        uint64_t parameter=s->profiling|((uint64_t)id<<QP_GRAPH_PIPELINE_NODE_SHIFT);
+        if(loaded) parameter|=QP_PAGES_INPUT;
+        csHelperSetComputeArg(&compute->Args[5],CS_64BIT_VALUE_TYPE,(u64)parameter);
+        return;
+    }
     int child=graph_child(s,id,phase);
     CS_MEM_HANDLE output=root?s->memory[2]:s->graph[id].packet;
     CS_MEM_HANDLE input=child>=0?s->graph[child].packet:s->graph_eof;
@@ -649,15 +679,22 @@ static void start(PlanStateCsd *s)
     s->graph_tree=s->graph_partition=false;
     s->graph_phase=GRAPH_NATIVE; s->graph_nodes=s->graph_init=0;
     s->graph_packets=s->graph_build_packets=0;
+    s->graph_pipeline_group=0;
     if(pg_sina_operator_graph) {
         if(start_operator_graph(s)) return;
-        for(unsigned i=0;i<s->plan->ninit;++i)
-            if(!graph_prepare(s,s->plan->init_nodes[i]))
-                elog(ERROR,"unsupported InitPlan for the experimental CSD operator graph");
-        if(!graph_prepare(s,s->plan->root))
-            elog(ERROR,"unsupported plan for the experimental CSD operator graph");
-        s->graph_tree=true;
-        graph_pick(s,graph_root(s));
+        s->graph_pipeline_group=graph_pipeline_group(s->plan);
+        if(s->graph_pipeline_group) {
+            s->graph_node=s->graph_pipeline_group-1;
+            s->graph_phase=GRAPH_PIPELINE_BUILD;
+        } else {
+            for(unsigned i=0;i<s->plan->ninit;++i)
+                if(!graph_prepare(s,s->plan->init_nodes[i]))
+                    elog(ERROR,"unsupported InitPlan for the experimental CSD operator graph");
+            if(!graph_prepare(s,s->plan->root))
+                elog(ERROR,"unsupported plan for the experimental CSD operator graph");
+            s->graph_tree=true;
+            graph_pick(s,graph_root(s));
+        }
     }
     pg_sina_read_resources(device);
     size_t parameter_bytes=qp_host_parameter_bytes(s->plan);
@@ -803,7 +840,7 @@ static void start(PlanStateCsd *s)
     }
     for(unsigned w=0;w<s->workers;++w)
         checked(transfer(s->memory[1],(w+1)*sizeof(struct qp_control),&s->slots[w+1].control,sizeof(struct qp_control),true),"initialize worker control");
-    s->function=pg_sina_function(s->graph_tree?"pg_sina_graph_continue":"pg_sina_plan"); s->active=true;
+    s->function=pg_sina_function((s->graph_tree || s->graph_pipeline_group)?"pg_sina_graph_continue":"pg_sina_plan"); s->active=true;
     size_t size=sizeof(CsBatchRequest)+6*sizeof(CsComputeArg); CsBatchRequest *request=palloc0(size);
     request->ReqType=CS_QUEUE_COMPUTE; request->u.Compute.CSFId=s->function; request->u.Compute.NumArgs=6;
     for(unsigned i=0;i<5;++i) csHelperSetComputeArg(&request->u.Compute.Args[i],CS_AFDM_TYPE,s->memory[i],0UL);
@@ -823,6 +860,9 @@ static void start(PlanStateCsd *s)
         s->graph_build=pg_sina_function("pg_sina_graph_hash_build");
         s->graph_probe=pg_sina_function("pg_sina_graph_hash_probe");
         s->graph_feed=pg_sina_function("pg_sina_graph_feed");
+    } else if(s->graph_pipeline_group) {
+        s->graph_build=pg_sina_function("pg_sina_graph_build_pipeline");
+        s->graph_feed=pg_sina_function("pg_sina_graph_group_pipeline");
     }
     pfree(request); s->started=true;
     if(s->async_scan || s->graph_tree) {
@@ -1236,6 +1276,10 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
             }
             continue;
         }
+        if(s->graph_pipeline_group && (value&QP_GRAPH_PHASE_DONE)) {
+            if(s->graph_phase==GRAPH_PIPELINE_BUILD) s->graph_phase=GRAPH_PIPELINE_GROUP;
+            else s->graph_phase=GRAPH_NATIVE;
+        }
         if(staged && !complete_graph_stage(s,value))
             return execution_failed(s,CS_ERROR_IN_EXECUTION,"unsupported SNIA graph stage continuation");
         if(result->rows || result->finished || slot->control.drained || (staged && !(value&QP_RESOURCE_WAIT)))
@@ -1534,6 +1578,8 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     pg_sina_explain_placement((CustomScan *)node->ss.ps.plan,es);
     ExplainPropertyText("Execution Path","csd",es);
     ExplainPropertyText("CSD Executor",pg_sina_operator_graph?"SNIA operator graph":"pg_sina_plan",es);
+    if(s->graph_pipeline_group)
+        ExplainPropertyText("CSD Operator Batches","HashBuild pipeline | Probe and Aggregate pipeline | Sort and Limit",es);
     if(s->graph_tree) {
         ExplainPropertyInteger("CSD Graph Nodes",NULL,s->graph_nodes,es);
         ExplainPropertyInteger("CSD Graph Packets",NULL,s->graph_packets,es);
