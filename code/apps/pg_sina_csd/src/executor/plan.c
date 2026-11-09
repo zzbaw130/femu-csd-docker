@@ -56,8 +56,14 @@ struct plan_slot {
     uint64_t scan_loads;
     uint64_t host_gap_ns,host_gap_max_ns,host_requeues;
 };
-enum graph_phase { GRAPH_NATIVE, GRAPH_SOURCE_RIGHT, GRAPH_BUILD_RIGHT,
-                   GRAPH_SOURCE_LEFT, GRAPH_BUILD_LEFT, GRAPH_PHASES };
+enum graph_phase { GRAPH_NATIVE, GRAPH_SOURCE, GRAPH_BUILD_RIGHT, GRAPH_BUILD_LEFT,
+                   GRAPH_PROBE, GRAPH_PROBE_SPILL, GRAPH_FEED, GRAPH_PHASES };
+struct graph_stage {
+    CS_MEM_HANDLE packet;
+    CS_BATCH_HANDLE batches[GRAPH_PHASES];
+    enum graph_phase phase;
+    bool ready, eof;
+};
 struct PlanStateCsd {
     CustomScanState css;
     struct qp_plan *plan;
@@ -114,12 +120,13 @@ struct PlanStateCsd {
     CS_MEM_HANDLE memory[5];
     CS_MEM_HANDLE worker_io[QS_WORKERS];
     CS_CSF_ID function;
-    CS_CSF_ID graph_source, graph_build;
-    CS_BATCH_HANDLE graph_batches[GRAPH_PHASES];
+    CS_CSF_ID graph_source, graph_build, graph_probe, graph_feed;
+    CS_MEM_HANDLE graph_eof;
+    struct graph_stage graph[QP_NODES];
     enum graph_phase graph_phase;
-    unsigned graph_join;
-    bool graph_eof;
-    uint64_t graph_packets;
+    unsigned graph_node, graph_nodes;
+    bool graph_tree, graph_partition;
+    uint64_t graph_packets, graph_build_packets;
     unsigned row;
     bool started, explain_only, active, profiling, operator_graph;
     uint64_t start_ns;
@@ -188,7 +195,7 @@ static void completed(void *context,CS_STATUS status,u64 value)
     slot->completion_status=status; slot->completion_value=value;
     pthread_mutex_unlock(&slot->mutex);
     atomic_store_explicit(&slot->completed,true,memory_order_release);
-    if(s->async_scan) deliver(s);
+    if(s->async_scan || s->graph_tree) deliver(s);
     atomic_fetch_sub_explicit(&s->callbacks,1,memory_order_release);
 }
 static CS_STATUS transfer(CS_MEM_HANDLE memory,size_t offset,void *data,size_t bytes,bool write)
@@ -254,10 +261,15 @@ static void close_state(void *arg)
         if(s->slots[w].resume) { csFreeBatchRequest(s->slots[w].resume); s->slots[w].resume=NULL; }
         if(s->slots[w].mutex_ready) { pthread_mutex_destroy(&s->slots[w].mutex); s->slots[w].mutex_ready=false; }
     }
-    for(unsigned i=1;i<GRAPH_PHASES;++i) if(s->graph_batches[i]) {
-        csFreeBatchRequest(s->graph_batches[i]); s->graph_batches[i]=NULL;
-    }
     CsMemFlags flags={.FDMId=1};
+    if(s->graph_eof) { csFreeMem(s->graph_eof,&flags); s->graph_eof=NULL; }
+    for(unsigned id=0;id<s->plan->count;++id) {
+        struct graph_stage *stage=&s->graph[id];
+        for(unsigned i=1;i<GRAPH_PHASES;++i) if(stage->batches[i]) {
+            csFreeBatchRequest(stage->batches[i]); stage->batches[i]=NULL;
+        }
+        if(stage->packet) { csFreeMem(stage->packet,&flags); stage->packet=NULL; }
+    }
     for(unsigned i=0;i<5;++i) if(s->memory[i]) { csFreeMem(s->memory[i],&flags); s->memory[i]=NULL; }
     for(unsigned w=0;w<s->workers;++w) if(s->worker_io[w]) {
         csFreeMem(s->worker_io[w],&flags); s->worker_io[w]=NULL;
@@ -465,21 +477,21 @@ static unsigned device_streams(Plan *plan)
 }
 /* This experiment shares the ordinary planner and only changes execution of
  * a scalar numeric SUM above an ordered, single-column heap scan. */
-static void start_operator_graph(PlanStateCsd *s)
+static bool start_operator_graph(PlanStateCsd *s)
 {
     static const enum qp_kind kinds[]={QP_AGGREGATE,QP_PROJECT,QP_LIMIT,QP_SORT,QP_SCAN};
     const struct qs_plan *stages[lengthof(kinds)];
     int id=s->plan->root;
     if(s->plan->ninit || s->plan->nparams || s->plan->count!=lengthof(kinds))
-        elog(ERROR,"unsupported plan for the experimental CSD operator graph");
+        return false;
     for(unsigned i=0;i<lengthof(kinds);++i) {
         if(id<0 || (unsigned)id>=s->plan->count)
-            elog(ERROR,"invalid input for the experimental CSD operator graph");
+            return false;
         const struct qp_node *n=&s->plan->nodes[id];
         const struct qs_plan *p=&n->expr;
         if(n->kind!=(int)kinds[i] || n->right>=0 || n->ordered_index || p->nout!=1 ||
            p->outputs[0].type_oid!=NUMERICOID || (i+1<lengthof(kinds) && p->predicate>=0))
-            elog(ERROR,"unsupported operator for the experimental CSD operator graph");
+            return false;
         stages[i]=p;
         if(i+1<lengthof(kinds)) id=n->left;
     }
@@ -487,15 +499,15 @@ static void start_operator_graph(PlanStateCsd *s)
     if(agg->naggs!=1 || agg->nkeys || agg->aggs[0].kind!=Q_SUM ||
        limit->limit>=0 || limit->offset<0 || sort->norder!=1 || sort->order[0].output!=0 ||
        scan->runtime_dict || scan->join.indexid)
-        elog(ERROR,"unsupported SUM, OFFSET or sort key for the experimental CSD operator graph");
+        return false;
     const struct qs_expr *output=&agg->exprs[agg->outputs[0].index];
     const struct qs_expr *arg=&agg->exprs[agg->aggs[0].expr];
     if(output->op!=Q_AGGREF || output->column!=0 || arg->op!=Q_COLUMN || arg->column!=0)
-        elog(ERROR,"unsupported SUM expression for the experimental CSD operator graph");
+        return false;
     for(unsigned i=1;i<=3;++i) {
         const struct qs_expr *expr=&stages[i]->exprs[stages[i]->outputs[0].index];
         if(expr->op!=Q_COLUMN || expr->column!=0)
-            elog(ERROR,"unsupported projection for the experimental CSD operator graph");
+            return false;
     }
 
     struct qs_request request=s->files[id];
@@ -511,25 +523,79 @@ static void start_operator_graph(PlanStateCsd *s)
     s->operator_graph=s->started=true;
     s->result_rows=s->result->rows;
     s->plan->nodes[s->plan->root].expr.work_mem_bytes=pg_sina_query_memory();
+    return true;
 }
 static bool graph_building(enum graph_phase phase)
 { return phase==GRAPH_BUILD_RIGHT || phase==GRAPH_BUILD_LEFT; }
-static bool graph_left(enum graph_phase phase)
-{ return phase==GRAPH_SOURCE_LEFT || phase==GRAPH_BUILD_LEFT; }
-static void graph_request(PlanStateCsd *s,enum graph_phase phase,CsComputeRequest *compute,bool loaded)
+static int graph_child(PlanStateCsd *s,unsigned id,enum graph_phase phase)
 {
-    const struct qp_node *join=&s->plan->nodes[s->graph_join-1];
+    const struct qp_node *n=&s->plan->nodes[id];
+    if(phase==GRAPH_SOURCE || phase==GRAPH_PROBE_SPILL) return -1;
+    return phase==GRAPH_BUILD_RIGHT?n->right:n->left;
+}
+static bool graph_prepare(PlanStateCsd *s,int id)
+{
+    if(id<0 || (unsigned)id>=s->plan->count || s->graph[id].phase) return false;
+    const struct qp_node *n=&s->plan->nodes[id];
+    enum graph_phase phase;
+    switch(n->kind) {
+        case QP_SCAN: phase=GRAPH_SOURCE; break;
+        case QP_PROJECT: phase=n->left<0?GRAPH_SOURCE:GRAPH_FEED; break;
+        case QP_AGGREGATE: case QP_SORT: case QP_LIMIT: phase=GRAPH_FEED; break;
+        case QP_JOIN: if(!n->hash) return false; phase=GRAPH_BUILD_RIGHT; break;
+        default: return false;
+    }
+    s->graph[id].phase=phase; ++s->graph_nodes;
+    if(phase==GRAPH_SOURCE) return n->left<0 && n->right<0;
+    if(!graph_prepare(s,n->left)) return false;
+    if(phase!=GRAPH_BUILD_RIGHT) return n->right<0;
+    s->graph_partition=true;
+    return graph_prepare(s,n->right);
+}
+/* Pull the deepest missing packet. A consumer owns its child's packet
+ * until its E9 completion acknowledges it, even if it produced output. */
+static void graph_pick(PlanStateCsd *s,unsigned id)
+{
+    enum graph_phase phase=s->graph[id].phase;
+    int child=graph_child(s,id,phase);
+    if(child>=0 && !s->graph[child].ready) { graph_pick(s,child); return; }
+    s->graph_node=id; s->graph_phase=phase;
+}
+static void graph_request(PlanStateCsd *s,CsComputeRequest *compute,bool loaded)
+{
+    unsigned id=s->graph_node;
+    enum graph_phase phase=s->graph_phase;
+    bool root=id==s->plan->root;
+    int child=graph_child(s,id,phase);
+    CS_MEM_HANDLE output=root?s->memory[2]:s->graph[id].packet;
+    CS_MEM_HANDLE input=child>=0?s->graph[child].packet:s->graph_eof;
     uint64_t parameter=s->profiling;
+    compute->NumArgs=6;
     if(graph_building(phase)) {
         compute->CSFId=s->graph_build;
-        parameter|=(uint64_t)(s->graph_join-1)<<QP_GRAPH_HASH_NODE_SHIFT;
-        if(graph_left(phase)) parameter|=QP_GRAPH_HASH_LEFT;
+        csHelperSetComputeArg(&compute->Args[2],CS_AFDM_TYPE,input,0UL);
+        parameter|=(uint64_t)id<<QP_GRAPH_HASH_NODE_SHIFT;
+        if(phase==GRAPH_BUILD_LEFT) parameter|=QP_GRAPH_HASH_LEFT;
     } else {
-        compute->CSFId=s->graph_source;
-        parameter|=(uint64_t)(graph_left(phase)?join->left:join->right)<<QP_GRAPH_SOURCE_NODE_SHIFT;
-        if(loaded) parameter|=QP_GRAPH_SOURCE_PAGES;
+        parameter|=(uint64_t)id<<QP_GRAPH_SOURCE_NODE_SHIFT;
+        if(root) parameter|=QP_GRAPH_HOST_OUTPUT;
+        if(phase==GRAPH_SOURCE) {
+            compute->CSFId=s->graph_source;
+            if(loaded) parameter|=QP_GRAPH_SOURCE_PAGES;
+            if(!root) {
+                csHelperSetComputeArg(&compute->Args[4],CS_AFDM_TYPE,output,0UL);
+                csHelperSetComputeArg(&compute->Args[5],CS_AFDM_TYPE,s->memory[4],0UL);
+                compute->NumArgs=7;
+            }
+        } else {
+            compute->CSFId=phase==GRAPH_FEED?s->graph_feed:s->graph_probe;
+            csHelperSetComputeArg(&compute->Args[2],CS_AFDM_TYPE,output,0UL);
+            csHelperSetComputeArg(&compute->Args[4],CS_AFDM_TYPE,input,0UL);
+            csHelperSetComputeArg(&compute->Args[5],CS_AFDM_TYPE,s->memory[4],0UL);
+            compute->NumArgs=7;
+        }
     }
-    csHelperSetComputeArg(&compute->Args[5],CS_64BIT_VALUE_TYPE,(u64)parameter);
+    csHelperSetComputeArg(&compute->Args[compute->NumArgs-1],CS_64BIT_VALUE_TYPE,(u64)parameter);
 }
 static void start(PlanStateCsd *s)
 {
@@ -558,17 +624,15 @@ static void start(PlanStateCsd *s)
         }
     }
     if(!device) elog(ERROR,"CSD PG Plan has no prepared relation");
-    s->graph_join=0; s->graph_phase=GRAPH_NATIVE; s->graph_packets=0;
+    memset(s->graph,0,sizeof(s->graph));
+    s->graph_tree=s->graph_partition=false;
+    s->graph_phase=GRAPH_NATIVE; s->graph_nodes=0; s->graph_packets=s->graph_build_packets=0;
     if(pg_sina_operator_graph) {
-        if(!s->plan->ninit) for(unsigned i=0;i<s->plan->count;++i) {
-            const struct qp_node *n=&s->plan->nodes[i];
-            if(n->kind==QP_JOIN && n->hash && n->join_type==QP_INNER &&
-               n->right>=0 && s->plan->nodes[n->right].kind==QP_JOIN) {
-                s->graph_join=i+1; s->graph_phase=GRAPH_SOURCE_RIGHT;
-                break;
-            }
-        }
-        if(!s->graph_join) { start_operator_graph(s); return; }
+        if(start_operator_graph(s)) return;
+        if(s->plan->ninit || !graph_prepare(s,s->plan->root))
+            elog(ERROR,"unsupported plan for the experimental CSD operator graph");
+        s->graph_tree=true;
+        graph_pick(s,s->plan->root);
     }
     pg_sina_read_resources(device);
     size_t parameter_bytes=qp_host_parameter_bytes(s->plan);
@@ -599,8 +663,18 @@ static void start(PlanStateCsd *s)
     qp_dictionary_size(s->plan,&entries,&data);
     bool indexed[QP_NODES]={0};
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_INDEX_JOIN) indexed[s->plan->nodes[i].right]=true;
-    qp_parallel_boundaries(s->plan,s->plan->root);
-    for(unsigned i=0;i<s->plan->ninit;++i) qp_parallel_boundaries(s->plan,s->plan->init_nodes[i]);
+    if(s->graph_tree) {
+        /* Scan morsels are independent producers once the fused native
+         * pipeline is split into graph stages. Keep their CU wave. */
+        for(unsigned i=0;i<s->plan->count;++i) {
+            s->plan->nodes[i].parallel=0;
+            if(s->graph[i].phase==GRAPH_SOURCE && s->plan->nodes[i].kind==QP_SCAN)
+                qp_mark_parallel(s->plan,i);
+        }
+    } else {
+        qp_parallel_boundaries(s->plan,s->plan->root);
+        for(unsigned i=0;i<s->plan->ninit;++i) qp_parallel_boundaries(s->plan,s->plan->init_nodes[i]);
+    }
     bool parallel=false;
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].parallel) parallel=true;
     s->plan->workers=1; s->workers=0;
@@ -618,13 +692,14 @@ static void start(PlanStateCsd *s)
     bool reserve_prefetch=probe!=0;
     atomic_init(&s->prefetch_done,false);
     size_t arena,sizes[5];
+    unsigned graph_buffers=s->graph_tree?s->graph_nodes-1+s->graph_partition:0;
     bool has_index_join=false;
     for(unsigned i=0;i<s->plan->count;++i) has_index_join|=s->plan->nodes[i].kind==QP_INDEX_JOIN;
     s->plan->index_cache_bytes=has_index_join?(uint64_t)pg_sina_index_cache_mib*1024*1024:0;
     CsMemFlags flags={.FDMId=1};
     for(;;) {
         arena=layout_buffers(s,indexed);
-        size_t needed=arena+plan_bytes+(s->workers+1)*(sizeof(struct qp_control)+sizeof(*s->result)+QS_SORT_IO_BYTES)+65536;
+        size_t needed=arena+plan_bytes+(s->workers+1)*(sizeof(struct qp_control)+sizeof(*s->result)+QS_SORT_IO_BYTES)+graph_buffers*sizeof(*s->result)+65536;
         /* Keep 4 MiB inputs. Independent HOST scans share the FDM budget. */
         if(capacity && needed>capacity/streams && s->workers) {
             if(--s->workers==1) s->workers=0;
@@ -648,7 +723,18 @@ static void start(PlanStateCsd *s)
             status=csAllocMem(s->device,sizes[i],&flags,&s->memory[i],NULL);
         for(unsigned w=0;w<s->workers && status==CS_SUCCESS;++w)
             status=csAllocMem(s->device,QS_SORT_IO_BYTES,&flags,&s->worker_io[w],NULL);
+        if(s->graph_tree) {
+            for(unsigned id=0;id<s->plan->count && status==CS_SUCCESS;++id)
+                if(id!=s->plan->root && s->graph[id].phase)
+                    status=csAllocMem(s->device,sizeof(*s->result),&flags,&s->graph[id].packet,NULL);
+            if(status==CS_SUCCESS && s->graph_partition)
+                status=csAllocMem(s->device,sizeof(*s->result),&flags,&s->graph_eof,NULL);
+        }
         if(status==CS_SUCCESS) break;
+        if(s->graph_eof) { csFreeMem(s->graph_eof,&flags); s->graph_eof=NULL; }
+        for(unsigned id=0;id<s->plan->count;++id) if(s->graph[id].packet) {
+            csFreeMem(s->graph[id].packet,&flags); s->graph[id].packet=NULL;
+        }
         /* Concurrent HOST join inputs share physical AFDM. Retry a smaller
          * layout using actual allocation failure, not a fixed node quota. */
         for(unsigned i=0;i<5;++i) if(s->memory[i]) {
@@ -662,12 +748,16 @@ static void start(PlanStateCsd *s)
         if(s->workers) { if(--s->workers==1) s->workers=0; continue; }
         checked(status,"allocate AFDM");
     }
-    s->fdm_bytes=s->workers*QS_SORT_IO_BYTES;
+    s->fdm_bytes=s->workers*QS_SORT_IO_BYTES+graph_buffers*sizeof(*s->result);
+    if(s->graph_eof) {
+        struct { int status; unsigned rows,begin,finished; } eof={.finished=1};
+        checked(transfer(s->graph_eof,0,&eof,sizeof(eof),true),"initialize graph EOF");
+    }
     for(unsigned i=0;i<5;++i) s->fdm_bytes+=sizes[i];
     /* Independent unordered scans return CU batches directly. The same
      * AFDM allocation/layout is retained; no input is shared across scans. */
     const struct qp_node *root=&s->plan->nodes[s->plan->root];
-    if(s->async_scan && s->workers>1 && !s->plan->ninit && !root->ordered_index)
+    if(!s->graph_tree && s->async_scan && s->workers>1 && !s->plan->ninit && !root->ordered_index)
         s->plan->packed_result=QP_DIRECT_RESULT;
     else s->plan->packed_result=QP_TYPED_RESULT;
     checked(transfer(s->memory[0],0,s->plan,sizeof(*s->plan),true),"copy plan");
@@ -688,7 +778,7 @@ static void start(PlanStateCsd *s)
     }
     for(unsigned w=0;w<s->workers;++w)
         checked(transfer(s->memory[1],(w+1)*sizeof(struct qp_control),&s->slots[w+1].control,sizeof(struct qp_control),true),"initialize worker control");
-    s->function=pg_sina_function(s->graph_join?"pg_sina_graph_continue":"pg_sina_plan"); s->active=true;
+    s->function=pg_sina_function(s->graph_tree?"pg_sina_graph_continue":"pg_sina_plan"); s->active=true;
     size_t size=sizeof(CsBatchRequest)+6*sizeof(CsComputeArg); CsBatchRequest *request=palloc0(size);
     request->ReqType=CS_QUEUE_COMPUTE; request->u.Compute.CSFId=s->function; request->u.Compute.NumArgs=6;
     for(unsigned i=0;i<5;++i) csHelperSetComputeArg(&request->u.Compute.Args[i],CS_AFDM_TYPE,s->memory[i],0UL);
@@ -703,19 +793,14 @@ static void start(PlanStateCsd *s)
         CS_BATCH_INDEX index; checked(csConfigureBatchEntry(s->slots[w].batch,CS_BATCH_ADD,request,0,0,&index),"configure batch");
         atomic_init(&s->slots[w].completed,false); s->slots[w].profiling=s->profiling;
     }
-    if(s->graph_join) {
+    if(s->graph_tree) {
         s->graph_source=pg_sina_function("pg_sina_graph_source");
         s->graph_build=pg_sina_function("pg_sina_graph_hash_build");
-        csHelperSetComputeArg(&request->u.Compute.Args[4],CS_AFDM_TYPE,s->memory[4],0UL);
-        for(enum graph_phase phase=GRAPH_SOURCE_RIGHT;phase<GRAPH_PHASES;++phase) {
-            graph_request(s,phase,&request->u.Compute,false);
-            checked(csAllocBatchRequest(CS_BATCH_SERIAL,1,&s->graph_batches[phase]),"allocate graph stage");
-            CS_BATCH_INDEX index;
-            checked(csConfigureBatchEntry(s->graph_batches[phase],CS_BATCH_ADD,request,0,0,&index),"configure graph stage");
-        }
+        s->graph_probe=pg_sina_function("pg_sina_graph_hash_probe");
+        s->graph_feed=pg_sina_function("pg_sina_graph_feed");
     }
     pfree(request); s->started=true;
-    if(s->async_scan) {
+    if(s->async_scan || s->graph_tree) {
         if(!s->delivery) initialize_delivery(s,NULL);
         struct result_delivery *q=s->delivery;
         q->fdm_bytes=s->fdm_bytes; q->workers=s->workers;
@@ -910,7 +995,8 @@ static CS_STATUS queue_pages(struct plan_slot *slot)
         status=csFreeBatchRequest(slot->resume); if(status!=CS_SUCCESS) return status;
         slot->resume=NULL;
     }
-    if(!graph_building(phase) && (slot->control.bytes || slot->control.index_nreads) && !slot->control.ready) {
+    if((phase==GRAPH_NATIVE || phase==GRAPH_SOURCE) &&
+       (slot->control.bytes || slot->control.index_nreads) && !slot->control.ready) {
         unsigned groups=1;
         for(unsigned j=1;j<slot->control.index_nreads;++j)
             groups+=slot->control.index_reads[j].slot!=slot->control.index_reads[j-1].slot+1;
@@ -926,22 +1012,26 @@ static CS_STATUS queue_pages(struct plan_slot *slot)
             if(status!=CS_SUCCESS) return status;
         }
     }
-    if(slot->resume) {
-        CsBatchRequest *request=calloc(1,sizeof(*request)+6*sizeof(CsComputeArg));
+    CS_BATCH_HANDLE *batch=phase==GRAPH_NATIVE?&slot->batch:&s->graph[s->graph_node].batches[phase];
+    if(slot->resume || !*batch) {
+        if(!slot->resume) {
+            status=csAllocBatchRequest(CS_BATCH_SERIAL,1,batch);
+            if(status!=CS_SUCCESS) return status;
+        }
+        CsBatchRequest *request=calloc(1,sizeof(*request)+7*sizeof(CsComputeArg));
         if(!request) return CS_OUT_OF_RESOURCES;
         request->ReqType=CS_QUEUE_COMPUTE; request->u.Compute.CSFId=s->function; request->u.Compute.NumArgs=6;
         for(unsigned i=0;i<5;++i) csHelperSetComputeArg(&request->u.Compute.Args[i],CS_AFDM_TYPE,s->memory[i],0UL);
         csHelperSetComputeArg(&request->u.Compute.Args[4],CS_AFDM_TYPE,worker?s->worker_io[worker-1]:s->memory[4],0UL);
-        if(phase!=GRAPH_NATIVE) graph_request(s,phase,&request->u.Compute,loaded);
+        if(phase!=GRAPH_NATIVE) graph_request(s,&request->u.Compute,loaded);
         else csHelperSetComputeArg(&request->u.Compute.Args[5],CS_64BIT_VALUE_TYPE,(u64)(s->profiling|(worker<<1)|(loaded?QP_PAGES_INPUT:0)));
         CS_BATCH_INDEX index;
-        status=csConfigureBatchEntry(slot->resume,CS_BATCH_ADD,request,0,slot->previous,&index);
+        status=csConfigureBatchEntry(slot->resume?slot->resume:*batch,CS_BATCH_ADD,request,0,slot->resume?slot->previous:0,&index);
         free(request); if(status!=CS_SUCCESS) return status;
     }
     slot->control_copied=false;
     if(s->profiling) slot->queued_ns=clock_ns();
-    CS_BATCH_HANDLE batch=phase==GRAPH_NATIVE?slot->batch:s->graph_batches[phase];
-    return csQueueBatchRequest(slot->resume?slot->resume:batch,slot,completed,NULL,&slot->inflight,NULL);
+    return csQueueBatchRequest(slot->resume?slot->resume:*batch,slot,completed,NULL,&slot->inflight,NULL);
 }
 static CS_STATUS submit(PlanStateCsd *s,unsigned worker)
 {
@@ -965,7 +1055,7 @@ static CS_STATUS submit(PlanStateCsd *s,unsigned worker)
         pthread_mutex_unlock(&slot->mutex);
         return status==CS_QUEUED?CS_SUCCESS:status;
     }
-    if(!worker && slot->control.available) {
+    if(!worker && slot->control.available && (!s->graph_tree || s->graph_phase==GRAPH_SOURCE)) {
         uint64_t written=s->profiling?clock_ns():0;
         CS_STATUS status=transfer(s->memory[1],offsetof(struct qp_control,available),&slot->control.available,sizeof(slot->control.available),true);
         if(status!=CS_SUCCESS) return status;
@@ -1015,19 +1105,25 @@ static CS_STATUS read_result(PlanStateCsd *s,unsigned worker,const struct qp_con
 }
 static bool complete_graph_stage(PlanStateCsd *s,u64 value)
 {
+    if(value&QP_RESOURCE_WAIT) return true;
+    unsigned id=s->graph_node;
     enum graph_phase phase=s->graph_phase;
+    struct graph_stage *stage=&s->graph[id];
+    int child=graph_child(s,id,phase);
     if(graph_building(phase)) {
-        if(value&QP_RESOURCE_WAIT) return true;
         if(!(value&QP_INPUT_DRAINED) || (value&QP_GRAPH_HASH_MERGE_REQUIRED)) return false;
-        ++s->graph_packets;
-        if(value&QP_WORKER_FINISHED) s->graph_phase=GRAPH_NATIVE;
-        else if(value&QP_GRAPH_HASH_NEEDS_LEFT) s->graph_phase=GRAPH_SOURCE_LEFT;
-        else if(!s->graph_eof) s->graph_phase=graph_left(phase)?GRAPH_SOURCE_LEFT:GRAPH_SOURCE_RIGHT;
-        else return false;
+        ++s->graph_build_packets;
+        if(value&QP_WORKER_FINISHED)
+            stage->phase=phase==GRAPH_BUILD_LEFT?GRAPH_PROBE_SPILL:GRAPH_PROBE;
+        else if(value&QP_GRAPH_HASH_NEEDS_LEFT)
+            stage->phase=GRAPH_BUILD_LEFT;
+        else if(s->graph[child].eof) return false;
     } else if(value&(QP_OUTPUT_READY|QP_WORKER_FINISHED)) {
-        s->graph_eof=(value&QP_WORKER_FINISHED)!=0;
-        s->graph_phase=graph_left(phase)?GRAPH_BUILD_LEFT:GRAPH_BUILD_RIGHT;
+        ++s->graph_packets;
+        stage->ready=true; stage->eof=(value&QP_WORKER_FINISHED)!=0;
     }
+    if(child>=0 && (value&QP_INPUT_DRAINED)) s->graph[child].ready=s->graph[child].eof;
+    if(id!=s->plan->root || !stage->eof) graph_pick(s,s->plan->root);
     return true;
 }
 static int advance(PlanStateCsd *s,struct qs_result *result)
@@ -1068,16 +1164,19 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
         }
         bool staged=!w && s->graph_phase!=GRAPH_NATIVE;
         if(!w) { memset(result,0,offsetof(struct qs_result,data)); result->str_bytes=0; }
-        if(status==CS_SUCCESS && !staged && (!w || direct) && (slot->control.output_rows || slot->control.finished))
+        bool root_output=staged && s->graph_node==s->plan->root && !graph_building(s->graph_phase);
+        if(status==CS_SUCCESS && ((!staged && (!w || direct)) ||
+           (root_output && (value&(QP_OUTPUT_READY|QP_WORKER_FINISHED)))) &&
+           (slot->control.output_rows || slot->control.finished))
             status=read_result(s,w,&slot->control,result);
         if(s->profiling) s->completion_copy_ns+=clock_ns()-observed;
         if(status!=CS_SUCCESS) {
             char operation[160];
             snprintf(operation,sizeof(operation),
-                "execute tree (worker=%u node=%u kind=%u device_error=%d completion=%llu)",
+                "execute tree (worker=%u node=%u kind=%u device_error=%d completion=%llu graph=%u/%u)",
                 w,slot->control.error_node,slot->control.error_node<s->plan->count?
                 s->plan->nodes[slot->control.error_node].kind:0,
-                slot->control.error,(unsigned long long)value);
+                slot->control.error,(unsigned long long)value,staged?s->graph_node:0,staged?s->graph_phase:0);
             return execution_failed(s,status,operation);
         }
         if(slot->resume) {
@@ -1107,7 +1206,7 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
             continue;
         }
         if(staged && !complete_graph_stage(s,value))
-            return execution_failed(s,CS_ERROR_IN_EXECUTION,"unsupported graph HashBuild continuation");
+            return execution_failed(s,CS_ERROR_IN_EXECUTION,"unsupported SNIA graph stage continuation");
         if(result->rows || result->finished || slot->control.drained || (staged && !(value&QP_RESOURCE_WAIT)))
             atomic_fetch_add_explicit(&s->batch_progress,1,memory_order_release);
         for(unsigned i=1;i<=s->workers;++i) if(slot->control.drained&(UINT64_C(1)<<(i-1))) s->slots[i].ready=false;
@@ -1190,7 +1289,8 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
             s->prefetch_waited=true;
             idle=false;
         }
-        if(idle && (graph_building(s->graph_phase) || !s->parallel || ready || !main->control.parallel)) {
+        bool graph_consumer=s->graph_tree && s->graph_phase!=GRAPH_SOURCE;
+        if(idle && (graph_consumer || !s->parallel || ready || !main->control.parallel)) {
             main->control.available=ready;
             CS_STATUS status=submit(s,0);
             if(status!=CS_SUCCESS) return execution_failed(s,status,"queue tree");
@@ -1249,7 +1349,7 @@ static void fetch(PlanStateCsd *s)
     uint64_t empty=0;
     for(;;) {
         CHECK_FOR_INTERRUPTS();
-        if(s->async_scan) {
+        if(s->async_scan || s->graph_tree) {
             struct result_delivery *q=s->delivery;
             uint64_t waiting=s->profiling?clock_ns():0;
             pthread_mutex_lock(&q->mutex);
@@ -1399,12 +1499,15 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     PlanStateCsd *s=(void *)node;
     /* EXPLAIN can inspect a LIMIT-stopped private stream before EndCustomScan.
      * Freeze callback-written counters before exposing them to PG. */
-    if(s->async_scan && !s->delivery_shared && s->started) close_state(s);
+    if((s->async_scan || s->graph_tree) && !s->delivery_shared && s->started) close_state(s);
     pg_sina_explain_placement((CustomScan *)node->ss.ps.plan,es);
     ExplainPropertyText("Execution Path","csd",es);
-    ExplainPropertyText("CSD Executor",s->graph_join?"staged SNIA HashBuild":
-        pg_sina_operator_graph?"SNIA operator graph":"pg_sina_plan",es);
-    if(s->graph_join) ExplainPropertyInteger("CSD Graph Build Packets",NULL,s->graph_packets,es);
+    ExplainPropertyText("CSD Executor",pg_sina_operator_graph?"SNIA operator graph":"pg_sina_plan",es);
+    if(s->graph_tree) {
+        ExplainPropertyInteger("CSD Graph Nodes",NULL,s->graph_nodes,es);
+        ExplainPropertyInteger("CSD Graph Packets",NULL,s->graph_packets,es);
+        ExplainPropertyInteger("CSD Graph Build Packets",NULL,s->graph_build_packets,es);
+    }
     if(s->operator_graph) {
         const struct qs_metrics *m=&s->result->metrics;
         ExplainPropertyText("CSD Operator Batches","LOAD -> Scan -> Filter -> SortSink | SortSource -> Offset -> Sum",es);

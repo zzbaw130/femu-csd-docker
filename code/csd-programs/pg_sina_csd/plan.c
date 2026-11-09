@@ -4470,7 +4470,7 @@ static int64_t aggregate_next_impl(struct execution *s,unsigned id,struct qs_cel
     if(n->nkeys && n->left>=0 && !n->sorted_input && !n->distinct && !o->phase && !o->emitted &&
        input_ordered(s->plan,n->left,n->nkeys,n->left_keys,NULL)) s->plan->nodes[id].sorted_input=1;
     if(n->nkeys && n->sorted_input && !n->distinct && !n->distinct_aggs && !o->input_done && !o->have_left &&
-       n->left>=0 && !(!s->worker && s->plan->workers>1 && s->plan->nodes[n->left].parallel)) {
+       n->left>=0 && !(!s->hash_input && !s->worker && s->plan->workers>1 && s->plan->nodes[n->left].parallel)) {
         int status=projection_init(s,id,0); if(status) return status;
     }
     /* Initialize before starting the child pipeline: parallel workers combine
@@ -4479,7 +4479,7 @@ static int64_t aggregate_next_impl(struct execution *s,unsigned id,struct qs_cel
         memset(o->accum,0,sizeof(o->accum)); o->phase=1;
     }
     if(!n->nkeys && !n->distinct && !n->distinct_aggs && !o->input_done && !o->emitted && n->left>=0 &&
-       !(!s->worker && s->plan->workers>1 && s->plan->nodes[n->left].parallel)) {
+       !(!s->hash_input && !s->worker && s->plan->workers>1 && s->plan->nodes[n->left].parallel)) {
         int64_t status=projection_init(s,id,0); if(status) return status;
         while(o->projection) {
             status=projection_fill(s,id,0);
@@ -5272,21 +5272,21 @@ restart:
         }
         s->partition_join=partition_join;
         unsigned hash_sink=0,group_sink=0,aggregate_sink=0,partition_sink=0;
-        for(unsigned i=0;i<p->count;++i) {
+        if(!s->graph_source_pending) for(unsigned i=0;i<p->count;++i) {
             const struct qp_node *parent=&p->nodes[i];
             if(parent->kind==QP_AGGREGATE && parent->left==(int)root &&
                !parent->nkeys && !parent->distinct && !parent->distinct_aggs)
                 aggregate_sink=i+1;
         }
-        for(unsigned i=0;i<p->count;++i)
+        if(!s->graph_source_pending) for(unsigned i=0;i<p->count;++i)
             if(p->nodes[i].kind==QP_AGGREGATE && p->nodes[i].left==(int)root &&
                p->nodes[i].hash && s->nodes[i].groups && !s->nodes[i].group_phase)
                 group_sink=i+1;
-        for(unsigned i=0;i<p->count;++i)
+        if(!s->graph_source_pending) for(unsigned i=0;i<p->count;++i)
             if(p->nodes[i].kind==QP_JOIN && p->nodes[i].right==(int)root &&
                s->nodes[i].hash_data && !s->nodes[i].hash_phase && !s->nodes[i].hash_fallback)
                 hash_sink=i+1;
-        if(!hash_sink) for(unsigned i=0;i<p->count;++i)
+        if(!s->graph_source_pending && !hash_sink) for(unsigned i=0;i<p->count;++i)
             if(p->nodes[i].kind==QP_JOIN && s->nodes[i].external &&
                ((!s->nodes[i].external->phase && p->nodes[i].right==(int)root) ||
                 (s->nodes[i].external->phase==1 && p->nodes[i].left==(int)root)))
@@ -5422,7 +5422,10 @@ restart:
             }
         }
         if(group_sink) { int status=parallel_group_begin(s,group_sink-1); if(status) return status; }
-        if(!hash_sink && !group_sink && !aggregate_sink && !partition_sink) parallel_sort_begin(s,root);
+        /* An explicit graph consumer takes the packet in a later E9
+         * submission. Workers still split and decode the scan morsels. */
+        if(!s->graph_source_pending && !hash_sink && !group_sink && !aggregate_sink && !partition_sink)
+            parallel_sort_begin(s,root);
         s->parallel_node=root; s->parallel_done=0;
         memset(s->parallel_position,0,sizeof(s->parallel_position)); atomic_store(&s->next_offset,0);
         s->control->parallel=hash_sink || group_sink || partition_sink?2:1; ++s->control->epoch; s->control->available=s->control->drained=0;
@@ -5747,7 +5750,7 @@ static int output_text(struct execution *s,struct qs_cell value,const char **byt
         int status=namespace_ranges(s,&s->plan->files[node],block*QS_PAGE,QS_PAGE,QS_PAGE,0,&count);
         if(status!=1 || !count || s->io_bytes<2*QS_PAGE) return -3;
         struct femu_graph_read *reads=s->io;
-        for(unsigned i=0;i<count;++i) reads[i].afdm_index=htole32(4);
+        for(unsigned i=0;i<count;++i) reads[i].afdm_index=htole32(s->args->numr-1);
         s->late_node=node; s->late_block=block; s->late_valid=0;
         s->late_wait=csNeedNvmRead(count); return -3;
     }
@@ -5890,6 +5893,37 @@ static int host_append(struct execution *s,const struct qs_plan *p,struct qs_res
     return 0;
 }
 
+static void host_begin(struct execution *s,const struct qs_plan *p,struct qs_result *out,unsigned capacity)
+{
+    for(unsigned col=0;col<p->nout;++col) {
+        s->host_widths[col]=qp_host_width(p->outputs[col].type_oid);
+        s->host_columns[col]=qp_host_values(out,p,capacity,col);
+        s->host_nulls[col]=s->host_columns[col]+(size_t)capacity*s->host_widths[col];
+        memset(s->host_nulls[col],0,(capacity+7)/8);
+    }
+}
+static void plan_output_metrics(struct execution *s,struct qs_result *out,unsigned worker)
+{
+    const struct qp_plan *plan=s->plan;
+    out->metrics=s->metrics; out->metrics.workers=s->used_workers?s->used_workers:1; out->profile=s->profile;
+    struct qs_dictionary_stats dictionary;
+    qs_dictionary_get_stats(s->paged,&dictionary);
+    out->metrics.dictionary_entries=dictionary.strings; out->metrics.dictionary_bytes=dictionary.bytes;
+    if(!worker) {
+        out->metrics.spill_read_bytes+=dictionary.loads*QS_DICTIONARY_PAGE_BYTES;
+        out->metrics.spill_write_bytes+=dictionary.stores*QS_DICTIONARY_PAGE_BYTES;
+    }
+    for(unsigned i=0;i<plan->count;++i) if(plan->nodes[i].kind==QP_INDEX_JOIN || plan->nodes[i].ordered_index) {
+        const struct qs_task *task=&s->nodes[i].index_task;
+        out->metrics.index_pages+=task->index_pages;
+        out->metrics.index_tuples+=task->index_tuples;
+        if(plan->nodes[i].kind==QP_INDEX_JOIN)
+            qs_index_cache_stats(&s->nodes[i].index_control,&out->metrics,&out->profile);
+    }
+    out->metrics.input_bytes+=out->metrics.index_pages*QS_PAGE;
+    struct cs_work_context_stats memory;
+    if(!cs_work_get_context_stats(s->context,&memory)) out->metrics.work_peak=memory.peak_used_bytes;
+}
 static int open_execution(struct femu_csd_args *a,struct qp_plan *plan,
     struct qp_control *control,struct execution **opened)
 {
@@ -5907,7 +5941,7 @@ static int open_execution(struct femu_csd_args *a,struct qp_plan *plan,
                 memcpy(&s->params[i],values+(size_t)i*sizeof(struct qs_cell),sizeof(struct qs_cell));
     }
     s->partition_join=s->source_node=-1;
-    s->arena=a->mr_addr[3]; s->io=a->mr_addr[4]; s->io_bytes=a->mr_len[4];
+    s->arena=a->mr_addr[3]; s->io=a->mr_addr[a->numr-1]; s->io_bytes=a->mr_len[a->numr-1];
     s->nodes=cs_work_calloc(context,plan->count,sizeof(*s->nodes));
     if(!s->nodes) { cs_work_end(context); return -4; }
     unsigned depth=sort_depth(plan,plan->root);
@@ -6020,36 +6054,53 @@ int64_t pg_sina_graph_hash_build(struct femu_csd_args *a)
     return flags;
 }
 
-/* Emit one packed device packet from a selected producer, retaining the
- * query context for its consumers. No host result encoding is involved. */
+static int64_t graph_finish(struct execution *s,struct femu_csd_args *a,struct qs_result *out)
+{
+    const struct qp_control *control=s->control;
+    if(s->buffered) { out->rows=s->buffered_rows; out->finished=s->buffered_finished; s->buffered=0; }
+    int64_t status=finish_dictionary(s,a,out);
+    if(status) return status;
+    if(control->state) return QP_RESOURCE_WAIT;
+    return QP_WORKER_FINISHED | QP_INPUT_DRAINED | (out->rows?QP_OUTPUT_READY:0);
+}
+
+/* Internal edges carry packed cells. The root uses the existing typed
+ * PostgreSQL boundary encoder and closes the same workmem context. */
 static int64_t graph_emit(struct femu_csd_args *a,enum graph_emit_kind kind)
 {
     bool probe=kind==GRAPH_EMIT_PROBE, fed=kind!=GRAPH_EMIT_SOURCE;
-    if(!a || a->numr!=(fed?6:5) || a->mr_len[0]<(long long)sizeof(struct qp_plan) ||
+    if(!a || (a->numr!=6 && (fed || a->numr!=5)) || a->mr_len[0]<(long long)sizeof(struct qp_plan) ||
        a->mr_len[1]<(long long)sizeof(struct qp_control) ||
        a->mr_len[2]<(long long)sizeof(struct qs_result) ||
-       a->mr_len[3]<(long long)sizeof(struct qs_dict) || a->mr_len[4]<QS_SORT_IO_BYTES ||
-       (fed && a->mr_len[5]<(long long)sizeof(struct qs_result))) return -1;
+       a->mr_len[3]<(long long)sizeof(struct qs_dict) || a->mr_len[a->numr-1]<QS_SORT_IO_BYTES ||
+       (a->numr==6 && a->mr_len[4]<(long long)sizeof(struct qs_result))) return -1;
     struct qp_plan *plan=a->mr_addr[0];
     struct qp_control *control=a->mr_addr[1];
     struct execution *s=(void *)(uintptr_t)control->state;
     if(control->close) { if(s) close_execution(s); return 0; }
-    uint64_t id=(uint64_t)a->cparam1>>QP_GRAPH_SOURCE_NODE_SHIFT;
+    uint64_t parameter=(uint64_t)a->cparam1;
+    bool typed=(parameter&QP_GRAPH_HOST_OUTPUT)!=0;
+    uint64_t id=(parameter&~QP_GRAPH_HOST_OUTPUT)>>QP_GRAPH_SOURCE_NODE_SHIFT;
     if(plan->count>QP_NODES || id>=plan->count || plan->nparams>QP_PARAMS || plan->ninit ||
        (uint64_t)a->mr_len[0]<sizeof(*plan)+qp_host_parameter_bytes(plan) ||
        plan->workers>QS_WORKERS || a->mr_len[1]<(long long)((plan->workers+1)*sizeof(*control)) ||
        (!s && a->mr_len[2]<(long long)((plan->workers+1)*sizeof(struct qs_result)))) return -1;
     unsigned cols=plan->nodes[id].expr.nout;
-    if(!cols || cols>QS_OUT) return -1;
+    if(!cols || cols>QS_OUT || (typed && (id!=plan->root || plan->packed_result!=QP_TYPED_RESULT ||
+       (!fed && a->numr==6)))) return -1;
+    const struct qs_plan *output=&plan->nodes[id].expr;
+    struct qs_result *out=!fed && a->numr==6?a->mr_addr[4]:a->mr_addr[2];
     if(!s) {
         if(fed || csIsReentry(a)) return -1;
         int status=open_execution(a,plan,control,&s); if(status) return status;
     }
-    if(s->plan!=plan || s->owner || s->closing ||
+    if(s->plan!=plan || s->owner ||
        (s->graph_source_pending && (s->graph_source_node!=id || s->graph_source_kind!=kind))) return -1;
+    s->args=a; s->io=a->mr_addr[a->numr-1]; s->io_bytes=a->mr_len[a->numr-1];
+    if(s->closing) return typed?graph_finish(s,a,out):-1;
     const struct qp_node *n=&plan->nodes[id];
     struct operator_state *o=&s->nodes[id];
-    const struct qs_result *in=fed?a->mr_addr[5]:NULL;
+    const struct qs_result *in=fed?a->mr_addr[4]:NULL;
     if(fed) {
         if(n->left<0 || (unsigned)n->left>=plan->count) return -1;
         if(probe && (n->kind!=QP_JOIN || !n->hash || o->hash_fallback==1 ||
@@ -6066,17 +6117,17 @@ static int64_t graph_emit(struct femu_csd_args *a,enum graph_emit_kind kind)
             o->graph_input_position=o->graph_probe_count=0; o->graph_input_held=true;
         }
     }
-    s->args=a; s->io=a->mr_addr[4]; s->io_bytes=a->mr_len[4];
     s->raw_projection=0;
     if(!csIsReentry(a)) {
         control->drained=0;
         if(!fed && ((uint64_t)a->cparam1&QP_GRAPH_SOURCE_PAGES)) control->ready=1;
     }
     wait_resume(s);
-    struct qs_result *out=a->mr_addr[2];
+    unsigned capacity=typed?qp_host_capacity(output):QS_RESULT_ROWS*QS_OUT/cols;
     if(!s->graph_source_pending) {
         out->rows=out->begin=out->finished=out->str_bytes=0; out->status=0;
         s->graph_source_node=id; s->graph_source_kind=kind; s->graph_source_pending=true;
+        if(typed) host_begin(s,output,out,capacity);
     }
     int64_t status=initialize_dictionary(s,a);
     if(status) goto wait;
@@ -6092,11 +6143,15 @@ static int64_t graph_emit(struct femu_csd_args *a,enum graph_emit_kind kind)
         s->hash_input=in; s->hash_input_node=n->left;
         s->hash_input_position=o->graph_input_position;
     }
-    unsigned capacity=QS_RESULT_ROWS*QS_OUT/cols;
     while(out->rows<capacity) {
-        status=next_row(s,id,qp_result_row(out,out->rows,cols,1));
+        struct qs_cell *row=typed?s->host_row:qp_result_row(out,out->rows,cols,1);
+        status=typed && s->host_pending?2:next_row(s,id,row);
         if(status!=2) break;
-        ++out->rows;
+        if(!typed) { ++out->rows; continue; }
+        s->host_pending=1;
+        int appended=host_append(s,output,out);
+        if(appended<0) status=appended;
+        if(appended) break;
     }
     if(fed) { o->graph_input_position=s->hash_input_position; s->hash_input=NULL; }
     if(s->late_wait) status=s->late_wait;
@@ -6118,6 +6173,13 @@ static int64_t graph_emit(struct femu_csd_args *a,enum graph_emit_kind kind)
     if(!status) out->finished=1;
     s->graph_source_pending=false;
     if(drained) o->graph_input_held=false;
+    if(typed) {
+        qp_host_compact(out,output,capacity);
+        control->output_rows=out->rows; control->output_strings=out->str_bytes;
+        control->finished=out->finished;
+        plan_output_metrics(s,out,0);
+        if(out->finished) { s->closing=1; return graph_finish(s,a,out); }
+    }
     return (out->rows?QP_OUTPUT_READY:0) | (out->finished?QP_WORKER_FINISHED:0) |
         (drained?QP_INPUT_DRAINED:status==QP_WAIT?QP_CONTROL_REQUIRED:0);
 wait:
@@ -6206,15 +6268,8 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
     unsigned capacity=worker && !typed?QS_RESULT_ROWS*QS_OUT/(columns?columns:1):
         qp_result_capacity(&plan->nodes[plan->root].expr,plan->packed_result);
     int64_t status=0; int host_full=0,host_publish=0;
-    if(typed && !s->host_building) {
-        const struct qs_plan *p=&plan->nodes[plan->root].expr;
-        for(unsigned col=0;col<p->nout;++col) {
-            s->host_widths[col]=qp_host_width(p->outputs[col].type_oid);
-            s->host_columns[col]=qp_host_values(out,p,capacity,col);
-            s->host_nulls[col]=s->host_columns[col]+(size_t)capacity*s->host_widths[col];
-            memset(s->host_nulls[col],0,(capacity+7)/8);
-        }
-    }
+    if(typed && !s->host_building)
+        host_begin(s,&plan->nodes[plan->root].expr,out,capacity);
     if(s->output_active) { status=s->output_status; goto export_results; }
     while(s->initializer<plan->ninit) {
         unsigned index=s->initializer,node=plan->init_nodes[index]; int param=plan->init_params[index];
@@ -6452,27 +6507,12 @@ combined:
     }
     control->output_rows=(s->late_wait || s->text_wait || s->dictionary_wait || (typed && !host_publish))?0:out->rows;
     control->output_strings=out->str_bytes;
-    out->metrics=s->metrics; out->metrics.workers=s->used_workers?s->used_workers:1; out->profile=s->profile;
-    struct qs_dictionary_stats dictionary;
-    qs_dictionary_get_stats(s->paged,&dictionary);
-    out->metrics.dictionary_entries=dictionary.strings; out->metrics.dictionary_bytes=dictionary.bytes;
-    if(!worker) {
-        out->metrics.spill_read_bytes+=dictionary.loads*QS_DICTIONARY_PAGE_BYTES;
-        out->metrics.spill_write_bytes+=dictionary.stores*QS_DICTIONARY_PAGE_BYTES;
-    }
-    for(unsigned i=0;i<plan->count;++i) if(plan->nodes[i].kind==QP_INDEX_JOIN || plan->nodes[i].ordered_index) {
-        const struct qs_task *task=&s->nodes[i].index_task;
-        out->metrics.index_pages+=task->index_pages;
-        out->metrics.index_tuples+=task->index_tuples;
-        if(plan->nodes[i].kind==QP_INDEX_JOIN)
-            qs_index_cache_stats(&s->nodes[i].index_control,&out->metrics,&out->profile);
-    }
-    out->metrics.input_bytes+=out->metrics.index_pages*QS_PAGE;
-    struct cs_work_context_stats memory;
-    if(!cs_work_get_context_stats(s->context,&memory)) out->metrics.work_peak=memory.peak_used_bytes;
+    plan_output_metrics(s,out,worker);
     if(status<0) {
         struct cs_work_stats pool={0};
+        struct cs_work_context_stats memory={0};
         cs_work_get_stats(&pool);
+        cs_work_get_context_stats(s->context,&memory);
         const struct operator_state *failed=&s->nodes[control->error_node<plan->count?control->error_node:plan->root];
         fprintf(stderr,"CSD plan error=%lld worker=%u node=%u root=%u phase=%u groups=%u capacity=%u radix=%u context_used=%zu context_limit=%zu pool_used=%zu pool_free=%zu largest_free=%zu\n",
             (long long)status,worker,control->error_node,s->root,failed->group_phase,

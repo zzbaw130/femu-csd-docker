@@ -148,7 +148,9 @@ static struct program connection_programs[]={
     {.file="pg-sina-graph-tail.so",.symbol="pg_sina_graph_sum",.index=515},
     {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_source"},
     {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_hash_build"},
-    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_continue"}
+    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_continue"},
+    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_hash_probe"},
+    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_feed"}
 };
 struct pg_sina_resources pg_sina_resources;
 static void close_connection(int code,Datum arg)
@@ -181,7 +183,7 @@ void pg_sina_init_device(void)
         /* Extra graph entries live above every backend's original range.
          * Reference connections can still use the installed 16-slot layout. */
         unsigned index=i<16?500+i+program_offset:
-            516+MaxBackends*16+(MyBackendId-1)*3+(i-16);
+            516+MaxBackends*16+(MyBackendId-1)*(lengthof(connection_programs)-16)+(i-16);
         if(index>UINT16_MAX) { status=CS_OUT_OF_RESOURCES; break; }
         connection_programs[i].index=index;
         status=load_program(connection_device,&connection_programs[i]);

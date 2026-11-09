@@ -1,7 +1,7 @@
 query,prior_device_plan,operator_graph_coverage
 Q1,"Single-table grouped aggregate fast path",single_table_aggregate
 Q2,"0:Limit <- 1; 1:Sort[0 desc,2 asc,1 asc,3 asc] <- 2; 2:Hash Join <- 3,20; 3:Hash Join <- 4,5; 4:Scan(nation); 5:Hash Join <- 6,7; 6:Scan(supplier); 7:Index Join <- 8,19; 8:Hash Join <- 9,18; 9:Projection <- 10; 10:Hash Aggregate[keys=1,payload=0] <- 11; 11:Hash Join <- 12,13; 12:Scan(partsupp); 13:Hash Join <- 14,15; 14:Scan(supplier); 15:Hash Join <- 16,17; 16:Scan(nation); 17:Scan(region); 18:Scan(part); 19:Scan(partsupp); 20:Scan(region)",general_operator_graph_required
-Q3,"0:Limit <- 1; 1:Sort[1 desc,2 asc] <- 2; 2:Hash Aggregate[keys=3,payload=0] <- 3; 3:Hash Join <- 4,5; 4:Scan(lineitem); 5:Hash Join <- 6,7; 6:Scan(orders); 7:Scan(customer)",staged_hash_build_only
+Q3,"0:Limit <- 1; 1:Sort[1 desc,2 asc] <- 2; 2:Hash Aggregate[keys=3,payload=0] <- 3; 3:Hash Join <- 4,5; 4:Scan(lineitem); 5:Hash Join <- 6,7; 6:Scan(orders); 7:Scan(customer)",tree_operator_graph
 Q4,"0:Sort[0 asc] <- 1; 1:Hash Aggregate[keys=1,payload=0] <- 2; 2:Index Join <- 3,4; 3:Scan(orders); 4:Scan(lineitem)",general_operator_graph_required
 Q5,"0:Sort[1 desc] <- 1; 1:Hash Aggregate[keys=1,payload=0] <- 2; 2:Projection <- 3; 3:Hash Join <- 4,13; 4:Index Join <- 5,12; 5:Hash Join <- 6,7; 6:Scan(orders); 7:Hash Join <- 8,9; 8:Scan(customer); 9:Hash Join <- 10,11; 10:Scan(nation); 11:Scan(region); 12:Scan(lineitem); 13:Scan(supplier)",general_operator_graph_required
 Q6,"0:Aggregate <- 1; 1:Scan(lineitem)",single_table_aggregate

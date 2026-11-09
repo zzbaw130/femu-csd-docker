@@ -26,6 +26,7 @@
  * input of a partitioned join, and the remaining bits for its qp_node ID.
  * Its input AFDM contains packed qs_result rows from the selected child. */
 #define QP_GRAPH_SOURCE_PAGES 2U
+#define QP_GRAPH_HOST_OUTPUT (UINT64_C(1)<<63)
 #define QP_GRAPH_SOURCE_NODE_SHIFT 2
 #define QP_GRAPH_HASH_LEFT 2U
 #define QP_GRAPH_HASH_NODE_SHIFT 2

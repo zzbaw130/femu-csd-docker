@@ -2368,7 +2368,7 @@ static int64_t graph_compute(function run,struct femu_csd_args *a,struct test_sp
         assert(status>=0);
         unsigned op=(uint64_t)status>>60;
         if(!op) { a->cparam2=0; return status; }
-        a->cparam2=spill_request(spill,op,(uint64_t)status&CS_IO_VALUE_MASK,a->mr_addr[4]);
+        a->cparam2=spill_request(spill,op,(uint64_t)status&CS_IO_VALUE_MASK,a->mr_addr[a->numr-1]);
     }
     abort();
 }
@@ -2502,14 +2502,14 @@ static void graph_hash_build(function source,function build,function probe,funct
     __int128 aggregate_sum=0, skipped=0, last=0;
     __int128 sum=0;
     struct qs_result *output=calloc(1,sizeof(*output)); assert(output);
-    void *probe_mr[]={plan,&control,output,arena,io,packet};
-    long long probe_len[]={sizeof(*plan),sizeof(control),sizeof(*output),bytes,QS_SORT_IO_BYTES,sizeof(*packet)};
+    void *probe_mr[]={plan,&control,output,arena,packet,io};
+    long long probe_len[]={sizeof(*plan),sizeof(control),sizeof(*output),bytes,sizeof(*packet),QS_SORT_IO_BYTES};
     struct femu_csd_args probe_args={.numr=6,.mr_addr=probe_mr,.mr_len=probe_len};
     struct qs_result *sorted=calloc(1,sizeof(*sorted)),*limited=calloc(1,sizeof(*limited));
     struct qs_result *final=calloc(1,sizeof(*final)); assert(sorted && limited && final);
-    void *sort_mr[]={plan,&control,sorted,arena,io,output};
-    void *limit_mr[]={plan,&control,limited,arena,io,sorted};
-    void *agg_mr[]={plan,&control,final,arena,io,limited};
+    void *sort_mr[]={plan,&control,sorted,arena,output,io};
+    void *limit_mr[]={plan,&control,limited,arena,sorted,io};
+    void *agg_mr[]={plan,&control,final,arena,limited,io};
     struct femu_csd_args sort_args=probe_args, limit_args=probe_args, agg_args=probe_args;
     sort_args.mr_addr=sort_mr; sort_args.cparam1=UINT64_C(6)<<QP_GRAPH_SOURCE_NODE_SHIFT;
     limit_args.mr_addr=limit_mr; limit_args.cparam1=UINT64_C(7)<<QP_GRAPH_SOURCE_NODE_SHIFT;
