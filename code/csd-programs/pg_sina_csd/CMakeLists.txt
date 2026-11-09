@@ -46,6 +46,8 @@ add_csd_program(pg-sina-graph-tail graph_tail.c)
 target_include_directories(pg-sina-graph-tail PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
 add_csd_program(pg-sina-plan plan.c scan.c sort.c index_scan.c filter.c dictionary.c)
 target_include_directories(pg-sina-plan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
+add_csd_program(pg-sina-graph-plan plan.c scan.c sort.c index_scan.c filter.c dictionary.c)
+target_include_directories(pg-sina-graph-plan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
 if(BUILD_TESTING)
     add_executable(pg-sina-scalar-dictionary-test tests/scalar_dictionary.c scan.c sort.c index_scan.c filter.c dictionary.c)
     target_include_directories(pg-sina-scalar-dictionary-test PRIVATE "${CSD_FEMU_INCLUDE}" "${CMAKE_CURRENT_SOURCE_DIR}"

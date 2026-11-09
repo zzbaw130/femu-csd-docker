@@ -6,6 +6,7 @@
 # 包装入口用 TPCH_CACHE_MODE 指定缓存模式，TPCH_RUNS 指定默认次数。
 # TPCH_MODES 可指定以空格分隔的执行模式；默认测试全部五种。
 # TPCH_MODES 可追加 original-csd 和 snia-operator-graph 进行执行器对照。
+# snia-staged-hash 仅验证设备端 HashBuild 交接及其原有后续路径。
 # TPCH_PG_MODULE 可指定实验扩展的绝对路径。original-csd 始终用 Guest 安装的扩展。
 # TPCH_REFERENCE_LOGS 可指定同一批正式 SQL 的已有 HOST 日志，用于只测卸载模式时校验结果。
 # TPCH_DCP=off 关闭启用 HPCP 的模式中的 DCP，默认两层同时启用。
@@ -128,6 +129,7 @@ for q in $queries; do
                     options="-c session_preload_libraries=$original_module,auto_explain"
                     ;;
                 snia-operator-graph) placement=csd-without-hpcp; executor='SNIA operator graph' ;;
+                snia-staged-hash) placement=csd-without-hpcp; executor='staged SNIA HashBuild' ;;
             esac
             [ -z "$executor" ] || explain=0
             prewarm=ok
@@ -156,7 +158,7 @@ for q in $queries; do
                 fi
                 printf "SET pg_sina_csd.exe_path='%s'; SET pg_sina_csd.hpcp=%s; SET pg_sina_csd.dcp=%s; SET pg_sina_csd.profile=on;\n" "$placement" "$population" "$dcp"
                 case $mode in
-                    snia-operator-graph) printf 'SET pg_sina_csd.experimental_operator_graph=on;\n' ;;
+                    snia-operator-graph|snia-staged-hash) printf 'SET pg_sina_csd.experimental_operator_graph=on;\n' ;;
                 esac
                 printf "SET auto_explain.log_min_duration=%s; SET auto_explain.log_level=notice; SET auto_explain.log_format=text; SET auto_explain.log_analyze=off; SET auto_explain.log_timing=off;\n" "$explain"
                 if [ -n "$executor" ]; then
@@ -278,7 +280,7 @@ awk -F '\t' -v qs="$queries" -v modes="$modes" -v n="$n" -v kind="$kind" -v out=
         count=split(modes,m," ");
         for(j=1;j<=count;j++) {
             name[j]=tolower(m[j]); gsub(/-/,"_",name[j])
-            if(m[j]=="original-csd" || m[j]=="snia-operator-graph") compare=1
+            if(m[j]=="original-csd" || m[j]=="snia-operator-graph" || m[j]=="snia-staged-hash") compare=1
         }
         timing=out "/" kind ".csv"; detail=out "/" kind "-sqlerate.csv";
         if(compare) {
@@ -302,7 +304,7 @@ awk -F '\t' -v qs="$queries" -v modes="$modes" -v n="$n" -v kind="$kind" -v out=
                 if(s=="ok" && check[k]!="match") s="mismatch";
                 if(s!="ok") bad=1;
                 checks=checks (j>1?";":"") m[j] "=" s;
-                if(m[j]=="original-csd" || m[j]=="snia-operator-graph")
+                if(m[j]=="original-csd" || m[j]=="snia-operator-graph" || m[j]=="snia-staged-hash")
                     print id "," m[j] "," plan[k] "," exec[k] "," ms[k] "," ledger[k] "," csv(path[k]) "," s > executors;
             }
             if(clean[q[i]]!="yes") bad=1;

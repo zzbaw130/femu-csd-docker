@@ -1090,11 +1090,10 @@ static int hash_insert_exists(struct execution *s,const struct qp_node *n,struct
     if(tag) __atomic_store_n(&o->hash_cache[cached],tag,__ATOMIC_RELEASE);
     return 1;
 }
-static int hash_sink_batch(struct execution *s,struct qs_result *out)
+static int hash_append_batch(struct execution *s,unsigned id,struct operator_state *o,
+    const struct qs_cell *rows,unsigned length)
 {
-    unsigned id=s->hash_sink-1;
     const struct qp_node *n=&s->plan->nodes[id];
-    struct operator_state *o=&s->owner->nodes[id];
     const struct qs_plan *right=&s->plan->nodes[n->right].expr;
     if(!o->hash_data || o->hash_fallback) return 0;
     unsigned at,count=0;
@@ -1103,24 +1102,33 @@ static int hash_sink_batch(struct execution *s,struct qs_result *out)
      * estimated build exceeds its current capacity. Growth retains fallback
      * compaction if the row estimate was too small. */
     if(hash_exists_only(n) && (o->hash_cache || s->plan->nodes[n->right].estimated_rows>=o->hash_capacity)) {
-        for(;count<out->rows;++count) {
-            const struct qs_cell *row=(struct qs_cell *)out->data+(size_t)count*right->nout;
+        for(;count<length;++count) {
+            const struct qs_cell *row=rows+(size_t)count*right->nout;
             int added=hash_insert_exists(s,n,o,right,row);
             if(added<0) return added;
             if(!added) break;
         }
     } else {
-        count=hash_reserve_rows(o,out->rows,&at);
+        count=hash_reserve_rows(o,length,&at);
         unsigned rb=hash_row_bytes(right);
         for(unsigned i=0;i<count;++i) {
-            const struct qs_cell *row=(struct qs_cell *)out->data+(size_t)i*right->nout;
+            const struct qs_cell *row=rows+(size_t)i*right->nout;
             hash_store(o->hash_data+(size_t)(at+i)*rb,row,right);
             hash_link(n,o,right,row,at+i);
         }
     }
-    s->metrics.build_rows+=count; out->rows-=count;
-    memmove(out->data,(struct qs_cell *)out->data+(size_t)count*right->nout,
-        (size_t)out->rows*right->nout*sizeof(struct qs_cell));
+    s->metrics.build_rows+=count;
+    return count;
+}
+static int hash_sink_batch(struct execution *s,struct qs_result *out)
+{
+    unsigned id=s->hash_sink-1,child=s->plan->nodes[id].right;
+    unsigned cols=s->plan->nodes[child].expr.nout;
+    int count=hash_append_batch(s,id,&s->owner->nodes[id],(struct qs_cell *)out->data,out->rows);
+    if(count<0) return count;
+    out->rows-=count;
+    memmove(out->data,(struct qs_cell *)out->data+(size_t)count*cols,
+        (size_t)out->rows*cols*sizeof(struct qs_cell));
     return 0;
 }
 /* Pure equality SEMI/ANTI needs existence, not duplicate build rows. Like
@@ -1185,7 +1193,7 @@ static int64_t hash_build_impl(struct execution *s,unsigned id)
     if(!o->hash_capacity) {
         uint64_t estimate=s->plan->nodes[n->right].estimated_rows;
         /* Blocking children need their working space before producing rows. */
-        if(s->plan->nodes[n->right].kind!=QP_SCAN) estimate=128;
+        if(s->plan->nodes[n->right].kind!=QP_SCAN && !s->hash_input) estimate=128;
         unsigned max=1; while((size_t)max*2*stride<=hash_limit && max<UINT_MAX/4) max*=2;
         unsigned capacity=128; while(capacity<estimate && capacity<max) capacity*=2;
         if(capacity>max) capacity=max;
@@ -1203,6 +1211,10 @@ static int64_t hash_build_impl(struct execution *s,unsigned id)
             if(o->hash_data) capacity*=2;
         }
         if(!o->hash_data) o->hash_data=hash_memory(s,id,NULL,bytes);
+        while(!o->hash_data && s->hash_input && capacity>128) {
+            capacity/=2;
+            o->hash_data=hash_memory(s,id,NULL,(size_t)capacity*stride);
+        }
         if(!o->hash_data) { o->hash_fallback=1; return 0; }
         o->hash_capacity=capacity; hash_reindex(s,id);
     }
@@ -1232,6 +1244,14 @@ static int64_t hash_build_impl(struct execution *s,unsigned id)
                 o->hash_data=NULL; o->hash_fallback=1; return 0;
             }
             o->hash_data=data; o->hash_capacity*=2; hash_reindex(s,id);
+        }
+        if(s->hash_input && s->hash_input_node==(unsigned)n->right &&
+           s->hash_input_position<s->hash_input->rows) {
+            unsigned at=s->hash_input->begin+s->hash_input_position;
+            const struct qs_cell *rows=(const struct qs_cell *)s->hash_input->data+(size_t)at*right->nout;
+            int count=hash_append_batch(s,id,o,rows,s->hash_input->rows-s->hash_input_position);
+            if(count<0) return count;
+            if(count) { s->hash_input_position+=count; continue; }
         }
         int64_t status=hash_build_input(s,n->right,o->right);
         if(status==QP_WAIT || status<0 || status>2) return status;
@@ -5893,7 +5913,7 @@ int64_t pg_sina_graph_hash_build(struct femu_csd_args *a)
     } else {
         if(o->hash_phase || o->finished || o->hash_fallback==1 ||
            left!=(o->external && o->external->phase==1)) return -1;
-        s->hash_input_position=0;
+        s->hash_input_position=0; control->drained=0;
     }
     s->hash_input_node=child;
     s->args=a; s->io=a->mr_addr[4]; s->io_bytes=a->mr_len[4];
@@ -5925,7 +5945,7 @@ int64_t pg_sina_graph_source(struct femu_csd_args *a)
     struct qp_control *control=a->mr_addr[1];
     struct execution *s=(void *)(uintptr_t)control->state;
     if(control->close) { if(s) close_execution(s); return 0; }
-    uint64_t id=(uint64_t)a->cparam1>>1;
+    uint64_t id=(uint64_t)a->cparam1>>QP_GRAPH_SOURCE_NODE_SHIFT;
     if(plan->count>QP_NODES || id>=plan->count || plan->nparams>QP_PARAMS || plan->ninit ||
        (uint64_t)a->mr_len[0]<sizeof(*plan)+qp_host_parameter_bytes(plan) ||
        plan->workers>QS_WORKERS || a->mr_len[1]<(long long)((plan->workers+1)*sizeof(*control)) ||
@@ -5940,6 +5960,10 @@ int64_t pg_sina_graph_source(struct femu_csd_args *a)
        (s->graph_source_pending && s->graph_source_node!=id)) return -1;
     s->args=a; s->io=a->mr_addr[4]; s->io_bytes=a->mr_len[4];
     s->raw_projection=0;
+    if(!csIsReentry(a)) {
+        control->drained=0;
+        if((uint64_t)a->cparam1&QP_GRAPH_SOURCE_PAGES) control->ready=1;
+    }
     wait_resume(s);
     struct qs_result *out=a->mr_addr[2];
     if(!s->graph_source_pending) {
@@ -5955,6 +5979,7 @@ int64_t pg_sina_graph_source(struct femu_csd_args *a)
     }
     status=resume_page_io(s,a); if(status) return status;
     status=resume_spool(s,a); if(status) return status;
+    if(s->profiling) s->pipeline_tick=now_ns(CLOCK_THREAD_CPUTIME_ID);
     unsigned capacity=QS_RESULT_ROWS*QS_OUT/cols;
     while(out->rows<capacity) {
         status=next_row(s,id,qp_result_row(out,out->rows,cols,1));
@@ -5971,6 +5996,9 @@ int64_t pg_sina_graph_source(struct femu_csd_args *a)
     if(status==QP_WAIT) {
         int64_t request=namespace_wait(s); if(request) status=request;
     }
+    if(s->profiling && s->parallel_started)
+        plan->pipelines[s->group_combine?s->group_combine-1:s->parallel_node].coordinator_ns+=
+            now_ns(CLOCK_THREAD_CPUTIME_ID)-s->pipeline_tick;
     if(status<0 || status>2) goto wait;
     if(!status) out->finished=1;
     s->graph_source_pending=false;
@@ -6346,3 +6374,7 @@ combined:
     wait_io(s,status);
     return status==QP_WAIT?0:status>2?status:0;
 }
+
+/* Graph stages and their native workers must use the same module and state layout. */
+int64_t pg_sina_graph_continue(struct femu_csd_args *a)
+{ return pg_sina_plan(a); }

@@ -1,0 +1,3 @@
+id,mode,planning_ms,execution_ms,total_ms,executor_end_ms,executor,status
+Q3-1,original-csd,18.662,4135.828,4199.515,17.845,"pg_sina_plan",ok
+Q3-1,snia-staged-hash,23.478,4509.371,4559.911,15.675,"staged SNIA HashBuild",ok

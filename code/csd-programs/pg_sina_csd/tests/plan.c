@@ -2431,7 +2431,7 @@ static void graph_hash_build(function source,function build,bool spill_input)
         bool end=false;
         for(unsigned call=0;!end;++call) {
             assert(call<1000);
-            a.cparam1=2U<<1;
+            a.cparam1=2U<<QP_GRAPH_SOURCE_NODE_SHIFT;
             int64_t emitted=graph_compute(source,&a,&spill);
             end=(emitted&QP_WORKER_FINISHED)!=0;
             if(emitted&(QP_OUTPUT_READY|QP_WORKER_FINISHED)) {
