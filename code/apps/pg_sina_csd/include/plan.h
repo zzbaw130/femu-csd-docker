@@ -22,6 +22,13 @@
 #define QP_WORKER_FINISHED 4U
 #define QP_CONTROL_REQUIRED 8U
 #define QP_RESOURCE_WAIT 16U /* Retain input; retry after another batch advances. */
+/* HashBuild graph CSF uses bit 0 for profiling, bit 1 for the left
+ * input of a partitioned join, and the remaining bits for its qp_node ID.
+ * Its input AFDM contains packed qs_result rows from the selected child. */
+#define QP_GRAPH_HASH_LEFT 2U
+#define QP_GRAPH_HASH_NODE_SHIFT 2
+#define QP_GRAPH_HASH_NEEDS_LEFT 32U
+#define QP_GRAPH_HASH_MERGE_REQUIRED 64U
 /* Resource CSF cparam1 selector. CPU fraction uses parts per million. */
 enum qp_resource { QP_RESOURCE_WORKMEM, QP_RESOURCE_CPU_RATIO };
 #define QP_CPU_RATIO_SCALE 1000000U

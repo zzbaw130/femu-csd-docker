@@ -318,6 +318,10 @@ struct execution {
     unsigned output_count,output_position,output_exported;
     int output_active,output_status;
     struct operator_state *nodes;
+    const struct qs_result *hash_input;
+    unsigned hash_input_node, hash_input_position;
+    unsigned graph_source_node;
+    bool graph_source_pending;
     /* One scalar projection can wait per CU. Reserve its continuation before
      * the dictionary cache fills the query budget, rather than during a miss. */
     struct pending_projection projection_retry;
@@ -1151,6 +1155,19 @@ static int hash_compact_exists(struct execution *s,unsigned id)
     o->hash_rows=kept;
     return kept<rows;
 }
+/* A graph consumer borrows the producer's packet until it has drained it.
+ * The ordinary executor continues pulling from the original child. */
+static int64_t hash_build_input(struct execution *s,unsigned child,struct qs_cell *row)
+{
+    const struct qs_result *in=s->hash_input;
+    if(!in) return next_row(s,child,row);
+    if(child!=s->hash_input_node) return QP_WAIT;
+    if(s->hash_input_position==in->rows) return in->finished?0:QP_WAIT;
+    unsigned cols=s->plan->nodes[child].expr.nout;
+    unsigned at=in->begin+s->hash_input_position++;
+    memcpy(row,(const struct qs_cell *)in->data+(size_t)at*cols,cols*sizeof(*row));
+    return 2;
+}
 static int64_t hash_build_impl(struct execution *s,unsigned id)
 {
     const struct qp_node *n=&s->plan->nodes[id]; struct operator_state *o=&s->nodes[id];
@@ -1216,7 +1233,7 @@ static int64_t hash_build_impl(struct execution *s,unsigned id)
             }
             o->hash_data=data; o->hash_capacity*=2; hash_reindex(s,id);
         }
-        int64_t status=next_row(s,n->right,o->right);
+        int64_t status=hash_build_input(s,n->right,o->right);
         if(status==QP_WAIT || status<0 || status>2) return status;
         if(status==2) {
             unsigned at=o->hash_rows++;
@@ -1520,7 +1537,7 @@ static int64_t external_build(struct execution *s,unsigned id)
         /* A sequential probe input can use the same CU-local partition
          * sink. Its ordinary scan buffers are already in this pipeline's
          * layout; do not serialize the whole input through the owner. */
-        if(!build && s->plan->workers>1 && s->plan->nodes[n->left].kind==QP_SCAN &&
+        if(!build && !s->hash_input && s->plan->workers>1 && s->plan->nodes[n->left].kind==QP_SCAN &&
            !s->plan->nodes[n->left].ordered_index) {
             if(!e->probe_parallel) {
                 e->probe_parallel_saved=s->plan->nodes[n->left].parallel;
@@ -1531,7 +1548,7 @@ static int64_t external_build(struct execution *s,unsigned id)
             s->plan->nodes[n->left].parallel=e->probe_parallel_saved;
             e->probe_parallel=0; ++e->phase; continue;
         }
-        if(build) partition_start(s,id);
+        if(build && !s->hash_input) partition_start(s,id);
         if(build && !e->prefix_parallel && !o->have_right && e->prefix_at<e->prefix_rows) {
             const unsigned char *row=e->prefix+(size_t)e->prefix_at*rb;
             int null; uint64_t hash=hash_packed(&keys,row,&null);
@@ -1544,8 +1561,8 @@ static int64_t external_build(struct execution *s,unsigned id)
         if(!o->have_right) {
             int64_t status;
             if(e->prefix && !e->prefix_parallel) { cs_work_free(s->context,e->prefix); e->prefix=NULL; }
-            if(build) partition_start(s,id);
-            status=next_row(s,build?n->right:n->left,o->right);
+            if(build && !s->hash_input) partition_start(s,id);
+            status=hash_build_input(s,build?n->right:n->left,o->right);
             if(status==QP_WAIT || status<0 || status>2) return status;
             if(!status) {
                 ++e->phase;
@@ -5766,6 +5783,204 @@ static int host_append(struct execution *s,const struct qs_plan *p,struct qs_res
     return 0;
 }
 
+static int open_execution(struct femu_csd_args *a,struct qp_plan *plan,
+    struct qp_control *control,struct execution **opened)
+{
+    if(!plan->count || plan->count>QP_NODES || plan->root>=plan->count) return -1;
+    struct cs_work_stats stats; if(cs_work_get_stats(&stats)) return -4;
+    size_t budget=plan->nodes[plan->root].expr.work_mem_bytes;
+    if(!budget || budget>stats.capacity_bytes) budget=stats.capacity_bytes;
+    cs_work_context *context=cs_work_begin_limit(budget); if(!context) return -4;
+    struct execution *s=cs_work_calloc(context,1,sizeof(*s)); if(!s) { cs_work_end(context); return -4; }
+    s->context=context; s->plan=plan; s->control=control; s->raw_projection=qp_host_raw_projection(plan);
+    if(qp_host_parameter_bytes(plan)) {
+        const char *values=(const char *)plan+sizeof(*plan);
+        for(unsigned i=0;i<plan->nparams;++i)
+            if(plan->param_nodes[i]==QP_HOST_PARAMETER)
+                memcpy(&s->params[i],values+(size_t)i*sizeof(struct qs_cell),sizeof(struct qs_cell));
+    }
+    s->partition_join=s->source_node=-1;
+    s->arena=a->mr_addr[3]; s->io=a->mr_addr[4]; s->io_bytes=a->mr_len[4];
+    s->nodes=cs_work_calloc(context,plan->count,sizeof(*s->nodes));
+    if(!s->nodes) { cs_work_end(context); return -4; }
+    unsigned depth=sort_depth(plan,plan->root);
+    s->sort_limit=budget/(depth+2); if(s->sort_limit<512*1024) { cs_work_end(context); return -4; }
+    s->literal_ids=cs_work_calloc(context,plan->count*QS_STRINGS,sizeof(*s->literal_ids));
+    unsigned text_columns=0;
+    const struct qs_plan *output=&plan->nodes[plan->root].expr;
+    for(unsigned col=0;col<output->nout;++col)
+        text_columns+=output->exprs[output->outputs[col].index].type==Q_STRING;
+    if(text_columns && plan->packed_result<QP_TYPED_RESULT) {
+        s->output_order=cs_work_calloc(context,(size_t)qp_result_capacity(output,plan->packed_result)*text_columns,sizeof(*s->output_order));
+        if(!s->output_order) { cs_work_end(context); return -4; }
+    }
+    s->paged=qs_dictionary_create(context);
+    if(s->paged) { s->text=qs_dictionary_text_create(s->paged); s->initial_access=qs_dictionary_access_create(s->paged); }
+    if(!s->literal_ids || !s->paged || !s->text || !s->initial_access) {
+        if(s->paged) qs_dictionary_abort(s->paged);
+        cs_work_end(context); return -4;
+    }
+    uint64_t cache_bytes=plan->index_cache_bytes;
+    size_t cache_limit=QP_INDEX_CACHE_MAX_MIB*1024*1024ULL;
+    if(cache_bytes>=1024*1024 && cache_bytes<=cache_limit && cache_bytes<budget)
+        s->index_cache=qs_index_cache_create(context,cache_bytes,cache_limit,a->cparam1&1);
+    s->imported=1;
+    s->profiling=a->cparam1&1; s->outputs=a->mr_addr[2]; control->state=(uintptr_t)s;
+    *opened=s;
+    return 0;
+}
+
+static int resume_page_io(struct execution *s,struct femu_csd_args *a)
+{
+    if(s->late_wait) {
+        if(!csIsReentry(a) || csReentryValue(a)!=((uint64_t)s->late_wait&CS_IO_VALUE_MASK)) return -1;
+        memcpy(s->late_page,(unsigned char *)s->io+QS_PAGE,QS_PAGE);
+        s->late_valid=1; s->late_wait=0;
+    }
+    if(s->pending_nvm) {
+        if(!csIsReentry(a) || csReentryValue(a)!=s->pending_nvm) return -1;
+        s->pending_nvm=0; s->control->ready=1;
+    }
+    return 0;
+}
+
+static int resume_spool(struct execution *s,struct femu_csd_args *a)
+{
+    if(s->pending_spool) {
+        if(!csIsReentry(a)) return -1;
+        struct spool *p=s->pending_spool;
+        if(s->pending_store) {
+            p->pages[p->blocks++]=(struct spool_block){.token=csReentryValue(a)};
+            p->used=0; s->metrics.spill_write_bytes+=QS_SORT_IO_BYTES;
+        }
+        else { memcpy(p->cache,s->io,QS_SORT_IO_BYTES); p->loaded=s->pending_block; s->metrics.spill_read_bytes+=QS_SORT_IO_BYTES; }
+        s->pending_spool=NULL;
+    }
+    return 0;
+}
+
+/* Independent SNIA HashBuild, consuming a packed packet already present in
+ * AFDM. The caller serializes uses of the shared coordinator context. */
+int64_t pg_sina_graph_hash_build(struct femu_csd_args *a)
+{
+    if(!a || a->numr!=5 || a->mr_len[0]<(long long)sizeof(struct qp_plan) ||
+       a->mr_len[1]<(long long)sizeof(struct qp_control) ||
+       a->mr_len[2]<(long long)sizeof(struct qs_result) ||
+       a->mr_len[3]<(long long)sizeof(struct qs_dict) || a->mr_len[4]<QS_SORT_IO_BYTES) return -1;
+    struct qp_plan *plan=a->mr_addr[0];
+    struct qp_control *control=a->mr_addr[1];
+    struct execution *s=(void *)(uintptr_t)control->state;
+    if(control->close) { if(s) close_execution(s); return 0; }
+    uint64_t id=(uint64_t)a->cparam1>>QP_GRAPH_HASH_NODE_SHIFT;
+    bool left=((uint64_t)a->cparam1&QP_GRAPH_HASH_LEFT)!=0;
+    if(plan->count>QP_NODES || id>=plan->count || plan->nparams>QP_PARAMS ||
+       (uint64_t)a->mr_len[0]<sizeof(*plan)+qp_host_parameter_bytes(plan)) return -1;
+    const struct qp_node *n=&plan->nodes[id];
+    if(n->kind!=QP_JOIN || !n->hash || n->left<0 || n->right<0 ||
+       (unsigned)n->left>=plan->count || (unsigned)n->right>=plan->count) return -1;
+    unsigned child=left?n->left:n->right,cols=plan->nodes[child].expr.nout;
+    const struct qs_result *in=a->mr_addr[2];
+    if(!cols || cols>QS_OUT || in->status || in->finished>1 ||
+       (uint64_t)in->begin+in->rows>QS_RESULT_ROWS*QS_OUT/cols) return -1;
+    if(!s) {
+        if(left || csIsReentry(a)) return -1;
+        int status=open_execution(a,plan,control,&s); if(status) return status;
+    }
+    if(s->plan!=plan || s->owner || s->closing || s->graph_source_pending) return -1;
+    struct operator_state *o=&s->nodes[id];
+    if(csIsReentry(a)) {
+        if(s->hash_input_node!=child || s->hash_input_position>in->rows) return -1;
+    } else {
+        if(o->hash_phase || o->finished || o->hash_fallback==1 ||
+           left!=(o->external && o->external->phase==1)) return -1;
+        s->hash_input_position=0;
+    }
+    s->hash_input_node=child;
+    s->args=a; s->io=a->mr_addr[4]; s->io_bytes=a->mr_len[4];
+    wait_resume(s);
+    int64_t status=initialize_dictionary(s,a);
+    if(status==QS_DICTIONARY_BUSY) return QP_RESOURCE_WAIT;
+    if(status) { wait_io(s,status); return status; }
+    status=resume_spool(s,a); if(status) return status;
+    s->hash_input=in;
+    status=hash_build(s,id);
+    s->hash_input=NULL;
+    if(status<0 || status>2) { wait_io(s,status); return status; }
+    unsigned flags=s->hash_input_position==in->rows?QP_INPUT_DRAINED:0;
+    if(o->hash_phase || o->finished) flags|=QP_WORKER_FINISHED;
+    else if(o->hash_fallback==1) flags|=QP_GRAPH_HASH_MERGE_REQUIRED;
+    else if(o->external && o->external->phase==1) flags|=QP_GRAPH_HASH_NEEDS_LEFT;
+    return flags;
+}
+
+/* Emit one packed device packet from a selected producer, retaining the
+ * query context for its consumers. No host result encoding is involved. */
+int64_t pg_sina_graph_source(struct femu_csd_args *a)
+{
+    if(!a || a->numr!=5 || a->mr_len[0]<(long long)sizeof(struct qp_plan) ||
+       a->mr_len[1]<(long long)sizeof(struct qp_control) ||
+       a->mr_len[2]<(long long)sizeof(struct qs_result) ||
+       a->mr_len[3]<(long long)sizeof(struct qs_dict) || a->mr_len[4]<QS_SORT_IO_BYTES) return -1;
+    struct qp_plan *plan=a->mr_addr[0];
+    struct qp_control *control=a->mr_addr[1];
+    struct execution *s=(void *)(uintptr_t)control->state;
+    if(control->close) { if(s) close_execution(s); return 0; }
+    uint64_t id=(uint64_t)a->cparam1>>1;
+    if(plan->count>QP_NODES || id>=plan->count || plan->nparams>QP_PARAMS || plan->ninit ||
+       (uint64_t)a->mr_len[0]<sizeof(*plan)+qp_host_parameter_bytes(plan) ||
+       plan->workers>QS_WORKERS || a->mr_len[1]<(long long)((plan->workers+1)*sizeof(*control)) ||
+       a->mr_len[2]<(long long)((plan->workers+1)*sizeof(struct qs_result))) return -1;
+    unsigned cols=plan->nodes[id].expr.nout;
+    if(!cols || cols>QS_OUT) return -1;
+    if(!s) {
+        if(csIsReentry(a)) return -1;
+        int status=open_execution(a,plan,control,&s); if(status) return status;
+    }
+    if(s->plan!=plan || s->owner || s->closing ||
+       (s->graph_source_pending && s->graph_source_node!=id)) return -1;
+    s->args=a; s->io=a->mr_addr[4]; s->io_bytes=a->mr_len[4];
+    s->raw_projection=0;
+    wait_resume(s);
+    struct qs_result *out=a->mr_addr[2];
+    if(!s->graph_source_pending) {
+        out->rows=out->begin=out->finished=out->str_bytes=0; out->status=0;
+        s->graph_source_node=id; s->graph_source_pending=true;
+    }
+    int64_t status=initialize_dictionary(s,a);
+    if(status) goto wait;
+    if(s->text_wait) {
+        status=qs_dictionary_text_resume(s->text,s->io,s->text_wait>QS_DICTIONARY_BUSY?csReentryValue(a):0);
+        s->text_wait=status; if(status) goto wait;
+        s->expression_wait=0;
+    }
+    status=resume_page_io(s,a); if(status) return status;
+    status=resume_spool(s,a); if(status) return status;
+    unsigned capacity=QS_RESULT_ROWS*QS_OUT/cols;
+    while(out->rows<capacity) {
+        status=next_row(s,id,qp_result_row(out,out->rows,cols,1));
+        if(status!=2) break;
+        ++out->rows;
+    }
+    if(s->late_wait) status=s->late_wait;
+    if(s->text_wait) status=s->text_wait;
+    if(s->dictionary_wait) status=s->dictionary_wait;
+    if(s->expression_wait && s->pending_spool) {
+        s->expression_wait=0;
+        status=csNeedLoad(s->pending_spool->pages[s->pending_block].token);
+    }
+    if(status==QP_WAIT) {
+        int64_t request=namespace_wait(s); if(request) status=request;
+    }
+    if(status<0 || status>2) goto wait;
+    if(!status) out->finished=1;
+    s->graph_source_pending=false;
+    return (out->rows?QP_OUTPUT_READY:0) | (out->finished?QP_WORKER_FINISHED:0) |
+        (status==QP_WAIT?QP_CONTROL_REQUIRED:0);
+wait:
+    wait_io(s,status);
+    return status==QS_DICTIONARY_BUSY?QP_RESOURCE_WAIT:status;
+}
+
 int64_t pg_sina_plan(struct femu_csd_args *a)
 {
     if(!a || a->numr!=5 || a->mr_len[0]<(long long)sizeof(struct qp_plan) ||
@@ -5782,46 +5997,7 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
     if(control->close) { if(s) close_execution(s); return 0; }
     if(!s) {
         if(worker) return -1;
-        if(!plan->count || plan->count>QP_NODES || plan->root>=plan->count) return -1;
-        struct cs_work_stats stats; if(cs_work_get_stats(&stats)) return -4;
-        size_t budget=plan->nodes[plan->root].expr.work_mem_bytes;
-        if(!budget || budget>stats.capacity_bytes) budget=stats.capacity_bytes;
-        cs_work_context *context=cs_work_begin_limit(budget); if(!context) return -4;
-        s=cs_work_calloc(context,1,sizeof(*s)); if(!s) { cs_work_end(context); return -4; }
-        s->context=context; s->plan=plan; s->control=control; s->raw_projection=qp_host_raw_projection(plan);
-        if(qp_host_parameter_bytes(plan)) {
-            const char *values=(const char *)plan+sizeof(*plan);
-            for(unsigned i=0;i<plan->nparams;++i)
-                if(plan->param_nodes[i]==QP_HOST_PARAMETER)
-                    memcpy(&s->params[i],values+(size_t)i*sizeof(struct qs_cell),sizeof(struct qs_cell));
-        }
-        s->partition_join=s->source_node=-1;
-        s->arena=a->mr_addr[3]; s->io=a->mr_addr[4]; s->io_bytes=a->mr_len[4];
-        s->nodes=cs_work_calloc(context,plan->count,sizeof(*s->nodes));
-        if(!s->nodes) { cs_work_end(context); return -4; }
-        unsigned depth=sort_depth(plan,plan->root);
-        s->sort_limit=budget/(depth+2); if(s->sort_limit<512*1024) { cs_work_end(context); return -4; }
-        s->literal_ids=cs_work_calloc(context,plan->count*QS_STRINGS,sizeof(*s->literal_ids));
-        unsigned text_columns=0;
-        const struct qs_plan *output=&plan->nodes[plan->root].expr;
-        for(unsigned col=0;col<output->nout;++col)
-            text_columns+=output->exprs[output->outputs[col].index].type==Q_STRING;
-        if(text_columns && plan->packed_result<QP_TYPED_RESULT) {
-            s->output_order=cs_work_calloc(context,(size_t)qp_result_capacity(output,plan->packed_result)*text_columns,sizeof(*s->output_order));
-            if(!s->output_order) { cs_work_end(context); return -4; }
-        }
-        s->paged=qs_dictionary_create(context);
-        if(s->paged) { s->text=qs_dictionary_text_create(s->paged); s->initial_access=qs_dictionary_access_create(s->paged); }
-        if(!s->literal_ids || !s->paged || !s->text || !s->initial_access) {
-            if(s->paged) qs_dictionary_abort(s->paged);
-            cs_work_end(context); return -4;
-        }
-        uint64_t cache_bytes=plan->index_cache_bytes;
-        size_t cache_limit=QP_INDEX_CACHE_MAX_MIB*1024*1024ULL;
-        if(cache_bytes>=1024*1024 && cache_bytes<=cache_limit && cache_bytes<budget)
-            s->index_cache=qs_index_cache_create(context,cache_bytes,cache_limit,a->cparam1&1);
-        s->imported=1;
-        s->profiling=a->cparam1&1; s->outputs=a->mr_addr[2]; control->state=(uintptr_t)s;
+        int status=open_execution(a,plan,control,&s); if(status) return status;
         out->rows=out->begin=out->finished=out->str_bytes=0; out->status=0;
     }
     s->args=a; s->io=a->mr_addr[4]; s->io_bytes=a->mr_len[4];
@@ -5859,25 +6035,8 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
     }
     /* The last AFDM is private to this CU, also for SNIA NEED_LOAD/STORE. */
     s->io=a->mr_addr[4]; s->io_bytes=a->mr_len[4];
-    if(s->late_wait) {
-        if(!csIsReentry(a) || csReentryValue(a)!=((uint64_t)s->late_wait&CS_IO_VALUE_MASK)) return -1;
-        memcpy(s->late_page,(unsigned char *)s->io+QS_PAGE,QS_PAGE);
-        s->late_valid=1; s->late_wait=0;
-    }
-    if(s->pending_nvm) {
-        if(!csIsReentry(a) || csReentryValue(a)!=s->pending_nvm) return -1;
-        s->pending_nvm=0; control->ready=1;
-    }
-    if(s->pending_spool) {
-        if(!csIsReentry(a)) return -1;
-        struct spool *p=s->pending_spool;
-        if(s->pending_store) {
-            p->pages[p->blocks++]=(struct spool_block){.token=csReentryValue(a)};
-            p->used=0; s->metrics.spill_write_bytes+=QS_SORT_IO_BYTES;
-        }
-        else { memcpy(p->cache,s->io,QS_SORT_IO_BYTES); p->loaded=s->pending_block; s->metrics.spill_read_bytes+=QS_SORT_IO_BYTES; }
-        s->pending_spool=NULL;
-    }
+    int resumed=resume_page_io(s,a); if(resumed) return resumed;
+    resumed=resume_spool(s,a); if(resumed) return resumed;
     if(!csIsReentry(a) && !continuing) {
         out->rows=out->begin=out->finished=out->str_bytes=0; out->status=0; s->output_exported=0;
     }

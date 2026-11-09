@@ -135,7 +135,7 @@ static void scan(struct qp_node *n)
         n->expr.outputs[i]=(struct qs_output){.index=i,.type_oid=23};
     }
 }
-struct test_spill { pthread_mutex_t mutex; void **tokens; unsigned count,stores; };
+struct test_spill { pthread_mutex_t mutex; void **tokens; unsigned count,stores,reads; };
 static uint64_t spill_request(struct test_spill *s,unsigned op,uint64_t id,void *io)
 {
     assert(!pthread_mutex_lock(&s->mutex));
@@ -146,7 +146,7 @@ static uint64_t spill_request(struct test_spill *s,unsigned op,uint64_t id,void 
         s->tokens[s->count++]=data; id=s->count; ++s->stores;
     } else {
         assert(id && id<=s->count && s->tokens[id-1]);
-        if(op==2) memcpy(io,s->tokens[id-1],QS_SORT_IO_BYTES);
+        if(op==2) { memcpy(io,s->tokens[id-1],QS_SORT_IO_BYTES); ++s->reads; }
         else { assert(op==3); free(s->tokens[id-1]); s->tokens[id-1]=NULL; }
     }
     assert(!pthread_mutex_unlock(&s->mutex)); return id;
@@ -2360,6 +2360,146 @@ static void poison_workmem(void)
     void *data=cs_work_alloc(ctx,stats.capacity_bytes-4096); assert(data);
     memset(data,0xa5,stats.capacity_bytes-4096); assert(!cs_work_end(ctx));
 }
+/* Run one compute node with the same I/O-token reentry as a graph EXEC. */
+static int64_t graph_compute(function run,struct femu_csd_args *a,struct test_spill *spill)
+{
+    for(unsigned i=0;i<100000;++i) {
+        int64_t status=run(a);
+        assert(status>=0);
+        unsigned op=(uint64_t)status>>60;
+        if(!op) { a->cparam2=0; return status; }
+        a->cparam2=spill_request(spill,op,(uint64_t)status&CS_IO_VALUE_MASK,a->mr_addr[4]);
+    }
+    abort();
+}
+static void graph_load_page(struct qp_plan *plan,struct qp_control *control,
+    unsigned char *arena,unsigned char *const raw[])
+{
+    unsigned id=control->node;
+    assert(id<plan->count && raw[id] && control->bytes && !control->ready);
+    struct qp_node *n=&plan->nodes[id];
+    assert(control->offset+control->bytes<=n->bytes);
+    memcpy(arena+n->input_offset,raw[id]+control->offset,control->bytes);
+    control->ready=1;
+}
+static void graph_hash_build(function source,function build,bool spill_input)
+{
+    struct qp_plan *plan=calloc(1,sizeof(*plan)); assert(plan);
+    plan->count=5; plan->scan_bytes=QS_PAGE;
+    struct qp_node *parent=&plan->nodes[0],*child=&plan->nodes[2];
+    for(unsigned i=0;i<2;++i) {
+        struct qp_node *join=i?child:parent;
+        *join=(struct qp_node){.kind=QP_JOIN,.hash=1,.join_type=QP_INNER,
+            .left=i?3:1,.right=i?4:2,.join_qual=-1,.nkeys=1};
+        struct qs_plan *p=&join->expr;
+        p->predicate=-1; p->nattrs=p->nexprs=4; p->nout=2;
+        p->exprs[0]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER,.column=0};
+        p->exprs[3]=(struct qs_expr){.op=Q_COLUMN,.type=Q_DECIMAL,.column=3,.scale=2};
+        p->outputs[0]=(struct qs_output){.index=0,.type_oid=23};
+        p->outputs[1]=(struct qs_output){.index=3,.type_oid=1700};
+    }
+    parent->expr.work_mem_bytes=64U*1024*1024;
+    unsigned char *raw[5]={0};
+    unsigned rows[5]={0,2,0,701,173};
+    size_t bytes=4096;
+    for(unsigned id=1;id<5;++id) if(rows[id]) {
+        struct qp_node *n=&plan->nodes[id]; scan(n);
+        size_t raw_bytes; raw[id]=heap(rows[id],id==4,&raw_bytes);
+        n->bytes=raw_bytes; n->input_offset=bytes; bytes+=plan->scan_bytes;
+        n->vector_offset=bytes; bytes+=(qs_chunk_bytes(qp_scan_capacity(plan,n),2)+4095)&~(size_t)4095;
+    }
+    struct qs_plan *right=&plan->nodes[4].expr;
+    right->nexprs=4;
+    right->exprs[2]=(struct qs_expr){.op=Q_CONST,.type=Q_DECIMAL,.constant=INT64_C(1)<<62,.scale=2,.dscale=2};
+    right->exprs[3]=(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=1,.right=2,.scale=2,.dscale=2};
+    right->outputs[1]=(struct qs_output){.index=3,.type_oid=1700};
+    unsigned char *arena=calloc(1,bytes),*io=calloc(1,QS_SORT_IO_BYTES);
+    struct qs_result *packet=calloc(1,sizeof(*packet)); assert(arena && io && packet);
+    for(unsigned id=1;id<5;++id) if(raw[id]) {
+        struct qp_node *n=&plan->nodes[id];
+        *(struct qs_chunk *)(arena+n->vector_offset)=(struct qs_chunk){.capacity=qp_scan_capacity(plan,n),.ncols=2};
+    }
+    struct qp_control control={0};
+    void *mr[]={plan,&control,packet,arena,io};
+    long long len[]={sizeof(*plan),sizeof(control),sizeof(*packet),bytes,QS_SORT_IO_BYTES};
+    struct femu_csd_args a={.numr=5,.mr_addr=mr,.mr_len=len};
+    struct test_spill spill={.mutex=PTHREAD_MUTEX_INITIALIZER};
+    unsigned expected=0,packets=0;
+    __int128 expected_sum=0,factor=(__int128)1<<62;
+
+    if(!spill_input) {
+        bool end=false;
+        for(unsigned call=0;!end;++call) {
+            assert(call<1000);
+            a.cparam1=2U<<1;
+            int64_t emitted=graph_compute(source,&a,&spill);
+            end=(emitted&QP_WORKER_FINISHED)!=0;
+            if(emitted&(QP_OUTPUT_READY|QP_WORKER_FINISHED)) {
+                if(packet->rows) ++packets;
+                a.cparam1=0;
+                int64_t consumed=graph_compute(build,&a,&spill);
+                assert(consumed==(QP_INPUT_DRAINED|(end?QP_WORKER_FINISHED:0)));
+            }
+            if(emitted&QP_CONTROL_REQUIRED) graph_load_page(plan,&control,arena,raw);
+        }
+        assert(packets>1);
+        for(unsigned l=1;l<rows[3];++l) if(l%17 && l%11==1)
+            for(unsigned r=1;r<rows[4];++r) if(r%17 && r%7==1) {
+                ++expected; expected_sum+=(r%13+1)*factor;
+            }
+    } else {
+        /* Drive partition spill with a projected child packet stream. The
+         * right subtree must never be reopened to recover consumed rows. */
+        unsigned total=2100000,capacity=QS_RESULT_ROWS*QS_OUT/2;
+        int64_t flags=0;
+        for(unsigned at=0;at<total;) {
+            unsigned count=total-at<capacity?total-at:capacity;
+            packet->begin=0; packet->rows=count; packet->finished=at+count==total;
+            for(unsigned i=0;i<count;++i) {
+                struct qs_cell *v=qp_result_row(packet,i,2,1);
+                v[0]=(struct qs_cell){.value=at+i?1000+at+i:1};
+                v[1]=(struct qs_cell){.value=9*factor,.scale=2,.dscale=2};
+            }
+            flags=graph_compute(build,&a,&spill);
+            assert(flags&QP_INPUT_DRAINED);
+            at+=count;
+        }
+        assert(spill.stores && flags==(QP_INPUT_DRAINED|QP_GRAPH_HASH_NEEDS_LEFT));
+        packet->begin=0; packet->rows=packet->finished=1;
+        struct qs_cell *v=qp_result_row(packet,0,2,1);
+        v[0]=(struct qs_cell){.value=1}; v[1]=(struct qs_cell){.value=2};
+        a.cparam1=QP_GRAPH_HASH_LEFT;
+        flags=graph_compute(build,&a,&spill);
+        assert(flags==(QP_INPUT_DRAINED|QP_WORKER_FINISHED));
+        expected=1; expected_sum=9*factor;
+    }
+
+    unsigned got=0;
+    __int128 sum=0;
+    a.cparam1=0;
+    for(unsigned call=0;;++call) {
+        assert(call<1000);
+        int64_t flags=graph_compute(source,&a,&spill);
+        for(unsigned i=0;i<packet->rows;++i) {
+            const struct qs_cell *v=qp_result_row(packet,i,2,1);
+            assert(!v[0].isnull && v[0].value==1 && !v[1].isnull && v[1].scale==2 && v[1].dscale==2);
+            ++got; sum+=v[1].value;
+        }
+        if(flags&QP_WORKER_FINISHED) break;
+        assert(flags&(QP_OUTPUT_READY|QP_CONTROL_REQUIRED));
+        if(flags&QP_CONTROL_REQUIRED) graph_load_page(plan,&control,arena,raw);
+    }
+    assert(got==expected && sum==expected_sum);
+    if(spill_input) assert(spill.reads);
+    control.close=1; assert(!source(&a) && !control.state);
+    struct cs_work_stats work; assert(!cs_work_get_stats(&work) && !work.used_bytes && !work.active_contexts);
+    for(unsigned i=0;i<spill.count;++i) free(spill.tokens[i]);
+    free(spill.tokens);
+    pthread_mutex_destroy(&spill.mutex);
+    for(unsigned i=0;i<5;++i) free(raw[i]);
+    free(packet); free(io); free(arena); free(plan);
+}
+
 int main(int argc,char **argv)
 {
     dictionary_size();
@@ -2367,6 +2507,15 @@ int main(int argc,char **argv)
     assert(qp_worker_mask(0)==0 && qp_worker_mask(32)==UINT32_MAX && qp_worker_mask(64)==UINT64_MAX);
     assert(argc==2 || argc==3 || argc==4); void *library=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(library);
     function capacity=(function)dlsym(library,"pg_sina_workmem_capacity"); assert(capacity);
+    if(argc==3 && !strcmp(argv[2],"--graph-hash-build-64m")) {
+        assert(!cs_work_init(64U*1024*1024));
+        function source=(function)dlsym(library,"pg_sina_graph_source"); assert(source);
+        function build=(function)dlsym(library,"pg_sina_graph_hash_build"); assert(build);
+        graph_hash_build(source,build,false);
+        graph_hash_build(source,build,true);
+        puts("PASS graph HashBuild: nested producer packets, exact int128, partition spill and cleanup");
+        return 0;
+    }
     if(argc==3 && !strcmp(argv[2],"--host-params-64m")) {
         assert(!cs_work_init(64U*1024*1024));
         function run=(function)dlsym(library,"pg_sina_plan"); assert(run);
