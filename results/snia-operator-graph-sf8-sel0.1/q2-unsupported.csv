@@ -1,2 +1,0 @@
-id,mode,planning_ms,execution_ms,total_ms,executor_end_ms,executor,status
-Q2-1,snia-operator-graph,62.419,,79.617,0.000,"",unsupported_executor
