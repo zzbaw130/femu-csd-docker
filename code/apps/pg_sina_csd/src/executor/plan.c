@@ -5,6 +5,7 @@
 #include "executor/executor.h"
 #include "access/parallel.h"
 #include "miscadmin.h"
+#include "mb/pg_wchar.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/resowner.h"
@@ -130,7 +131,7 @@ struct PlanStateCsd {
     enum graph_phase graph_phase;
     unsigned graph_node, graph_nodes, graph_init, graph_pipeline_group;
     CS_CSF_ID graph_block[BLOCK_STEPS];
-    bool graph_tree, graph_partition, graph_waves;
+    bool graph_tree, graph_partition, graph_waves, graph_resident_text;
     uint64_t graph_packets, graph_build_packets;
     unsigned row;
     bool started, explain_only, active, profiling, operator_graph;
@@ -621,6 +622,34 @@ static void graph_pick(PlanStateCsd *s,unsigned id)
     if(child>=0 && !s->graph[child].ready) { graph_pick(s,child); return; }
     s->graph_node=id; s->graph_phase=phase;
 }
+/* Resident dictionary admission uses declared byte widths. Output-only
+ * Heap references survive as file offsets and need no dictionary entry. */
+static bool resident_graph_text(const struct qp_plan *plan)
+{
+    unsigned width=pg_database_encoding_max_length();
+    bool text=false;
+    for(unsigned i=0;i<plan->count;++i) {
+        const struct qp_node *n=&plan->nodes[i];
+        if(n->kind!=QP_SCAN) continue;
+        for(unsigned col=0;col<n->expr.nout;++col) {
+            const struct qs_output *out=&n->expr.outputs[col];
+            if(out->index<0 || (unsigned)out->index>=n->expr.nexprs) return false;
+            const struct qs_expr *expr=&n->expr.exprs[out->index];
+            if(expr->type!=Q_STRING) continue;
+            if(expr->op==Q_COLUMN && expr->column>=0 && expr->column<QS_COLS &&
+               (n->late_text&(UINT64_C(1)<<expr->column))) continue;
+            if((out->type_oid!=BPCHAROID && out->type_oid!=VARCHAROID) ||
+               out->typmod<VARHDRSZ || (unsigned)(out->typmod-VARHDRSZ)>128/width) return false;
+            text=true;
+        }
+    }
+    return text;
+}
+static uint64_t graph_coordinator_flags(const PlanStateCsd *s)
+{
+    return (s->graph_waves?QP_GRAPH_BLOCK_EXEC:0) |
+           (s->graph_resident_text?QP_GRAPH_RESIDENT_TEXT:0);
+}
 static void graph_request(PlanStateCsd *s,CsComputeRequest *compute,bool loaded)
 {
     unsigned id=s->graph_node;
@@ -630,7 +659,7 @@ static void graph_request(PlanStateCsd *s,CsComputeRequest *compute,bool loaded)
         compute->CSFId=phase==GRAPH_PIPELINE_BUILD?s->graph_build:s->graph_feed;
         uint64_t parameter=s->profiling|((uint64_t)id<<QP_GRAPH_PIPELINE_NODE_SHIFT);
         if(loaded) parameter|=QP_PAGES_INPUT;
-        parameter|=QP_GRAPH_BLOCK_EXEC;
+        parameter|=graph_coordinator_flags(s);
         csHelperSetComputeArg(&compute->Args[5],CS_64BIT_VALUE_TYPE,(u64)parameter);
         return;
     }
@@ -721,6 +750,7 @@ static void start(PlanStateCsd *s)
             }
         }
     }
+    s->graph_resident_text=s->graph_waves && resident_graph_text(s->plan);
     pg_sina_read_resources(device);
     size_t parameter_bytes=qp_host_parameter_bytes(s->plan);
     size_t plan_bytes=sizeof(*s->plan)+parameter_bytes;
@@ -775,7 +805,9 @@ static void start(PlanStateCsd *s)
     if(s->workers<=1) s->workers=0;
     s->plan->scan_bytes=QS_CHUNK;
     s->prefetch_build=s->prefetch_reused=0; s->prefetch_waited=s->prefetch_claimed=false;
-    unsigned probe=streams==1?prefetch_probe(s->plan,&s->prefetch_build):0;
+    /* An explicit scan graph owns its LOAD. Preloading a probe block would
+     * submit that same block separately before its EXEC chain. */
+    unsigned probe=streams==1 && !s->graph_waves?prefetch_probe(s->plan,&s->prefetch_build):0;
     bool reserve_prefetch=probe!=0;
     atomic_init(&s->prefetch_done,false);
     size_t arena,sizes[5];
@@ -875,7 +907,7 @@ static void start(PlanStateCsd *s)
         slot->mutex_ready=true; slot->owner=s; slot->worker=w;
         /* FEMU compute ranges start at zero; each CU needs its own spill AFDM. */
         csHelperSetComputeArg(&request->u.Compute.Args[4],CS_AFDM_TYPE,w?s->worker_io[w-1]:s->memory[4],0UL);
-        csHelperSetComputeArg(&request->u.Compute.Args[5],CS_64BIT_VALUE_TYPE,(u64)(s->profiling|(w<<1)|(!w && s->graph_waves?QP_GRAPH_BLOCK_EXEC:0)));
+        csHelperSetComputeArg(&request->u.Compute.Args[5],CS_64BIT_VALUE_TYPE,(u64)(s->profiling|(w<<1)|(w?0:graph_coordinator_flags(s))));
         checked(csAllocBatchRequest(CS_BATCH_SERIAL,1,&s->slots[w].batch),"allocate batch");
         CS_BATCH_INDEX index; checked(csConfigureBatchEntry(s->slots[w].batch,CS_BATCH_ADD,request,0,0,&index),"configure batch");
         atomic_init(&s->slots[w].completed,false); s->slots[w].profiling=s->profiling;
@@ -1172,7 +1204,7 @@ static CS_STATUS queue_pages(struct plan_slot *slot)
         csHelperSetComputeArg(&request->u.Compute.Args[4],CS_AFDM_TYPE,worker?s->worker_io[worker-1]:s->memory[4],0UL);
         if(phase!=GRAPH_NATIVE) graph_request(s,&request->u.Compute,loaded);
         else csHelperSetComputeArg(&request->u.Compute.Args[5],CS_64BIT_VALUE_TYPE,(u64)(s->profiling|(worker<<1)|(loaded?QP_PAGES_INPUT:0)|
-            (!worker && s->graph_waves?QP_GRAPH_BLOCK_EXEC:0)));
+            (worker?0:graph_coordinator_flags(s))));
         CS_BATCH_INDEX index;
         status=csConfigureBatchEntry(slot->resume?slot->resume:*batch,CS_BATCH_ADD,request,0,slot->resume?slot->previous:0,&index);
         free(request); if(status!=CS_SUCCESS) return status;

@@ -146,24 +146,29 @@ static void paging(unsigned count,unsigned key_length,size_t limit)
     assert(!remaining.used_bytes && !remaining.allocations);
     assert(!cs_work_end(parent)); storage_end(&s);
 }
-struct worker { struct qs_dictionary *dict; struct access access; struct storage *storage; uint32_t ids[3000]; unsigned order; };
+struct worker { struct qs_dictionary *dict; struct access access; struct storage *storage; uint32_t ids[3000]; unsigned order,resident; };
 static void *worker_insert(void *arg)
 {
     struct worker *w=arg; char key[64];
     for(unsigned i=0;i<3000;++i) {
         unsigned index=(i+w->order*719)%3000; make_key(key,index,sizeof(key));
-        w->ids[index]=insert(w->dict,&w->access,w->storage,key,sizeof(key));
+        if(w->resident) {
+            uint32_t id=0;
+            assert(!qs_dictionary_insert(w->dict,w->access.state,key,sizeof(key),&id,w->access.io,0));
+            assert(id); w->ids[index]=id;
+        } else w->ids[index]=insert(w->dict,&w->access,w->storage,key,sizeof(key));
     }
     return NULL;
 }
-static void concurrent_insert(size_t limit)
+static void concurrent_insert(size_t limit,unsigned resident)
 {
     cs_work_context *parent=cs_work_begin_limit(limit); assert(parent);
-    struct qs_dictionary *d=qs_dictionary_create(parent); assert(d);
+    struct qs_dictionary *d=resident?qs_dictionary_create_resident(parent):qs_dictionary_create(parent);
+    assert(d);
     struct storage s={.mutex=PTHREAD_MUTEX_INITIALIZER};
     struct worker workers[4]; pthread_t threads[4];
     for(unsigned i=0;i<4;++i) {
-        workers[i]=(struct worker){.dict=d,.storage=&s,.order=i};
+        workers[i]=(struct worker){.dict=d,.storage=&s,.order=i,.resident=resident};
         workers[i].access.state=qs_dictionary_access_create(d); assert(workers[i].access.state);
     }
     for(unsigned i=0;i<4;++i) assert(!pthread_create(&threads[i],NULL,worker_insert,&workers[i]));
@@ -172,6 +177,16 @@ static void concurrent_insert(size_t limit)
         for(unsigned w=1;w<4;++w) assert(workers[w].ids[i]==workers[0].ids[i]);
     if(limit<64U*1024*1024) assert(s.stores && s.loads);
     else assert(!s.stores && !s.loads);
+    if(resident) {
+        struct access *a=&workers[0].access;
+        assert(qs_dictionary_evict(d,a->state,a->io,0)==-4);
+        char key[64]; unsigned length=0;
+        make_key(key,0,sizeof(key));
+        const char *bytes=NULL;
+        assert(!qs_dictionary_pin(d,a->state,workers[0].ids[0],&bytes,&length,a->io,0));
+        assert(length==sizeof(key) && !memcmp(bytes,key,length));
+        qs_dictionary_unpin(a->state);
+    }
     check_budget(parent,limit); close_dictionary(d,&workers[0].access,&s);
     assert(!cs_work_end(parent)); storage_end(&s);
 }
@@ -552,7 +567,8 @@ int main(int argc,char **argv)
 {
     assert(!cs_work_init(64U*1024*1024));
     if(argc==2 && !strcmp(argv[1],"--resident-concurrent-64m")) {
-        concurrent_insert(64U*1024*1024);
+        concurrent_insert(64U*1024*1024,0);
+        concurrent_insert(64U*1024*1024,1);
         return 0;
     }
     if(argc==2 && !strcmp(argv[1],"--short-text-cache-64m")) {
@@ -564,7 +580,7 @@ int main(int argc,char **argv)
     assert(argc==1);
     paging(10000,800,4U*1024*1024);
     paging(20000,17,384U*1024);
-    concurrent_insert(256U*1024); cancel_pending(CS_NEED_STORE); cancel_pending(CS_NEED_LOAD); heap_scan(); vector_expressions();
+    concurrent_insert(256U*1024,0); cancel_pending(CS_NEED_STORE); cancel_pending(CS_NEED_LOAD); heap_scan(); vector_expressions();
     retained_location(); short_text_references(); text_cancel(CS_NEED_STORE); text_cancel(CS_NEED_LOAD);
     cs_work_stats stats; assert(!cs_work_get_stats(&stats));
     assert(!stats.used_bytes && !stats.active_contexts && !stats.active_allocations);

@@ -52,6 +52,7 @@
 #define QP_GRAPH_BLOCK_MAX_CHAIN 60 /* E9 leaves four entries for LOAD, Scan, Filter and sink. */
 enum qp_graph_block_step { BLOCK_SCAN, BLOCK_FILTER, BLOCK_PROBE, BLOCK_INDEX, BLOCK_PROJECT, BLOCK_GROUP, BLOCK_HASH, BLOCK_SORT, BLOCK_PARTITION, BLOCK_STEPS };
 #define QP_GRAPH_BLOCK_EXEC (UINT64_C(1)<<63)
+#define QP_GRAPH_RESIDENT_TEXT (UINT64_C(1)<<62)
 /* Resource CSF cparam1 selector. CPU fraction uses parts per million. */
 enum qp_resource { QP_RESOURCE_WORKMEM, QP_RESOURCE_CPU_RATIO };
 #define QP_CPU_RATIO_SCALE 1000000U

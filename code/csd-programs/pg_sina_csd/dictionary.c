@@ -33,7 +33,7 @@ struct qs_dictionary {
     struct file files[FILES];
     uint32_t capacity,count,body_page,body_used;
     uint64_t clock,retired;
-    unsigned io;
+    unsigned io,resident_only;
     struct page *pending;
     struct qs_dictionary_stats stats;
 };
@@ -85,6 +85,12 @@ struct qs_dictionary *qs_dictionary_create(cs_work_context *parent)
     atomic_init(&d->owner,0);
     return d;
 }
+struct qs_dictionary *qs_dictionary_create_resident(cs_work_context *parent)
+{
+    struct qs_dictionary *d=qs_dictionary_create(parent);
+    if(d) d->resident_only=1;
+    return d;
+}
 struct qs_dictionary_access *qs_dictionary_access_create(struct qs_dictionary *d)
 { return cs_work_calloc(d->context,1,sizeof(struct qs_dictionary_access)); }
 
@@ -134,6 +140,7 @@ static int64_t allocate(struct qs_dictionary *d,size_t bytes,void **out,void *io
     for(;;) {
         *out=cs_work_alloc(d->context,bytes);
         if(*out) return 0;
+        if(d->resident_only) return -4;
         struct page *p=victim(d);
         if(!p) return -4;
         if(p->dirty) {
@@ -356,6 +363,9 @@ void qs_dictionary_unpin(struct qs_dictionary_access *a)
 static int64_t dictionary_evict(struct qs_dictionary *d,struct qs_dictionary_access *a,
     void *io,uint64_t completion)
 {
+    /* An E9 worker cannot wait for a peer's logical ownership across flash
+     * I/O. Resident dictionaries stay in workmem while the query is live. */
+    if(d->resident_only) return -4;
     int64_t rc=begin(d,a,EVICT,io,completion);
     if(rc) return rc;
     struct page *p=victim(d);

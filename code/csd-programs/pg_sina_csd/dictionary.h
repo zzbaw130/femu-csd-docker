@@ -13,6 +13,8 @@ struct qs_dictionary_stats {
     uint64_t strings, bytes, stores, loads, metadata_stores, metadata_loads;
 };
 struct qs_dictionary *qs_dictionary_create(cs_work_context *parent);
+/* All pages stay in workmem, so an EXEC never waits for a peer's spill. */
+struct qs_dictionary *qs_dictionary_create_resident(cs_work_context *parent);
 struct qs_dictionary_access *qs_dictionary_access_create(struct qs_dictionary *dict);
 /* Repeat the same operation after each NEED_* completion, passing its token.
  * The input key and access must survive until insert completes. Each access

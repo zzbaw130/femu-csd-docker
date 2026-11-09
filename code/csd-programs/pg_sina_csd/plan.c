@@ -336,6 +336,7 @@ struct execution {
     struct sorted_rows *pending_sort;
     struct sorted_rows *sort_sink; /* CU-local state; runs are owned by the query. */
     bool block_graph, block_chain, block_row_pending, block_done;
+    bool resident_dictionary;
     bool block_sink_started, block_sink_done;
     unsigned block_write, block_input_node, block_native_deferred;
     int block_native_checked;
@@ -5330,12 +5331,12 @@ static bool block_chain_supported(const struct execution *s,unsigned root,int so
     for(int at=root;at!=source;at=p->nodes[at].left) {
         if(at<0 || ++count>QP_GRAPH_BLOCK_MAX_CHAIN) return false;
         const struct qp_node *n=&p->nodes[at];
-        if(!block_passes_text(n) || !n->expr.nout) return false;
+        if((!s->resident_dictionary && !block_passes_text(n)) || !n->expr.nout) return false;
         if(n->kind==QP_PROJECT) continue;
         if(n->kind==QP_JOIN && n->hash && s->nodes[at].hash_phase && !s->nodes[at].external &&
            !s->nodes[at].hash_fallback) continue;
         if(n->kind==QP_INDEX_JOIN && n->right>=0 && p->files[n->right].count &&
-           p->indexes[n->right].count && block_numeric_output(&p->nodes[n->right])) continue;
+           p->indexes[n->right].count && (s->resident_dictionary || block_numeric_output(&p->nodes[n->right]))) continue;
         return false;
     }
     return count!=0;
@@ -5547,12 +5548,13 @@ restart:
         bool hash_probe=producer->kind==QP_JOIN && producer->left==source && !s->nodes[root].external;
         bool index_probe=producer->kind==QP_INDEX_JOIN && producer->left==source && producer->right>=0 &&
             p->files[producer->right].count && p->indexes[producer->right].count &&
-            block_numeric_output(&p->nodes[producer->right]);
+            (s->resident_dictionary || block_numeric_output(&p->nodes[producer->right]));
         if(s->block_graph && (hash_sink || group_sink || aggregate_sink || sort_sink || partition_sink) &&
            leaf->kind==QP_SCAN &&
-           !leaf->ordered_index && block_numeric_output(leaf) && block_passes_text(producer) &&
-           (!group_sink || block_group_supported(&p->nodes[group_sink-1])) &&
-           (!aggregate_sink || block_group_supported(&p->nodes[aggregate_sink-1]))) {
+           !leaf->ordered_index &&
+           (s->resident_dictionary || (block_numeric_output(leaf) && block_passes_text(producer) &&
+            (!group_sink || block_group_supported(&p->nodes[group_sink-1])) &&
+            (!aggregate_sink || block_group_supported(&p->nodes[aggregate_sink-1]))))) {
             bool direct=(hash_probe || index_probe) && !sort_sink && !partition_sink;
             bool chain=root!=(unsigned)source && !direct && block_chain_supported(s,root,source);
             if(root==(unsigned)source || direct || chain)
@@ -6119,7 +6121,8 @@ static int open_execution(struct femu_csd_args *a,struct qp_plan *plan,
         s->output_order=cs_work_calloc(context,(size_t)qp_result_capacity(output,plan->packed_result)*text_columns,sizeof(*s->output_order));
         if(!s->output_order) { cs_work_end(context); return -4; }
     }
-    s->paged=qs_dictionary_create(context);
+    s->resident_dictionary=((uint64_t)a->cparam1&QP_GRAPH_RESIDENT_TEXT)!=0;
+    s->paged=s->resident_dictionary?qs_dictionary_create_resident(context):qs_dictionary_create(context);
     if(s->paged) { s->text=qs_dictionary_text_create(s->paged); s->initial_access=qs_dictionary_access_create(s->paged); }
     if(!s->literal_ids || !s->paged || !s->text || !s->initial_access) {
         if(s->paged) qs_dictionary_abort(s->paged);
@@ -6824,7 +6827,7 @@ static int64_t plan_execute(struct femu_csd_args *a,enum pipeline_phase phase)
        a->mr_len[2]<(long long)((worker+1)*sizeof(struct qs_result))) return -1;
     unsigned target=0;
     if(phase!=PIPELINE_EXECUTE) {
-        uint64_t id=((uint64_t)a->cparam1&~QP_GRAPH_BLOCK_EXEC)>>QP_GRAPH_PIPELINE_NODE_SHIFT;
+        uint64_t id=((uint64_t)a->cparam1&~(QP_GRAPH_BLOCK_EXEC|QP_GRAPH_RESIDENT_TEXT))>>QP_GRAPH_PIPELINE_NODE_SHIFT;
         if(worker || plan->ninit || id>=plan->count || id>=QP_NODES) return -1;
         const struct qp_node *n=&plan->nodes[id];
         if(n->kind!=QP_AGGREGATE || !n->nkeys || n->left<0 ||
