@@ -46,6 +46,9 @@ struct plan_slot {
     uint64_t retry_progress;
     unsigned scan_node;
     bool need_input, prefetched_input;
+    unsigned block_flags, batch_block_flags;
+    CS_BATCH_INDEX block_entries[BLOCK_STEPS];
+    uint64_t block_submissions;
     uint64_t queued_ns;
     PlanStateCsd *owner;
     unsigned worker;
@@ -126,6 +129,7 @@ struct PlanStateCsd {
     struct graph_stage graph[QP_NODES];
     enum graph_phase graph_phase;
     unsigned graph_node, graph_nodes, graph_init, graph_pipeline_group;
+    CS_CSF_ID graph_block[BLOCK_STEPS];
     bool graph_tree, graph_partition;
     uint64_t graph_packets, graph_build_packets;
     unsigned row;
@@ -362,6 +366,12 @@ static void initialize_delivery(PlanStateCsd *s,struct result_delivery *shared)
         s->advance_mutex_ready=true;
     }
 }
+static unsigned scan_capacity(const PlanStateCsd *s,unsigned id)
+{
+    const struct qp_node *n=&s->plan->nodes[id];
+    if(n->ordered_index) return 256;
+    return s->graph_pipeline_group?qp_scan_buffer_bytes(s->plan,n)/24:qp_scan_capacity(s->plan,n);
+}
 /* Compute offsets without allocating, so a larger I/O block can be tried
  * before reducing CU concurrency. Small relations need only their own bytes. */
 static size_t layout_buffers(PlanStateCsd *s,const bool *indexed)
@@ -370,7 +380,7 @@ static size_t layout_buffers(PlanStateCsd *s,const bool *indexed)
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_SCAN && !indexed[i]) {
         struct qp_node *n=&s->plan->nodes[i]; unsigned bytes=n->ordered_index?QS_INDEX_IO_BYTES:qp_scan_buffer_bytes(s->plan,n);
         n->input_offset=arena; arena+=bytes; n->vector_offset=arena;
-        arena+=(qs_chunk_bytes(n->ordered_index?256:qp_scan_capacity(s->plan,n),n->expr.ncols)+4095)&~(size_t)4095;
+        arena+=(qs_chunk_bytes(scan_capacity(s,i),n->expr.ncols)+4095)&~(size_t)4095;
     }
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_INDEX_JOIN) {
         struct qp_node *n=&s->plan->nodes[i]; n->input_offset=arena;
@@ -399,7 +409,7 @@ static size_t layout_buffers(PlanStateCsd *s,const bool *indexed)
                     n->parallel_input=end; end+=qp_scan_buffer_bytes(s->plan,n);
                 }
                 n->parallel_vector=end;
-                end+=(qs_chunk_bytes(n->ordered_index?256:qp_scan_capacity(s->plan,n),n->expr.ncols)+4095)&~(size_t)4095; break;
+                end+=(qs_chunk_bytes(scan_capacity(s,id),n->expr.ncols)+4095)&~(size_t)4095; break;
             }
             if(n->kind==QP_INDEX_JOIN) {
                 n->parallel_vector=end;
@@ -546,6 +556,13 @@ static unsigned graph_pipeline_group(const struct qp_plan *p)
     if(build->kind!=QP_JOIN || !build->hash || build->join_type!=QP_INNER ||
        build->left<0 || build->right<0 || p->nodes[build->left].kind!=QP_SCAN ||
        p->nodes[build->right].kind!=QP_SCAN) return 0;
+    /* A block EXEC can wait for E9 I/O. Dictionary contention between
+     * CUs needs a different retry protocol, so keep text as a filter input. */
+    for(unsigned id=0;id<p->count;++id) {
+        const struct qs_plan *expr=&p->nodes[id].expr;
+        for(unsigned col=0;col<expr->nout;++col)
+            if(expr->exprs[expr->outputs[col].index].type==Q_STRING) return 0;
+    }
     return sort->left+1;
 }
 static bool graph_building(enum graph_phase phase)
@@ -613,6 +630,7 @@ static void graph_request(PlanStateCsd *s,CsComputeRequest *compute,bool loaded)
         compute->CSFId=phase==GRAPH_PIPELINE_BUILD?s->graph_build:s->graph_feed;
         uint64_t parameter=s->profiling|((uint64_t)id<<QP_GRAPH_PIPELINE_NODE_SHIFT);
         if(loaded) parameter|=QP_PAGES_INPUT;
+        parameter|=QP_GRAPH_BLOCK_EXEC;
         csHelperSetComputeArg(&compute->Args[5],CS_64BIT_VALUE_TYPE,(u64)parameter);
         return;
     }
@@ -835,7 +853,7 @@ static void start(PlanStateCsd *s)
     checked(transfer(s->memory[3],0,&dictionary,sizeof(dictionary),true),"initialize strings");
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_SCAN && !indexed[i]) {
         struct qp_node *n=&s->plan->nodes[i];
-        struct qs_chunk header={.capacity=n->ordered_index?256:qp_scan_capacity(s->plan,n),.ncols=n->expr.ncols};
+        struct qs_chunk header={.capacity=scan_capacity(s,i),.ncols=n->expr.ncols};
         checked(transfer(s->memory[3],n->vector_offset,&header,sizeof(header),true),"initialize scan");
     }
     for(unsigned w=0;w<s->workers;++w)
@@ -863,6 +881,11 @@ static void start(PlanStateCsd *s)
     } else if(s->graph_pipeline_group) {
         s->graph_build=pg_sina_function("pg_sina_graph_build_pipeline");
         s->graph_feed=pg_sina_function("pg_sina_graph_group_pipeline");
+        s->graph_block[BLOCK_SCAN]=pg_sina_function("pg_sina_graph_block_scan");
+        s->graph_block[BLOCK_FILTER]=pg_sina_function("pg_sina_graph_block_filter");
+        s->graph_block[BLOCK_PROBE]=pg_sina_function("pg_sina_graph_block_probe");
+        s->graph_block[BLOCK_GROUP]=pg_sina_function("pg_sina_graph_block_aggregate");
+        s->graph_block[BLOCK_HASH]=pg_sina_function("pg_sina_graph_block_hash_build");
     }
     pfree(request); s->started=true;
     if(s->async_scan || s->graph_tree) {
@@ -946,14 +969,19 @@ static CS_STATUS queue_scan(struct plan_slot *slot)
     CsBatchRequest *compute=calloc(1,sizeof(*compute)+6*sizeof(CsComputeArg));
     CS_STATUS status=CS_OUT_OF_RESOURCES;
     if(!load || !compute) goto done;
-    bool reuse=needs_load && slot->resume && slot->scan_load;
+    bool reuse=needs_load && slot->resume && slot->scan_load &&
+        slot->batch_block_flags==slot->block_flags;
+    bool block=slot->block_flags&QP_GRAPH_BLOCK_SCAN;
+    bool probe=slot->block_flags&QP_GRAPH_BLOCK_PROBE;
     if(slot->resume && !reuse) {
         status=csFreeBatchRequest(slot->resume); if(status!=CS_SUCCESS) goto done;
         slot->resume=NULL;
     }
     if(!reuse) {
         slot->scan_load=0;
-        status=csAllocBatchRequest(CS_BATCH_SERIAL,needs_load?2:1,&slot->resume);
+        slot->batch_block_flags=slot->block_flags;
+        unsigned entries=(needs_load?1:0)+(block?3+probe:1);
+        status=csAllocBatchRequest(CS_BATCH_SERIAL,entries,&slot->resume);
         if(status!=CS_SUCCESS) goto done;
     }
     CS_BATCH_INDEX previous=0,current;
@@ -974,16 +1002,30 @@ static CS_STATUS queue_scan(struct plan_slot *slot)
     csHelperSetComputeArg(&compute->u.Compute.Args[4],CS_AFDM_TYPE,s->worker_io[worker-1],0UL);
     uint64_t parameter=s->profiling|(worker<<1)|QP_SCAN_INPUT|((offset/QS_PAGE)<<QP_SCAN_PAGE_SHIFT);
     csHelperSetComputeArg(&compute->u.Compute.Args[5],CS_64BIT_VALUE_TYPE,(u64)parameter);
-    status=csConfigureBatchEntry(slot->resume,reuse?CS_BATCH_RECONFIG:CS_BATCH_ADD,compute,
-        reuse?slot->previous:0,reuse?0:previous,reuse?NULL:&current);
-    if(status!=CS_SUCCESS) goto done;
-    if(!reuse) slot->previous=current;
+    if(block) {
+        for(unsigned step=0;step<BLOCK_STEPS;++step) {
+            if(step==BLOCK_PROBE && !probe) continue;
+            if(step==BLOCK_GROUP && (slot->block_flags&QP_GRAPH_BLOCK_BUILD)) continue;
+            if(step==BLOCK_HASH && !(slot->block_flags&QP_GRAPH_BLOCK_BUILD)) continue;
+            compute->u.Compute.CSFId=s->graph_block[step];
+            status=csConfigureBatchEntry(slot->resume,reuse?CS_BATCH_RECONFIG:CS_BATCH_ADD,compute,
+                reuse?slot->block_entries[step]:0,reuse?0:previous,reuse?NULL:&slot->block_entries[step]);
+            if(status!=CS_SUCCESS) goto done;
+            previous=slot->block_entries[step];
+        }
+    } else {
+        status=csConfigureBatchEntry(slot->resume,reuse?CS_BATCH_RECONFIG:CS_BATCH_ADD,compute,
+            reuse?slot->previous:0,reuse?0:previous,reuse?NULL:&current);
+        if(status!=CS_SUCCESS) goto done;
+        if(!reuse) slot->previous=current;
+    }
     slot->control.bytes=slot->control.index_nreads=0; slot->need_input=false;
     if(s->profiling) slot->queued_ns=clock_ns();
     status=csQueueBatchRequest(slot->resume,slot,completed,NULL,&slot->inflight,NULL);
     if(status==CS_QUEUED) {
         slot->prefetched_input=false;
         if(needs_load) ++slot->scan_loads;
+        if(block && bytes) ++slot->block_submissions;
         if(loaded) ++s->prefetch_reused;
     }
 done:
@@ -1060,6 +1102,7 @@ static CS_STATUS queue_pages(struct plan_slot *slot)
         status=csFreeBatchRequest(slot->resume); if(status!=CS_SUCCESS) return status;
         slot->resume=NULL;
     }
+    slot->scan_load=0;
     if(!graph_building(phase) &&
        (slot->control.bytes || slot->control.index_nreads) && !slot->control.ready) {
         unsigned groups=1;
@@ -1288,7 +1331,8 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
         s->parallel=slot->control.parallel;
         if(slot->control.epoch!=s->epoch) {
             s->epoch=slot->control.epoch;
-            unsigned scan=slot->control.scan_node;
+            unsigned scan=slot->control.scan_node&~QP_GRAPH_BLOCK_FLAGS;
+            unsigned block_flags=slot->control.scan_node&QP_GRAPH_BLOCK_FLAGS;
             unsigned prefetched=s->prefetch_batch && !s->prefetch_claimed &&
                 scan==s->plan->prefetch_node?s->plan->prefetch_slots:0;
             if(prefetched) s->prefetch_claimed=true;
@@ -1297,7 +1341,7 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
             for(unsigned i=1;i<=s->workers;++i) {
                 struct plan_slot *worker=&s->slots[i];
                 worker->ready=worker->done=worker->yielded=false;
-                worker->scan_node=scan;
+                worker->scan_node=scan; worker->block_flags=block_flags;
                 worker->need_input=worker->scan_node!=0;
                 worker->prefetched_input=i<=prefetched;
                 /* The device initializes each phase's worker control to
@@ -1578,8 +1622,14 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     pg_sina_explain_placement((CustomScan *)node->ss.ps.plan,es);
     ExplainPropertyText("Execution Path","csd",es);
     ExplainPropertyText("CSD Executor",pg_sina_operator_graph?"SNIA operator graph":"pg_sina_plan",es);
-    if(s->graph_pipeline_group)
-        ExplainPropertyText("CSD Operator Batches","HashBuild pipeline | Probe and Aggregate pipeline | Sort and Limit",es);
+    if(s->graph_pipeline_group) {
+        uint64_t blocks=0;
+        for(unsigned w=1;w<=s->workers;++w) blocks+=s->slots[w].block_submissions;
+        ExplainPropertyInteger("CSD Explicit Scan Block Batches",NULL,blocks,es);
+        if(blocks)
+            ExplainPropertyText("CSD Operator Batches",
+                "LOAD -> Scan -> Filter -> [HashProbe] -> HashBuild or Aggregate | Sort and Limit",es);
+    }
     if(s->graph_tree) {
         ExplainPropertyInteger("CSD Graph Nodes",NULL,s->graph_nodes,es);
         ExplainPropertyInteger("CSD Graph Packets",NULL,s->graph_packets,es);

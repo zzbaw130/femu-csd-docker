@@ -37,6 +37,13 @@
 /* The coarse graph coordinator uses bits 0 and 9 as in pg_sina_plan. */
 #define QP_GRAPH_PIPELINE_NODE_SHIFT 10
 #define QP_GRAPH_PHASE_DONE 128U
+/* scan_node carries the topology of a block's explicit EXEC chain. */
+#define QP_GRAPH_BLOCK_SCAN (1U<<31)
+#define QP_GRAPH_BLOCK_BUILD (1U<<30)
+#define QP_GRAPH_BLOCK_PROBE (1U<<29)
+#define QP_GRAPH_BLOCK_FLAGS (QP_GRAPH_BLOCK_SCAN|QP_GRAPH_BLOCK_BUILD|QP_GRAPH_BLOCK_PROBE)
+enum qp_graph_block_step { BLOCK_SCAN, BLOCK_FILTER, BLOCK_PROBE, BLOCK_GROUP, BLOCK_HASH, BLOCK_STEPS };
+#define QP_GRAPH_BLOCK_EXEC (UINT64_C(1)<<63)
 /* Resource CSF cparam1 selector. CPU fraction uses parts per million. */
 enum qp_resource { QP_RESOURCE_WORKMEM, QP_RESOURCE_CPU_RATIO };
 #define QP_CPU_RATIO_SCALE 1000000U

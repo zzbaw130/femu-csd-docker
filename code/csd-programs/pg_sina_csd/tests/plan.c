@@ -468,6 +468,30 @@ static void namespace_reentry(function run)
     }
     free(raw); free(arena); free(io); free(out); free(p);
 }
+static function test_block_steps[BLOCK_STEPS];
+static atomic_uint test_probe_stores, test_group_reads, test_hash_stores;
+static int64_t test_block_exec(struct probe_test *t)
+{
+    int64_t status=0;
+    for(unsigned step=0;step<BLOCK_STEPS;++step) {
+        if(step==BLOCK_PROBE && !(t->scan_node&QP_GRAPH_BLOCK_PROBE)) continue;
+        if(step==BLOCK_GROUP && (t->scan_node&QP_GRAPH_BLOCK_BUILD)) continue;
+        if(step==BLOCK_HASH && !(t->scan_node&QP_GRAPH_BLOCK_BUILD)) continue;
+        for(;;) {
+            status=test_block_steps[step](&t->args);
+            assert(status>=0);
+            unsigned op=(uint64_t)status>>60;
+            if(!op) { t->args.cparam2=0; break; }
+            if(step==BLOCK_PROBE && op==1) atomic_fetch_add(&test_probe_stores,1);
+            if(step==BLOCK_GROUP && op==2) atomic_fetch_add(&test_group_reads,1);
+            if(step==BLOCK_HASH && op==1) atomic_fetch_add(&test_hash_stores,1);
+            t->args.cparam2=spill_request(t->spill,op,(uint64_t)status&CS_IO_VALUE_MASK,t->args.mr_addr[4]);
+        }
+        if(step==BLOCK_GROUP || step==BLOCK_HASH) return status;
+        assert(!status);
+    }
+    abort();
+}
 static void *probe_worker(void *arg)
 {
     struct probe_test *t=arg;
@@ -480,12 +504,13 @@ static void *probe_worker(void *arg)
         struct qp_control *c=t->control;
         if(!csIsReentry(&t->args)) t->args.cparam1=(t->worker<<1)|(t->args.cparam1&1);
         if(t->next_offset && *t->need_input && !c->index_nreads && !csIsReentry(&t->args)) {
-            const struct qp_node *n=&t->plan->nodes[t->scan_node-1];
+            unsigned scan=(t->scan_node&~QP_GRAPH_BLOCK_FLAGS)-1;
+            const struct qp_node *n=&t->plan->nodes[scan];
             uint64_t offset=atomic_fetch_add(t->next_offset,t->plan->scan_bytes);
             if(offset>n->bytes) offset=n->bytes;
             size_t bytes=n->bytes-offset<t->plan->scan_bytes?n->bytes-offset:t->plan->scan_bytes;
             size_t input=t->worker>1?n->parallel_input+(t->worker-2)*t->plan->parallel_stride:n->input_offset;
-            memcpy(t->arena+input,((t->scan_node-1==3 || t->scan_node-1==6)?t->heap:t->raw)+offset,bytes);
+            memcpy(t->arena+input,((scan==3 || scan==6)?t->heap:t->raw)+offset,bytes);
             t->args.cparam1|=QP_SCAN_INPUT | ((offset/QS_PAGE)<<QP_SCAN_PAGE_SHIFT);
             *t->need_input=false;
         } else if(!csIsReentry(&t->args) && (c->index_nreads || (!t->next_offset && c->bytes)) && !c->ready) {
@@ -504,7 +529,7 @@ static void *probe_worker(void *arg)
                 c->ready=1;
             }
         }
-        int64_t status=t->run(&t->args);
+        int64_t status=(t->scan_node&QP_GRAPH_BLOCK_SCAN)?test_block_exec(t):t->run(&t->args);
         if(status<0) fprintf(stderr,"worker %u status=%lld node=%u kind=%d ready=%u bytes=%u offset=%llu\n",
             t->worker,(long long)status,c->error_node,t->plan->nodes[c->error_node].kind,
             c->ready,c->bytes,(unsigned long long)c->offset);
@@ -810,7 +835,8 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             indexed->parallel_input=parallel_bytes; parallel_bytes+=QS_INDEX_IO_BYTES;
             indexed->parallel_vector=parallel_bytes; parallel_bytes+=qs_index_input_bytes()+((qs_chunk_bytes(256,4)+4095)&~(size_t)4095);
         }
-        if(parallel==TEST_BUILD_PHASE || parallel==TEST_BUILD_FALLBACK || grouped_build || wide_build) {
+        if(parallel==TEST_BUILD_PHASE || parallel==TEST_BUILD_FALLBACK || grouped_build || wide_build ||
+           test_block_steps[BLOCK_SCAN]) {
             plan->nodes[3].parallel=1;
             plan->nodes[3].parallel_input=plan->nodes[2].parallel_input;
             plan->nodes[3].parallel_vector=plan->nodes[2].parallel_vector;
@@ -916,10 +942,12 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         }
         if(iteration==1000000) { fprintf(stderr,"STUCK join=%u hash=%d parallel=%d epoch=%u avail=%llu done=%llu active=%u rows=%u node=%u reads=%u bytes=%u\n",join,hash,parallel,control.epoch,(unsigned long long)available,(unsigned long long)done,control.parallel,out->rows,control.node,control.index_nreads,control.bytes); abort(); }
         uint64_t consumed=csIsReentry(&args)?control.drained:0; unsigned previous_epoch=control.epoch;
+        if(test_block_steps[BLOCK_SCAN] && pipeline_phase<2) args.cparam1|=QP_GRAPH_BLOCK_EXEC;
         int64_t status=coordinator(&args);
         if(status==QP_GRAPH_PHASE_DONE) {
             assert(test_pipeline_build && pipeline_phase<2 && !out->rows);
             coordinator=++pipeline_phase==1?test_pipeline_group:run;
+            args.cparam1&=~QP_GRAPH_BLOCK_EXEC;
         }
         if(control.epoch==previous_epoch) assert((control.drained&consumed)==consumed);
         if(status<0) { fprintf(stderr,"native plan status=%lld join=%u row=%u state=%llu\n",(long long)status,join,rows,(unsigned long long)control.state); abort(); }
@@ -1032,7 +1060,10 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         if(parallel==TEST_PARTITION_SERIAL) assert(!control.epoch);
         else assert(memory==8?control.epoch==1:control.epoch>1);
     }
-    if(test_pipeline_build) assert(pipeline_phase==2 && pipeline_stores && pipeline_reads);
+    if(test_block_steps[BLOCK_SCAN])
+        assert(pipeline_phase==2 && pipeline_reads && atomic_load(&test_hash_stores) &&
+               atomic_load(&test_probe_stores) && atomic_load(&test_group_reads));
+    else if(test_pipeline_build) assert(pipeline_phase==2 && pipeline_stores && pipeline_reads);
     for(size_t i=0;i<spill.count;++i) free(spill.tokens[i]);
     assert(!pthread_mutex_destroy(&spill.mutex));
     free(controls); free(spill.tokens); free(raw[0]); free(raw[1]); free(index); free(plan); free(arena); free(io); free(out);
@@ -2784,6 +2815,17 @@ int main(int argc,char **argv)
         test_pipeline_group=(function)dlsym(library,"pg_sina_graph_group_pipeline");
         assert(test_pipeline_build && test_pipeline_group);
         test(run,QP_INNER,31,3000003,64,1,TEST_PARTITION_GROUP);
+        static const char *steps[]={
+            "pg_sina_graph_block_scan","pg_sina_graph_block_filter","pg_sina_graph_block_probe",
+            "pg_sina_graph_block_aggregate","pg_sina_graph_block_hash_build"};
+        for(unsigned i=0;i<BLOCK_STEPS;++i) {
+            test_block_steps[i]=(function)dlsym(library,steps[i]);
+            assert(test_block_steps[i]);
+        }
+        /* Duplicate matches produce more rows in one input block than can
+         * fit in 64 MiB. The undersized shared build also forces its block
+         * sink to spool rejected rows for the coordinator to grow/replay. */
+        test(run,QP_INNER,6003,2303,64,1,TEST_HASH_GROUP);
         return 0;
     }
     if(argc==3 && !strcmp(argv[2],"--sort-payload-64m")) {
