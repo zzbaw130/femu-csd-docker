@@ -25,6 +25,7 @@ extern int qs_sort_paged_dictionary(uint64_t,struct qs_dictionary *);
 extern const char *qs_sort_output_text(const struct qs_result *,uint32_t,unsigned *);
 extern int qs_sort_prepare(uint64_t);
 extern size_t qs_sort_min_workspace(void);
+extern size_t qs_sort_integer_partial_workspace(void);
 extern int64_t qs_sort_finish_sink(uint64_t,struct femu_csd_args *);
 extern int64_t qs_sort_sink_columns(struct femu_csd_args *,const struct qs_plan *,const struct qs_vector *,unsigned,unsigned);
 #define QP_WAIT 1
@@ -92,6 +93,7 @@ struct spool {
     unsigned char *tail,*cache;
     struct spool_block *pages;
     unsigned blocks, capacity, used, loaded;
+    unsigned block_bytes,flush_head;
     uint64_t rows;
 };
 /* Each Sink owns its partition streams; a Source claims a complete partition
@@ -99,7 +101,8 @@ struct spool {
 struct radix_group {
     struct spool *streams;
     unsigned partitions,workers;
-    size_t resident_reserve;
+    size_t resident_reserve,source_sort_limit;
+    atomic_size_t source_growth;
     atomic_uint next;
     struct operator_state *serial;
 };
@@ -328,6 +331,7 @@ struct execution {
     struct sorted_rows *pending_sort;
     struct sorted_rows *sort_sink; /* CU-local state; runs are owned by the query. */
     struct spool *pending_spool;
+    unsigned pending_spool_blocks;
     unsigned pending_block;
     int pending_store;
     int expression_wait;
@@ -342,6 +346,8 @@ struct execution {
     unsigned group_source_profiling;
     uint64_t wait_started,wait_ns[QP_WAITS],wait_calls[QP_WAITS],finished_ns;
     unsigned wait_kind;
+    uint64_t spill_started;
+    bool spill_store;
     uint64_t sink_ns,sink_rows;
     bool profiling, host_scan, scan_drained;
     struct femu_csd_args *args;
@@ -358,6 +364,7 @@ struct execution {
     uint64_t partition_prefix_at,partition_prefix_end;
     struct spool *partitions;
     bool group_shard,group_merge_full;
+    atomic_bool ibex_overflow;
     atomic_uint_fast64_t next_offset;
     atomic_uint active_cus, peak_cus;
     struct execution *owner, *workers[QS_WORKERS];
@@ -372,6 +379,12 @@ static uint64_t now_ns(clockid_t clock)
  * includes LOAD/queueing; dictionary BUSY includes the host retry policy. */
 static void wait_resume(struct execution *s)
 {
+    if(s->spill_started) {
+        uint64_t elapsed=now_ns(CLOCK_MONOTONIC)-s->spill_started;
+        if(s->spill_store) s->metrics.spill_write_wait_ns+=elapsed;
+        else s->metrics.spill_read_wait_ns+=elapsed;
+        s->spill_started=0;
+    }
     if(s->wait_started) {
         s->wait_ns[s->wait_kind]+=now_ns(CLOCK_MONOTONIC)-s->wait_started;
         s->wait_started=0;
@@ -386,6 +399,10 @@ static void wait_begin(struct execution *s,unsigned kind)
 static void wait_io(struct execution *s,int64_t status)
 {
     uint64_t operation=(uint64_t)status&~CS_IO_VALUE_MASK;
+    if(s->profiling && (operation==CS_NEED_STORE || operation==CS_NEED_LOAD)) {
+        s->spill_started=now_ns(CLOCK_MONOTONIC);
+        s->spill_store=operation==CS_NEED_STORE;
+    }
     if(status==QS_DICTIONARY_BUSY) wait_begin(s,QP_WAIT_DICTIONARY);
     else if(operation==CS_NEED_NVM_READ) wait_begin(s,QP_WAIT_NVM);
     else if(operation==CS_NEED_STORE || operation==CS_NEED_LOAD || operation==CS_NEED_FREE)
@@ -821,7 +838,7 @@ static int64_t sort_call(struct execution *s,struct sorted_rows *sort,int source
     return status;
 }
 static int64_t sort_init(struct execution *s,struct sorted_rows *sort,const struct qs_plan *input,
-    unsigned keys,const int *columns,const struct qs_order *order)
+    unsigned keys,const int *columns,const struct qs_order *order,size_t limit)
 {
     if(sort->initialized) return 0;
     sort->input=cs_work_calloc(s->context,1,sizeof(*sort->input));
@@ -847,6 +864,7 @@ static int64_t sort_init(struct execution *s,struct sorted_rows *sort,const stru
     size_t available=free_bytes/(active+2);
     if(free_bytes>reserve && free_bytes-reserve>available) available=free_bytes-reserve;
     if(available>sort->plan.work_mem_bytes) sort->plan.work_mem_bytes=available;
+    if(limit && limit<sort->plan.work_mem_bytes) sort->plan.work_mem_bytes=limit;
     sort->plan.work_mem_parent=(uintptr_t)s->context;
     memcpy(sort->plan.outputs,input->outputs,input->nout*sizeof(input->outputs[0]));
     for(unsigned i=0;i<keys;++i) sort->plan.order[sort->plan.norder++]=order?order[i]:(struct qs_order){.output=columns[i]};
@@ -861,7 +879,7 @@ static int64_t sorted_input(struct execution *s,struct sorted_rows *sort,unsigne
     unsigned keys,const int *columns,const struct qs_order *order,struct qs_cell *row)
 {
     const struct qp_node *input=&s->plan->nodes[child];
-    int64_t status=sort_init(s,sort,&input->expr,keys,columns,order); if(status) return status;
+    int64_t status=sort_init(s,sort,&input->expr,keys,columns,order,0); if(status) return status;
     if(sort->drained && !sort->output) return 0;
     while(!sort->complete) {
         if(sort->input_pending) {
@@ -1377,26 +1395,34 @@ static int64_t hash_next(struct execution *s,unsigned id,struct qs_cell *row)
         o->hash_output_pending=0; if(count) return 2;
     }
 }
+static unsigned spool_block_bytes(const struct spool *p)
+{ return p->block_bytes?p->block_bytes:QS_SORT_IO_BYTES; }
+static bool spool_reserve_pages(struct spool *p,cs_work_context *context,unsigned count)
+{
+    if(count<=p->capacity-p->blocks) return true;
+    unsigned capacity=p->capacity?p->capacity*2:8;
+    void *pages=cs_work_realloc(context,p->pages,(size_t)capacity*sizeof(*p->pages));
+    if(!pages) return false;
+    p->pages=pages; p->capacity=capacity;
+    return true;
+}
 static int64_t spool_append_context(struct execution *s,struct spool *p,const void *row,unsigned row_bytes,
     cs_work_context *context,size_t resident_reserve)
 {
-    unsigned block_rows=QS_SORT_IO_BYTES/row_bytes;
+    unsigned block_bytes=spool_block_bytes(p),block_rows=block_bytes/row_bytes;
     if(!p->tail) {
-        p->tail=cs_work_alloc(context,QS_SORT_IO_BYTES); p->loaded=UINT_MAX;
+        p->tail=cs_work_alloc(context,block_bytes); p->loaded=UINT_MAX;
         if(!p->tail) return -4;
     }
     if(p->used==block_rows) {
-        if(p->blocks==p->capacity) {
-            unsigned capacity=p->capacity?p->capacity*2:8;
-            void *pages=cs_work_realloc(context,p->pages,(size_t)capacity*sizeof(*p->pages)); if(!pages) return -4;
-            p->pages=pages; p->capacity=capacity;
-        }
+        if(!spool_reserve_pages(p,context,1)) return -4;
         unsigned char *tail=NULL;
-        if(resident_reserve && cs_work_available(context)>resident_reserve+QS_SORT_IO_BYTES)
-            tail=cs_work_alloc(context,QS_SORT_IO_BYTES);
+        if(resident_reserve && cs_work_available(context)>resident_reserve+block_bytes)
+            tail=cs_work_alloc(context,block_bytes);
         if(!tail) {
-            memcpy(s->io,p->tail,QS_SORT_IO_BYTES); s->pending_spool=p; s->pending_store=1;
-            return csNeedStore(QS_SORT_IO_BYTES);
+            memcpy(s->io,p->tail,block_bytes); s->pending_spool=p; s->pending_store=1;
+            s->pending_spool_blocks=1; p->used=0;
+            return csNeedStore(block_bytes);
         }
         p->pages[p->blocks++]=(struct spool_block){.data=p->tail};
         p->tail=tail; p->used=0;
@@ -1407,17 +1433,19 @@ static int64_t spool_append_bytes(struct execution *s,struct spool *p,const void
 { return spool_append_context(s,p,row,row_bytes,s->context,0); }
 static int64_t spool_row_bytes(struct execution *s,struct spool *p,uint64_t index,unsigned row_bytes,void *row)
 {
-    unsigned block_rows=QS_SORT_IO_BYTES/row_bytes,block=index/block_rows;
+    unsigned block_bytes=spool_block_bytes(p),block_rows=block_bytes/row_bytes,block=index/block_rows;
     if(index>=p->rows) return -1;
     unsigned char *data=p->tail;
     if(block<p->blocks && p->pages[block].data) data=p->pages[block].data;
     else if(block<p->blocks) {
         if(!p->cache) { p->cache=cs_work_alloc(s->context,QS_SORT_IO_BYTES); if(!p->cache) return -4; }
-        if(p->loaded!=block) {
+        uint64_t token=p->pages[block].token;
+        /* Batched radix blocks in a stream share one token and one read. */
+        if(p->loaded!=block && (p->loaded>=block || p->pages[p->loaded].token!=token)) {
             s->pending_spool=p; s->pending_store=0; s->pending_block=block;
-            return csNeedLoad(p->pages[block].token);
+            return csNeedLoad(token);
         }
-        data=p->cache;
+        data=p->cache+(size_t)(block-p->loaded)*block_bytes;
     }
     memcpy(row,data+(index%block_rows)*row_bytes,row_bytes); return 0;
 }
@@ -2026,6 +2054,7 @@ static int64_t scan_chunk_next(struct execution *s,unsigned id)
         *o->index_plan=*p; o->index_plan->work_mem_parent=(uintptr_t)s->context;
         o->index_plan->join.nattrs=p->nattrs; o->index_plan->join.work_mem_bytes=QS_INDEX_WORK_BYTES;
         int status=qs_index_init(o->index_plan,&o->index_control); if(status) return status;
+        if(n->ordered_index&QP_INDEX_UPPER) qs_index_scan_upper(&o->index_control,n->index_upper);
         if(s->paged) { int bound=qs_index_paged_dictionary(&o->index_control,s->paged); if(bound) return bound; }
         else qs_index_dictionary(&o->index_control,s->dictionary);
     }
@@ -3694,6 +3723,12 @@ static struct operator_state *group_worker_local(struct execution *s,unsigned id
 static int group_worker_values(struct execution *s,unsigned id,struct operator_state *o,
     const struct qs_cell *keys,const struct group_value *values,int shared,uint64_t hash)
 {
+    if(shared && s->plan->ibex && id==s->plan->root) {
+        if(atomic_load_explicit(&s->owner->ibex_overflow,memory_order_relaxed)) return 0;
+        int added=group_sink_hashed_values(s,id,o,keys,values,shared,hash);
+        if(!added) atomic_store_explicit(&s->owner->ibex_overflow,true,memory_order_relaxed);
+        return added;
+    }
     if(s->group_update && s->group_update->active) return group_update_continue(s,id);
     struct operator_state *local=shared?group_worker_local(s,id):NULL;
     if(local) {
@@ -3761,6 +3796,62 @@ static void group_prefetch(struct operator_state *local,uint64_t hash,int payloa
             __builtin_prefetch(group_at(local,entry->row),1,1);
     }
 }
+/* Use the local lookup array as links after the Sink has stopped inserting.
+ * Consecutive blocks in a write belong to one partition, so the Source can
+ * read the whole extent once and release it after its last block. */
+static int64_t radix_flush_blocks(struct execution *s,struct operator_state *local,
+    struct spool *streams,unsigned rows,int wide)
+{
+    struct radix_group *radix=local->group_radix;
+    cs_work_context *context=s->owner->context;
+    unsigned block_bytes=spool_block_bytes(streams),stride=local->group_stride;
+    unsigned block_rows=block_bytes/stride,blocks_per_io=QS_SORT_IO_BYTES/block_bytes;
+    if(!local->group_flush) {
+        for(unsigned row=rows;row;--row) {
+            struct compact_group *g=group_at(local,row-1);
+            uint64_t hash=wide?(uint64_t)g->key:mix_hash(g->key_flags==2?0:(uint64_t)g->key);
+            struct spool *p=&streams[(hash>>32)&(radix->partitions-1)];
+            local->group_entries[row-1].row=p->flush_head;
+            p->flush_head=row;
+        }
+        local->group_flush=1;
+    }
+    for(;local->group_flush<=radix->partitions;++local->group_flush) {
+        struct spool *p=&streams[local->group_flush-1];
+        if(!p->flush_head) continue;
+        if(!p->tail) {
+            p->tail=cs_work_alloc(context,block_bytes); p->loaded=UINT_MAX;
+            if(!p->tail) return -4;
+        }
+        unsigned blocks=0;
+        while(p->flush_head) {
+            if(p->used==block_rows) {
+                if(!blocks && cs_work_available(context)>radix->resident_reserve+block_bytes) {
+                    if(!spool_reserve_pages(p,context,1)) return -4;
+                    unsigned char *tail=cs_work_alloc(context,block_bytes);
+                    if(tail) {
+                        p->pages[p->blocks++]=(struct spool_block){.data=p->tail};
+                        p->tail=tail; p->used=0;
+                        continue;
+                    }
+                }
+                memcpy((unsigned char *)s->io+(size_t)blocks*block_bytes,p->tail,block_bytes);
+                p->used=0;
+                if(++blocks==blocks_per_io) break;
+            }
+            unsigned row=p->flush_head-1;
+            memcpy(p->tail+(size_t)p->used*stride,group_at(local,row),stride);
+            p->flush_head=local->group_entries[row].row;
+            ++p->used; ++p->rows;
+        }
+        if(blocks) {
+            if(!spool_reserve_pages(p,context,blocks)) return -4;
+            s->pending_spool=p; s->pending_store=1; s->pending_spool_blocks=blocks;
+            return csNeedStore(blocks*block_bytes);
+        }
+    }
+    return 0;
+}
 /* A full private table is flushed by its own CU, never by the coordinator.
  * The partial aggregate records and stream metadata outlive the Sink workers. */
 static int64_t radix_flush(struct execution *s,unsigned id)
@@ -3770,11 +3861,14 @@ static int64_t radix_flush(struct execution *s,unsigned id)
     const struct qp_node *n=&s->plan->nodes[id];
     int wide=n->nkeys!=1 || n->expr.exprs[n->expr.keys[0]].type!=Q_INTEGER;
     unsigned rows=atomic_load_explicit(local->group_count,memory_order_relaxed);
-    while(local->group_flush<rows) {
+    struct spool *streams=&radix->streams[(s->worker-1)*radix->partitions];
+    if(spool_block_bytes(streams)<QS_SORT_IO_BYTES) {
+        int64_t status=radix_flush_blocks(s,local,streams,rows,wide); if(status) return status;
+    } else while(local->group_flush<rows) {
         struct compact_group *g=group_at(local,local->group_flush);
         uint64_t hash=wide?(uint64_t)g->key:mix_hash(g->key_flags==2?0:(uint64_t)g->key);
         unsigned partition=(hash>>32)&(radix->partitions-1);
-        struct spool *stream=&radix->streams[(s->worker-1)*radix->partitions+partition];
+        struct spool *stream=&streams[partition];
         int64_t status=spool_append_context(s,stream,g,local->group_stride,s->owner->context,radix->resident_reserve);
         if(status) return status;
         ++local->group_flush;
@@ -3782,6 +3876,18 @@ static int64_t radix_flush(struct execution *s,unsigned id)
     memset(local->group_entries,0,(size_t)local->group_capacity*sizeof(*local->group_entries));
     atomic_store_explicit(local->group_count,0,memory_order_relaxed);
     local->group_flush=local->group_phase=0;
+    return 0;
+}
+static int group_return_rows(struct projection_batch *b,struct qs_result *out,unsigned first,unsigned end)
+{
+    for(unsigned r=first;r<end;++r) {
+        struct qs_cell *row=(struct qs_cell *)out->data+(size_t)out->rows*b->plan.nout;
+        for(unsigned col=0;col<b->plan.nout;++col) {
+            int index=b->plan.outputs[col].index; if(b->vectors[index].errors[r]) return -5;
+            row[col]=qs_vector_cell(&b->plan,b->vectors,index,r);
+        }
+        ++out->rows;
+    }
     return 0;
 }
 /* Keep keys and aggregate arguments in vectors. Only rows rejected by a full
@@ -3819,6 +3925,14 @@ static int64_t group_sink_vectors(struct execution *s,unsigned id,struct qs_resu
     }
     while(b->position<b->count && out->rows<capacity) {
         unsigned first=b->position;
+        if(s->plan->ibex && id==s->plan->root &&
+           atomic_load_explicit(&s->owner->ibex_overflow,memory_order_relaxed)) {
+            unsigned end=first+capacity-out->rows;
+            if(end>b->count) end=b->count;
+            int status=group_return_rows(b,out,first,end); if(status) return status;
+            s->metrics.matched+=end-first; b->position=end;
+            break;
+        }
         struct group_batch_input stack,*input=&stack; stack.phase=0;
         if(group_text_extreme(s,n)) {
             if(!b->group_input) b->group_input=cs_work_calloc(s->context,1,sizeof(*b->group_input));
@@ -3871,14 +3985,7 @@ static int64_t group_sink_vectors(struct execution *s,unsigned id,struct qs_resu
                 int64_t status=radix_flush(s,id); if(status) return status;
                 continue; /* Retry this uncommitted input against the empty table. */
             }
-            for(unsigned r=first;r<input->end;++r) {
-                struct qs_cell *row=(struct qs_cell *)out->data+(size_t)out->rows*b->plan.nout;
-                for(unsigned col=0;col<b->plan.nout;++col) {
-                    int index=b->plan.outputs[col].index; if(b->vectors[index].errors[r]) return -5;
-                    row[col]=qs_vector_cell(&b->plan,b->vectors,index,r);
-                }
-                ++out->rows;
-            }
+            int status=group_return_rows(b,out,first,input->end); if(status) return status;
         }
         s->metrics.matched+=input->end-first; b->position=input->end; input->phase=0;
     }
@@ -3970,20 +4077,32 @@ static int group_input_pending(const struct execution *s,int id)
     if(n->kind==QP_MATERIALIZED) return 1;
     return group_input_pending(s,n->left) || group_input_pending(s,n->right);
 }
+/* The Source wave shares the bytes left after reserving all sort workspaces.
+ * Claim before allocating so several CUs cannot spend the same free space. */
+static bool radix_claim_growth(struct radix_group *radix,size_t bytes)
+{
+    size_t available=atomic_load_explicit(&radix->source_growth,memory_order_relaxed);
+    while(available>=bytes)
+        if(atomic_compare_exchange_weak_explicit(&radix->source_growth,&available,available-bytes,
+            memory_order_relaxed,memory_order_relaxed)) return true;
+    return false;
+}
 static int64_t radix_input(struct execution *s,unsigned id,struct operator_state *o)
 {
     struct radix_group *radix=o->group_radix;
     cs_work_context *owner=s->worker?s->owner->context:s->context;
-    unsigned bytes=o->group_stride,block_rows=QS_SORT_IO_BYTES/bytes;
+    unsigned bytes=o->group_stride;
     while(o->radix_writer<radix->workers) {
         struct spool *p=&radix->streams[o->radix_writer*radix->partitions+o->radix_partition];
+        unsigned block_bytes=spool_block_bytes(p),block_rows=block_bytes/bytes;
         if(o->radix_row && !(o->radix_row%block_rows)) {
             unsigned block=o->radix_row/block_rows-1;
             if(block<p->blocks) {
                 struct spool_block *page=&p->pages[block];
                 if(page->data) {
                     cs_work_free(owner,page->data); page->data=NULL;
-                } else if(page->token) {
+                    if(s->worker) atomic_fetch_add_explicit(&radix->source_growth,block_bytes,memory_order_relaxed);
+                } else if(page->token && (block+1==p->blocks || p->pages[block+1].token!=page->token)) {
                     uint64_t token=page->token; page->token=0;
                     return csNeedFree(token);
                 }
@@ -3991,8 +4110,10 @@ static int64_t radix_input(struct execution *s,unsigned id,struct operator_state
         }
         if(o->radix_row==p->rows) {
             cs_work_free(s->context,p->cache); p->cache=NULL;
+            size_t released=(p->tail?block_bytes:0)+(p->pages?(size_t)p->capacity*sizeof(*p->pages):0);
             cs_work_free(owner,p->tail); p->tail=NULL;
             cs_work_free(owner,p->pages); p->pages=NULL;
+            if(s->worker && released) atomic_fetch_add_explicit(&radix->source_growth,released,memory_order_relaxed);
             ++o->radix_writer; o->radix_row=0; continue;
         }
         _Alignas(16) unsigned char storage[sizeof(struct compact_group)+QS_AGGS*sizeof(struct group_value)+QS_KEYS*sizeof(struct qs_cell)+32];
@@ -4014,6 +4135,7 @@ static int64_t hash_aggregate_state(struct execution *s,unsigned id,struct opera
 {
     struct qp_node *n=&s->plan->nodes[id];
     struct sorted_rows *sort=&o->left_sort;
+    bool ibex=s->plan->ibex && id==s->plan->root;
     if(!qp_hash_aggregate_supported(n)) { n->hash=0; return prepare?3:aggregate_next_impl(s,id,row,raw); }
     int wide=n->nkeys!=1 || n->expr.exprs[n->expr.keys[0]].type!=Q_INTEGER;
     if(!o->group_capacity) {
@@ -4022,7 +4144,10 @@ static int64_t hash_aggregate_state(struct execution *s,unsigned id,struct opera
          * query close; table resize does not move it or change its count. */
         if(!o->group_count) {
             void *storage=cs_work_alloc(s->context,128);
-            if(!storage) { n->hash=0; return prepare?3:aggregate_next_impl(s,id,row,raw); }
+            if(!storage) {
+                if(ibex) return -4;
+                n->hash=0; return prepare?3:aggregate_next_impl(s,id,row,raw);
+            }
             o->group_count=(void *)(((uintptr_t)storage+63)&~(uintptr_t)63);
             atomic_init(o->group_count,0);
         }
@@ -4051,7 +4176,7 @@ static int64_t hash_aggregate_state(struct execution *s,unsigned id,struct opera
         size_t bytes_per_slot=o->group_stride-o->group_stride/8+sizeof(struct group_entry);
         while(!group_input_pending(s,n->left) &&
               (!wide || n->estimated_groups>0 || s->plan->nodes[n->left].kind==QP_SCAN ||
-              (key_only && s->plan->nodes[n->left].parallel)) && capacity<groups*8/7 &&
+              (key_only && s->plan->nodes[n->left].parallel)) && (ibex || capacity<groups*8/7) &&
               (size_t)capacity*2*bytes_per_slot<=available && capacity<UINT_MAX/2)
             capacity*=2;
         for(;;) {
@@ -4065,7 +4190,10 @@ static int64_t hash_aggregate_state(struct execution *s,unsigned id,struct opera
             if(capacity==128) break;
             capacity/=2;
         }
-        if(!o->groups) { n->hash=0; return prepare?3:aggregate_next_impl(s,id,row,raw); }
+        if(!o->groups) {
+            if(ibex) return -4;
+            n->hash=0; return prepare?3:aggregate_next_impl(s,id,row,raw);
+        }
         o->group_capacity=capacity;
     }
     for(;;) {
@@ -4091,6 +4219,13 @@ static int64_t hash_aggregate_state(struct execution *s,unsigned id,struct opera
                     }
                 }
             }
+            if(ibex && atomic_load_explicit(&s->ibex_overflow,memory_order_relaxed)) {
+                row[0]=o->left[n->left_keys[0]];
+                row[1]=o->left[n->expr.exprs[n->expr.aggs[0].expr].column];
+                o->have_left=0;
+                ++s->metrics.host_overflow_rows;
+                return 2;
+            }
             int added;
             if(o->radix_source) {
                 struct group_value values[QS_AGGS];
@@ -4107,17 +4242,20 @@ static int64_t hash_aggregate_state(struct execution *s,unsigned id,struct opera
                 unsigned capacity=o->group_capacity*2;
                 struct cs_work_context_stats m;
                 if(cs_work_get_context_stats(s->context,&m)) return -4;
-                cs_work_context *context=s->worker && o->radix_source?s->owner->context:s->context;
-                size_t available=cs_work_available(context),reserve=group_reserve(s,n);
-                /* Keep spill/worker space after replacing the old buffers.
-                 * Realloc may grow in place; the allocator, rather than a
-                 * pessimistic quota, enforces the actual transient peak. */
+                struct radix_group *radix=s->worker && o->radix_source?o->group_radix:NULL;
+                cs_work_context *context=radix?s->owner->context:s->context;
                 size_t bytes_per_slot=o->group_stride-o->group_stride/8+sizeof(struct group_entry);
-                size_t released=(size_t)o->group_capacity*bytes_per_slot;
-                available+=released;
-                available=available>reserve?available-reserve:0;
-                struct group_entry *entries=capacity>o->group_capacity &&
-                    (size_t)capacity*bytes_per_slot<=available?
+                size_t growth=(size_t)o->group_capacity*bytes_per_slot;
+                size_t old_entries=(size_t)o->group_capacity*sizeof(*o->group_entries);
+                bool admitted=false;
+                if(capacity>o->group_capacity) {
+                    if(radix) admitted=radix_claim_growth(radix,growth+old_entries);
+                    else {
+                        size_t available=cs_work_available(context),reserve=group_reserve(s,n);
+                        admitted=available>reserve && growth<=available-reserve;
+                    }
+                }
+                struct group_entry *entries=admitted?
                     cs_work_calloc(context,capacity,sizeof(*entries)):NULL;
                 void *larger=entries?cs_work_realloc(context,o->groups,(size_t)(capacity-capacity/8)*o->group_stride):NULL;
                 if(larger) {
@@ -4138,9 +4276,16 @@ static int64_t hash_aggregate_state(struct execution *s,unsigned id,struct opera
                         entries[slot].row=i;
                         atomic_store_explicit(&entries[slot].state,group_entry_state(v->key_flags,hash),memory_order_relaxed);
                     }
-                    cs_work_free(context,old); continue;
+                    cs_work_free(context,old);
+                    if(radix) atomic_fetch_add_explicit(&radix->source_growth,old_entries,memory_order_relaxed);
+                    continue;
                 }
                 cs_work_free(context,entries);
+                if(radix && admitted) atomic_fetch_add_explicit(&radix->source_growth,growth+old_entries,memory_order_relaxed);
+                if(ibex) {
+                    atomic_store_explicit(&s->ibex_overflow,true,memory_order_relaxed);
+                    continue; /* Emit the uncommitted row on the next iteration. */
+                }
                 o->group_phase=1; continue;
             }
             if(o->group_partial) { ++o->group_local_row; o->group_partial=0; }
@@ -4161,7 +4306,8 @@ static int64_t hash_aggregate_state(struct execution *s,unsigned id,struct opera
                 partial.outputs[n->nkeys+2*a].type_oid=1700;
                 partial.outputs[n->nkeys+2*a+1].type_oid=20;
             }
-            int64_t status=sort_init(s,sort,&partial,qp_group_keys(n),columns,NULL); if(status) return status;
+            size_t limit=s->worker && o->radix_source?o->group_radix->source_sort_limit:0;
+            int64_t status=sort_init(s,sort,&partial,qp_group_keys(n),columns,NULL,limit); if(status) return status;
             if(sort->input_pending) {
                 status=sort_call(s,sort,0); if(status) return status;
                 sort->input_pending=0; sort->input->rows=0;
@@ -4277,8 +4423,9 @@ static int64_t radix_source_next(struct execution *s,unsigned id,struct qs_cell 
 }
 static int64_t hash_aggregate_next(struct execution *s,unsigned id,struct qs_cell *row,int raw)
 {
-    /* Pure in-memory output is one call per group: leave it untimed. */
-    if(!s->profiling || s->nodes[id].group_phase==3 ||
+    /* The output loop times Ibex batches. Pure in-memory output elsewhere
+     * is one call per group and also needs no per-row timer. */
+    if(!s->profiling || (s->plan->ibex && id==s->plan->root) || s->nodes[id].group_phase==3 ||
        (s->group_source_profiling && s->nodes[id].group_phase==2))
         return hash_aggregate_next_impl(s,id,row,0,raw);
     unsigned op=s->nodes[id].group_phase==2?QS_AGG_SOURCE:QS_AGG_SINK;
@@ -4801,7 +4948,8 @@ static int64_t next_row_impl(struct execution *s,unsigned id,struct qs_cell *row
     if(o->finished && !projection_pending(o->projection) && !projection_pending(o->source_projection)) {
         projection_clear(s,&o->projection); projection_clear(s,&o->source_projection); return 0;
     }
-    if(!s->worker && s->plan->workers>1 && n->parallel) return parallel_next(s,id,row);
+    bool ibex=s->plan->ibex && id==s->plan->root;
+    if(!ibex && !s->worker && s->plan->workers>1 && n->parallel) return parallel_next(s,id,row);
     if(id==s->plan->root && s->raw_projection) return scan_next(s,id,row);
     if(n->kind==QP_SCAN || n->kind==QP_SORT || (n->kind==QP_PROJECT && n->left>=0) || n->kind==QP_JOIN || n->kind==QP_INDEX_JOIN) {
         int status=projection_init(s,id,0); if(status) return status;
@@ -4811,6 +4959,7 @@ static int64_t next_row_impl(struct execution *s,unsigned id,struct qs_cell *row
     if(n->kind==QP_JOIN) return n->hash?hash_next(s,id,row):join_next(s,id,row);
     if(n->kind==QP_INDEX_JOIN) return index_next(s,id,row,NULL);
     if(n->kind==QP_AGGREGATE) {
+        if(ibex) return aggregate_next(s,id,row);
         int status=projection_init(s,id,1); if(status) return status;
         if(o->source_projection) return projection_next(s,id,row,1);
         return aggregate_next(s,id,row);
@@ -4932,18 +5081,34 @@ static int parallel_radix_begin(struct execution *s,unsigned id)
     while(capacity<target && (size_t)capacity*2*per_slot<=table_budget) capacity*=2;
     unsigned partitions=2;
     while(partitions<64 && (partitions<workers || partitions<groups/(capacity-capacity/8))) partitions*=2;
-    size_t tails=(size_t)workers*partitions*QS_SORT_IO_BYTES;
-    while(partitions>2 && tails>(available-reserve)/4) { partitions/=2; tails/=2; }
+    unsigned block_bytes=QS_SORT_IO_BYTES;
+    size_t tail_budget=(available-reserve)/4;
+    size_t tails=(size_t)workers*partitions*block_bytes;
+    /* Smaller blocks cost more requests. Use them only for an external
+     * aggregate whose Source needs another radix bit, if the extra streams
+     * fit alongside the existing Sink tables and Source reserve. */
+    if(external && tails>tail_budget && partitions==64 && groups>partitions*(capacity-capacity/8.0)) {
+        const unsigned small_block_bytes=16*1024;
+        size_t table_bytes=(size_t)workers*capacity*per_slot;
+        size_t more_tails=(size_t)workers*(2*partitions)*small_block_bytes;
+        if(more_tails<=(available-reserve)/3 && more_tails<=available-reserve-table_bytes) {
+            partitions*=2; block_bytes=small_block_bytes; tails=more_tails;
+            tail_budget=more_tails;
+        }
+    }
+    while(partitions>2 && tails>tail_budget) { partitions/=2; tails/=2; }
     if(partitions<2 || (size_t)capacity*per_slot*workers+tails+reserve>available) return 0;
     struct radix_group *radix=cs_work_calloc(s->context,1,sizeof(*radix));
     if(!radix) return -4;
     radix->partitions=partitions; radix->workers=workers; atomic_init(&radix->next,0);
+    atomic_init(&radix->source_growth,0);
     /* Retain room for not-yet-opened tails, Source read buffers and table
      * workspaces. Concurrent Sinks can each reserve one extra block. */
     radix->resident_reserve=reserve+tails+(size_t)workers*2*QS_SORT_IO_BYTES;
     radix->streams=cs_work_calloc(s->context,(size_t)workers*partitions,sizeof(*radix->streams));
     o->group_locals=cs_work_calloc(s->context,workers,sizeof(*o->group_locals));
     if(!radix->streams || !o->group_locals) return -4;
+    for(unsigned i=0;i<workers*partitions;++i) radix->streams[i].block_bytes=block_bytes;
     cs_work_free(s->context,o->groups); cs_work_free(s->context,o->group_entries);
     o->groups=NULL; o->group_entries=NULL; o->group_local_count=workers; o->group_radix=radix;
     for(unsigned w=0;w<workers;++w) {
@@ -4963,7 +5128,7 @@ static int parallel_radix_begin(struct execution *s,unsigned id)
 static int parallel_group_begin(struct execution *s,unsigned id)
 {
     struct operator_state *o=&s->nodes[id]; unsigned workers=s->plan->workers;
-    if(s->partition_join>=0) return 0;
+    if(s->partition_join>=0 || (s->plan->ibex && id==s->plan->root)) return 0;
     int radix=parallel_radix_begin(s,id); if(radix) return radix<0?radix:0;
     if(!o->group_locals) {
         struct cs_work_context_stats m;
@@ -5299,6 +5464,30 @@ restart:
         }
         if(group_sink) { int status=parallel_group_begin(s,group_sink-1); if(status) return status; }
         if(!hash_sink && !group_sink && !aggregate_sink && !partition_sink) parallel_sort_begin(s,root);
+        struct operator_state *input=&s->nodes[source];
+        if(partition_join<0 && p->nodes[source].kind==QP_AGGREGATE && input->group_radix) {
+            struct radix_group *radix=input->group_radix;
+            /* Budget the live Source workers together. A shared free-space
+             * check at each resize lets concurrent tables spend the same
+             * bytes that their fallback sorts will need. */
+            for(unsigned w=0;w<p->workers;++w) {
+                int status=projection_init(s->workers[w],root,p->nodes[root].kind==QP_AGGREGATE);
+                if(status<0) return status;
+            }
+            size_t available=cs_work_available(s->context),share=available/p->workers;
+            size_t overhead=2*QS_SORT_IO_BYTES+2*sizeof(struct qs_result);
+            const struct qp_node *aggregate=&p->nodes[source];
+            size_t workspace=aggregate->nkeys==1 && aggregate->expr.exprs[aggregate->expr.keys[0]].type==Q_INTEGER?
+                qs_sort_integer_partial_workspace():qs_sort_min_workspace()-2*sizeof(struct qs_result);
+            if(share<overhead+8*QS_SORT_IO_BYTES) {
+                close_workers(s); p->nodes[root].parallel=0;
+                return row?next_row(s,root,row):3;
+            }
+            share-=overhead;
+            radix->source_sort_limit=share<workspace?share:workspace;
+            atomic_store_explicit(&radix->source_growth,
+                available-p->workers*(overhead+radix->source_sort_limit),memory_order_relaxed);
+        }
         s->parallel_node=root; s->parallel_done=0;
         memset(s->parallel_position,0,sizeof(s->parallel_position)); atomic_store(&s->next_offset,0);
         s->control->parallel=hash_sink || group_sink || partition_sink?2:1; ++s->control->epoch; s->control->available=s->control->drained=0;
@@ -5376,6 +5565,8 @@ restart:
             }
             s->metrics.spill_read_bytes+=v->metrics.spill_read_bytes;
             s->metrics.spill_write_bytes+=v->metrics.spill_write_bytes;
+            s->metrics.spill_read_wait_ns+=v->metrics.spill_read_wait_ns;
+            s->metrics.spill_write_wait_ns+=v->metrics.spill_write_wait_ns;
             s->metrics.runs+=v->metrics.runs;
             s->metrics.spilled_runs+=v->metrics.spilled_runs;
             for(unsigned op=0;op<QS_OPERATORS;++op) {
@@ -5483,6 +5674,8 @@ static int64_t finish_dictionary(struct execution *s,struct femu_csd_args *a,str
         return dictionary_request(s,out,status);
     }
     s->paged=NULL; out->finished=s->control->finished=1; s->control->output_rows=out->rows;
+    out->metrics.spill_read_wait_ns=s->metrics.spill_read_wait_ns;
+    out->metrics.spill_write_wait_ns=s->metrics.spill_write_wait_ns;
     close_execution(s); return 0;
 }
 /* Resource discovery reuses this CSF: selector 0 reports workmem bytes,
@@ -5589,12 +5782,14 @@ static int64_t namespace_wait(struct execution *s)
         pool->slot_bytes=htole32(QS_PAGE);
         pool->slots=htole32(QS_INDEX_SLOTS);
         pool->pin_limit=htole32(QS_INDEX_READS);
+        /* A bounded key range runs without host page-cache population. */
+        uint32_t fill_pool=n->ordered_index&QP_INDEX_UPPER?0:pool_offset;
         for(unsigned i=0;i<c->index_nreads;++i) {
             const struct qs_index_read *r=&c->index_reads[i];
             size_t target;
             if(r->heap>1 || !qp_index_page_offset(input,r->slot,&target)) return -1;
             const struct qp_file_mapping *map=r->heap?&s->plan->files[leaf]:&s->plan->indexes[leaf];
-            status=namespace_ranges(s,map,(uint64_t)r->block*QS_PAGE,QS_PAGE,target,pool_offset,&count);
+            status=namespace_ranges(s,map,(uint64_t)r->block*QS_PAGE,QS_PAGE,target,fill_pool,&count);
             if(status<=0) return status;
         }
     } else {
@@ -5783,11 +5978,13 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
     if(!s) {
         if(worker) return -1;
         if(!plan->count || plan->count>QP_NODES || plan->root>=plan->count) return -1;
+        if(plan->ibex && !qp_ibex_supported(plan)) return -1;
         struct cs_work_stats stats; if(cs_work_get_stats(&stats)) return -4;
         size_t budget=plan->nodes[plan->root].expr.work_mem_bytes;
         if(!budget || budget>stats.capacity_bytes) budget=stats.capacity_bytes;
         cs_work_context *context=cs_work_begin_limit(budget); if(!context) return -4;
         s=cs_work_calloc(context,1,sizeof(*s)); if(!s) { cs_work_end(context); return -4; }
+        atomic_init(&s->ibex_overflow,false);
         s->context=context; s->plan=plan; s->control=control; s->raw_projection=qp_host_raw_projection(plan);
         if(qp_host_parameter_bytes(plan)) {
             const char *values=(const char *)plan+sizeof(*plan);
@@ -5871,11 +6068,17 @@ int64_t pg_sina_plan(struct femu_csd_args *a)
     if(s->pending_spool) {
         if(!csIsReentry(a)) return -1;
         struct spool *p=s->pending_spool;
+        unsigned bytes=spool_block_bytes(p);
         if(s->pending_store) {
-            p->pages[p->blocks++]=(struct spool_block){.token=csReentryValue(a)};
-            p->used=0; s->metrics.spill_write_bytes+=QS_SORT_IO_BYTES;
+            for(unsigned block=0;block<s->pending_spool_blocks;++block)
+                p->pages[p->blocks++]=(struct spool_block){.token=csReentryValue(a)};
+            s->metrics.spill_write_bytes+=(size_t)s->pending_spool_blocks*bytes;
+        } else {
+            unsigned first=s->pending_block,end=first+1;
+            while(end<p->blocks && p->pages[end].token==p->pages[first].token) ++end;
+            size_t loaded=(size_t)(end-first)*bytes;
+            memcpy(p->cache,s->io,loaded); p->loaded=first; s->metrics.spill_read_bytes+=loaded;
         }
-        else { memcpy(p->cache,s->io,QS_SORT_IO_BYTES); p->loaded=s->pending_block; s->metrics.spill_read_bytes+=QS_SORT_IO_BYTES; }
         s->pending_spool=NULL;
     }
     if(!csIsReentry(a) && !continuing) {
@@ -5995,7 +6198,11 @@ produce:
                 s->sink_rows+=b->position-before-(out->rows-rows);
             }
             if(status) goto produced;
-            status=2; if(out->rows) goto produced;
+            /* Ibex overflow rows occupy only the worker's private output.
+             * Fill that buffer across vectors, or flush it at an input wait
+             * or EOF, before asking the coordinator to acknowledge it. */
+            status=2;
+            if(out->rows && (!plan->ibex || out->rows==capacity)) goto produced;
         }
         status=2;
     }
@@ -6025,6 +6232,17 @@ produce:
         }
         status=2;
     }
+    if(!worker && plan->ibex && control->parallel==2 &&
+       atomic_load_explicit(&s->ibex_overflow,memory_order_relaxed)) {
+        /* Drain each published worker slot as it becomes ready. Keep the
+         * shared groups resident until all workers have reached EOF. */
+        control->parallel=1;
+    }
+    /* One timer for the coordinator's output slice, including numeric
+     * encoding. Close it before yielding to an input or a full batch. */
+    bool profile_ibex_batch=s->profiling && !worker && plan->ibex;
+    struct blocking_timer ibex_batch={0};
+    if(profile_ibex_batch) ibex_batch=blocking_begin(s);
     while(status>=0 && status!=QP_WAIT && status<=2 && out->rows<capacity) {
         struct qs_cell *row=typed?s->host_row:worker?(struct qs_cell *)out->data+(size_t)out->rows*columns:
             qp_result_row(out,out->rows,columns,plan->packed_result);
@@ -6066,6 +6284,7 @@ produce:
         if(!worker && !s->output_order && export_row(s,root,row,out)) { status=-3; break; }
         ++out->rows;
     }
+    if(profile_ibex_batch) blocking_end(s,QS_AGG_SINK,ibex_batch);
 produced:
     if(worker && s->sort_sink && !s->sort_sink->columns && status>=0 && status<=2 &&
        (out->rows || out->finished || s->pending_sort==s->sort_sink)) {
@@ -6093,7 +6312,12 @@ produced:
         uint64_t cpu=s->profiling?now_ns(CLOCK_THREAD_CPUTIME_ID):0;
         unsigned rows=out->rows;
         if(s->hash_sink) { int added=hash_sink_batch(s,out); if(added<0) status=added; }
-        if(s->group_sink) { int64_t added=group_sink_batch(s,out); if(added) status=added; }
+        /* Once Ibex switches to handoff, neither rejected vector rows nor
+         * scalar scan rows should go through the shared group sink again. */
+        if(s->group_sink && (!plan->ibex ||
+           !atomic_load_explicit(&owner->ibex_overflow,memory_order_relaxed))) {
+            int64_t added=group_sink_batch(s,out); if(added) status=added;
+        }
         if(s->aggregate_sink) { int added=aggregate_sink_batch(s,out); if(added<0) status=added; }
         if(s->profiling) { s->sink_ns+=now_ns(CLOCK_THREAD_CPUTIME_ID)-cpu; s->sink_rows+=rows-out->rows; }
         /* A direct sink can consume another output batch from the same input

@@ -144,14 +144,18 @@ CSF 通过 MR 输出数据，工作状态保存在 workmem，入口可多次恢�
 
 CSF 用 `csIsReentry/csReentryValue` 及自己的 pending 状态识别恢复点。NEED_* 占用完成值的保留编码，不修改 SNIA `CS_STATUS`。设备解释这些通用 I/O 请求，等待 I/O 到期后把原 CSF 重新放入 CU 就绪队列；图节点尚未真正结束，不解锁后继。SQL 程序自行将文件逻辑页经已给定 extent 转为 LBA，FTL 不理解索引或表语义。
 
+并行外排聚合先在各执行槽局部聚合，再按哈希分区保存部分状态。恢复前，执行器统一预留并行槽的读缓冲和回退排序工作区。各槽扩容哈希表时从共享余额申请内存，计入旧索引表在重建期间的占用。消费完毕的驻留块和分区缓冲释放后归还余额。当前分区无法扩容时，执行槽使用预留空间生成和归并有序段。
+
+部分需要更多分区的外排聚合可以使用 16 KiB 的分区缓冲块。刷出时，同一分区的连续满块最多合并为一次 64 KiB 的 STORE。恢复时同一 token 覆盖的块一次 LOAD，并在最后一块消费完成后 FREE。工作区预留和块合并均由 SQL 算子管理，沿用已有的可重入 I/O 协议。
+
 隐藏临时空间由 `CSD_SPILL_SIZE_MB` 配置，使用会话 token 和区段位图管理。它独立于可见 namespace、文件系统和 workmem，不等于自动征用 FTL 的 OP 空间。Guest 脚本保留的 spill 分区与这套隐藏空间是两种不同资源，当前设备图 spill 使用后者。释放 token 回收隐藏分配，不需要让 HOST 文件系统感知一次临时文件删除。
 
 ### 5.3 内存归属
 
 | 资源 | 当前配置/性质 | 谁使用 |
 | --- | --- | --- |
-| FDM | 64MiB，由设备 AFDM 分配器管理 | 页输入、列批次、控制、结果、重入 I/O |
-| workmem | 1 GiB，所有设备 SQL SO 共享同一 `libcs-workmem.so` | 查询根/子 context、Hash、run、字典、游标及可回收的 Index Join 页缓存 |
+| FDM | Compose 默认 128 MiB，由设备 AFDM 分配器管理 | 页输入、列批次、控制、结果、重入 I/O |
+| workmem | Compose 默认 896 MiB，所有设备 SQL SO 共享同一 `libcs-workmem.so` | 查询根/子 context、Hash、run、字典、游标及可回收的 Index Join 页缓存 |
 | 可见 NVM | Compose中32768MiB RAM-backed namespace，默认整盘挂载`/data` | PG表、索引和HOST临时文件；历史分区布局仅可选 |
 | 隐藏 spill NVM | Compose 中 8192MiB | 设备临时 token |
 | 设备队列元数据 | FEMU 普通进程内存 | 图、引用、128 项填充记录和派发/完成描述；不从 SQL workmem 扣费 |

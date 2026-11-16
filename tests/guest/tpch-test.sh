@@ -1,9 +1,11 @@
 #!/bin/sh
 # 由 tpch-cold/warm/repeat.sh 调用，位置参数为查询编号（省略时运行 1 至 22）。
-# SF 默认 8。-n 次数，-b shared_buffers，-w 每个 Gather 的 worker 数，-m work_mem。
+# SF 默认 8。-n 次数，-b/-w/-m 覆盖实例的 shared_buffers、每 Gather worker 数、work_mem。
 # -s 选择率，默认 0.1。运行对应 sf<SF>_sel<选择率> 下已生成的 SQL。
 # -D PGDATA，-d 数据库，-o 输出目录（也可用 TPCH_RESULTS）。显式 PGDATA/PGDATABASE 优先于 SF。
 # 包装入口用 TPCH_CACHE_MODE 指定缓存模式，TPCH_RUNS 指定默认次数。
+# TPCH_WORKER_POOL 可独立指定全局 parallel workers 和 background worker 槽位。
+# TPCH_ENABLE_HASHAGG 可显式指定 on 或 off。
 # TPCH_MODES 可指定以空格分隔的执行模式；默认测试全部五种。
 # TPCH_REFERENCE_LOGS 可指定同一批正式 SQL 的已有 HOST 日志，用于只测卸载模式时校验结果。
 # TPCH_DCP=off 关闭启用 HPCP 的模式中的 DCP，默认两层同时启用。
@@ -14,7 +16,7 @@
 set -eu
 export PATH=/home/femu/opt/postgres/release/bin:$PATH
 kind=${TPCH_CACHE_MODE:?use tpch-cold.sh, tpch-warm.sh or tpch-repeat.sh}
-n=${TPCH_RUNS:-3}; buffers=2GB; workers=4; memory=16MB
+n=${TPCH_RUNS:-3}; buffers=; workers=; memory=
 selectivity=0.1
 out=${TPCH_RESULTS:-}
 while getopts 'n:b:w:m:s:D:d:o:' option; do
@@ -28,9 +30,7 @@ shift $((OPTIND-1))
 PGDATA=${PGDATA:-/data/${PGDATABASE:-tpch_s${SF:-8}}}
 [ "$n" -gt 0 ]
 case $buffers in *G|*M) buffers=${buffers}B ;; esac
-case $memory in *G|*M) memory=${memory}B ;; esac
 export PGDATA PGDATABASE=${PGDATABASE:-${PGDATA##*/}}
-processes=$workers; [ "$processes" -ge 8 ] || processes=8
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 sf=${PGDATABASE#tpch_s}
 case "$sf" in *[!0-9.]*) sf= ;; esac
@@ -72,13 +72,51 @@ case "$kind:$warm_layer" in
     warm:page|warm:database|warm:both) modes=host-only ;;
     *) echo 'TPCH_WARM_LAYER 仅支持 warm 模式下的 page、database 或 both' >&2; exit 2 ;;
 esac
+hashagg=${TPCH_ENABLE_HASHAGG:-}
+case $memory in *G|*M) memory=${memory}B ;; esac
+processes=${TPCH_WORKER_POOL:-}
+case $processes in
+    *[!0-9]*) echo 'TPCH_WORKER_POOL 必须为非负整数' >&2; exit 2 ;;
+esac
+case $workers in
+    *[!0-9]*) echo '-w 必须为非负整数' >&2; exit 2 ;;
+esac
+case $hashagg in
+    ''|on|off) ;;
+    *) echo 'TPCH_ENABLE_HASHAGG 需要 on 或 off' >&2; exit 2 ;;
+esac
 logs=$out/logs/$kind
 mkdir -p "$logs"
 tmp=$(mktemp -d /tmp/tpch-test.XXXXXX)
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 : > "$tmp/data"
+configured() {
+    value=$(postgres -D "$PGDATA" -C "$1") || return
+    case $1 in
+        shared_buffers)
+            block_size=$(postgres -D "$PGDATA" -C block_size) || return
+            kib=$((value * block_size / 1024))
+            ;;
+        work_mem) kib=$value ;;
+        *) printf '%s\n' "$value"; return ;;
+    esac
+    if [ "$((kib % 1048576))" -eq 0 ]; then
+        printf '%sGB\n' "$((kib / 1048576))"
+    elif [ "$((kib % 1024))" -eq 0 ]; then
+        printf '%sMB\n' "$((kib / 1024))"
+    else
+        printf '%skB\n' "$kib"
+    fi
+}
+start_options="-c autovacuum=off${buffers:+ -c shared_buffers=$buffers}${workers:+ -c max_parallel_workers_per_gather=$workers}${memory:+ -c work_mem=$memory}"
+start_options="$start_options${processes:+ -c max_parallel_workers=$processes -c max_worker_processes=$processes}${hashagg:+ -c enable_hashagg=$hashagg}"
 printf 'PGDATA=%s\nPGDATABASE=%s\nselectivity=%s\nquery_dir=%s\nshared_buffers=%s\nmax_parallel_workers_per_gather=%s\nwork_mem=%s\n%s_runs=%s\n' \
-    "$PGDATA" "$PGDATABASE" "$selectivity" "$query_dir" "$buffers" "$workers" "$memory" "$kind" "$n" > "$logs/settings.txt"
+    "$PGDATA" "$PGDATABASE" "$selectivity" "$query_dir" "${buffers:-$(configured shared_buffers)}" \
+    "${workers:-$(configured max_parallel_workers_per_gather)}" "${memory:-$(configured work_mem)}" \
+    "$kind" "$n" > "$logs/settings.txt"
+printf 'max_parallel_workers=%s\nmax_worker_processes=%s\nenable_hashagg=%s\n' \
+    "${processes:-$(configured max_parallel_workers)}" "${processes:-$(configured max_worker_processes)}" \
+    "${hashagg:-$(configured enable_hashagg)}" >> "$logs/settings.txt"
 printf 'modes=%s\n' "$modes" >> "$logs/settings.txt"
 printf 'cache_mode_dcp=%s\n' "$cache_mode_dcp" >> "$logs/settings.txt"
 [ -z "$reference_logs" ] || printf 'reference_logs=%s\n' "$reference_logs" >> "$logs/settings.txt"
@@ -87,7 +125,7 @@ printf 'cache_mode_dcp=%s\n' "$cache_mode_dcp" >> "$logs/settings.txt"
 export PGOPTIONS="-c session_preload_libraries=pg_sina_csd,auto_explain"
 [ "$compare_profile" != 1 ] || export SNIA_FEMU_PROFILE=${SNIA_FEMU_PROFILE:-cache}
 start_pg() {
-    pg_ctl -D "$PGDATA" -l "$PGDATA/log" -w start -o "-c autovacuum=off -c shared_buffers=$buffers -c work_mem=$memory -c max_parallel_workers_per_gather=$workers -c max_parallel_workers=$processes -c max_worker_processes=$processes" > /dev/null
+    pg_ctl -D "$PGDATA" -l "$PGDATA/log" -w start -o "$start_options" > /dev/null
 }
 reset_cache() {
     pg_ctl -D "$PGDATA" -m fast -w stop > /dev/null

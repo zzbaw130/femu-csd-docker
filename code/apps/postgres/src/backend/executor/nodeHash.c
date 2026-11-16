@@ -38,10 +38,13 @@
 #include "pgstat.h"
 #include "port/atomics.h"
 #include "port/pg_bitutils.h"
+#include "utils/builtins.h"
 #include "utils/dynahash.h"
+#include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+#include "utils/varlena.h"
 
 
 static void ExecHashIncreaseNumBatches(HashJoinTable hashtable);
@@ -428,6 +431,50 @@ ExecEndHash(HashState *node)
 }
 
 
+/* Apply a session-local experiment preset to one serial Hash plan node.
+ * Keep the executor's normal memory checks and ability to grow. */
+static void
+ApplyHashBatchPreset(HashState *state, size_t space_allowed, int *nbuckets, int *nbatch)
+{
+	const char *spec = GetConfigOption("experiment.hash_batch_preset", true, false);
+	char	   *value;
+	List	   *fields = NIL;
+	int			plan_id;
+	int			batches;
+	int			buckets;
+
+	if (spec == NULL || *spec == '\0')
+		return;
+
+	value = pstrdup(spec);
+	if (!SplitGUCList(value, ':', &fields) || list_length(fields) != 3)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("experiment.hash_batch_preset requires plan_node_id:batches:buckets")));
+	plan_id = pg_strtoint32(linitial(fields));
+	batches = pg_strtoint32(lsecond(fields));
+	buckets = pg_strtoint32(lthird(fields));
+	list_free(fields);
+	pfree(value);
+
+	if (plan_id != state->ps.plan->plan_node_id)
+		return;
+	if (state->parallel_state != NULL || state->ps.plan->parallel_aware)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("experiment.hash_batch_preset requires a serial hash table")));
+	if (batches <= 0 || (batches & (batches - 1)) != 0 ||
+		(Size) batches > Min(space_allowed, MaxAllocSize) / (2 * sizeof(BufFile *)) ||
+		buckets < 1024 || (buckets & (buckets - 1)) != 0 ||
+		(Size) buckets > Min(space_allowed, MaxAllocSize) / sizeof(HashJoinTuple))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid hash batch or bucket count for work_mem")));
+
+	*nbatch = batches;
+	*nbuckets = buckets;
+}
+
 /* ----------------------------------------------------------------
  *		ExecHashTableCreate
  *
@@ -474,6 +521,7 @@ ExecHashTableCreate(HashState *state, List *hashOperators, List *hashCollations,
 							state->parallel_state->nparticipants - 1 : 0,
 							&space_allowed,
 							&nbuckets, &nbatch, &num_skew_mcvs);
+	ApplyHashBatchPreset(state, space_allowed, &nbuckets, &nbatch);
 
 	/* nbuckets must be a power of 2 */
 	log2_nbuckets = my_log2(nbuckets);

@@ -26,7 +26,7 @@ void pg_sina_cache_profile(void);
 const struct pg_sina_cache_entry *pg_sina_cache_lookup(RelFileNode);
 void pg_sina_cache_buffer(int buffer);
 extern int pg_sina_exe_path;
-enum pg_sina_path { PG_SINA_HOST, PG_SINA_FILTER, PG_SINA_CSD, PG_SINA_HPCP, PG_SINA_ADAPTIVE };
+enum pg_sina_path { PG_SINA_HOST, PG_SINA_FILTER, PG_SINA_CSD, PG_SINA_HPCP, PG_SINA_ADAPTIVE, PG_SINA_IBEX };
 const char *pg_sina_path_name(void);
 bool pg_sina_hpcp_enabled(void);
 extern bool pg_sina_dcp;

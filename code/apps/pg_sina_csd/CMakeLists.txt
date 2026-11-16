@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(pg_sina_csd VERSION 0.2 LANGUAGES C)
+project(pg_sina_csd VERSION 0.3 LANGUAGES C)
 include(CTest)
 set(CMAKE_C_STANDARD 11)
 find_program(PG_CONFIG pg_config)
@@ -20,7 +20,8 @@ target_include_directories(pg_sina_csd PRIVATE src include "${CMAKE_CURRENT_SOUR
 target_compile_definitions(pg_sina_csd PRIVATE _GNU_SOURCE)
 target_compile_options(pg_sina_csd PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter -fno-strict-aliasing -fwrapv)
 install(TARGETS pg_sina_csd LIBRARY DESTINATION "${PG_pkglibdir}")
-install(FILES pg_sina_csd.control sql/pg_sina_csd--0.1.sql sql/pg_sina_csd--0.2.sql sql/pg_sina_csd--0.1--0.2.sql DESTINATION "${PG_sharedir}/extension")
+install(FILES pg_sina_csd.control sql/pg_sina_csd--0.1.sql sql/pg_sina_csd--0.2.sql
+    sql/pg_sina_csd--0.1--0.2.sql sql/pg_sina_csd--0.2--0.3.sql DESTINATION "${PG_sharedir}/extension")
 find_path(SNIA_INCLUDE cs.h)
 find_library(SNIA_LIBRARY snia)
 find_package(Threads REQUIRED)

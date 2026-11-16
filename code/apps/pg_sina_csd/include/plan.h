@@ -33,6 +33,7 @@ static inline unsigned qp_output_rows(uint64_t value) { return (value>>5)&0x1fff
 static inline unsigned qp_output_strings(uint64_t value) { return (value>>22)&0x1ffff; }
 enum qp_kind { QP_SCAN, QP_PROJECT, QP_JOIN, QP_AGGREGATE, QP_SORT, QP_LIMIT, QP_INDEX_JOIN, QP_CTE_SCAN, QP_MATERIALIZED, QP_SET };
 enum qp_join { QP_INNER, QP_LEFT, QP_SEMI, QP_ANTI };
+#define QP_INDEX_UPPER 16U
 enum qp_expr { QP_PARAMETER=Q_PARAMETER, QP_LIKE=Q_LIKE, QP_SUBSTRING=Q_SUBSTRING,
                QP_COALESCE=Q_COALESCE, QP_INSET=Q_INSET };
 struct qp_node {
@@ -44,6 +45,7 @@ struct qp_node {
     unsigned group_keys;
     uint64_t late_text; /* Scan attribute bitmap: output-only Heap references. */
     unsigned sorted_input, ordered_index; /* bits: forward, heap read-ahead, covered keys, unordered leaf ranges */
+    int64_t index_upper;
     unsigned hash, parallel;
     int left_keys[QS_KEYS], right_keys[QS_KEYS];
     uint64_t bytes, index_bytes, input_offset, vector_offset;
@@ -88,6 +90,7 @@ struct qp_plan {
     unsigned count, root, nparams, ninit;
     unsigned workers, scan_bytes; /* workers counts task contexts, not physical CUs. */
     unsigned packed_result; /* 0: legacy, 1: projected cells, 2: typed, 3: CU-direct typed. */
+    unsigned ibex; /* Root SUM emits partial groups and unaggregated input after capacity. */
     uint64_t parallel_stride;
     uint64_t index_cache_bytes; /* Optional clean pages charged to workmem. */
     unsigned prefetch_node, prefetch_slots; /* One-based probe scan and independent input slots. */
@@ -195,6 +198,25 @@ static inline int qp_hash_aggregate_supported(const struct qp_node *n)
             a->kind!=Q_MIN && a->kind!=Q_MAX) || a->expr<0)) return 0;
     }
     return 1;
+}
+static inline int qp_ibex_supported(const struct qp_plan *p)
+{
+    const struct qp_node *n=&p->nodes[p->root];
+    int sum=n->expr.aggs[0].expr;
+    int key=n->expr.outputs[0].index,result=n->expr.outputs[1].index;
+    if(n->kind!=QP_AGGREGATE || !n->hash || n->nkeys!=1 || n->expr.naggs!=1 ||
+       n->expr.aggs[0].kind!=Q_SUM || n->expr.nout!=2 || n->expr.predicate>=0 ||
+       n->left<0 || (unsigned)n->left>=p->count || n->expr.nexprs>QS_EXPRS ||
+       (unsigned)sum>=n->expr.nexprs || (unsigned)key>=n->expr.nexprs ||
+       (unsigned)result>=n->expr.nexprs) return 0;
+    const struct qp_node *input=&p->nodes[n->left];
+    return input->kind==QP_SCAN && input->expr.nout==2 &&
+        n->expr.exprs[key].op==Q_COLUMN && n->expr.exprs[key].type==Q_INTEGER &&
+        n->expr.exprs[key].column==n->left_keys[0] &&
+        n->expr.exprs[result].op==Q_AGGREF && n->expr.exprs[result].column==0 &&
+        n->expr.exprs[sum].op==Q_COLUMN && n->expr.exprs[sum].type==Q_DECIMAL &&
+        (unsigned)n->expr.exprs[sum].column<input->expr.nout &&
+        (unsigned)n->left_keys[0]<input->expr.nout;
 }
 static inline uint64_t qp_worker_mask(unsigned workers)
 { return workers==64?UINT64_MAX:(UINT64_C(1)<<workers)-1; }

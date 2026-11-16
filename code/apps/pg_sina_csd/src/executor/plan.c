@@ -19,6 +19,7 @@ typedef struct PlanStateCsd PlanStateCsd;
  * device handles, elected submitter or PG worker-owned device state. */
 struct delivery_timing {
     uint64_t lock_ns,copy_ns,empty_ns,full_ns,advance_ns,claims;
+    uint64_t first_ready_ns;
 };
 struct result_delivery {
     pthread_mutex_t mutex;
@@ -69,7 +70,10 @@ struct PlanStateCsd {
     atomic_bool prefetch_done;
     CS_STATUS prefetch_status;
     bool prefetch_waited, prefetch_claimed;
-    bool async_scan, delivery_shared, delivery_owner;
+    bool async_delivery, delivery_shared, delivery_owner;
+    PlanState *host_aggregate;
+    bool host_finished;
+    uint64_t host_finished_ns;
     struct result_delivery *delivery;
     dsm_segment *delivery_segment;
     /* Local callback serialization is separate from the shared data queue:
@@ -90,6 +94,8 @@ struct PlanStateCsd {
     /* Queue time is within PG submit; LOAD preparation also includes
      * callbacks. Pending/requeue times sum concurrent requests, not latency. */
     uint64_t poll_ns, completion_copy_ns, submit_ns, queue_ns, idle_ns, pending_ns;
+    uint64_t first_batch_ns, first_batch_idle_ns, consumer_rows, idle_sleeps;
+    uint64_t max_batch_idle_ns, max_batch_idle_after_rows;
     uint64_t submits, polls, completions;
     uint64_t notice_ns, notice_max_ns;
     uint64_t barrier_started,barrier_ns,barriers;
@@ -180,7 +186,7 @@ static void completed(void *context,CS_STATUS status,u64 value)
     slot->completion_status=status; slot->completion_value=value;
     pthread_mutex_unlock(&slot->mutex);
     atomic_store_explicit(&slot->completed,true,memory_order_release);
-    if(s->async_scan) deliver(s);
+    if(s->async_delivery) deliver(s);
     atomic_fetch_sub_explicit(&s->callbacks,1,memory_order_release);
 }
 static CS_STATUS transfer(CS_MEM_HANDLE memory,size_t offset,void *data,size_t bytes,bool write)
@@ -290,6 +296,10 @@ static void begin(CustomScanState *node,EState *estate,int flags)
     if(!s->plan->count || s->plan->count>QP_NODES || s->plan->root>=s->plan->count ||
        (length!=sizeof(*s->plan) && length!=qp_plan_constant_bytes(s->plan))) elog(ERROR,"invalid CSD PG Plan");
     s->plan->packed_result=QP_TYPED_RESULT;
+    if(scan->custom_plans) {
+        s->host_aggregate=ExecInitNode(linitial(scan->custom_plans),estate,flags);
+        node->custom_ps=list_make1(s->host_aggregate);
+    }
     s->parameter_exprs=ExecInitExprList(scan->custom_exprs,(PlanState *)node);
     size_t parameter_bytes=qp_host_parameter_bytes(s->plan);
     if(parameter_bytes) s->host_parameters=(void *)TYPEALIGN(16,(uintptr_t)palloc0(parameter_bytes+15));
@@ -303,7 +313,8 @@ static void begin(CustomScanState *node,EState *estate,int flags)
     atomic_init(&s->stopping,false); atomic_init(&s->next_scan_offset,0);
     atomic_init(&s->callbacks,0); atomic_init(&s->control_read_ns,0);
     atomic_init(&s->delivery_pending,false);
-    s->async_scan=s->plan->count==1 && s->plan->nodes[s->plan->root].kind==QP_SCAN && !s->plan->ninit;
+    s->async_delivery=s->host_aggregate || s->plan->ibex ||
+        (s->plan->count==1 && s->plan->nodes[s->plan->root].kind==QP_SCAN && !s->plan->ninit);
     atomic_init(&s->load_ns,0); atomic_init(&s->load_calls,0);
     atomic_init(&s->completion_reads,0); atomic_init(&s->batch_progress,0);
     s->resource_owner=CurrentResourceOwner;
@@ -497,6 +508,8 @@ static void start(PlanStateCsd *s)
     atomic_store(&s->batch_progress,0); s->retry_worker=s->next_result_worker=0;
     s->poll_ns=s->completion_copy_ns=s->submit_ns=s->queue_ns=s->control_write_ns=0;
     s->idle_ns=s->pending_ns=s->submits=s->polls=s->completions=0;
+    s->first_batch_ns=s->first_batch_idle_ns=s->consumer_rows=s->idle_sleeps=0;
+    s->max_batch_idle_ns=s->max_batch_idle_after_rows=0;
     s->completion_reads=s->control_writes=0;
     s->notice_ns=s->notice_max_ns=0;
     s->barrier_started=s->barrier_ns=s->barriers=0;
@@ -576,7 +589,7 @@ static void start(PlanStateCsd *s)
     /* Independent unordered scans return CU batches directly. The same
      * AFDM allocation/layout is retained; no input is shared across scans. */
     const struct qp_node *root=&s->plan->nodes[s->plan->root];
-    if(s->async_scan && s->workers>1 && !s->plan->ninit && !root->ordered_index)
+    if(s->async_delivery && root->kind==QP_SCAN && s->workers>1 && !s->plan->ninit && !root->ordered_index)
         s->plan->packed_result=QP_DIRECT_RESULT;
     else s->plan->packed_result=QP_TYPED_RESULT;
     checked(transfer(s->memory[0],0,s->plan,sizeof(*s->plan),true),"copy plan");
@@ -613,14 +626,14 @@ static void start(PlanStateCsd *s)
         atomic_init(&s->slots[w].completed,false); s->slots[w].profiling=s->profiling;
     }
     pfree(request); s->started=true;
-    if(s->async_scan) {
+    if(s->async_delivery) {
         if(!s->delivery) initialize_delivery(s,NULL);
         struct result_delivery *q=s->delivery;
         q->fdm_bytes=s->fdm_bytes; q->workers=s->workers;
         q->scan_bytes=s->plan->scan_bytes; q->resources=pg_sina_resources;
         /* Submit before any callback owns delivery; callbacks advance every
          * subsequent request and may wait for HOST consumption independently. */
-        checked(submit(s,0),"queue initial scan");
+        checked(submit(s,0),"queue initial device request");
     }
     if(s->profiling) s->setup_ns=clock_ns()-s->start_ns;
 }
@@ -1106,6 +1119,8 @@ static void deliver(PlanStateCsd *s)
             if(s->profiling) q->timing.advance_ns+=advanced-advancing;
             q->status=s->execution_status;
             if(produced<=0) break;
+            if(s->profiling && s->host_aggregate && next->rows && !q->timing.first_ready_ns)
+                q->timing.first_ready_ns=advanced-s->start_ns;
             ++q->count; q->eof=next->finished;
             q->result_bytes=s->result_bytes; q->result_reads=s->result_reads; q->result_rows=s->result_rows;
             pthread_cond_broadcast(&q->ready);
@@ -1122,9 +1137,11 @@ static void deliver(PlanStateCsd *s)
 static void fetch(PlanStateCsd *s)
 {
     uint64_t empty=0;
+    bool profile_ibex=s->profiling && s->plan->ibex;
+    uint64_t prior_idle=s->idle_ns;
     for(;;) {
         CHECK_FOR_INTERRUPTS();
-        if(s->async_scan) {
+        if(s->async_delivery) {
             struct result_delivery *q=s->delivery;
             uint64_t waiting=s->profiling?clock_ns():0;
             pthread_mutex_lock(&q->mutex);
@@ -1153,9 +1170,23 @@ static void fetch(PlanStateCsd *s)
             } else if(q->eof || q->stopped) { s->result->rows=0; s->result->finished=1; }
             if(have && s->profiling) { q->timing.copy_ns+=clock_ns()-copying; ++q->timing.claims; }
             pthread_mutex_unlock(&q->mutex);
-            if(status!=CS_SUCCESS) checked(status,"scan completion");
+            if(status!=CS_SUCCESS) checked(status,s->execution_operation);
             if(copied) elog(ERROR,"invalid CSD variable result slice");
-            if(have) { s->row=0; return; }
+            if(have) {
+                if(profile_ibex) {
+                    uint64_t waited=s->idle_ns-prior_idle;
+                    if(!s->consumer_rows && s->result->rows) {
+                        s->first_batch_ns=copying-s->start_ns;
+                        s->first_batch_idle_ns=s->idle_ns;
+                    } else if(s->consumer_rows && waited>s->max_batch_idle_ns) {
+                        s->max_batch_idle_ns=waited;
+                        s->max_batch_idle_after_rows=s->consumer_rows;
+                    }
+                    s->consumer_rows+=s->result->rows;
+                }
+                s->row=0;
+                return;
+            }
         } else {
             HOLD_INTERRUPTS();
             int produced=advance(s,s->result);
@@ -1165,7 +1196,10 @@ static void fetch(PlanStateCsd *s)
         }
         bool populated=pg_sina_dcp_poll(false);
         uint64_t idle=s->profiling?clock_ns():0;
-        if(!populated) pg_usleep(50L);
+        if(!populated) {
+            pg_usleep(50L);
+            if(profile_ibex) ++s->idle_sleeps;
+        }
         if(s->profiling) { uint64_t slept=clock_ns()-idle; s->idle_ns+=slept; empty+=slept; }
     }
 }
@@ -1175,6 +1209,17 @@ static TupleTableSlot *execute(CustomScanState *node)
     if(s->explain_only) return ExecClearTuple(slot);
     const struct qs_plan *root=&s->plan->nodes[s->plan->root].expr;
     if(!s->started && !s->delivery_shared) start(s);
+    if(s->host_aggregate && !s->host_finished) {
+        TupleTableSlot *host=ExecProcNode(s->host_aggregate);
+        if(!TupIsNull(host)) {
+            if(!node->ss.ps.ps_ProjInfo) return host;
+            ResetExprContext(node->ss.ps.ps_ExprContext);
+            node->ss.ps.ps_ExprContext->ecxt_scantuple=host;
+            return ExecProject(node->ss.ps.ps_ProjInfo);
+        }
+        s->host_finished=true;
+        if(s->profiling) s->host_finished_ns=clock_ns()-s->start_ns;
+    }
     if(s->row==s->result->rows && !s->result->finished) fetch(s);
     if(s->row==s->result->rows) { close_state(s); return ExecClearTuple(slot); }
     if(!s->row) for(unsigned i=0;i<root->nout;++i) {
@@ -1202,7 +1247,12 @@ static TupleTableSlot *execute(CustomScanState *node)
     ExecStoreVirtualTuple(slot); node->ss.ps.ps_ExprContext->ecxt_scantuple=slot;
     return node->ss.ps.ps_ProjInfo?ExecProject(node->ss.ps.ps_ProjInfo):slot;
 }
-static void end(CustomScanState *node) { close_state(node); }
+static void end(CustomScanState *node)
+{
+    PlanStateCsd *s=(void *)node;
+    close_state(s);
+    if(s->host_aggregate) ExecEndNode(s->host_aggregate);
+}
 static Size estimate_dsm(CustomScanState *node,ParallelContext *pcxt)
 { return sizeof(struct result_delivery); }
 static void initialize_dsm(CustomScanState *node,ParallelContext *pcxt,void *coordinate)
@@ -1250,6 +1300,12 @@ static void shutdown_scan(CustomScanState *node)
 static void rescan(CustomScanState *node)
 {
     PlanStateCsd *s=(void *)node; close_state(s);
+    if(s->host_aggregate) {
+        if(node->ss.ps.chgParam) UpdateChangedParamSet(s->host_aggregate,node->ss.ps.chgParam);
+        if(!s->host_aggregate->chgParam) ExecReScan(s->host_aggregate);
+        s->host_finished=false;
+        s->host_finished_ns=0;
+    }
     if(s->delivery && !s->delivery_shared) {
         s->delivery->head=s->delivery->count=s->delivery->position=0;
         s->delivery->eof=s->delivery->stopped=false; s->delivery->status=CS_SUCCESS;
@@ -1265,9 +1321,16 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     PlanStateCsd *s=(void *)node;
     /* EXPLAIN can inspect a LIMIT-stopped private stream before EndCustomScan.
      * Freeze callback-written counters before exposing them to PG. */
-    if(s->async_scan && !s->delivery_shared && s->started) close_state(s);
+    if(s->async_delivery && !s->delivery_shared && s->started) close_state(s);
     pg_sina_explain_placement((CustomScan *)node->ss.ps.plan,es);
-    ExplainPropertyText("Execution Path","csd",es);
+    ExplainPropertyText("Execution Path",s->host_aggregate || s->plan->ibex?"ibex":"csd",es);
+    if(s->host_aggregate) {
+        const struct qp_node *group=&s->plan->nodes[s->plan->root];
+        ExplainPropertyInteger("CSD Ibex Exclusive Upper Key",NULL,s->plan->nodes[group->left].index_upper,es);
+        List *private=((CustomScan *)node->ss.ps.plan)->custom_private;
+        if(list_length(private)>1 && IsA(lsecond(private),Integer))
+            ExplainPropertyInteger("CSD Ibex Ranked Groups",NULL,group->estimated_groups,es);
+    }
     ExplainPropertyInteger("CSD Device CUs",NULL,pg_sina_resources.cus,es);
     ExplainPropertyFloat("CSD CU CPU Ratio",NULL,pg_sina_resources.cpu_ratio,6,es);
     ExplainPropertyInteger("CSD HOST Parameter Count",NULL,list_length(s->parameter_exprs),es);
@@ -1279,9 +1342,9 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     ExplainPropertyInteger("CSD Host Result Bytes","bytes",s->result_bytes,es);
     ExplainPropertyText("CSD Counter Scope",s->delivery_shared?"shared device stream; do not sum PG participants":"current device stream",es);
     ExplainPropertyBool("CSD Direct CU Output",s->plan->packed_result==QP_DIRECT_RESULT,es);
-    ExplainPropertyText("CSD Result Delivery",s->async_scan?"SNIA callbacks; two bounded host batches":"synchronous",es);
+    ExplainPropertyText("CSD Result Delivery",s->async_delivery?"SNIA callbacks; two bounded host batches":"synchronous",es);
 
-    if(s->profiling && s->async_scan) {
+    if(s->profiling && s->async_delivery) {
         struct delivery_timing t=s->delivery_timing;
         if(s->delivery) {
             pthread_mutex_lock(&s->delivery->mutex); t=s->delivery->timing;
@@ -1293,11 +1356,17 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
         ExplainPropertyFloat("CSD Delivery Full Wait Sum","ms",t.full_ns/1e6,3,es);
         ExplainPropertyFloat("CSD Delivery Advance Wall","ms",t.advance_ns/1e6,3,es);
         ExplainPropertyInteger("CSD Consumer Claims",NULL,t.claims,es);
+        if(s->host_aggregate) {
+            ExplainPropertyFloat("CSD Ibex First Batch Ready","ms",t.first_ready_ns/1e6,3,es);
+            ExplainPropertyFloat("CSD Ibex Host Range Finished","ms",s->host_finished_ns/1e6,3,es);
+        }
     }
     ExplainPropertyInteger("CSD Host Result Requests",NULL,s->result_reads,es);
     ExplainPropertyInteger("CSD Returned Rows",NULL,s->result_rows,es);
     ExplainPropertyInteger("CSD Output Columns",NULL,s->plan->nodes[s->plan->root].expr.nout,es);
-    ExplainPropertyText("CSD Intermediate Data","device workmem and internal spill; 128-bit values",es);
+    ExplainPropertyText("CSD Intermediate Data",s->host_aggregate?"final device groups from a disjoint key range":
+                        s->plan->ibex?"device partial sums and overflow rows to HOST":
+                        "device workmem and internal spill; 128-bit values",es);
     static const char *names[]={"Scan","Projection","Merge Join","Aggregate","Sort","Limit","Index Join","CTE Scan","CTE materialization","IN hash set"};
     StringInfoData tree; initStringInfo(&tree);
     bool used[QP_NODES]={0}; used[s->plan->root]=true;
@@ -1352,8 +1421,12 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
         ExplainPropertyInteger("CSD Workmem Heap Page Misses",NULL,s->result->metrics.index_cache_misses[1],es);
         ExplainPropertyInteger("CSD Spill Read","bytes",s->result->metrics.spill_read_bytes,es);
         ExplainPropertyInteger("CSD Spill Write","bytes",s->result->metrics.spill_write_bytes,es);
+        if(s->plan->ibex)
+            ExplainPropertyInteger("CSD Overflow Rows Returned",NULL,s->result->metrics.host_overflow_rows,es);
         ExplainPropertyInteger("CSD Runs",NULL,s->result->metrics.runs,es);
         if(s->profiling) {
+            ExplainPropertyInteger("CSD Spill Read Wait Sum","ns",s->result->metrics.spill_read_wait_ns,es);
+            ExplainPropertyInteger("CSD Spill Write Wait Sum","ns",s->result->metrics.spill_write_wait_ns,es);
             const struct qs_timing *t=&s->result->profile.operators[QS_JOIN_PROBE];
             if(s->result->profile.operators[QS_INDEX_CACHE_LOOKUP].calls) {
                 static const char *const labels[]={
@@ -1427,6 +1500,13 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
             ExplainPropertyFloat("CSD Host Queue (within Submit)","ms",s->queue_ns/1e6,3,es);
             ExplainPropertyFloat("CSD Host Control Write (within Submit)","ms",s->control_write_ns/1e6,3,es);
             ExplainPropertyFloat("CSD Host Idle Sleep","ms",s->idle_ns/1e6,3,es);
+            if(s->plan->ibex) {
+                ExplainPropertyFloat("CSD Ibex First Batch Wall","ms",s->first_batch_ns/1e6,3,es);
+                ExplainPropertyFloat("CSD Ibex Sleep Before First Batch","ms",s->first_batch_idle_ns/1e6,3,es);
+                ExplainPropertyInteger("CSD Ibex Empty Queue Sleeps",NULL,s->idle_sleeps,es);
+                ExplainPropertyFloat("CSD Ibex Max Sleep After First Batch","ms",s->max_batch_idle_ns/1e6,3,es);
+                ExplainPropertyInteger("CSD Ibex Max Sleep After Rows",NULL,s->max_batch_idle_after_rows,es);
+            }
             ExplainPropertyInteger("CSD Host Submissions",NULL,s->submits,es);
             ExplainPropertyInteger("CSD Host Polls",NULL,s->polls,es);
             ExplainPropertyInteger("CSD Host Completions",NULL,s->completions,es);

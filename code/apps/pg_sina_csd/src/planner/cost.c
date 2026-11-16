@@ -6,6 +6,7 @@
 #include "pg_internal.h"
 #include "miscadmin.h"
 #include "cost_model.h"
+#include "catalog/pg_aggregate.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_index.h"
@@ -691,21 +692,72 @@ static double host_parallel_divisor(int workers)
 {
     return workers+(parallel_leader_participation?Max(0,1-0.3*workers):0);
 }
+/* A worker sorting for a compact partial aggregate can finish its scan and
+ * sort before the leader drains its tuple queue. Match the actual sort keys
+ * to the grouping keys before using the number of groups as sort-key NDV. */
+static Agg *host_compact_sorted_group(Plan *plan)
+{
+    if(!IsA(plan,GatherMerge) || !IsA(plan->lefttree,Agg)) return NULL;
+    Agg *agg=(Agg *)plan->lefttree;
+    if(agg->aggstrategy!=AGG_SORTED || agg->aggsplit!=AGGSPLIT_INITIAL_SERIAL ||
+       !agg->numCols || agg->groupingSets || agg->plan.qual || !IsA(agg->plan.lefttree,Sort)) return NULL;
+    Sort *sort=(Sort *)agg->plan.lefttree;
+    Plan *scan=sort->plan.lefttree;
+    if(!IsA(scan,SeqScan) || !scan->parallel_aware || sort->numCols!=agg->numCols) return NULL;
+    for(int i=0;i<sort->numCols;++i)
+        if(sort->sortColIdx[i]!=agg->grpColIdx[i] || sort->collations[i]!=agg->grpCollations[i] ||
+           get_equality_op_for_ordering_op(sort->sortOperators[i],NULL)!=agg->grpOperators[i]) return NULL;
+
+    /* Leave room for the allocator and the geometric growth of SortTuple
+     * storage. Partial tuple messages include a length word and tuple header.
+     * Use half of PG12's 64 KiB worker queue for the estimated output. */
+    double row_bytes=MAXALIGN(scan->plan_width+SizeofMinimalTupleHeader);
+    double sort_record=MAXALIGN(sizeof(void *)+sizeof(Datum)+sizeof(int)+sizeof(bool));
+    double sort_bytes=2*sort->plan.plan_rows*(row_bytes+sort_record);
+    double groups=Max(agg->numGroups,agg->plan.plan_rows);
+    double group_bytes=groups*(MAXALIGN(agg->plan.plan_width+SizeofMinimalTupleHeader)+sizeof(Size));
+    return sort_bytes<=work_mem*1024.0 && group_bytes<=32*1024 ? agg : NULL;
+}
+/* SUM and AVG on the same Numeric expression can share one transition.
+ * Count its header/digit access and accumulator update beyond PG's
+ * generic function invocation cost. */
+static double host_numeric_group_work(Agg *agg,double rows)
+{
+    List *inputs=NIL;
+    ListCell *cell;
+    foreach(cell,agg->plan.targetlist) {
+        TargetEntry *entry=lfirst(cell);
+        if(!IsA(entry->expr,Aggref)) continue;
+        Aggref *ref=(Aggref *)entry->expr;
+        if(ref->aggfilter || list_member(inputs,ref->args)) continue;
+        HeapTuple tuple=SearchSysCache1(AGGFNOID,ObjectIdGetDatum(ref->aggfnoid));
+        if(!HeapTupleIsValid(tuple)) continue;
+        Form_pg_aggregate definition=(Form_pg_aggregate)GETSTRUCT(tuple);
+        if(definition->aggtransfn==F_NUMERIC_AVG_ACCUM) inputs=lappend(inputs,ref->args);
+        ReleaseSysCache(tuple);
+    }
+    double cost=rows*list_length(inputs)*2*cpu_operator_cost;
+    list_free(inputs);
+    return cost;
+}
 /* A PG partial subtree may have been priced for more workers than its final
  * Gather launches (e.g. a 4-worker inner Parallel Hash below a 2-worker join).
  * Reconcile that CPU work before comparing final statements. Do not divide
  * I/O, serial/private inputs, or charge the whole subtree again at parents. */
-static double host_parallel_cost(Plan *plan,List *rtable,List **observations,int workers,double *divisor)
+static double host_parallel_cost(Plan *plan,List *rtable,List **observations,int workers,Agg *group,double *divisor)
 {
     *divisor=0;
     if(!plan) return 0;
     bool gather=IsA(plan,Gather) || IsA(plan,GatherMerge);
-    if(gather) workers=IsA(plan,Gather)?((Gather *)plan)->num_workers:((GatherMerge *)plan)->num_workers;
+    if(gather) {
+        workers=IsA(plan,Gather)?((Gather *)plan)->num_workers:((GatherMerge *)plan)->num_workers;
+        group=host_compact_sorted_group(plan);
+    }
     double left=0,right=0;
     double extra=pg_sina_host_hash_penalty(plan,true)/pg_sina_host_cost_ms;
-    extra+=host_parallel_cost(plan->lefttree,rtable,observations,workers,&left);
+    extra+=host_parallel_cost(plan->lefttree,rtable,observations,workers,group,&left);
     double repeats=IsA(plan,NestLoop) && plan->righttree && !IsA(plan->righttree,Material)?Max(1,plan->lefttree->plan_rows):1;
-    extra+=host_parallel_cost(plan->righttree,rtable,observations,workers,&right)*repeats;
+    extra+=host_parallel_cost(plan->righttree,rtable,observations,workers,group,&right)*repeats;
     double local=Max(0,plan->total_cost-(plan->lefttree?plan->lefttree->total_cost:0)-
         (plan->righttree?plan->righttree->total_cost*repeats:0));
     if(IsA(plan,SeqScan) || IsA(plan,IndexScan) || IsA(plan,IndexOnlyScan)) {
@@ -723,16 +775,32 @@ static double host_parallel_cost(Plan *plan,List *rtable,List **observations,int
         }
     }
     if(workers && left>0 && !gather) {
-        double ratio=left/host_parallel_divisor(workers);
-        extra+=local*(ratio-1);
+        double target=group && parallel_leader_participation?workers+1:host_parallel_divisor(workers);
+        double ratio=left/target,adjusted=local*ratio;
+        if(group && plan==group->plan.lefttree) {
+            double rows=plan->plan_rows*ratio;
+            double groups=Min(rows,Max(group->numGroups,group->plan.plan_rows));
+            /* Three-way quicksort removes equal keys from further partitions.
+             * Each row still enters and leaves tuplesort and pays at least
+             * one full-key comparison and the original output iteration. */
+            double sort_cpu=rows*(2*cpu_tuple_cost+cpu_operator_cost*
+                (2*log2(Max(1,groups))+2*group->numCols+1));
+            adjusted=Min(adjusted,sort_cpu);
+        } else if(group && plan==&group->plan)
+            adjusted+=host_numeric_group_work(group,plan->lefttree->plan_rows*ratio);
+        extra+=adjusted-local;
+        if(group && pg_sina_planning)
+            ereport(NOTICE,(errmsg("SQLerate HOST sorted group stage=%s participants=%.2f cpu_ms=%.3f repriced_cpu_ms=%.3f",
+                IsA(plan,Sort)?"sort":IsA(plan,Agg)?"partial aggregate":"scan",
+                target,local*pg_sina_host_cost_ms,adjusted*pg_sina_host_cost_ms)));
     }
     if(IsA(plan,CustomScan)) {
         ListCell *c; foreach(c,((CustomScan *)plan)->custom_plans) {
-            double child=0; extra+=host_parallel_cost(lfirst(c),rtable,observations,workers,&child);
+            double child=0; extra+=host_parallel_cost(lfirst(c),rtable,observations,workers,NULL,&child);
         }
     }
     if(IsA(plan,SubqueryScan)) {
-        double child=0; extra+=host_parallel_cost(((SubqueryScan *)plan)->subplan,rtable,observations,workers,&child);
+        double child=0; extra+=host_parallel_cost(((SubqueryScan *)plan)->subplan,rtable,observations,workers,NULL,&child);
     }
     *divisor=gather?0:left;
     return extra;
@@ -740,7 +808,7 @@ static double host_parallel_cost(Plan *plan,List *rtable,List **observations,int
 double pg_sina_host_parallel_cost(PlannedStmt *stmt)
 {
     List **observations=pg_sina_search_observations(); double divisor=0;
-    return observations?host_parallel_cost(stmt->planTree,stmt->rtable,observations,0,&divisor)*pg_sina_host_cost_ms:0;
+    return observations?host_parallel_cost(stmt->planTree,stmt->rtable,observations,0,NULL,&divisor)*pg_sina_host_cost_ms:0;
 }
 static double statement_cache_cost(Plan *p,List *rtable,List **observations,double repeats)
 {
@@ -1352,7 +1420,9 @@ static void fast_cost(struct placement *p,const struct qs_plan *plan,List **obse
     for(unsigned i=0;i<plan->nkeys;++i) sink[plan->keys[i]]=true;
     for(unsigned i=0;i<plan->naggs;++i) if(plan->aggs[i].expr>=0) sink[plan->aggs[i].expr]=true;
     double lanes=vector_lanes(),filter_ops=fused_input_ops(plan,filter,1);
-    if(fused_scan_comparison(plan)) filter_ops/=lanes;
+    /* SIMD predicate comparison also reads the validity bitmap and
+     * extracts the lane mask before emitting the selected positions. */
+    if(fused_scan_comparison(plan) && lanes>1) filter_ops=(filter_ops+2)/lanes;
     bool predicate_columns[QS_COLS]={0};
     for(unsigned i=0;i<plan->nexprs;++i)
         if(filter[i] && plan->exprs[i].op==Q_COLUMN)
@@ -1371,7 +1441,9 @@ static void fast_cost(struct placement *p,const struct qs_plan *plan,List **obse
      * lookup, null check and reference validation before decoding. A
      * predicate can also decode it on rows that are later rejected. */
     const double numeric_ops=0.75,late_numeric_ops=numeric_ops+3;
-    double decode_ops=cost_heap_decode_ops(plan,attrs);
+    /* Scan forms payload offsets/lengths on every visited tuple, even
+     * though Filter decodes the referenced payload only for selected rows. */
+    double decode_ops=cost_heap_decode_ops(plan,attrs)+0.25*deferred;
     double scan=(r->bytes/BLCKSZ+r->tuples*(2+decode_ops+filter_ops+numeric_ops*eager))*
         cpu_operator_cost*unit;
     double deferred_work=(selected*deferred+r->tuples*predicate_deferred)*late_numeric_ops*cpu_operator_cost*unit;
@@ -2359,8 +2431,9 @@ void pg_sina_explain_placement(CustomScan *scan,ExplainState *es)
     ExplainPropertyText("HPCP",pg_sina_hpcp_enabled()?"enabled":"disabled",es);
     ExplainPropertyText("DCP",pg_sina_dcp?"shared_buffers":"disabled",es);
     ExplainPropertyText("Input Source","internal NVM to FDM",es);
-    if(list_length(scan->custom_private)>1) {
-        List *v=lsecond(scan->custom_private);
+    Node *costs=list_length(scan->custom_private)>1?lsecond(scan->custom_private):NULL;
+    if(costs && IsA(costs,List)) {
+        List *v=(List *)costs;
         ExplainPropertyFloat("SQLerate HOST Cost","ms",floatVal(linitial(v)),3,es);
         ExplainPropertyFloat("SQLerate CSD Cost","ms",floatVal(lsecond(v)),3,es);
         ExplainPropertyFloat("SQLerate CSD to HOST Cost","ms",floatVal(lthird(v)),3,es);

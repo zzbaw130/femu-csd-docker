@@ -135,19 +135,21 @@ static void scan(struct qp_node *n)
         n->expr.outputs[i]=(struct qs_output){.index=i,.type_oid=23};
     }
 }
-struct test_spill { pthread_mutex_t mutex; void **tokens; unsigned count,stores; };
+struct test_spill_block { void *data; size_t bytes; };
+struct test_spill { pthread_mutex_t mutex; struct test_spill_block *tokens; unsigned count,stores; };
 static uint64_t spill_request(struct test_spill *s,unsigned op,uint64_t id,void *io)
 {
     assert(!pthread_mutex_lock(&s->mutex));
     if(op==1) {
-        assert(id==QS_SORT_IO_BYTES);
+        assert(id && id<=QS_SORT_IO_BYTES);
         s->tokens=realloc(s->tokens,(s->count+1)*sizeof(*s->tokens)); assert(s->tokens);
         void *data=malloc(id); assert(data); memcpy(data,io,id);
-        s->tokens[s->count++]=data; id=s->count; ++s->stores;
+        s->tokens[s->count++]=(struct test_spill_block){.data=data,.bytes=id}; id=s->count; ++s->stores;
     } else {
-        assert(id && id<=s->count && s->tokens[id-1]);
-        if(op==2) memcpy(io,s->tokens[id-1],QS_SORT_IO_BYTES);
-        else { assert(op==3); free(s->tokens[id-1]); s->tokens[id-1]=NULL; }
+        assert(id && id<=s->count && s->tokens[id-1].data);
+        struct test_spill_block *block=&s->tokens[id-1];
+        if(op==2) memcpy(io,block->data,block->bytes);
+        else { assert(op==3); free(block->data); block->data=NULL; }
     }
     assert(!pthread_mutex_unlock(&s->mutex)); return id;
 }
@@ -391,10 +393,10 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
         if(payload==2 || payload==3) assert(out->profile.operators[QS_FILTER].calls);
         if(ordered==DICTIONARY_SORT && budget>=64U*1024*1024)
             assert((uint64_t)loads*QS_SORT_IO_BYTES<out->metrics.dictionary_bytes*8);
-        for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i]);
+        for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i].data);
     } else {
         assert(cancelled && !c->state);
-        for(unsigned i=0;i<spill.count;++i) { free(spill.tokens[i]); spill.tokens[i]=NULL; }
+        for(unsigned i=0;i<spill.count;++i) { free(spill.tokens[i].data); spill.tokens[i].data=NULL; }
     }
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
     if(!cancel) printf("PASS default dictionary %s: %u rows, %llu bytes, STORE=%u LOAD=%u peak=%llu/%zu\n",
@@ -1022,7 +1024,7 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         if(parallel==TEST_PARTITION_SERIAL) assert(!control.epoch);
         else assert(memory==8?control.epoch==1:control.epoch>1);
     }
-    for(size_t i=0;i<spill.count;++i) free(spill.tokens[i]);
+    for(size_t i=0;i<spill.count;++i) free(spill.tokens[i].data);
     assert(!pthread_mutex_destroy(&spill.mutex));
     free(controls); free(spill.tokens); free(raw[0]); free(raw[1]); free(index); free(plan); free(arena); free(io); free(out);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
@@ -1436,7 +1438,7 @@ static void set_projection(function run,unsigned variant,unsigned filter,unsigne
                 c.close=1; assert(!run(&a));
                 struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
                 /* Closing a SNIA session also releases its remaining tokens. */
-                for(unsigned i=0;i<spill.count;++i) { free(spill.tokens[i]); spill.tokens[i]=NULL; }
+                for(unsigned i=0;i<spill.count;++i) { free(spill.tokens[i].data); spill.tokens[i].data=NULL; }
                 memset(&c,0,sizeof(c)); memset(out,0,sizeof(*out)); a.cparam2=0; cancelled=1;
                 seen=returned=0;
                 for(unsigned i=0;i<2;++i) {
@@ -1474,7 +1476,7 @@ static void set_projection(function run,unsigned variant,unsigned filter,unsigne
         assert(spill.stores && out->metrics.spill_write_bytes && out->metrics.spill_read_bytes);
         assert(out->metrics.work_peak<=4U*1024*1024);
     }
-    for(unsigned i=0;i<spill.count;++i) free(spill.tokens[i]);
+    for(unsigned i=0;i<spill.count;++i) free(spill.tokens[i].data);
     free(spill.tokens); assert(!pthread_mutex_destroy(&spill.mutex));
     if(!filter) assert(seen==rows);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
@@ -1588,7 +1590,7 @@ static void set_join(function run,unsigned kind,int hash,int has_null)
         assert(seen[i]==expected[i]);
     }
     assert(spill.stores && out->metrics.work_peak<=4U*1024*1024);
-    for(unsigned i=0;i<spill.count;++i) free(spill.tokens[i]);
+    for(unsigned i=0;i<spill.count;++i) free(spill.tokens[i].data);
     free(spill.tokens); assert(!pthread_mutex_destroy(&spill.mutex));
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
     for(unsigned i=0;i<3;++i) free(raw[i]);
@@ -1930,7 +1932,7 @@ static void local_group_merge(function run,int large_merge)
         printf("PASS local merge: %u groups, peak=%llu/%u bytes, no NVM stores\n",
             count,(unsigned long long)out->metrics.work_peak,memory);
     }
-    for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i]);
+    for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i].data);
     assert(!pthread_mutex_destroy(&spill.mutex));
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
     memset(c,0,(workers+1)*sizeof(*c)); memset(out,0,(workers+1)*sizeof(*out)); args.cparam2=0;
@@ -2048,7 +2050,7 @@ static void parallel_sort_spill(function run,unsigned workers,unsigned memory,in
     assert(sunk==rows || held_stores); /* local Sink or the spill-safe adapter */
     if(memory==8U*1024*1024) assert(sunk==rows);
     if(memory==4U*1024*1024) assert(spill.stores);
-    for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i]);
+    for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i].data);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
     memset(controls,0,(workers+1)*sizeof(*controls)); memset(out,0,(workers+1)*sizeof(*out)); args.cparam2=0;
     assert(!run(&args) && c->parallel);
@@ -2305,7 +2307,7 @@ static void multiple_group_aggregates(function run,unsigned memory,unsigned kind
     /* A single aggregate can now fit without spilling at 4 MiB. Wider
      * partial states still exceed that budget and exercise NVM reentry. */
     if(memory==4 && counts) assert(spill.count);
-    for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i]);
+    for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i].data);
     assert(!pthread_mutex_destroy(&spill.mutex));
     free(controls); free(spill.tokens); free(raw); free(expected); free(p); free(arena); free(io); free(out);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);

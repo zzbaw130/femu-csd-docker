@@ -31,7 +31,8 @@ static PlannedStmt *plan_query(Query *query,int cursorOptions,ParamListInfo boun
 static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,ParamListInfo boundParams)
 {
     /* SPI mapping lookups are PG queries too, not new placement searches. */
-    if(pg_sina_compiling_plan || parse->commandType!=CMD_SELECT || parse->hasModifyingCTE)
+    if(pg_sina_compiling_plan || parse->commandType!=CMD_SELECT || parse->hasModifyingCTE ||
+       pg_sina_exe_path==PG_SINA_IBEX)
         return plan_query(parse,cursorOptions,boundParams);
     bool measure_forced=pg_sina_profile && pg_sina_exe_path==PG_SINA_CSD;
     instr_time forced_start;
@@ -199,7 +200,7 @@ static void assign_path(int value,void *extra)
 }
 const char *pg_sina_path_name(void)
 {
-    static const char *names[]={"host-only","filter-only","csd-without-hpcp","csd-with-hpcp","SQLerate"};
+    static const char *names[]={"host-only","filter-only","csd-without-hpcp","csd-with-hpcp","SQLerate","ibex"};
     return names[pg_sina_exe_path];
 }
 bool pg_sina_hpcp_enabled(void)
@@ -224,7 +225,7 @@ static bool check_memory(int *value,void **extra,GucSource source)
 static const struct config_enum_entry execution_paths[] = {
     {"host-only",PG_SINA_HOST,false}, {"filter-only",PG_SINA_FILTER,false},
     {"csd-without-hpcp",PG_SINA_CSD,false}, {"csd-with-hpcp",PG_SINA_HPCP,false},
-    {"SQLerate",PG_SINA_ADAPTIVE,false}, {NULL, 0, false}
+    {"SQLerate",PG_SINA_ADAPTIVE,false}, {"ibex",PG_SINA_IBEX,false}, {NULL, 0, false}
 };
 double pg_sina_host_cost_ms=0.02,pg_sina_csd_cpu_ratio=0.35;
 double pg_sina_parallel_task_ms=0.02;
@@ -286,5 +287,5 @@ void _PG_init(void)
 PG_FUNCTION_INFO_V1(pg_sina_csd_version);
 Datum pg_sina_csd_version(PG_FUNCTION_ARGS)
 {
-    PG_RETURN_TEXT_P(cstring_to_text("pg_sina_csd 0.2: SNIA vector query execution"));
+    PG_RETURN_TEXT_P(cstring_to_text("pg_sina_csd 0.3: SNIA vector query execution"));
 }

@@ -297,6 +297,7 @@ struct qs_metrics {
     uint64_t build_rows, join_rows, build_batches;
     uint64_t index_pages, index_tuples;
     uint64_t index_cache_hits[2], index_cache_misses[2];
+    uint64_t spill_read_wait_ns,spill_write_wait_ns,host_overflow_rows;
     unsigned workers;
 };
 /* Optional per-query measurements. Each CU owns its own AFDM counters. */

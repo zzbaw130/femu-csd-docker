@@ -57,6 +57,8 @@ struct index_cursor {
     uint64_t *scan_tids;
     int scan_started,scan_done;
     unsigned scan_end;
+    bool scan_has_upper;
+    int64_t scan_upper;
     struct qs_scan_cursor *decoder;
     void *spill_io;
     uint64_t dictionary_completion;
@@ -435,6 +437,12 @@ void qs_index_scan_range(struct qs_join_control *control,unsigned first,unsigned
     c->scan=(struct lookup){.block=first}; c->scan_end=end;
     c->scan_started=1; c->scan_done=first>=end;
 }
+void qs_index_scan_upper(struct qs_join_control *control,int64_t upper)
+{
+    struct index_join *h=(void *)(uintptr_t)control->state;
+    h->cursors[0]->scan_upper=upper;
+    h->cursors[0]->scan_has_upper=true;
+}
 int64_t qs_index_scan(struct qs_chunk *out,struct qs_task *task,struct qs_join_control *control,void *io,
     unsigned heap_pages,unsigned index_pages,int flags)
 {
@@ -487,6 +495,11 @@ int64_t qs_index_scan(struct qs_chunk *out,struct qs_task *task,struct qs_join_c
             unsigned item=c->scan.item++,len=0;
             if(((u32(page+24+(item-1)*4)>>15)&3)==3) continue;
             const unsigned char *t=item_at(page,item,&len); if(!t || len<8) return -2;
+            if(c->scan_has_upper) {
+                int cmp;
+                if(compare(t,len,h->scan.join.index_key_bytes,c->scan_upper,&cmp)) return -2;
+                if(cmp>=0) { c->scan_done=1; break; }
+            }
             if(flags&4) {
                 unsigned info=u16(t+6),off=info&0x8000?16:8;
                 if((info&8191)!=len || ((info&0x8000) && len<16)) return -2;

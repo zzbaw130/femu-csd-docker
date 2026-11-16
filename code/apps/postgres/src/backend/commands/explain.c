@@ -1856,6 +1856,8 @@ ExplainNode(PlanState *planstate, List *ancestors,
 								  es);
 			break;
 		case T_Hash:
+			if (es->verbose && es->format != EXPLAIN_FORMAT_TEXT)
+				ExplainPropertyInteger("Hash Plan Node ID", NULL, plan->plan_node_id, es);
 			show_hash_info(castNode(HashState, planstate), es);
 			break;
 		default:

@@ -132,6 +132,14 @@ size_t qs_sort_min_workspace(void)
     return 3*RUN_BYTES+32*(QS_SORT_IO_BYTES+sizeof(struct row_run)+QS_OUT*sizeof(struct qs_cell))+
         sizeof(struct row_sort)+QS_EXPRS*sizeof(struct qs_vector)+2*sizeof(struct qs_result)+4096;
 }
+/* Integer-key aggregate partials arrive as cells and need no expression
+ * vectors or text runs. Bound their private sort to a run, radix scratch
+ * and a small merge window. Additional runs use the existing spill path. */
+size_t qs_sort_integer_partial_workspace(void)
+{
+    return 2*RUN_BYTES+8*(QS_SORT_IO_BYTES+sizeof(struct row_run)+QS_OUT*sizeof(struct qs_cell))+
+        sizeof(struct row_sort)+4096;
+}
 enum { ROW_NONE, ROW_STORE, ROW_LOAD, ROW_FREE, ROW_COMPACT_STORE,
        ROW_TEXT_STORE, ROW_TEXT_LOAD, ROW_TEXT_FREE };
 enum { DICTIONARY_NONE, DICTIONARY_COMPARE, DICTIONARY_EVICT, DICTIONARY_COPY };

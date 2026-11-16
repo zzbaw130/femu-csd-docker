@@ -1,6 +1,10 @@
 /* Lower the selected PG Plan, without choosing another join order. */
 #include "pg_internal.h"
+#include "cost_model.h"
 #include "access/table.h"
+#include "access/tableam.h"
+#include "access/genam.h"
+#include "access/stratnum.h"
 #include "access/sysattr.h"
 #include "access/relation.h"
 #include "catalog/namespace.h"
@@ -11,6 +15,7 @@
 #include "catalog/pg_collation_d.h"
 #include "catalog/pg_statistic.h"
 #include "executor/spi.h"
+#include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
@@ -18,6 +23,7 @@
 #include "optimizer/tlist.h"
 #include "parser/parse_oper.h"
 #include "parser/parsetree.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/array.h"
 #include "utils/lsyscache.h"
@@ -27,6 +33,7 @@
 #include "utils/fmgroids.h"
 #include "utils/numeric.h"
 #include "utils/syscache.h"
+#include "utils/snapmgr.h"
 #include <locale.h>
 
 struct binding {
@@ -1996,7 +2003,7 @@ bool pg_sina_scan_parameters(PlannerInfo *root,Plan *native,List **values)
     *values=parameters.values;
     return true;
 }
-Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
+static Plan *compile_subtree(PlannerInfo *root,Plan *native,bool boundary,bool ibex)
 {
     bool host_scan=boundary && pg_sina_is_scan(native);
     List *parameters=NIL;
@@ -2032,6 +2039,9 @@ Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
     }
     if(copy) result=compile_node(root,copy,tree,ordered);
     if(result<0) { goto failed; }
+    tree->root=result;
+    if(ibex && !qp_ibex_supported(tree)) goto failed;
+    tree->ibex=ibex;
     bool has_scan=false;
     for(unsigned i=0;i<tree->count;++i) {
         has_scan|=tree->nodes[i].kind==QP_SCAN;
@@ -2050,7 +2060,6 @@ Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
         if(prepared && !device[0]) strlcpy(device,path,sizeof(device));
     }
     if(!prepared) { goto failed; }
-    tree->root=result;
     defer_output_text(tree,NULL);
     pg_sina_refine_groups(root,tree);
     pg_sina_read_resources(device);
@@ -2087,6 +2096,8 @@ failed:
     pfree(tree);
     return native;
 }
+Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
+{ return compile_subtree(root,native,boundary,false); }
 Plan *pg_sina_describe_candidate(PlannerInfo *root,Plan *native,bool boundary,struct qp_plan **lowered)
 {
     bool host_scan=boundary && pg_sina_is_scan(native);
@@ -2207,6 +2218,185 @@ Plan *pg_sina_native_plan(Plan *plan)
     if(IsA(plan,SubqueryScan)) ((SubqueryScan *)plan)->subplan=pg_sina_native_plan(((SubqueryScan *)plan)->subplan);
     return plan;
 }
+struct ibex_split {
+    struct qs_join mapping;
+    int64_t upper;
+    uint64_t ranked_groups;
+};
+
+static void ibex_rank_boundary(uint64_t budget,const struct qp_node *group,struct ibex_split *split)
+{
+    Oid ns=get_namespace_oid("sina_csd",true);
+    if(!OidIsValid(ns)) return;
+    Oid boundaries=get_relname_relid("ibex_group_boundaries",ns);
+    if(!OidIsValid(boundaries) || pg_class_aclcheck(boundaries,GetUserId(),ACL_SELECT)!=ACLCHECK_OK) return;
+    /* Match the device's power-of-two buckets and 7/8 occupancy. Leave
+     * 16 MiB for the ordered scan, executor, and minimum sort reserves. */
+    uint64_t stride=cost_group_stride(group),slot_bytes=8+stride-stride/8;
+    uint64_t slots=128,available=budget-16ULL*1024*1024;
+    while(slots*2<=available/slot_bytes) slots*=2;
+    int64_t limit=slots-slots/8;
+    if(SPI_connect()!=SPI_OK_CONNECT) elog(ERROR,"SPI_connect failed");
+    Oid types[]={OIDOID,INT8OID};
+    Datum values[]={ObjectIdGetDatum(split->mapping.indexid),Int64GetDatum(limit)};
+    int status=SPI_execute_with_args("SELECT groups_before,upper_key FROM sina_csd.ibex_group_boundaries "
+        "WHERE indexid=$1 AND groups_before>0 AND groups_before<=$2 ORDER BY groups_before DESC LIMIT 1",
+        2,types,values,NULL,true,1);
+    if(status==SPI_OK_SELECT && SPI_processed==1) {
+        HeapTuple row=SPI_tuptable->vals[0]; TupleDesc desc=SPI_tuptable->tupdesc;
+        bool isnull;
+        split->ranked_groups=DatumGetInt64(SPI_getbinval(row,desc,1,&isnull));
+        split->upper=DatumGetInt64(SPI_getbinval(row,desc,2,&isnull));
+    }
+    SPI_finish();
+}
+
+static IndexScan *ibex_host_scan(PlannerInfo *root,Scan *input,Var *key,
+    uint64_t budget,const struct qp_node *group,struct ibex_split *split)
+{
+    Index rti=input->scanrelid;
+    Oid heap_oid=planner_rt_fetch(rti,root)->relid;
+    Relation heap=table_open(heap_oid,NoLock);
+    if(key->varattno<=0 || !TupleDescAttr(RelationGetDescr(heap),key->varattno-1)->attnotnull) {
+        table_close(heap,NoLock);
+        return NULL;
+    }
+    IndexOptInfo *chosen=NULL;
+    Oid op=InvalidOid;
+    ListCell *cell;
+    foreach(cell,root->simple_rel_array[rti]->indexlist) {
+        IndexOptInfo *index=lfirst_node(IndexOptInfo,cell);
+        if(index->relam!=BTREE_AM_OID || index->indexkeys[0]!=key->varattno) continue;
+        op=get_opfamily_member(index->opfamily[0],key->vartype,key->vartype,BTGreaterEqualStrategyNumber);
+        if(OidIsValid(op) && index_metadata(index->indexoid,heap_oid,key->varattno,&split->mapping)) {
+            chosen=index;
+            break;
+        }
+    }
+    if(!chosen) { table_close(heap,NoLock); return NULL; }
+    int16 len; bool byval;
+    get_typlenbyval(key->vartype,&len,&byval);
+    ibex_rank_boundary(budget,group,split);
+    if(!split->ranked_groups) {
+        /* Older mappings have no exact ranks. Bound the number of possible
+         * groups by the integer span, including keys absent from the heap. */
+        Relation index=index_open(chosen->indexoid,NoLock);
+        IndexScanDesc scan=index_beginscan(heap,index,GetActiveSnapshot(),0,0);
+        TupleTableSlot *slot=table_slot_create(heap,NULL);
+        index_rescan(scan,NULL,0,NULL,0);
+        bool found=index_getnext_slot(scan,ForwardScanDirection,slot),isnull=true;
+        Datum first=found?slot_getattr(slot,key->varattno,&isnull):(Datum)0;
+        ExecDropSingleTupleTableSlot(slot);
+        index_endscan(scan);
+        index_close(index,NoLock);
+        if(!found || isnull) { table_close(heap,NoLock); return NULL; }
+        int64_t min=len==2?DatumGetInt16(first):len==4?DatumGetInt32(first):DatumGetInt64(first);
+        int64_t type_max=len==2?PG_INT16_MAX:len==4?PG_INT32_MAX:PG_INT64_MAX;
+        int64_t groups=budget/160;
+        split->upper=min>type_max-groups?type_max:min+groups;
+        if(split->upper<=min) { table_close(heap,NoLock); return NULL; }
+    }
+    table_close(heap,NoLock);
+    Datum limit=len==2?Int16GetDatum(split->upper):len==4?Int32GetDatum(split->upper):Int64GetDatum(split->upper);
+    Const *constant=makeConst(key->vartype,-1,InvalidOid,len,limit,false,byval);
+    Var *index_key=copyObject(key);
+    index_key->varno=INDEX_VAR; index_key->varattno=1;
+    IndexScan *host=makeNode(IndexScan);
+    host->scan=*input; NodeSetTag(host,T_IndexScan);
+    host->scan.plan.parallel_aware=false;
+    host->indexid=chosen->indexoid;
+    host->indexorderdir=ForwardScanDirection;
+    host->indexqual=list_make1(make_opclause(op,BOOLOID,false,(Expr *)index_key,(Expr *)constant,InvalidOid,InvalidOid));
+    host->indexqualorig=list_make1(make_opclause(op,BOOLOID,false,(Expr *)copyObject(key),(Expr *)copyObject(constant),InvalidOid,InvalidOid));
+    root->glob->relationOids=list_append_unique_oid(root->glob->relationOids,chosen->indexoid);
+    return host;
+}
+
+static Plan *ibex_aggregate(PlannerInfo *root,Plan *native)
+{
+    if(!IsA(native,Agg) || root->init_plans) return native;
+    Agg *agg=copyObject((Agg *)native);
+    if(agg->numCols!=1 || agg->groupingSets || agg->chain ||
+       (agg->aggstrategy!=AGG_HASHED && agg->aggstrategy!=AGG_SORTED)) return native;
+    Plan *input=agg->plan.lefttree;
+    Agg *partial=agg;
+    if(DO_AGGSPLIT_COMBINE(agg->aggsplit)) {
+        input=partial_input(input);
+        if(!input) return native;
+        partial=(Agg *)input;
+        if(partial->numCols!=1) return native;
+        input=input->lefttree;
+    } else if(agg->aggsplit!=AGGSPLIT_SIMPLE) return native;
+    if(!input) return native;
+    TargetEntry *key=get_tle_by_resno(input->targetlist,partial->grpColIdx[0]);
+    if(!key || !IsA(key->expr,Var)) return native;
+    Oid keytype=exprType((Node *)key->expr);
+    if(keytype!=INT2OID && keytype!=INT4OID && keytype!=INT8OID) return native;
+    if(IsA(input,Sort)) input=input->lefttree;
+    if(!IsA(input,SeqScan)) return native;
+    List *outputs=list_concat(list_copy(agg->plan.targetlist),agg->plan.qual);
+    List *references=pull_var_clause((Node *)outputs,PVC_INCLUDE_AGGREGATES|PVC_RECURSE_PLACEHOLDERS);
+    Aggref *sum=NULL;
+    ListCell *cell;
+    foreach(cell,references) {
+        if(!IsA(lfirst(cell),Aggref)) continue;
+        Aggref *ref=lfirst_node(Aggref,cell);
+        if(sum && !equal(sum,ref)) return native;
+        sum=ref;
+    }
+    if(!sum || !function_is(sum->aggfnoid,"sum") || sum->aggtype!=NUMERICOID ||
+       sum->aggdistinct || sum->aggorder || sum->aggfilter || list_length(sum->args)!=1)
+        return native;
+    Expr *quantity=linitial_node(TargetEntry,sum->args)->expr;
+    if(!IsA(quantity,Var) || exprType((Node *)quantity)!=NUMERICOID ||
+       ((Var *)quantity)->varno!=((Scan *)input)->scanrelid ||
+       ((Var *)key->expr)->varno!=((Scan *)input)->scanrelid) return native;
+
+    List *columns=list_make2(makeTargetEntry(copyObject(key->expr),1,NULL,false),
+                             makeTargetEntry(copyObject(quantity),2,NULL,false));
+    Plan *source=copyObject(input);
+    source->targetlist=copyObject(columns);
+    agg->aggsplit=AGGSPLIT_SIMPLE;
+    agg->grpColIdx[0]=1;
+    agg->plan.parallel_aware=agg->plan.parallel_safe=false;
+    foreach(cell,references)
+        if(IsA(lfirst(cell),Aggref)) lfirst_node(Aggref,cell)->aggsplit=AGGSPLIT_SIMPLE;
+    agg->plan.lefttree=source;
+    agg->aggstrategy=AGG_HASHED;
+    Plan *compiled=compile_subtree(root,(Plan *)agg,false,false);
+    uint64_t budget=pg_sina_query_memory();
+    if(compiled==(Plan *)agg || budget<64ULL*1024*1024) return native;
+
+    CustomScan *scan=(CustomScan *)compiled;
+    Const *program=linitial_node(Const,scan->custom_private);
+    bytea *bytes=DatumGetByteaP(program->constvalue);
+    size_t length=VARSIZE_ANY_EXHDR(bytes);
+    struct qp_plan *tree=palloc0(sizeof(*tree));
+    memcpy(tree,VARDATA_ANY(bytes),length);
+    struct qp_node *group=&tree->nodes[tree->root];
+    if(group->kind!=QP_AGGREGATE || group->left<0 || tree->nodes[group->left].kind!=QP_SCAN) {
+        pfree(tree);
+        return native;
+    }
+    struct ibex_split split={0};
+    IndexScan *host=ibex_host_scan(root,(Scan *)source,(Var *)key->expr,budget,group,&split);
+    if(!host) { pfree(tree); return native; }
+    struct qp_node *leaf=&tree->nodes[group->left];
+    leaf->ordered_index=3|QP_INDEX_UPPER; /* Forward B-tree with heap read-ahead. */
+    leaf->index_upper=split.upper;
+    leaf->expr.join=split.mapping;
+    group->estimated_groups=split.ranked_groups?split.ranked_groups:budget/160;
+    if(split.ranked_groups) scan->custom_private=lappend(scan->custom_private,makeInteger(1));
+    memcpy(VARDATA_ANY(bytes),tree,length);
+    pfree(tree);
+
+    /* The complementary index range is ordered by the group key. PG can
+     * finalize each group as it scans while the device runs asynchronously. */
+    agg->aggstrategy=AGG_SORTED;
+    agg->plan.lefttree=(Plan *)host;
+    scan->custom_plans=list_make1(agg);
+    return compiled;
+}
 static Plan *rewrite_selected(PlannerInfo *root,RelOptInfo *rel,CustomPath *path,List *tlist,List *clauses,List *plans)
 {
     Plan *native=linitial(plans);
@@ -2214,7 +2404,9 @@ static Plan *rewrite_selected(PlannerInfo *root,RelOptInfo *rel,CustomPath *path
     pg_sina_compiling_plan=true;
     PG_TRY();
     {
-        if(pg_sina_exe_path==PG_SINA_FILTER || pg_sina_exe_path==PG_SINA_ADAPTIVE)
+        if(pg_sina_exe_path==PG_SINA_IBEX)
+            compiled=ibex_aggregate(root,native);
+        else if(pg_sina_exe_path==PG_SINA_FILTER || pg_sina_exe_path==PG_SINA_ADAPTIVE)
             compiled=pg_sina_adaptive_plan(root,native);
         else {
             compiled=pg_sina_fast_plan(root,native);
@@ -2245,9 +2437,14 @@ static const CustomPathMethods selected_methods={.CustomName="SniaSelectedPlan",
 void pg_sina_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *input,RelOptInfo *output,void *extra)
 {
     Query *q=root->parse;
-    if(pg_sina_exe_path==PG_SINA_HOST || root->parent_root || stage!=UPPERREL_FINAL || q->commandType!=CMD_SELECT ||
+    bool ibex=pg_sina_exe_path==PG_SINA_IBEX;
+    if(pg_sina_exe_path==PG_SINA_HOST || stage!=UPPERREL_FINAL || q->commandType!=CMD_SELECT ||
        q->hasRowSecurity || q->hasTargetSRFs || q->rowMarks || q->windowClause || q->groupingSets ||
        q->setOperations || root->append_rel_list) return;
+    if(ibex) {
+        if(!q->hasAggs || list_length(q->groupClause)!=1 || list_length(q->rtable)!=1 ||
+           linitial_node(RangeTblEntry,q->rtable)->rtekind!=RTE_RELATION || q->cteList || q->hasSubLinks) return;
+    } else if(root->parent_root) return;
     Path *selected=NULL; ListCell *c;
     foreach(c,output->pathlist) {
         Path *candidate=lfirst(c);
@@ -2257,7 +2454,8 @@ void pg_sina_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *i
     CustomPath *path=makeNode(CustomPath); path->path=*selected;
     NodeSetTag(path,T_CustomPath); path->path.pathtype=T_CustomScan;
     path->path.parallel_aware=path->path.parallel_safe=false;
-    path->path.startup_cost=path->path.total_cost=0;
+    if(ibex) path->path.pathkeys=NIL;
+    if(!ibex) path->path.startup_cost=path->path.total_cost=0;
     path->custom_paths=list_make1(selected); path->methods=&selected_methods;
     /* add_path may pfree the dominated path, which is our own child here. */
     output->pathlist=list_make1(path);

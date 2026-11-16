@@ -1086,7 +1086,7 @@ static void topn_bound(void)
         struct qs_plan input={.nout=2}; input.outputs[0].type_oid=20; input.outputs[1].type_oid=25;
         struct sorted_rows *sort=&s->nodes[1].left_sort;
         struct qs_order order={.output=0,.descending=1};
-        assert(!sort_init(s,sort,&input,1,NULL,&order));
+        assert(!sort_init(s,sort,&input,1,NULL,&order,0));
         assert(sort->plan.limit==(shared?-1:(int64_t)top+parent->expr.offset));
         for(unsigned row=0;row<1001;++row) {
             sort->input->rows=1; sort->input->data[0].cells[0]=(struct qs_cell){.value=row};
