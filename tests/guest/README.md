@@ -1,6 +1,6 @@
 # TPC-H 全量测试
 
-在 30 GiB Guest 中使用三个入口，默认数据库为 SF8（`tpch_s8`），默认目标选择率为 0.1。五种 exe_path 的预热和正式测量都读取 `queries/sf8_sel0.1/` 下已生成的 SQL。可用 `SF=4` 等环境变量选择其他已启动规模，用 `-s` 选择已生成的目标选择率。测试前先在宿主机运行下文的生成命令。Guest 挂载路径为 `/home/femu/tests`，`PGDATA` 和 `PGDATABASE` 可单独指定路径和数据库。
+在 16 GiB Guest 中使用三个入口，默认数据库为 SF8（`tpch_s8`），默认目标选择率为 0.1。五种 exe_path 的预热和正式测量都读取 `queries/sf8_sel0.1/` 下已生成的 SQL。可用 `SF=4` 等环境变量选择其他已启动规模，用 `-s` 选择已生成的目标选择率。测试前先在宿主机运行下文的生成命令。Guest 挂载路径为 `/home/femu/tests`，`PGDATA` 和 `PGDATABASE` 可单独指定路径和数据库。
 
 参数名按查询编号和用途命名，Q17 和 Q20 文件末尾保留使用同一组参数的原始相关子查询。单独运行模板时，可传入自己的参数值。
 
@@ -17,9 +17,7 @@ sh /home/femu/tests/tpch-warm.sh   -n 3 -o /home/femu/results/tpch-sf8
 sh /home/femu/tests/tpch-repeat.sh -n 5 -o /home/femu/results/tpch-sf8
 ```
 
-`-n` 指定测试次数，`-s` 指定目标选择率（默认 0.1，写法需与生成目录一致），`-b` 指定 `shared_buffers`（默认 2GB），`-w` 指定 `max_parallel_workers_per_gather`，`-m` 指定 `work_mem`，`-D` 指定 PGDATA，`-d` 指定数据库，`-o` 指定结果目录。默认结果目录名包含选择率，避免不同组覆盖。内存也接受 `2G`、`16M` 写法。`TPCH_WORKER_POOL` 同时设置 `max_parallel_workers` 和 `max_worker_processes`，`TPCH_ENABLE_HASHAGG=on|off` 显式设置 `enable_hashagg`。可在选项后指定少量查询编号，例如 `-s 0.1 -n 1 1`。正式全量省略查询编号。
-
-各执行模式默认沿用 `scripts/guest/start-postgre.sh` 写入实例的配置。每个 Gather 最多 8 个 worker，全局并行 worker 和后台 worker 上限各为 16，`work_mem=1GB`、`shared_buffers=2GB`、`enable_hashagg=off`。专项实验可用上述选项显式覆盖，实际参数保存到 `logs/<模式>/settings.txt`。
+`-n` 指定测试次数，`-s` 指定目标选择率（默认 0.1，写法需与生成目录一致），`-b` 指定 shared_buffers（默认 2GB），`-w` 指定 max_parallel_workers_per_gather（默认 4），`-m` 指定 work_mem（默认 16MB），`-D` 指定 PGDATA，`-d` 指定数据库，`-o` 指定结果目录。默认结果目录名包含选择率，避免不同组覆盖。内存也接受 `2G`、`16M` 写法。全局 parallel_workers/worker_processes 至少为 8 或指定 worker 数，以免限制每个 Gather 的配置。可在选项后指定少量查询编号，例如 `-s 0.1 -n 1 1`。正式全量省略查询编号。
 
 - 冷启动：每次测量前停止PG、sync、清Guest page cache、重启PG。
 - 热启动：每条SQL、每种模式先清两层缓存，原生HOST执行该SQL一次，再在同一连接连续测n次。预热不计时。
@@ -40,7 +38,7 @@ sh /home/femu/tests/tpch-repeat.sh -n 5 -o /home/femu/results/tpch-sf8
 
 `*_ms`和`total_ms`是原始psql时间。按项目既定口径分析查询主体时，减去对应`*_executor_end_ms`；原始值不可覆盖。热态和重复CSV还保存五种模式的`*_cache_residency`：`shared`、`file`、`known`分别为已观测shared_buffers驻留、文件缓存驻留、文件观测覆盖百分比。分母是当前数据库用户表及索引main fork总页数，**不是当前SQL工作集命中率**，两层缓存不可相加。数据直接读取扩展已有位图快照，文件观测允许短暂滞后，不额外扫描或同步等待。
 
-原始输出、文本计划和参数保存在`logs/cold|warm|repeat`。只有SQLerate启用auto_explain，不启用节点ANALYZE/TIMING；不用额外EXPLAIN重跑。结果与本组首次HOST输出比较，FDM只在每条SQL的五个模式完成后检查一次。执行期间只打印进度，不逐条分析性能、不调模型、不重复补测；全部结束后统一读取CSV生成report。新实验的 Python 封装按 `AGENTS.md` 调用这些入口。
+原始输出、文本计划和参数保存在`logs/cold|warm|repeat`。只有SQLerate启用auto_explain，不启用节点ANALYZE/TIMING；不用额外EXPLAIN重跑。结果与本组首次HOST输出比较，FDM只在每条SQL的五个模式完成后检查一次。执行期间只打印进度，不逐条分析性能、不调模型、不重复补测；全部结束后统一读取CSV生成report。脚本和汇总使用sh/awk，不使用Python。
 
 ### HOST 缓存对照
 
@@ -77,32 +75,3 @@ sh tests/guest/queries/selectivity/generate.sh 0.1
 第二个位置参数或环境变量 `SF` 可指定其他规模，例如 `sh tests/guest/queries/selectivity/generate.sh 0.1 4` 生成 `sf4_sel0.1/`。
 
 生成的 SQL 已填入具体参数，文件开头记录各过滤阶段的实际选择率。若目标目录已存在，脚本会退出，避免覆盖已有文件。
-
-## SQLerate 论文实验
-
-完整 TPC-H 仍由 `tpch-cold.sh`、`tpch-warm.sh`、`tpch-repeat.sh` 执行。论文使用
-`results/tpch-sf8-selectivity-sweep-20261107` 的四套冻结结果。以下脚本只提取数据，
-可在拥有结果目录写权限的主机或容器中运行。
-
-| 脚本 | 输入 |
-| --- | --- |
-| `M1-boundary-traffic.sh`、`M3-fixed-placement.sh` | 冻结的 `sel0.1` 目录，输出目录 |
-| `RQ1-tpch-performance.sh`、`RQ4-planner-quality.sh`、`RQ5-query-sensitivity.sh` | 冻结的 sweep 目录，输出目录 |
-| `RQ5-selectivity.sh` | `RQ1-tpch-performance.csv`，输出目录 |
-
-在已准备好的 SF8 Guest 内顺序执行以下专项，输出参数为 `/home/femu/results` 下的
-绝对目录。目录与主机的 `results` 挂载相通。
-
-- `M1-state-growth.sh` 测量原生 PG Hash 和 Sort 工作状态，并核验聚合分组数。
-- `RQ2-spill-budget.sh` 测量 Q3、Q18 在四个设备查询内存上限下的冷态表现。
-  论文图读取 `results/RQ2-spill-budget-optimized/RQ2-spill-budget.csv`，该目录来自优化后构建的一次完整 RQ2 专项。
-  `RQ2-spill-stages.sh` 从其日志导出计划和流水线统计。
-- `RQ3-two-level-cache.sh` 测量 Q6、Q4 的四种填充配置和 HOST 对照。
-  `RQ3-cross-query.sh` 测量 Q6→Q1 的跨查询复用，`RQ3-repeat-residency.sh` 从冻结的 `sel0.1` 目录导出缓存轨迹。
-  `RQ3-dma-overlap.sh` 单独采集 Q6 的设备诊断。用此次运行窗口的 FEMU
-  控制台 `CACHE_BLOCK`、`CACHE_GRAPH` 日志调用 `RQ3-dma-events.sh` 导出事件。
-- `RQ5-cu-quota.sh` 在 FEMU 容器中运行，依次设置八个专用 CU 的配额，
-  并调用 Guest 侧 `RQ5-cu-sample.sh`。退出时恢复原配额。
-
-`paper/figures/plot_experiments.py` 从对应的 M/RQ CSV 生成可编辑 PDF 和 SVG。
-依赖 Python、Matplotlib 和 NumPy。各脚本在单独的实验输出目录中生成结果。

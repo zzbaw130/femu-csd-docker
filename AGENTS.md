@@ -8,18 +8,15 @@
 - 不要修改无关模块。
 
 ## 测试
-- 正式实验和最终结论使用 SF8（`tpch_s8`），Guest 内存为 30 GiB。
-- **PostgreSQL 默认资源。** `scripts/guest/start-postgre.sh` 初始化 TPC-H 实例时设置 `shared_buffers=2GB`、`work_mem=1GB`、`max_parallel_workers_per_gather=8`、`max_parallel_workers=16`、`max_worker_processes=16`、`enable_hashagg=off`。常规测试重启 PG 时沿用实例默认值，只有专项实验显式覆盖，并在结果中记录生效参数。同批各 exe_path 使用相同配置。
+- 正式实验和最终结论使用 SF8（`tpch_s8`），Guest 内存为 16 GiB。
 
 - 对已更改的组件运行针对性测试。
 - 除非特别要求，否则不要运行完整的TPC-H基准测试。
-- **Python 测试脚本。** 今后的测试统一封装为 Python 脚本。每个脚本提供 `test()` 和 `plot()`，由 `main()` 要求调用者显式选择 `test` 或 `plot`。`test()` 执行正式测试并输出最终 CSV，CSV 只保留实验规定的字段。计算最终指标所需的中间量在 `test()` 内记录，并说明各量的用途。`plot()` 读取该 CSV 绘制结果图，绘图时不重新执行测试。
-- **CSV 字段说明。** 输出 CSV 的测试脚本须在文件顶部的注释或模块文档字符串中，按表头顺序说明每个字段的含义、单位和必要的统计口径。脚本输出多种 CSV 时，说明各自的字段，并在表头或统计口径变化时同步更新。
 - **冷启动模式（cold）。** 每次正式执行SQL前重启PG并清除Guest page cache，使数据库缓存和主机文件缓存均为空，从NVM开始读取；查询内部正常产生和复用缓存。默认每条SQL、每种exe_path独立测一次，报告该次延迟。
 - **热启动模式（warm）。** 每条SQL、每种exe_path开始测试前先重启PG并清除Guest page cache，再以`host-only`完整执行一次待测正式SQL脚本作预热；随后立即用目标模式正式执行同一SQL一次。预热不计入正式统计。若显式指定多次测量，测量之间不清缓存、不再次预热、不插入其他业务操作。只预热目标SQL，不预热全部表；实际驻留可能不足100%。此规则取代旧的“每轮重新预热”及“多条SQL统一预热”流程。
 - **重复启动模式（repeat）。** 每条SQL、每种exe_path从重启PG并清Guest page cache的冷状态开始，直接用该模式连续执行同一SQL三次；没有`host-only`预热，三次之间不清缓存、不切模式、不执行其他业务操作。相邻两次之间由测试脚本固定停顿1秒，让异步缓存观测完成；不在规划器内同步等待，不用额外SQL触发刷新。三次有两段停顿，停顿不计入单次查询及三次查询耗时之和，另行记录。记录每一次延迟、实际路径及三次总延迟，不能仅报告中位数。用于观察各模式自身建立和利用缓存的能力。
 - **组间隔离与公平性。** 三种模式切换SQL或exe_path时均重新准备缓存，禁止沿用前一组的缓存；同一warm/repeat组优先在同一连接内连续运行，不在相邻执行之间插入采样SQL或调参。warm不额外等待，repeat只使用上述固定1秒间隔，各exe_path规则一致。允许系统自身的缓存填充和异步驻留更新正常推进。配置和资源保持一致，预热/初始化不混入正式延迟；记录规划、执行、总时间及SQLerate实际路径。
-- **全量测试统一入口。** 五种 exe_path 的全量性能测试由 Python 脚本的 `test()` 直接调用 `tests/guest/tpch-cold.sh`、`tpch-warm.sh`、`tpch-repeat.sh`，公共执行复用现有 `tpch-test.sh`，禁止为每轮实验临时编写另一套全量驱动。`-b/-w/-m` 分别显式覆盖 shared_buffers、每 Gather 并行 worker、work_mem。`TPCH_WORKER_POOL` 和 `TPCH_ENABLE_HASHAGG` 可显式覆盖全局 worker 上限和 HashAggregate。`-n` 配置次数，cold/warm 默认 1、repeat 默认 3。全量测试保留 host-only、filter-only、csd-without-hpcp、csd-with-hpcp、SQLerate 五种 exe_path，只读正式 22 条 SQL，不传查询编号；针对性检查可在同一入口后传编号。
+- **全量测试统一入口。** 必须直接运行`tests/guest/tpch-cold.sh`、`tpch-warm.sh`、`tpch-repeat.sh`，公共执行复用现有`tpch-test.sh`；禁止为每轮实验临时编写另一套全量驱动，禁止使用Python测试/汇总脚本。参数`-b/-w/-m`分别配置shared_buffers、每Gather并行worker、work_mem，默认2GB/4/16MB；`-n`配置次数，cold/warm默认1、repeat默认3。全量测试保留host-only、filter-only、csd-without-hpcp、csd-with-hpcp、SQLerate五种exe_path，只读正式22条SQL，不传查询编号；针对性检查可在同一入口后传编号。
 - **先批量执行、后统一分析。** 全量期间冻结代码、模型和资源，只记录原始结果、正确性及进度，不逐条执行后分析、诊断、调参或补测。三种测试全部结束后，统一从CSV生成report；发现错误或明显回退也先如实记录，不隐去失败/慢样本，后续修复另开明确的针对性验证。
 - **六份原始CSV。** 保存`cold.csv/warm.csv/repeat.csv`与各自`*-sqlerate.csv`。每份全量CSV恰好22×n行，用`Q1-1`表示Q1的第1次；一行并列五种exe_path耗时，不在执行脚本中提前取中位数。SQLerate逐次保留规划、执行、原始总时间及实际路径。warm/repeat保存各模式执行前的缓存驻留快照，标明shared_buffers与文件缓存比例及观测覆盖；不得将数据库整体驻留误称为当前SQL命中率。保留ExecutorEnd维护时间和原始总时间，统一分析时再按既定口径扣除；Q15总时间保留CREATE/SELECT/DROP。冷/热默认报告每条SQL的一次测量，显式多轮时取逐查询中位数，repeat展示每次及累计，不跨不同SQL求中位数。
 - **实验目标。** 冷启动以完整CSD系列快于host-only/filter-only、SQLerate选择完整CSD为目标；热启动允许HOST、扫描下推混合或完整CSD胜出，SQLerate应选择最低延迟的可执行路径。repeat比较三次累计延迟：HOST通常由慢变快，固定卸载路径可能近似稳定；SQLerate应随缓存状态变化选择路径，争取最低累计延迟。固定路径的HOST部分也可能获得缓存收益，不能将所有变化强行归为异常。路径选择是否正确与包含规划/填充的总延迟是否最低分别报告，不为了符合理论预期修改查询、资源或按查询编号特化。
@@ -32,8 +29,6 @@
 
 - 简明地总结变更内容，不保留已经废弃的测试结果和方案。
 - 只报告相关测试结果和问题。
-- 测试结果默认保存在项目根目录的 `results/<测试名称>/`。M1 的三个脚本将 CSV、SVG 和 PDF 直接保存在 `results/m1/`。使用 `Path(__file__).stem` 取得测试名称并构造默认文件名。从脚本位置定位项目根目录，`test()` 和 `plot()` 默认共用同一结果目录。Guest 使用映射到项目 `results/` 的目录。
-- 所有测试脚本的 `plot()` 同时导出 SVG 和 PDF 文件。
 - **延迟逐查询展示。** cold/warm默认展示每条SQL、每种exe_path的一次正式测量，显式多轮时逐查询取中位数；禁止用22条不同SQL之间的中位数概括性能。“逐查询中位数之和”只能作为明确标注的辅助汇总，不能替代逐查询结果。repeat仍报告每次及累计时间。
 
 ## 实现约束

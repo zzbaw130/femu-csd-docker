@@ -38,7 +38,7 @@ cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,f
 耗时几分钟。
 
 前置条件：x86_64 + **可用的 `/dev/kvm`**、docker compose v2、首次构建/首次启动需要联网；
-内存按第 5 节预留，包括 30 GiB Guest RAM、namespace、设备 spill、FDM、workmem 和元数据。
+内存按第 5 节预留（默认约 20 GiB namespace、8 GiB 设备 spill 和 16 GiB Guest RAM，另需 FDM、workmem 和元数据）。
 
 ## 2. 快速验证
 
@@ -56,7 +56,7 @@ cloud-init，并顺带安装 `build-essential,zlib1g-dev,libreadline-dev,bison,f
 ./scripts/ssh-guest.sh
 ```
 
-TPC-H 三种测试模式遵循 `AGENTS.md`，正式实验使用 SF8 和 30 GiB Guest 内存。三个入口用 `-s` 指定目标选择率，默认 0.1，执行前需生成对应的 SQL 目录。
+TPC-H 三种测试模式遵循 `AGENTS.md`，正式实验使用 SF8 和 16 GiB Guest 内存。三个入口用 `-s` 指定目标选择率，默认 0.1，执行前需生成对应的 SQL 目录。
 重建 FEMU 后，先初始化 Guest，再用 `./scripts/sh-guest.sh scripts/guest/start-postgre.sh 8` 启动 SF8，
 并用 `bash tests/pg-sina-csd-test.sh prepare` 重建 CSD 映射。随后在 Guest 中运行完整实验：
 
@@ -67,31 +67,13 @@ sh /home/femu/tests/tpch-warm.sh -n 3 -o /home/femu/results/tpch-sf8
 sh /home/femu/tests/tpch-repeat.sh -n 5 -o /home/femu/results/tpch-sf8
 ```
 
-三个入口默认次数分别为 1、1、3，可用 `-n` 调整。测试沿用 PG 初始化配置（2 GB shared_buffers、1 GB work_mem、每 Gather 最多 8 个 worker、全局并行和后台 worker 上限各 16、HashAggregate 关闭）。专项实验可用 `-b/-w/-m` 等选项覆盖，选项后可传查询编号。warm 先由 HOST 预热一次，repeat 从冷态开始且相邻执行间隔 1 秒。组内使用同一连接，不插入采样 SQL。详见[测试说明](tests/guest/README.md)。
+三个入口默认次数分别为3、3、5，可用`-n`调整。`-b/-w/-m`配置shared_buffers、每Gather并行worker、work_mem，默认2GB/4/16MB。选项后可传查询编号做针对性检查。warm先HOST预热一次，repeat从冷态开始且相邻执行间隔1秒；组内同一连接，不插入采样SQL。详见[测试说明](tests/guest/README.md)。
 
 五个 `exe_path` 保持现有名称：`host-only`、`filter-only`、`csd-without-hpcp`、`csd-with-hpcp`、`SQLerate`。其中后两者在本实验同时开启 HPCP/DCP，前三者关闭两种填充；`csd-without-hpcp`/`csd-with-hpcp` 对应实验中的“无缓存填充/有缓存填充”完整 CSD 对照。各模式的配置和资源不另行特化。
 
 三个入口共保存六份原始CSV，每份22×n行，编号Q1-1；主表并列五种模式，SQLerate详情另存规划/执行/总时间和路径，warm/repeat附缓存驻留。原始日志与配置在logs下，只有SQLerate记录auto_explain文本计划，不开启节点ANALYZE/TIMING。三种全量全部完成后才统一从CSV分析并输出report，不逐SQL分析或中途改模型。Q15总时间含CREATE/SELECT/DROP，ExecutorEnd维护时间单列，不覆盖原始时间。
 
 想换数据规模：`./scripts/sh-guest.sh guest/start-postgre.sh -f 1`（`-f` 强制重新解压，SF 见 `data/`）。
-
-M1 的三个 Python 脚本位于 `test/guest/m1/`。从项目根目录同步到运行中的 Guest，再运行相应脚本的 `test`。宿主机可直接运行 `plot`。三个脚本的 CSV、SVG 和 PDF 都直接保存在 `results/m1/`，文件名以脚本名称为前缀。
-
-```sh
-tar -cf - test/guest/m1 | docker compose exec -T femu-csd ./run-guest-ssh.sh 'tar -xf - -C /home/femu'
-docker compose exec -T femu-csd ./run-guest-ssh.sh 'python3 /home/femu/test/guest/m1/m1c_spill_cost.py test'
-python3 test/guest/m1/m1c_spill_cost.py plot
-```
-
-`m1c_spill_cost.py test --repeat-upper` 对 Q21 的 0.9× 到 0.5× 档各做三次独立冷启动，按轮保存带编号的 CSV，再用各档的中位延迟样本更新主 CSV。该命令也输出 0.4× 和 0.3× 档的哈希批次和临时文件诊断。
-
-预设批数对照使用独立的 Guest 二进制。`experiment.hash_batch_preset` 接受 `plan_node_id:batches:buckets`，只作用于指定的串行 Hash 节点。`test --preset-batches` 按档查找 Q21 的构建节点，核对其执行中没有扩批，并将数据写到 `m1c_spill_cost_preset.csv`。`plot --preset-batches` 读取这份 CSV。
-
-```sh
-make -C /home/femu/opt/postgres/build/src/backend -j2 postgres
-install -m 755 /home/femu/opt/postgres/build/src/backend/postgres /home/femu/opt/postgres/release/bin/postgres-hash-preset
-python3 /home/femu/test/guest/m1/m1c_spill_cost.py test --preset-batches
-```
 
 ## 3. 目录结构
 
@@ -162,9 +144,8 @@ tests/    ← 9p: 宿主机 tests/guest    （tpch-test.sh + queries/）
 首次格式化会清除原有设备数据。可显式传入`--partitioned`恢复历史80%数据/20%spill分区布局，
 该模式需要Guest的`parted`，现有分区标签匹配时复用。两种布局的设备spill均使用独立隐藏空间。
 宿主物理绑定在 `run-csd.sh` 启动 QEMU 时执行。当前 Compose 使用 8 CU：
-`FEMU_HOST_CPUS=30-39` 将 Guest vCPU 和其他 QEMU 主机线程绑定到 node3。
-`FEMU_HOST_NODE=3` 将 30 GiB Guest RAM 分配在 node3，该节点总容量约为 31.5 GiB。
-`FEMU_DEVICE_CPUS=20-28` 是 15 个设备线程共享的 CPU 集合，包含 1 个 FTL、8 个受配额限制的 CU、2 个 NVMe poller、2 个 NVM copy 和 2 个缓存 DMA 线程。
+`FEMU_HOST_CPUS=30-39`、`FEMU_HOST_NODE=3` 放置 Guest vCPU、其他 QEMU 线程及 16GiB Guest RAM；
+`FEMU_DEVICE_CPUS=20-28` 放置13个设备线程，8条CU分别受CPU配额限制。
 `FEMU_DEVICE_NODE=1,2`允许设备内存在这两个节点分配：32GiB NVM及8GiB隐藏spill无法容纳于单个约31.4GiB的node2。
 设备线程在入口设置亲和性，不需要启动后查找 PID/TID；容器通过 SYS_NICE 允许设置 NUMA 内存策略。
 Guest 仍只看到一个虚拟 NUMA 节点。更换宿主时应核对物理核、SMT 拓扑和节点容量，再调整上述四项。
@@ -199,7 +180,7 @@ cc application.c -lsnia -o application
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `FEMU_SMP` | 8 | guest vCPU 数 |
-| `FEMU_MEM` | 30G | guest 内存 |
+| `FEMU_MEM` | 16G | guest 内存 |
 | `CSD_NVM_SIZE` | 32768 | **暴露给 guest 的SSD容量**（MiB）。整盘用于SF8表、索引和PG临时文件 |
 | `CSD_SPILL_SIZE_MB` | 8192 | 设备隐藏的NVM临时区（MiB），不占FDM或计算workmem；与namespace合计必须满足NAND的GC保留要求 |
 | `CSD_FDM_SIZE` | 128 | 从设备内存尾部划出的 CSF 输入输出缓冲 FDM（MiB） |
