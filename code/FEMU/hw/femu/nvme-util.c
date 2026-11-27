@@ -593,6 +593,8 @@ void nvme_drain_sq(FemuCtrl *n, NvmeSQueue *sq)
                 }
                 if (req->sq != sq) {
                     kept[nkept++] = req;
+                } else {
+                    nvme_link_clear_pending(n, req);
                 }
             }
             /* put the survivors back in the order they were taken */
@@ -693,6 +695,7 @@ void nvme_retire_ns_requests(FemuCtrl *n, NvmeNamespace *ns)
 
                 assert(rc == 1);
                 if (req->ns == ns) {
+                    nvme_link_clear_pending(n, req);
                     bool completed = req->status != NVME_SUCCESS ||
                         ((!n->use_ftl_thread || r == 1) &&
                          !n->pcie_enabled && !n->fw_enabled &&

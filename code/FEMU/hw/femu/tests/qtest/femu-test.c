@@ -18219,9 +18219,9 @@ static const char femu_csd_slow_src[] =
     " unsigned *v=a->a[0]; const long long step=5ULL<<60;\n"
     " if(a->p1==0) {\n"
     "  if(v[0]!=v[1]) return -1;\n"
-    "  if(v[0]==3) return step|4; ++v[0]; return step|2; }\n"
+    "  if(v[0]==96) return step|4; ++v[0]; return step|2; }\n"
     " if(a->p1==1) {\n"
-    "  if(a->input==2) return v[1]==3?step|4:-2;\n"
+    "  if(a->input==2) return v[1]==96?step|4:-2;\n"
     "  if(a->input!=1 || v[0]!=v[1]+1) return -3;\n"
     "  if(!__atomic_load_n(v+4,__ATOMIC_ACQUIRE)) {\n"
     "   a->event(a->context,(unsigned long)(v+4),0);\n"
@@ -18234,7 +18234,11 @@ static const char femu_csd_slow_src[] =
     "  if(!__atomic_load_n(v+3,__ATOMIC_ACQUIRE)) return -4;\n"
     "  nanosleep(&delay,0); __atomic_store_n(v+4,1,__ATOMIC_RELEASE);\n"
     "  a->event(a->context,(unsigned long)(v+4),1); return 0; }\n"
-    " if(v[1]!=3) return -5; v[5]=1; return 0; }\n"
+    " if(a->p1==4) {\n"
+    "  if(a->input==2) return v[6]==96?step|4:-6;\n"
+    "  if(a->input!=1 || v[0]!=v[6]+1 || v[6]!=v[1]) return -7;\n"
+    "  ++v[6]; return 7ULL<<60; }\n"
+    " if(v[1]!=96) return -5; v[5]=1; return 0; }\n"
     "long long graph_spill(struct args *a) {\n"
     " unsigned long long *v=a->a[0]; char *io=a->a[a->numr-1];\n"
     " if(!a->p1) { if(a->p2) { v[0]=a->p2; return a->p2; }\n"
@@ -18244,15 +18248,17 @@ static const char femu_csd_slow_src[] =
     " if(v[1]==1) { for(long long i=0;i<a->l[a->numr-1];i++)\n"
     "   if(io[i]!=(char)(i*13+7)) return -2; v[1]=2; return (3ULL<<60)|v[0]; }\n"
     " v[1]=0; return 0x123456789abcdLL; }\n"
+    "static void graph_read_pool(void *base) {\n"
+    " unsigned *pool=base+4*4096; pool[0]=4096; pool[1]=4; pool[2]=3; }\n"
     "long long graph_read(struct args *a) {\n"
-    " struct read { unsigned ns,blocks,index,reserved; unsigned long long lba,offset; };\n"
-    " static unsigned step; if(!a->p2) step=0; else {\n"
-    "  unsigned char *p=a->a[0]; for(unsigned i=0;i<4096;i++) {\n"
+    " struct read { unsigned ns,blocks,index,pool; unsigned long long lba,offset; };\n"
+    " static unsigned step; if(!a->p2) { step=0; graph_read_pool(a->a[0]); } else {\n"
+    "  unsigned char *p=a->a[0]+(step-1)*4096; for(unsigned i=0;i<4096;i++) {\n"
     "   unsigned char want=(unsigned char)(i*13+7); if((step-1)%2) want=~want;\n"
     "   if(p[i]!=want) return -9; }\n"
     "  struct timespec t={0,200000}; nanosleep(&t,0); }\n"
     " if(step==3) return 0x55;\n"
-    " *(struct read *)a->a[1]=(struct read){1,8,0,0,(step%2)*8,0}; step++;\n"
+    " *(struct read *)a->a[1]=(struct read){1,8,0,4*4096,(step%2)*8,step*4096}; step++;\n"
     " return (4ULL<<60)|1; }\n"
     "long long graph_read_batch(struct args *a) {\n"
     " struct read { unsigned ns,blocks,index,reserved; unsigned long long lba,offset; };\n"
@@ -18264,13 +18270,14 @@ static const char femu_csd_slow_src[] =
     "  if(p[i*4096+j]!=(a->p1==1?16:a->p1==2?1:i+1)) return -2;\n"
     " return 0xbeef; }\n"
     "long long graph_read_pair(struct args *a) {\n"
-    " struct read { unsigned ns,blocks,index,reserved; unsigned long long lba,offset; };\n"
+    " struct read { unsigned ns,blocks,index,pool; unsigned long long lba,offset; };\n"
     " if(!a->p2) { struct read *r=a->a[1];\n"
-    "  r[0]=(struct read){1,8,0,0,0,0}; r[1]=(struct read){1,8,1,0,8,0};\n"
+    "  graph_read_pool(a->a[0]); graph_read_pool(a->a[1]);\n"
+    "  r[0]=(struct read){1,8,0,4*4096,0,3*4096}; r[1]=(struct read){1,8,1,4*4096,8,0};\n"
     "  return (4ULL<<60)|2; }\n"
     " if(a->p2!=2) return -1; for(unsigned k=0;k<2;k++) for(unsigned i=0;i<4096;i++) {\n"
     "  unsigned char want=(unsigned char)(i*13+7); if(k) want=~want;\n"
-    "  if(((unsigned char *)a->a[k])[i]!=want) return -2; } return 0x77; }\n";
+    "  if(((unsigned char *)a->a[k])[i+(k?0:3*4096)]!=want) return -2; } return 0x77; }\n";
 
 /* build the program with the host compiler; false when there is none */
 static bool femu_csd_build_slow(void)
@@ -18613,23 +18620,25 @@ static void femu_test_csd_graph_stream(void *obj, void *data, QGuestAllocator *a
     femu_graph_afdm(&c, buf, id, control, true);
     struct {
         struct femu_graph_header h;
-        struct femu_graph_node n[3];
+        struct femu_graph_node n[4];
         uint32_t mr[8];
     } graph = {
-        .h = {.count = cpu_to_le32(3), .flags = cpu_to_le32(FEMU_CSD_GRAPH_STREAM | FEMU_CSD_GRAPH_SERIAL),
+        .h = {.count = cpu_to_le32(4), .flags = cpu_to_le32(FEMU_CSD_GRAPH_STREAM | FEMU_CSD_GRAPH_SERIAL),
               .session = cpu_to_le64(session), .cookie = cpu_to_le64(1), .bytes = cpu_to_le32(sizeof(graph))}
     };
     graph.mr[2] = cpu_to_le32(id);
-    for (unsigned i = 0; i < 3; ++i) {
+    for (unsigned i = 0; i < 4; ++i) {
         graph.n[i] = (struct femu_graph_node) {
             .operation = cpu_to_le32(FEMU_GRAPH_EXEC), .program = cpu_to_le32(6),
             .payload = cpu_to_le32(offsetof(typeof(graph), mr)), .count = cpu_to_le32(1),
         };
     }
     graph.n[1].afdm_offset = cpu_to_le64(1);
-    graph.n[1].cparam1 = cpu_to_le64(1);
-    graph.n[2].dependencies = cpu_to_le64(2);
-    graph.n[2].cparam1 = cpu_to_le64(3);
+    graph.n[1].cparam1 = cpu_to_le64(4);
+    graph.n[2].afdm_offset = cpu_to_le64(2);
+    graph.n[2].cparam1 = cpu_to_le64(1);
+    graph.n[3].dependencies = cpu_to_le64(4);
+    graph.n[3].cparam1 = cpu_to_le64(3);
     struct {
         struct femu_graph_header h;
         struct femu_graph_node n;
@@ -18648,12 +18657,13 @@ static void femu_test_csd_graph_stream(void *obj, void *data, QGuestAllocator *a
         g_assert_cmpint(FEMU_SC(femu_complete(&c, &c.io, NULL, NULL)), ==, NVME_SUCCESS);
     }
     femu_graph_afdm(&c, buf, id, control, false);
-    g_assert_cmpuint(control[0], ==, 3);
-    g_assert_cmpuint(control[1], ==, 3);
-    g_assert_cmpuint(control[2], ==, 6);
+    g_assert_cmpuint(control[0], ==, 96);
+    g_assert_cmpuint(control[1], ==, 96);
+    g_assert_cmpuint(control[2], ==, 96 * 97 / 2);
     g_assert_cmpuint(control[3], ==, 1);
     g_assert_cmpuint(control[4], ==, 1);
     g_assert_cmpuint(control[5], ==, 1);
+    g_assert_cmpuint(control[6], ==, 96);
     femu_graph_session_cmd(&c, FEMU_GRAPH_CLOSE, session, 0);
     femu_queue_free(&c, &c.io);
     femu_disable(&c);
@@ -18768,6 +18778,101 @@ static void femu_test_csd_exec_graph(void *obj,void *data,QGuestAllocator *alloc
     femu_queue_free(&c,&c.io); femu_disable(&c); femu_csd_remove_slow();
 }
 
+/* Keep a multi-page foreground transfer in flight while a LOAD offers an
+ * optional refill. The graph may return its buffer before the foreground CQE,
+ * and the denied refill must leave the entire receive slot untouched. */
+static void femu_check_cache_priority(FemuCtrlState *c, QGuestAllocator *alloc,
+                                     uint64_t graph_buf, void *graph,
+                                     unsigned graph_bytes, uint64_t slot,
+                                     uint64_t dest, uint8_t first_byte)
+{
+    enum { bytes = 128 * 1024, page = 4096 };
+    QTestState *qts = c->pdev->bus->qts;
+    FemuQueue foreground;
+    uint32_t afdm = femu_graph_alloc(c, bytes);
+    uint64_t buf = guest_alloc(alloc, bytes);
+    uint64_t prps = guest_alloc(alloc, page);
+    uint64_t addresses[bytes / page - 1];
+    uint8_t actual[page], sentinel[page];
+
+    femu_burst_queue(c, &foreground, 5);
+    for (unsigned i = 0; i < ARRAY_SIZE(addresses); i++) {
+        addresses[i] = cpu_to_le64(buf + (i + 1) * page);
+    }
+    qtest_memwrite(qts, prps, addresses, sizeof(addresses));
+    memset(sentinel, 0x5a, sizeof(sentinel));
+    for (unsigned i = 0; i < 2; i++) {
+        NvmeCmd cmd = {
+            .opcode = i ? FEMU_CSD_READ_AFDM : NVME_CMD_READ,
+            .nsid = cpu_to_le32(1),
+            .cdw12 = cpu_to_le32(i ? bytes : bytes / 512 - 1),
+            .cdw14 = cpu_to_le32(i ? afdm : 0),
+            .dptr = { .prp1 = cpu_to_le64(buf), .prp2 = cpu_to_le64(prps) },
+        };
+
+        qtest_memwrite(qts, dest, sentinel, sizeof(sentinel));
+        qtest_writeb(qts, buf, sentinel[0]);
+        femu_submit(c, &foreground, &cmd);
+        int64_t deadline = g_get_monotonic_time() + FEMU_POLL_LIMIT_MS * 1000;
+        while (qtest_readb(qts, buf) != (i ? 0 : first_byte)) {
+            g_assert_cmpint(g_get_monotonic_time(), <, deadline);
+        }
+
+        g_assert_cmpint(femu_graph_run(c, graph_buf, graph, graph_bytes, NULL),
+                        ==, NVME_SUCCESS);
+        g_assert_false(femu_csd_cq_ready(c, &foreground));
+        g_assert_cmpint(FEMU_SC(femu_complete(c, &foreground, NULL, NULL)),
+                        ==, NVME_SUCCESS);
+        g_assert_cmpuint(qtest_readq(qts, slot), ==, 0);
+        qtest_memread(qts, dest, actual, sizeof(actual));
+        g_assert_cmpmem(actual, sizeof(actual), sentinel, sizeof(sentinel));
+    }
+
+    NvmeCmd release = {
+        .opcode = FEMU_CSD_DEALLOC, .nsid = cpu_to_le32(1),
+        .cdw10 = cpu_to_le32(afdm),
+    };
+    femu_submit(c, &c->io, &release);
+    g_assert_cmpint(FEMU_SC(femu_complete(c, &c->io, NULL, NULL)), ==,
+                    NVME_SUCCESS);
+    g_assert_cmpint(femu_delete_sq(c, foreground.qid), ==, NVME_SUCCESS);
+    femu_queue_free(c, &foreground);
+    guest_free(alloc, prps);
+    guest_free(alloc, buf);
+}
+
+static unsigned femu_expect_internal_cache(QTestState *qts, uint64_t descriptors,
+                                           const uint64_t *dest,
+                                           const uint8_t expected[2][4096],
+                                           uint64_t cookie, unsigned count)
+{
+    int64_t deadline = g_get_monotonic_time() + FEMU_POLL_LIMIT_MS * 1000;
+    unsigned sources = 0, returned = 0;
+    uint8_t actual[4096];
+
+    do {
+        for (unsigned i = 0; i < FEMU_CACHE_RX_SLOTS; i++) {
+            uint64_t address = descriptors + i * sizeof(struct femu_cache_slot);
+            struct femu_cache_slot slot;
+
+            qtest_memread(qts, address, &slot, sizeof(slot));
+            if (!le64_to_cpu(slot.ready)) {
+                continue;
+            }
+            g_assert_cmpuint(le64_to_cpu(slot.cookie), ==, cookie);
+            unsigned source = le64_to_cpu(slot.lba) == 8;
+            qtest_memread(qts, dest[i], actual, sizeof(actual));
+            g_assert_cmpmem(actual, sizeof(actual), expected[source], sizeof(actual));
+            sources |= 1U << source;
+            returned++;
+            qtest_writeq(qts, address, 0);
+        }
+        g_assert_cmpint(g_get_monotonic_time(), <, deadline);
+    } while (returned < count);
+    g_assert_cmpuint(returned, ==, count);
+    return sources;
+}
+
 /* Refill uses the poller Read path and keeps FDM alive after deallocation.
  * Read two disjoint ranges; the graph must retain the input until both finish. */
 static void femu_test_csd_cache_dma(void *obj, void *data, QGuestAllocator *alloc)
@@ -18811,6 +18916,14 @@ static void femu_test_csd_cache_dma(void *obj, void *data, QGuestAllocator *allo
         .n={.operation=cpu_to_le32(FEMU_GRAPH_LOAD),.afdm=cpu_to_le32(id),
             .count=cpu_to_le32(1),.payload=cpu_to_le32(offsetof(typeof(graph),range))},
         .range={.nsid=cpu_to_le32(1),.blocks=cpu_to_le32(8)}};
+    if (data) {
+        graph.h.cookie = cpu_to_le64(200);
+        femu_check_cache_priority(&c, alloc, buf, &graph, sizeof(graph),
+                                   descriptors + FEMU_CACHE_LARGE_SLOTS *
+                                       sizeof(struct femu_cache_slot),
+                                   dest[FEMU_CACHE_LARGE_SLOTS],
+                                   expected[0][0]);
+    }
     /* Full FDM still permits direct DMA by holding the original input only
      * until transmission ends, without allocating hidden extra FDM. */
     uint32_t padding=femu_graph_alloc(&c,16*1024*1024-4096);
@@ -18853,9 +18966,10 @@ static void femu_test_csd_cache_dma(void *obj, void *data, QGuestAllocator *allo
     g_assert_cmpuint(qtest_readq(qts,first_small+offsetof(struct femu_cache_slot,cookie)),==,10);
     for(unsigned i=0;i<FEMU_CACHE_RX_SLOTS;i++)
         qtest_writeq(qts,descriptors+i*sizeof(struct femu_cache_slot),0);
-    /* A reentrant CSF reads three times into the same AFDM. Every DMA must
-     * see the original bytes, even while the next internal read is pending. */
-    uint32_t io=femu_graph_alloc(&c,4096);
+    /* A reentrant CSF reads into three protected slots in the same AFDM.
+     * A deferred copy keeps its source pinned across graph completion. */
+    uint32_t read_pool=femu_graph_alloc(&c,5*4096);
+    uint32_t io=femu_graph_alloc(&c,5*4096);
     g_assert_cmpint(femu_csd_load_at(&c,buf,6,"slow.so","graph_read",false),==,NVME_SUCCESS);
     g_assert_cmpint(femu_csd_activate(&c,6),==,NVME_SUCCESS);
     struct {struct femu_graph_header h; struct femu_graph_node n; uint32_t mr[16];} internal={
@@ -18864,23 +18978,12 @@ static void femu_test_csd_cache_dma(void *obj, void *data, QGuestAllocator *allo
             .session=cpu_to_le64(session),.cookie=cpu_to_le64(14)},
         .n={.operation=cpu_to_le32(FEMU_GRAPH_EXEC),.program=cpu_to_le32(6),
             .count=cpu_to_le32(2),.payload=cpu_to_le32(offsetof(typeof(internal),mr))}};
-    internal.mr[2]=cpu_to_le32(id); internal.mr[10]=cpu_to_le32(io);
+    internal.mr[2]=cpu_to_le32(read_pool); internal.mr[10]=cpu_to_le32(io);
     uint64_t result=0;
     g_assert_cmpint(femu_graph_run(&c,buf,&internal,sizeof(internal),&result),==,NVME_SUCCESS);
     g_assert_cmpuint(result,==,0x55);
-    unsigned returned=0;
-    for(unsigned i=0;i<FEMU_CACHE_RX_SLOTS;i++) {
-        struct femu_cache_slot slot;
-        qtest_memread(qts,descriptors+i*sizeof(slot),&slot,sizeof(slot));
-        if(!le64_to_cpu(slot.ready)) continue;
-        g_assert_cmpuint(le64_to_cpu(slot.cookie),==,14);
-        unsigned source=le64_to_cpu(slot.lba)==8;
-        qtest_memread(qts,dest[i],actual,sizeof(actual));
-        g_assert_cmpmem(actual,sizeof(actual),expected[source],sizeof(actual));
-        returned++;
-        qtest_writeq(qts,descriptors+i*sizeof(slot),0);
-    }
-    g_assert_cmpuint(returned,==,3);
+    g_assert_cmpuint(femu_expect_internal_cache(qts, descriptors, dest,
+                                                expected, 14, 3), ==, 3);
     /* Two disjoint MRs complete together; one also held the descriptors.
      * HPCP must retain both ranges' source AFDM and LBA, not only the last. */
     g_assert_cmpint(femu_csd_load_at(&c,buf,7,"slow.so","graph_read_pair",false),==,NVME_SUCCESS);
@@ -18888,19 +18991,8 @@ static void femu_test_csd_cache_dma(void *obj, void *data, QGuestAllocator *allo
     internal.n.program=cpu_to_le32(7); internal.h.cookie=cpu_to_le64(15);
     g_assert_cmpint(femu_graph_run(&c,buf,&internal,sizeof(internal),&result),==,NVME_SUCCESS);
     g_assert_cmpuint(result,==,0x77);
-    unsigned sources=0; returned=0;
-    for(unsigned i=0;i<FEMU_CACHE_RX_SLOTS;i++) {
-        struct femu_cache_slot slot;
-        qtest_memread(qts,descriptors+i*sizeof(slot),&slot,sizeof(slot));
-        if(!le64_to_cpu(slot.ready)) continue;
-        g_assert_cmpuint(le64_to_cpu(slot.cookie),==,15);
-        unsigned source=le64_to_cpu(slot.lba)==8;
-        qtest_memread(qts,dest[i],actual,sizeof(actual));
-        g_assert_cmpmem(actual,sizeof(actual),expected[source],sizeof(actual));
-        sources|=1U<<source; returned++;
-        qtest_writeq(qts,descriptors+i*sizeof(slot),0);
-    }
-    g_assert_cmpuint(returned,==,2); g_assert_cmpuint(sources,==,3);
+    g_assert_cmpuint(femu_expect_internal_cache(qts, descriptors, dest,
+                                                expected, 15, 2), ==, 3);
     /* A published LOAD can name a dependent CSF that cancellation never
      * starts. That consumer must not pin the graph and its AFDM forever. */
     uint32_t control=femu_graph_alloc(&c,4096);
@@ -18942,6 +19034,9 @@ static void femu_test_csd_cache_dma(void *obj, void *data, QGuestAllocator *allo
     femu_submit(&c,&c.io,&cmd);
     g_assert_cmpint(FEMU_SC(femu_complete(&c,&c.io,NULL,NULL)),==,NVME_SUCCESS);
     cmd=(NvmeCmd){.opcode=FEMU_CSD_DEALLOC,.nsid=cpu_to_le32(1),.cdw10=cpu_to_le32(io)};
+    femu_submit(&c,&c.io,&cmd);
+    g_assert_cmpint(FEMU_SC(femu_complete(&c,&c.io,NULL,NULL)),==,NVME_SUCCESS);
+    cmd.cdw10=cpu_to_le32(read_pool);
     femu_submit(&c,&c.io,&cmd);
     g_assert_cmpint(FEMU_SC(femu_complete(&c,&c.io,NULL,NULL)),==,NVME_SUCCESS);
     graph.h.cookie=cpu_to_le64(11);

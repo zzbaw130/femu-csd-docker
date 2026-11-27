@@ -226,7 +226,7 @@ static int64_t probe_stage(unsigned stage,struct qs_chunk *c,const struct qs_pla
     struct qs_join_control *control,struct femu_csd_args *a,int reentry,int emit)
 {
     const struct qs_join *j=qs_join_at(p,stage);
-    if(j->indexid) return qs_index_probe(stage,c,p,task,control,a,reentry);
+    if(j->indexid) return qs_index_probe(stage,c,p,task,control,a,reentry,qs_join_consume);
     struct hash_join *h=(void *)(uintptr_t)control[stage].state;
     struct qs_chunk *out=(void *)((unsigned char *)a->mr_addr[4]+stage*qs_join_chunk_stride(p));
     unsigned base=qs_probe_attrs(p);

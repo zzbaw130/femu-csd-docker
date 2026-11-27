@@ -31,7 +31,10 @@ void qs_index_spill_io(struct qs_join_control *,unsigned slot,void *io);
 int qs_index_dictionary_pending(const struct qs_join_control *,unsigned slot);
 int64_t qs_index_scan_paged(struct qs_chunk *,struct qs_task *,struct qs_join_control *,void *,
     unsigned heap_pages,unsigned index_pages,int flags,struct femu_csd_args *);
-int64_t qs_index_probe(unsigned,struct qs_chunk *,const struct qs_plan *,struct qs_task *,struct qs_join_control *,struct femu_csd_args *,int);
+typedef int64_t (*qs_index_consumer)(unsigned,struct qs_chunk *,const struct qs_plan *,
+    struct qs_task *,struct qs_join_control *,struct femu_csd_args *,int);
+int64_t qs_index_probe(unsigned,struct qs_chunk *,const struct qs_plan *,struct qs_task *,
+    struct qs_join_control *,struct femu_csd_args *,int,qs_index_consumer);
 int64_t qs_join_consume(unsigned,struct qs_chunk *,const struct qs_plan *,struct qs_task *,struct qs_join_control *,struct femu_csd_args *,int);
 int qs_scan_tuple(const struct qs_plan *,const unsigned char *,unsigned,unsigned,unsigned,struct qs_chunk *,unsigned,struct qs_dict *);
 #endif

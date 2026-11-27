@@ -428,6 +428,33 @@ static int conditions(struct binding *b,List *list)
     }
     return result;
 }
+
+static bool integer_constant(Node *node,int64 value)
+{
+    if(!IsA(node,Const)) return false;
+    const Const *c=(const Const *)node;
+    if(c->constisnull) return false;
+    return (c->consttype==INT4OID && DatumGetInt32(c->constvalue)==value) ||
+        (c->consttype==INT8OID && DatumGetInt64(c->constvalue)==value);
+}
+
+/* Bind the example only to a heap scan immediately below an aggregate. */
+static Var *keep_even_qual(const struct binding *b)
+{
+    if(!pg_sina_operator_graph || !IsA(b->plan,SeqScan) || b->tree->count!=2 ||
+       b->tree->nodes[0].kind!=QP_AGGREGATE || list_length(b->plan->qual)!=1 ||
+       !IsA(linitial(b->plan->qual),OpExpr)) return NULL;
+    const OpExpr *eq=linitial(b->plan->qual);
+    Oid fn=get_opcode(eq->opno);
+    if((fn!=F_INT4EQ && fn!=F_INT8EQ && fn!=F_INT84EQ && fn!=F_INT48EQ) ||
+       list_length(eq->args)!=2 || !IsA(linitial(eq->args),OpExpr) ||
+       !integer_constant(lsecond(eq->args),0)) return NULL;
+    const OpExpr *mod=linitial(eq->args);
+    fn=get_opcode(mod->opno);
+    if((fn!=F_INT4MOD && fn!=F_INT8MOD) || list_length(mod->args)!=2 ||
+       !IsA(linitial(mod->args),Var) || !integer_constant(lsecond(mod->args),2)) return NULL;
+    return linitial(mod->args);
+}
 /* The planning locks keep a relation's tuple layout stable. Cache only the
  * immutable descriptor in this search; each candidate still owns its slots,
  * predicate restrictions and other mutable column properties. */
@@ -914,7 +941,7 @@ static bool choose_algorithms(PlannerInfo *root,Plan **slot,bool ordered)
         Agg *a=(Agg *)p;
         struct candidate_group group={.supported=a->numCols>0 && a->numCols<=QS_KEYS};
         simple_group((Node *)p->targetlist,&group); simple_group((Node *)p->qual,&group);
-        bool supported=group.supported && group.aggregates && a->numCols+2*list_length(group.aggregates)<=QS_OUT;
+        bool supported=group.supported && group.aggregates && qp_group_partial_width(a->numCols,list_length(group.aggregates))<=QS_OUT;
         bool sort=IsA(p->lefttree,Sort);
         /* An unfiltered non-covering index orders every Heap tuple just for
          * grouping. Both modes can instead scan batches and hash groups. */
@@ -1015,6 +1042,101 @@ static bool group_output(struct qs_plan *p,int index,struct qp_node *n,bool reta
         x->op==Q_LIKE || x->op==Q_COALESCE || (x->op>=Q_EQ && x->op<=Q_OR)) &&
         group_output(p,x->left,n,retain) && group_output(p,x->right,n,retain);
 }
+static const struct qs_expr *integer_output(const struct qp_node *node,unsigned column)
+{
+    if(column>=node->expr.nout) return NULL;
+    const struct qs_expr *e=&node->expr.exprs[node->expr.outputs[column].index];
+    return e->op==Q_COLUMN && e->type==Q_INTEGER?e:NULL;
+}
+
+/* Find a necessary key domain through projections and inner equality
+ * joins. Residual predicates only remove more keys from that domain. */
+static int group_key_domain_scan(const struct qp_plan *p,int id,unsigned column,unsigned *key)
+{
+    const struct qp_node *n=&p->nodes[id];
+    const struct qs_expr *e=integer_output(n,column);
+    if(!e) return -1;
+    if(n->kind==QP_SCAN && !n->ordered_index) { *key=column; return id; }
+    if(n->kind==QP_PROJECT && n->left>=0)
+        return group_key_domain_scan(p,n->left,e->column,key);
+    if(n->kind!=QP_JOIN || !n->hash || n->join_type!=QP_INNER || n->left<0 || n->right<0)
+        return -1;
+    unsigned width=p->nodes[n->left].expr.nout;
+    bool right=(unsigned)e->column>=width;
+    unsigned local=(unsigned)e->column-(right?width:0);
+    int best=group_key_domain_scan(p,right?n->right:n->left,local,key);
+    for(unsigned k=0;k<n->nkeys;++k) {
+        if(local!=(unsigned)(right?n->right_keys[k]:n->left_keys[k])) continue;
+        unsigned other_key;
+        int other=group_key_domain_scan(p,right?n->left:n->right,
+            right?n->left_keys[k]:n->right_keys[k],&other_key);
+        if(other>=0 && (best<0 || p->nodes[other].estimated_rows<p->nodes[best].estimated_rows)) {
+            best=other; *key=other_key;
+        }
+    }
+    return best;
+}
+
+/* A small filtered key domain can eliminate entire groups before a blocking
+ * hash aggregate. Keep the original joins, residuals and output multiplicity. */
+static bool push_group_key_prefilter(struct qp_plan *p,struct qp_node *join)
+{
+    if(!pg_sina_operator_graph || !join->hash || join->join_type!=QP_INNER ||
+       join->nkeys!=1 || p->ninit || p->nparams || p->count+3>QP_NODES) return false;
+    for(unsigned side=0;side<2;++side) {
+        int child=side?join->right:join->left;
+        unsigned column=side?join->right_keys[0]:join->left_keys[0];
+        int id=child;
+        const struct qs_expr *key=integer_output(&p->nodes[id],column);
+        while(key && p->nodes[id].kind==QP_PROJECT && p->nodes[id].left>=0) {
+            id=p->nodes[id].left; column=key->column;
+            key=integer_output(&p->nodes[id],column);
+        }
+        struct qp_node *agg=&p->nodes[id];
+        if(!key || agg->kind!=QP_AGGREGATE || !agg->hash || agg->nkeys!=1 ||
+           agg->left_keys[0]!=key->column || agg->left<0 ||
+           p->nodes[agg->left].kind!=QP_SCAN || p->nodes[agg->left].ordered_index)
+            continue;
+        unsigned scan_key;
+        int source=group_key_domain_scan(p,side?join->left:join->right,
+            side?join->left_keys[0]:join->right_keys[0],&scan_key);
+        if(source<0) continue;
+        const struct qp_node *scan=&p->nodes[source],*input=&p->nodes[agg->left];
+        double groups=Max(1,agg->estimated_groups);
+        if(scan->estimated_rows*4>=groups ||
+           scan->estimated_rows*4*sizeof(int64_t)>pg_sina_query_memory()/8) continue;
+
+        unsigned set=p->count++,key_scan=p->count++,filter=p->count++;
+        p->nodes[key_scan]=*scan;
+        p->nodes[key_scan].expr.outputs[0]=scan->expr.outputs[scan_key];
+        p->nodes[key_scan].expr.nout=1;
+        p->nodes[set]=(struct qp_node){.kind=QP_SET,.left=key_scan,.right=-1,
+            .expr=p->nodes[key_scan].expr,.estimated_rows=scan->estimated_rows};
+        p->init_nodes[0]=set; p->init_params[0]=-1; p->ninit=1;
+        double selectivity=Min(1.0,scan->estimated_rows/groups);
+        struct qp_node *f=&p->nodes[filter];
+        *f=(struct qp_node){.kind=QP_PROJECT,.left=agg->left,.right=-1,
+            .estimated_rows=input->estimated_rows*selectivity};
+        f->expr.nattrs=f->expr.ncols=f->expr.nout=f->expr.nexprs=input->expr.nout;
+        f->expr.having=f->expr.limit=-1;
+        for(unsigned k=0;k<f->expr.nout;++k) {
+            f->expr.outputs[k]=input->expr.outputs[k]; f->expr.outputs[k].index=k;
+            unsigned type=input->expr.exprs[input->expr.outputs[k].index].type;
+            f->expr.exprs[k]=(struct qs_expr){.op=Q_COLUMN,.column=k,.type=type};
+            f->expr.cols[k]=(struct qs_column){.slot=k,.type=type};
+        }
+        f->expr.predicate=add_expr(&f->expr,(struct qs_expr){.op=QP_INSET,.type=Q_BOOLEAN,
+            .left=key->column,.column=set});
+        agg->left=filter; agg->estimated_groups*=selectivity;
+        for(int at=child;;at=p->nodes[at].left) {
+            p->nodes[at].estimated_rows*=selectivity;
+            if(at==id) break;
+        }
+        return true;
+    }
+    return false;
+}
+
 /* A unique integer-key join that only returns its key is a membership test.
  * Move that test below GROUP BY, where it removes whole groups, never rows
  * within a retained group. Reuse the existing device IN set and initializer. */
@@ -1412,7 +1534,13 @@ static int compile_node_impl(PlannerInfo *root,Plan *native,struct qp_plan *tree
         int expr=expression(&b,(Node *)t->expr); if(expr<0) return -1;
         p->outputs[p->nout++]=(struct qs_output){.index=expr,.type_oid=exprType((Node *)t->expr),.typmod=exprTypmod((Node *)t->expr)};
     }
-    p->predicate=conditions(&b,native->qual); if(p->predicate==-2) return -1;
+    Var *even=keep_even_qual(&b);
+    if(even) {
+        if(expression(&b,(Node *)even)<0) return -1;
+        n->keep_even_column=p->cols[even->varattno-1].slot+1;
+    } else {
+        p->predicate=conditions(&b,native->qual); if(p->predicate==-2) return -1;
+    }
     if(IsA(native,Result) && ((Result *)native)->resconstantqual) {
         Node *qual=((Result *)native)->resconstantqual;
         int extra=IsA(qual,List)?conditions(&b,(List *)qual):expression(&b,qual); if(extra<0) return -1;
@@ -1454,6 +1582,8 @@ static int compile_node_impl(PlannerInfo *root,Plan *native,struct qp_plan *tree
     }
     if(n->kind==QP_JOIN && !ordered && ((Join *)native)->inner_unique &&
        (!pg_sina_path_search || (pg_sina_encoding_choice(id)&PG_SINA_GROUP_FILTER))) push_group_key_filter(tree,n);
+    if(n->kind==QP_JOIN && (!pg_sina_path_search || (pg_sina_encoding_choice(id)&PG_SINA_GROUP_PREFILTER)))
+        push_group_key_prefilter(tree,n);
     if(n->kind==QP_AGGREGATE &&
        (!pg_sina_path_search || (pg_sina_encoding_choice(id)&PG_SINA_LEFT_COUNT))) push_left_join_count(tree,n);
     return id;
@@ -1801,7 +1931,12 @@ static int describe_tree(PlannerInfo *root,Plan *native,struct qp_plan *tree,boo
         int property=describe_expression(&b,value); if(property<0) return -1;
         p->outputs[p->nout++]=(struct qs_output){.index=property,.type_oid=exprType(value),.typmod=exprTypmod(value)};
     }
-    if(!describe_list(&b,native->qual)) return -1;
+    Var *even=keep_even_qual(&b);
+    if(even) {
+        if(describe_expression(&b,(Node *)even)<0 ||
+           add_expr(p,(struct qs_expr){.op=Q_AGGREF,.type=Q_BOOLEAN,.column=-1,
+               .constant=(intptr_t)linitial(native->qual)})<0) return -1;
+    } else if(!describe_list(&b,native->qual)) return -1;
     if(n->kind==QP_SCAN && native->qual) {
         /* Cost metadata only: retain the original predicate root so PG can
          * estimate the selectivity of the device's early AND prefilters.
@@ -1851,6 +1986,7 @@ static int describe_tree(PlannerInfo *root,Plan *native,struct qp_plan *tree,boo
         push_group_key_filter(tree,n);
         if(n->kind!=QP_JOIN) choices[id]|=PG_SINA_GROUP_FILTER;
     }
+    if(n->kind==QP_JOIN && push_group_key_prefilter(tree,n)) choices[id]|=PG_SINA_GROUP_PREFILTER;
     if(n->kind==QP_AGGREGATE) {
         push_left_join_count(tree,n);
         if(n->kind!=QP_AGGREGATE) choices[id]|=PG_SINA_LEFT_COUNT;

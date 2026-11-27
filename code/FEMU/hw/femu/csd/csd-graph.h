@@ -19,6 +19,9 @@
 #define FEMU_GRAPH_STEP_DONE 4U
 #define FEMU_GRAPH_STEP_ACTION 5U
 #define FEMU_GRAPH_WAIT_ACTION 6U
+/* Publish an output that borrows the inlet. The last output reader
+ * releases the inlet credit without calling the publishing CSF again. */
+#define FEMU_GRAPH_BORROW_ACTION 7U
 enum { FEMU_GRAPH_INPUT_NONE, FEMU_GRAPH_INPUT_BATCH, FEMU_GRAPH_INPUT_EOF };
 enum { FEMU_GRAPH_OPEN, FEMU_GRAPH_CLOSE, FEMU_GRAPH_CANCEL,
        FEMU_GRAPH_FORGET_CANCEL, FEMU_GRAPH_ROLLBACK };

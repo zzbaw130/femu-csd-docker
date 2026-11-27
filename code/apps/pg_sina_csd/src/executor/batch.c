@@ -86,11 +86,15 @@ static CS_STATUS copy(CS_MEM_HANDLE memory,unsigned offset,void *data,int bytes,
 }
 static CS_STATUS load_program(CS_DEV_HANDLE device,struct program *p)
 {
-    char descriptor[128]; size_t size=strlen(p->file)+1;
-    memcpy(descriptor,p->file,size); strcpy(descriptor+size,p->symbol);
+    char descriptor[128];
+    size_t file_size=strlen(p->file)+1, symbol_size=strlen(p->symbol)+1;
+    if(file_size>sizeof(descriptor) || symbol_size>sizeof(descriptor)-file_size)
+        return CS_INVALID_ARG;
+    memcpy(descriptor,p->file,file_size);
+    memcpy(descriptor+file_size,p->symbol,symbol_size);
     CsCSFDownloadInfo download={.Type=CS_CSF_VENDOR_SPECIFIC,.SubType=CS_SUBTYPE_VENDOR_SPECIFIC,.CSEEId=1,.Index=p->index};
     snprintf(download.common.UniqueName,sizeof(download.common.UniqueName),"pg-sina-%u",p->index);
-    download.common.DataBuffer=descriptor; download.common.Length=size+strlen(p->symbol)+1;
+    download.common.DataBuffer=descriptor; download.common.Length=file_size+symbol_size;
     double mark=pg_sina_planner_clock();
     u32 id; CS_STATUS s=csCSFDownload(device,&download,&id);
     if(pg_sina_planning) pg_sina_planning->download+=pg_sina_planner_clock()-mark;
@@ -129,40 +133,28 @@ static CsProperties *properties(CS_DEV_HANDLE device,CS_RESOURCE_TYPE type)
 static CS_DEV_HANDLE connection_device;
 static unsigned connection_users;
 static char connection_path[128];
+/* The first fourteen entries keep the legacy backend slots. The graph
+ * range has a fixed stride so different catalog sizes cannot overlap. */
+enum { LEGACY_PROGRAMS=14, LEGACY_PROGRAM_SLOTS=16, GRAPH_PROGRAM_SLOTS=64 };
 static struct program connection_programs[]={
-    {.file="pg-sina-plan.so",.symbol="pg_sina_plan",.index=500},
-    {.file="pg-sina-scan.so",.symbol="pg_sina_scan",.index=501},
-    {.file="pg-sina-filter.so",.symbol="pg_sina_filter",.index=502},
-    {.file="pg-sina-aggregate.so",.symbol="pg_sina_aggregate_sink",.index=503},
-    {.file="pg-sina-aggregate.so",.symbol="pg_sina_aggregate_source",.index=504},
-    {.file="pg-sina-sort.so",.symbol="pg_sina_sort",.index=505},
-    {.file="pg-sina-limit.so",.symbol="pg_sina_limit",.index=506},
-    {.file="pg-sina-join.so",.symbol="pg_sina_join_build",.index=507},
-    {.file="pg-sina-join.so",.symbol="pg_sina_join_load",.index=508},
-    {.file="pg-sina-join.so",.symbol="pg_sina_join_close",.index=509},
-    {.file="pg-sina-graph-join.so",.symbol="pg_sina_join_probe",.index=510},
-    {.file="pg-sina-sort.so",.symbol="pg_sina_sort_sink",.index=511},
-    {.file="pg-sina-sort.so",.symbol="pg_sina_sort_source",.index=512},
-    {.file="pg-sina-plan.so",.symbol="pg_sina_workmem_capacity",.index=513},
-    {.file="pg-sina-graph-tail.so",.symbol="pg_sina_graph_offset",.index=514},
-    {.file="pg-sina-graph-tail.so",.symbol="pg_sina_graph_sum",.index=515},
-    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_source"},
-    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_hash_build"},
-    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_continue"},
-    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_hash_probe"},
-    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_feed"},
-    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_build_pipeline"},
-    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_group_pipeline"},
-    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_block_scan"},
-    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_block_filter"},
-    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_block_probe"},
-    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_block_index"},
-    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_block_project"},
-    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_block_aggregate"},
-    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_block_hash_build"},
-    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_block_sort"},
-    {.file="pg-sina-graph-plan.so",.symbol="pg_sina_graph_block_partition"}
+    {.file="pg-sina-plan.so",.symbol="pg_sina_plan"},
+    {.file="pg-sina-scan.so",.symbol="pg_sina_scan"},
+    {.file="pg-sina-filter.so",.symbol="pg_sina_filter"},
+    {.file="pg-sina-aggregate.so",.symbol="pg_sina_aggregate_sink"},
+    {.file="pg-sina-aggregate.so",.symbol="pg_sina_aggregate_source"},
+    {.file="pg-sina-sort.so",.symbol="pg_sina_sort"},
+    {.file="pg-sina-limit.so",.symbol="pg_sina_limit"},
+    {.file="pg-sina-join.so",.symbol="pg_sina_join_build"},
+    {.file="pg-sina-join.so",.symbol="pg_sina_join_load"},
+    {.file="pg-sina-join.so",.symbol="pg_sina_join_close"},
+    {.file="pg-sina-graph-join.so",.symbol="pg_sina_join_probe"},
+    {.file="pg-sina-sort.so",.symbol="pg_sina_sort_sink"},
+    {.file="pg-sina-sort.so",.symbol="pg_sina_sort_source"},
+    {.file="pg-sina-plan.so",.symbol="pg_sina_workmem_capacity"},
+#include "graph_registry.inc"
 };
+_Static_assert(lengthof(connection_programs)-LEGACY_PROGRAMS<=GRAPH_PROGRAM_SLOTS,
+    "too many graph EXECs for the backend's device index range");
 struct pg_sina_resources pg_sina_resources;
 static void close_connection(int code,Datum arg)
 {
@@ -191,12 +183,12 @@ void pg_sina_init_device(void)
         if(!cus || !fdm) status=CS_DEVICE_ERROR;
     }
     for(unsigned i=0;status==CS_SUCCESS && i<lengthof(connection_programs);++i) {
-        /* Extra graph entries live above every backend's original range.
-         * Reference connections can still use the installed 16-slot layout. */
-        unsigned index=i<16?500+i+program_offset:
-            516+MaxBackends*16+(MyBackendId-1)*(lengthof(connection_programs)-16)+(i-16);
+        uint64_t index=500+i+program_offset;
+        if(i>=LEGACY_PROGRAMS)
+            index=500+(uint64_t)(MaxBackends+1)*LEGACY_PROGRAM_SLOTS+
+                (uint64_t)(MyBackendId-1)*GRAPH_PROGRAM_SLOTS+(i-LEGACY_PROGRAMS);
         if(index>UINT16_MAX) { status=CS_OUT_OF_RESOURCES; break; }
-        connection_programs[i].index=index;
+        connection_programs[i].index=(unsigned)index;
         status=load_program(connection_device,&connection_programs[i]);
     }
     if(status==CS_SUCCESS) {

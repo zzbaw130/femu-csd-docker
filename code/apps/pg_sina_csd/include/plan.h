@@ -9,6 +9,7 @@
 #define QP_HOST_PARAMETER (-2) /* Value supplied by PG, never a device InitPlan. */
 #define QP_SCAN_BYTES (1024U*1024)
 #define QP_VECTOR_ROWS 2048U
+#define QP_SCAN_VECTOR_ROWS 4096U
 /* cparam1: profile bit 0, CU slot bits 1..7. A scheduled heap input uses
  * bit 8 and its page number in bits 9..63. With bit 8 clear, bit 9 marks
  * completion of the previous requested page LOAD; cparam2 stays for spill. */
@@ -34,9 +35,13 @@
 #define QP_GRAPH_HASH_NODE_SHIFT 2
 #define QP_GRAPH_HASH_NEEDS_LEFT 32U
 #define QP_GRAPH_HASH_MERGE_REQUIRED 64U
-/* The coarse graph coordinator uses bits 0 and 9 as in pg_sina_plan. */
+/* Stage EXECs use bits 0 and 9 as in pg_sina_plan. */
 #define QP_GRAPH_PIPELINE_NODE_SHIFT 10
+#define QP_GRAPH_PIPELINE_NODE_MASK 127U
+#define QP_GRAPH_PIPELINE_ROUTE_SHIFT 17 /* The coordinator receives the worker scan_node word. */
+#define QP_GRAPH_PIPELINE_BUDGET_SHIFT 49 /* One byte for the workmem divisor. */
 #define QP_GRAPH_PHASE_DONE 128U
+#define QP_GRAPH_SERIAL_SORT 256U /* Final aggregate is read by one graph. */
 /* scan_node keeps the one-based scan ID in its low byte. For a chain,
  * the next bits carry the one-based producer root and the high bits are flags. */
 #define QP_GRAPH_BLOCK_SCAN (1U<<31)
@@ -47,11 +52,14 @@
 #define QP_GRAPH_BLOCK_SORT (1U<<26)
 #define QP_GRAPH_BLOCK_PARTITION (1U<<25)
 #define QP_GRAPH_BLOCK_STREAM (1U<<24)
-#define QP_GRAPH_BLOCK_FLAGS (QP_GRAPH_BLOCK_SCAN|QP_GRAPH_BLOCK_BUILD|QP_GRAPH_BLOCK_PROBE|QP_GRAPH_BLOCK_INDEX|QP_GRAPH_BLOCK_CHAIN|QP_GRAPH_BLOCK_SORT|QP_GRAPH_BLOCK_PARTITION|QP_GRAPH_BLOCK_STREAM)
+#define QP_GRAPH_BLOCK_DEVICE_SOURCE (1U<<23)
+#define QP_GRAPH_BLOCK_SET (1U<<22)
+#define QP_GRAPH_BLOCK_EXTERNAL (1U<<21) /* Source is a partitioned Hash Join. */
+#define QP_GRAPH_BLOCK_FLAGS (QP_GRAPH_BLOCK_SCAN|QP_GRAPH_BLOCK_BUILD|QP_GRAPH_BLOCK_PROBE|QP_GRAPH_BLOCK_INDEX|QP_GRAPH_BLOCK_CHAIN|QP_GRAPH_BLOCK_SORT|QP_GRAPH_BLOCK_PARTITION|QP_GRAPH_BLOCK_STREAM|QP_GRAPH_BLOCK_DEVICE_SOURCE|QP_GRAPH_BLOCK_SET|QP_GRAPH_BLOCK_EXTERNAL)
 #define QP_GRAPH_BLOCK_ROOT_SHIFT 8
 #define QP_GRAPH_BLOCK_NODE_SHIFT 57 /* Chain EXEC cparam1 carries its operator ID. */
 #define QP_GRAPH_BLOCK_MAX_CHAIN 60 /* E9 leaves four entries for LOAD, Scan, Filter and sink. */
-enum qp_graph_block_step { BLOCK_SCAN, BLOCK_FILTER, BLOCK_PROBE, BLOCK_INDEX, BLOCK_PROJECT, BLOCK_GROUP, BLOCK_HASH, BLOCK_SORT, BLOCK_PARTITION, BLOCK_STEPS };
+enum qp_graph_block_step { BLOCK_SCAN, BLOCK_FILTER, BLOCK_PROBE, BLOCK_INDEX, BLOCK_PROJECT, BLOCK_GROUP, BLOCK_HASH, BLOCK_SORT, BLOCK_PARTITION, BLOCK_SET, BLOCK_CTE_SCAN, BLOCK_HOST_OUTPUT, BLOCK_STEPS };
 #define QP_GRAPH_BLOCK_EXEC (UINT64_C(1)<<63)
 #define QP_GRAPH_RESIDENT_TEXT (UINT64_C(1)<<62)
 #define QP_GRAPH_STREAM_EXEC (UINT64_C(1)<<61)
@@ -75,6 +83,7 @@ struct qp_node {
     /* Aggregate keys occupy the prefix; remaining entries carry PG-proven
      * functionally dependent output values, never Hash/equality keys. */
     unsigned group_keys;
+    unsigned keep_even_column; /* One-based scan slot for the example EXEC. */
     uint64_t late_text; /* Scan attribute bitmap: output-only Heap references. */
     unsigned sorted_input, ordered_index; /* bits: forward, heap read-ahead, covered keys, unordered leaf ranges */
     unsigned hash, parallel;
@@ -217,11 +226,13 @@ struct qp_control {
     unsigned output_rows, peak_cus, output_strings;
     struct qs_index_read index_reads[QS_INDEX_READS];
 };
-/* Each spilled group carries its keys and one value/count pair per aggregate.
- * Keep planner eligibility and the device's bounded row format in agreement. */
+/* Spill records store keys, aggregate values and two 64-bit counts per
+ * 128-bit count cell. The intermediate row stays within the sort ABI. */
+static inline unsigned qp_group_partial_width(unsigned keys,unsigned aggregates)
+{ return keys+aggregates+(aggregates+1)/2; }
 static inline int qp_hash_aggregate_supported(const struct qp_node *n)
 {
-    if(!n->nkeys || !n->expr.naggs || n->expr.naggs>QS_AGGS || n->nkeys+2*n->expr.naggs>QS_OUT) return 0;
+    if(!n->nkeys || !n->expr.naggs || n->expr.naggs>QS_AGGS || qp_group_partial_width(n->nkeys,n->expr.naggs)>QS_OUT) return 0;
     for(unsigned i=0;i<n->expr.naggs;++i) {
         const struct qs_agg *a=&n->expr.aggs[i];
         if(a->kind!=Q_COUNT_STAR && ((a->kind!=Q_SUM && a->kind!=Q_AVG && a->kind!=Q_COUNT &&
@@ -240,7 +251,7 @@ static inline unsigned qp_scan_buffer_bytes(const struct qp_plan *p,const struct
 static inline unsigned qp_scan_capacity(const struct qp_plan *p,const struct qp_node *n)
 {
     unsigned rows=qp_scan_buffer_bytes(p,n)/24;
-    return rows<QP_VECTOR_ROWS?rows:QP_VECTOR_ROWS;
+    return rows<QP_SCAN_VECTOR_ROWS?rows:QP_SCAN_VECTOR_ROWS;
 }
 static inline size_t qp_input_offset(const struct qp_plan *p,const struct qp_node *n,unsigned worker)
 {
@@ -324,10 +335,17 @@ static inline int qp_pipeline_source(const struct qp_plan *p,int id)
     if(id<0) return -1;
     const struct qp_node *n=&p->nodes[id];
     if(n->kind==QP_SCAN) return n->ordered_index && !(n->ordered_index&8)?-1:id;
+    if(n->kind==QP_CTE_SCAN) return id;
     if(n->kind==QP_AGGREGATE && n->hash && !n->distinct && !n->distinct_aggs && qp_hash_aggregate_supported(n)) return id;
     if(n->kind==QP_PROJECT || n->kind==QP_INDEX_JOIN || (n->kind==QP_JOIN && n->hash))
         return qp_pipeline_source(p,n->left);
     return -1;
+}
+static inline unsigned qp_sort_depth(const struct qp_plan *plan,unsigned id)
+{
+    const struct qp_node *n=&plan->nodes[id]; unsigned left=n->left<0?0:qp_sort_depth(plan,n->left),right=n->right<0?0:qp_sort_depth(plan,n->right);
+    if(n->kind==QP_JOIN) return (left>right?left:right)+2;
+    return left+(n->kind==QP_SORT || (n->kind==QP_AGGREGATE && n->nkeys && (!n->sorted_input || n->distinct)));
 }
 static inline void qp_mark_parallel(struct qp_plan *p,int id)
 {

@@ -587,6 +587,7 @@ static bool compile(PlannerInfo *root,List *relations,List *joins,List *quals,st
 static Plan *fast_plan(PlannerInfo *root,Plan *native,struct qs_plan **properties)
 {
     Query *q=root->parse;
+    if(pg_sina_operator_graph) return NULL;
     if(!q->hasAggs || q->hasSubLinks || q->havingQual || q->cteList || q->windowClause ||
        q->groupingSets || q->distinctClause || q->hasRowSecurity || q->hasTargetSRFs ||
        list_length(q->jointree->fromlist)!=1 || !IsA(linitial(q->jointree->fromlist),RangeTblRef)) return NULL;

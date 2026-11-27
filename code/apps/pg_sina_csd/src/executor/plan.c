@@ -35,7 +35,7 @@ struct result_delivery {
 };
 struct plan_slot {
     struct qp_control control;
-    CS_BATCH_HANDLE batch, resume;
+    CS_BATCH_HANDLE batch, resume, sort_batch;
     CS_BATCH_INDEX previous,scan_load;
     CS_REQ_HANDLE pending; /* PG-owned marker for the whole callback chain. */
     atomic_bool completed;
@@ -48,6 +48,7 @@ struct plan_slot {
     unsigned scan_node;
     bool need_input, prefetched_input;
     unsigned block_flags, batch_block_flags, block_root, batch_block_root;
+    bool batch_has_filter;
     CS_BATCH_INDEX block_entries[QP_GRAPH_BLOCK_MAX_CHAIN+3];
     uint64_t block_submissions,stream_submissions;
     uint64_t queued_ns;
@@ -60,14 +61,12 @@ struct plan_slot {
     uint64_t scan_loads;
     uint64_t host_gap_ns,host_gap_max_ns,host_requeues;
 };
-enum graph_phase { GRAPH_NATIVE, GRAPH_SOURCE, GRAPH_CTE_SOURCE, GRAPH_BUILD_RIGHT, GRAPH_BUILD_LEFT,
-                   GRAPH_PROBE, GRAPH_PROBE_SPILL, GRAPH_FEED, GRAPH_PIPELINE_BUILD,
-                   GRAPH_PIPELINE_GROUP, GRAPH_PHASES };
+enum graph_phase { GRAPH_NATIVE, GRAPH_PIPELINE_RESERVE, GRAPH_PIPELINE_BUILD, GRAPH_PIPELINE_PARTITION,
+                   GRAPH_PIPELINE_RESERVE_INPUT, GRAPH_PIPELINE_GROUP_INPUT, GRAPH_PIPELINE_MATERIALIZE,
+                   GRAPH_PIPELINE_GROUP, GRAPH_PIPELINE_SET, GRAPH_PIPELINE_INIT_RESULT, GRAPH_PIPELINE_SORT, GRAPH_PIPELINE_SORT_INPUT,
+                   GRAPH_PIPELINE_TAIL, GRAPH_PIPELINE_SCAN, GRAPH_PHASES };
 struct graph_stage {
-    CS_MEM_HANDLE packet;
     CS_BATCH_HANDLE batches[GRAPH_PHASES];
-    enum graph_phase phase;
-    bool ready, eof, prepared;
 };
 struct PlanStateCsd {
     CustomScanState css;
@@ -125,14 +124,17 @@ struct PlanStateCsd {
     CS_MEM_HANDLE memory[5];
     CS_MEM_HANDLE worker_io[QS_WORKERS];
     CS_CSF_ID function;
-    CS_CSF_ID graph_source, graph_build, graph_probe, graph_feed;
-    CS_MEM_HANDLE graph_eof;
+    CS_CSF_ID graph_build, graph_group, graph_partition_reload, graph_partition_probe;
+    bool graph_external[QP_NODES];
     struct graph_stage graph[QP_NODES];
     enum graph_phase graph_phase;
-    unsigned graph_node, graph_nodes, graph_init, graph_pipeline_group;
+    unsigned graph_node, graph_init, graph_pipeline_group;
+    unsigned graph_sort_node, graph_build_at, graph_build_count;
+    unsigned graph_build_nodes[QP_NODES], graph_build_end[QP_PARAMS+1];
+    CS_CSF_ID graph_reserve, graph_combine, graph_sort, graph_result, graph_init_result, graph_set, graph_materialize, graph_tail[4];
     CS_CSF_ID graph_block[BLOCK_STEPS];
-    bool graph_tree, graph_partition, graph_waves, graph_resident_text, graph_stream_waves;
-    uint64_t graph_packets, graph_build_packets;
+    CS_CSF_ID graph_keep_even, graph_scan_wave, graph_scan_drain;
+    bool graph_waves, graph_stream_waves, graph_tail_serial, graph_scan;
     unsigned row;
     bool started, explain_only, active, profiling, operator_graph;
     uint64_t start_ns;
@@ -165,7 +167,7 @@ static void completed(void *context,CS_STATUS status,u64 value)
         uint64_t previous=slot->queued_ns;
         CS_STATUS next=CS_NOT_DONE;
         if(slot->scan_node) {
-            if((value&31)==QP_INPUT_DRAINED) next=queue_scan(slot);
+            if(!(slot->block_flags&QP_GRAPH_BLOCK_DEVICE_SOURCE) && (value&31)==QP_INPUT_DRAINED) next=queue_scan(slot);
         } else {
             PlanStateCsd *s=slot->owner;
             if(value&QP_CONTROL_REQUIRED) {
@@ -201,7 +203,7 @@ static void completed(void *context,CS_STATUS status,u64 value)
     slot->completion_status=status; slot->completion_value=value;
     pthread_mutex_unlock(&slot->mutex);
     atomic_store_explicit(&slot->completed,true,memory_order_release);
-    if(s->async_scan || s->graph_tree) deliver(s);
+    if(s->async_scan) deliver(s);
     atomic_fetch_sub_explicit(&s->callbacks,1,memory_order_release);
 }
 static CS_STATUS transfer(CS_MEM_HANDLE memory,size_t offset,void *data,size_t bytes,bool write)
@@ -243,6 +245,11 @@ static void close_state(void *arg)
         pthread_mutex_unlock(&s->advance_mutex);
     }
     for(unsigned w=0;w<=s->workers;++w) if(s->slots[w].pending) {
+        /* Failed peers can leave a graph waiting for an event. Cancel it
+         * before draining so no graph retains a reference to query memory. */
+        if(s->execution_status!=CS_SUCCESS && s->slots[w].inflight &&
+           !atomic_load_explicit(&s->slots[w].completed,memory_order_acquire))
+            csAbortRequest(s->slots[w].inflight);
         /* The stopping flag prevents callbacks from claiming another block.
          * Drain current bounded blocks so their input DMA references finish. */
         while(!atomic_load_explicit(&s->slots[w].completed,memory_order_acquire)) {
@@ -265,16 +272,15 @@ static void close_state(void *arg)
     for(unsigned w=0;w<=s->workers;++w) {
         if(s->slots[w].batch) { csFreeBatchRequest(s->slots[w].batch); s->slots[w].batch=NULL; }
         if(s->slots[w].resume) { csFreeBatchRequest(s->slots[w].resume); s->slots[w].resume=NULL; }
+        if(s->slots[w].sort_batch) { csFreeBatchRequest(s->slots[w].sort_batch); s->slots[w].sort_batch=NULL; }
         if(s->slots[w].mutex_ready) { pthread_mutex_destroy(&s->slots[w].mutex); s->slots[w].mutex_ready=false; }
     }
     CsMemFlags flags={.FDMId=1};
-    if(s->graph_eof) { csFreeMem(s->graph_eof,&flags); s->graph_eof=NULL; }
     for(unsigned id=0;id<s->plan->count;++id) {
         struct graph_stage *stage=&s->graph[id];
         for(unsigned i=1;i<GRAPH_PHASES;++i) if(stage->batches[i]) {
             csFreeBatchRequest(stage->batches[i]); stage->batches[i]=NULL;
         }
-        if(stage->packet) { csFreeMem(stage->packet,&flags); stage->packet=NULL; }
     }
     for(unsigned i=0;i<5;++i) if(s->memory[i]) { csFreeMem(s->memory[i],&flags); s->memory[i]=NULL; }
     for(unsigned w=0;w<s->workers;++w) if(s->worker_io[w]) {
@@ -489,21 +495,21 @@ static unsigned device_streams(Plan *plan)
 }
 /* This experiment shares the ordinary planner and only changes execution of
  * a scalar numeric SUM above an ordered, single-column heap scan. */
-static bool start_operator_graph(PlanStateCsd *s)
+static int graph_sort_sum_scan(const struct qp_plan *plan)
 {
     static const enum qp_kind kinds[]={QP_AGGREGATE,QP_PROJECT,QP_LIMIT,QP_SORT,QP_SCAN};
     const struct qs_plan *stages[lengthof(kinds)];
-    int id=s->plan->root;
-    if(s->plan->ninit || s->plan->nparams || s->plan->count!=lengthof(kinds))
-        return false;
+    int id=plan->root;
+    if(plan->ninit || plan->nparams || plan->count!=lengthof(kinds))
+        return -1;
     for(unsigned i=0;i<lengthof(kinds);++i) {
-        if(id<0 || (unsigned)id>=s->plan->count)
-            return false;
-        const struct qp_node *n=&s->plan->nodes[id];
+        if(id<0 || (unsigned)id>=plan->count)
+            return -1;
+        const struct qp_node *n=&plan->nodes[id];
         const struct qs_plan *p=&n->expr;
         if(n->kind!=(int)kinds[i] || n->right>=0 || n->ordered_index || p->nout!=1 ||
            p->outputs[0].type_oid!=NUMERICOID || (i+1<lengthof(kinds) && p->predicate>=0))
-            return false;
+            return -1;
         stages[i]=p;
         if(i+1<lengthof(kinds)) id=n->left;
     }
@@ -511,24 +517,34 @@ static bool start_operator_graph(PlanStateCsd *s)
     if(agg->naggs!=1 || agg->nkeys || agg->aggs[0].kind!=Q_SUM ||
        limit->limit>=0 || limit->offset<0 || sort->norder!=1 || sort->order[0].output!=0 ||
        scan->runtime_dict || scan->join.indexid)
-        return false;
+        return -1;
     const struct qs_expr *output=&agg->exprs[agg->outputs[0].index];
     const struct qs_expr *arg=&agg->exprs[agg->aggs[0].expr];
     if(output->op!=Q_AGGREF || output->column!=0 || arg->op!=Q_COLUMN || arg->column!=0)
-        return false;
+        return -1;
     for(unsigned i=1;i<=3;++i) {
         const struct qs_expr *expr=&stages[i]->exprs[stages[i]->outputs[0].index];
         if(expr->op!=Q_COLUMN || expr->column!=0)
-            return false;
+            return -1;
     }
 
+    return id;
+}
+
+static bool start_operator_graph(PlanStateCsd *s)
+{
+    int id=graph_sort_sum_scan(s->plan);
+    if(id<0) return false;
+    const struct qp_node *agg=&s->plan->nodes[s->plan->root];
+    const struct qp_node *limit=&s->plan->nodes[s->plan->nodes[agg->left].left];
+    const struct qs_plan *sort=&s->plan->nodes[limit->left].expr;
     struct qs_request request=s->files[id];
     request.plan.ordered_rows=1;
     request.plan.norder=1;
     request.plan.order[0]=sort->order[0];
     request.plan.limit=-1;
     request.plan.offset=0;
-    const struct qs_graph_tail tail={.remaining=limit->offset,.sum={.isnull=1}};
+    const struct qs_graph_tail tail={.remaining=limit->expr.offset,.sum={.isnull=1}};
     struct pg_sina_stream *stream=NULL;
     pg_sina_execute(&request,s->extents[id],s->result,s->profiling,&stream,&tail);
     Assert(!stream);
@@ -537,177 +553,211 @@ static bool start_operator_graph(PlanStateCsd *s)
     s->plan->nodes[s->plan->root].expr.work_mem_bytes=pg_sina_query_memory();
     return true;
 }
-/* The coarse graph experiment covers a bounded Sort over a grouped
- * inner hash tree with a nested build. Leaves retain their native CU waves. */
-static unsigned graph_pipeline_group(const struct qp_plan *p)
+static bool graph_heap_leaf(const struct qp_node *node)
 {
-    if(p->ninit) return 0;
-    const struct qp_node *limit=&p->nodes[p->root];
-    if(limit->kind!=QP_LIMIT || limit->left<0) return 0;
-    const struct qp_node *sort=&p->nodes[limit->left];
-    if(sort->kind!=QP_SORT || sort->left<0 || qp_sort_bound(p,limit->left)<0) return 0;
-    const struct qp_node *group=&p->nodes[sort->left];
-    if(group->kind!=QP_AGGREGATE || !group->hash || group->distinct || group->distinct_aggs ||
-       !qp_hash_aggregate_supported(group) ||
-       group->left<0) return 0;
-    const struct qp_node *join=&p->nodes[group->left];
-    if(join->kind!=QP_JOIN || !join->hash || join->join_type!=QP_INNER ||
-       join->left<0 || join->right<0 || p->nodes[join->left].kind!=QP_SCAN) return 0;
-    const struct qp_node *build=&p->nodes[join->right];
-    if(build->kind!=QP_JOIN || !build->hash || build->join_type!=QP_INNER ||
-       build->left<0 || build->right<0 || p->nodes[build->left].kind!=QP_SCAN ||
-       p->nodes[build->right].kind!=QP_SCAN) return 0;
-    /* A block EXEC can wait for E9 I/O. Dictionary contention between
-     * CUs needs a different retry protocol, so keep text as a filter input. */
-    for(unsigned id=0;id<p->count;++id) {
-        const struct qs_plan *expr=&p->nodes[id].expr;
-        for(unsigned col=0;col<expr->nout;++col)
-            if(expr->exprs[expr->outputs[col].index].type==Q_STRING) return 0;
+    return node->kind==QP_SCAN && !node->ordered_index;
+}
+
+struct graph_schedule {
+    unsigned count, sort, nodes[QP_NODES], end[QP_PARAMS+1];
+};
+
+/* Collect builds in dependency order. Each build wave may read a Heap or
+ * probe an already built table over a Heap. Keep the chosen join tree. */
+static bool graph_pipeline_builds(const struct qp_plan *p,struct graph_schedule *schedule,unsigned id)
+{
+    const struct qp_node *node=&p->nodes[id];
+    if(graph_heap_leaf(node) || (node->kind==QP_SCAN && (node->ordered_index&8) &&
+       node->expr.join.indexid)) return true;
+    if(node->left<0) return false;
+    if(node->kind==QP_CTE_SCAN && p->nodes[node->left].kind!=QP_MATERIALIZED) return false;
+    if(node->kind==QP_MATERIALIZED) {
+        for(unsigned i=0;i<schedule->count;++i)
+            if(schedule->nodes[i]==id) return true;
+        if(p->nodes[node->left].kind!=QP_AGGREGATE || !graph_pipeline_builds(p,schedule,node->left) ||
+           schedule->count>=QP_NODES) return false;
+        schedule->nodes[schedule->count++]=id;
+        return true;
     }
-    return sort->left+1;
-}
-static bool graph_building(enum graph_phase phase)
-{ return phase==GRAPH_BUILD_RIGHT || phase==GRAPH_BUILD_LEFT; }
-static bool graph_sourcing(enum graph_phase phase)
-{ return phase==GRAPH_SOURCE || phase==GRAPH_CTE_SOURCE; }
-static unsigned graph_root(const PlanStateCsd *s)
-{ return s->graph_init<s->plan->ninit?(unsigned)s->plan->init_nodes[s->graph_init]:s->plan->root; }
-static int graph_child(PlanStateCsd *s,unsigned id,enum graph_phase phase)
-{
-    const struct qp_node *n=&s->plan->nodes[id];
-    if(phase==GRAPH_SOURCE || phase==GRAPH_PROBE_SPILL) return -1;
-    return phase==GRAPH_BUILD_RIGHT?n->right:n->left;
-}
-static bool graph_prepare(PlanStateCsd *s,int id)
-{
-    if(id<0 || (unsigned)id>=s->plan->count) return false;
-    const struct qp_node *n=&s->plan->nodes[id];
-    struct graph_stage *stage=&s->graph[id];
-    if(stage->phase) return stage->prepared && n->kind==QP_MATERIALIZED;
-    enum graph_phase phase;
-    switch(n->kind) {
-        case QP_SCAN: phase=GRAPH_SOURCE; break;
-        case QP_PROJECT: phase=n->left<0?GRAPH_SOURCE:GRAPH_FEED; break;
-        case QP_AGGREGATE: case QP_SORT: case QP_LIMIT: case QP_MATERIALIZED: case QP_SET:
-            phase=GRAPH_FEED; break;
-        case QP_CTE_SCAN:
-            if(n->left<0 || (unsigned)n->left>=s->plan->count ||
-               s->plan->nodes[n->left].kind!=QP_MATERIALIZED) return false;
-            phase=GRAPH_CTE_SOURCE; break;
-        case QP_INDEX_JOIN:
-            if(n->right<0 || (unsigned)n->right>=s->plan->count ||
-               s->plan->nodes[n->right].kind!=QP_SCAN) return false;
-            phase=GRAPH_FEED; break;
-        case QP_JOIN: if(!n->hash) return false; phase=GRAPH_BUILD_RIGHT; break;
-        default: return false;
+    if(!graph_pipeline_builds(p,schedule,node->left)) return false;
+    if(node->kind==QP_PROJECT || node->kind==QP_CTE_SCAN) return true;
+    if(node->kind==QP_AGGREGATE) {
+        if(!node->hash || !qp_hash_aggregate_supported(node) || node->distinct ||
+           node->distinct_aggs || schedule->count>=QP_NODES) return false;
+        schedule->nodes[schedule->count++]=id;
+        return true;
     }
-    stage->phase=phase; ++s->graph_nodes;
-    if(phase!=GRAPH_SOURCE && !graph_prepare(s,n->left)) return false;
-    if(phase==GRAPH_BUILD_RIGHT) {
-        s->graph_partition=true;
-        if(!graph_prepare(s,n->right)) return false;
+    if(node->right<0) return false;
+    if(node->kind==QP_INDEX_JOIN)
+        return graph_heap_leaf(&p->nodes[node->right]) && p->nodes[node->right].expr.join.indexid;
+    if(node->kind!=QP_JOIN || !node->hash ||
+       !graph_pipeline_builds(p,schedule,node->right) || schedule->count>=QP_NODES) return false;
+    schedule->nodes[schedule->count++]=id;
+    return true;
+}
+
+static unsigned graph_pipeline_group(const struct qp_plan *p,struct graph_schedule *schedule)
+{
+    for(unsigned i=0;i<p->ninit;++i) {
+        int init_id=p->init_nodes[i];
+        if(init_id<0 || (unsigned)init_id>=p->count) return 0;
+        const struct qp_node *init=&p->nodes[init_id];
+        if(init->left<0) return 0;
+        if(p->init_params[i]<0) {
+            if(init->kind!=QP_SET || !graph_heap_leaf(&p->nodes[init->left])) return 0;
+        } else if(init->kind!=QP_AGGREGATE || init->nkeys || init->distinct ||
+                  init->distinct_aggs || !graph_pipeline_builds(p,schedule,init->left)) return 0;
+        schedule->end[i]=schedule->count;
     }
-    /* Index Join reads its right relation by address through its native
-     * lookup cursor. Only the left key stream has a packet edge. */
-    stage->prepared=phase==GRAPH_BUILD_RIGHT || n->kind==QP_INDEX_JOIN ||
-        (n->right<0 && (phase!=GRAPH_SOURCE || n->left<0));
-    return stage->prepared;
-}
-/* Pull the deepest missing packet. A consumer owns its child's packet
- * until its E9 completion acknowledges it, even if it produced output. */
-static void graph_pick(PlanStateCsd *s,unsigned id)
-{
-    enum graph_phase phase=s->graph[id].phase;
-    int child=graph_child(s,id,phase);
-    if(child>=0 && !s->graph[child].ready) { graph_pick(s,child); return; }
-    s->graph_node=id; s->graph_phase=phase;
-}
-/* Resident dictionary admission uses declared byte widths. Output-only
- * Heap references survive as file offsets and need no dictionary entry. */
-static bool resident_graph_text(const struct qp_plan *plan)
-{
-    unsigned width=pg_database_encoding_max_length();
-    bool text=false;
-    for(unsigned i=0;i<plan->count;++i) {
-        const struct qp_node *n=&plan->nodes[i];
-        if(n->kind!=QP_SCAN) continue;
-        for(unsigned col=0;col<n->expr.nout;++col) {
-            const struct qs_output *out=&n->expr.outputs[col];
-            if(out->index<0 || (unsigned)out->index>=n->expr.nexprs) return false;
-            const struct qs_expr *expr=&n->expr.exprs[out->index];
-            if(expr->type!=Q_STRING) continue;
-            if(expr->op==Q_COLUMN && expr->column>=0 && expr->column<QS_COLS &&
-               (n->late_text&(UINT64_C(1)<<expr->column))) continue;
-            if((out->type_oid!=BPCHAROID && out->type_oid!=VARCHAROID) ||
-               out->typmod<VARHDRSZ || (unsigned)(out->typmod-VARHDRSZ)>128/width) return false;
-            text=true;
-        }
-    }
-    return text;
-}
-/* A direct Index Join feeding a grouped sink can share a single vector
- * between its probe and aggregate. Other text plans retain the coarse path. */
-static bool graph_stream_index_group(const struct qp_plan *p)
-{
+    unsigned sort_id=p->root;
     const struct qp_node *root=&p->nodes[p->root];
-    if(root->kind!=QP_SORT || root->left<0 || p->ninit) return false;
-    const struct qp_node *group=&p->nodes[root->left];
-    if(group->kind!=QP_AGGREGATE || !group->hash || group->distinct ||
-       group->distinct_aggs || !qp_hash_aggregate_supported(group) || group->left<0) return false;
-    const struct qp_node *probe=&p->nodes[group->left];
-    return probe->kind==QP_INDEX_JOIN && probe->left>=0 && probe->right>=0 &&
-        p->nodes[probe->left].kind==QP_SCAN && p->nodes[probe->right].kind==QP_SCAN;
+    if(root->kind==QP_LIMIT) {
+        if(root->left<0 || qp_sort_bound(p,root->left)<0 || root->expr.limit<0 ||
+           root->expr.offset<0 || (uint64_t)root->expr.limit>qp_host_capacity(&root->expr)) return 0;
+        sort_id=root->left;
+    }
+    const struct qp_node *sort=&p->nodes[sort_id];
+    bool sorted=sort->kind==QP_SORT && sort->left>=0;
+    if(!sorted && (sort_id!=p->root || root->kind!=QP_AGGREGATE)) return 0;
+    unsigned group_id=sorted?(unsigned)sort->left:p->root;
+    const struct qp_node *group=&p->nodes[group_id];
+    if(sorted && group->kind!=QP_AGGREGATE) {
+        int source=qp_pipeline_source(p,group_id);
+        if(source<0 || !graph_pipeline_builds(p,schedule,group_id)) return 0;
+        schedule->end[p->ninit]=schedule->count;
+        schedule->sort=sort_id;
+        return sort_id+1;
+    }
+    if(group->kind!=QP_AGGREGATE || group->distinct || group->distinct_aggs || group->left<0)
+        return 0;
+    if(group->nkeys && (!group->hash || !qp_hash_aggregate_supported(group))) return 0;
+    if(!graph_pipeline_builds(p,schedule,group->left)) return 0;
+    schedule->end[p->ninit]=schedule->count;
+    schedule->sort=sorted?sort_id:QP_NODES;
+    return group_id+1;
 }
+bool pg_sina_graph_plan_supported(const struct qp_plan *plan)
+{
+    struct graph_schedule schedule={0};
+    return (plan->count==1 && !plan->ninit && plan->nodes[plan->root].kind==QP_SCAN) ||
+        graph_sort_sum_scan(plan)>=0 || graph_pipeline_group(plan,&schedule)!=0;
+}
+
 static uint64_t graph_coordinator_flags(const PlanStateCsd *s)
 {
     return (s->graph_waves?QP_GRAPH_BLOCK_EXEC:0) |
-           (s->graph_resident_text?QP_GRAPH_RESIDENT_TEXT:0) |
            (s->graph_stream_waves?QP_GRAPH_STREAM_EXEC:0);
 }
-static void graph_request(PlanStateCsd *s,CsComputeRequest *compute,bool loaded)
+static enum graph_phase graph_next_build(const PlanStateCsd *s)
+{
+    if(s->graph_build_at==s->graph_build_end[s->graph_init]) {
+        if(s->graph_node==s->graph_sort_node) return GRAPH_PIPELINE_SORT;
+        if(s->plan->nodes[s->graph_node].kind==QP_SET) return GRAPH_PIPELINE_SET;
+        return GRAPH_PIPELINE_GROUP;
+    }
+    switch(s->plan->nodes[s->graph_build_nodes[s->graph_build_at]].kind) {
+        case QP_AGGREGATE: return GRAPH_PIPELINE_RESERVE_INPUT;
+        case QP_MATERIALIZED: return GRAPH_PIPELINE_MATERIALIZE;
+        default: return GRAPH_PIPELINE_BUILD;
+    }
+}
+
+/* Describe the stream workers before the coordinator allocates their state.
+ * The same route is returned in scan_node when the workers are ready. */
+static unsigned graph_worker_route(const PlanStateCsd *s,enum graph_phase phase,unsigned target)
+{
+    const struct qp_plan *p=s->plan;
+    const struct qp_node *sink=&p->nodes[target];
+    int root=phase==GRAPH_PIPELINE_BUILD?sink->right:sink->left;
+    int source=qp_pipeline_source(p,root);
+    if(source<0) return 0;
+    bool external=false;
+    for(int id=root;id!=source;id=p->nodes[id].left)
+        if(s->graph_external[id]) { source=id; external=true; break; }
+    const struct qp_node *input=&p->nodes[source],*producer=&p->nodes[root];
+    bool sort=phase==GRAPH_PIPELINE_SORT;
+    bool set=phase==GRAPH_PIPELINE_SET;
+    bool build=phase==GRAPH_PIPELINE_BUILD;
+    unsigned flags=QP_GRAPH_BLOCK_SCAN|QP_GRAPH_BLOCK_STREAM;
+    if(build) flags|=QP_GRAPH_BLOCK_BUILD;
+    if(phase==GRAPH_PIPELINE_PARTITION) flags|=QP_GRAPH_BLOCK_PARTITION;
+    if(external) flags|=QP_GRAPH_BLOCK_EXTERNAL;
+    if(sort) flags|=QP_GRAPH_BLOCK_SORT;
+    if(set) flags|=QP_GRAPH_BLOCK_SET;
+    if(!graph_heap_leaf(input)) {
+        /* Sort consumes a finalized aggregate through the tail graph. */
+        if(sort && producer->kind==QP_AGGREGATE) return source+1;
+        if(set) return 0;
+        flags|=QP_GRAPH_BLOCK_DEVICE_SOURCE;
+    }
+    if(root!=source) {
+        if(graph_heap_leaf(input) && !sort && producer->left==source && producer->kind==QP_JOIN)
+            flags|=QP_GRAPH_BLOCK_PROBE;
+        else if(graph_heap_leaf(input) && !sort && producer->left==source && producer->kind==QP_INDEX_JOIN)
+            flags|=QP_GRAPH_BLOCK_INDEX;
+        else {
+            unsigned count=0;
+            for(int at=root;at!=source;at=p->nodes[at].left)
+                if(at<0 || ++count>QP_GRAPH_BLOCK_MAX_CHAIN || !p->nodes[at].expr.nout) return 0;
+            flags|=QP_GRAPH_BLOCK_CHAIN;
+        }
+    }
+    if(flags&(QP_GRAPH_BLOCK_CHAIN|QP_GRAPH_BLOCK_DEVICE_SOURCE))
+        flags|=(root+1)<<QP_GRAPH_BLOCK_ROOT_SHIFT;
+    return (source+1)|flags;
+}
+
+static bool graph_request(PlanStateCsd *s,CsComputeRequest *compute,bool loaded)
 {
     unsigned id=s->graph_node;
     enum graph_phase phase=s->graph_phase;
-    bool root=id==s->plan->root;
-    if(phase==GRAPH_PIPELINE_BUILD || phase==GRAPH_PIPELINE_GROUP) {
-        compute->CSFId=phase==GRAPH_PIPELINE_BUILD?s->graph_build:s->graph_feed;
-        uint64_t parameter=s->profiling|((uint64_t)id<<QP_GRAPH_PIPELINE_NODE_SHIFT);
+    if(phase==GRAPH_PIPELINE_SCAN) {
+        const struct qp_node *root=&s->plan->nodes[id];
+        unsigned route=(id+1)|QP_GRAPH_BLOCK_SCAN|QP_GRAPH_BLOCK_STREAM;
+        if(root->ordered_index)
+            route|=QP_GRAPH_BLOCK_DEVICE_SOURCE|((id+1)<<QP_GRAPH_BLOCK_ROOT_SHIFT);
+        uint64_t parameter=s->profiling|graph_coordinator_flags(s)|
+            ((uint64_t)id<<QP_GRAPH_PIPELINE_NODE_SHIFT)|
+            ((uint64_t)route<<QP_GRAPH_PIPELINE_ROUTE_SHIFT)|
+            ((uint64_t)(qp_sort_depth(s->plan,id)+2)<<QP_GRAPH_PIPELINE_BUDGET_SHIFT);
+        compute->CSFId=s->graph_scan_wave;
+        csHelperSetComputeArg(&compute->Args[5],CS_64BIT_VALUE_TYPE,(u64)parameter);
+        return true;
+    }
+    bool input_stage=phase==GRAPH_PIPELINE_BUILD || phase==GRAPH_PIPELINE_PARTITION ||
+        phase==GRAPH_PIPELINE_RESERVE_INPUT ||
+        phase==GRAPH_PIPELINE_GROUP_INPUT;
+    if(phase==GRAPH_PIPELINE_RESERVE || input_stage ||
+       phase==GRAPH_PIPELINE_GROUP || phase==GRAPH_PIPELINE_SET || phase==GRAPH_PIPELINE_SORT) {
+        compute->CSFId=phase==GRAPH_PIPELINE_RESERVE || phase==GRAPH_PIPELINE_RESERVE_INPUT?
+            s->graph_reserve:(phase==GRAPH_PIPELINE_BUILD || phase==GRAPH_PIPELINE_PARTITION)?s->graph_build:
+            phase==GRAPH_PIPELINE_SORT?s->graph_sort:
+            phase==GRAPH_PIPELINE_SET?s->graph_set:s->graph_group;
+        unsigned target=input_stage?s->graph_build_nodes[s->graph_build_at]:
+            phase==GRAPH_PIPELINE_SORT?s->graph_sort_node:id;
+        uint64_t parameter=s->profiling|((uint64_t)target<<QP_GRAPH_PIPELINE_NODE_SHIFT);
+        if(phase!=GRAPH_PIPELINE_RESERVE && phase!=GRAPH_PIPELINE_RESERVE_INPUT)
+            parameter|=(uint64_t)graph_worker_route(s,phase,target)<<QP_GRAPH_PIPELINE_ROUTE_SHIFT;
+        parameter|=(uint64_t)(qp_sort_depth(s->plan,s->plan->root)+2)<<QP_GRAPH_PIPELINE_BUDGET_SHIFT;
         if(loaded) parameter|=QP_PAGES_INPUT;
         parameter|=graph_coordinator_flags(s);
         csHelperSetComputeArg(&compute->Args[5],CS_64BIT_VALUE_TYPE,(u64)parameter);
-        return;
+        return true;
     }
-    int child=graph_child(s,id,phase);
-    CS_MEM_HANDLE output=root?s->memory[2]:s->graph[id].packet;
-    CS_MEM_HANDLE input=child>=0?s->graph[child].packet:s->graph_eof;
-    uint64_t parameter=s->profiling;
-    compute->NumArgs=6;
-    if(graph_building(phase)) {
-        compute->CSFId=s->graph_build;
-        csHelperSetComputeArg(&compute->Args[2],CS_AFDM_TYPE,input,0UL);
-        parameter|=(uint64_t)id<<QP_GRAPH_HASH_NODE_SHIFT;
-        if(phase==GRAPH_BUILD_LEFT) parameter|=QP_GRAPH_HASH_LEFT;
-    } else {
-        parameter|=(uint64_t)id<<QP_GRAPH_SOURCE_NODE_SHIFT;
-        if(root) parameter|=QP_GRAPH_HOST_OUTPUT;
-        if(s->graph_init<s->plan->ninit && id==graph_root(s)) parameter|=QP_GRAPH_INIT_OUTPUT;
-        if(loaded) parameter|=QP_GRAPH_SOURCE_PAGES;
-        if(graph_sourcing(phase)) {
-            compute->CSFId=s->graph_source;
-            if(!root) {
-                csHelperSetComputeArg(&compute->Args[4],CS_AFDM_TYPE,output,0UL);
-                csHelperSetComputeArg(&compute->Args[5],CS_AFDM_TYPE,s->memory[4],0UL);
-                compute->NumArgs=7;
-            }
-        } else {
-            compute->CSFId=phase==GRAPH_FEED?s->graph_feed:s->graph_probe;
-            csHelperSetComputeArg(&compute->Args[2],CS_AFDM_TYPE,output,0UL);
-            csHelperSetComputeArg(&compute->Args[4],CS_AFDM_TYPE,input,0UL);
-            csHelperSetComputeArg(&compute->Args[5],CS_AFDM_TYPE,s->memory[4],0UL);
-            compute->NumArgs=7;
-        }
+    if(phase==GRAPH_PIPELINE_INIT_RESULT) {
+        compute->CSFId=s->graph_init_result;
+        uint64_t parameter=s->profiling|QP_GRAPH_INIT_OUTPUT|((uint64_t)id<<QP_GRAPH_SOURCE_NODE_SHIFT);
+        csHelperSetComputeArg(&compute->Args[5],CS_64BIT_VALUE_TYPE,(u64)parameter);
+        return true;
     }
-    csHelperSetComputeArg(&compute->Args[compute->NumArgs-1],CS_64BIT_VALUE_TYPE,(u64)parameter);
+    if(phase==GRAPH_PIPELINE_TAIL && s->plan->nodes[s->plan->root].kind!=QP_LIMIT) {
+        compute->CSFId=s->graph_result;
+        uint64_t parameter=s->profiling|QP_GRAPH_HOST_OUTPUT|
+            ((uint64_t)s->plan->root<<QP_GRAPH_SOURCE_NODE_SHIFT);
+        csHelperSetComputeArg(&compute->Args[5],CS_64BIT_VALUE_TYPE,(u64)parameter);
+        return true;
+    }
+    return false;
 }
 static void start(PlanStateCsd *s)
 {
@@ -737,35 +787,37 @@ static void start(PlanStateCsd *s)
     }
     if(!device) elog(ERROR,"CSD PG Plan has no prepared relation");
     memset(s->graph,0,sizeof(s->graph));
-    s->graph_tree=s->graph_partition=false;
-    s->graph_phase=GRAPH_NATIVE; s->graph_nodes=s->graph_init=0;
-    s->graph_packets=s->graph_build_packets=0;
-    s->graph_pipeline_group=0; s->graph_waves=false;
+    memset(s->graph_external,0,sizeof(s->graph_external));
+    s->graph_tail_serial=false;
+    s->graph_phase=GRAPH_NATIVE; s->graph_init=0;
+    s->graph_pipeline_group=0; s->graph_waves=false; s->graph_scan=false;
+    s->graph_build_at=s->graph_build_count=0;
     if(pg_sina_operator_graph) {
         if(start_operator_graph(s)) return;
         s->graph_waves=true;
-        s->graph_pipeline_group=graph_pipeline_group(s->plan);
-        if(s->graph_pipeline_group) {
-            s->graph_node=s->graph_pipeline_group-1;
-            s->graph_phase=GRAPH_PIPELINE_BUILD;
+        s->graph_scan=s->async_scan;
+        if(s->graph_scan) {
+            s->graph_node=s->plan->root;
+            s->graph_phase=GRAPH_PIPELINE_SCAN;
         } else {
-            bool heap=false;
-            for(unsigned i=0;i<s->plan->count;++i)
-                heap|=s->plan->nodes[i].kind==QP_SCAN && !s->plan->nodes[i].ordered_index;
-            if(!heap) {
-                s->graph_waves=false;
-                for(unsigned i=0;i<s->plan->ninit;++i)
-                    if(!graph_prepare(s,s->plan->init_nodes[i]))
-                        elog(ERROR,"unsupported InitPlan for the experimental CSD operator graph");
-                if(!graph_prepare(s,s->plan->root))
-                    elog(ERROR,"unsupported plan for the experimental CSD operator graph");
-                s->graph_tree=true;
-                graph_pick(s,graph_root(s));
-            }
+            struct graph_schedule schedule={0};
+            s->graph_pipeline_group=graph_pipeline_group(s->plan,&schedule);
+            if(!s->graph_pipeline_group)
+                elog(ERROR,"unsupported plan for the experimental CSD operator graph");
+            s->graph_build_count=schedule.count;
+            s->graph_sort_node=schedule.sort;
+            memcpy(s->graph_build_nodes,schedule.nodes,sizeof(schedule.nodes));
+            memcpy(s->graph_build_end,schedule.end,sizeof(schedule.end));
+            s->graph_node=s->plan->ninit?(unsigned)s->plan->init_nodes[0]:s->graph_pipeline_group-1;
+            s->graph_phase=s->plan->nodes[s->graph_node].kind==QP_AGGREGATE?GRAPH_PIPELINE_RESERVE:graph_next_build(s);
         }
     }
-    s->graph_stream_waves=s->graph_waves && (s->graph_pipeline_group || graph_stream_index_group(s->plan));
-    s->graph_resident_text=s->graph_waves && !s->graph_stream_waves && resident_graph_text(s->plan);
+    s->graph_stream_waves=s->graph_waves;
+    for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].keep_even_column) {
+        if(!s->graph_pipeline_group || !s->graph_stream_waves)
+            elog(ERROR,"KeepEven requires a streaming CSD aggregate pipeline");
+        s->graph_keep_even=pg_sina_function("pg_sina_graph_keep_even");
+    }
     pg_sina_read_resources(device);
     size_t parameter_bytes=qp_host_parameter_bytes(s->plan);
     size_t plan_bytes=sizeof(*s->plan)+parameter_bytes;
@@ -795,17 +847,16 @@ static void start(PlanStateCsd *s)
     qp_dictionary_size(s->plan,&entries,&data);
     bool indexed[QP_NODES]={0};
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].kind==QP_INDEX_JOIN) indexed[s->plan->nodes[i].right]=true;
-    if(s->graph_tree) {
-        /* Scan morsels are independent producers once the fused native
-         * pipeline is split into graph stages. Keep their CU wave. */
-        for(unsigned i=0;i<s->plan->count;++i) {
-            s->plan->nodes[i].parallel=0;
-            if(s->graph[i].phase==GRAPH_SOURCE && s->plan->nodes[i].kind==QP_SCAN)
-                qp_mark_parallel(s->plan,i);
+    qp_parallel_boundaries(s->plan,s->plan->root);
+    for(unsigned i=0;i<s->plan->ninit;++i) qp_parallel_boundaries(s->plan,s->plan->init_nodes[i]);
+    if(s->graph_pipeline_group) for(unsigned i=0;i<s->plan->count;++i) {
+        const struct qp_node *node=&s->plan->nodes[i];
+        if(node->kind==QP_SET) s->plan->nodes[node->left].parallel=1;
+        if(node->kind==QP_SORT || node->kind==QP_AGGREGATE) {
+            int source=qp_pipeline_source(s->plan,node->left);
+            if(source>=0 && s->plan->nodes[source].kind==QP_CTE_SCAN)
+                s->plan->nodes[node->left].parallel=1;
         }
-    } else {
-        qp_parallel_boundaries(s->plan,s->plan->root);
-        for(unsigned i=0;i<s->plan->ninit;++i) qp_parallel_boundaries(s->plan,s->plan->init_nodes[i]);
     }
     bool parallel=false;
     for(unsigned i=0;i<s->plan->count;++i) if(s->plan->nodes[i].parallel) parallel=true;
@@ -817,7 +868,10 @@ static void start(PlanStateCsd *s)
     unsigned streams=device_streams(stmt->planTree); ListCell *subplan;
     foreach(subplan,stmt->subplans) streams+=device_streams(lfirst(subplan));
     if(!streams) streams=1;
-    if(s->workers<=1) s->workers=0;
+    if(s->graph_scan) {
+        const struct qp_node *scan=&s->plan->nodes[s->plan->root];
+        if(!s->workers || (scan->ordered_index && !(scan->ordered_index&8))) s->workers=1;
+    } else if(s->workers<=1) s->workers=0;
     s->plan->scan_bytes=QS_CHUNK;
     s->prefetch_build=s->prefetch_reused=0; s->prefetch_waited=s->prefetch_claimed=false;
     /* An explicit scan graph owns its LOAD. Preloading a probe block would
@@ -826,17 +880,16 @@ static void start(PlanStateCsd *s)
     bool reserve_prefetch=probe!=0;
     atomic_init(&s->prefetch_done,false);
     size_t arena,sizes[5];
-    unsigned graph_buffers=s->graph_tree?s->graph_nodes-1+s->graph_partition:0;
     bool has_index_join=false;
     for(unsigned i=0;i<s->plan->count;++i) has_index_join|=s->plan->nodes[i].kind==QP_INDEX_JOIN;
     s->plan->index_cache_bytes=has_index_join?(uint64_t)pg_sina_index_cache_mib*1024*1024:0;
     CsMemFlags flags={.FDMId=1};
     for(;;) {
         arena=layout_buffers(s,indexed);
-        size_t needed=arena+plan_bytes+(s->workers+1)*(sizeof(struct qp_control)+sizeof(*s->result)+QS_SORT_IO_BYTES)+graph_buffers*sizeof(*s->result)+65536;
+        size_t needed=arena+plan_bytes+(s->workers+1)*(sizeof(struct qp_control)+sizeof(*s->result)+QS_SORT_IO_BYTES)+65536;
         /* Keep 4 MiB inputs. Independent HOST scans share the FDM budget. */
-        if(capacity && needed>capacity/streams && s->workers) {
-            if(--s->workers==1) s->workers=0;
+        if(capacity && needed>capacity/streams && s->workers>(unsigned)s->graph_scan) {
+            if(--s->workers==1 && !s->graph_scan) s->workers=0;
             continue;
         }
         s->plan->prefetch_node=s->plan->prefetch_slots=0;
@@ -857,18 +910,7 @@ static void start(PlanStateCsd *s)
             status=csAllocMem(s->device,sizes[i],&flags,&s->memory[i],NULL);
         for(unsigned w=0;w<s->workers && status==CS_SUCCESS;++w)
             status=csAllocMem(s->device,QS_SORT_IO_BYTES,&flags,&s->worker_io[w],NULL);
-        if(s->graph_tree) {
-            for(unsigned id=0;id<s->plan->count && status==CS_SUCCESS;++id)
-                if(id!=s->plan->root && s->graph[id].phase)
-                    status=csAllocMem(s->device,sizeof(*s->result),&flags,&s->graph[id].packet,NULL);
-            if(status==CS_SUCCESS && s->graph_partition)
-                status=csAllocMem(s->device,sizeof(*s->result),&flags,&s->graph_eof,NULL);
-        }
         if(status==CS_SUCCESS) break;
-        if(s->graph_eof) { csFreeMem(s->graph_eof,&flags); s->graph_eof=NULL; }
-        for(unsigned id=0;id<s->plan->count;++id) if(s->graph[id].packet) {
-            csFreeMem(s->graph[id].packet,&flags); s->graph[id].packet=NULL;
-        }
         /* Concurrent HOST join inputs share physical AFDM. Retry a smaller
          * layout using actual allocation failure, not a fixed node quota. */
         for(unsigned i=0;i<5;++i) if(s->memory[i]) {
@@ -879,19 +921,18 @@ static void start(PlanStateCsd *s)
         }
         if(status!=CS_NOT_ENOUGH_MEMORY && status!=CS_OUT_OF_RESOURCES) checked(status,"allocate AFDM");
         if(s->plan->prefetch_slots) { reserve_prefetch=false; continue; }
-        if(s->workers) { if(--s->workers==1) s->workers=0; continue; }
+        if(s->workers>(unsigned)s->graph_scan) {
+            if(--s->workers==1 && !s->graph_scan) s->workers=0;
+            continue;
+        }
         checked(status,"allocate AFDM");
     }
-    s->fdm_bytes=s->workers*QS_SORT_IO_BYTES+graph_buffers*sizeof(*s->result);
-    if(s->graph_eof) {
-        struct { int status; unsigned rows,begin,finished; } eof={.finished=1};
-        checked(transfer(s->graph_eof,0,&eof,sizeof(eof),true),"initialize graph EOF");
-    }
+    s->fdm_bytes=s->workers*QS_SORT_IO_BYTES;
     for(unsigned i=0;i<5;++i) s->fdm_bytes+=sizes[i];
     /* Independent unordered scans return CU batches directly. The same
      * AFDM allocation/layout is retained; no input is shared across scans. */
     const struct qp_node *root=&s->plan->nodes[s->plan->root];
-    if(!s->graph_tree && s->async_scan && s->workers>1 && !s->plan->ninit && !root->ordered_index)
+    if(s->graph_scan || (s->async_scan && s->workers>1 && !s->plan->ninit && !root->ordered_index))
         s->plan->packed_result=QP_DIRECT_RESULT;
     else s->plan->packed_result=QP_TYPED_RESULT;
     checked(transfer(s->memory[0],0,s->plan,sizeof(*s->plan),true),"copy plan");
@@ -912,7 +953,15 @@ static void start(PlanStateCsd *s)
     }
     for(unsigned w=0;w<s->workers;++w)
         checked(transfer(s->memory[1],(w+1)*sizeof(struct qp_control),&s->slots[w+1].control,sizeof(struct qp_control),true),"initialize worker control");
-    s->function=pg_sina_function((s->graph_tree || s->graph_waves)?"pg_sina_graph_continue":"pg_sina_plan"); s->active=true;
+    s->function=pg_sina_function(s->graph_waves?"pg_sina_graph_query_close":"pg_sina_plan");
+    if(s->graph_scan) {
+        s->graph_scan_wave=pg_sina_function("pg_sina_graph_scan_wave");
+        s->graph_scan_drain=pg_sina_function("pg_sina_graph_scan_drain");
+        s->graph_block[BLOCK_HOST_OUTPUT]=pg_sina_function("pg_sina_graph_scan_output");
+    }
+    if(s->graph_pipeline_group)
+        s->graph_combine=pg_sina_function("pg_sina_graph_aggregate_combine");
+    s->active=true;
     size_t size=sizeof(CsBatchRequest)+6*sizeof(CsComputeArg); CsBatchRequest *request=palloc0(size);
     request->ReqType=CS_QUEUE_COMPUTE; request->u.Compute.CSFId=s->function; request->u.Compute.NumArgs=6;
     for(unsigned i=0;i<5;++i) csHelperSetComputeArg(&request->u.Compute.Args[i],CS_AFDM_TYPE,s->memory[i],0UL);
@@ -920,6 +969,8 @@ static void start(PlanStateCsd *s)
         struct plan_slot *slot=&s->slots[w];
         if(pthread_mutex_init(&slot->mutex,NULL)) elog(ERROR,"cannot initialize CSD submission lock");
         slot->mutex_ready=true; slot->owner=s; slot->worker=w;
+        request->u.Compute.CSFId=w && s->graph_scan?s->graph_scan_drain:
+            w && s->graph_pipeline_group?s->graph_combine:s->function;
         /* FEMU compute ranges start at zero; each CU needs its own spill AFDM. */
         csHelperSetComputeArg(&request->u.Compute.Args[4],CS_AFDM_TYPE,w?s->worker_io[w-1]:s->memory[4],0UL);
         csHelperSetComputeArg(&request->u.Compute.Args[5],CS_64BIT_VALUE_TYPE,(u64)(s->profiling|(w<<1)|(w?0:graph_coordinator_flags(s))));
@@ -927,14 +978,22 @@ static void start(PlanStateCsd *s)
         CS_BATCH_INDEX index; checked(csConfigureBatchEntry(s->slots[w].batch,CS_BATCH_ADD,request,0,0,&index),"configure batch");
         atomic_init(&s->slots[w].completed,false); s->slots[w].profiling=s->profiling;
     }
-    if(s->graph_tree) {
-        s->graph_source=pg_sina_function("pg_sina_graph_source");
-        s->graph_build=pg_sina_function("pg_sina_graph_hash_build");
-        s->graph_probe=pg_sina_function("pg_sina_graph_hash_probe");
-        s->graph_feed=pg_sina_function("pg_sina_graph_feed");
-    } else if(s->graph_pipeline_group) {
-        s->graph_build=pg_sina_function("pg_sina_graph_build_pipeline");
-        s->graph_feed=pg_sina_function("pg_sina_graph_group_pipeline");
+    if(s->graph_pipeline_group) {
+        s->graph_reserve=pg_sina_function("pg_sina_graph_aggregate_reserve");
+        s->graph_build=pg_sina_function("pg_sina_graph_hash_wave");
+        s->graph_partition_reload=pg_sina_function("pg_sina_graph_partition_reload");
+        s->graph_partition_probe=pg_sina_function("pg_sina_graph_partition_probe");
+        s->graph_group=pg_sina_function("pg_sina_graph_aggregate_wave");
+        s->graph_set=pg_sina_function("pg_sina_graph_set_wave");
+        s->graph_materialize=pg_sina_function("pg_sina_graph_cte_materialize");
+        s->graph_sort=pg_sina_function("pg_sina_graph_sort_wave");
+        s->graph_init_result=pg_sina_function("pg_sina_graph_aggregate_result");
+        s->graph_result=pg_sina_function(s->graph_sort_node==QP_NODES?
+            "pg_sina_graph_aggregate_result":"pg_sina_graph_sort_result");
+        s->graph_tail[0]=pg_sina_function("pg_sina_graph_aggregate_source");
+        s->graph_tail[1]=pg_sina_function("pg_sina_graph_sort_sink");
+        s->graph_tail[2]=pg_sina_function("pg_sina_graph_sort_source");
+        s->graph_tail[3]=pg_sina_function("pg_sina_graph_limit");
     }
     if(s->graph_waves) {
         s->graph_block[BLOCK_SCAN]=pg_sina_function("pg_sina_graph_block_scan");
@@ -946,9 +1005,11 @@ static void start(PlanStateCsd *s)
         s->graph_block[BLOCK_HASH]=pg_sina_function("pg_sina_graph_block_hash_build");
         s->graph_block[BLOCK_SORT]=pg_sina_function("pg_sina_graph_block_sort");
         s->graph_block[BLOCK_PARTITION]=pg_sina_function("pg_sina_graph_block_partition");
+        s->graph_block[BLOCK_SET]=pg_sina_function("pg_sina_graph_block_set");
+        s->graph_block[BLOCK_CTE_SCAN]=pg_sina_function("pg_sina_graph_cte_scan");
     }
     pfree(request); s->started=true;
-    if(s->async_scan || s->graph_tree) {
+    if(s->async_scan) {
         if(!s->delivery) initialize_delivery(s,NULL);
         struct result_delivery *q=s->delivery;
         q->fdm_bytes=s->fdm_bytes; q->workers=s->workers;
@@ -1029,18 +1090,25 @@ static CS_STATUS queue_scan(struct plan_slot *slot)
     CsBatchRequest *compute=calloc(1,sizeof(*compute)+6*sizeof(CsComputeArg));
     CS_STATUS status=CS_OUT_OF_RESOURCES;
     if(!load || !compute) goto done;
-    bool reuse=needs_load && slot->resume && slot->scan_load &&
-        slot->batch_block_flags==slot->block_flags && slot->batch_block_root==slot->block_root;
     bool block=slot->block_flags&QP_GRAPH_BLOCK_SCAN;
     bool probe=slot->block_flags&(QP_GRAPH_BLOCK_PROBE|QP_GRAPH_BLOCK_INDEX);
     bool chain=slot->block_flags&QP_GRAPH_BLOCK_CHAIN;
     bool stream=slot->block_flags&QP_GRAPH_BLOCK_STREAM;
+    bool filter=!stream || n->expr.predicate>=0 || n->keep_even_column;
+    bool reuse=needs_load && slot->resume && slot->scan_load && slot->batch_has_filter==filter &&
+        slot->batch_block_flags==slot->block_flags && slot->batch_block_root==slot->block_root;
+    unsigned scan_steps=1+filter;
+    if(s->graph_pipeline_group && (!block || !stream)) {
+        status=CS_UNSUPPORTED;
+        goto done;
+    }
     unsigned ops[QP_GRAPH_BLOCK_MAX_CHAIN],count=0;
     if(chain)
         for(int id=slot->block_root;id!=(int)node;id=s->plan->nodes[id].left) {
             if(id<0 || (unsigned)id>=s->plan->count || count==lengthof(ops)) { status=CS_INVALID_ARG; goto done; }
             ops[count++]=id;
         }
+    unsigned block_steps=scan_steps+1+(chain?count:probe);
     if(slot->resume && !reuse) {
         status=csFreeBatchRequest(slot->resume); if(status!=CS_SUCCESS) goto done;
         slot->resume=NULL;
@@ -1049,7 +1117,8 @@ static CS_STATUS queue_scan(struct plan_slot *slot)
         slot->scan_load=0;
         slot->batch_block_flags=slot->block_flags;
         slot->batch_block_root=slot->block_root;
-        unsigned entries=(needs_load?1:0)+(block?3+(chain?count:probe):1);
+        slot->batch_has_filter=filter;
+        unsigned entries=(needs_load?1:0)+(block?block_steps:1);
         status=csAllocBatchRequest(CS_BATCH_SERIAL,entries,&slot->resume);
         if(status!=CS_SUCCESS) goto done;
     }
@@ -1072,19 +1141,20 @@ static CS_STATUS queue_scan(struct plan_slot *slot)
     uint64_t parameter=s->profiling|(worker<<1)|QP_SCAN_INPUT|((offset/QS_PAGE)<<QP_SCAN_PAGE_SHIFT);
     csHelperSetComputeArg(&compute->u.Compute.Args[5],CS_64BIT_VALUE_TYPE,(u64)parameter);
     if(block) {
-        unsigned steps=3+(chain?count:probe);
-        for(unsigned i=0;i<steps;++i) {
+        for(unsigned i=0;i<block_steps;++i) {
             unsigned step;
             uint64_t args=parameter;
-            if(i<2) step=i;
-            else if(i+1==steps) {
-                if(slot->block_flags&QP_GRAPH_BLOCK_BUILD) step=BLOCK_HASH;
+            if(i<scan_steps) step=i;
+            else if(i+1==block_steps) {
+                if(s->graph_scan) step=BLOCK_HOST_OUTPUT;
+                else if(slot->block_flags&QP_GRAPH_BLOCK_SET) step=BLOCK_SET;
+                else if(slot->block_flags&QP_GRAPH_BLOCK_BUILD) step=BLOCK_HASH;
                 else if(slot->block_flags&QP_GRAPH_BLOCK_PARTITION) step=BLOCK_PARTITION;
                 else if(slot->block_flags&QP_GRAPH_BLOCK_SORT) step=BLOCK_SORT;
                 else step=BLOCK_GROUP;
             }
             else if(chain) {
-                unsigned id=ops[count-1-(i-2)];
+                unsigned id=ops[count-1-(i-scan_steps)];
                 switch(s->plan->nodes[id].kind) {
                     case QP_JOIN: step=BLOCK_PROBE; break;
                     case QP_INDEX_JOIN: step=BLOCK_INDEX; break;
@@ -1093,7 +1163,10 @@ static CS_STATUS queue_scan(struct plan_slot *slot)
                 }
                 args|=(uint64_t)(id+1)<<QP_GRAPH_BLOCK_NODE_SHIFT;
             } else step=(slot->block_flags&QP_GRAPH_BLOCK_INDEX)?BLOCK_INDEX:BLOCK_PROBE;
-            compute->u.Compute.CSFId=s->graph_block[step];
+            if(step==BLOCK_FILTER && n->keep_even_column) {
+                compute->u.Compute.CSFId=s->graph_keep_even;
+                args=s->profiling|(worker<<1)|((uint64_t)n->keep_even_column<<QP_GRAPH_BLOCK_NODE_SHIFT);
+            } else compute->u.Compute.CSFId=s->graph_block[step];
             csHelperSetComputeArg(&compute->u.Compute.Args[5],CS_64BIT_VALUE_TYPE,(u64)args);
             status=csConfigureBatchEntry(slot->resume,reuse?CS_BATCH_RECONFIG:CS_BATCH_ADD,compute,
                 reuse?slot->block_entries[i]:0,reuse?0:previous,reuse?NULL:&slot->block_entries[i]);
@@ -1186,18 +1259,144 @@ static CS_STATUS load_pages(PlanStateCsd *s,unsigned worker)
 }
 /* The completed batch no longer owns its snapshot. Keep one fresh LOAD ->
  * compute batch per continuation; the slot mutex protects cancellation. */
+static CS_STATUS queue_pipeline_tail(struct plan_slot *slot)
+{
+    PlanStateCsd *s=slot->owner;
+    unsigned worker=slot->worker;
+    enum graph_phase phase=s->graph_phase;
+    CS_BATCH_HANDLE *batch=worker?&slot->sort_batch:&s->graph[s->graph_node].batches[phase];
+    if(!*batch) {
+        bool serial=!worker && s->graph_tail_serial;
+        unsigned count=serial && phase==GRAPH_PIPELINE_TAIL?4:2;
+        CS_STATUS status=csAllocBatchRequest(CS_BATCH_SERIAL,count,batch);
+        if(status!=CS_SUCCESS) return status;
+        unsigned limit=s->plan->root,sort=s->graph_sort_node;
+        unsigned nodes[]={s->graph_node,sort,sort,limit};
+        bool materialize=phase==GRAPH_PIPELINE_MATERIALIZE;
+        if(materialize) {
+            nodes[1]=s->graph_build_nodes[s->graph_build_at];
+            nodes[0]=s->plan->nodes[nodes[1]].left;
+        }
+        size_t size=sizeof(CsBatchRequest)+6*sizeof(CsComputeArg);
+        CsBatchRequest *request=calloc(1,size);
+        if(!request) return CS_OUT_OF_RESOURCES;
+        request->ReqType=CS_QUEUE_COMPUTE;
+        request->u.Compute.NumArgs=6;
+        for(unsigned i=0;i<5;++i)
+            csHelperSetComputeArg(&request->u.Compute.Args[i],CS_AFDM_TYPE,s->memory[i],0UL);
+        if(worker)
+            csHelperSetComputeArg(&request->u.Compute.Args[4],CS_AFDM_TYPE,s->worker_io[worker-1],0UL);
+        CS_BATCH_INDEX prev=0;
+        unsigned first=worker || serial || materialize?0:2;
+        for(unsigned i=first;i<first+count && status==CS_SUCCESS;++i) {
+            CS_BATCH_INDEX entry;
+            request->u.Compute.CSFId=materialize && i==1?s->graph_materialize:s->graph_tail[i];
+            csHelperSetComputeArg(&request->u.Compute.Args[5],CS_64BIT_VALUE_TYPE,
+                (u64)(s->profiling|(worker<<1)|((uint64_t)nodes[i]<<QP_GRAPH_PIPELINE_NODE_SHIFT)));
+            status=csConfigureBatchEntry(*batch,CS_BATCH_ADD,request,0,prev,&entry);
+            if(status==CS_SUCCESS && (i==1 || i==3))
+                status=csConfigureBatchEntry(*batch,CS_BATCH_STREAM_LINK,NULL,entry,prev,NULL);
+            if(status==CS_SUCCESS) prev=entry;
+        }
+        free(request);
+        if(status!=CS_SUCCESS) return status;
+    }
+    slot->control_copied=false;
+    if(s->profiling) slot->queued_ns=clock_ns();
+    return csQueueBatchRequest(*batch,slot,completed,NULL,&slot->inflight,NULL);
+}
+static CS_STATUS queue_device_source_pipeline(struct plan_slot *slot)
+{
+    PlanStateCsd *s=slot->owner;
+    unsigned source=slot->scan_node-1, worker=slot->worker;
+    unsigned nodes[QP_GRAPH_BLOCK_MAX_CHAIN], count=0;
+    bool external=(slot->block_flags&QP_GRAPH_BLOCK_EXTERNAL)!=0;
+    bool filter=!external && s->plan->nodes[source].kind!=QP_AGGREGATE &&
+        s->plan->nodes[source].expr.predicate>=0;
+    unsigned source_steps=1+(external || filter);
+    for(int id=slot->block_root;id!=(int)source;id=s->plan->nodes[id].left) {
+        if(id<0 || (unsigned)id>=s->plan->count || count==lengthof(nodes)) return CS_INVALID_ARG;
+        nodes[count++]=id;
+    }
+    if(slot->resume) {
+        CS_STATUS status=csFreeBatchRequest(slot->resume);
+        if(status!=CS_SUCCESS) return status;
+        slot->resume=NULL;
+    }
+    slot->scan_load=0;
+    unsigned entries=count+source_steps+1;
+    CS_STATUS status=csAllocBatchRequest(CS_BATCH_SERIAL,entries,&slot->resume);
+    if(status!=CS_SUCCESS) return status;
+    CsBatchRequest *request=calloc(1,sizeof(*request)+6*sizeof(CsComputeArg));
+    if(!request) return CS_OUT_OF_RESOURCES;
+    request->ReqType=CS_QUEUE_COMPUTE;
+    request->u.Compute.NumArgs=6;
+    for(unsigned i=0;i<4;++i)
+        csHelperSetComputeArg(&request->u.Compute.Args[i],CS_AFDM_TYPE,s->memory[i],0UL);
+    csHelperSetComputeArg(&request->u.Compute.Args[4],CS_AFDM_TYPE,s->worker_io[worker-1],0UL);
+    CS_BATCH_INDEX prev=0;
+    for(unsigned i=0;i<entries && status==CS_SUCCESS;++i) {
+        uint64_t args=s->profiling|(worker<<1);
+        if(external && i<source_steps) {
+            request->u.Compute.CSFId=i?s->graph_partition_probe:s->graph_partition_reload;
+            args|=(uint64_t)source<<QP_GRAPH_PIPELINE_NODE_SHIFT;
+        } else if(!i) {
+            switch(s->plan->nodes[source].kind) {
+                case QP_AGGREGATE: request->u.Compute.CSFId=s->graph_tail[0]; break;
+                case QP_CTE_SCAN: request->u.Compute.CSFId=s->graph_block[BLOCK_CTE_SCAN]; break;
+                default: request->u.Compute.CSFId=s->graph_block[BLOCK_SCAN]; break;
+            }
+            args|=(uint64_t)source<<QP_GRAPH_PIPELINE_NODE_SHIFT;
+        } else if(filter && i==1) {
+            request->u.Compute.CSFId=s->graph_block[BLOCK_FILTER];
+        } else if(i+1==entries) {
+            unsigned step=s->graph_scan?BLOCK_HOST_OUTPUT:
+                (slot->block_flags&QP_GRAPH_BLOCK_BUILD)?BLOCK_HASH:
+                (slot->block_flags&QP_GRAPH_BLOCK_PARTITION)?BLOCK_PARTITION:
+                (slot->block_flags&QP_GRAPH_BLOCK_SORT)?BLOCK_SORT:BLOCK_GROUP;
+            request->u.Compute.CSFId=s->graph_block[step];
+        } else {
+            unsigned id=nodes[count-1-(i-source_steps)],step;
+            switch(s->plan->nodes[id].kind) {
+                case QP_JOIN: step=BLOCK_PROBE; break;
+                case QP_INDEX_JOIN: step=BLOCK_INDEX; break;
+                case QP_PROJECT: step=BLOCK_PROJECT; break;
+                default: free(request); return CS_INVALID_ARG;
+            }
+            request->u.Compute.CSFId=s->graph_block[step];
+            args|=(uint64_t)(id+1)<<QP_GRAPH_BLOCK_NODE_SHIFT;
+        }
+        csHelperSetComputeArg(&request->u.Compute.Args[5],CS_64BIT_VALUE_TYPE,(u64)args);
+        CS_BATCH_INDEX entry;
+        status=csConfigureBatchEntry(slot->resume,CS_BATCH_ADD,request,0,prev,&entry);
+        if(status==CS_SUCCESS && prev)
+            status=csConfigureBatchEntry(slot->resume,CS_BATCH_STREAM_LINK,NULL,entry,prev,NULL);
+        if(status==CS_SUCCESS) prev=entry;
+    }
+    free(request);
+    if(status!=CS_SUCCESS) return status;
+    slot->control_copied=false;
+    if(s->profiling) slot->queued_ns=clock_ns();
+    return csQueueBatchRequest(slot->resume,slot,completed,NULL,&slot->inflight,NULL);
+}
 static CS_STATUS queue_pages(struct plan_slot *slot)
 {
     PlanStateCsd *s=slot->owner; unsigned worker=slot->worker;
     CS_STATUS status; bool loaded=false;
     enum graph_phase phase=worker?GRAPH_NATIVE:s->graph_phase;
+    if(worker && (slot->block_flags&QP_GRAPH_BLOCK_DEVICE_SOURCE) &&
+       (!s->graph_scan || slot->need_input || !slot->control.output_rows))
+        return queue_device_source_pipeline(slot);
+    if(phase==GRAPH_PIPELINE_SORT_INPUT || phase==GRAPH_PIPELINE_MATERIALIZE ||
+       (phase==GRAPH_PIPELINE_TAIL && s->plan->nodes[s->plan->root].kind==QP_LIMIT) ||
+       (worker && s->graph_phase==GRAPH_PIPELINE_SORT && s->graph_node!=s->graph_sort_node))
+        return queue_pipeline_tail(slot);
     if(slot->resume) {
         status=csFreeBatchRequest(slot->resume); if(status!=CS_SUCCESS) return status;
         slot->resume=NULL;
     }
     slot->scan_load=0;
-    if(!graph_building(phase) &&
-       (slot->control.bytes || slot->control.index_nreads) && !slot->control.ready) {
+    if((slot->control.bytes || slot->control.index_nreads) && !slot->control.ready) {
         unsigned groups=1;
         for(unsigned j=1;j<slot->control.index_nreads;++j)
             groups+=slot->control.index_reads[j].slot!=slot->control.index_reads[j-1].slot+1;
@@ -1224,8 +1423,12 @@ static CS_STATUS queue_pages(struct plan_slot *slot)
         request->ReqType=CS_QUEUE_COMPUTE; request->u.Compute.CSFId=s->function; request->u.Compute.NumArgs=6;
         for(unsigned i=0;i<5;++i) csHelperSetComputeArg(&request->u.Compute.Args[i],CS_AFDM_TYPE,s->memory[i],0UL);
         csHelperSetComputeArg(&request->u.Compute.Args[4],CS_AFDM_TYPE,worker?s->worker_io[worker-1]:s->memory[4],0UL);
-        if(phase!=GRAPH_NATIVE) graph_request(s,&request->u.Compute,loaded);
-        else csHelperSetComputeArg(&request->u.Compute.Args[5],CS_64BIT_VALUE_TYPE,(u64)(s->profiling|(worker<<1)|(loaded?QP_PAGES_INPUT:0)|
+        if(phase!=GRAPH_NATIVE) {
+            if(!graph_request(s,&request->u.Compute,loaded)) {
+                free(request);
+                return CS_UNSUPPORTED;
+            }
+        } else csHelperSetComputeArg(&request->u.Compute.Args[5],CS_64BIT_VALUE_TYPE,(u64)(s->profiling|(worker<<1)|(loaded?QP_PAGES_INPUT:0)|
             (worker?0:graph_coordinator_flags(s))));
         CS_BATCH_INDEX index;
         status=csConfigureBatchEntry(slot->resume?slot->resume:*batch,CS_BATCH_ADD,request,0,slot->resume?slot->previous:0,&index);
@@ -1240,7 +1443,7 @@ static CS_STATUS submit(PlanStateCsd *s,unsigned worker)
     uint64_t started=s->profiling?clock_ns():0;
     struct plan_slot *slot=&s->slots[worker];
     slot->yielded=false;
-    bool assigned=slot->scan_node && slot->need_input;
+    bool assigned=slot->scan_node && slot->need_input && !(slot->block_flags&QP_GRAPH_BLOCK_DEVICE_SOURCE);
     if(assigned) {
         atomic_store_explicit(&slot->completed,false,memory_order_relaxed);
         pthread_mutex_lock(&slot->mutex);
@@ -1257,7 +1460,7 @@ static CS_STATUS submit(PlanStateCsd *s,unsigned worker)
         pthread_mutex_unlock(&slot->mutex);
         return status==CS_QUEUED?CS_SUCCESS:status;
     }
-    if(!worker && slot->control.available && (!s->graph_tree || s->graph_phase==GRAPH_SOURCE)) {
+    if(!worker && slot->control.available) {
         uint64_t written=s->profiling?clock_ns():0;
         CS_STATUS status=transfer(s->memory[1],offsetof(struct qp_control,available),&slot->control.available,sizeof(slot->control.available),true);
         if(status!=CS_SUCCESS) return status;
@@ -1305,30 +1508,6 @@ static CS_STATUS read_result(PlanStateCsd *s,unsigned worker,const struct qp_con
     if(s->profiling) s->result_read_ns+=clock_ns()-reading;
     return status;
 }
-static bool complete_graph_stage(PlanStateCsd *s,u64 value)
-{
-    if(value&QP_RESOURCE_WAIT) return true;
-    unsigned id=s->graph_node;
-    enum graph_phase phase=s->graph_phase;
-    struct graph_stage *stage=&s->graph[id];
-    int child=graph_child(s,id,phase);
-    if(graph_building(phase)) {
-        if(!(value&QP_INPUT_DRAINED) || (value&QP_GRAPH_HASH_MERGE_REQUIRED)) return false;
-        ++s->graph_build_packets;
-        if(value&QP_WORKER_FINISHED)
-            stage->phase=phase==GRAPH_BUILD_LEFT?GRAPH_PROBE_SPILL:GRAPH_PROBE;
-        else if(value&QP_GRAPH_HASH_NEEDS_LEFT)
-            stage->phase=GRAPH_BUILD_LEFT;
-        else if(s->graph[child].eof) return false;
-    } else if(value&(QP_OUTPUT_READY|QP_WORKER_FINISHED)) {
-        ++s->graph_packets;
-        stage->ready=true; stage->eof=(value&QP_WORKER_FINISHED)!=0;
-    }
-    if(child>=0 && (value&QP_INPUT_DRAINED)) s->graph[child].ready=s->graph[child].eof;
-    if(id==graph_root(s) && stage->eof && s->graph_init<s->plan->ninit) ++s->graph_init;
-    if(id!=s->plan->root || !stage->eof) graph_pick(s,graph_root(s));
-    return true;
-}
 static int advance(PlanStateCsd *s,struct qs_result *result)
 {
     bool direct=s->plan->packed_result==QP_DIRECT_RESULT;
@@ -1351,19 +1530,11 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
             s->pending_ns+=observed-slot->queued_ns; ++s->completions;
         }
         slot->pending=NULL;
-        bool staged=!w && s->graph_tree;
-        bool root_output=staged && s->graph_node==s->plan->root && !graph_building(s->graph_phase);
-        bool published=root_output && (value&(QP_OUTPUT_READY|QP_WORKER_FINISHED));
         if(w && slot->scan_node && status==CS_SUCCESS && !(value&QP_CONTROL_REQUIRED)) {
             slot->control.output_rows=value&QP_TYPED_OUTPUT?qp_output_rows(value):(value&QP_OUTPUT_READY)!=0;
             slot->control.output_strings=value&QP_TYPED_OUTPUT?qp_output_strings(value):0;
             slot->control.finished=(value&QP_WORKER_FINISHED)!=0;
             slot->need_input=(value&QP_INPUT_DRAINED)!=0;
-        } else if(staged && !graph_sourcing(s->graph_phase) && status==CS_SUCCESS &&
-                  !(value&QP_CONTROL_REQUIRED) && !published) {
-            /* An internal sink/probe acknowledges its device packet in the
-             * completion bits and never starts or drains a worker scan. */
-            slot->control.drained=0;
         } else {
             if(!slot->control_copied) {
                 uint64_t reading=s->profiling?clock_ns():0;
@@ -1374,7 +1545,7 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
             slot->control_copied=false;
         }
         if(!w) { memset(result,0,offsetof(struct qs_result,data)); result->str_bytes=0; }
-        if(status==CS_SUCCESS && ((!staged && (!w || direct)) || published) &&
+        if(status==CS_SUCCESS && (!w || direct) &&
            (slot->control.output_rows || slot->control.finished))
             status=read_result(s,w,&slot->control,result);
         if(s->profiling) s->completion_copy_ns+=clock_ns()-observed;
@@ -1384,7 +1555,9 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
                 "execute tree (worker=%u node=%u kind=%u device_error=%d completion=%llu graph=%u/%u)",
                 w,slot->control.error_node,slot->control.error_node<s->plan->count?
                 s->plan->nodes[slot->control.error_node].kind:0,
-                slot->control.error,(unsigned long long)value,staged?s->graph_node:0,staged?s->graph_phase:0);
+                slot->control.error,(unsigned long long)value,
+                s->graph_pipeline_group?s->graph_node:0,
+                s->graph_pipeline_group?s->graph_phase:0);
             return execution_failed(s,status,operation);
         }
         if(slot->resume) {
@@ -1413,13 +1586,49 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
             }
             continue;
         }
-        if(s->graph_pipeline_group && (value&QP_GRAPH_PHASE_DONE)) {
-            if(s->graph_phase==GRAPH_PIPELINE_BUILD) s->graph_phase=GRAPH_PIPELINE_GROUP;
-            else s->graph_phase=GRAPH_NATIVE;
+        if(s->graph_phase==GRAPH_PIPELINE_BUILD && (value&QP_GRAPH_HASH_NEEDS_LEFT)) {
+            CS_BATCH_HANDLE *batch=&s->graph[s->graph_node].batches[GRAPH_PIPELINE_BUILD];
+            if(*batch) { csFreeBatchRequest(*batch); *batch=NULL; }
+            s->graph_phase=GRAPH_PIPELINE_PARTITION;
+        } else if(s->graph_pipeline_group && (value&QP_GRAPH_PHASE_DONE)) {
+            if(s->graph_phase==GRAPH_PIPELINE_RESERVE) {
+                s->graph_phase=graph_next_build(s);
+            } else if(s->graph_phase==GRAPH_PIPELINE_BUILD || s->graph_phase==GRAPH_PIPELINE_PARTITION ||
+                      s->graph_phase==GRAPH_PIPELINE_RESERVE_INPUT ||
+                      s->graph_phase==GRAPH_PIPELINE_GROUP_INPUT ||
+                      s->graph_phase==GRAPH_PIPELINE_MATERIALIZE) {
+                enum graph_phase completed_phase=s->graph_phase;
+                if(completed_phase==GRAPH_PIPELINE_RESERVE_INPUT)
+                    s->graph_phase=GRAPH_PIPELINE_GROUP_INPUT;
+                else {
+                    if(completed_phase==GRAPH_PIPELINE_PARTITION)
+                        s->graph_external[s->graph_build_nodes[s->graph_build_at]]=true;
+                    ++s->graph_build_at; s->graph_phase=graph_next_build(s);
+                }
+                /* The target operator is bound in the cached request. */
+                CS_BATCH_HANDLE *batch=&s->graph[s->graph_node].batches[completed_phase];
+                if(*batch) { csFreeBatchRequest(*batch); *batch=NULL; }
+            } else if(s->graph_phase==GRAPH_PIPELINE_GROUP) {
+                s->graph_phase=s->graph_init<s->plan->ninit?GRAPH_PIPELINE_INIT_RESULT:
+                    s->graph_sort_node==QP_NODES?GRAPH_PIPELINE_TAIL:GRAPH_PIPELINE_SORT;
+            } else if(s->graph_phase==GRAPH_PIPELINE_SORT) {
+                s->graph_tail_serial=(value&QP_GRAPH_SERIAL_SORT)!=0;
+                s->graph_phase=s->graph_tail_serial && s->graph_sort_node==s->plan->root?
+                    GRAPH_PIPELINE_SORT_INPUT:GRAPH_PIPELINE_TAIL;
+            } else if(s->graph_phase==GRAPH_PIPELINE_SORT_INPUT) {
+                s->graph_phase=GRAPH_PIPELINE_TAIL;
+            }
         }
-        if(staged && !complete_graph_stage(s,value))
-            return execution_failed(s,CS_ERROR_IN_EXECUTION,"unsupported SNIA graph stage continuation");
-        if(result->rows || result->finished || slot->control.drained || (staged && !(value&QP_RESOURCE_WAIT)))
+        if((s->graph_phase==GRAPH_PIPELINE_INIT_RESULT && (value&QP_WORKER_FINISHED)) ||
+           (s->graph_phase==GRAPH_PIPELINE_SET && (value&QP_GRAPH_PHASE_DONE))) {
+            CS_BATCH_HANDLE *batch=&s->graph[s->graph_node].batches[s->graph_phase];
+            if(*batch) { csFreeBatchRequest(*batch); *batch=NULL; }
+            s->graph_init++;
+            s->graph_node=s->graph_init<s->plan->ninit?
+                (unsigned)s->plan->init_nodes[s->graph_init]:s->graph_pipeline_group-1;
+            s->graph_phase=s->plan->nodes[s->graph_node].kind==QP_AGGREGATE?GRAPH_PIPELINE_RESERVE:graph_next_build(s);
+        }
+        if(result->rows || result->finished || slot->control.drained)
             atomic_fetch_add_explicit(&s->batch_progress,1,memory_order_release);
         for(unsigned i=1;i<=s->workers;++i) if(slot->control.drained&(UINT64_C(1)<<(i-1))) s->slots[i].ready=false;
         s->parallel=slot->control.parallel;
@@ -1438,7 +1647,7 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
                 worker->ready=worker->done=worker->yielded=false;
                 worker->scan_node=scan; worker->block_flags=block_flags;
                 worker->block_root=block_root?block_root-1:0;
-                worker->need_input=worker->scan_node!=0;
+                worker->need_input=worker->scan_node!=0 && !(block_flags&QP_GRAPH_BLOCK_DEVICE_SOURCE);
                 worker->prefetched_input=i<=prefetched;
                 /* The device initializes each phase's worker control to
                  * zero except its private state pointer. PG never uses it. */
@@ -1504,8 +1713,7 @@ static int advance(PlanStateCsd *s,struct qs_result *result)
             s->prefetch_waited=true;
             idle=false;
         }
-        bool graph_consumer=s->graph_tree && s->graph_phase!=GRAPH_SOURCE;
-        if(idle && (graph_consumer || !s->parallel || ready || !main->control.parallel)) {
+        if(idle && (!s->parallel || ready || !main->control.parallel)) {
             main->control.available=ready;
             CS_STATUS status=submit(s,0);
             if(status!=CS_SUCCESS) return execution_failed(s,status,"queue tree");
@@ -1564,7 +1772,7 @@ static void fetch(PlanStateCsd *s)
     uint64_t empty=0;
     for(;;) {
         CHECK_FOR_INTERRUPTS();
-        if(s->async_scan || s->graph_tree) {
+        if(s->async_scan) {
             struct result_delivery *q=s->delivery;
             uint64_t waiting=s->profiling?clock_ns():0;
             pthread_mutex_lock(&q->mutex);
@@ -1593,7 +1801,8 @@ static void fetch(PlanStateCsd *s)
             } else if(q->eof || q->stopped) { s->result->rows=0; s->result->finished=1; }
             if(have && s->profiling) { q->timing.copy_ns+=clock_ns()-copying; ++q->timing.claims; }
             pthread_mutex_unlock(&q->mutex);
-            if(status!=CS_SUCCESS) checked(status,"scan completion");
+            if(status!=CS_SUCCESS)
+                checked(status,s->execution_operation[0]?s->execution_operation:"scan completion");
             if(copied) elog(ERROR,"invalid CSD variable result slice");
             if(have) { s->row=0; return; }
         } else {
@@ -1714,10 +1923,18 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     PlanStateCsd *s=(void *)node;
     /* EXPLAIN can inspect a LIMIT-stopped private stream before EndCustomScan.
      * Freeze callback-written counters before exposing them to PG. */
-    if((s->async_scan || s->graph_tree) && !s->delivery_shared && s->started) close_state(s);
+    if(s->async_scan && !s->delivery_shared && s->started) close_state(s);
     pg_sina_explain_placement((CustomScan *)node->ss.ps.plan,es);
     ExplainPropertyText("Execution Path","csd",es);
     ExplainPropertyText("CSD Executor",pg_sina_operator_graph?"SNIA operator graph":"pg_sina_plan",es);
+    if(s->graph_keep_even) ExplainPropertyText("CSD Stream Filter","KeepEven",es);
+    if(s->graph_pipeline_group)
+        ExplainPropertyText("CSD Pipeline Stages",s->graph_pipeline_group-1==s->graph_sort_node?
+            (s->graph_sort_node==s->plan->root?"Scan and joins -> SortSink -> SortSource":
+             "Scan and joins -> SortSink -> SortSource/Limit"):s->graph_sort_node==QP_NODES?
+            "Scan and joins -> Aggregate -> AggregateSource":s->graph_sort_node==s->plan->root?
+            "Scan and joins -> Aggregate -> AggregateSource/SortSink -> SortSource":
+            "Scan and joins -> Aggregate -> AggregateSource/SortSink -> SortSource/Limit",es);
     if(s->graph_waves) {
         uint64_t blocks=0,stream=0;
         for(unsigned w=1;w<=s->workers;++w) {
@@ -1729,12 +1946,9 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
         ExplainPropertyInteger("CSD Explicit Scan Block Batches",NULL,blocks,es);
         if(blocks)
             ExplainPropertyText("CSD Operator Batches",
+                s->graph_keep_even?"LOAD -> Scan -> KeepEven -> Aggregate":
+                s->graph_scan?"LOAD -> Scan -> Filter -> HOST output":
                 "LOAD -> Scan -> Filter -> [Probe/Project chain] -> device sink",es);
-    }
-    if(s->graph_tree) {
-        ExplainPropertyInteger("CSD Graph Nodes",NULL,s->graph_nodes,es);
-        ExplainPropertyInteger("CSD Graph Packets",NULL,s->graph_packets,es);
-        ExplainPropertyInteger("CSD Graph Build Packets",NULL,s->graph_build_packets,es);
     }
     if(s->operator_graph) {
         const struct qs_metrics *m=&s->result->metrics;
@@ -1826,7 +2040,7 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
             ExplainPropertyInteger("CSD Probe Prefetch Reused Blocks",NULL,s->prefetch_reused,es);
             ExplainPropertyBool("CSD Probe Prefetch Ready Before Probe",s->prefetch_reused && !s->prefetch_waited,es);
         }
-        ExplainPropertyInteger("CSD Scan Vector Capacity","rows",QP_VECTOR_ROWS,es);
+        ExplainPropertyInteger("CSD Scan Vector Capacity","rows",QP_SCAN_VECTOR_ROWS,es);
         ExplainPropertyInteger("CSD AFDM","bytes",s->fdm_bytes,es);
         if(s->plan->index_cache_bytes) ExplainPropertyInteger("CSD Index Join Cache Limit","bytes",s->plan->index_cache_bytes,es);
         ExplainPropertyInteger("CSD Workmem B-tree Page Hits",NULL,s->result->metrics.index_cache_hits[0],es);

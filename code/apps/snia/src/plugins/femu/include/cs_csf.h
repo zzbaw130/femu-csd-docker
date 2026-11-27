@@ -36,6 +36,8 @@ static inline int64_t csGraphStep(unsigned flags,uint64_t result)
     return result>(CS_IO_VALUE_MASK>>3)?-1:
         (int64_t)(((uint64_t)FEMU_GRAPH_STEP_ACTION<<60)|(result<<3)|flags);
 }
+static inline int64_t csGraphBorrowedOutput(void)
+{ return (int64_t)((uint64_t)FEMU_GRAPH_BORROW_ACTION<<60); }
 static inline int64_t csGraphWait(void)
 { return (int64_t)((uint64_t)FEMU_GRAPH_WAIT_ACTION<<60); }
 static inline void csGraphArmEvent(const struct femu_csd_args *args,uintptr_t key)

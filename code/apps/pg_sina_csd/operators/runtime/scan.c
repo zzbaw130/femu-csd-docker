@@ -30,6 +30,8 @@ struct heap_prefix {
     unsigned attrs,bytes,count;
     bool borrowed_tail;
     struct { unsigned offset,size,slot; } projected[QS_COLS];
+    unsigned short_run[QS_COLS];
+    int64_t *tail_values[QS_COLS];
 };
 struct qs_scan_cursor {
     struct qs_dictionary *dictionary;
@@ -88,32 +90,16 @@ static inline int64_t fixed_number(const unsigned char *v,unsigned size)
 /* With no NULL bitmap or paging, each tuple's offsets can stay local while
  * walking its variable-width headers. Values still go into column vectors. */
 static int scan_borrowed_tail(const struct qs_plan *p,struct heap_tuple *tuples,
-    unsigned count,struct qs_chunk *c,unsigned first,int last)
+    unsigned count,const struct heap_prefix *prefix,int last)
 {
-    int64_t *values[QS_COLS];
-    uint8_t *scales[QS_COLS];
-    unsigned short_run[QS_COLS]={0};
-    unsigned run=0;
-    for(int col=last;col>=(int)first;--col) {
-        const struct qs_column *spec=&p->cols[col];
-        run=spec->slot<0 && spec->length==-1?run+1:0;
-        short_run[col]=run;
-    }
-    for(unsigned col=first;(int)col<=last;++col) {
-        int slot=p->cols[col].slot;
-        if(slot<0) continue;
-        size_t at=(size_t)slot*c->capacity;
-        values[col]=qs_values(c)+at;
-        scales[col]=qs_dscales(c)+at;
-    }
     for(unsigned i=0;i<count;++i) {
         const struct heap_tuple *t=&tuples[i];
         unsigned off=t->off;
-        for(unsigned col=first;(int)col<=last;++col) {
+        for(unsigned col=prefix->attrs;(int)col<=last;++col) {
             const struct qs_column *spec=&p->cols[col];
             unsigned size,header; int compressed;
-            if(short_run[col]) {
-                unsigned end=col+short_run[col];
+            if(prefix->short_run[col]) {
+                unsigned end=col+prefix->short_run[col];
                 /* An inline short varlena carries its total size in the
                  * first byte and needs no alignment or payload decoding. */
                 for(;col<end;++col) {
@@ -133,9 +119,8 @@ static int scan_borrowed_tail(const struct qs_plan *p,struct heap_tuple *tuples,
                 if(compressed) return -3;
                 if(spec->deferred) {
                     struct qs_heap_ref ref={t->absolute+off+header,size-header};
-                    memcpy(&values[col][t->row],&ref,sizeof(ref));
-                } else values[col][t->row]=fixed_number(t->data+off,size);
-                scales[col][t->row]=0;
+                    memcpy(&prefix->tail_values[col][t->row],&ref,sizeof(ref));
+                } else prefix->tail_values[col][t->row]=fixed_number(t->data+off,size);
             }
             off+=size;
         }
@@ -158,11 +143,10 @@ static int64_t scan_tuples(const struct qs_plan *p,struct heap_tuple *tuples,uns
         if(t->first) for(unsigned j=0;j<prefix->count;++j) {
             unsigned at=prefix->projected[j].slot*c->capacity+t->row;
             qs_values(c)[at]=fixed_number(tuple+off+prefix->projected[j].offset,prefix->projected[j].size);
-            qs_dscales(c)[at]=0;
         }
     }
     if(!cursor && no_nulls && prefix && prefix->borrowed_tail)
-        return scan_borrowed_tail(p,tuples,count,c,start,last);
+        return scan_borrowed_tail(p,tuples,count,prefix,last);
     for(int col=cursor && cursor->decoding?(int)cursor->column:(int)start;col<=last;++col) {
         const struct qs_column *spec=&p->cols[col]; int slot=spec->slot;
         if(slot<0) {
@@ -287,7 +271,8 @@ static int64_t scan_columns(struct femu_csd_args *a,struct qs_scan_cursor *curso
     if(p->nattrs>QS_COLS || p->ncols>p->nattrs || p->nstrings>QS_STRINGS || a->mr_len[2]<(long long)sizeof(*c) ||
         c->ncols!=p->ncols || qs_chunk_bytes(c->capacity,c->ncols)>(uint64_t)a->mr_len[2] ||
         bytes%QS_PAGE || bytes>(uint64_t)a->mr_len[0]) return -1;
-    if(!cursor || !cursor->active) {
+    bool reset=!cursor || !cursor->active;
+    if(reset) {
         c->rows=c->selected=0; memset(qs_nulls(c),0,((c->capacity+7)/8)*(size_t)c->ncols);
         if(cursor) { cursor->active=1; cursor->page=cursor->line=cursor->count=cursor->decoding=0; }
     }
@@ -316,6 +301,24 @@ static int64_t scan_columns(struct femu_csd_args *a,struct qs_scan_cursor *curso
         if(spec->slot<0 || spec->deferred) continue;
         prefix.borrowed_tail=(spec->type==Q_INTEGER || spec->type==Q_DATE) &&
             (spec->length==1 || spec->length==2 || spec->length==4 || spec->length==8);
+    }
+    /* Prefix scalars and borrowed tail fields always have scale zero.
+     * Prepare the tail layout once per window, not once per tuple group. */
+    if(reset)
+        for(unsigned i=0;i<prefix.count;++i)
+            memset(qs_dscales(c)+(size_t)prefix.projected[i].slot*c->capacity,0,c->capacity);
+    if(!cursor && prefix.borrowed_tail) {
+        unsigned run=0;
+        for(int col=last;col>=(int)prefix.attrs;--col) {
+            const struct qs_column *spec=&p->cols[col];
+            run=spec->slot<0 && spec->length==-1?run+1:0;
+            prefix.short_run[col]=run;
+            if(spec->slot>=0) {
+                size_t at=(size_t)spec->slot*c->capacity;
+                prefix.tail_values[col]=qs_values(c)+at;
+                memset(qs_dscales(c)+at,0,c->capacity);
+            }
+        }
     }
     for(unsigned page=cursor?cursor->page:0;page<bytes;page+=QS_PAGE) {
         const unsigned char *raw=(unsigned char *)a->mr_addr[0]+page;

@@ -1,3 +1,13 @@
+set(graph_modules "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/operators")
+set(graph_include "${graph_modules}/../include")
+set(graph_runtime "${graph_modules}/runtime")
+foreach(kernel scan filter index_scan sort dictionary)
+    set(graph_${kernel} "${graph_runtime}/${kernel}.c")
+endforeach()
+include_directories("${graph_runtime}")
+set(PG_SINA_BUILD_DEVICE_OPERATORS ON)
+add_subdirectory("${graph_modules}" graph-operators)
+
 add_csd_program(pg-sina-heap-count heap_count.c)
 target_include_directories(pg-sina-heap-count PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
 if(BUILD_TESTING)
@@ -22,36 +32,61 @@ foreach(operator scan filter aggregate sort limit join)
     foreach(entry IN LISTS entries)
         list(APPEND renames "${entry}=${entry}_impl")
     endforeach()
-    set_source_files_properties(${operator}.c PROPERTIES COMPILE_DEFINITIONS "${renames}")
-    add_csd_program(pg-sina-${operator} ${operator}.c profile.c)
+    if(DEFINED graph_${operator})
+        set(operator_source "${graph_${operator}}")
+    else()
+        set(operator_source "${operator}.c")
+    endif()
+    set_source_files_properties("${operator_source}" PROPERTIES COMPILE_DEFINITIONS "${renames}")
+    add_csd_program(pg-sina-${operator} "${operator_source}" profile.c)
     if(NOT operator STREQUAL "limit")
-        target_sources(pg-sina-${operator} PRIVATE dictionary.c)
+        target_sources(pg-sina-${operator} PRIVATE ${graph_dictionary})
     endif()
     if(operator STREQUAL "aggregate")
         # Reuse the existing private row sorter; no nested NVMe requests.
-        target_sources(pg-sina-aggregate PRIVATE sort.c)
+        target_sources(pg-sina-aggregate PRIVATE ${graph_sort})
     endif()
     if(operator STREQUAL "join")
-        target_sources(pg-sina-join PRIVATE aggregate.c sort.c filter.c index_scan.c scan.c)
+        target_sources(pg-sina-join PRIVATE aggregate.c ${graph_sort} ${graph_filter} ${graph_index_scan} ${graph_scan})
     endif()
     string(TOUPPER "${operator}" profile_operator)
     target_compile_definitions(pg-sina-${operator} PRIVATE "PROFILE_${profile_operator}")
     target_include_directories(pg-sina-${operator} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
 endforeach()
 # Build the graph probe without rebuilding the reference program in its place.
-add_csd_program(pg-sina-graph-join join.c profile.c dictionary.c aggregate.c sort.c filter.c index_scan.c scan.c)
+add_csd_program(pg-sina-graph-join join.c profile.c ${graph_dictionary} aggregate.c ${graph_sort} ${graph_filter} ${graph_index_scan} ${graph_scan})
 target_compile_definitions(pg-sina-graph-join PRIVATE PROFILE_JOIN)
 target_include_directories(pg-sina-graph-join PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
-add_csd_program(pg-sina-graph-tail graph_tail.c)
-target_include_directories(pg-sina-graph-tail PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
-add_csd_program(pg-sina-plan plan.c scan.c sort.c index_scan.c filter.c dictionary.c)
-target_include_directories(pg-sina-plan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
-add_csd_program(pg-sina-graph-plan plan.c scan.c sort.c index_scan.c filter.c dictionary.c)
-target_include_directories(pg-sina-graph-plan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
+# The native reference build reuses the original set of implementation files.
+# New graph modules are discovered by the graph build only.
+set(graph_operators
+    "${graph_modules}/aggregate/graph_aggregate.c"
+    "${graph_modules}/aggregate/graph_aggregate_state.c"
+    "${graph_modules}/cte-scan/graph_cte_scan.c"
+    "${graph_modules}/filter/graph_filter.c"
+    "${graph_modules}/hash-build/graph_hash_build.c"
+    "${graph_modules}/hash-probe/graph_hash_probe.c"
+    "${graph_modules}/index-join/graph_index_join.c"
+    "${graph_modules}/limit/graph_limit.c"
+    "${graph_modules}/materialize/graph_materialize.c"
+    "${graph_modules}/project/graph_project.c"
+    "${graph_modules}/scan/graph_scan.c"
+    "${graph_modules}/set/graph_set.c"
+    "${graph_modules}/sort/graph_sort.c")
+set(graph_support
+    "${graph_runtime}/projection.c" "${graph_runtime}/predicate.c" "${graph_runtime}/hash.c"
+    "${graph_runtime}/index.c" "${graph_runtime}/row_sort.c")
+add_csd_program(pg-sina-plan "${graph_runtime}/plan.c" ${graph_scan} ${graph_sort}
+    ${graph_index_scan} ${graph_filter} ${graph_dictionary} ${graph_support} ${graph_operators})
+target_include_directories(pg-sina-plan PRIVATE "${graph_include}")
+
 if(BUILD_TESTING)
-    add_executable(pg-sina-scalar-dictionary-test tests/scalar_dictionary.c scan.c sort.c index_scan.c filter.c dictionary.c)
+    set(scalar_graph_operators ${graph_operators})
+    list(FILTER scalar_graph_operators EXCLUDE REGEX "/(graph_aggregate_state|graph_hash_build|graph_hash_probe|graph_index_join)\\.c$")
+    add_executable(pg-sina-scalar-dictionary-test tests/scalar_dictionary.c
+        ${graph_scan} ${graph_sort} ${graph_index_scan} ${graph_filter} ${graph_dictionary} ${graph_support} ${scalar_graph_operators})
     target_include_directories(pg-sina-scalar-dictionary-test PRIVATE "${CSD_FEMU_INCLUDE}" "${CMAKE_CURRENT_SOURCE_DIR}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
+        "${graph_include}" "${graph_modules}")
     target_compile_options(pg-sina-scalar-dictionary-test PRIVATE -UNDEBUG)
     target_link_libraries(pg-sina-scalar-dictionary-test PRIVATE cs-workmem Threads::Threads)
     add_test(NAME pgSinaDictionaryScalarOutput COMMAND pg-sina-scalar-dictionary-test)
@@ -63,7 +98,7 @@ if(BUILD_TESTING)
     add_test(NAME pgSinaExistenceCache64MiB COMMAND pg-sina-scalar-dictionary-test --existence-cache-64m)
     add_test(NAME pgSinaJoinPayload64MiB COMMAND pg-sina-scalar-dictionary-test --join-payload-64m)
     add_test(NAME pgSinaDictionaryPipeline COMMAND pg-sina-scalar-dictionary-test --pipeline)
-    add_executable(pg-sina-dictionary-test tests/dictionary.c dictionary.c scan.c)
+    add_executable(pg-sina-dictionary-test tests/dictionary.c ${graph_dictionary} ${graph_scan})
     target_include_directories(pg-sina-dictionary-test PRIVATE "${CSD_FEMU_INCLUDE}" "${CMAKE_CURRENT_SOURCE_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
     target_compile_options(pg-sina-dictionary-test PRIVATE -UNDEBUG)
@@ -139,7 +174,7 @@ if(BUILD_TESTING)
 endif()
 
 if(BUILD_TESTING)
-    add_executable(pg-sina-sort-test tests/sort.c dictionary.c)
+    add_executable(pg-sina-sort-test tests/sort.c ${graph_dictionary})
     target_include_directories(pg-sina-sort-test PRIVATE "${CSD_FEMU_INCLUDE}" "${CMAKE_CURRENT_SOURCE_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
     target_compile_options(pg-sina-sort-test PRIVATE -UNDEBUG)
@@ -157,7 +192,7 @@ if(BUILD_TESTING)
 endif()
 
 if(BUILD_TESTING)
-    add_executable(pg-sina-vector-test tests/vector.c dictionary.c)
+    add_executable(pg-sina-vector-test tests/vector.c ${graph_dictionary})
     target_include_directories(pg-sina-vector-test PRIVATE "${CSD_FEMU_INCLUDE}" "${CMAKE_CURRENT_SOURCE_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
     target_compile_options(pg-sina-vector-test PRIVATE -UNDEBUG)
@@ -194,7 +229,7 @@ if(BUILD_TESTING)
 endif()
 
 if(BUILD_TESTING)
-    add_executable(pg-sina-index-dictionary-test tests/index_dictionary.c index_scan.c scan.c dictionary.c)
+    add_executable(pg-sina-index-dictionary-test tests/index_dictionary.c ${graph_index_scan} ${graph_scan} ${graph_dictionary})
     target_include_directories(pg-sina-index-dictionary-test PRIVATE "${CSD_FEMU_INCLUDE}" "${CMAKE_CURRENT_SOURCE_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/pg_sina_csd/include")
     target_compile_options(pg-sina-index-dictionary-test PRIVATE -UNDEBUG)

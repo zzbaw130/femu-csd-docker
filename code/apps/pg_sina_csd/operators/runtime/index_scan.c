@@ -568,7 +568,7 @@ int64_t qs_index_scan_paged(struct qs_chunk *out,struct qs_task *task,struct qs_
     return qs_index_scan(out,task,control,io,heap_pages,index_pages,flags);
 }
 static int64_t flush(unsigned stage,struct qs_chunk *out,const struct qs_plan *p,struct qs_task *task,
-    struct qs_join_control *control,struct femu_csd_args *a,struct index_cursor *cursor,int resume)
+    struct qs_join_control *control,struct femu_csd_args *a,struct index_cursor *cursor,int resume,qs_index_consumer consume)
 {
     if(!resume && !qs_join_at(p,stage)->semi && qs_join_at(p,stage)->predicate>=0) {
         struct qs_plan filter=*p; filter.predicate=qs_join_at(p,stage)->predicate;
@@ -578,11 +578,11 @@ static int64_t flush(unsigned stage,struct qs_chunk *out,const struct qs_plan *p
         int64_t status=pg_sina_filter_impl(&call); if(status) return status;
     }
     cursor->pending=1;
-    int64_t status=qs_join_consume(stage,out,p,task,control,a,resume); if(status) return status;
+    int64_t status=consume(stage,out,p,task,control,a,resume); if(status) return status;
     cursor->pending=0; out->rows=out->selected=0; return 0;
 }
 int64_t qs_index_probe(unsigned stage,struct qs_chunk *c,const struct qs_plan *p,struct qs_task *task,
-    struct qs_join_control *control,struct femu_csd_args *a,int resume)
+    struct qs_join_control *control,struct femu_csd_args *a,int resume,qs_index_consumer consume)
 {
     const struct qs_join *j=qs_join_at(p,stage); struct index_join *h=(void *)(uintptr_t)control[stage].state;
     struct index_cursor *cursor=index_cursor(h,task->slot); if(!cursor) return -4;
@@ -599,7 +599,7 @@ int64_t qs_index_probe(unsigned stage,struct qs_chunk *c,const struct qs_plan *p
     if(!resume && !cursor->dictionary_pending) {
         cursor->position=cursor->count=cursor->pending=0; out->rows=out->selected=0;
     } else if(cursor->pending) {
-        int64_t status=flush(stage,out,p,task,control,a,cursor,csIsReentry(a)); if(status) return status;
+        int64_t status=flush(stage,out,p,task,control,a,cursor,csIsReentry(a),consume); if(status) return status;
     }
     unsigned base=qs_probe_attrs(p); for(unsigned i=0;i<stage;++i) base+=qs_join_at(p,i)->nattrs;
     unsigned keyslot=stage?(unsigned)p->cols[j->probe_key].slot:0;
@@ -668,7 +668,7 @@ int64_t qs_index_probe(unsigned stage,struct qs_chunk *c,const struct qs_plan *p
                     }
                     ++task->index_tuples; key->phase=j->semi>0?4:2;
                     qs_selection(out)[dest]=dest; ++out->rows; ++out->selected;
-                    if(j->semi==-1 || out->rows==out->capacity) { int64_t status=flush(stage,out,p,task,control,a,cursor,0); if(status) return status; }
+                    if(j->semi==-1 || out->rows==out->capacity) { int64_t status=flush(stage,out,p,task,control,a,cursor,0,consume); if(status) return status; }
                     /* Let each unresolved key contribute one candidate per
                      * round. The consumer can filter them together, then
                      * qs_index_skip stops only keys with an accepted match. */
@@ -678,7 +678,7 @@ int64_t qs_index_probe(unsigned stage,struct qs_chunk *c,const struct qs_plan *p
             done+=key->phase==4;
         }
         if(j->semi==-2 && out->rows) {
-            int64_t status=flush(stage,out,p,task,control,a,cursor,0); if(status) return status;
+            int64_t status=flush(stage,out,p,task,control,a,cursor,0,consume); if(status) return status;
         }
         if(done==cursor->count) { cursor->count=0; continue; }
         if(first) continue; /* Revisit earlier keys only after the retained tuple completes. */
@@ -687,6 +687,6 @@ int64_t qs_index_probe(unsigned stage,struct qs_chunk *c,const struct qs_plan *p
         cursor->waiting=1; task->index_pending=1; task->index_pages+=task->index_nreads;
         return QS_INDEX_WAIT;
     }
-    if(out->rows) return flush(stage,out,p,task,control,a,cursor,0);
+    if(out->rows) return flush(stage,out,p,task,control,a,cursor,0,consume);
     return 0;
 }

@@ -222,7 +222,7 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
         p->files[1]=(struct qp_file_mapping){.offset=sizeof(*p),.nsid=1,.lba_bytes=512,.count=1};
         *(struct qs_extent *)(p+1)=(struct qs_extent){.lba=4096,.bytes=raw_bytes};
     }
-    size_t vector=(qs_chunk_bytes(QP_VECTOR_ROWS,leaf->expr.ncols)+4095)&~(size_t)4095;
+    size_t vector=(qs_chunk_bytes(qp_scan_capacity(p,leaf),leaf->expr.ncols)+4095)&~(size_t)4095;
     size_t bytes=leaf->vector_offset+vector;
     if(workers) {
         p->workers=workers; leaf->parallel=1;
@@ -257,7 +257,7 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
         }
     }
     *(struct qs_dict *)arena=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
-    *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=QP_VECTOR_ROWS,.ncols=leaf->expr.ncols};
+    *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=qp_scan_capacity(p,leaf),.ncols=leaf->expr.ncols};
     struct qp_control *controls=calloc(workers+1,sizeof(*controls)); assert(controls);
     struct qp_control *c=&controls[0]; void *mr[]={p,c,out,arena,io};
     long long lengths[]={plan_bytes,(workers+1)*sizeof(*c),(workers+1)*sizeof(*out),bytes,(workers+1)*QS_SORT_IO_BYTES};
@@ -468,12 +468,13 @@ static void namespace_reentry(function run)
     }
     free(raw); free(arena); free(io); free(out); free(p);
 }
-static function test_block_steps[BLOCK_STEPS];
+/* This regression exercises scan, hash build/probe and aggregate. */
+static function test_block_steps[BLOCK_PARTITION+1];
 static atomic_uint test_probe_stores, test_group_reads, test_hash_stores;
 static int64_t test_block_exec(struct probe_test *t)
 {
     int64_t status=0;
-    for(unsigned step=0;step<BLOCK_STEPS;++step) {
+    for(unsigned step=0;step<=BLOCK_PARTITION;++step) {
         if(step==BLOCK_PROBE && !(t->scan_node&QP_GRAPH_BLOCK_PROBE)) continue;
         if(step==BLOCK_INDEX && !(t->scan_node&QP_GRAPH_BLOCK_INDEX)) continue;
         if(step==BLOCK_PROJECT || step==BLOCK_SORT || step==BLOCK_PARTITION) continue;
@@ -1682,7 +1683,7 @@ static void parameter_projection(function run,int joined,int wide,int null_param
     for(unsigned i=0;i<(joined?2U:1U);++i) {
         struct qp_node *n=&p->nodes[i?4:leaf]; n->bytes=sizes[i]; n->estimated_rows=i?1:rows;
         n->input_offset=bytes; bytes+=QP_SCAN_BYTES; n->vector_offset=bytes;
-        bytes=(bytes+qs_chunk_bytes(QP_VECTOR_ROWS,2)+4095)&~(size_t)4095;
+        bytes=(bytes+qs_chunk_bytes(qp_scan_capacity(p,n),2)+4095)&~(size_t)4095;
     }
     unsigned char *arena=calloc(1,bytes),*io=calloc(1,QS_SORT_IO_BYTES); assert(arena && io);
     *(struct qs_dict *)arena=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
@@ -1792,11 +1793,11 @@ static void filtered_projection(function run,unsigned mode)
     }
     struct qp_node *leaf=&p->nodes[2]; leaf->bytes=raw_bytes; leaf->input_offset=config;
     leaf->vector_offset=config+p->scan_bytes;
-    size_t bytes=leaf->vector_offset+qs_chunk_bytes(QP_VECTOR_ROWS,2);
+    size_t bytes=leaf->vector_offset+qs_chunk_bytes(qp_scan_capacity(p,leaf),2);
     unsigned char *arena=calloc(1,bytes),*io=calloc(1,QS_SORT_IO_BYTES);
     struct qs_result *out=calloc(1,sizeof(*out)); assert(arena && io && out);
     *(struct qs_dict *)arena=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
-    *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=QP_VECTOR_ROWS,.ncols=2};
+    *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=qp_scan_capacity(p,leaf),.ncols=2};
     struct qp_control control={0}; void *mr[]={p,&control,out,arena,io};
     long long lengths[]={sizeof(*p),sizeof(control),sizeof(*out),bytes,QS_SORT_IO_BYTES};
     struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=lengths};
@@ -1895,7 +1896,7 @@ static void local_group_merge(function run,int large_merge)
     p->count=2; p->workers=workers; p->scan_bytes=per_worker*2/100*QS_PAGE;
     struct qp_node *leaf=&p->nodes[1]; scan(leaf); leaf->bytes=raw_bytes; leaf->parallel=1;
     size_t config=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
-    size_t vector=(qs_chunk_bytes(QP_VECTOR_ROWS,2)+4095)&~(size_t)4095;
+    size_t vector=(qs_chunk_bytes(qp_scan_capacity(p,leaf),2)+4095)&~(size_t)4095;
     leaf->input_offset=config; leaf->vector_offset=config+p->scan_bytes;
     size_t base=leaf->vector_offset+vector;
     leaf->parallel_input=base; leaf->parallel_vector=base+p->scan_bytes;
@@ -1993,7 +1994,7 @@ static void parallel_sort_spill(function run,unsigned workers,unsigned memory,in
     p->count=leaf_id+1; p->workers=workers; p->scan_bytes=QP_SCAN_BYTES;
     struct qp_node *leaf=&p->nodes[leaf_id]; scan(leaf); leaf->bytes=raw_bytes; leaf->parallel=1;
     size_t config=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
-    size_t vector=(qs_chunk_bytes(QP_VECTOR_ROWS,2)+4095)&~(size_t)4095;
+    size_t vector=(qs_chunk_bytes(qp_scan_capacity(p,leaf),2)+4095)&~(size_t)4095;
     leaf->input_offset=config; leaf->vector_offset=config+p->scan_bytes;
     size_t base=leaf->vector_offset+vector;
     leaf->parallel_input=base; leaf->parallel_vector=base+p->scan_bytes;
@@ -2025,7 +2026,7 @@ static void parallel_sort_spill(function run,unsigned workers,unsigned memory,in
     struct qp_control *controls=calloc(workers+1,sizeof(*controls));
     struct qs_result *out=calloc(workers+1,sizeof(*out)); assert(arena && io && controls && out);
     *(struct qs_dict *)arena=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
-    *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=QP_VECTOR_ROWS,.ncols=2};
+    *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=qp_scan_capacity(p,leaf),.ncols=2};
     struct qp_control *c=&controls[0];
     void *mr[]={p,c,out,arena,io};
     long long len[]={sizeof(*p),(workers+1)*sizeof(*controls),(workers+1)*sizeof(*out),bytes,(workers+1)*QS_SORT_IO_BYTES};
@@ -2821,7 +2822,7 @@ int main(int argc,char **argv)
             "pg_sina_graph_block_scan","pg_sina_graph_block_filter","pg_sina_graph_block_probe",
             "pg_sina_graph_block_index","pg_sina_graph_block_project","pg_sina_graph_block_aggregate","pg_sina_graph_block_hash_build",
             "pg_sina_graph_block_sort","pg_sina_graph_block_partition"};
-        for(unsigned i=0;i<BLOCK_STEPS;++i) {
+        for(unsigned i=0;i<sizeof(steps)/sizeof(steps[0]);++i) {
             test_block_steps[i]=(function)dlsym(library,steps[i]);
             assert(test_block_steps[i]);
         }

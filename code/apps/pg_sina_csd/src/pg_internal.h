@@ -116,7 +116,8 @@ List **pg_sina_search_observations(void);
 List **pg_sina_search_index_metadata(void);
 List **pg_sina_search_scan_schemas(void);
 struct qp_plan *pg_sina_cost_workspace(void);
-enum { PG_SINA_GROUP_FILTER=1U<<8, PG_SINA_LEFT_COUNT=1U<<9, PG_SINA_DISTINCT=1U<<10, PG_SINA_DISTINCT_SORT=1U<<11 };
+enum { PG_SINA_GROUP_FILTER=1U<<8, PG_SINA_LEFT_COUNT=1U<<9, PG_SINA_DISTINCT=1U<<10, PG_SINA_DISTINCT_SORT=1U<<11,
+    PG_SINA_GROUP_PREFILTER=1U<<12 };
 /* Query-local choice, never a wire field: low bits select relational rewrites;
  * high bits freeze the node/access algorithms and index residual presence
  * checked by the final encoder (residuals affect probe early-exit costs). */
@@ -161,6 +162,7 @@ Plan *pg_sina_prepare_candidate(PlannerInfo *,Plan *,bool);
 Plan *pg_sina_require_output_order(PlannerInfo *,Plan *);
 /* Cost properties and a borrowed workspace, valid until the next candidate.
  * Candidate Const holds binary cost metadata, never an executable program. */
+bool pg_sina_graph_plan_supported(const struct qp_plan *);
 Plan *pg_sina_describe_candidate(PlannerInfo *,Plan *,bool,struct qp_plan **);
 Plan *pg_sina_candidate_scan(Plan *,bool,bool);
 void pg_sina_finish_device_plans(Plan *);

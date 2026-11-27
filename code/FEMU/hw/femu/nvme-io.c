@@ -434,8 +434,11 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
             if (n->stage_sets) {
                 req->t_handoff = nvme_io_clock(n);
             }
-            rc = femu_ring_enqueue(n->to_ftl[index_poller], (void *)&req, 1);
+            rc = n->use_ftl_thread ?
+                 femu_ring_enqueue(n->to_ftl[index_poller], (void *)&req, 1) :
+                 nvme_enqueue_completion(n, n->to_ftl[index_poller], req);
             if (rc != 1) {
+                nvme_link_clear_pending(n, req);
                 femu_err("enqueue failed, ret=%d\n", rc);
             }
         }
@@ -625,28 +628,103 @@ static uint64_t nvme_fw_cost(FemuCtrl *n, uint8_t opcode)
     }
 }
 
-/* One shared full-duplex link per controller, independent of poller count.
- * A reservation models transfer time; actual CPU copying is not charged again.
- * Cache push DMA reserves before publishing its completion; normal commands
- * reserve once their media deadline is known. link_timing avoids double charging. */
-void nvme_charge_link(FemuCtrl *n, NvmeRequest *req, bool hpcp)
+static uint64_t nvme_link_bytes(const NvmeRequest *req)
 {
-    uint64_t bytes = req->xfer_bytes;
-    if (!n->pcie_enabled || !req->ns || req->link_timing.end) return;
+    if (!req->ns || req->link_timing.end) {
+        return 0;
+    }
     if (req->cmd_opcode == NVME_CMD_READ || req->cmd_opcode == NVME_CMD_WRITE) {
         uint8_t lbads = req->ns->id_ns.lbaf[
             NVME_ID_NS_FLBAS_INDEX(req->ns->id_ns.flbas)].lbads;
-        bytes = NS_KVSSD(req->ns) ? req->xfer_bytes : (uint64_t)req->nlb << lbads;
+        return NS_KVSSD(req->ns) ? req->xfer_bytes : (uint64_t)req->nlb << lbads;
     }
-    if (!bytes) return;
-    uint64_t transfer = n->pcie_bandwidth_mbps ?
-                        DIV_ROUND_UP(bytes * 1000, n->pcie_bandwidth_mbps) : 0;
+    return req->xfer_bytes;
+}
+
+void nvme_link_mark_pending(FemuCtrl *n, NvmeRequest *req)
+{
+    if (n->pcie_enabled && n->csd_ctrl_state && !req->link_pending) {
+        qatomic_inc(&n->pcie_tx_pending);
+        req->link_pending = true;
+    }
+}
+
+void nvme_link_clear_pending(FemuCtrl *n, NvmeRequest *req)
+{
+    if (req->link_pending) {
+        req->link_pending = false;
+        qatomic_dec(&n->pcie_tx_pending);
+    }
+}
+
+/* Announce outbound data before the poller can see the completion. */
+int nvme_enqueue_completion(FemuCtrl *n, struct rte_ring *ring,
+                           NvmeRequest *req)
+{
+    bool was_pending = req->link_pending;
+
+    if (n->pcie_enabled && n->csd_ctrl_state && !req->is_write &&
+        nvme_link_bytes(req)) {
+        nvme_link_mark_pending(n, req);
+    }
+    int rc = femu_ring_enqueue(ring, (void *)&req, 1);
+    if (rc != 1 && !was_pending) {
+        nvme_link_clear_pending(n, req);
+    }
+    return rc;
+}
+
+static uint64_t nvme_link_transfer_ns(FemuCtrl *n, uint64_t bytes)
+{
+    return n->pcie_bandwidth_mbps ?
+           DIV_ROUND_UP(bytes * 1000, n->pcie_bandwidth_mbps) : 0;
+}
+
+/* A cache copy may take the link now. A nonzero return is when to retry. */
+uint64_t nvme_try_cache_link(FemuCtrl *n, uint64_t bytes,
+                            uint64_t *begin, uint64_t *end)
+{
+    const uint64_t poller_retry_ns = 10 * SCALE_US;
+
+    if (!n->pcie_enabled) {
+        return 0;
+    }
+    uint64_t transfer = nvme_link_transfer_ns(n, bytes);
+    uint64_t retry = 0;
+
+    pthread_spin_lock(&n->pcie_lock);
+    uint64_t now = nvme_io_clock(n);
+    uint64_t next = n->pcie_tx_next_avail_time;
+    if (qatomic_read(&n->pcie_tx_pending)) {
+        /* The poller has yet to assign a deadline to a foreground transfer. */
+        retry = MAX(next, now + poller_retry_ns);
+    } else if (next > now) {
+        retry = next;
+    } else {
+        *begin = now;
+        *end = now + transfer + n->pcie_prop_delay_ns;
+        if (transfer) {
+            n->pcie_tx_next_avail_time = now + transfer;
+        }
+    }
+    pthread_spin_unlock(&n->pcie_lock);
+    return retry;
+}
+
+/* One shared full-duplex link per controller, independent of poller count. */
+static void nvme_charge_link(FemuCtrl *n, NvmeRequest *req)
+{
+    uint64_t bytes = n->pcie_enabled ? nvme_link_bytes(req) : 0;
+    if (!bytes) {
+        return;
+    }
+    uint64_t transfer = nvme_link_transfer_ns(n, bytes);
     pthread_spin_lock(&n->pcie_lock);
     uint64_t *next = req->is_write ? &n->pcie_rx_next_avail_time :
                                     &n->pcie_tx_next_avail_time;
     uint64_t start = MAX(*next, (uint64_t)req->expire_time);
     *next = start + transfer;
-    if (n->pcie_profile_users && !req->is_write && !hpcp) {
+    if (n->pcie_profile_users && !req->is_write) {
         struct FemuLinkProfile *p = &n->pcie_profile;
         uint64_t shadow_start = MAX(n->pcie_tx_without_hpcp,
                                     (uint64_t)req->expire_time);
@@ -703,7 +781,8 @@ static void nvme_process_cq_cpl(void *arg, int index_poller)
             req->t_return = nvme_io_clock(n);
         }
 
-        nvme_charge_link(n, req, false);
+        nvme_charge_link(n, req);
+        nvme_link_clear_pending(n, req);
 
         /*
          * Optional controller-CPU model: charge each command its firmware
