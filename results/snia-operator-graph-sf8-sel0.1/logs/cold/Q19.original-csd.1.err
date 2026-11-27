@@ -1,0 +1,224 @@
+TPCH_BEGIN 1
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache resident shared_pct=0.000 file_pct=0.000 known_pct=100.000 generation=1
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  duration: 0.199 ms  plan:
+Query Text: SELECT device FROM sina_csd.relations WHERE relid=$1 AND relfilenode=$2
+Index Scan using relations_pkey on relations  (cost=0.15..8.17 rows=1 width=32) (actual rows=1 loops=1)
+  Index Cond: (relid = '16427'::oid)
+  Filter: (relfilenode = '16427'::oid)
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  duration: 0.028 ms  plan:
+Query Text: SELECT device FROM sina_csd.relations WHERE relid=$1 AND relfilenode=$2
+Index Scan using relations_pkey on relations  (cost=0.15..8.17 rows=1 width=32) (actual rows=1 loops=1)
+  Index Cond: (relid = '16387'::oid)
+  Filter: (relfilenode = '16387'::oid)
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate original device estimate total_ms=4573.689 cpu_ms=4298.644 io_ms=2182.353 spill_bytes=0 peak_bytes=12247568 stages=3/Scan rows=3758 groups=0 tasks=65 cpu=488.895ms state=0B resident=0B available=934072256B spill=0B visited=1600022 expr_ops=36 physical_ops=36.25 decode_ops=3.75; 2/Scan rows=912520 groups=0 tasks=1758 cpu=3770.778ms state=0B resident=0B available=936481088B spill=0B visited=47991640 expr_ops=17 physical_ops=3.61 decode_ops=6.25; 1/Join rows=896 groups=0 tasks=1758 cpu=34.349ms state=245760B resident=245760B available=469762048B spill=0B join=inner; 0/Aggregate rows=1 groups=1 tasks=0 cpu=0.042ms state=1904B resident=1904B available=939235648B spill=0B; pipeline_io_overlap=1909.559ms
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  duration: 0.265 ms  plan:
+Query Text: SELECT r.relfilenode,i.root,i.key_bytes FROM sina_csd.indexes i JOIN sina_csd.relations r ON r.relid=i.indexid WHERE i.indexid=$1 AND i.heaprelid=$2 AND i.attnum=$3
+Nested Loop  (cost=0.30..16.35 rows=1 width=14) (actual rows=1 loops=1)
+  ->  Index Scan using indexes_pkey on indexes i  (cost=0.15..8.18 rows=1 width=14) (actual rows=1 loops=1)
+        Index Cond: (indexid = '16451'::oid)
+        Filter: ((heaprelid = '16387'::oid) AND (attnum = '1'::smallint))
+  ->  Index Scan using relations_pkey on relations r  (cost=0.15..8.17 rows=1 width=8) (actual rows=1 loops=1)
+        Index Cond: (relid = '16451'::oid)
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  CSD planner total_ms=23.545
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  CSD planner total_ms=1.261
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  CSD planner total_ms=0.434
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate query IO available=1 device_reads=4 device_read_bytes=32768 reclaim_scan_pages=0 reclaim_steal_pages=0 refault_file=0 free_before_bytes=15983734784 free_after_bytes=16039841792 file_before_bytes=240476160 file_after_bytes=240754688 shmem_before_bytes=69918720 shmem_after_bytes=69976064 active_file_before_bytes=128274432 active_file_after_bytes=128319488 inactive_file_before_bytes=33144832 inactive_file_after_bytes=33480704
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  duration: 4598.757 ms  plan:
+Query Text: select
+	sum(l_extendedprice* (1 - l_discount)) as revenue
+from
+	lineitem,
+	part
+where
+	(
+		p_partkey = l_partkey
+		and p_brand = 'Brand#15'
+		and p_container in ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')
+		and l_quantity >= '5'::integer and l_quantity <= '5'::integer + 10
+		and p_size between 1 and 5
+		and l_shipmode in ('AIR', 'AIR REG')
+		and l_shipinstruct = 'DELIVER IN PERSON'
+	)
+	or
+	(
+		p_partkey = l_partkey
+		and p_brand = 'Brand#13'
+		and p_container in ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')
+		and l_quantity >= '19'::integer and l_quantity <= '19'::integer + 10
+		and p_size between 1 and 10
+		and l_shipmode in ('AIR', 'AIR REG')
+		and l_shipinstruct = 'DELIVER IN PERSON'
+	)
+	or
+	(
+		p_partkey = l_partkey
+		and p_brand = 'Brand#42'
+		and p_container in ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')
+		and l_quantity >= '30'::integer and l_quantity <= '30'::integer + 10
+		and p_size between 1 and 15
+		and l_shipmode in ('AIR', 'AIR REG')
+		and l_shipinstruct = 'DELIVER IN PERSON'
+	);
+Custom Scan (SQLeratePlan)  (cost=228684.45..228684.45 rows=1 width=32) (actual rows=1 loops=1)
+  Execution Mode: csd-without-hpcp
+  HPCP: disabled
+  DCP: disabled
+  Placement Costs: milliseconds; estimates, not execution timings
+  Placement: subtree:CSD; query=original PG physical tree; original HOST=26219.045ms original CSD=4573.689ms shared search=4573.689ms
+  ->  Custom Scan (SniaCsdPlan)  (cost=1310952.24..1310952.25 rows=1 width=32) (actual rows=1 loops=1)
+        Execution Mode: csd-without-hpcp
+        HPCP: disabled
+        DCP: disabled
+        Input Source: internal NVM to FDM
+        SQLerate HOST Cost: 26219.045 ms
+        SQLerate CSD Cost: 4573.439 ms
+        SQLerate CSD to HOST Cost: 0.250 ms
+        Host Page Cache Residency: 0.00 percent
+        Estimated Spill I/O: 0 bytes
+        Estimated CSD CPU: 4298.644 ms
+        Estimated Internal I/O including Spill: 2182.353 ms
+        Estimated Peak Workmem: 12247568 bytes
+        Estimated HPCP Link Work: 0.000 ms
+        Estimated CSD Serial CPU: 0.000 ms
+        Estimated CSD Parallel CPU: 4294.064 ms
+        Estimated CSD Scheduling: 4.580 ms
+        Estimated CSD Combine CPU: 0.001 ms
+        Estimated Dictionary Working Set: 134144 bytes
+        Estimated FDM Reservation: 79033632 bytes
+        Estimated CSD Worker Slots: 16
+        CSD Stage Estimates: 3/Scan rows=3758 groups=0 tasks=65 cpu=488.895ms state=0B resident=0B available=934072256B spill=0B visited=1600022 expr_ops=36 physical_ops=36.25 decode_ops=3.75; 2/Scan rows=912520 groups=0 tasks=1758 cpu=3770.778ms state=0B resident=0B available=936481088B spill=0B visited=47991640 expr_ops=17 physical_ops=3.61 decode_ops=6.25; 1/Join rows=896 groups=0 tasks=1758 cpu=34.349ms state=245760B resident=245760B available=469762048B spill=0B join=inner; 0/Aggregate rows=1 groups=1 tasks=0 cpu=0.042ms state=1904B resident=1904B available=939235648B spill=0B; pipeline_io_overlap=1909.559ms
+        Execution Path: csd
+        CSD Device CUs: 8
+        CSD CU CPU Ratio: 0.333300
+        CSD HOST Parameter Count: 0
+        CSD Device Initializers: 0
+        CSD Device FDM: 134217728 bytes
+        CSD Device Workmem: 939524096 bytes
+        CSD Query Memory Limit: 939524096 bytes
+        CSD Plan Source: PostgreSQL selected Plan; CSD build/probe orientation
+        CSD Host Result Bytes: 902 bytes
+        CSD Counter Scope: current device stream
+        CSD Direct CU Output: false
+        CSD Result Delivery: synchronous
+        CSD Host Result Requests: 2
+        CSD Returned Rows: 1
+        CSD Output Columns: 1
+        CSD Intermediate Data: device workmem and internal spill; 128-bit values
+        CSD Plan: 0:Aggregate <- 1; 1:Hash Join <- 2,3; 2:Scan(lineitem); 3:Scan(part)
+        CSD Dictionary AFDM: 4096 bytes
+        CSD Dictionary Entries: 18
+        CSD Dictionary Bytes: 132 bytes
+        CSD Heap Rows: 49589007
+        CSD Internal Read: 7638237184 bytes
+        CSD Index/Heap Page Loads: 0
+        CSD Indexed Heap Tuples: 0
+        CSD Workmem Peak: 6561040 bytes
+        CSD Workers: 16
+        CSD Task Slots: 16
+        CSD Parallel Pipelines: 2
+        CSD Scan Block: 4194304 bytes
+        CSD Probe Prefetch Reused Blocks: 8
+        CSD Probe Prefetch Ready Before Probe: true
+        CSD Scan Vector Capacity: 2048 rows
+        CSD AFDM: 108313640 bytes
+        CSD Workmem B-tree Page Hits: 0
+        CSD Workmem B-tree Page Misses: 0
+        CSD Workmem Heap Page Hits: 0
+        CSD Workmem Heap Page Misses: 0
+        CSD Spill Read: 0 bytes
+        CSD Spill Write: 0 bytes
+        CSD Runs: 0
+        CSD Tree Wall: 4596.193 ms
+        CSD Setup Wall: 33.974 ms
+        CSD Cleanup Wall: 0.555 ms
+        CSD CSF Wall: 36031.428 ms
+        CSD CSF CPU: 12057.688 ms
+        CSD CSF Calls: 1863
+        CSD Active CUs Peak: 8
+        CSD Scan Decode CPU: 7457.800 ms
+        CSD Vector Filter CPU: 4240.157 ms
+        CSD Sort Sink CPU: 0.000 ms
+        CSD Sort Source CPU: 0.000 ms
+        CSD Hash Build Coordinator CPU: 0.831 ms
+        CSD Aggregate Sink Coordinator CPU: 0.000 ms
+        CSD Aggregate Merge CPU: 0.000 ms
+        CSD Aggregate Merge Calls: 0
+        CSD Sort Source Calls: 0
+        CSD Hash Table 1: memory_cpu=0.002 ms reindex_cpu=0.012 ms reindexes=1 rows=0 moved_bytes=0 (within Build)
+        CSD Pipeline 1: rounds=1 wall=4051.257 ms coordinator=0.046 ms workers=10742.651 ms avg_cus=2.65 cpu_util=33.1% sink=3.294 ms sink_rows=980
+        CSD Pipeline 1 task balance: csf_wall_sum=32153.797 ms task_cpu_min=664.411 ms task_cpu_max=680.434 ms finished_idle_sum=168.640 ms
+        CSD Pipeline 1 next_input: calls=1757 task_wait_sum=32232.341 ms (includes requeue; concurrent tasks overlap)
+        CSD Pipeline 3: rounds=1 wall=507.380 ms coordinator=0.017 ms workers=1313.267 ms avg_cus=2.59 cpu_util=32.4% sink=3.859 ms sink_rows=4043
+        CSD Pipeline 3 sink distribution: sink_node=1 returned_rows=0 slow_slot=11 scanned=100013/1600000 sink_rows=234 returned_rows=0
+        CSD Pipeline 3 task balance: csf_wall_sum=3875.854 ms task_cpu_min=78.178 ms task_cpu_max=86.186 ms finished_idle_sum=352.900 ms
+        CSD Pipeline 3 next_input: calls=64 task_wait_sum=3331.766 ms (includes requeue; concurrent tasks overlap)
+        CSD LOAD Preparation: 0.000 ms
+        CSD Host LOAD Requests: 0
+        CSD Host Poll: 26.657 ms
+        CSD Host Completion Copy: 0.356 ms
+        CSD Result Read Wall: 0.050 ms
+        CSD Control Read Sum: 0.293 ms
+        CSD Host Submit: 2.531 ms
+        CSD Host Queue (within Submit): 1.993 ms
+        CSD Host Control Write (within Submit): 0.277 ms
+        CSD Host Idle Sleep: 4489.475 ms
+        CSD Host Submissions: 42
+        CSD Host Polls: 646790
+        CSD Host Completions: 42
+        CSD Pending Requests Sum: 72363.787 ms
+        CSD Host Assigned LOADs: 1815
+        CSD Callback Submissions: 1821
+        CSD Callback Requeue Average: 21.627 us
+        CSD Callback Requeue Maximum: 204.775 us
+        CSD Callback Completed Requests Sum: 71860.539 ms
+        CSD PG Scan Requeues: 16
+        CSD PG Scan Requeue Average: 23175.328 us
+        CSD PG Scan Requeue Maximum: 30538.650 us
+        CSD Shared Sink Waits: 0
+        CSD Shared Sink Wait: 0.000 ms
+        CSD Host Completion Reads: 10
+        CSD Host Control Writes: 9
+        CSD Completion Notice Sum: 2.666 ms
+        CSD Completion Notice Average: 63.478 us
+        CSD Completion Notice Maximum: 190.905 us
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  duration: 0.308 ms  plan:
+Query Text: SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','i','m') AND c.relpersistence='p' AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' ORDER BY c.oid
+Sort  (cost=24.90..25.11 rows=84 width=4) (actual rows=24 loops=1)
+  Sort Key: c.oid
+  Sort Method: quicksort  Memory: 26kB
+  ->  Hash Join  (cost=1.11..22.21 rows=84 width=4) (actual rows=24 loops=1)
+        Hash Cond: (c.relnamespace = n.oid)
+        ->  Seq Scan on pg_class c  (cost=0.00..19.97 rows=251 width=8) (actual rows=261 loops=1)
+              Filter: ((relpersistence = 'p'::"char") AND (relkind = ANY ('{r,i,m}'::"char"[])))
+              Rows Removed by Filter: 180
+        ->  Hash  (cost=1.09..1.09 rows=2 width=4) (actual rows=2 loops=1)
+              Buckets: 1024  Batches: 1  Memory Usage: 9kB
+              ->  Seq Scan on pg_namespace n  (cost=0.00..1.09 rows=2 width=4) (actual rows=2 loops=1)
+                    Filter: ((nspname !~ '^pg_'::text) AND (nspname <> 'information_schema'::name))
+                    Rows Removed by Filter: 5
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=16403 blocks=139519 shared_pages=0 file_pages=0 file_total=279038 file_known=1 file_generation=1 shared_delta_pages=0
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=16459 blocks=32905 shared_pages=0 file_pages=0 file_total=65810 file_known=1 file_generation=1 shared_delta_pages=0
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=16387 blocks=32769 shared_pages=0 file_pages=0 file_total=65538 file_known=1 file_generation=1 shared_delta_pages=0
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=24603 blocks=2 shared_pages=1 file_pages=0 file_total=4 file_known=1 file_generation=1 shared_delta_pages=1
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=24610 blocks=1 shared_pages=1 file_pages=0 file_total=2 file_known=1 file_generation=1 shared_delta_pages=1
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=16461 blocks=131584 shared_pages=1 file_pages=0 file_total=263168 file_known=1 file_generation=1 shared_delta_pages=1
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=24578 blocks=1 shared_pages=1 file_pages=0 file_total=2 file_known=1 file_generation=1 shared_delta_pages=1
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=24593 blocks=2 shared_pages=0 file_pages=0 file_total=4 file_known=1 file_generation=1 shared_delta_pages=0
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=24600 blocks=1 shared_pages=1 file_pages=0 file_total=2 file_known=1 file_generation=1 shared_delta_pages=1
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=16427 blocks=899633 shared_pages=0 file_pages=0 file_total=1799266 file_known=1 file_generation=1 shared_delta_pages=0
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=16455 blocks=17551 shared_pages=0 file_pages=0 file_total=35102 file_known=1 file_generation=1 shared_delta_pages=0
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=16453 blocks=221 shared_pages=0 file_pages=0 file_total=442 file_known=1 file_generation=1 shared_delta_pages=0
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=16420 blocks=208731 shared_pages=0 file_pages=0 file_total=417462 file_known=1 file_generation=1 shared_delta_pages=0
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=24587 blocks=1 shared_pages=0 file_pages=0 file_total=2 file_known=1 file_generation=1 shared_delta_pages=0
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=16457 blocks=3293 shared_pages=0 file_pages=0 file_total=6586 file_known=1 file_generation=1 shared_delta_pages=0
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=24613 blocks=2 shared_pages=2 file_pages=0 file_total=4 file_known=1 file_generation=1 shared_delta_pages=2
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=16396 blocks=1773 shared_pages=0 file_pages=0 file_total=3546 file_known=1 file_generation=1 shared_delta_pages=0
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=16441 blocks=1 shared_pages=0 file_pages=0 file_total=2 file_known=1 file_generation=1 shared_delta_pages=0
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=16465 blocks=2 shared_pages=0 file_pages=0 file_total=4 file_known=1 file_generation=1 shared_delta_pages=0
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=16451 blocks=4390 shared_pages=6 file_pages=0 file_total=8780 file_known=1 file_generation=1 shared_delta_pages=6
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=16463 blocks=2 shared_pages=0 file_pages=0 file_total=4 file_known=1 file_generation=1 shared_delta_pages=0
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=24585 blocks=2 shared_pages=2 file_pages=0 file_total=4 file_known=1 file_generation=1 shared_delta_pages=2
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=16435 blocks=1 shared_pages=0 file_pages=0 file_total=2 file_known=1 file_generation=1 shared_delta_pages=0
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger relation generation=2 relid=16411 blocks=28666 shared_pages=0 file_pages=0 file_total=57332 file_known=1 file_generation=1 shared_delta_pages=0
+psql:/home/femu/snia-operator-graph/sf8-src/tests/guest/queries/sf8_sel0.1/19.sql:40: NOTICE:  SQLerate cache ledger refresh reason=executor_end generation=2 wall_ms=15.022 relations=24 dcp_updates=0 dcp_evictions=0 coalesced=0 returned_ns=215590259860591
+TPCH_END 1

@@ -357,7 +357,8 @@ static void add_device_path(PlannerInfo *root,RelOptInfo *rel,Path *native,bool 
     /* Within PG's 1% path cost tolerance, keep supported unary operators
      * with their existing device input if the device preserves the order.
      * An ordered Limit can then supply its bound to the device Sort. */
-    if(extends_device_path(native) &&
+    bool deliverable=intVal(list_nth(((CustomScan *)device)->custom_private,5));
+    if(deliverable && extends_device_path(native) &&
        pathkeys_contained_in(native->pathkeys,path->path.pathkeys) &&
        path->path.total_cost<=native->total_cost*1.01)
         rel->pathlist=list_delete_ptr(rel->pathlist,native);
@@ -385,7 +386,9 @@ static void add_device_path(PlannerInfo *root,RelOptInfo *rel,Path *native,bool 
             state->scan[shared]=palloc(sizeof(*path)); *state->scan[shared]=*path;
         }
     }
-    state->pending=lappend(state->pending,path);
+    /* An internal tree can be extended by a supported sink, but cannot
+     * be selected on its own if the graph cannot return it to PostgreSQL. */
+    if(deliverable) state->pending=lappend(state->pending,path);
     if(pg_sina_planning) pg_sina_planning->retain_publish+=pg_sina_planner_clock()-freed;
     if(pg_sina_planning) pg_sina_planning->retain+=pg_sina_planner_clock()-mark;
 }
@@ -400,9 +403,18 @@ static void publish_paths(PlannerInfo *root,RelOptInfo *rel)
     }
     list_free(pending);
 }
-/* Use PG's hash budget to price one possible growth event. For an
- * already-batched Parallel Hash, PG has priced the normal read/write pass;
- * only the additional build-side repartition belongs here. */
+/* Match costsize.c's spill tuple width. PG charges a partial Path's rows;
+ * a shared temporary-file pass must move all participants' pages. */
+static double hash_shared_spill_extra_pages(Path *input)
+{
+    double divisor=Max(1,input->parallel_workers+(parallel_leader_participation?
+        Max(0,1-0.3*input->parallel_workers):0));
+    double pages=input->rows*(MAXALIGN(input->pathtarget->width)+MAXALIGN(SizeofHeapTupleHeader))/BLCKSZ;
+    return ceil(pages*divisor)-ceil(pages);
+}
+
+/* Correct shared spill service and use PG's hash budget to price one
+ * possible growth event. */
 static double hash_batch_risk(PlannerInfo *root,HashPath *hash,double *startup,double *total)
 {
     JoinPath *join=&hash->jpath;
@@ -410,6 +422,15 @@ static double hash_batch_risk(PlannerInfo *root,HashPath *hash,double *startup,d
     int planned=hash->num_batches;
     bool shared=join->path.parallel_aware;
     if(planned>1 && !shared) return 0;
+    if(planned>1) {
+        double inner_pages=hash_shared_spill_extra_pages(inner);
+        double outer_pages=hash_shared_spill_extra_pages(outer);
+        *startup=inner_pages*seq_page_cost;
+        *total=2*(inner_pages+outer_pages)*seq_page_cost;
+        if(pg_sina_planning)
+            ereport(DEBUG1,(errmsg("SQLerate HOST Hash shared spill batches=%d inner_pages=%.0f outer_pages=%.0f extra_ms=%.3f",
+                planned,inner_pages,outer_pages,*total*pg_sina_host_cost_ms)));
+    }
     double uncertainty=1;
     int member=-1;
     while((member=bms_next_member(inner->parent->relids,member))>=0)
@@ -439,15 +460,19 @@ static double hash_batch_risk(PlannerInfo *root,HashPath *hash,double *startup,d
         /* Growth happens during the build, before partitioning the probe
          * side. At the capacity crossing, read the already-spooled batches
          * and write their replacements plus the displaced in-memory rows.
-         * Use PG's parallel per-participant I/O convention for this pass. */
+         * Workers share the temporary-file I/O path. Only repartition CPU
+         * work is divided among participants. */
         double tuple_bytes=MAXALIGN(width)+MAXALIGN(SizeofMinimalTupleHeader)+sizeof(uint32);
         double read_pages=ceil(high*(1-1.0/planned)*tuple_bytes/BLCKSZ);
         double write_pages=ceil(high*(1-0.5/planned)*tuple_bytes/BLCKSZ);
-        *startup=*total=risk*((read_pages+write_pages)*seq_page_cost+
-            high*2*cpu_operator_cost)/divisor;
+        double io=(read_pages+write_pages)*seq_page_cost;
+        double cpu=high*2*cpu_operator_cost/divisor;
+        *startup+=risk*(io+cpu);
+        *total+=risk*(io+cpu);
         if(pg_sina_planning)
-            ereport(DEBUG1,(errmsg("SQLerate HOST Hash growth batches=%d build_rows=%.0f crossing_rows=%.0f risk=%.3f read_pages=%.0f write_pages=%.0f extra_ms=%.3f",
-                planned,rows,high,risk,read_pages,write_pages,*total*pg_sina_host_cost_ms)));
+            ereport(DEBUG1,(errmsg("SQLerate HOST Hash growth batches=%d build_rows=%.0f crossing_rows=%.0f risk=%.3f read_pages=%.0f write_pages=%.0f io_ms=%.3f cpu_ms=%.3f extra_ms=%.3f",
+                planned,rows,high,risk,read_pages,write_pages,risk*io*pg_sina_host_cost_ms,
+                risk*cpu*pg_sina_host_cost_ms,risk*(io+cpu)*pg_sina_host_cost_ms)));
         return risk;
     }
     double build=(high+upper)/2;
@@ -474,7 +499,8 @@ static double price_hash_batch_risk(PlannerInfo *root,HashPath *hash)
 static void observe_host_hash(PlannerInfo *root,HashPath *hash)
 {
     double startup=0,total=0;
-    if(hash_batch_risk(root,hash,&startup,&total)<=0) return;
+    hash_batch_risk(root,hash,&startup,&total);
+    if(total<=0) return;
     const JoinPath *join=&hash->jpath;
     MemoryContext previous=MemoryContextSwitchTo(pg_sina_search_context());
     struct host_hash_cost *cost=palloc(sizeof(*cost));

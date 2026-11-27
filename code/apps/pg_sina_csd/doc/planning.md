@@ -293,7 +293,7 @@ HPCP与无HPCP的22条SQL耗时合计相差约-0.12%，总体基本持平；单�
 1. `src/extension.c:hooked_planner`仅在完整CSD/HPCP/SQLerate模式先复制Query，调用`src/planner/rewrite.c`。host-only和filter-only保持原始Query，交给PG正常规划。
 2. 本项目改写严格WHERE条件中的相关标量SUM/AVG/MIN/MAX：提取内外层整数等值键，将内层聚合改成按关联键分组，再与外层INNER JOIN，之后仍由PG选择物理Join顺序。只覆盖空集返回NULL的聚合及其严格表达式；COUNT、OR分支、SELECT输出位置、非等值相关、额外GROUP BY/HAVING/窗口/LIMIT等形态不做这项改写。它借鉴DuckDB的去相关思想，但不是DuckDB完整的Delim/Mark/Single Join实现。
 3. PG12自己的`prepjointree.c:pull_up_sublinks`会在满足条件的WHERE/JOIN ON位置，将ANY/EXISTS/NOT EXISTS转成Semi/Anti Join；不能保持NULL、相关或外连接语义时会保留子计划。`subselect.c:build_subplan`通常将非相关标量结果转成InitPlan/PARAM_EXEC，将适合哈希的非相关ANY保留为hashed SubPlan。不能期待所有子查询都消失，非相关标量只计算一次本来就是合理方案。
-4. 扩展的`src/planner/plan.c`编译上述物理节点；设备`code/csd-programs/pg_sina_csd/plan.c`执行注册的初始化子计划，再运行主流水线。
+4. 扩展的`src/planner/plan.c`编译上述物理节点；设备`code/apps/pg_sina_csd/operators/runtime/plan.c`执行注册的初始化子计划，再运行主流水线。
 
 | PG规划后的形态 | 当前完整CSD支持 |
 | --- | --- |

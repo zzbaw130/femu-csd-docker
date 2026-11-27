@@ -86,7 +86,9 @@ typedef enum {
     CS_BATCH_DELETE = 2,
     CS_BATCH_RECONFIG = 3,
     CS_BATCH_JOIN = 4,
-    CS_BATCH_SPLIT = 5
+    CS_BATCH_SPLIT = 5,
+    /* Device extension: replace the after-to-before edge with one stream inlet. */
+    CS_BATCH_STREAM_LINK = 6
 } CS_BATCH_CONFIG_TYPE;
 typedef enum {
     CS_STAT_CSE_USAGE = 1,     // query to provide CSE runtime statistics

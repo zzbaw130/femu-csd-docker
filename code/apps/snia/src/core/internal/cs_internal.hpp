@@ -99,7 +99,7 @@ struct PreparedRequest final {
     CS_STATUS execute(u64 *value) const;
     CS_STATUS executeBatchEntry(std::atomic_bool &cancelled, void *execution, u64 *value) const;
 };
-struct BatchEntry { std::shared_ptr<PreparedRequest> request; u64 dependencies = 0; };
+struct BatchEntry { std::shared_ptr<PreparedRequest> request; u64 dependencies = 0, stream_inputs = 0; };
 struct Batch final : Handle {
     CS_BATCH_MODE mode;
     unsigned capacity;

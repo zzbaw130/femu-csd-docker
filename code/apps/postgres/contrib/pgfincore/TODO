@@ -1,3 +1,0 @@
-* [sql] average contigous block or stats like that (what part of the file is in cache)
-* [code] split mmaping in shorter segment (say 64Mb) per sugestion from Andres Freund
-* graph

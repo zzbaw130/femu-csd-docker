@@ -1,0 +1,176 @@
+NOTICE:  SQLerate cache resident shared_pct=0.000 file_pct=0.000 known_pct=100.000 generation=1
+NOTICE:  duration: 0.175 ms  plan:
+Query Text: SELECT device FROM sina_csd.relations WHERE relid=$1 AND relfilenode=$2
+Index Scan using relations_pkey on relations  (cost=0.15..8.17 rows=1 width=32) (actual rows=1 loops=1)
+  Index Cond: (relid = '16427'::oid)
+  Filter: (relfilenode = '16427'::oid)
+NOTICE:  SQLerate original device estimate total_ms=11367.910 cpu_ms=9738.240 io_ms=3427.819 spill_bytes=257087424 peak_bytes=134271888 stages=4/Scan rows=6075492 groups=0 tasks=1758 cpu=2057.600ms state=0B resident=0B available=133672912B spill=0B visited=47991640 expr_ops=1 physical_ops=0.25 decode_ops=3.75; 3/Sort rows=6075492 groups=0 tasks=0 cpu=4407.874ms state=194595848B resident=134201424B available=134201424B spill=257087424B; 2/Limit rows=6075392 groups=0 tasks=0 cpu=318.995ms state=0B resident=0B available=65536B spill=0B; 1/Project rows=6075392 groups=0 tasks=0 cpu=1275.960ms state=0B resident=0B available=65536B spill=0B; 0/Aggregate rows=1 groups=1 tasks=0 cpu=1594.951ms state=1904B resident=1904B available=65536B spill=0B; pipeline_io_overlap=1800.400ms
+NOTICE:  CSD planner total_ms=3.951
+NOTICE:  CSD planner total_ms=1.745
+NOTICE:  SQLerate query IO available=1 device_reads=50 device_read_bytes=1122304 reclaim_scan_pages=0 reclaim_steal_pages=0 refault_file=0 free_before_bytes=16179384320 free_after_bytes=16200482816 file_before_bytes=232308736 file_after_bytes=239116288 shmem_before_bytes=69459968 shmem_after_bytes=69722112 active_file_before_bytes=122740736 active_file_after_bytes=126668800 inactive_file_before_bytes=30756864 inactive_file_after_bytes=33755136
+NOTICE:  duration: 21472.530 ms  plan:
+Query Text: SELECT SUM(l_extendedprice)
+FROM (
+    SELECT l_extendedprice
+    FROM lineitem
+    WHERE l_shipdate < DATE '1993-01-01'
+    ORDER BY l_extendedprice DESC
+    OFFSET 100
+) AS sorted;
+Custom Scan (SQLeratePlan)  (cost=568395.49..568395.49 rows=1 width=32) (actual rows=1 loops=1)
+  Execution Mode: csd-without-hpcp
+  HPCP: disabled
+  DCP: disabled
+  Placement Costs: milliseconds; estimates, not execution timings
+  Placement: subtree:CSD; query=original PG physical tree; original HOST=40614.244ms original CSD=11367.910ms shared search=11367.910ms
+  ->  Custom Scan (SniaCsdPlan)  (cost=2030712.20..2030712.21 rows=1 width=32) (actual rows=1 loops=1)
+        Execution Mode: csd-without-hpcp
+        HPCP: disabled
+        DCP: disabled
+        Input Source: internal NVM to FDM
+        SQLerate HOST Cost: 40614.244 ms
+        SQLerate CSD Cost: 11367.659 ms
+        SQLerate CSD to HOST Cost: 0.250 ms
+        Host Page Cache Residency: 0.00 percent
+        Estimated Spill I/O: 257087424 bytes
+        Estimated CSD CPU: 9738.240 ms
+        Estimated Internal I/O including Spill: 3427.819 ms
+        Estimated Peak Workmem: 134271888 bytes
+        Estimated HPCP Link Work: 0.000 ms
+        Estimated CSD Serial CPU: 3189.905 ms
+        Estimated CSD Parallel CPU: 2656.397 ms
+        Estimated CSD Scheduling: 82.860 ms
+        Estimated CSD Combine CPU: 3809.079 ms
+        Estimated Dictionary Working Set: 0 bytes
+        Estimated FDM Reservation: 73577760 bytes
+        Estimated CSD Worker Slots: 16
+        CSD Stage Estimates: 4/Scan rows=6075492 groups=0 tasks=1758 cpu=2057.600ms state=0B resident=0B available=133672912B spill=0B visited=47991640 expr_ops=1 physical_ops=0.25 decode_ops=3.75; 3/Sort rows=6075492 groups=0 tasks=0 cpu=4407.874ms state=194595848B resident=134201424B available=134201424B spill=257087424B; 2/Limit rows=6075392 groups=0 tasks=0 cpu=318.995ms state=0B resident=0B available=65536B spill=0B; 1/Project rows=6075392 groups=0 tasks=0 cpu=1275.960ms state=0B resident=0B available=65536B spill=0B; 0/Aggregate rows=1 groups=1 tasks=0 cpu=1594.951ms state=1904B resident=1904B available=65536B spill=0B; pipeline_io_overlap=1800.400ms
+        Execution Path: csd
+        CSD Executor: pg_sina_plan
+        CSD Device CUs: 8
+        CSD CU CPU Ratio: 0.333300
+        CSD HOST Parameter Count: 0
+        CSD Device Initializers: 0
+        CSD Device FDM: 134217728 bytes
+        CSD Device Workmem: 939524096 bytes
+        CSD Query Memory Limit: 134217728 bytes
+        CSD Plan Source: PostgreSQL selected Plan; CSD build/probe orientation
+        CSD Host Result Bytes: 904 bytes
+        CSD Counter Scope: current device stream
+        CSD Direct CU Output: false
+        CSD Result Delivery: synchronous
+        CSD Host Result Requests: 2
+        CSD Returned Rows: 1
+        CSD Output Columns: 1
+        CSD Intermediate Data: device workmem and internal spill; 128-bit values
+        CSD Plan: 0:Aggregate <- 1; 1:Projection <- 2; 2:Limit <- 3; 3:Sort[0 desc] <- 4; 4:Scan(lineitem)
+        CSD Dictionary AFDM: 4096 bytes
+        CSD Dictionary Entries: 0
+        CSD Dictionary Bytes: 0 bytes
+        CSD Heap Rows: 47989007
+        CSD Internal Read: 7369793536 bytes
+        CSD Index/Heap Page Loads: 0
+        CSD Indexed Heap Tuples: 0
+        CSD Workmem Peak: 134132960 bytes
+        CSD Workers: 16
+        CSD Task Slots: 16
+        CSD Parallel Pipelines: 1
+        CSD Scan Block: 4194304 bytes
+        CSD Scan Vector Capacity: 2048 rows
+        CSD AFDM: 73493400 bytes
+        CSD Workmem B-tree Page Hits: 0
+        CSD Workmem B-tree Page Misses: 0
+        CSD Workmem Heap Page Hits: 0
+        CSD Workmem Heap Page Misses: 0
+        CSD Spill Read: 77594624 bytes
+        CSD Spill Write: 77594624 bytes
+        CSD Runs: 196
+        CSD Tree Wall: 21470.215 ms
+        CSD Setup Wall: 24.114 ms
+        CSD Cleanup Wall: 0.536 ms
+        CSD CSF Wall: 44734.284 ms
+        CSD CSF CPU: 15732.852 ms
+        CSD CSF Calls: 5338
+        CSD Active CUs Peak: 8
+        CSD Scan Decode CPU: 5273.201 ms
+        CSD Vector Filter CPU: 621.324 ms
+        CSD Sort Sink CPU: 2832.503 ms
+        CSD Sort Source CPU: 4828.328 ms
+        CSD Hash Build Coordinator CPU: 0.000 ms
+        CSD Aggregate Sink Coordinator CPU: 0.000 ms
+        CSD Aggregate Merge CPU: 0.000 ms
+        CSD Aggregate Merge Calls: 0
+        CSD Sort Source Calls: 26109
+        CSD Pipeline 4: rounds=1 wall=3562.632 ms coordinator=0.087 ms workers=9108.392 ms avg_cus=2.56 cpu_util=32.0% sink=2933.202 ms sink_rows=6073365
+        CSD Pipeline 4 task balance: csf_wall_sum=26989.510 ms task_cpu_min=463.969 ms task_cpu_max=647.696 ms finished_idle_sum=2638.447 ms
+        CSD Pipeline 4 spill_io: calls=1168 task_wait_sum=6173.399 ms (includes requeue; concurrent tasks overlap)
+        CSD Pipeline 4 next_input: calls=1757 task_wait_sum=20960.229 ms (includes requeue; concurrent tasks overlap)
+        CSD LOAD Preparation: 0.000 ms
+        CSD Host LOAD Requests: 0
+        CSD Host Poll: 30.646 ms
+        CSD Host Completion Copy: 1.846 ms
+        CSD Result Read Wall: 0.049 ms
+        CSD Control Read Sum: 1.781 ms
+        CSD Host Submit: 2.887 ms
+        CSD Host Queue (within Submit): 1.902 ms
+        CSD Host Control Write (within Submit): 0.805 ms
+        CSD Host Idle Sleep: 21315.914 ms
+        CSD Host Submissions: 29
+        CSD Host Polls: 645036
+        CSD Host Completions: 29
+        CSD Pending Requests Sum: 72201.282 ms
+        CSD Host Assigned LOADs: 1758
+        CSD Callback Submissions: 1757
+        CSD Callback Requeue Average: 22.221 us
+        CSD Callback Requeue Maximum: 164.401 us
+        CSD Callback Completed Requests Sum: 53798.537 ms
+        CSD PG Scan Requeues: 0
+        CSD PG Scan Requeue Average: 0.000 us
+        CSD PG Scan Requeue Maximum: 0.000 us
+        CSD Shared Sink Waits: 0
+        CSD Shared Sink Wait: 0.000 ms
+        CSD Host Completion Reads: 13
+        CSD Host Control Writes: 12
+        CSD Completion Notice Sum: 2.057 ms
+        CSD Completion Notice Average: 70.925 us
+        CSD Completion Notice Maximum: 179.622 us
+NOTICE:  duration: 0.396 ms  plan:
+Query Text: SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','i','m') AND c.relpersistence='p' AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' ORDER BY c.oid
+Sort  (cost=24.90..25.11 rows=84 width=4) (actual rows=24 loops=1)
+  Sort Key: c.oid
+  Sort Method: quicksort  Memory: 26kB
+  ->  Hash Join  (cost=1.11..22.21 rows=84 width=4) (actual rows=24 loops=1)
+        Hash Cond: (c.relnamespace = n.oid)
+        ->  Seq Scan on pg_class c  (cost=0.00..19.97 rows=251 width=8) (actual rows=261 loops=1)
+              Filter: ((relpersistence = 'p'::"char") AND (relkind = ANY ('{r,i,m}'::"char"[])))
+              Rows Removed by Filter: 180
+        ->  Hash  (cost=1.09..1.09 rows=2 width=4) (actual rows=2 loops=1)
+              Buckets: 1024  Batches: 1  Memory Usage: 9kB
+              ->  Seq Scan on pg_namespace n  (cost=0.00..1.09 rows=2 width=4) (actual rows=2 loops=1)
+                    Filter: ((nspname !~ '^pg_'::text) AND (nspname <> 'information_schema'::name))
+                    Rows Removed by Filter: 5
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16403 blocks=139519 shared_pages=0 file_pages=0 file_total=279038 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16459 blocks=32905 shared_pages=0 file_pages=0 file_total=65810 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16387 blocks=32769 shared_pages=0 file_pages=0 file_total=65538 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=24603 blocks=2 shared_pages=1 file_pages=0 file_total=4 file_known=1 file_generation=1 shared_delta_pages=1
+NOTICE:  SQLerate cache ledger relation generation=2 relid=24610 blocks=1 shared_pages=0 file_pages=0 file_total=2 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16461 blocks=131584 shared_pages=1 file_pages=0 file_total=263168 file_known=1 file_generation=1 shared_delta_pages=1
+NOTICE:  SQLerate cache ledger relation generation=2 relid=24578 blocks=1 shared_pages=1 file_pages=0 file_total=2 file_known=1 file_generation=1 shared_delta_pages=1
+NOTICE:  SQLerate cache ledger relation generation=2 relid=24593 blocks=2 shared_pages=0 file_pages=0 file_total=4 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=24600 blocks=1 shared_pages=1 file_pages=0 file_total=2 file_known=1 file_generation=1 shared_delta_pages=1
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16427 blocks=899633 shared_pages=0 file_pages=0 file_total=1799266 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16455 blocks=17551 shared_pages=0 file_pages=0 file_total=35102 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16453 blocks=221 shared_pages=0 file_pages=0 file_total=442 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16420 blocks=208731 shared_pages=0 file_pages=0 file_total=417462 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=24587 blocks=1 shared_pages=0 file_pages=0 file_total=2 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16457 blocks=3293 shared_pages=0 file_pages=0 file_total=6586 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=24613 blocks=2 shared_pages=0 file_pages=0 file_total=4 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16396 blocks=1773 shared_pages=0 file_pages=0 file_total=3546 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16441 blocks=1 shared_pages=0 file_pages=0 file_total=2 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16465 blocks=2 shared_pages=0 file_pages=0 file_total=4 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16451 blocks=4390 shared_pages=0 file_pages=0 file_total=8780 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16463 blocks=2 shared_pages=0 file_pages=0 file_total=4 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=24585 blocks=2 shared_pages=2 file_pages=0 file_total=4 file_known=1 file_generation=1 shared_delta_pages=2
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16435 blocks=1 shared_pages=0 file_pages=0 file_total=2 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger relation generation=2 relid=16411 blocks=28666 shared_pages=0 file_pages=0 file_total=57332 file_known=1 file_generation=1 shared_delta_pages=0
+NOTICE:  SQLerate cache ledger refresh reason=executor_end generation=2 wall_ms=14.693 relations=24 dcp_updates=0 dcp_evictions=0 coalesced=0 returned_ns=213475637901778

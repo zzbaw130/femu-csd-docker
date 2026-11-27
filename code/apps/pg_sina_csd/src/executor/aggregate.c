@@ -50,7 +50,7 @@ static TupleTableSlot *execute(CustomScanState *node)
     if(!s->executed) {
         struct qs_extent *extents=pg_sina_mapping(&s->request);
         s->profiling=pg_sina_profile;
-        pg_sina_execute(&s->request,extents,s->result,s->profiling,&s->stream); s->executed=true;
+        pg_sina_execute(&s->request,extents,s->result,s->profiling,&s->stream,NULL); s->executed=true;
         if(s->result->begin+s->result->rows>QS_RESULT_ROWS) elog(ERROR,"invalid CSD result range");
     }
     while(s->index==s->result->rows && !s->result->finished && s->stream) {
@@ -107,7 +107,7 @@ static void rescan(CustomScanState *node)
 {
     SniaState *s=(SniaState *)node; release(s); s->executed=false; s->index=0;
 }
-static void explain_profile(const struct qs_profile *p,ExplainState *es)
+static void explain_profile(const struct qs_profile *p,ExplainState *es,bool graph_join)
 {
     static const char *names[]={"Scan","Filter","Aggregate.sink","Aggregate.source","Sort","Limit","Sort.sink","Sort.source","HashJoin.build","HashJoin.load","HashJoin.probe+Aggregate"};
     if(es->format==EXPLAIN_FORMAT_TEXT) {
@@ -123,19 +123,20 @@ static void explain_profile(const struct qs_profile *p,ExplainState *es)
     ExplainPropertyFloat("Total Wall","ms",p->total_ns/1e6,3,es);
     for(unsigned i=0;i<QS_OPERATORS;++i) if(p->operators[i].calls) {
         const struct qs_timing *t=&p->operators[i];
+        const char *name=graph_join && i==QS_JOIN_PROBE?"HashJoin.probe":names[i];
         if(es->format==EXPLAIN_FORMAT_TEXT) {
             char summary[192];
             snprintf(summary,sizeof(summary),"calls=%llu wall_sum=%.3f ms cpu_sum=%.3f ms wall_max=%.3f ms",
                 (unsigned long long)t->calls,t->wall_ns/1e6,t->cpu_ns/1e6,t->max_wall_ns/1e6);
-            ExplainPropertyText(names[i],summary,es);
+            ExplainPropertyText(name,summary,es);
         } else {
-            ExplainOpenGroup("Operator",names[i],true,es);
-            ExplainPropertyText("Name",names[i],es);
+            ExplainOpenGroup("Operator",name,true,es);
+            ExplainPropertyText("Name",name,es);
             ExplainPropertyInteger("Calls",NULL,t->calls,es);
             ExplainPropertyFloat("Wall Sum","ms",t->wall_ns/1e6,3,es);
             ExplainPropertyFloat("CPU Sum","ms",t->cpu_ns/1e6,3,es);
             ExplainPropertyFloat("Wall Max","ms",t->max_wall_ns/1e6,3,es);
-            ExplainCloseGroup("Operator",names[i],true,es);
+            ExplainCloseGroup("Operator",name,true,es);
         }
     }
     ExplainCloseGroup("CSD-Profile","CSD Profile",true,es);
@@ -152,7 +153,9 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     ExplainPropertyInteger("CSD Device Workmem","bytes",pg_sina_resources.workmem_bytes,es);
     ExplainPropertyInteger("CSD Query Memory Limit","bytes",pg_sina_query_memory(),es);
     ExplainPropertyText("CSD Scan Relation",get_rel_name(p->relid),es);
-    ExplainPropertyText("CSD Scheduling","independent serial batches",es);
+    ExplainPropertyText("CSD Executor","SNIA operator graph",es);
+    ExplainPropertyText("CSD Scheduling",pg_sina_operator_graph && p->join.relid?
+        "independent serial batches with PG probe continuation":"independent serial batches",es);
     if(p->external_aggregate) ExplainPropertyText("CSD Aggregation","adaptive partial-state merge",es);
     StringInfoData graph; initStringInfo(&graph);
     if(p->join.relid) {
@@ -205,7 +208,7 @@ static void explain(CustomScanState *node,List *ancestors,ExplainState *es)
     if(p->nstrings) ExplainPropertyInteger("CSD String Literals",NULL,p->nstrings,es);
     if(p->runtime_dict) ExplainPropertyText("CSD Runtime Strings",p->dict_big?"large string dictionary":"low-cardinality dictionary",es);
     if(s->executed) {
-        if(s->profiling) explain_profile(&s->result->profile,es);
+        if(s->profiling) explain_profile(&s->result->profile,es,pg_sina_operator_graph && p->join.relid);
         ExplainPropertyInteger("CSD AFDM","bytes",s->result->metrics.fdm_bytes,es);
         ExplainPropertyInteger("CSD Chunks",NULL,s->result->metrics.chunks,es);
         ExplainPropertyInteger("CSD Workers",NULL,s->result->metrics.workers,es);

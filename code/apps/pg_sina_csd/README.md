@@ -2,7 +2,7 @@
 
 系统分层、PG/SNIA/NVMe 接口、设备图与 CU 调度，以及 HPCP/DCP 的队列和槽位设计见[系统架构](doc/architecture.md)。
 
-这是只读实验用 PostgreSQL 12 扩展。Guest 中的 PG 负责解析 SQL、规划和调用 SNIA；容器中编译的设备 SO 由 FEMU CU 执行扫描、表达式、连接、聚合和排序。完整下推时只有最终结果传回 Guest 并转换为 PG Datum。
+这是只读实验用 PostgreSQL 12 扩展。Guest 中的 PG 负责解析 SQL、规划和调用 SNIA；容器中编译的设备 SO 由 FEMU CU 执行扫描、表达式、连接、聚合和排序。原始 Heap 和中间结果不传回 Guest 执行器，只有最终结果转换为 PG Datum。
 
 ## 计划从哪里来
 
@@ -15,10 +15,6 @@
 | `csd-without-hpcp` | 尽可能完整卸载，未支持的节点在 PG | 关闭 |
 | `csd-with-hpcp` | 同上 | 开启 |
 | `SQLerate` | 将 HOST/CSD 候选加入 PG 的扫描、连接及上层路径搜索，选择混合计划 | CSD 子树开启 |
-
-专项对照可用 `SET pg_sina_csd.exe_path = 'ibex'`。对于单表、非空整数分组键和 `SUM(numeric)`，Ibex 使用以分组键为首列的已准备 B-tree。PG 按设备 workmem 为设备选定键值前缀，PG 扫描互补的后缀。设备任务先通过 SNIA 异步提交，PG 随即在本地按索引顺序分组。两侧分别完成 `SUM` 和 `HAVING`，PG 在本地范围结束后收取设备的最终结果，并执行后续算子。无可用索引或设备配额低于 64 MiB 时，保留原生 PG 路径。用 `python3 /home/femu/tests/m1d_ibex_workmem.py test --diagnose` 运行 SF8 Q18 的 128 和 896 MiB 冷启动对照。
-
-扩展升级到 0.3 后，可在表冻结且已有 CSD 映射时执行 `SELECT sina_csd.prepare_ibex('public.lineitem_pkey');`，为索引每 4096 个实际分组记录一个分界键。规划阶段只读取设备哈希表容量以内最大的分界。重新准备 CSD 映射后需重新生成这些分界。没有可用分界时，Ibex 用整数键区间宽度约束设备的最大分组数。冷启动计时前完成准备并清空缓存。
 
 HPCP 全称 **Host Page Cache Population（主机页缓存填充）**。它把设备读入的数据填充到 Guest 文件页缓存；两种 CSD 模式目前都从内部 NVM 读入 FDM，不会因为命中主机缓存就默认上传。SQLerate 分别观测 PG shared_buffers 和文件页缓存：前者命中免除读盘及内核到 PG 缓冲区的复制，后者命中仍保留复制成本；CPU、谓词和索引查找成本继续保留。这里只改变估价，HPCP 仍填充文件页缓存。成本公式、参数及当前执行边界见 [规划说明](doc/planning.md)。
 
@@ -178,7 +174,7 @@ sh /home/femu/tests/tpch-warm.sh -n 3
 sh /home/femu/tests/tpch-repeat.sh -n 5 19
 ```
 
-三个测试入口沿用 Guest 初始化时的 PG 参数。默认 `shared_buffers=2GB`、`work_mem=1GB`、每 Gather 最多 8 个 worker、全局并行和后台 worker 上限各 16，HashAggregate 关闭。专项实验可用选项覆盖。 `work_mem` 是每节点和每 worker 的额度，参数保存在 `logs/<模式>/settings.txt`。
+三个测试入口以启动参数统一设置`max_parallel_workers_per_gather=4`、`shared_buffers=2GB`、`work_mem=16MB`，也可用选项修改；`work_mem`是每节点/worker额度。当前参数保存在结果目录`logs/<模式>/settings.txt`。
 与原默认配置的完整冷启动对照见 [原生 PG 配置对照](doc/host-configuration.md)。
 
 只保留标准规定的 Q2=100、Q3=10、Q10=20、Q18=100、Q21=100 行上限，其余查询不额外添加 LIMIT。查询参数、子查询写法和 Q15 的 CREATE VIEW/SELECT/DROP VIEW 均保持该目录原样。host 与 CSD 接收同一个文件，超时或错误直接记录为失败，不用手写参考 SQL 替代。

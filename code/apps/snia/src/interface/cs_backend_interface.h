@@ -9,7 +9,7 @@
 #include "cs.h"
 #include <stdbool.h>
 #define CS_BACKEND_ABI 3
-struct cs_backend_batch_entry { const CsBatchRequest *request; u64 dependencies; };
+struct cs_backend_batch_entry { const CsBatchRequest *request; u64 dependencies, stream_inputs; };
 struct cs_backend_ops {
     unsigned abi;
     const char *name;

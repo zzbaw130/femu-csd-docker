@@ -1,5 +1,6 @@
 #ifndef FEMU_CSD_KERNEL_H
 #define FEMU_CSD_KERNEL_H
+#include <stdint.h>
 
 struct femu_csd_args {
     int numr;
@@ -11,6 +12,9 @@ struct femu_csd_args {
      * The current SNIA backend does not submit this payload: NULL / 0 there. */
     void *data_buffer;
     long long buffer_len;
+    void *graph_context;
+    uint64_t (*graph_event)(void *context, uintptr_t key, int signal);
+    unsigned graph_stream, graph_input;
 } __attribute__((packed));
 
 #endif

@@ -1703,6 +1703,7 @@ typedef struct NvmeRequest {
     NvmeCmd                 cmd;
     NvmeCqe                 cqe;
     uint8_t                 cmd_opcode;
+    bool                    link_pending;
     QEMUSGList              qsg;
     QEMUIOVector            iov;
     QTAILQ_ENTRY(NvmeRequest)entry;
@@ -1710,7 +1711,7 @@ typedef struct NvmeRequest {
     /* io_stages: when the poller handed it to the FTL ring, and got it back */
     int64_t                 t_handoff;
     int64_t                 t_return;
-    /* Shared PCIe link reservation, also used by autonomous cache DMA. */
+    /* Shared PCIe link reservation. */
     struct { uint64_t begin,end; } link_timing;
     int64_t                 reqlat;
     int64_t                 gcrt;
@@ -2477,6 +2478,7 @@ typedef struct FemuCtrl {
     uint32_t        pcie_prop_delay_ns;
     uint64_t        pcie_tx_next_avail_time;
     uint64_t        pcie_rx_next_avail_time;
+    unsigned        pcie_tx_pending; /* outbound requests awaiting reservation */
     pthread_spinlock_t pcie_lock;
     /* Comparison with a TX queue fed the same foreground requests only. */
     unsigned pcie_profile_users;
@@ -2985,7 +2987,12 @@ void nvme_enqueue_ns_event(FemuCtrl *n, uint8_t event_type, uint8_t event_info,
                            uint8_t log_page, uint32_t nsid);
 void nvme_clear_ns_events(FemuCtrl *n, uint8_t event_type, uint32_t nsid);
 void nvme_post_cqes_io(void *opaque);
-void nvme_charge_link(FemuCtrl *n, NvmeRequest *req, bool hpcp);
+void nvme_link_mark_pending(FemuCtrl *n, NvmeRequest *req);
+void nvme_link_clear_pending(FemuCtrl *n, NvmeRequest *req);
+int nvme_enqueue_completion(FemuCtrl *n, struct rte_ring *ring,
+                           NvmeRequest *req);
+uint64_t nvme_try_cache_link(FemuCtrl *n, uint64_t bytes,
+                            uint64_t *begin, uint64_t *end);
 void *nvme_poller(void *arg);
 
 /* NVMe I/O */

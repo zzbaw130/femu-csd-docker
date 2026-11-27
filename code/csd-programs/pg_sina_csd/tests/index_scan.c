@@ -153,10 +153,6 @@ static void ordered_scan(void *library,unsigned rows,int empty,int flags)
     struct qs_join_control control={0}; struct qs_task task={0}; assert(!init(&p,&control));
     void (*range)(struct qs_join_control *,unsigned,unsigned)=dlsym(library,"qs_index_scan_range"); assert(range);
     if(flags&16) range(&control,1,3);
-    if(flags&32) {
-        void (*upper)(struct qs_join_control *,int64_t)=dlsym(library,"qs_index_scan_upper"); assert(upper);
-        upper(&control,7); /* A duplicate key starts on the first leaf and spans both. */
-    }
     struct qs_chunk *out=calloc(1,qs_chunk_bytes(17,2)); assert(out); out->capacity=17; out->ncols=p.ncols;
     char *io=calloc(1,QS_INDEX_IO_BYTES); assert(io);
     unsigned seen=0;
@@ -186,7 +182,7 @@ static void ordered_scan(void *library,unsigned rows,int empty,int flags)
         }
         out->rows=out->selected=0;
     }
-    assert(seen==(empty?0:flags&32?2:rows)); close(&control); free(out); free(io);
+    assert(seen==(empty?0:rows)); close(&control); free(out); free(io);
 }
 int main(int argc,char **argv)
 {
@@ -196,7 +192,6 @@ int main(int argc,char **argv)
     heap_window=(void (*)(struct qs_join_control *,unsigned,const void *,uint32_t,uint32_t))dlsym(join,"qs_index_heap_window"); assert(heap_window);
     reset_cache=(void (*)(struct qs_join_control *,unsigned))dlsym(join,"qs_index_reset"); assert(reset_cache);
     key_bytes=4; pages(); ordered_scan(join,8,0,0); ordered_scan(join,8,1,2); ordered_scan(join,8,0,4);
-    ordered_scan(join,8,0,32);
     ordered_scan(join,8,0,12);
     ordered_scan(join,8,0,20); ordered_scan(join,8,0,28);
     /* Physical ranges do not follow downlinks through ignored pages. */

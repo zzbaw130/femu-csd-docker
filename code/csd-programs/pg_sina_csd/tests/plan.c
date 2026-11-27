@@ -135,21 +135,19 @@ static void scan(struct qp_node *n)
         n->expr.outputs[i]=(struct qs_output){.index=i,.type_oid=23};
     }
 }
-struct test_spill_block { void *data; size_t bytes; };
-struct test_spill { pthread_mutex_t mutex; struct test_spill_block *tokens; unsigned count,stores; };
+struct test_spill { pthread_mutex_t mutex; void **tokens; unsigned count,stores,reads; };
 static uint64_t spill_request(struct test_spill *s,unsigned op,uint64_t id,void *io)
 {
     assert(!pthread_mutex_lock(&s->mutex));
     if(op==1) {
-        assert(id && id<=QS_SORT_IO_BYTES);
+        assert(id==QS_SORT_IO_BYTES);
         s->tokens=realloc(s->tokens,(s->count+1)*sizeof(*s->tokens)); assert(s->tokens);
         void *data=malloc(id); assert(data); memcpy(data,io,id);
-        s->tokens[s->count++]=(struct test_spill_block){.data=data,.bytes=id}; id=s->count; ++s->stores;
+        s->tokens[s->count++]=data; id=s->count; ++s->stores;
     } else {
-        assert(id && id<=s->count && s->tokens[id-1].data);
-        struct test_spill_block *block=&s->tokens[id-1];
-        if(op==2) memcpy(io,block->data,block->bytes);
-        else { assert(op==3); free(block->data); block->data=NULL; }
+        assert(id && id<=s->count && s->tokens[id-1]);
+        if(op==2) { memcpy(io,s->tokens[id-1],QS_SORT_IO_BYTES); ++s->reads; }
+        else { assert(op==3); free(s->tokens[id-1]); s->tokens[id-1]=NULL; }
     }
     assert(!pthread_mutex_unlock(&s->mutex)); return id;
 }
@@ -224,7 +222,7 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
         p->files[1]=(struct qp_file_mapping){.offset=sizeof(*p),.nsid=1,.lba_bytes=512,.count=1};
         *(struct qs_extent *)(p+1)=(struct qs_extent){.lba=4096,.bytes=raw_bytes};
     }
-    size_t vector=(qs_chunk_bytes(QP_VECTOR_ROWS,leaf->expr.ncols)+4095)&~(size_t)4095;
+    size_t vector=(qs_chunk_bytes(qp_scan_capacity(p,leaf),leaf->expr.ncols)+4095)&~(size_t)4095;
     size_t bytes=leaf->vector_offset+vector;
     if(workers) {
         p->workers=workers; leaf->parallel=1;
@@ -259,7 +257,7 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
         }
     }
     *(struct qs_dict *)arena=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
-    *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=QP_VECTOR_ROWS,.ncols=leaf->expr.ncols};
+    *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=qp_scan_capacity(p,leaf),.ncols=leaf->expr.ncols};
     struct qp_control *controls=calloc(workers+1,sizeof(*controls)); assert(controls);
     struct qp_control *c=&controls[0]; void *mr[]={p,c,out,arena,io};
     long long lengths[]={plan_bytes,(workers+1)*sizeof(*c),(workers+1)*sizeof(*out),bytes,(workers+1)*QS_SORT_IO_BYTES};
@@ -393,10 +391,10 @@ static void dictionary_plan(function run,unsigned cancel,unsigned workers,int or
         if(payload==2 || payload==3) assert(out->profile.operators[QS_FILTER].calls);
         if(ordered==DICTIONARY_SORT && budget>=64U*1024*1024)
             assert((uint64_t)loads*QS_SORT_IO_BYTES<out->metrics.dictionary_bytes*8);
-        for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i].data);
+        for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i]);
     } else {
         assert(cancelled && !c->state);
-        for(unsigned i=0;i<spill.count;++i) { free(spill.tokens[i].data); spill.tokens[i].data=NULL; }
+        for(unsigned i=0;i<spill.count;++i) { free(spill.tokens[i]); spill.tokens[i]=NULL; }
     }
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
     if(!cancel) printf("PASS default dictionary %s: %u rows, %llu bytes, STORE=%u LOAD=%u peak=%llu/%zu\n",
@@ -470,6 +468,33 @@ static void namespace_reentry(function run)
     }
     free(raw); free(arena); free(io); free(out); free(p);
 }
+/* This regression exercises scan, hash build/probe and aggregate. */
+static function test_block_steps[BLOCK_PARTITION+1];
+static atomic_uint test_probe_stores, test_group_reads, test_hash_stores;
+static int64_t test_block_exec(struct probe_test *t)
+{
+    int64_t status=0;
+    for(unsigned step=0;step<=BLOCK_PARTITION;++step) {
+        if(step==BLOCK_PROBE && !(t->scan_node&QP_GRAPH_BLOCK_PROBE)) continue;
+        if(step==BLOCK_INDEX && !(t->scan_node&QP_GRAPH_BLOCK_INDEX)) continue;
+        if(step==BLOCK_PROJECT || step==BLOCK_SORT || step==BLOCK_PARTITION) continue;
+        if(step==BLOCK_GROUP && (t->scan_node&QP_GRAPH_BLOCK_BUILD)) continue;
+        if(step==BLOCK_HASH && !(t->scan_node&QP_GRAPH_BLOCK_BUILD)) continue;
+        for(;;) {
+            status=test_block_steps[step](&t->args);
+            assert(status>=0);
+            unsigned op=(uint64_t)status>>60;
+            if(!op) { t->args.cparam2=0; break; }
+            if(step==BLOCK_PROBE && op==1) atomic_fetch_add(&test_probe_stores,1);
+            if(step==BLOCK_GROUP && op==2) atomic_fetch_add(&test_group_reads,1);
+            if(step==BLOCK_HASH && op==1) atomic_fetch_add(&test_hash_stores,1);
+            t->args.cparam2=spill_request(t->spill,op,(uint64_t)status&CS_IO_VALUE_MASK,t->args.mr_addr[4]);
+        }
+        if(step==BLOCK_GROUP || step==BLOCK_HASH) return status;
+        assert(!status);
+    }
+    abort();
+}
 static void *probe_worker(void *arg)
 {
     struct probe_test *t=arg;
@@ -482,12 +507,13 @@ static void *probe_worker(void *arg)
         struct qp_control *c=t->control;
         if(!csIsReentry(&t->args)) t->args.cparam1=(t->worker<<1)|(t->args.cparam1&1);
         if(t->next_offset && *t->need_input && !c->index_nreads && !csIsReentry(&t->args)) {
-            const struct qp_node *n=&t->plan->nodes[t->scan_node-1];
+            unsigned scan=(t->scan_node&~QP_GRAPH_BLOCK_FLAGS)-1;
+            const struct qp_node *n=&t->plan->nodes[scan];
             uint64_t offset=atomic_fetch_add(t->next_offset,t->plan->scan_bytes);
             if(offset>n->bytes) offset=n->bytes;
             size_t bytes=n->bytes-offset<t->plan->scan_bytes?n->bytes-offset:t->plan->scan_bytes;
             size_t input=t->worker>1?n->parallel_input+(t->worker-2)*t->plan->parallel_stride:n->input_offset;
-            memcpy(t->arena+input,((t->scan_node-1==3 || t->scan_node-1==6)?t->heap:t->raw)+offset,bytes);
+            memcpy(t->arena+input,((scan==3 || scan==6)?t->heap:t->raw)+offset,bytes);
             t->args.cparam1|=QP_SCAN_INPUT | ((offset/QS_PAGE)<<QP_SCAN_PAGE_SHIFT);
             *t->need_input=false;
         } else if(!csIsReentry(&t->args) && (c->index_nreads || (!t->next_offset && c->bytes)) && !c->ready) {
@@ -506,7 +532,7 @@ static void *probe_worker(void *arg)
                 c->ready=1;
             }
         }
-        int64_t status=t->run(&t->args);
+        int64_t status=(t->scan_node&QP_GRAPH_BLOCK_SCAN)?test_block_exec(t):t->run(&t->args);
         if(status<0) fprintf(stderr,"worker %u status=%lld node=%u kind=%d ready=%u bytes=%u offset=%llu\n",
             t->worker,(long long)status,c->error_node,t->plan->nodes[c->error_node].kind,
             c->ready,c->bytes,(unsigned long long)c->offset);
@@ -539,6 +565,7 @@ static void *probe_worker(void *arg)
         /* A direct sink can consume a batch without emitting rows or I/O. */
     }
 }
+static function test_pipeline_build, test_pipeline_group;
 static void test(function run,unsigned join,unsigned rows,unsigned right_rows,unsigned memory,int hash,int parallel)
 {
     int partitioned_group=parallel==TEST_PARTITION_GROUP;
@@ -811,7 +838,8 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
             indexed->parallel_input=parallel_bytes; parallel_bytes+=QS_INDEX_IO_BYTES;
             indexed->parallel_vector=parallel_bytes; parallel_bytes+=qs_index_input_bytes()+((qs_chunk_bytes(256,4)+4095)&~(size_t)4095);
         }
-        if(parallel==TEST_BUILD_PHASE || parallel==TEST_BUILD_FALLBACK || grouped_build || wide_build) {
+        if(parallel==TEST_BUILD_PHASE || parallel==TEST_BUILD_FALLBACK || grouped_build || wide_build ||
+           test_block_steps[BLOCK_SCAN]) {
             plan->nodes[3].parallel=1;
             plan->nodes[3].parallel_input=plan->nodes[2].parallel_input;
             plan->nodes[3].parallel_vector=plan->nodes[2].parallel_vector;
@@ -895,6 +923,8 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
     uint64_t available=0,done=0; unsigned epoch=0;
     atomic_uint_fast64_t host_offset=0;
     bool need_input[QS_WORKERS]={0};
+    unsigned pipeline_phase=0, pipeline_stores=0, pipeline_reads=0;
+    function coordinator=test_pipeline_build?test_pipeline_build:run;
     for(unsigned iteration=0;!out->finished;++iteration) {
         if(control.parallel && !csIsReentry(&args)) {
             pthread_t threads[QS_WORKERS]; struct probe_test tasks[QS_WORKERS]; uint64_t started=0;
@@ -915,12 +945,21 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         }
         if(iteration==1000000) { fprintf(stderr,"STUCK join=%u hash=%d parallel=%d epoch=%u avail=%llu done=%llu active=%u rows=%u node=%u reads=%u bytes=%u\n",join,hash,parallel,control.epoch,(unsigned long long)available,(unsigned long long)done,control.parallel,out->rows,control.node,control.index_nreads,control.bytes); abort(); }
         uint64_t consumed=csIsReentry(&args)?control.drained:0; unsigned previous_epoch=control.epoch;
-        int64_t status=run(&args);
+        if(test_block_steps[BLOCK_SCAN] && pipeline_phase<2) args.cparam1|=QP_GRAPH_BLOCK_EXEC;
+        int64_t status=coordinator(&args);
+        if(status==QP_GRAPH_PHASE_DONE) {
+            assert(test_pipeline_build && pipeline_phase<2 && !out->rows);
+            coordinator=++pipeline_phase==1?test_pipeline_group:run;
+            args.cparam1&=~QP_GRAPH_BLOCK_EXEC;
+        }
         if(control.epoch==previous_epoch) assert((control.drained&consumed)==consumed);
         if(status<0) { fprintf(stderr,"native plan status=%lld join=%u row=%u state=%llu\n",(long long)status,join,rows,(unsigned long long)control.state); abort(); }
         uint64_t op=(uint64_t)status>>60,id=(uint64_t)status&CS_IO_VALUE_MASK;
         if(op) {
             if(op==4) { namespace_read(&args,id,raw[0],raw[1],index); continue; }
+            if(test_pipeline_build && pipeline_phase<2) {
+                pipeline_stores+=op==1; pipeline_reads+=op==2;
+            }
             args.cparam2=spill_request(&spill,op,id,io);
             continue;
         }
@@ -1024,7 +1063,11 @@ static void test(function run,unsigned join,unsigned rows,unsigned right_rows,un
         if(parallel==TEST_PARTITION_SERIAL) assert(!control.epoch);
         else assert(memory==8?control.epoch==1:control.epoch>1);
     }
-    for(size_t i=0;i<spill.count;++i) free(spill.tokens[i].data);
+    if(test_block_steps[BLOCK_SCAN])
+        assert(pipeline_phase==2 && pipeline_reads && atomic_load(&test_hash_stores) &&
+               atomic_load(&test_probe_stores) && atomic_load(&test_group_reads));
+    else if(test_pipeline_build) assert(pipeline_phase==2 && pipeline_stores && pipeline_reads);
+    for(size_t i=0;i<spill.count;++i) free(spill.tokens[i]);
     assert(!pthread_mutex_destroy(&spill.mutex));
     free(controls); free(spill.tokens); free(raw[0]); free(raw[1]); free(index); free(plan); free(arena); free(io); free(out);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
@@ -1438,7 +1481,7 @@ static void set_projection(function run,unsigned variant,unsigned filter,unsigne
                 c.close=1; assert(!run(&a));
                 struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
                 /* Closing a SNIA session also releases its remaining tokens. */
-                for(unsigned i=0;i<spill.count;++i) { free(spill.tokens[i].data); spill.tokens[i].data=NULL; }
+                for(unsigned i=0;i<spill.count;++i) { free(spill.tokens[i]); spill.tokens[i]=NULL; }
                 memset(&c,0,sizeof(c)); memset(out,0,sizeof(*out)); a.cparam2=0; cancelled=1;
                 seen=returned=0;
                 for(unsigned i=0;i<2;++i) {
@@ -1476,7 +1519,7 @@ static void set_projection(function run,unsigned variant,unsigned filter,unsigne
         assert(spill.stores && out->metrics.spill_write_bytes && out->metrics.spill_read_bytes);
         assert(out->metrics.work_peak<=4U*1024*1024);
     }
-    for(unsigned i=0;i<spill.count;++i) free(spill.tokens[i].data);
+    for(unsigned i=0;i<spill.count;++i) free(spill.tokens[i]);
     free(spill.tokens); assert(!pthread_mutex_destroy(&spill.mutex));
     if(!filter) assert(seen==rows);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
@@ -1590,7 +1633,7 @@ static void set_join(function run,unsigned kind,int hash,int has_null)
         assert(seen[i]==expected[i]);
     }
     assert(spill.stores && out->metrics.work_peak<=4U*1024*1024);
-    for(unsigned i=0;i<spill.count;++i) free(spill.tokens[i].data);
+    for(unsigned i=0;i<spill.count;++i) free(spill.tokens[i]);
     free(spill.tokens); assert(!pthread_mutex_destroy(&spill.mutex));
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
     for(unsigned i=0;i<3;++i) free(raw[i]);
@@ -1640,7 +1683,7 @@ static void parameter_projection(function run,int joined,int wide,int null_param
     for(unsigned i=0;i<(joined?2U:1U);++i) {
         struct qp_node *n=&p->nodes[i?4:leaf]; n->bytes=sizes[i]; n->estimated_rows=i?1:rows;
         n->input_offset=bytes; bytes+=QP_SCAN_BYTES; n->vector_offset=bytes;
-        bytes=(bytes+qs_chunk_bytes(QP_VECTOR_ROWS,2)+4095)&~(size_t)4095;
+        bytes=(bytes+qs_chunk_bytes(qp_scan_capacity(p,n),2)+4095)&~(size_t)4095;
     }
     unsigned char *arena=calloc(1,bytes),*io=calloc(1,QS_SORT_IO_BYTES); assert(arena && io);
     *(struct qs_dict *)arena=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
@@ -1750,11 +1793,11 @@ static void filtered_projection(function run,unsigned mode)
     }
     struct qp_node *leaf=&p->nodes[2]; leaf->bytes=raw_bytes; leaf->input_offset=config;
     leaf->vector_offset=config+p->scan_bytes;
-    size_t bytes=leaf->vector_offset+qs_chunk_bytes(QP_VECTOR_ROWS,2);
+    size_t bytes=leaf->vector_offset+qs_chunk_bytes(qp_scan_capacity(p,leaf),2);
     unsigned char *arena=calloc(1,bytes),*io=calloc(1,QS_SORT_IO_BYTES);
     struct qs_result *out=calloc(1,sizeof(*out)); assert(arena && io && out);
     *(struct qs_dict *)arena=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
-    *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=QP_VECTOR_ROWS,.ncols=2};
+    *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=qp_scan_capacity(p,leaf),.ncols=2};
     struct qp_control control={0}; void *mr[]={p,&control,out,arena,io};
     long long lengths[]={sizeof(*p),sizeof(control),sizeof(*out),bytes,QS_SORT_IO_BYTES};
     struct femu_csd_args args={.numr=5,.mr_addr=mr,.mr_len=lengths};
@@ -1853,7 +1896,7 @@ static void local_group_merge(function run,int large_merge)
     p->count=2; p->workers=workers; p->scan_bytes=per_worker*2/100*QS_PAGE;
     struct qp_node *leaf=&p->nodes[1]; scan(leaf); leaf->bytes=raw_bytes; leaf->parallel=1;
     size_t config=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
-    size_t vector=(qs_chunk_bytes(QP_VECTOR_ROWS,2)+4095)&~(size_t)4095;
+    size_t vector=(qs_chunk_bytes(qp_scan_capacity(p,leaf),2)+4095)&~(size_t)4095;
     leaf->input_offset=config; leaf->vector_offset=config+p->scan_bytes;
     size_t base=leaf->vector_offset+vector;
     leaf->parallel_input=base; leaf->parallel_vector=base+p->scan_bytes;
@@ -1932,7 +1975,7 @@ static void local_group_merge(function run,int large_merge)
         printf("PASS local merge: %u groups, peak=%llu/%u bytes, no NVM stores\n",
             count,(unsigned long long)out->metrics.work_peak,memory);
     }
-    for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i].data);
+    for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i]);
     assert(!pthread_mutex_destroy(&spill.mutex));
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
     memset(c,0,(workers+1)*sizeof(*c)); memset(out,0,(workers+1)*sizeof(*out)); args.cparam2=0;
@@ -1951,7 +1994,7 @@ static void parallel_sort_spill(function run,unsigned workers,unsigned memory,in
     p->count=leaf_id+1; p->workers=workers; p->scan_bytes=QP_SCAN_BYTES;
     struct qp_node *leaf=&p->nodes[leaf_id]; scan(leaf); leaf->bytes=raw_bytes; leaf->parallel=1;
     size_t config=(qs_dict_bytes(512,65536)+4095)&~(size_t)4095;
-    size_t vector=(qs_chunk_bytes(QP_VECTOR_ROWS,2)+4095)&~(size_t)4095;
+    size_t vector=(qs_chunk_bytes(qp_scan_capacity(p,leaf),2)+4095)&~(size_t)4095;
     leaf->input_offset=config; leaf->vector_offset=config+p->scan_bytes;
     size_t base=leaf->vector_offset+vector;
     leaf->parallel_input=base; leaf->parallel_vector=base+p->scan_bytes;
@@ -1983,7 +2026,7 @@ static void parallel_sort_spill(function run,unsigned workers,unsigned memory,in
     struct qp_control *controls=calloc(workers+1,sizeof(*controls));
     struct qs_result *out=calloc(workers+1,sizeof(*out)); assert(arena && io && controls && out);
     *(struct qs_dict *)arena=(struct qs_dict){.entries=512,.capacity=512,.data=65536};
-    *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=QP_VECTOR_ROWS,.ncols=2};
+    *(struct qs_chunk *)(arena+leaf->vector_offset)=(struct qs_chunk){.capacity=qp_scan_capacity(p,leaf),.ncols=2};
     struct qp_control *c=&controls[0];
     void *mr[]={p,c,out,arena,io};
     long long len[]={sizeof(*p),(workers+1)*sizeof(*controls),(workers+1)*sizeof(*out),bytes,(workers+1)*QS_SORT_IO_BYTES};
@@ -2050,7 +2093,7 @@ static void parallel_sort_spill(function run,unsigned workers,unsigned memory,in
     assert(sunk==rows || held_stores); /* local Sink or the spill-safe adapter */
     if(memory==8U*1024*1024) assert(sunk==rows);
     if(memory==4U*1024*1024) assert(spill.stores);
-    for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i].data);
+    for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i]);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
     memset(controls,0,(workers+1)*sizeof(*controls)); memset(out,0,(workers+1)*sizeof(*out)); args.cparam2=0;
     assert(!run(&args) && c->parallel);
@@ -2307,7 +2350,7 @@ static void multiple_group_aggregates(function run,unsigned memory,unsigned kind
     /* A single aggregate can now fit without spilling at 4 MiB. Wider
      * partial states still exceed that budget and exercise NVM reentry. */
     if(memory==4 && counts) assert(spill.count);
-    for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i].data);
+    for(unsigned i=0;i<spill.count;++i) assert(!spill.tokens[i]);
     assert(!pthread_mutex_destroy(&spill.mutex));
     free(controls); free(spill.tokens); free(raw); free(expected); free(p); free(arena); free(io); free(out);
     struct cs_work_stats stats; assert(!cs_work_get_stats(&stats) && !stats.used_bytes && !stats.active_contexts);
@@ -2362,6 +2405,292 @@ static void poison_workmem(void)
     void *data=cs_work_alloc(ctx,stats.capacity_bytes-4096); assert(data);
     memset(data,0xa5,stats.capacity_bytes-4096); assert(!cs_work_end(ctx));
 }
+/* Run one compute node with the same I/O-token reentry as a graph EXEC. */
+static int64_t graph_compute(function run,struct femu_csd_args *a,struct test_spill *spill)
+{
+    for(unsigned i=0;i<100000;++i) {
+        int64_t status=run(a);
+        assert(status>=0);
+        unsigned op=(uint64_t)status>>60;
+        if(!op) { a->cparam2=0; return status; }
+        a->cparam2=spill_request(spill,op,(uint64_t)status&CS_IO_VALUE_MASK,a->mr_addr[a->numr-1]);
+    }
+    abort();
+}
+static void graph_load_page(struct qp_plan *plan,struct qp_control *control,
+    unsigned char *arena,unsigned char *const raw[])
+{
+    unsigned id=control->node;
+    assert(id<plan->count && raw[id] && control->bytes && !control->ready);
+    struct qp_node *n=&plan->nodes[id];
+    assert(control->offset+control->bytes<=n->bytes);
+    memcpy(arena+n->input_offset,raw[id]+control->offset,control->bytes);
+    control->ready=1;
+}
+static void graph_hash_build(function source,function build,function probe,function feed,bool spill_input,bool grouped)
+{
+    struct qp_plan *plan=calloc(1,sizeof(*plan)); assert(plan);
+    plan->count=8; plan->root=5; plan->scan_bytes=QS_PAGE;
+    struct qp_node *agg=&plan->nodes[5],*sort=&plan->nodes[6],*limit=&plan->nodes[7];
+    *agg=(struct qp_node){.kind=QP_AGGREGATE,.left=7,.right=-1,.hash=grouped,.nkeys=grouped};
+    agg->expr.predicate=-1;
+    agg->expr.nattrs=agg->expr.nout=2; agg->expr.nkeys=agg->expr.naggs=1;
+    agg->expr.nexprs=3;
+    agg->expr.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER,.column=0};
+    agg->expr.exprs[1]=(struct qs_expr){.op=Q_COLUMN,.type=Q_DECIMAL,.column=1,.scale=2,.dscale=2};
+    agg->expr.exprs[2]=(struct qs_expr){.op=Q_AGGREF,.type=Q_DECIMAL,.column=0,.scale=2,.dscale=2};
+    agg->expr.outputs[0]=(struct qs_output){.index=0,.type_oid=23};
+    agg->expr.outputs[1]=(struct qs_output){.index=2,.type_oid=1700};
+    agg->expr.aggs[0]=(struct qs_agg){.kind=Q_SUM,.expr=1};
+    *sort=(struct qp_node){.kind=QP_SORT,.left=0,.right=-1};
+    sort->expr.nattrs=sort->expr.nexprs=sort->expr.nout=2;
+    sort->expr.predicate=-1; sort->expr.limit=-1;
+    memcpy(sort->expr.exprs,agg->expr.exprs,2*sizeof(struct qs_expr));
+    sort->expr.outputs[0]=agg->expr.outputs[0];
+    sort->expr.outputs[1]=(struct qs_output){.index=1,.type_oid=1700};
+    if(!grouped) {
+        agg->expr.nkeys=0; agg->expr.nout=1;
+        agg->expr.outputs[0]=agg->expr.outputs[1];
+    }
+    *limit=(struct qp_node){.kind=QP_LIMIT,.left=6,.right=-1,.expr=sort->expr};
+    limit->expr.offset=100;
+    sort->expr.norder=1; sort->expr.order[0]=(struct qs_order){.output=1};
+    struct qp_node *parent=&plan->nodes[0],*child=&plan->nodes[2];
+    for(unsigned i=0;i<2;++i) {
+        struct qp_node *join=i?child:parent;
+        *join=(struct qp_node){.kind=QP_JOIN,.hash=1,.join_type=QP_INNER,
+            .left=i?3:1,.right=i?4:2,.join_qual=-1,.nkeys=1};
+        struct qs_plan *p=&join->expr;
+        p->predicate=-1; p->nattrs=p->nexprs=4; p->nout=2;
+        p->exprs[0]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER,.column=0};
+        p->exprs[3]=(struct qs_expr){.op=Q_COLUMN,.type=Q_DECIMAL,.column=3,.scale=2};
+        p->outputs[0]=(struct qs_output){.index=0,.type_oid=23};
+        p->outputs[1]=(struct qs_output){.index=3,.type_oid=1700};
+    }
+    parent->expr.work_mem_bytes=64U*1024*1024;
+    unsigned char *raw[5]={0};
+    unsigned rows[5]={0,2,0,1101,347};
+    size_t bytes=4096;
+    for(unsigned id=1;id<5;++id) if(rows[id]) {
+        struct qp_node *n=&plan->nodes[id]; scan(n);
+        size_t raw_bytes; raw[id]=heap(rows[id],id==4,&raw_bytes);
+        n->bytes=raw_bytes; n->input_offset=bytes; bytes+=plan->scan_bytes;
+        n->vector_offset=bytes; bytes+=(qs_chunk_bytes(qp_scan_capacity(plan,n),2)+4095)&~(size_t)4095;
+    }
+    struct qs_plan *right=&plan->nodes[4].expr;
+    right->nexprs=4;
+    right->exprs[2]=(struct qs_expr){.op=Q_CONST,.type=Q_DECIMAL,.constant=INT64_C(1)<<62,.scale=2,.dscale=2};
+    right->exprs[3]=(struct qs_expr){.op=Q_MUL,.type=Q_DECIMAL,.left=1,.right=2,.scale=2,.dscale=2};
+    right->outputs[1]=(struct qs_output){.index=3,.type_oid=1700};
+    unsigned char *arena=calloc(1,bytes),*io=calloc(1,QS_SORT_IO_BYTES);
+    struct qs_result *packet=calloc(1,sizeof(*packet)); assert(arena && io && packet);
+    for(unsigned id=1;id<5;++id) if(raw[id]) {
+        struct qp_node *n=&plan->nodes[id];
+        *(struct qs_chunk *)(arena+n->vector_offset)=(struct qs_chunk){.capacity=qp_scan_capacity(plan,n),.ncols=2};
+    }
+    struct qp_control control={0};
+    void *mr[]={plan,&control,packet,arena,io};
+    long long len[]={sizeof(*plan),sizeof(control),sizeof(*packet),bytes,QS_SORT_IO_BYTES};
+    struct femu_csd_args a={.numr=5,.mr_addr=mr,.mr_len=len};
+    struct test_spill spill={.mutex=PTHREAD_MUTEX_INITIALIZER};
+    unsigned expected=0,packets=0;
+    __int128 expected_sum=0,factor=(__int128)1<<62;
+
+    if(!spill_input) {
+        bool end=false;
+        for(unsigned call=0;!end;++call) {
+            assert(call<1000);
+            a.cparam1=2U<<QP_GRAPH_SOURCE_NODE_SHIFT;
+            int64_t emitted=graph_compute(source,&a,&spill);
+            end=(emitted&QP_WORKER_FINISHED)!=0;
+            if(emitted&(QP_OUTPUT_READY|QP_WORKER_FINISHED)) {
+                if(packet->rows) ++packets;
+                a.cparam1=0;
+                int64_t consumed=graph_compute(build,&a,&spill);
+                assert(consumed==(QP_INPUT_DRAINED|(end?QP_WORKER_FINISHED:0)));
+            }
+            if(emitted&QP_CONTROL_REQUIRED) graph_load_page(plan,&control,arena,raw);
+        }
+        assert(packets>1);
+        for(unsigned l=1;l<rows[3];++l) if(l%17 && l%11==1)
+            for(unsigned r=1;r<rows[4];++r) if(r%17 && r%7==1) {
+                ++expected; expected_sum+=(r%13+1)*factor;
+            }
+    } else {
+        /* Drive partition spill with a projected child packet stream. The
+         * right subtree must never be reopened to recover consumed rows. */
+        unsigned total=2100000,capacity=QS_RESULT_ROWS*QS_OUT/2;
+        int64_t flags=0;
+        for(unsigned at=0;at<total;) {
+            unsigned count=total-at<capacity?total-at:capacity;
+            packet->begin=0; packet->rows=count; packet->finished=at+count==total;
+            for(unsigned i=0;i<count;++i) {
+                struct qs_cell *v=qp_result_row(packet,i,2,1);
+                v[0]=(struct qs_cell){.value=at+i?1000+at+i:1};
+                v[1]=(struct qs_cell){.value=9*factor,.scale=2,.dscale=2};
+            }
+            flags=graph_compute(build,&a,&spill);
+            assert(flags&QP_INPUT_DRAINED);
+            at+=count;
+        }
+        assert(spill.stores && flags==(QP_INPUT_DRAINED|QP_GRAPH_HASH_NEEDS_LEFT));
+        packet->begin=0; packet->rows=packet->finished=1;
+        struct qs_cell *v=qp_result_row(packet,0,2,1);
+        v[0]=(struct qs_cell){.value=1}; v[1]=(struct qs_cell){.value=2};
+        a.cparam1=QP_GRAPH_HASH_LEFT;
+        flags=graph_compute(build,&a,&spill);
+        assert(flags==(QP_INPUT_DRAINED|QP_WORKER_FINISHED));
+        expected=1; expected_sum=9*factor;
+    }
+
+    unsigned got=0, held=0, groups=0, sorted_rows=0, limited_rows=0;
+    __int128 aggregate_sum=0, skipped=0, last=0;
+    __int128 sum=0;
+    struct qs_result *output=calloc(1,sizeof(*output)); assert(output);
+    void *probe_mr[]={plan,&control,output,arena,packet,io};
+    long long probe_len[]={sizeof(*plan),sizeof(control),sizeof(*output),bytes,sizeof(*packet),QS_SORT_IO_BYTES};
+    struct femu_csd_args probe_args={.numr=6,.mr_addr=probe_mr,.mr_len=probe_len};
+    struct qs_result *sorted=calloc(1,sizeof(*sorted)),*limited=calloc(1,sizeof(*limited));
+    struct qs_result *final=calloc(1,sizeof(*final)); assert(sorted && limited && final);
+    void *sort_mr[]={plan,&control,sorted,arena,output,io};
+    void *limit_mr[]={plan,&control,limited,arena,sorted,io};
+    void *agg_mr[]={plan,&control,final,arena,limited,io};
+    struct femu_csd_args sort_args=probe_args, limit_args=probe_args, agg_args=probe_args;
+    sort_args.mr_addr=sort_mr; sort_args.cparam1=UINT64_C(6)<<QP_GRAPH_SOURCE_NODE_SHIFT;
+    limit_args.mr_addr=limit_mr; limit_args.cparam1=UINT64_C(7)<<QP_GRAPH_SOURCE_NODE_SHIFT;
+    agg_args.mr_addr=agg_mr; agg_args.cparam1=(uint64_t)plan->root<<QP_GRAPH_SOURCE_NODE_SHIFT;
+    for(unsigned batch=0;batch<(spill_input?1U:2U);++batch) {
+        packet->begin=spill_input?0:1;
+        packet->rows=spill_input?0:2;
+        packet->finished=spill_input || batch==1;
+        if(!spill_input) {
+            struct qs_cell *v=qp_result_row(packet,packet->begin,2,1);
+            v[0]=(struct qs_cell){.isnull=1}; v[1]=(struct qs_cell){0};
+            v[2]=(struct qs_cell){.value=1}; v[3]=(struct qs_cell){.value=2};
+        }
+        for(unsigned call=0;;++call) {
+            assert(call<1000);
+            int64_t flags=graph_compute(probe,&probe_args,&spill);
+            for(unsigned i=0;i<output->rows;++i) {
+                const struct qs_cell *v=qp_result_row(output,i,2,1);
+                assert(!v[0].isnull && v[0].value==1 && !v[1].isnull && v[1].scale==2 && v[1].dscale==2);
+                ++got; sum+=v[1].value;
+            }
+            if(output->rows || output->finished) for(unsigned sort_call=0;;++sort_call) {
+                assert(sort_call<1000);
+                int64_t sorted_flags=graph_compute(feed,&sort_args,&spill);
+                for(unsigned i=0;i<sorted->rows;++i) {
+                    const struct qs_cell *v=qp_result_row(sorted,i,2,1);
+                    assert(v[0].value==1 && (!sorted_rows || last<=v[1].value));
+                    if(sorted_rows++<100) skipped+=v[1].value;
+                    last=v[1].value;
+                }
+                if(sorted->rows || sorted->finished) for(unsigned limit_call=0;;++limit_call) {
+                    assert(limit_call<1000);
+                    int64_t limited_flags=graph_compute(feed,&limit_args,&spill);
+                    limited_rows+=limited->rows;
+                    if(limited->rows || limited->finished) {
+                        int64_t consumed=graph_compute(feed,&agg_args,&spill);
+                        assert(consumed&QP_INPUT_DRAINED);
+                        assert(!!(consumed&QP_WORKER_FINISHED)==!!limited->finished);
+                        if(final->rows) {
+                            assert(limited->finished && final->rows==1);
+                            const struct qs_cell *v=qp_result_row(final,0,2,1);
+                            if(grouped) { assert(!v[0].isnull && v[0].value==1); ++v; }
+                            assert(!v->isnull && v->scale==2);
+                            ++groups; aggregate_sum+=v->value;
+                        }
+                    }
+                    if(limited_flags&QP_INPUT_DRAINED) break;
+                    assert(limited_flags&QP_OUTPUT_READY);
+                }
+                if(sorted_flags&QP_INPUT_DRAINED) break;
+                assert(sorted_flags&QP_OUTPUT_READY);
+            }
+            if(flags&QP_INPUT_DRAINED) {
+                assert(!!(flags&QP_WORKER_FINISHED)==!!packet->finished);
+                break;
+            }
+            assert((flags&QP_OUTPUT_READY) && !(flags&(QP_CONTROL_REQUIRED|QP_WORKER_FINISHED)));
+            ++held;
+        }
+    }
+    assert(got==expected*(spill_input?1U:2U) && sum==expected_sum*(spill_input?1:2));
+    if(spill_input) assert(spill.reads);
+    else assert(held>=2);
+    assert(sorted_rows==got && limited_rows==(got>100?got-100:0));
+    assert(groups==(limited_rows?1U:0U) && aggregate_sum==sum-skipped);
+    free(final); free(limited); free(sorted); free(output);
+    control.close=1; assert(!source(&a) && !control.state);
+    struct cs_work_stats work; assert(!cs_work_get_stats(&work) && !work.used_bytes && !work.active_contexts);
+    for(unsigned i=0;i<spill.count;++i) free(spill.tokens[i]);
+    free(spill.tokens);
+    pthread_mutex_destroy(&spill.mutex);
+    for(unsigned i=0;i<5;++i) free(raw[i]);
+    free(packet); free(io); free(arena); free(plan);
+}
+
+static void graph_initializers(function source,function feed)
+{
+    struct qp_plan *plan=calloc(1,sizeof(*plan)); assert(plan);
+    plan->count=8; plan->packed_result=QP_TYPED_RESULT;
+    plan->nparams=1; plan->ninit=2;
+    plan->param_nodes[0]=1;
+    plan->init_nodes[0]=1; plan->init_params[0]=0;
+    plan->init_nodes[1]=3; plan->init_params[1]=-1;
+    struct qs_plan value={.nexprs=1,.nout=1,.predicate=-1,
+        .exprs={{.op=Q_CONST,.type=Q_INTEGER,.constant=7}},
+        .outputs={{.index=0,.type_oid=23}}};
+    plan->nodes[1]=(struct qp_node){.kind=QP_PROJECT,.left=-1,.right=-1,.expr=value};
+    plan->nodes[1].expr.exprs[0].constant=11;
+    plan->nodes[2]=(struct qp_node){.kind=QP_PROJECT,.left=-1,.right=-1,.expr=value};
+    plan->nodes[3]=(struct qp_node){.kind=QP_SET,.left=2,.right=-1,.expr=value};
+    plan->nodes[4]=(struct qp_node){.kind=QP_PROJECT,.left=-1,.right=-1,.expr=value};
+    plan->nodes[5]=(struct qp_node){.kind=QP_MATERIALIZED,.left=4,.right=-1,.expr=value};
+    value.nattrs=1; value.exprs[0]=(struct qs_expr){.op=Q_COLUMN,.type=Q_INTEGER};
+    plan->nodes[6]=(struct qp_node){.kind=QP_CTE_SCAN,.left=5,.right=-1,.expr=value};
+    plan->nodes[7]=plan->nodes[6];
+    plan->nodes[0]=(struct qp_node){.kind=QP_PROJECT,.left=6,.right=-1,.expr=value};
+    struct qs_plan *root=&plan->nodes[0].expr;
+    root->nexprs=4; root->predicate=3; root->outputs[0].index=2;
+    root->exprs[1]=(struct qs_expr){.op=QP_PARAMETER,.type=Q_INTEGER};
+    root->exprs[2]=(struct qs_expr){.op=Q_ADD,.type=Q_INTEGER,.left=0,.right=1};
+    root->exprs[3]=(struct qs_expr){.op=QP_INSET,.type=Q_BOOLEAN,.left=0,.column=3};
+
+    struct qp_control control={0};
+    struct qs_dict arena={0};
+    struct qs_result *packet=calloc(1,sizeof(*packet)),*output=calloc(1,sizeof(*output));
+    void *io=calloc(1,QS_SORT_IO_BYTES); assert(packet && output && io);
+    void *mr[]={plan,&control,output,&arena,packet,io};
+    long long len[]={sizeof(*plan),sizeof(control),sizeof(*output),sizeof(arena),sizeof(*packet),QS_SORT_IO_BYTES};
+    struct femu_csd_args a={.numr=6,.mr_addr=mr,.mr_len=len};
+    struct test_spill spill={.mutex=PTHREAD_MUTEX_INITIALIZER};
+    a.cparam1=QP_GRAPH_INIT_OUTPUT|(UINT64_C(1)<<QP_GRAPH_SOURCE_NODE_SHIFT);
+    assert(graph_compute(source,&a,&spill)==QP_WORKER_FINISHED && !packet->rows);
+    for(unsigned id=2;id<=4;id+=2) {
+        a.cparam1=(uint64_t)id<<QP_GRAPH_SOURCE_NODE_SHIFT;
+        assert(graph_compute(source,&a,&spill)==(QP_WORKER_FINISHED|QP_OUTPUT_READY));
+        a.cparam1=(uint64_t)(id+1)<<QP_GRAPH_SOURCE_NODE_SHIFT;
+        if(id==2) a.cparam1|=QP_GRAPH_INIT_OUTPUT;
+        assert(graph_compute(feed,&a,&spill)==(QP_WORKER_FINISHED|QP_INPUT_DRAINED));
+        a.mr_addr=mr;
+    }
+    for(unsigned id=7;id>=6;--id) {
+        a.cparam1=(uint64_t)id<<QP_GRAPH_SOURCE_NODE_SHIFT;
+        assert(graph_compute(source,&a,&spill)==(QP_WORKER_FINISHED|QP_OUTPUT_READY));
+        assert(packet->rows==1 && qp_result_row(packet,0,1,1)->value==7);
+    }
+    a.cparam1=QP_GRAPH_HOST_OUTPUT;
+    assert(graph_compute(feed,&a,&spill)==(QP_WORKER_FINISHED|QP_INPUT_DRAINED|QP_OUTPUT_READY));
+    int32_t result;
+    memcpy(&result,qp_host_values(output,root,output->rows,0),sizeof(result));
+    assert(output->rows==1 && control.finished && !control.state && result==18);
+    assert(!spill.count);
+    struct cs_work_stats work; assert(!cs_work_get_stats(&work) && !work.used_bytes && !work.active_contexts);
+    pthread_mutex_destroy(&spill.mutex);
+    free(io); free(output); free(packet); free(plan);
+}
+
 int main(int argc,char **argv)
 {
     dictionary_size();
@@ -2369,6 +2698,19 @@ int main(int argc,char **argv)
     assert(qp_worker_mask(0)==0 && qp_worker_mask(32)==UINT32_MAX && qp_worker_mask(64)==UINT64_MAX);
     assert(argc==2 || argc==3 || argc==4); void *library=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(library);
     function capacity=(function)dlsym(library,"pg_sina_workmem_capacity"); assert(capacity);
+    if(argc==3 && !strcmp(argv[2],"--graph-hash-build-64m")) {
+        assert(!cs_work_init(64U*1024*1024));
+        function source=(function)dlsym(library,"pg_sina_graph_source"); assert(source);
+        function build=(function)dlsym(library,"pg_sina_graph_hash_build"); assert(build);
+        function probe=(function)dlsym(library,"pg_sina_graph_hash_probe"); assert(probe);
+        function feed=(function)dlsym(library,"pg_sina_graph_feed"); assert(feed);
+        graph_hash_build(source,build,probe,feed,false,true);
+        graph_hash_build(source,build,probe,feed,false,false);
+        graph_hash_build(source,build,probe,feed,true,true);
+        graph_initializers(source,feed);
+        puts("PASS graph HashBuild/Probe/Sort/Offset/Aggregate: nested packets, duplicate fanout, exact int128, partition spill, InitPlan and shared CTE");
+        return 0;
+    }
     if(argc==3 && !strcmp(argv[2],"--host-params-64m")) {
         assert(!cs_work_init(64U*1024*1024));
         function run=(function)dlsym(library,"pg_sina_plan"); assert(run);
@@ -2472,6 +2814,22 @@ int main(int argc,char **argv)
         test(run,QP_INNER,31,3000003,64,1,TEST_PARTITION_PACKED);
         test(run,QP_INNER,31,3000003,64,1,TEST_PARTITION_SERIAL);
         test(run,QP_INNER,31,3000003,64,1,TEST_PARTITION_GROUP);
+        test_pipeline_build=(function)dlsym(library,"pg_sina_graph_build_pipeline");
+        test_pipeline_group=(function)dlsym(library,"pg_sina_graph_group_pipeline");
+        assert(test_pipeline_build && test_pipeline_group);
+        test(run,QP_INNER,31,3000003,64,1,TEST_PARTITION_GROUP);
+        static const char *steps[]={
+            "pg_sina_graph_block_scan","pg_sina_graph_block_filter","pg_sina_graph_block_probe",
+            "pg_sina_graph_block_index","pg_sina_graph_block_project","pg_sina_graph_block_aggregate","pg_sina_graph_block_hash_build",
+            "pg_sina_graph_block_sort","pg_sina_graph_block_partition"};
+        for(unsigned i=0;i<sizeof(steps)/sizeof(steps[0]);++i) {
+            test_block_steps[i]=(function)dlsym(library,steps[i]);
+            assert(test_block_steps[i]);
+        }
+        /* Duplicate matches produce more rows in one input block than can
+         * fit in 64 MiB. The undersized shared build also forces its block
+         * sink to spool rejected rows for the coordinator to grow/replay. */
+        test(run,QP_INNER,6003,2303,64,1,TEST_HASH_GROUP);
         return 0;
     }
     if(argc==3 && !strcmp(argv[2],"--sort-payload-64m")) {

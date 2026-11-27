@@ -1,0 +1,7 @@
+query,mode,planning_ms,execution_ms,total_ms,executor_end_ms,result_check,graph_path,explicit_scan_blocks,assigned_scan_loads,host_submissions,callback_submissions,counted_submissions,afdm_bytes,workmem_peak_bytes,spill_read_bytes,spill_write_bytes,dictionary_entries,prefetch_reused_blocks,streaming_scan_blocks,device_csf_calls,dictionary_waits,dictionary_wait_task_ms,source_run
+Q3-1,original-csd,16.958,4219.967,4285.557,15.566,ok,original,,2222,39,2219,2258,46255736,99375440,0,0,1,0,0,2258,0,0,e9-vector-stream-paired
+Q3-1,snia-operator-graph,18.211,5058.070,5120.400,15.101,ok,all_assigned_loads_explicit,2222,2222,45,2219,2264,46255736,98938800,0,0,1,0,2222,194212,0,0,e9-vector-stream-paired
+Q4-1,original-csd,21.102,2876.890,2959.031,15.992,ok,original,,408,18,407,425,100429320,144674176,0,0,5,0,0,12944,0,0,e9-vector-stream-paired
+Q4-1,snia-operator-graph,12.321,3274.277,3330.609,16.233,ok,all_assigned_loads_explicit,408,408,18,407,425,100429320,145467632,0,0,5,0,408,54827,0,0,e9-vector-stream-paired
+Q12-1,original-csd,12.984,3470.936,3540.617,13.887,ok,original,,1758,18,1757,1775,100953464,142376256,0,0,7,0,0,5769,0,0,e9-vector-stream-paired
+Q12-1,snia-operator-graph,16.058,4720.946,4788.844,18.024,ok,all_assigned_loads_explicit,1758,1758,18,1757,1775,100953464,144385712,0,0,7,0,1758,202215,0,0,e9-vector-stream-paired

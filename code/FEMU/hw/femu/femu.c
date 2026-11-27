@@ -2109,8 +2109,9 @@ static void *femu_ftl_thread(void *arg)
             req->reqlat = lat;
             req->expire_time += lat;
 
-            rc = femu_ring_enqueue(n->to_poller[i], (void *)&req, 1);
+            rc = nvme_enqueue_completion(n, n->to_poller[i], req);
             if (rc != 1) {
+                nvme_link_clear_pending(n, req);
                 femu_err("FEMU: FTL to_poller enqueue failed\n");
             }
 
@@ -3006,6 +3007,7 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     n->pcie_enabled = (n->pcie_bandwidth_mbps || n->pcie_prop_delay_ns);
     n->pcie_tx_next_avail_time = 0;
     n->pcie_rx_next_avail_time = 0;
+    n->pcie_tx_pending = 0;
     n->fw_cpu_next_avail_time = 0;
     n->fw_enabled = n->fw_cpu_ns || n->fw_read_ns || n->fw_write_ns ||
                     n->fw_other_ns;

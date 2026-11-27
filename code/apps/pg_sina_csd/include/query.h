@@ -105,9 +105,12 @@ struct qs_task {
     uint32_t input_bytes, workers, slot; /* slot is a PG-assigned input index. */
     uint64_t scanned, matched, joined;
     uint64_t index_pages, index_tuples;
-    uint32_t index_pending, index_nreads;
+    union { uint32_t index_pending, probe_pending; };
+    uint32_t index_nreads;
     struct qs_index_read index_reads[QS_INDEX_READS];
 };
+/* cparam1 bit 0 remains the profiling bit. */
+#define QS_BATCH_HASH_PROBE 2U
 struct qs_join_control {
     uint64_t state, rows, spill_write_bytes, spill_read_bytes;
     uint32_t batches, current, indexed;
@@ -289,6 +292,11 @@ static inline int qs_dict_get(const struct qs_dict *dict,unsigned id,const char 
         (size_t)d->capacity*sizeof(uint32_t);
     *bytes=base+e->offset; *length=e->length; return 0;
 }
+/* State shared by the experimental streaming Offset and Sum CSFs. */
+struct qs_graph_tail {
+    uint64_t remaining;
+    struct qs_cell sum;
+};
 struct qs_row { struct qs_cell cells[QS_OUT]; };
 struct qs_metrics {
     uint64_t scanned, matched, input_bytes, chunks, work_peak, fdm_bytes;
@@ -297,7 +305,6 @@ struct qs_metrics {
     uint64_t build_rows, join_rows, build_batches;
     uint64_t index_pages, index_tuples;
     uint64_t index_cache_hits[2], index_cache_misses[2];
-    uint64_t spill_read_wait_ns,spill_write_wait_ns,host_overflow_rows;
     unsigned workers;
 };
 /* Optional per-query measurements. Each CU owns its own AFDM counters. */

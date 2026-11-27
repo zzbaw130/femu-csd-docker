@@ -1,6 +1,10 @@
 /* Compile the private executor into this test: exercise its actual scalar
  * projection and output conversion without adding a test-only CSF/API. */
-#include "../plan.c"
+#include "runtime/plan.c"
+#include "aggregate/graph_aggregate_state.c"
+#include "hash-build/graph_hash_build.c"
+#include "hash-probe/graph_hash_probe.c"
+#include "index-join/graph_index_join.c"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1086,7 +1090,7 @@ static void topn_bound(void)
         struct qs_plan input={.nout=2}; input.outputs[0].type_oid=20; input.outputs[1].type_oid=25;
         struct sorted_rows *sort=&s->nodes[1].left_sort;
         struct qs_order order={.output=0,.descending=1};
-        assert(!sort_init(s,sort,&input,1,NULL,&order,0));
+        assert(!sort_init(s,sort,&input,1,NULL,&order));
         assert(sort->plan.limit==(shared?-1:(int64_t)top+parent->expr.offset));
         for(unsigned row=0;row<1001;++row) {
             sort->input->rows=1; sort->input->data[0].cells[0]=(struct qs_cell){.value=row};
@@ -1149,7 +1153,8 @@ static void grouped_payload(void)
     *extent=(struct qs_extent){.logical=0,.lba=100,.bytes=2*QS_PAGE};
     s.plan->nodes[1].bytes=2*QS_PAGE;
     s.plan->files[1]=(struct qp_file_mapping){.offset=sizeof(*s.plan),.nsid=1,.lba_bytes=512,.count=1};
-    long long lengths[]={bytes}; struct femu_csd_args args={.mr_len=lengths}; s.args=&args;
+    long long lengths[]={bytes,0,0,0,sizeof(io)};
+    struct femu_csd_args args={.numr=5,.mr_len=lengths}; s.args=&args;
     const char *text; unsigned length;
     assert(output_text(&s,(struct qs_cell){.value=qs_late_text(1,QS_PAGE+123,3)},&text,&length)<0 && s.late_wait==csNeedNvmRead(1));
     struct femu_graph_read *read=(void *)io;

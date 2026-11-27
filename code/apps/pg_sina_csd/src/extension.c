@@ -15,6 +15,7 @@ int pg_sina_exe_path = 0;
 bool pg_sina_profile = false;
 bool pg_sina_dcp = false;
 static bool hpcp = true;
+bool pg_sina_operator_graph = false;
 int pg_sina_max_memory = 0; /* KiB; 0 uses the device workmem capacity. */
 bool pg_sina_compiling_plan = false;
 struct pg_sina_planner_profile *pg_sina_planning;
@@ -31,8 +32,7 @@ static PlannedStmt *plan_query(Query *query,int cursorOptions,ParamListInfo boun
 static PlannedStmt *hooked_planner(Query *volatile parse,int cursorOptions,ParamListInfo boundParams)
 {
     /* SPI mapping lookups are PG queries too, not new placement searches. */
-    if(pg_sina_compiling_plan || parse->commandType!=CMD_SELECT || parse->hasModifyingCTE ||
-       pg_sina_exe_path==PG_SINA_IBEX)
+    if(pg_sina_compiling_plan || parse->commandType!=CMD_SELECT || parse->hasModifyingCTE)
         return plan_query(parse,cursorOptions,boundParams);
     bool measure_forced=pg_sina_profile && pg_sina_exe_path==PG_SINA_CSD;
     instr_time forced_start;
@@ -200,7 +200,7 @@ static void assign_path(int value,void *extra)
 }
 const char *pg_sina_path_name(void)
 {
-    static const char *names[]={"host-only","filter-only","csd-without-hpcp","csd-with-hpcp","SQLerate","ibex"};
+    static const char *names[]={"host-only","filter-only","csd-without-hpcp","csd-with-hpcp","SQLerate"};
     return names[pg_sina_exe_path];
 }
 bool pg_sina_hpcp_enabled(void)
@@ -225,7 +225,7 @@ static bool check_memory(int *value,void **extra,GucSource source)
 static const struct config_enum_entry execution_paths[] = {
     {"host-only",PG_SINA_HOST,false}, {"filter-only",PG_SINA_FILTER,false},
     {"csd-without-hpcp",PG_SINA_CSD,false}, {"csd-with-hpcp",PG_SINA_HPCP,false},
-    {"SQLerate",PG_SINA_ADAPTIVE,false}, {"ibex",PG_SINA_IBEX,false}, {NULL, 0, false}
+    {"SQLerate",PG_SINA_ADAPTIVE,false}, {NULL, 0, false}
 };
 double pg_sina_host_cost_ms=0.02,pg_sina_csd_cpu_ratio=0.35;
 double pg_sina_parallel_task_ms=0.02;
@@ -249,6 +249,9 @@ void _PG_init(void)
         &hpcp,true,PGC_USERSET,0,NULL,assign_hpcp,NULL);
     DefineCustomBoolVariable("pg_sina_csd.dcp", "Populate PostgreSQL shared_buffers from device receive data", NULL,
         &pg_sina_dcp,false,PGC_USERSET,0,NULL,assign_dcp,NULL);
+    DefineCustomBoolVariable("pg_sina_csd.experimental_operator_graph",
+        "Execute the supported sorted scalar SUM using separate CSD functions", NULL,
+        &pg_sina_operator_graph,false,PGC_USERSET,0,NULL,NULL,NULL);
     DefineCustomIntVariable("pg_sina_csd.max_memory", "Maximum device work memory per query", NULL,
         &pg_sina_max_memory, 0, 0, MAX_KILOBYTES, PGC_USERSET, GUC_UNIT_KB, check_memory, assign_memory, NULL);
     DefineCustomIntVariable("pg_sina_csd.index_cache_mib", "Maximum clean Index Join page cache in device workmem, in MiB", NULL,
@@ -287,5 +290,5 @@ void _PG_init(void)
 PG_FUNCTION_INFO_V1(pg_sina_csd_version);
 Datum pg_sina_csd_version(PG_FUNCTION_ARGS)
 {
-    PG_RETURN_TEXT_P(cstring_to_text("pg_sina_csd 0.3: SNIA vector query execution"));
+    PG_RETURN_TEXT_P(cstring_to_text("pg_sina_csd 0.2: SNIA vector query execution"));
 }

@@ -1,6 +1,0 @@
-# pgfincore extension
-comment = 'examine and manage the os buffer cache'
-default_version = '1.4'
-module_pathname = '$libdir/pgfincore'
-directory = pgfincore
-relocatable = true

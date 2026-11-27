@@ -11,6 +11,18 @@
 #define FEMU_CSD_GRAPH_CACHE 4U /* Caller guarantees LOAD input is immutable during EXEC. */
 #define FEMU_CSD_GRAPH_PROFILE 2U /* existing SNIA_FEMU_PROFILE diagnostics */
 #define FEMU_CSD_GRAPH_CACHE_SUMMARY 8U /* session totals without per-event logging */
+#define FEMU_CSD_GRAPH_STREAM 16U
+/* Stream inputs use afdm_offset on EXEC nodes. The scheduler owns one
+ * credit per edge; the CSFs own the shared vector and its representation. */
+#define FEMU_GRAPH_STEP_CONSUMED 1U
+#define FEMU_GRAPH_STEP_OUTPUT 2U
+#define FEMU_GRAPH_STEP_DONE 4U
+#define FEMU_GRAPH_STEP_ACTION 5U
+#define FEMU_GRAPH_WAIT_ACTION 6U
+/* Publish an output that borrows the inlet. The last output reader
+ * releases the inlet credit without calling the publishing CSF again. */
+#define FEMU_GRAPH_BORROW_ACTION 7U
+enum { FEMU_GRAPH_INPUT_NONE, FEMU_GRAPH_INPUT_BATCH, FEMU_GRAPH_INPUT_EOF };
 enum { FEMU_GRAPH_OPEN, FEMU_GRAPH_CLOSE, FEMU_GRAPH_CANCEL,
        FEMU_GRAPH_FORGET_CANCEL, FEMU_GRAPH_ROLLBACK };
 enum { FEMU_GRAPH_LOAD=1, FEMU_GRAPH_EXEC, FEMU_GRAPH_STORE };

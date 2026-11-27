@@ -26,7 +26,7 @@ void pg_sina_cache_profile(void);
 const struct pg_sina_cache_entry *pg_sina_cache_lookup(RelFileNode);
 void pg_sina_cache_buffer(int buffer);
 extern int pg_sina_exe_path;
-enum pg_sina_path { PG_SINA_HOST, PG_SINA_FILTER, PG_SINA_CSD, PG_SINA_HPCP, PG_SINA_ADAPTIVE, PG_SINA_IBEX };
+enum pg_sina_path { PG_SINA_HOST, PG_SINA_FILTER, PG_SINA_CSD, PG_SINA_HPCP, PG_SINA_ADAPTIVE };
 const char *pg_sina_path_name(void);
 bool pg_sina_hpcp_enabled(void);
 extern bool pg_sina_dcp;
@@ -43,7 +43,7 @@ extern double pg_sina_internal_mbps, pg_sina_pcie_mbps, pg_sina_cache_mbps;
 extern double pg_sina_internal_read_iops;
 extern double pg_sina_internal_write_mbps;
 extern double pg_sina_result_batch_ms, pg_sina_parallel_task_ms;
-extern bool pg_sina_profile;
+extern bool pg_sina_profile, pg_sina_operator_graph;
 /* Existing profile switch also measures planner work; all fields are ms.
  * The pointer is query-local and restored for nested planner invocations. */
 struct pg_sina_planner_profile {
@@ -116,7 +116,8 @@ List **pg_sina_search_observations(void);
 List **pg_sina_search_index_metadata(void);
 List **pg_sina_search_scan_schemas(void);
 struct qp_plan *pg_sina_cost_workspace(void);
-enum { PG_SINA_GROUP_FILTER=1U<<8, PG_SINA_LEFT_COUNT=1U<<9, PG_SINA_DISTINCT=1U<<10, PG_SINA_DISTINCT_SORT=1U<<11 };
+enum { PG_SINA_GROUP_FILTER=1U<<8, PG_SINA_LEFT_COUNT=1U<<9, PG_SINA_DISTINCT=1U<<10, PG_SINA_DISTINCT_SORT=1U<<11,
+    PG_SINA_GROUP_PREFILTER=1U<<12 };
 /* Query-local choice, never a wire field: low bits select relational rewrites;
  * high bits freeze the node/access algorithms and index residual presence
  * checked by the final encoder (residuals affect probe early-exit costs). */
@@ -161,6 +162,7 @@ Plan *pg_sina_prepare_candidate(PlannerInfo *,Plan *,bool);
 Plan *pg_sina_require_output_order(PlannerInfo *,Plan *);
 /* Cost properties and a borrowed workspace, valid until the next candidate.
  * Candidate Const holds binary cost metadata, never an executable program. */
+bool pg_sina_graph_plan_supported(const struct qp_plan *);
 Plan *pg_sina_describe_candidate(PlannerInfo *,Plan *,bool,struct qp_plan **);
 Plan *pg_sina_candidate_scan(Plan *,bool,bool);
 void pg_sina_finish_device_plans(Plan *);
@@ -174,7 +176,8 @@ Plan *pg_sina_native_plan(Plan *);
 Plan *pg_sina_native_wrapper(Plan *);
 extern const CustomScanMethods pg_sina_plan_methods;
 struct qs_extent *pg_sina_mapping(struct qs_request *request);
-void pg_sina_execute(struct qs_request *,struct qs_extent *,struct qs_result *,bool,struct pg_sina_stream **);
+Datum pg_sina_decimal(struct qs_cell);
+void pg_sina_execute(struct qs_request *,struct qs_extent *,struct qs_result *,bool,struct pg_sina_stream **,const struct qs_graph_tail *);
 void pg_sina_fetch(struct pg_sina_stream **,struct qs_result *);
 void pg_sina_close(struct pg_sina_stream *);
 Plan *pg_sina_project_scan(Plan *scope,Plan *scan);

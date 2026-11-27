@@ -192,7 +192,7 @@ static void run(cs_work_context *parent,int probe,uint64_t cancel)
     unsigned waits=0; int resume=0; nrecords=0;
     for(unsigned attempts=0;;++attempts) {
         assert(attempts<1000000);
-        int64_t rc=probe?qs_index_probe(0,input,&p,&task,&control,&a,resume):
+        int64_t rc=probe?qs_index_probe(0,input,&p,&task,&control,&a,resume,qs_join_consume):
             qs_index_scan_paged(out,&task,&control,io,ROWS/PER_PAGE,LEAVES+2,0,&ordered);
         a.cparam2=ordered.cparam2=0;
         if(!rc) {

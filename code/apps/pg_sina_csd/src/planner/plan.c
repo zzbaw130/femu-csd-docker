@@ -1,10 +1,6 @@
 /* Lower the selected PG Plan, without choosing another join order. */
 #include "pg_internal.h"
-#include "cost_model.h"
 #include "access/table.h"
-#include "access/tableam.h"
-#include "access/genam.h"
-#include "access/stratnum.h"
 #include "access/sysattr.h"
 #include "access/relation.h"
 #include "catalog/namespace.h"
@@ -15,7 +11,6 @@
 #include "catalog/pg_collation_d.h"
 #include "catalog/pg_statistic.h"
 #include "executor/spi.h"
-#include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
@@ -23,7 +18,6 @@
 #include "optimizer/tlist.h"
 #include "parser/parse_oper.h"
 #include "parser/parsetree.h"
-#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/array.h"
 #include "utils/lsyscache.h"
@@ -33,7 +27,6 @@
 #include "utils/fmgroids.h"
 #include "utils/numeric.h"
 #include "utils/syscache.h"
-#include "utils/snapmgr.h"
 #include <locale.h>
 
 struct binding {
@@ -434,6 +427,33 @@ static int conditions(struct binding *b,List *list)
         if(result<0) return -2;
     }
     return result;
+}
+
+static bool integer_constant(Node *node,int64 value)
+{
+    if(!IsA(node,Const)) return false;
+    const Const *c=(const Const *)node;
+    if(c->constisnull) return false;
+    return (c->consttype==INT4OID && DatumGetInt32(c->constvalue)==value) ||
+        (c->consttype==INT8OID && DatumGetInt64(c->constvalue)==value);
+}
+
+/* Bind the example only to a heap scan immediately below an aggregate. */
+static Var *keep_even_qual(const struct binding *b)
+{
+    if(!pg_sina_operator_graph || !IsA(b->plan,SeqScan) || b->tree->count!=2 ||
+       b->tree->nodes[0].kind!=QP_AGGREGATE || list_length(b->plan->qual)!=1 ||
+       !IsA(linitial(b->plan->qual),OpExpr)) return NULL;
+    const OpExpr *eq=linitial(b->plan->qual);
+    Oid fn=get_opcode(eq->opno);
+    if((fn!=F_INT4EQ && fn!=F_INT8EQ && fn!=F_INT84EQ && fn!=F_INT48EQ) ||
+       list_length(eq->args)!=2 || !IsA(linitial(eq->args),OpExpr) ||
+       !integer_constant(lsecond(eq->args),0)) return NULL;
+    const OpExpr *mod=linitial(eq->args);
+    fn=get_opcode(mod->opno);
+    if((fn!=F_INT4MOD && fn!=F_INT8MOD) || list_length(mod->args)!=2 ||
+       !IsA(linitial(mod->args),Var) || !integer_constant(lsecond(mod->args),2)) return NULL;
+    return linitial(mod->args);
 }
 /* The planning locks keep a relation's tuple layout stable. Cache only the
  * immutable descriptor in this search; each candidate still owns its slots,
@@ -921,7 +941,7 @@ static bool choose_algorithms(PlannerInfo *root,Plan **slot,bool ordered)
         Agg *a=(Agg *)p;
         struct candidate_group group={.supported=a->numCols>0 && a->numCols<=QS_KEYS};
         simple_group((Node *)p->targetlist,&group); simple_group((Node *)p->qual,&group);
-        bool supported=group.supported && group.aggregates && a->numCols+2*list_length(group.aggregates)<=QS_OUT;
+        bool supported=group.supported && group.aggregates && qp_group_partial_width(a->numCols,list_length(group.aggregates))<=QS_OUT;
         bool sort=IsA(p->lefttree,Sort);
         /* An unfiltered non-covering index orders every Heap tuple just for
          * grouping. Both modes can instead scan batches and hash groups. */
@@ -1022,6 +1042,101 @@ static bool group_output(struct qs_plan *p,int index,struct qp_node *n,bool reta
         x->op==Q_LIKE || x->op==Q_COALESCE || (x->op>=Q_EQ && x->op<=Q_OR)) &&
         group_output(p,x->left,n,retain) && group_output(p,x->right,n,retain);
 }
+static const struct qs_expr *integer_output(const struct qp_node *node,unsigned column)
+{
+    if(column>=node->expr.nout) return NULL;
+    const struct qs_expr *e=&node->expr.exprs[node->expr.outputs[column].index];
+    return e->op==Q_COLUMN && e->type==Q_INTEGER?e:NULL;
+}
+
+/* Find a necessary key domain through projections and inner equality
+ * joins. Residual predicates only remove more keys from that domain. */
+static int group_key_domain_scan(const struct qp_plan *p,int id,unsigned column,unsigned *key)
+{
+    const struct qp_node *n=&p->nodes[id];
+    const struct qs_expr *e=integer_output(n,column);
+    if(!e) return -1;
+    if(n->kind==QP_SCAN && !n->ordered_index) { *key=column; return id; }
+    if(n->kind==QP_PROJECT && n->left>=0)
+        return group_key_domain_scan(p,n->left,e->column,key);
+    if(n->kind!=QP_JOIN || !n->hash || n->join_type!=QP_INNER || n->left<0 || n->right<0)
+        return -1;
+    unsigned width=p->nodes[n->left].expr.nout;
+    bool right=(unsigned)e->column>=width;
+    unsigned local=(unsigned)e->column-(right?width:0);
+    int best=group_key_domain_scan(p,right?n->right:n->left,local,key);
+    for(unsigned k=0;k<n->nkeys;++k) {
+        if(local!=(unsigned)(right?n->right_keys[k]:n->left_keys[k])) continue;
+        unsigned other_key;
+        int other=group_key_domain_scan(p,right?n->left:n->right,
+            right?n->left_keys[k]:n->right_keys[k],&other_key);
+        if(other>=0 && (best<0 || p->nodes[other].estimated_rows<p->nodes[best].estimated_rows)) {
+            best=other; *key=other_key;
+        }
+    }
+    return best;
+}
+
+/* A small filtered key domain can eliminate entire groups before a blocking
+ * hash aggregate. Keep the original joins, residuals and output multiplicity. */
+static bool push_group_key_prefilter(struct qp_plan *p,struct qp_node *join)
+{
+    if(!pg_sina_operator_graph || !join->hash || join->join_type!=QP_INNER ||
+       join->nkeys!=1 || p->ninit || p->nparams || p->count+3>QP_NODES) return false;
+    for(unsigned side=0;side<2;++side) {
+        int child=side?join->right:join->left;
+        unsigned column=side?join->right_keys[0]:join->left_keys[0];
+        int id=child;
+        const struct qs_expr *key=integer_output(&p->nodes[id],column);
+        while(key && p->nodes[id].kind==QP_PROJECT && p->nodes[id].left>=0) {
+            id=p->nodes[id].left; column=key->column;
+            key=integer_output(&p->nodes[id],column);
+        }
+        struct qp_node *agg=&p->nodes[id];
+        if(!key || agg->kind!=QP_AGGREGATE || !agg->hash || agg->nkeys!=1 ||
+           agg->left_keys[0]!=key->column || agg->left<0 ||
+           p->nodes[agg->left].kind!=QP_SCAN || p->nodes[agg->left].ordered_index)
+            continue;
+        unsigned scan_key;
+        int source=group_key_domain_scan(p,side?join->left:join->right,
+            side?join->left_keys[0]:join->right_keys[0],&scan_key);
+        if(source<0) continue;
+        const struct qp_node *scan=&p->nodes[source],*input=&p->nodes[agg->left];
+        double groups=Max(1,agg->estimated_groups);
+        if(scan->estimated_rows*4>=groups ||
+           scan->estimated_rows*4*sizeof(int64_t)>pg_sina_query_memory()/8) continue;
+
+        unsigned set=p->count++,key_scan=p->count++,filter=p->count++;
+        p->nodes[key_scan]=*scan;
+        p->nodes[key_scan].expr.outputs[0]=scan->expr.outputs[scan_key];
+        p->nodes[key_scan].expr.nout=1;
+        p->nodes[set]=(struct qp_node){.kind=QP_SET,.left=key_scan,.right=-1,
+            .expr=p->nodes[key_scan].expr,.estimated_rows=scan->estimated_rows};
+        p->init_nodes[0]=set; p->init_params[0]=-1; p->ninit=1;
+        double selectivity=Min(1.0,scan->estimated_rows/groups);
+        struct qp_node *f=&p->nodes[filter];
+        *f=(struct qp_node){.kind=QP_PROJECT,.left=agg->left,.right=-1,
+            .estimated_rows=input->estimated_rows*selectivity};
+        f->expr.nattrs=f->expr.ncols=f->expr.nout=f->expr.nexprs=input->expr.nout;
+        f->expr.having=f->expr.limit=-1;
+        for(unsigned k=0;k<f->expr.nout;++k) {
+            f->expr.outputs[k]=input->expr.outputs[k]; f->expr.outputs[k].index=k;
+            unsigned type=input->expr.exprs[input->expr.outputs[k].index].type;
+            f->expr.exprs[k]=(struct qs_expr){.op=Q_COLUMN,.column=k,.type=type};
+            f->expr.cols[k]=(struct qs_column){.slot=k,.type=type};
+        }
+        f->expr.predicate=add_expr(&f->expr,(struct qs_expr){.op=QP_INSET,.type=Q_BOOLEAN,
+            .left=key->column,.column=set});
+        agg->left=filter; agg->estimated_groups*=selectivity;
+        for(int at=child;;at=p->nodes[at].left) {
+            p->nodes[at].estimated_rows*=selectivity;
+            if(at==id) break;
+        }
+        return true;
+    }
+    return false;
+}
+
 /* A unique integer-key join that only returns its key is a membership test.
  * Move that test below GROUP BY, where it removes whole groups, never rows
  * within a retained group. Reuse the existing device IN set and initializer. */
@@ -1419,7 +1534,13 @@ static int compile_node_impl(PlannerInfo *root,Plan *native,struct qp_plan *tree
         int expr=expression(&b,(Node *)t->expr); if(expr<0) return -1;
         p->outputs[p->nout++]=(struct qs_output){.index=expr,.type_oid=exprType((Node *)t->expr),.typmod=exprTypmod((Node *)t->expr)};
     }
-    p->predicate=conditions(&b,native->qual); if(p->predicate==-2) return -1;
+    Var *even=keep_even_qual(&b);
+    if(even) {
+        if(expression(&b,(Node *)even)<0) return -1;
+        n->keep_even_column=p->cols[even->varattno-1].slot+1;
+    } else {
+        p->predicate=conditions(&b,native->qual); if(p->predicate==-2) return -1;
+    }
     if(IsA(native,Result) && ((Result *)native)->resconstantqual) {
         Node *qual=((Result *)native)->resconstantqual;
         int extra=IsA(qual,List)?conditions(&b,(List *)qual):expression(&b,qual); if(extra<0) return -1;
@@ -1461,6 +1582,8 @@ static int compile_node_impl(PlannerInfo *root,Plan *native,struct qp_plan *tree
     }
     if(n->kind==QP_JOIN && !ordered && ((Join *)native)->inner_unique &&
        (!pg_sina_path_search || (pg_sina_encoding_choice(id)&PG_SINA_GROUP_FILTER))) push_group_key_filter(tree,n);
+    if(n->kind==QP_JOIN && (!pg_sina_path_search || (pg_sina_encoding_choice(id)&PG_SINA_GROUP_PREFILTER)))
+        push_group_key_prefilter(tree,n);
     if(n->kind==QP_AGGREGATE &&
        (!pg_sina_path_search || (pg_sina_encoding_choice(id)&PG_SINA_LEFT_COUNT))) push_left_join_count(tree,n);
     return id;
@@ -1808,7 +1931,12 @@ static int describe_tree(PlannerInfo *root,Plan *native,struct qp_plan *tree,boo
         int property=describe_expression(&b,value); if(property<0) return -1;
         p->outputs[p->nout++]=(struct qs_output){.index=property,.type_oid=exprType(value),.typmod=exprTypmod(value)};
     }
-    if(!describe_list(&b,native->qual)) return -1;
+    Var *even=keep_even_qual(&b);
+    if(even) {
+        if(describe_expression(&b,(Node *)even)<0 ||
+           add_expr(p,(struct qs_expr){.op=Q_AGGREF,.type=Q_BOOLEAN,.column=-1,
+               .constant=(intptr_t)linitial(native->qual)})<0) return -1;
+    } else if(!describe_list(&b,native->qual)) return -1;
     if(n->kind==QP_SCAN && native->qual) {
         /* Cost metadata only: retain the original predicate root so PG can
          * estimate the selectivity of the device's early AND prefilters.
@@ -1858,6 +1986,7 @@ static int describe_tree(PlannerInfo *root,Plan *native,struct qp_plan *tree,boo
         push_group_key_filter(tree,n);
         if(n->kind!=QP_JOIN) choices[id]|=PG_SINA_GROUP_FILTER;
     }
+    if(n->kind==QP_JOIN && push_group_key_prefilter(tree,n)) choices[id]|=PG_SINA_GROUP_PREFILTER;
     if(n->kind==QP_AGGREGATE) {
         push_left_join_count(tree,n);
         if(n->kind!=QP_AGGREGATE) choices[id]|=PG_SINA_LEFT_COUNT;
@@ -2003,7 +2132,7 @@ bool pg_sina_scan_parameters(PlannerInfo *root,Plan *native,List **values)
     *values=parameters.values;
     return true;
 }
-static Plan *compile_subtree(PlannerInfo *root,Plan *native,bool boundary,bool ibex)
+Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
 {
     bool host_scan=boundary && pg_sina_is_scan(native);
     List *parameters=NIL;
@@ -2039,9 +2168,6 @@ static Plan *compile_subtree(PlannerInfo *root,Plan *native,bool boundary,bool i
     }
     if(copy) result=compile_node(root,copy,tree,ordered);
     if(result<0) { goto failed; }
-    tree->root=result;
-    if(ibex && !qp_ibex_supported(tree)) goto failed;
-    tree->ibex=ibex;
     bool has_scan=false;
     for(unsigned i=0;i<tree->count;++i) {
         has_scan|=tree->nodes[i].kind==QP_SCAN;
@@ -2060,6 +2186,7 @@ static Plan *compile_subtree(PlannerInfo *root,Plan *native,bool boundary,bool i
         if(prepared && !device[0]) strlcpy(device,path,sizeof(device));
     }
     if(!prepared) { goto failed; }
+    tree->root=result;
     defer_output_text(tree,NULL);
     pg_sina_refine_groups(root,tree);
     pg_sina_read_resources(device);
@@ -2096,8 +2223,6 @@ failed:
     pfree(tree);
     return native;
 }
-Plan *pg_sina_compile_subtree(PlannerInfo *root,Plan *native,bool boundary)
-{ return compile_subtree(root,native,boundary,false); }
 Plan *pg_sina_describe_candidate(PlannerInfo *root,Plan *native,bool boundary,struct qp_plan **lowered)
 {
     bool host_scan=boundary && pg_sina_is_scan(native);
@@ -2218,185 +2343,6 @@ Plan *pg_sina_native_plan(Plan *plan)
     if(IsA(plan,SubqueryScan)) ((SubqueryScan *)plan)->subplan=pg_sina_native_plan(((SubqueryScan *)plan)->subplan);
     return plan;
 }
-struct ibex_split {
-    struct qs_join mapping;
-    int64_t upper;
-    uint64_t ranked_groups;
-};
-
-static void ibex_rank_boundary(uint64_t budget,const struct qp_node *group,struct ibex_split *split)
-{
-    Oid ns=get_namespace_oid("sina_csd",true);
-    if(!OidIsValid(ns)) return;
-    Oid boundaries=get_relname_relid("ibex_group_boundaries",ns);
-    if(!OidIsValid(boundaries) || pg_class_aclcheck(boundaries,GetUserId(),ACL_SELECT)!=ACLCHECK_OK) return;
-    /* Match the device's power-of-two buckets and 7/8 occupancy. Leave
-     * 16 MiB for the ordered scan, executor, and minimum sort reserves. */
-    uint64_t stride=cost_group_stride(group),slot_bytes=8+stride-stride/8;
-    uint64_t slots=128,available=budget-16ULL*1024*1024;
-    while(slots*2<=available/slot_bytes) slots*=2;
-    int64_t limit=slots-slots/8;
-    if(SPI_connect()!=SPI_OK_CONNECT) elog(ERROR,"SPI_connect failed");
-    Oid types[]={OIDOID,INT8OID};
-    Datum values[]={ObjectIdGetDatum(split->mapping.indexid),Int64GetDatum(limit)};
-    int status=SPI_execute_with_args("SELECT groups_before,upper_key FROM sina_csd.ibex_group_boundaries "
-        "WHERE indexid=$1 AND groups_before>0 AND groups_before<=$2 ORDER BY groups_before DESC LIMIT 1",
-        2,types,values,NULL,true,1);
-    if(status==SPI_OK_SELECT && SPI_processed==1) {
-        HeapTuple row=SPI_tuptable->vals[0]; TupleDesc desc=SPI_tuptable->tupdesc;
-        bool isnull;
-        split->ranked_groups=DatumGetInt64(SPI_getbinval(row,desc,1,&isnull));
-        split->upper=DatumGetInt64(SPI_getbinval(row,desc,2,&isnull));
-    }
-    SPI_finish();
-}
-
-static IndexScan *ibex_host_scan(PlannerInfo *root,Scan *input,Var *key,
-    uint64_t budget,const struct qp_node *group,struct ibex_split *split)
-{
-    Index rti=input->scanrelid;
-    Oid heap_oid=planner_rt_fetch(rti,root)->relid;
-    Relation heap=table_open(heap_oid,NoLock);
-    if(key->varattno<=0 || !TupleDescAttr(RelationGetDescr(heap),key->varattno-1)->attnotnull) {
-        table_close(heap,NoLock);
-        return NULL;
-    }
-    IndexOptInfo *chosen=NULL;
-    Oid op=InvalidOid;
-    ListCell *cell;
-    foreach(cell,root->simple_rel_array[rti]->indexlist) {
-        IndexOptInfo *index=lfirst_node(IndexOptInfo,cell);
-        if(index->relam!=BTREE_AM_OID || index->indexkeys[0]!=key->varattno) continue;
-        op=get_opfamily_member(index->opfamily[0],key->vartype,key->vartype,BTGreaterEqualStrategyNumber);
-        if(OidIsValid(op) && index_metadata(index->indexoid,heap_oid,key->varattno,&split->mapping)) {
-            chosen=index;
-            break;
-        }
-    }
-    if(!chosen) { table_close(heap,NoLock); return NULL; }
-    int16 len; bool byval;
-    get_typlenbyval(key->vartype,&len,&byval);
-    ibex_rank_boundary(budget,group,split);
-    if(!split->ranked_groups) {
-        /* Older mappings have no exact ranks. Bound the number of possible
-         * groups by the integer span, including keys absent from the heap. */
-        Relation index=index_open(chosen->indexoid,NoLock);
-        IndexScanDesc scan=index_beginscan(heap,index,GetActiveSnapshot(),0,0);
-        TupleTableSlot *slot=table_slot_create(heap,NULL);
-        index_rescan(scan,NULL,0,NULL,0);
-        bool found=index_getnext_slot(scan,ForwardScanDirection,slot),isnull=true;
-        Datum first=found?slot_getattr(slot,key->varattno,&isnull):(Datum)0;
-        ExecDropSingleTupleTableSlot(slot);
-        index_endscan(scan);
-        index_close(index,NoLock);
-        if(!found || isnull) { table_close(heap,NoLock); return NULL; }
-        int64_t min=len==2?DatumGetInt16(first):len==4?DatumGetInt32(first):DatumGetInt64(first);
-        int64_t type_max=len==2?PG_INT16_MAX:len==4?PG_INT32_MAX:PG_INT64_MAX;
-        int64_t groups=budget/160;
-        split->upper=min>type_max-groups?type_max:min+groups;
-        if(split->upper<=min) { table_close(heap,NoLock); return NULL; }
-    }
-    table_close(heap,NoLock);
-    Datum limit=len==2?Int16GetDatum(split->upper):len==4?Int32GetDatum(split->upper):Int64GetDatum(split->upper);
-    Const *constant=makeConst(key->vartype,-1,InvalidOid,len,limit,false,byval);
-    Var *index_key=copyObject(key);
-    index_key->varno=INDEX_VAR; index_key->varattno=1;
-    IndexScan *host=makeNode(IndexScan);
-    host->scan=*input; NodeSetTag(host,T_IndexScan);
-    host->scan.plan.parallel_aware=false;
-    host->indexid=chosen->indexoid;
-    host->indexorderdir=ForwardScanDirection;
-    host->indexqual=list_make1(make_opclause(op,BOOLOID,false,(Expr *)index_key,(Expr *)constant,InvalidOid,InvalidOid));
-    host->indexqualorig=list_make1(make_opclause(op,BOOLOID,false,(Expr *)copyObject(key),(Expr *)copyObject(constant),InvalidOid,InvalidOid));
-    root->glob->relationOids=list_append_unique_oid(root->glob->relationOids,chosen->indexoid);
-    return host;
-}
-
-static Plan *ibex_aggregate(PlannerInfo *root,Plan *native)
-{
-    if(!IsA(native,Agg) || root->init_plans) return native;
-    Agg *agg=copyObject((Agg *)native);
-    if(agg->numCols!=1 || agg->groupingSets || agg->chain ||
-       (agg->aggstrategy!=AGG_HASHED && agg->aggstrategy!=AGG_SORTED)) return native;
-    Plan *input=agg->plan.lefttree;
-    Agg *partial=agg;
-    if(DO_AGGSPLIT_COMBINE(agg->aggsplit)) {
-        input=partial_input(input);
-        if(!input) return native;
-        partial=(Agg *)input;
-        if(partial->numCols!=1) return native;
-        input=input->lefttree;
-    } else if(agg->aggsplit!=AGGSPLIT_SIMPLE) return native;
-    if(!input) return native;
-    TargetEntry *key=get_tle_by_resno(input->targetlist,partial->grpColIdx[0]);
-    if(!key || !IsA(key->expr,Var)) return native;
-    Oid keytype=exprType((Node *)key->expr);
-    if(keytype!=INT2OID && keytype!=INT4OID && keytype!=INT8OID) return native;
-    if(IsA(input,Sort)) input=input->lefttree;
-    if(!IsA(input,SeqScan)) return native;
-    List *outputs=list_concat(list_copy(agg->plan.targetlist),agg->plan.qual);
-    List *references=pull_var_clause((Node *)outputs,PVC_INCLUDE_AGGREGATES|PVC_RECURSE_PLACEHOLDERS);
-    Aggref *sum=NULL;
-    ListCell *cell;
-    foreach(cell,references) {
-        if(!IsA(lfirst(cell),Aggref)) continue;
-        Aggref *ref=lfirst_node(Aggref,cell);
-        if(sum && !equal(sum,ref)) return native;
-        sum=ref;
-    }
-    if(!sum || !function_is(sum->aggfnoid,"sum") || sum->aggtype!=NUMERICOID ||
-       sum->aggdistinct || sum->aggorder || sum->aggfilter || list_length(sum->args)!=1)
-        return native;
-    Expr *quantity=linitial_node(TargetEntry,sum->args)->expr;
-    if(!IsA(quantity,Var) || exprType((Node *)quantity)!=NUMERICOID ||
-       ((Var *)quantity)->varno!=((Scan *)input)->scanrelid ||
-       ((Var *)key->expr)->varno!=((Scan *)input)->scanrelid) return native;
-
-    List *columns=list_make2(makeTargetEntry(copyObject(key->expr),1,NULL,false),
-                             makeTargetEntry(copyObject(quantity),2,NULL,false));
-    Plan *source=copyObject(input);
-    source->targetlist=copyObject(columns);
-    agg->aggsplit=AGGSPLIT_SIMPLE;
-    agg->grpColIdx[0]=1;
-    agg->plan.parallel_aware=agg->plan.parallel_safe=false;
-    foreach(cell,references)
-        if(IsA(lfirst(cell),Aggref)) lfirst_node(Aggref,cell)->aggsplit=AGGSPLIT_SIMPLE;
-    agg->plan.lefttree=source;
-    agg->aggstrategy=AGG_HASHED;
-    Plan *compiled=compile_subtree(root,(Plan *)agg,false,false);
-    uint64_t budget=pg_sina_query_memory();
-    if(compiled==(Plan *)agg || budget<64ULL*1024*1024) return native;
-
-    CustomScan *scan=(CustomScan *)compiled;
-    Const *program=linitial_node(Const,scan->custom_private);
-    bytea *bytes=DatumGetByteaP(program->constvalue);
-    size_t length=VARSIZE_ANY_EXHDR(bytes);
-    struct qp_plan *tree=palloc0(sizeof(*tree));
-    memcpy(tree,VARDATA_ANY(bytes),length);
-    struct qp_node *group=&tree->nodes[tree->root];
-    if(group->kind!=QP_AGGREGATE || group->left<0 || tree->nodes[group->left].kind!=QP_SCAN) {
-        pfree(tree);
-        return native;
-    }
-    struct ibex_split split={0};
-    IndexScan *host=ibex_host_scan(root,(Scan *)source,(Var *)key->expr,budget,group,&split);
-    if(!host) { pfree(tree); return native; }
-    struct qp_node *leaf=&tree->nodes[group->left];
-    leaf->ordered_index=3|QP_INDEX_UPPER; /* Forward B-tree with heap read-ahead. */
-    leaf->index_upper=split.upper;
-    leaf->expr.join=split.mapping;
-    group->estimated_groups=split.ranked_groups?split.ranked_groups:budget/160;
-    if(split.ranked_groups) scan->custom_private=lappend(scan->custom_private,makeInteger(1));
-    memcpy(VARDATA_ANY(bytes),tree,length);
-    pfree(tree);
-
-    /* The complementary index range is ordered by the group key. PG can
-     * finalize each group as it scans while the device runs asynchronously. */
-    agg->aggstrategy=AGG_SORTED;
-    agg->plan.lefttree=(Plan *)host;
-    scan->custom_plans=list_make1(agg);
-    return compiled;
-}
 static Plan *rewrite_selected(PlannerInfo *root,RelOptInfo *rel,CustomPath *path,List *tlist,List *clauses,List *plans)
 {
     Plan *native=linitial(plans);
@@ -2404,9 +2350,7 @@ static Plan *rewrite_selected(PlannerInfo *root,RelOptInfo *rel,CustomPath *path
     pg_sina_compiling_plan=true;
     PG_TRY();
     {
-        if(pg_sina_exe_path==PG_SINA_IBEX)
-            compiled=ibex_aggregate(root,native);
-        else if(pg_sina_exe_path==PG_SINA_FILTER || pg_sina_exe_path==PG_SINA_ADAPTIVE)
+        if(pg_sina_exe_path==PG_SINA_FILTER || pg_sina_exe_path==PG_SINA_ADAPTIVE)
             compiled=pg_sina_adaptive_plan(root,native);
         else {
             compiled=pg_sina_fast_plan(root,native);
@@ -2437,14 +2381,9 @@ static const CustomPathMethods selected_methods={.CustomName="SniaSelectedPlan",
 void pg_sina_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *input,RelOptInfo *output,void *extra)
 {
     Query *q=root->parse;
-    bool ibex=pg_sina_exe_path==PG_SINA_IBEX;
-    if(pg_sina_exe_path==PG_SINA_HOST || stage!=UPPERREL_FINAL || q->commandType!=CMD_SELECT ||
+    if(pg_sina_exe_path==PG_SINA_HOST || root->parent_root || stage!=UPPERREL_FINAL || q->commandType!=CMD_SELECT ||
        q->hasRowSecurity || q->hasTargetSRFs || q->rowMarks || q->windowClause || q->groupingSets ||
        q->setOperations || root->append_rel_list) return;
-    if(ibex) {
-        if(!q->hasAggs || list_length(q->groupClause)!=1 || list_length(q->rtable)!=1 ||
-           linitial_node(RangeTblEntry,q->rtable)->rtekind!=RTE_RELATION || q->cteList || q->hasSubLinks) return;
-    } else if(root->parent_root) return;
     Path *selected=NULL; ListCell *c;
     foreach(c,output->pathlist) {
         Path *candidate=lfirst(c);
@@ -2454,8 +2393,7 @@ void pg_sina_upper_paths(PlannerInfo *root,UpperRelationKind stage,RelOptInfo *i
     CustomPath *path=makeNode(CustomPath); path->path=*selected;
     NodeSetTag(path,T_CustomPath); path->path.pathtype=T_CustomScan;
     path->path.parallel_aware=path->path.parallel_safe=false;
-    if(ibex) path->path.pathkeys=NIL;
-    if(!ibex) path->path.startup_cost=path->path.total_cost=0;
+    path->path.startup_cost=path->path.total_cost=0;
     path->custom_paths=list_make1(selected); path->methods=&selected_methods;
     /* add_path may pfree the dominated path, which is our own child here. */
     output->pathlist=list_make1(path);
